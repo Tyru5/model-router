@@ -456,12 +456,14 @@ mod tests {
 
     #[test]
     fn task_file_mode_browses_directories_and_selects_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let docs = dir.path().join("docs");
+        let temp = tempfile::tempdir().unwrap();
+        // Canonical root: macOS temp dirs live behind the /var -> /private/var symlink.
+        let dir = fs::canonicalize(temp.path()).unwrap();
+        let docs = dir.join("docs");
         fs::create_dir(&docs).unwrap();
         let spec = docs.join("Feature 雪.md");
         fs::write(&spec, "# A task").unwrap();
-        let mut picker = PathPicker::files(dir.path()).unwrap();
+        let mut picker = PathPicker::files(&dir).unwrap();
         picker.paste("docs");
         assert!(matches!(
             key(&mut picker, Key::Enter).unwrap(),
@@ -497,9 +499,10 @@ mod tests {
 
     #[test]
     fn browses_folders_and_selects_repositories_and_linked_worktrees() {
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("current");
-        let group = root.path().join("projects");
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let project = root.join("current");
+        let group = root.join("projects");
         let repo = group.join("Repo with spaces 雪");
         let linked = group.join("linked-worktree");
         fs::create_dir(&project).unwrap();
@@ -536,8 +539,9 @@ mod tests {
 
     #[test]
     fn invalid_paths_and_empty_search_keep_the_browser_open() {
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("current");
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let project = root.join("current");
         fs::create_dir(&project).unwrap();
         let mut picker = PathPicker::new(&project, vec![]).unwrap();
         picker.paste("no such repo");
@@ -562,9 +566,10 @@ mod tests {
 
     #[test]
     fn direct_paths_and_non_git_directories_can_be_selected() {
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("project");
-        let other = root.path().join("empty folder 雪");
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let project = root.join("project");
+        let other = root.join("empty folder 雪");
         fs::create_dir(&project).unwrap();
         fs::create_dir(&other).unwrap();
         let mut picker = PathPicker::new(&project, vec![]).unwrap();
@@ -590,14 +595,15 @@ mod tests {
 
     #[test]
     fn recent_projects_are_searchable_and_can_be_browsed() {
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("first");
-        let second = root.path().join("second");
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let project = root.join("first");
+        let second = root.join("second");
         fs::create_dir(&project).unwrap();
         fs::create_dir(&second).unwrap();
         let mut picker = PathPicker::new(
             &project,
-            vec![project.clone(), root.path().join("deleted"), second.clone()],
+            vec![project.clone(), root.join("deleted"), second.clone()],
         )
         .unwrap();
         key(&mut picker, Key::Tab).unwrap();
@@ -615,16 +621,17 @@ mod tests {
     #[test]
     fn directory_symlinks_are_browsable_without_recursive_scanning() {
         use std::os::unix::fs::symlink;
-        let root = tempfile::tempdir().unwrap();
-        let project = root.path().join("repo");
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let project = root.join("repo");
         fs::create_dir_all(project.join(".git")).unwrap();
-        symlink(&project, root.path().join("repo-alias")).unwrap();
-        symlink(root.path(), root.path().join("loop")).unwrap();
-        symlink(root.path().join("missing"), root.path().join("broken")).unwrap();
+        symlink(&project, root.join("repo-alias")).unwrap();
+        symlink(&root, root.join("loop")).unwrap();
+        symlink(root.join("missing"), root.join("broken")).unwrap();
         let mut picker = PathPicker::new(&project, vec![]).unwrap();
         picker.paste("repo-alias");
         assert!(
-            matches!(key(&mut picker, Key::Enter).unwrap(), PickerAction::Select(path) if path == root.path().join("repo-alias"))
+            matches!(key(&mut picker, Key::Enter).unwrap(), PickerAction::Select(path) if path == root.join("repo-alias"))
         );
         key(&mut picker, Key::Right).unwrap();
         assert_eq!(picker.directory, fs::canonicalize(&project).unwrap());
@@ -632,7 +639,7 @@ mod tests {
         picker.filter = textarea("loop");
         picker.selected = 0;
         key(&mut picker, Key::Enter).unwrap();
-        assert_eq!(picker.directory, fs::canonicalize(root.path()).unwrap());
+        assert_eq!(picker.directory, fs::canonicalize(&root).unwrap());
         picker.paste("broken");
         assert!(picker.matches().is_empty());
     }

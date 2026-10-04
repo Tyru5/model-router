@@ -39,13 +39,17 @@ class Terminal:
         self.stream = pyte.Stream(self.screen)
         self.raw = bytearray()
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
-        self.resize(*size)
+        self.resize(*size, wait=False)
         self.exited = False
 
-    def resize(self, cols, rows):
+    def resize(self, cols, rows, wait=True):
+        start = len(self.raw)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         self.screen.resize(lines=rows, columns=cols)
         os.kill(self.pid, signal.SIGWINCH)
+        if wait:
+            # Keys sent before the full-screen redraw can race the resize on slow machines.
+            self.wait(lambda: b"\x1b[2J" in self.raw[start:], "No redraw after resize", timeout=5)
 
     def pump(self, duration=0.15):
         end = time.monotonic() + duration
