@@ -90,6 +90,7 @@ def main():
                 assert "Keep this task" in terminal.text()
             assert workflows[-1]["name"] == "Full feature (2)"
             terminal.resize(120, 36)
+            terminal.wait(lambda: "Selected stage" in terminal.text(), "TUI did not redraw after resizing")
             terminal.send("wOffline demo\r")
             terminal.wait(lambda: "Offline demo" in terminal.text(), "Saved workflow did not reopen")
             assert not records(project), "Preset selection started a harness"

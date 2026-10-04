@@ -1,4 +1,5 @@
 use crate::config::{CustomAdapter, Mode, Stage};
+use crate::harness_settings;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -82,12 +83,7 @@ pub fn program(harness: &str, custom: &BTreeMap<String, CustomAdapter>) -> Strin
 }
 
 pub fn validate_options(stage: &Stage) -> Result<()> {
-    if !stage.provider.is_empty()
-        && matches!(
-            stage.harness.as_str(),
-            "claude" | "cursor" | "gemini" | "amp" | "copilot"
-        )
-    {
+    if !stage.provider.is_empty() && !harness_settings::supports_provider(&stage.harness) {
         bail!(
             "{} uses its existing provider/auth configuration; leave the provider field empty",
             stage.harness
@@ -99,18 +95,13 @@ pub fn validate_options(stage: &Stage) -> Result<()> {
             "A provider override requires a model"
         );
     }
-    if !stage.effort.is_empty()
-        && matches!(
-            stage.harness.as_str(),
-            "cursor" | "gemini" | "aider" | "goose" | "amp" | "copilot"
-        )
-    {
+    if !stage.effort.is_empty() && !harness_settings::supports_effort(&stage.harness) {
         bail!(
             "{} has no portable effort flag; use its native model/mode or explicit arguments instead",
             stage.harness
         );
     }
-    Ok(())
+    harness_settings::validate(stage)
 }
 
 pub struct ContextPaths<'a> {
@@ -127,6 +118,8 @@ pub fn build(
     paths: &ContextPaths<'_>,
 ) -> Result<Invocation> {
     validate_options(stage)?;
+    let mut extra_args = harness_settings::arguments(stage)?;
+    extra_args.extend(stage.extra_args.clone());
     let interactive = stage.mode == Mode::Interactive;
     let mut invocation = Invocation {
         program: program(&stage.harness, custom),
@@ -183,7 +176,7 @@ pub fn build(
                     ),
                 ]);
             }
-            a.extend(stage.extra_args.clone());
+            a.extend(extra_args.clone());
             if interactive {
                 a.push(prompt.into());
             } else {
@@ -202,7 +195,7 @@ pub fn build(
             if !stage.effort.is_empty() {
                 append(&["--effort", &stage.effort]);
             }
-            a.extend(stage.extra_args.clone());
+            a.extend(extra_args.clone());
             if interactive {
                 a.push(prompt.into());
             } else {
@@ -223,7 +216,7 @@ pub fn build(
             if !stage.effort.is_empty() {
                 append(&["--thinking", &stage.effort]);
             }
-            a.extend(stage.extra_args.clone());
+            a.extend(extra_args.clone());
             a.push(format!("@{}", paths.prompt_file.display()));
         }
         "cursor" => {
@@ -234,7 +227,7 @@ pub fn build(
             if !stage.model.is_empty() {
                 append(&["--model", &stage.model]);
             }
-            a.extend(stage.extra_args.clone());
+            a.extend(extra_args.clone());
             a.push(prompt.into());
         }
         "gemini" => {
@@ -247,7 +240,7 @@ pub fn build(
             } else {
                 append(&["--prompt", prompt, "--output-format", "json"]);
             }
-            a.extend(stage.extra_args.clone());
+            a.extend(extra_args.clone());
         }
         "opencode" => {
             invocation.kind = OutputKind::OpenCode;
@@ -262,7 +255,7 @@ pub fn build(
             if !stage.effort.is_empty() {
                 append(&["--variant", &stage.effort]);
             }
-            a.extend(stage.extra_args.clone());
+            a.extend(extra_args.clone());
             a.push(prompt.into());
         }
         "aider" => {
@@ -294,7 +287,7 @@ pub fn build(
                         .context("Prompt path must be UTF-8")?,
                 ]);
             }
-            a.extend(stage.extra_args.clone());
+            a.extend(extra_args.clone());
         }
         "goose" => {
             append(&["run", "--text", prompt]);
@@ -307,7 +300,7 @@ pub fn build(
             if !stage.provider.is_empty() {
                 append(&["--provider", &stage.provider]);
             }
-            a.extend(stage.extra_args.clone());
+            a.extend(extra_args.clone());
         }
         "amp" => {
             invocation.kind = OutputKind::Amp;
@@ -317,7 +310,7 @@ pub fn build(
             if !interactive {
                 append(&["--execute", "--stream-json"]);
             }
-            a.extend(stage.extra_args.clone());
+            a.extend(extra_args.clone());
             if interactive {
                 a.push(prompt.into());
             } else {
@@ -336,7 +329,7 @@ pub fn build(
                 },
                 prompt,
             ]);
-            a.extend(stage.extra_args.clone());
+            a.extend(extra_args.clone());
         }
         name => {
             let adapter = custom
@@ -361,7 +354,7 @@ pub fn build(
                 ("{run_dir}", paths.attempt_dir.display().to_string()),
             ];
             a.extend(args.iter().map(|arg| expand(arg, &values)));
-            a.extend(stage.extra_args.clone());
+            a.extend(extra_args.clone());
             if adapter.prompt_stdin && !interactive {
                 invocation.stdin = Some(prompt.into());
             }

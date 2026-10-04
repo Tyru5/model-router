@@ -42,15 +42,21 @@ subcommands bypass it automatically; `NO_COLOR` suppresses its colors.
 
 Opening the router does not start a model. Press `p` to choose a repository,
 `t` to describe the task or `f` to import a task/spec,
-`e` to edit a stage, `m` to choose a model, and `r` to start. `Space` enables
+`c` to configure the selected stage's harness, `e` to edit the stage,
+`m` to choose a model, and `r` to start. `Space` enables
 or disables a stage. `?` opens the full keyboard guide. Use `Ctrl+S` to apply
 text/form edits; `Esc` cancels them. `q` saves workflow edits and exits.
 
+In selection menus, including repository and file browsers, `Ctrl+N` moves to
+the next option and `Ctrl+P` to the previous option, just like `↓` and `↑`.
+
 ## What works
 
+- Twelve colour themes with live preview and a saved preference across projects.
 - Named workflow templates and per-run snapshots.
 - Twelve stage presets and four ready-to-edit workflow presets.
 - Explicit harness/model/provider/effort selection and extra CLI arguments.
+- In-app harness settings for each stage, including native permission controls.
 - Optional research, planning, implementation, review, testing, and custom stages.
 - Native interactive terminals, including paste, resize, and a saved transcript.
 - Unattended execution with live output, cancellation, and timeouts.
@@ -60,6 +66,22 @@ text/form edits; `Esc` cancels them. `q` saves workflow edits and exits.
 - Interactive repository browser, recent projects, and optional Git worktrees.
 - Editable task/spec imports from local files, text URLs, and GitHub issues/files.
 - CLI execution and previews using the same engine as the TUI.
+
+## Choose a theme
+
+Press `T` (Shift+T) from any main view. Type to filter, then use `↑`/`↓` or
+`Ctrl+N`/`Ctrl+P` to preview a theme across the app. `Enter` applies and saves it;
+`Esc` restores your current theme.
+
+Choose from **Model Router** (the original default), **Catppuccin Mocha / Latte**,
+**Dracula**, **Nord**, **Tokyo Night**, **Gruvbox Dark / Light**, **One Dark**,
+**Monokai**, and **Solarized Dark / Light**. Editors, file browsers, status colours,
+and the startup animation all follow the selected theme.
+
+The preference is saved automatically in your user config directory
+(`~/.config/model-router/appearance.json` on Linux, respecting `XDG_CONFIG_HOME`).
+It applies to every project without changing workflow files. Native harness
+terminals keep their own theme settings. See [theme details and palette sources](docs/themes.md).
 
 ## Select a repository
 
@@ -275,11 +297,44 @@ a structured handoff stop at the human checkpoint with a missing-handoff notice.
 You can supply a summary or reopen the stage.
 
 Unattended stages have no interactive input. The router inherits native
-permissions and accepts explicit per-stage argument overrides; it never adds
-blanket permission-bypass flags. Reported denials pause the run. Some harnesses
+permissions unless you explicitly override them in stage settings or extra
+arguments; it never enables permission bypass by default. Reported denials pause the run. Some harnesses
 surface approval needs only as an error or a stalled process; cancel or let
 the stage time out, then reopen it interactively. Copilot programmatic tool
 execution needs permissions configured explicitly in its native settings/flags.
+
+### Configure a stage's harness
+
+Select a stage in **Workflow** and press **c**. Edit its model, provider and effort
+(where supported), execution mode, timeout, native permissions, and extra
+arguments. **F2** browses models and returns to the settings draft.
+
+- **Tab**, **Shift+Tab**, or **Ctrl+N/P** move between fields.
+- **Left/Right**, **Space**, or **Enter** cycle choice fields. Type in text fields.
+- **Ctrl+S** applies the draft; **Esc** cancels it. **s** on Workflow saves the
+  project configuration; **q** also saves on exit.
+- **P** on Workflow previews the resulting commands without running a model.
+
+| Harness | Native permission controls |
+| --- | --- |
+| Codex | Sandbox (`read-only`, `workspace-write`, `danger-full-access`) and approval policy (`on-request`, `never`) |
+| Claude Code | Permission mode (`manual`, `acceptEdits`, `plan`, `dontAsk`, `auto`, `bypassPermissions`) |
+| Cursor | Sandbox (`enabled`, `disabled`) |
+| Gemini | Approval mode (`default`, `auto_edit`, `plan`, `yolo`) |
+| Other/custom harnesses | Native permission arguments through **Extra arguments** |
+
+Permission controls default to **Harness default**, which sends no override. Native
+mode availability depends on the installed CLI version and account. Codex
+`never` disables approval prompts; it does not bypass the chosen sandbox.
+Settings that also appear in extra arguments must be resolved before applying.
+Choosing **Harness default** leaves control with native configuration and your
+explicit extra arguments.
+
+These settings belong to the selected stage. They are saved in its
+`harness_settings` table and carried into new run snapshots. They do not edit
+the harness's global configuration or credentials. Changing harness clears
+its structured settings along with model/provider/effort; explicit extra
+arguments are kept for you to review.
 
 Failures, cancellation, malformed review verdicts, and timeouts stop progress.
 Retries preserve existing filesystem changes and get separate attempt logs.
@@ -393,6 +448,7 @@ uv run --with pyte python scripts/smoke_tui.py
 uv run --with pyte python scripts/smoke_repos.py
 uv run --with pyte python scripts/smoke_imports.py
 uv run --with pyte python scripts/smoke_stages.py
+uv run --with pyte python scripts/smoke_themes.py
 uv run --with pyte --with pillow python scripts/smoke_startup.py
 ```
 

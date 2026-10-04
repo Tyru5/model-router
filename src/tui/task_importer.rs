@@ -1,5 +1,6 @@
 use super::path_picker::{PathPicker, PickerAction};
-use super::{ACCENT, FG, MUTED, RED, content, panel, selected_style, textarea};
+use super::theme::Palette;
+use super::{content, textarea};
 use crate::{config, storage, task_import};
 use anyhow::{Result, ensure};
 use crossterm::event::{KeyCode as Key, KeyEvent, KeyModifiers as Mods};
@@ -7,6 +8,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::Style,
+    text::Line,
     widgets::{Paragraph, Tabs, Wrap},
 };
 use std::{
@@ -202,15 +204,15 @@ impl TaskImporter {
         Ok(ImportAction::Stay)
     }
 
-    pub fn draw(&mut self, frame: &mut Frame<'_>, rect: Rect) {
+    pub fn draw(&mut self, frame: &mut Frame<'_>, rect: Rect, palette: Palette) {
         if let Some(job) = &self.job {
             frame.render_widget(Paragraph::new(format!("Fetching task/spec…\n\n{}\n\nEsc cancels. The current task is unchanged until you apply a preview.", storage::clean_terminal(&job.source)))
-                .block(panel(" Import task/spec ").border_style(Style::default().fg(ACCENT)))
-                .style(Style::default().fg(FG)).wrap(Wrap { trim: false }), rect);
+                .block(palette.modal("Import task/spec", &[("Esc", "cancel")]))
+                .style(Style::default().fg(palette.fg)).wrap(Wrap { trim: false }), rect);
             return;
         }
         if let Some(draft) = &mut self.draft {
-            let block = panel(" Preview task/spec ").border_style(Style::default().fg(ACCENT));
+            let block = palette.modal("Preview task/spec", &[("Tab", "append/replace")]);
             let inner = block.inner(rect);
             frame.render_widget(block, rect);
             let chunks = Layout::vertical([
@@ -223,20 +225,21 @@ impl TaskImporter {
             .split(inner);
             frame.render_widget(
                 Paragraph::new(storage::clean_terminal(&draft.source))
-                    .style(Style::default().fg(MUTED))
+                    .style(Style::default().fg(palette.muted))
                     .wrap(Wrap { trim: false }),
                 chunks[0],
             );
             frame.render_widget(
                 Tabs::new(["Replace task", "Append to task"])
                     .select(draft.mode)
-                    .style(Style::default().fg(MUTED))
-                    .highlight_style(selected_style()),
+                    .style(Style::default().fg(palette.muted))
+                    .highlight_style(palette.selected_style()),
                 chunks[1],
             );
             let field = &mut draft.fields[draft.mode];
+            palette.style_textarea(field);
             let bytes = content(field).len();
-            field.set_block(panel(format!(
+            field.set_block(palette.panel(format!(
                 " Editable task · {bytes} / {} bytes ",
                 config::MAX_TASK_BYTES
             )));
@@ -252,13 +255,31 @@ impl TaskImporter {
             };
             frame.render_widget(
                 Paragraph::new(storage::clean_terminal(note))
-                    .style(Style::default().fg(if self.error.is_empty() { MUTED } else { RED }))
+                    .style(Style::default().fg(if self.error.is_empty() {
+                        palette.muted
+                    } else {
+                        palette.red
+                    }))
                     .wrap(Wrap { trim: false }),
                 chunks[3],
             );
-            frame.render_widget(Paragraph::new("Ctrl+S use task · Tab append/replace · Esc back\nApplying an import does not start a workflow.").style(Style::default().fg(MUTED)), chunks[4]);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    palette.hints(&[
+                        ("Ctrl+S", "use task"),
+                        ("Tab", "append/replace"),
+                        ("Esc", "back"),
+                    ]),
+                    Line::styled(
+                        "Applying an import does not start a workflow.",
+                        Style::default().fg(palette.muted),
+                    ),
+                ]),
+                chunks[4],
+            );
         } else if let Some(url) = &mut self.url {
-            let block = panel(" Import from URL ").border_style(Style::default().fg(ACCENT));
+            palette.style_textarea(url);
+            let block = palette.modal("Import from URL", &[]);
             let inner = block.inner(rect);
             frame.render_widget(block, rect);
             let chunks = Layout::vertical([
@@ -268,22 +289,23 @@ impl TaskImporter {
                 Constraint::Length(2),
             ])
             .split(inner);
-            url.set_block(panel(" Markdown/text URL or GitHub issue/file URL "));
+            url.set_block(palette.panel(" Markdown/text URL or GitHub issue/file URL "));
             frame.render_widget(&*url, chunks[0]);
-            frame.render_widget(Paragraph::new("https://example.com/spec.md\nhttps://github.com/owner/repo/issues/123\nhttps://github.com/owner/repo/blob/main/spec.md\n\nGitHub uses your gh login. Text limit: 32 KiB.").style(Style::default().fg(MUTED)).wrap(Wrap { trim: false }), chunks[1]);
+            frame.render_widget(Paragraph::new("https://example.com/spec.md\nhttps://github.com/owner/repo/issues/123\nhttps://github.com/owner/repo/blob/main/spec.md\n\nGitHub uses your gh login. Text limit: 32 KiB.").style(Style::default().fg(palette.muted)).wrap(Wrap { trim: false }), chunks[1]);
             frame.render_widget(
                 Paragraph::new(storage::clean_terminal(&self.error))
-                    .style(Style::default().fg(RED))
+                    .style(Style::default().fg(palette.red))
                     .wrap(Wrap { trim: false }),
                 chunks[2],
             );
             frame.render_widget(
-                Paragraph::new("Enter fetch and preview · Esc back to files")
-                    .style(Style::default().fg(MUTED)),
+                Paragraph::new(
+                    palette.hints(&[("Enter", "fetch and preview"), ("Esc", "back to files")]),
+                ),
                 chunks[3],
             );
         } else {
-            self.picker.draw(frame, rect);
+            self.picker.draw(frame, rect, palette);
         }
     }
 }

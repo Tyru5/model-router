@@ -1,13 +1,14 @@
-use super::{ACCENT, FG, MUTED, RED, content, panel, selected_style, textarea};
+use super::theme::Palette;
+use super::{content, menu_key, textarea};
 use crate::{catalog, storage};
 use anyhow::{Context, Result, ensure};
 use crossterm::event::{KeyCode as Key, KeyEvent, KeyModifiers as Mods};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{List, ListItem, ListState, Paragraph, Tabs, Wrap},
+    widgets::{HighlightSpacing, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use std::{
     fs,
@@ -230,7 +231,7 @@ impl PathPicker {
             self.path_input = Some(input);
             return Ok(PickerAction::Stay);
         }
-        match key.code {
+        match menu_key(key) {
             Key::Esc => return Ok(PickerAction::Close),
             Key::Tab | Key::BackTab => {
                 if !self.files {
@@ -271,13 +272,15 @@ impl PathPicker {
         Ok(PickerAction::Stay)
     }
 
-    pub fn draw(&mut self, frame: &mut Frame<'_>, rect: Rect) {
-        let block = panel(if self.files {
-            " Import task/spec · choose file "
-        } else {
-            " Choose repository "
-        })
-        .border_style(Style::default().fg(ACCENT));
+    pub fn draw(&mut self, frame: &mut Frame<'_>, rect: Rect, palette: Palette) {
+        let block = palette.modal(
+            if self.files {
+                "Import task/spec · choose file"
+            } else {
+                "Choose repository"
+            },
+            &[],
+        );
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         let chunks = Layout::vertical([
@@ -292,15 +295,15 @@ impl PathPicker {
         if self.files {
             frame.render_widget(
                 Paragraph::new("Markdown / text files · Ctrl+U import a URL")
-                    .style(Style::default().fg(MUTED)),
+                    .style(Style::default().fg(palette.muted)),
                 chunks[0],
             );
         } else {
             frame.render_widget(
                 Tabs::new(["Folders", "Recent"])
                     .select(usize::from(self.show_recent))
-                    .style(Style::default().fg(MUTED))
-                    .highlight_style(selected_style()),
+                    .style(Style::default().fg(palette.muted))
+                    .highlight_style(palette.selected_style()),
                 chunks[0],
             );
         }
@@ -308,20 +311,22 @@ impl PathPicker {
             Paragraph::new(storage::clean_terminal(
                 &self.directory.display().to_string(),
             ))
-            .style(Style::default().fg(FG))
+            .style(Style::default().fg(palette.fg))
             .wrap(Wrap { trim: false }),
             chunks[1],
         );
         if let Some(input) = &mut self.path_input {
-            input.set_block(panel(if self.files {
+            palette.style_textarea(input);
+            input.set_block(palette.panel(if self.files {
                 " File or directory path · Enter open · Esc back "
             } else {
                 " Directory path · Enter browse · Esc back "
             }));
             frame.render_widget(&*input, chunks[2]);
         } else {
+            palette.style_textarea(&mut self.filter);
             self.filter
-                .set_block(panel(" Type to filter · Ctrl+L enter path "));
+                .set_block(palette.panel(" Type to filter · Ctrl+L enter path "));
             frame.render_widget(&self.filter, chunks[2]);
         }
         let matches = self.matches();
@@ -336,13 +341,19 @@ impl PathPicker {
             };
             frame.render_widget(
                 Paragraph::new(message)
-                    .style(Style::default().fg(MUTED))
+                    .style(Style::default().fg(palette.muted))
                     .wrap(Wrap { trim: false }),
                 chunks[3],
             );
         } else {
             let rows = matches.iter().map(|index| match index {
-                None => ListItem::new("[use]     Use this folder"),
+                None => ListItem::new(Line::from(vec![
+                    Span::styled("[use]     ", Style::default().fg(palette.accent)),
+                    Span::styled(
+                        "Use this folder",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                ])),
                 Some(index) => {
                     let entry = &self.entries()[*index];
                     let label = if self.show_recent {
@@ -359,14 +370,23 @@ impl PathPicker {
                             } else {
                                 "[folder]  "
                             },
-                            Style::default().fg(if entry.repository { ACCENT } else { MUTED }),
+                            Style::default().fg(if !entry.directory {
+                                palette.blue
+                            } else if entry.repository {
+                                palette.accent
+                            } else {
+                                palette.muted
+                            }),
                         ),
                         Span::raw(storage::clean_terminal(&label)),
                     ]))
                 }
             });
             frame.render_stateful_widget(
-                List::new(rows).highlight_style(selected_style()),
+                List::new(rows)
+                    .highlight_style(palette.selected_style())
+                    .highlight_symbol("▌ ")
+                    .highlight_spacing(HighlightSpacing::Always),
                 chunks[3],
                 &mut ListState::default().with_selected(Some(self.selected)),
             );
@@ -380,17 +400,51 @@ impl PathPicker {
         };
         frame.render_widget(
             Paragraph::new(storage::clean_terminal(&detail))
-                .style(Style::default().fg(if self.error.is_empty() { MUTED } else { RED }))
+                .style(Style::default().fg(if self.error.is_empty() {
+                    palette.muted
+                } else {
+                    palette.red
+                }))
                 .wrap(Wrap { trim: false }),
             chunks[4],
         );
         frame.render_widget(
             Paragraph::new(if self.files {
-                "↑↓ select · Enter open folder / preview file · ← parent\nCtrl+L enter path · Ctrl+U URL · Esc cancel\nPreview, edit, then append to or replace your task."
+                vec![
+                    palette.hints(&[
+                        ("↑↓ / Ctrl+N/P", "select"),
+                        ("Enter", "open folder / preview file"),
+                        ("←", "parent"),
+                    ]),
+                    palette.hints(&[
+                        ("Ctrl+L", "enter path"),
+                        ("Ctrl+U", "URL"),
+                        ("Esc", "cancel"),
+                    ]),
+                    Line::styled(
+                        "Preview, edit, then append to or replace your task.",
+                        Style::default().fg(palette.muted),
+                    ),
+                ]
             } else {
-                "↑↓ select · Enter choose repo / open folder · → browse repo\n← parent · Tab recent/folders · Esc cancel\nSwitching projects saves workflow edits; task/run view resets."
+                vec![
+                    palette.hints(&[
+                        ("↑↓ / Ctrl+N/P", "select"),
+                        ("Enter", "choose repo / open folder"),
+                        ("→", "browse repo"),
+                    ]),
+                    palette.hints(&[
+                        ("←", "parent"),
+                        ("Tab", "recent/folders"),
+                        ("Esc", "cancel"),
+                    ]),
+                    Line::styled(
+                        "Switching projects saves workflow edits; task/run view resets.",
+                        Style::default().fg(palette.muted),
+                    ),
+                ]
             })
-                .style(Style::default().fg(MUTED)).wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false }),
             chunks[5],
         );
     }

@@ -5,7 +5,7 @@ Verified locally on Linux with Rust 1.93.0. Installed executable reports
 
 | Check | Result |
 | --- | --- |
-| `cargo test --locked` | 46 tests passed |
+| `cargo test --locked` | 58 tests passed |
 | `cargo clippy --all-targets --locked -- -D warnings` | Passed |
 | `cargo fmt --check` | Passed |
 | `cargo build --release --locked` | Passed; installation rebuilt the final changed code |
@@ -14,7 +14,9 @@ Verified locally on Linux with Rust 1.93.0. Installed executable reports
 | Installed import commands | `run --help` exposes `--task-file` and `--task-url`; installed executable matches the release build |
 | Installed preset commands | `presets` lists 12 stages and four workflows; `init --preset` accepts the workflow keys |
 | Installed `model-router preview --task 'Example task'` | Astra research, interactive Claude implementation, review disabled |
-| Real terminal smoke tests | Workflow, repository browser, task import, stage presets, and startup animation scripts passed using offline fixtures and actual PTYs |
+| Real terminal smoke tests | Workflow, repository browser, task import, stage presets, theme selection, and startup animation scripts passed using offline fixtures and actual PTYs |
+| Theme selection | All 12 palettes preview and save; Ctrl+N/P, cancellation, cross-project persistence, restart, themed startup, and invalid preferences verified |
+| Stage harness settings | Stage isolation, native permission arguments, conflict validation, model discovery returning to the draft, cancellation, and persistence passed; workflow, preset, and theme PTY regressions also passed |
 | Private GitHub task import | Imported `Tyru5/model-router/blob/main/docs/spec.md` into an editable TUI preview using the existing `gh` login; no workflow started |
 | Native model discovery | Codex cache, Pi catalog, Cursor account list, and OpenCode catalog returned selections |
 
@@ -72,6 +74,23 @@ paste, Ctrl+C/SIGTERM cleanup, and unaffected CLI output. It records the real
 terminal animation as `startup.gif`; rendering is also tested at 120×36, 80×24,
 40×10, and 1×1. Both color and `NO_COLOR` terminal runs passed.
 
+`scripts/smoke_themes.py` checks all 12 themes in a real terminal, including
+Ctrl+N/P previews, cancellation, saved preferences, repository switching,
+restart, startup colours, and recovery from invalid preferences. Rust tests
+cover failed saves, unchanged task/workflow contents, text contrast, and every
+theme in all main views and dialogs. Theme preferences live separately from
+workflow files. The stage smoke check waits for the resized layout before
+typing into its workflow picker.
+
+`scripts/smoke_harness_settings.py` opens stage settings from the main view,
+edits Codex sandbox/approvals and Claude permissions, browses an offline model
+catalog, validates timeout and conflicting argument errors, cancels drafts,
+and reloads saved settings. It checks Ctrl+N/P navigation and layouts at
+120×36, 80×24, and 65×20. Rust tests cover native arguments in both execution
+modes, old configuration compatibility, unsupported settings, stage isolation,
+and returning to the draft after model discovery failure. Permission controls
+inherit native settings until explicitly changed. No test starts a paid model.
+
 Local screen captures:
 
 - `../.model-router/qa/workflow-120x36.txt`
@@ -91,6 +110,9 @@ Local screen captures:
 - `../.model-router/qa/full-feature-120x36.txt`
 - `../.model-router/qa/startup.gif`
 - `../.model-router/qa/startup.png`
+- `../.model-router/qa/harness-settings-codex-120x36.png`
+- `../.model-router/qa/harness-settings-claude-80x24.png`
+- `../.model-router/qa/harness-settings-codex-65x20.png`
 
 All execution tests use the offline Python fixture; none send paid inference
 requests. Built-in adapter command construction is tested and checked against
