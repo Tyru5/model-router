@@ -72,8 +72,8 @@ fn query(
 
 pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Catalog> {
     let mut models = vec![entry("", "harness setting", "inherits configured default")];
-    let note: String;
-    match harness {
+
+    let note: String = match harness {
         "codex" => {
             let dir = std::env::var_os("CODEX_HOME")
                 .map(std::path::PathBuf::from)
@@ -107,7 +107,7 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
                     }
                 }
             }
-            note = "Reads Codex's local model cache. Open Codex to refresh its account catalog; custom IDs remain editable.".into();
+            "Reads Codex's local model cache. Open Codex to refresh its account catalog; custom IDs remain editable.".into()
         }
         "claude" => {
             for id in ["sonnet", "opus", "haiku"] {
@@ -117,13 +117,13 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
                     "unverified; depends on account/provider",
                 ));
             }
-            note = "Claude aliases follow your native account/provider settings. Enter a full model ID for an explicit selection.".into();
+            "Claude aliases follow your native account/provider settings. Enter a full model ID for an explicit selection.".into()
         }
         "amp" => {
             for id in ["low", "medium", "high", "ultra"] {
                 models.push(entry(id, "Amp mode", "mode; underlying model may change"));
             }
-            note = "Amp selects modes, not arbitrary model IDs. Plugin mode keys may be entered manually.".into();
+            "Amp selects modes, not arbitrary model IDs. Plugin mode keys may be entered manually.".into()
         }
         "pi" => {
             let output = query(
@@ -147,7 +147,7 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
                     models.push(m);
                 }
             }
-            note = "Pi lists models from configured providers and extensions. Exact provider/model selections avoid fuzzy routing.".into();
+            "Pi lists models from configured providers and extensions. Exact provider/model selections avoid fuzzy routing.".into()
         }
         "opencode" => {
             let output = query(harness, vec!["models".into()], &settings.adapters, project)?;
@@ -160,7 +160,7 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
                     ));
                 }
             }
-            note = "Provider catalog, not an account entitlement check. Model IDs include the provider prefix.".into();
+            "Provider catalog, not an account entitlement check. Model IDs include the provider prefix.".into()
         }
         "cursor" => {
             let output = query(
@@ -180,7 +180,7 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
                     }
                 }
             }
-            note = "Cursor-native account selections. If your CLI uses a different list format, enter its exact slug manually.".into();
+            "Cursor-native account selections. If your CLI uses a different list format, enter its exact slug manually.".into()
         }
         name if settings.adapters.contains_key(name) => {
             let custom = &settings.adapters[name];
@@ -193,15 +193,14 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
                     models.push(entry(line, "custom catalog command", "adapter-reported"));
                 }
             }
-            note =
-                "Custom adapters can provide models_args returning one native model ID per line."
-                    .into();
+            "Custom adapters can provide models_args returning one native model ID per line."
+                    .into()
         }
         "gemini" | "aider" | "goose" | "copilot" => {
-            note = "Use your harness's configured default, a saved selection, or enter a native model ID. This adapter does not probe account entitlements.".into();
+            "Use your harness's configured default, a saved selection, or enter a native model ID. This adapter does not probe account entitlements.".into()
         }
         _ => anyhow::bail!("Unknown harness {harness}"),
-    }
+    };
     for stage in settings
         .workflows
         .iter()
