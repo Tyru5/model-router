@@ -1,4 +1,61 @@
+# Rust build outputs and compiler backups.
+# Cargo.lock stays tracked for reproducible application builds.
 /target/
-/.model-router/
-*.swp
+**/*.rs.bk
+
+# Router run state, logs, captures, and generated worktrees.
+# Project workflow templates (.model-router.toml) stay trackable.
+.model-router/
+.model-router-config/
+
+# Local environment variables and secrets; keep sanitized templates shareable.
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+.envrc.local
+.secrets/
+.direnv/
+
+# Python test helpers and local virtual environments.
 __pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage, profiling, and transient output.
+/coverage/
+/htmlcov/
+.coverage
+.coverage.*
+/coverage.xml
+/lcov.info
+*.profraw
+*.profdata
+.cache/
+*.log
+*.tmp
+
+# Editor state; allow shared VS Code project configuration.
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/tasks.json
+!.vscode/launch.json
+*.swp
+*.swo
+*~
+\#*\#
+.\#*
+
+# macOS and Windows filesystem metadata.
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
