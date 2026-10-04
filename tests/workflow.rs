@@ -281,6 +281,19 @@ fn timeout_and_cancellation_preserve_attempts_and_stop_children() {
             "descendant still running: {stat}"
         );
     }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&output.stdout);
+        let stat = stat.trim();
+        assert!(
+            stat.is_empty() || stat.starts_with('Z'),
+            "descendant still running: {stat}"
+        );
+    }
 }
 
 #[test]
