@@ -96,7 +96,8 @@ enum Commands {
 
 fn main() {
     if let Err(error) = main_result() {
-        eprintln!("Error: {error:#}");
+        // Terminal loss can close stderr too; reporting it must not panic.
+        let _ = writeln!(io::stderr(), "Error: {error:#}");
         std::process::exit(1);
     }
 }

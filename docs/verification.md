@@ -15,6 +15,7 @@ Verified locally on Linux with Rust 1.93.0. Installed executable reports
 | Installed preset commands | `presets` lists 12 stages and four workflows; `init --preset` accepts the workflow keys |
 | Installed `model-router preview --task 'Example task'` | Astra research, interactive Claude implementation, review disabled |
 | Real terminal smoke tests | Workflow, repository browser, task import, stage presets, theme selection, and startup animation scripts passed using offline fixtures and actual PTYs |
+| Terminal loss and shutdown | Eight real-PTY scenarios passed: idle/startup disconnect, unattended/interactive cancellation, terminals without SIGHUP, and normal SIGTERM/SIGHUP cleanup |
 | Theme selection | All 12 palettes preview and save; Ctrl+N/P, cancellation, cross-project persistence, restart, themed startup, and invalid preferences verified |
 | Stage harness settings | Stage isolation, native permission arguments, conflict validation, model discovery returning to the draft, cancellation, and persistence passed; workflow, preset, and theme PTY regressions also passed |
 | Private GitHub task import | Imported `Tyru5/model-router/blob/main/docs/spec.md` into an editable TUI preview using the existing `gh` login; no workflow started |
@@ -73,6 +74,18 @@ consuming the skip key, flag/environment bypass, resizing to a small terminal,
 paste, Ctrl+C/SIGTERM cleanup, and unaffected CLI output. It records the real
 terminal animation as `startup.gif`; rendering is also tested at 120×36, 80×24,
 40×10, and 1×1. Both color and `NO_COLOR` terminal runs passed.
+
+`python3 scripts/smoke_shutdown.py` closes real PTYs while the router is idle,
+animating, or running offline unattended/interactive harnesses. It requires
+prompt exit without a panic, checks that harness children stop and cancellation
+is saved, and verifies SIGTERM/SIGHUP still restore an open terminal. Cases
+without a controlling terminal ensure shutdown does not depend on SIGHUP.
+An optional binary path runs the same checks against a release or installed build.
+
+This reproduces the former full-core CPU loop on terminal EOF. Crossterm's
+`use-dev-tty` backend bounds its reads and polling after EOF; the interactive
+forwarder also cancels on hangup, invalid input descriptors, or EOF. Terminal cleanup and
+error reporting tolerate disconnected stdout/stderr.
 
 `scripts/smoke_themes.py` checks all 12 themes in a real terminal, including
 Ctrl+N/P previews, cancellation, saved preferences, repository switching,

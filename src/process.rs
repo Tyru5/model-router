@@ -248,7 +248,10 @@ pub fn interactive(
         if poll_result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
             return Err(io::Error::last_os_error().into());
         }
-        if polls[0].revents & libc::POLLIN != 0 {
+        // A disconnected PTY may not send SIGHUP (for example, when it is not
+        // our controlling terminal). Stop on hangup/EOF instead of busy-polling.
+        cancelled |= polls[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
+        if !cancelled && polls[0].revents & libc::POLLIN != 0 {
             let n = unsafe { libc::read(0, bytes.as_mut_ptr().cast(), bytes.len()) };
             if n > 0 {
                 if bytes[..n as usize].contains(&0x1d) {
@@ -256,7 +259,29 @@ pub fn interactive(
                 } else {
                     input.extend_from_slice(&bytes[..n as usize]);
                 }
+            } else if n == 0 {
+                cancelled = true;
+            } else {
+                let error = io::Error::last_os_error();
+                if !matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) {
+                    return Err(error.into());
+                }
             }
+        }
+        // Cancel before forwarding output to a terminal that has disappeared.
+        if cancelled || cancel.load(Ordering::Relaxed) {
+            cancelled = true;
+            if let Some(status) = child.child.try_wait()? {
+                break status;
+            }
+            if let Some(pid) = child.child.process_id() {
+                kill_group(pid);
+            }
+            child.child.kill()?;
+            break child.child.wait()?;
         }
         if !input.is_empty() {
             match writer.write(&input) {
@@ -290,14 +315,6 @@ pub fn interactive(
         }
         if let Some(status) = child.child.try_wait()? {
             break status;
-        }
-        if cancelled || cancel.load(Ordering::Relaxed) {
-            cancelled = true;
-            if let Some(pid) = child.child.process_id() {
-                kill_group(pid);
-            }
-            child.child.kill()?;
-            break child.child.wait()?;
         }
         if let Ok(next_size) = crossterm::terminal::size() {
             if next_size != size {

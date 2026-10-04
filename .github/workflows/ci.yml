@@ -78,6 +78,8 @@ jobs:
         run: uv run --with pyte python scripts/smoke_harness_settings.py
       - name: Startup animation
         run: uv run --with pyte --with pillow python scripts/smoke_startup.py
+      - name: Terminal disconnect and shutdown
+        run: python3 scripts/smoke_shutdown.py
       - name: Upload screen captures
         if: failure()
         uses: actions/upload-artifact@v7

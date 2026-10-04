@@ -10,7 +10,9 @@ license = "MIT"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-crossterm = "0.28"
+# The default Unix reader spins on EOF after a PTY closes, starving shutdown.
+# This backend breaks its read loop on EOF and preserves the poll timeout.
+crossterm = { version = "0.28", features = ["use-dev-tty"] }
 directories = "6"
 fs2 = "0.4"
 libc = "0.2"

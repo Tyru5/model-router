@@ -27,7 +27,7 @@ use ratatui::{
 };
 use std::{
     collections::VecDeque,
-    io::{self, Stdout},
+    io::{self, Stdout, Write},
     path::PathBuf,
     sync::{
         Arc,
@@ -49,8 +49,32 @@ use path_picker::{PathPicker, PickerAction};
 use task_importer::{ImportAction, TaskImporter};
 use theme::{Palette, Theme};
 
+struct ScreenOutput {
+    stdout: Stdout,
+    closed: Arc<AtomicBool>,
+}
+
+impl Write for ScreenOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.closed.load(Ordering::Relaxed) {
+            Ok(bytes.len())
+        } else {
+            self.stdout.write(bytes)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.closed.load(Ordering::Relaxed) {
+            Ok(())
+        } else {
+            self.stdout.flush()
+        }
+    }
+}
+
 struct Screen {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: Terminal<CrosstermBackend<ScreenOutput>>,
+    output_closed: Arc<AtomicBool>,
     active: bool,
 }
 impl Screen {
@@ -60,8 +84,13 @@ impl Screen {
             let _ = terminal::disable_raw_mode();
             return Err(e.into());
         }
+        let output_closed = Arc::new(AtomicBool::new(false));
         let mut screen = Self {
-            terminal: Terminal::new(CrosstermBackend::new(io::stdout()))?,
+            terminal: Terminal::new(CrosstermBackend::new(ScreenOutput {
+                stdout: io::stdout(),
+                closed: output_closed.clone(),
+            }))?,
+            output_closed,
             active: true,
         };
         screen.terminal.clear()?;
@@ -92,6 +121,10 @@ impl Screen {
 impl Drop for Screen {
     fn drop(&mut self) {
         self.restore();
+        // Ratatui 0.29 retries cursor restoration in Drop and eprintln!s on failure.
+        // After our best-effort restore, discard those duplicate writes so a lost
+        // terminal (including stderr) cannot turn normal shutdown into a panic.
+        self.output_closed.store(true, Ordering::Relaxed);
     }
 }
 
