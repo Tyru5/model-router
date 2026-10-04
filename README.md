@@ -474,8 +474,8 @@ uv run --with pyte --with pillow python scripts/smoke_startup.py
 
 GitHub Actions (`.github/workflows/ci.yml`) runs these checks on every pull
 request and push to `main`: formatting, clippy, `cargo test` on Linux and
-macOS (macOS non-blocking until verified), a Rust 1.85 MSRV check, and every
-smoke script against the debug build. Failed smoke runs upload their screen
+macOS, a Rust 1.85 MSRV check, and every smoke script against the Linux debug
+build. Failed smoke runs upload their screen
 captures as artifacts.
 
 The terminal smoke test exercises actual PTYs, text editing, Unicode paste,
@@ -501,8 +501,8 @@ Built-in adapter flags were checked against locally installed CLI help or
 official documentation. Automated execution tests use mocks. Live authenticated
 end-to-end runs against all ten services have **not** been performed. CLI
 versions, native permissions, and account access can affect compatibility.
-Linux is tested locally; the implementation targets Linux and macOS, but macOS
-has not been exercised in this environment.
+Linux is tested locally and in CI. On macOS, CI runs the Rust test suite; the
+terminal smoke tests and live harness runs are Linux-only so far.
 
 See [design decisions](docs/design-interview.md), [build specification](docs/spec.md),
 and [adapter references](docs/adapters.md).
