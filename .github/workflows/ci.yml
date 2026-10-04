@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    name: Format and clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # macOS is a supported target but not yet exercised; report without blocking.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --locked
+
+  smoke:
+    name: Terminal smoke tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.12"
+      - run: cargo build --locked
+      - name: Workflow
+        run: uv run --with pyte python scripts/smoke_tui.py
+      - name: Repository browser
+        run: uv run --with pyte python scripts/smoke_repos.py
+      - name: Task imports
+        run: uv run --with pyte python scripts/smoke_imports.py
+      - name: Stage presets
+        run: uv run --with pyte python scripts/smoke_stages.py
+      - name: Themes
+        run: uv run --with pyte python scripts/smoke_themes.py
+      - name: Harness settings
+        run: uv run --with pyte python scripts/smoke_harness_settings.py
+      - name: Startup animation
+        run: uv run --with pyte --with pillow python scripts/smoke_startup.py
+      - name: Upload screen captures
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-captures
+          path: .model-router/qa/
+          if-no-files-found: ignore

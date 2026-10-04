@@ -1,5 +1,9 @@
 # Model Router
 
+<p align="center">
+  <img src="docs/assets/model-router-icon.png" alt="Model Router icon" width="160">
+</p>
+
 A native Rust TUI for running a task through your preferred agentic harnesses
 and models. Choose the sequence, the model for each stage, and whether each
 stage runs unattended or opens its native interactive terminal.
@@ -44,7 +48,8 @@ Opening the router does not start a model. Press `p` to choose a repository,
 `t` to describe the task or `f` to import a task/spec,
 `c` to configure the selected stage's harness, `e` to edit the stage,
 `m` to choose a model, and `r` to start. `Space` enables
-or disables a stage. `?` opens the full keyboard guide. Use `Ctrl+S` to apply
+or disables a stage. `T` chooses a theme. `1`–`4` or `Tab` switch views.
+`?` opens the full keyboard guide. Use `Ctrl+S` to apply
 text/form edits; `Esc` cancels them. `q` saves workflow edits and exits.
 
 In selection menus, including repository and file browsers, `Ctrl+N` moves to
@@ -258,13 +263,15 @@ template set. Global configuration uses your platform's config directory
 (`~/.config/model-router/config.toml` on Linux).
 
 `s` saves project templates; `S` saves global templates. `w` chooses, clones,
-or adds a workflow preset. `a` adds a stage preset, `d` duplicates it, `J`/`K`
-move it, and `x` removes it. `v` toggles execution mode. `l` sets the repair limit.
+or adds a workflow preset; `R` renames and `X` deletes the current workflow.
+`a` adds a stage preset, `d` duplicates it, `J`/`K` move it, and `x` removes it.
+`h` picks the stage's harness and `v` toggles execution mode. `g` toggles an
+isolated Git worktree for the next run. `l` sets the repair limit.
 All fields, including instructions and permission arguments, are editable with `e`.
 
 Each stage has a stable `id`, human-readable `name`, semantic `role`, `enabled`
 flag, `harness`, `model`, `provider`, `effort`, `mode`, `instructions`,
-`extra_args`, and `timeout_seconds`. A review may also set `repair_target` to
+`extra_args`, `harness_settings`, and `timeout_seconds`. A review may also set `repair_target` to
 an upstream implementation stage ID. Blank chooses the nearest enabled one.
 
 ## Running and recovering
@@ -331,7 +338,19 @@ Choosing **Harness default** leaves control with native configuration and your
 explicit extra arguments.
 
 These settings belong to the selected stage. They are saved in its
-`harness_settings` table and carried into new run snapshots. They do not edit
+`harness_settings` table and carried into new run snapshots:
+
+```toml
+[[workflows.stages]]
+id = "implement"
+harness = "codex"
+# ...
+harness_settings = { sandbox = "workspace-write", approval_policy = "on-request" }
+```
+
+Keys are `sandbox` and `approval_policy` (Codex), `permission_mode` (Claude),
+`sandbox` (Cursor), and `approval_mode` (Gemini). Omitted keys inherit native
+configuration. They do not edit
 the harness's global configuration or credentials. Changing harness clears
 its structured settings along with model/provider/effort; explicit extra
 arguments are kept for you to review.
@@ -449,8 +468,15 @@ uv run --with pyte python scripts/smoke_repos.py
 uv run --with pyte python scripts/smoke_imports.py
 uv run --with pyte python scripts/smoke_stages.py
 uv run --with pyte python scripts/smoke_themes.py
+uv run --with pyte python scripts/smoke_harness_settings.py
 uv run --with pyte --with pillow python scripts/smoke_startup.py
 ```
+
+GitHub Actions (`.github/workflows/ci.yml`) runs these checks on every pull
+request and push to `main`: formatting, clippy, `cargo test` on Linux and
+macOS (macOS non-blocking until verified), a Rust 1.85 MSRV check, and every
+smoke script against the debug build. Failed smoke runs upload their screen
+captures as artifacts.
 
 The terminal smoke test exercises actual PTYs, text editing, Unicode paste,
 resizing, disabled review, interactive completion, history, and terminal cleanup.
@@ -462,6 +488,11 @@ append/replace, cancellation, errors, and saved task contents using a local HTTP
 server and an offline GitHub CLI fixture.
 The stage test covers preset selection, editing, cancellation, ordering,
 optional reviews, workflow persistence, and interactive verification handoffs.
+The theme test previews and saves all 12 themes, including cancellation,
+restart, repository switching, and invalid preferences.
+The harness settings test covers per-stage isolation, native permission
+arguments, conflict validation, model browsing from the draft, cancellation,
+and persistence.
 The startup test verifies animation, automatic completion, skip/bypass controls,
 resize, and interrupt cleanup. It also records a GIF preview from the real
 terminal at `.model-router/qa/startup.gif`.
