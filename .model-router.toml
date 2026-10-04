@@ -1,0 +1,52 @@
+version = 1
+
+[[workflows]]
+name = "Feature development"
+max_repair_passes = 2
+
+[[workflows.stages]]
+id = "research"
+name = "Investigate"
+role = "research"
+enabled = true
+harness = "codex"
+model = "gpt-6-astra"
+provider = ""
+effort = ""
+mode = "unattended"
+instructions = "Investigate the task and relevant project files. Explain the root cause or requirements, cite evidence, and propose a concrete implementation plan. Do not change project code."
+extra_args = []
+timeout_seconds = 3600
+repair_target = ""
+
+[[workflows.stages]]
+id = "implement"
+name = "Implement"
+role = "implementation"
+enabled = true
+harness = "claude"
+model = "sonnet"
+provider = ""
+effort = ""
+mode = "interactive"
+instructions = "Implement the task using the prior findings. Follow project conventions, run appropriate checks, and report what changed and any remaining issues."
+extra_args = []
+timeout_seconds = 3600
+repair_target = ""
+
+[[workflows.stages]]
+id = "review"
+name = "Review (optional)"
+role = "review"
+enabled = false
+harness = "codex"
+model = "gpt-6-astra"
+provider = ""
+effort = ""
+mode = "unattended"
+instructions = "Review the implementation and test evidence. Do not modify code. Distinguish blocking correctness issues and failed required checks from advisory suggestions. Give an explicit pass or needs_changes verdict."
+extra_args = []
+timeout_seconds = 3600
+repair_target = ""
+
+[adapters]
