@@ -3,7 +3,7 @@ use crate::{
     catalog::{self, Catalog, Model},
     config::{self, Mode, Role, Settings, Stage},
     engine::{self, Action, Event as RunEvent, Run, Status},
-    presets, storage,
+    harness_settings, presets, storage,
 };
 use anyhow::{Context, Result, ensure};
 use crossterm::{
@@ -17,12 +17,12 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
+    layout::{Constraint, Layout, Margin, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span, Text},
     widgets::{
-        Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table,
-        TableState, Tabs, Wrap,
+        Block, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Padding,
+        Paragraph, Row, Table, TableState, Wrap,
     },
 };
 use std::{
@@ -39,20 +39,15 @@ use std::{
 };
 use tui_textarea::TextArea;
 
+mod harness_editor;
 mod path_picker;
 mod startup;
 mod task_importer;
+mod theme;
+use harness_editor::HarnessEditor;
 use path_picker::{PathPicker, PickerAction};
 use task_importer::{ImportAction, TaskImporter};
-
-const BG: Color = Color::Rgb(13, 20, 33);
-const PANEL: Color = Color::Rgb(19, 29, 45);
-const FG: Color = Color::Rgb(222, 231, 242);
-const MUTED: Color = Color::Rgb(141, 160, 180);
-const ACCENT: Color = Color::Rgb(79, 209, 197);
-const LINE: Color = Color::Rgb(46, 65, 86);
-const WARN: Color = Color::Rgb(246, 193, 91);
-const RED: Color = Color::Rgb(250, 126, 126);
+use theme::{Palette, Theme};
 
 struct Screen {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -117,6 +112,7 @@ enum PickValue {
     StagePreset(usize),
     Harness(String),
     Model(Model),
+    Theme(Theme),
 }
 impl PickValue {
     fn detail(&self) -> Option<String> {
@@ -148,6 +144,13 @@ struct Choice {
     label: String,
     value: PickValue,
 }
+fn matching_choices<'a>(items: &'a [Choice], filter: &TextArea<'_>) -> Vec<&'a Choice> {
+    let query = content(filter).to_lowercase();
+    items
+        .iter()
+        .filter(|choice| choice.label.to_lowercase().contains(&query))
+        .collect()
+}
 enum Modal {
     Input {
         title: String,
@@ -158,6 +161,7 @@ enum Modal {
         editor: Box<StageEditor>,
         insert_at: Option<usize>,
     },
+    Harness(Box<HarnessEditor>),
     Repositories(Box<PathPicker>),
     Import(Box<TaskImporter>),
     Picker {
@@ -171,6 +175,7 @@ enum Modal {
         title: String,
         body: String,
         scroll: u16,
+        guide: bool,
     },
     Loading(String),
 }
@@ -195,15 +200,17 @@ struct StageEditor {
     harnesses: Vec<String>,
 }
 fn textarea(value: &str) -> TextArea<'static> {
-    let mut text = TextArea::from(value.split('\n').map(str::to_owned).collect::<Vec<_>>());
-    text.set_style(Style::default().fg(FG).bg(PANEL));
-    text.set_cursor_line_style(Style::default());
-    text.set_cursor_style(Style::default().fg(BG).bg(ACCENT));
-    text.set_selection_style(Style::default().fg(BG).bg(ACCENT));
-    text
+    TextArea::from(value.split('\n').map(str::to_owned).collect::<Vec<_>>())
 }
 fn content(text: &TextArea<'_>) -> String {
     text.lines().join("\n")
+}
+fn menu_key(key: KeyEvent) -> Key {
+    match key.code {
+        Key::Char('n') if key.modifiers.contains(Mods::CONTROL) => Key::Down,
+        Key::Char('p') if key.modifiers.contains(Mods::CONTROL) => Key::Up,
+        code => code,
+    }
 }
 impl StageEditor {
     fn new(stage: Stage, harnesses: Vec<String>) -> Self {
@@ -244,6 +251,9 @@ impl StageEditor {
             .find(|r| r.label() == content(&self.fields[1]))
             .context("Unknown role")?;
         stage.harness = content(&self.fields[2]);
+        if stage.harness != self.stage.harness {
+            stage.harness_settings.clear();
+        }
         stage.model = content(&self.fields[3]).trim().into();
         stage.provider = content(&self.fields[4]).trim().into();
         stage.effort = content(&self.fields[5]).trim().into();
@@ -263,9 +273,13 @@ impl StageEditor {
         Ok(stage)
     }
     fn key(&mut self, key: KeyEvent) {
-        if key.code == Key::Tab {
+        if key.code == Key::Tab
+            || (key.code == Key::Char('n') && key.modifiers.contains(Mods::CONTROL))
+        {
             self.selected = (self.selected + 1) % self.fields.len();
-        } else if key.code == Key::BackTab {
+        } else if key.code == Key::BackTab
+            || (key.code == Key::Char('p') && key.modifiers.contains(Mods::CONTROL))
+        {
             self.selected = (self.selected + self.fields.len() - 1) % self.fields.len();
         } else if [1, 2, 6].contains(&self.selected) {
             if matches!(
@@ -312,6 +326,8 @@ struct Worker {
 struct App {
     project: PathBuf,
     config_path: PathBuf,
+    theme: Theme,
+    theme_path: PathBuf,
     settings: Settings,
     workflow: usize,
     selected: usize,
@@ -321,6 +337,8 @@ struct App {
     page: usize,
     modal: Option<Modal>,
     message: String,
+    /// Last error shown; the status line turns red while it is current.
+    alert: String,
     run: Option<Run>,
     worker: Option<Worker>,
     cancel: Arc<AtomicBool>,
@@ -332,6 +350,7 @@ struct App {
     history_selected: usize,
     harness_selected: usize,
     catalog: Option<Receiver<std::result::Result<Catalog, String>>>,
+    model_editor: Option<Box<HarnessEditor>>,
     quit_after_stop: bool,
 }
 impl App {
@@ -345,6 +364,8 @@ impl App {
             project,
             settings,
             config_path,
+            theme: Theme::default(),
+            theme_path: config::config_dir().join("appearance.json"),
             workflow: 0,
             selected: 0,
             task: String::new(),
@@ -353,6 +374,7 @@ impl App {
             page: 0,
             modal: None,
             message: "Define a task, choose your stages, then run. Review is optional.".into(),
+            alert: String::new(),
             run: None,
             worker: None,
             signal: cancel,
@@ -364,8 +386,59 @@ impl App {
             history_selected: 0,
             harness_selected: 0,
             catalog: None,
+            model_editor: None,
             quit_after_stop: false,
         }
+    }
+    fn displayed_theme(&self) -> Theme {
+        if let Some(Modal::Picker {
+            items,
+            selected,
+            filter,
+            ..
+        }) = &self.modal
+        {
+            let choices = matching_choices(items, filter);
+            if let Some(choice) = choices.get((*selected).min(choices.len().saturating_sub(1))) {
+                if let PickValue::Theme(theme) = choice.value {
+                    return theme;
+                }
+            }
+        }
+        self.theme
+    }
+    fn palette(&self) -> Palette {
+        self.displayed_theme().palette()
+    }
+    fn choose_theme(&mut self) {
+        self.modal = Some(Modal::Picker {
+            title: "Choose theme · live preview".into(),
+            items: Theme::ALL
+                .into_iter()
+                .map(|theme| Choice {
+                    label: format!(
+                        "{} · {}{}",
+                        theme.name(),
+                        theme.appearance(),
+                        if theme == self.theme {
+                            " (current)"
+                        } else {
+                            ""
+                        }
+                    ),
+                    value: PickValue::Theme(theme),
+                })
+                .collect(),
+            selected: Theme::ALL
+                .iter()
+                .position(|theme| *theme == self.theme)
+                .unwrap_or(0),
+            filter: textarea(""),
+            note: format!(
+                "Preview as you move. Enter saves for every project. Esc restores {}.",
+                self.theme.name()
+            ),
+        });
     }
     fn stage(&self) -> &Stage {
         &self.settings.workflows[self.workflow].stages[self.selected]
@@ -385,6 +458,7 @@ impl App {
             title: title.into(),
             body,
             scroll: 0,
+            guide: false,
         });
     }
     fn save(&mut self, global: bool) -> Result<()> {
@@ -463,7 +537,10 @@ impl App {
                                 .and_then(|r| r.error.clone())
                                 .unwrap_or_else(|| "Run stopped".into())
                         }
-                        Err(error) => self.message = error,
+                        Err(error) => {
+                            self.alert = error.clone();
+                            self.message = error;
+                        }
                     }
                 }
             }
@@ -500,8 +577,13 @@ impl App {
                         });
                     }
                     Err(error) => {
-                        self.modal = None;
-                        self.message = format!("{error}. Use e to enter a model ID manually.");
+                        self.message =
+                            format!("{error}. Enter a model ID manually in harness settings (c).");
+                        self.alert = self.message.clone();
+                        self.modal = self.model_editor.take().map(|mut editor| {
+                            editor.error = self.message.clone();
+                            Modal::Harness(editor)
+                        });
                     }
                 }
             }
@@ -515,7 +597,7 @@ impl App {
         let (sender, receiver) = mpsc::channel();
         self.catalog = Some(receiver);
         self.modal = Some(Modal::Loading(format!(
-            "Reading {harness} model selections…  Esc cancels"
+            "Reading {harness} model selections…"
         )));
         thread::spawn(move || {
             let _ = sender.send(
@@ -574,6 +656,9 @@ impl App {
             }
             PickValue::Harness(harness) => {
                 let stage = self.stage_mut();
+                if stage.harness != harness {
+                    stage.harness_settings.clear();
+                }
                 stage.harness = harness;
                 stage.model.clear();
                 stage.provider.clear();
@@ -581,10 +666,20 @@ impl App {
                 self.dirty = true;
             }
             PickValue::Model(model) => {
-                let stage = self.stage_mut();
-                stage.model = model.id;
-                stage.provider = model.provider;
-                self.dirty = true;
+                if let Some(mut editor) = self.model_editor.take() {
+                    editor.set_model(model);
+                    self.modal = Some(Modal::Harness(editor));
+                } else {
+                    let stage = self.stage_mut();
+                    stage.model = model.id;
+                    stage.provider = model.provider;
+                    self.dirty = true;
+                }
+            }
+            PickValue::Theme(theme) => {
+                theme::save(&self.theme_path, theme)?;
+                self.theme = theme;
+                self.message = format!("Theme saved: {}. T changes it anytime.", theme.name());
             }
         }
         Ok(())
@@ -669,6 +764,14 @@ impl App {
         };
         if key.code == Key::Esc && !matches!(modal, Modal::Repositories(_) | Modal::Import(_)) {
             self.catalog = None;
+            self.modal = self.model_editor.take().map(Modal::Harness);
+            return Ok(());
+        }
+        if key.code == Key::F(2) && matches!(modal, Modal::Harness(_)) {
+            if let Modal::Harness(editor) = modal {
+                self.model_editor = Some(editor);
+            }
+            self.model_picker();
             return Ok(());
         }
         let mut keep = true;
@@ -701,6 +804,20 @@ impl App {
                                 "Stage added. J/K reorders; Space enables or disables it.".into();
                         }
                         self.dirty = true;
+                        keep = false;
+                    } else {
+                        editor.key(key);
+                    }
+                }
+                Modal::Harness(editor) => {
+                    if key.modifiers.contains(Mods::CONTROL) && key.code == Key::Char('s') {
+                        let stage = editor.finish()?;
+                        let mut candidate = self.settings.clone();
+                        candidate.workflows[self.workflow].stages[self.selected] = stage;
+                        candidate.validate()?;
+                        self.settings = candidate;
+                        self.dirty = true;
+                        self.message = "Harness settings applied to this stage. s saves; P previews the command.".into();
                         keep = false;
                     } else {
                         editor.key(key);
@@ -744,21 +861,15 @@ impl App {
                     filter,
                     ..
                 } => {
-                    let query = content(filter).to_lowercase();
-                    let matches: Vec<usize> = items
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, c)| c.label.to_lowercase().contains(&query))
-                        .map(|(i, _)| i)
-                        .collect();
-                    match key.code {
+                    let matches = matching_choices(items, filter);
+                    match menu_key(key) {
                         Key::Up => *selected = selected.saturating_sub(1),
                         Key::Down => {
                             *selected = (*selected + 1).min(matches.len().saturating_sub(1))
                         }
                         Key::Enter if !matches.is_empty() => {
-                            let index = matches[(*selected).min(matches.len() - 1)];
-                            self.pick(items[index].value.clone())?;
+                            let choice = matches[(*selected).min(matches.len() - 1)];
+                            self.pick(choice.value.clone())?;
                             keep = false;
                         }
                         _ => {
@@ -771,10 +882,26 @@ impl App {
             }
             Ok(())
         })();
+        if let Err(error) = &result {
+            if let Modal::Harness(editor) = &mut modal {
+                editor.error = format!("{error:#}");
+            }
+            if let Modal::Picker { note, .. } = &mut modal {
+                *note = storage::clean_terminal(&format!(
+                    "Could not apply selection: {error:#}\nEsc cancels."
+                ));
+            }
+        }
         if keep {
             self.modal = Some(modal);
         }
-        result
+        if matches!(self.modal, Some(Modal::Harness(_))) {
+            // Validation is shown in the draft, so it cannot leave a stale
+            // error behind the dialog after the user corrects the field.
+            Ok(())
+        } else {
+            result
+        }
     }
     fn key(&mut self, key: KeyEvent) -> Result<bool> {
         if key.kind == KeyEventKind::Release {
@@ -805,8 +932,17 @@ impl App {
             return Ok(true);
         }
         match key.code {
+            Key::Char('T') => {
+                self.choose_theme();
+                return Ok(false);
+            }
             Key::Char('?') => {
-                self.text("Keyboard guide", HELP.into());
+                self.modal = Some(Modal::Text {
+                    title: "Keyboard guide".into(),
+                    body: HELP.into(),
+                    scroll: 0,
+                    guide: true,
+                });
                 return Ok(false);
             }
             Key::Tab => {
@@ -869,7 +1005,7 @@ impl App {
                     }
                     Key::Enter => {
                         let harness = &harnesses[self.harness_selected];
-                        self.text(harness, format!("Executable: {}\n\n{}\n\nSelect this harness with h on the workflow page, then press m to load model selections. Use e to enter any native model ID, alias, or mode.\n\nPermissions and authentication come from the harness's configuration.\n\nCustom adapters are defined in TOML. See README.md for the template contract.", adapters::program(harness, &self.settings.adapters), if harness == "amp" { "Amp uses mode keys. A mode determines its model and tools." } else { "A model must be supported by the selected harness/provider." }));
+                        self.text(harness, format!("Executable: {}\n\n{}\n\nSelect this harness with h on the workflow page, then press m to load model selections. Use c on Workflow to configure the selected stage, including permissions and extra arguments.\n\nPermissions inherit the harness configuration unless overridden for a stage. Authentication stays with the harness.\n\nCustom adapters are defined in TOML. See README.md for the template contract.", adapters::program(harness, &self.settings.adapters), if harness == "amp" { "Amp uses mode keys. A mode determines its model and tools." } else { "A model must be supported by the selected harness/provider." }));
                     }
                     _ => {}
                 }
@@ -985,7 +1121,7 @@ impl App {
                     items,
                     selected: 0,
                     filter: textarea(""),
-                    note: "Changing harness clears the previous model/provider/effort selection."
+                    note: "Changing harness clears model/provider/effort and native settings; extra arguments are kept."
                         .into(),
                 });
             }
@@ -997,6 +1133,11 @@ impl App {
                     )),
                     insert_at: None,
                 })
+            }
+            Key::Char('c') => {
+                self.modal = Some(Modal::Harness(Box::new(HarnessEditor::new(
+                    self.stage().clone(),
+                ))))
             }
             Key::Char('m') => self.model_picker(),
             Key::Char('a') => {
@@ -1189,27 +1330,74 @@ impl Drop for App {
     }
 }
 
-fn panel(title: impl Into<Line<'static>>) -> Block<'static> {
-    Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(LINE))
-        .style(Style::default().bg(PANEL).fg(FG))
+/// Lines needed to show `line` wrapped at `width`, capped at `max`.
+fn rows_for(line: &Line<'_>, width: u16, max: u16) -> u16 {
+    (line.width() as u16).div_ceil(width.max(1)).clamp(1, max)
 }
-fn selected_style() -> Style {
-    Style::default()
-        .bg(Color::Rgb(29, 61, 70))
-        .fg(ACCENT)
-        .add_modifier(Modifier::BOLD)
-}
-fn status_color(status: Status) -> Color {
-    match status {
-        Status::Complete => ACCENT,
-        Status::Failed | Status::Blocked | Status::Cancelled => RED,
-        Status::Running | Status::Interactive | Status::AwaitingConfirmation => WARN,
-        _ => MUTED,
+fn elapsed(seconds: i64) -> String {
+    match seconds {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m {:02}s", s / 60, s % 60),
+        s => format!("{}h {:02}m", s / 3600, s % 3600 / 60),
     }
+}
+/// Home-relative path, trimmed from the left to fit `width` columns.
+fn short_path(path: &std::path::Path, width: usize) -> String {
+    let mut text = path.display().to_string();
+    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        if let Ok(rest) = path.strip_prefix(&home) {
+            text = format!("~/{}", rest.display());
+        }
+    }
+    let text = storage::clean_terminal(&text);
+    let count = text.chars().count();
+    if count <= width {
+        return text;
+    }
+    let keep = width.saturating_sub(1);
+    format!("…{}", text.chars().skip(count - keep).collect::<String>())
+}
+fn kv(palette: Palette, label: &str, value: &str, set: bool) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<11}"), Style::default().fg(palette.muted)),
+        Span::styled(
+            value.to_string(),
+            Style::default().fg(if set { palette.fg } else { palette.muted }),
+        ),
+    ])
+}
+fn or_default<'a>(value: &'a str, fallback: &'a str) -> (&'a str, bool) {
+    if value.is_empty() {
+        (fallback, false)
+    } else {
+        (value, true)
+    }
+}
+/// Centered headline plus muted guidance inside a titled panel.
+fn empty_state(
+    frame: &mut Frame<'_>,
+    palette: Palette,
+    area: Rect,
+    block: Block<'static>,
+    head: &str,
+    body: &str,
+) {
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let text = Text::from(vec![
+        Line::styled(
+            head.to_string(),
+            Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::styled(body.to_string(), Style::default().fg(palette.muted)),
+    ]);
+    let top = inner.height.saturating_sub(4) / 2;
+    let rect = Rect::new(inner.x, inner.y + top, inner.width, inner.height - top);
+    frame.render_widget(
+        Paragraph::new(text).centered().wrap(Wrap { trim: true }),
+        rect,
+    );
 }
 fn popup(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width.saturating_sub(4));
@@ -1221,461 +1409,750 @@ fn popup(area: Rect, width: u16, height: u16) -> Rect {
         height,
     )
 }
+/// Fade everything already drawn so a modal reads as the foreground.
+fn dim(frame: &mut Frame<'_>, palette: Palette) {
+    for cell in &mut frame.buffer_mut().content {
+        cell.set_style(
+            Style::default()
+                .fg(palette.line)
+                .bg(palette.bg)
+                .remove_modifier(Modifier::all()),
+        );
+    }
+}
+
+const TABS: [&str; 4] = ["Workflow", "Monitor", "Runs", "Harnesses"];
 
 fn draw(frame: &mut Frame<'_>, app: &mut App) {
+    let palette = app.palette();
     let area = frame.area();
-    frame.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.bg).fg(palette.fg)),
+        area,
+    );
     if area.width < 65 || area.height < 20 {
+        let top = area.height.saturating_sub(3) / 2;
         frame.render_widget(
-            Paragraph::new("Model Router\nResize to at least 65 × 20. Press q to exit.")
-                .wrap(Wrap { trim: false })
-                .style(Style::default().fg(ACCENT)),
-            area,
+            Paragraph::new(vec![
+                Line::styled(
+                    "MODEL ROUTER",
+                    Style::default()
+                        .fg(palette.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Line::styled(
+                    "Resize to at least 65 × 20.",
+                    Style::default().fg(palette.fg),
+                ),
+                Line::styled("Press q to exit.", Style::default().fg(palette.muted)),
+            ])
+            .centered()
+            .wrap(Wrap { trim: false }),
+            Rect::new(area.x, area.y + top, area.width, area.height - top),
         );
         return;
     }
-    let chunks = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Length(2),
-        Constraint::Min(10),
-        Constraint::Length(2),
-        Constraint::Length(2),
-    ])
-    .margin(1)
-    .split(area);
-    let title = Line::from(vec![
+    let keys: &[(&str, &str)] = match app.page {
+        0 => &[
+            ("r", "run"),
+            ("t", "task"),
+            ("f", "import"),
+            ("p", "repos"),
+            ("c", "harness"),
+            ("m", "models"),
+            ("Space", "toggle"),
+            ("s", "save"),
+            ("T", "themes"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        1 if app.worker.is_some() => &[
+            ("c", "cancel stage"),
+            ("h", "handoff"),
+            ("PgUp/PgDn", "scroll"),
+            ("Tab", "switch view"),
+            ("T", "themes"),
+            ("q", "stop & exit"),
+        ],
+        1 => &[
+            ("a", "advance"),
+            ("c", "continue"),
+            ("y", "retry"),
+            ("i", "interactive"),
+            ("m", "model"),
+            ("h", "handoff"),
+            ("e", "summary"),
+            ("n", "workflow"),
+            ("T", "themes"),
+            ("?", "help"),
+        ],
+        2 => &[
+            ("↑↓", "select"),
+            ("Enter", "open run"),
+            ("r", "refresh"),
+            ("Tab", "switch view"),
+            ("T", "themes"),
+            ("q", "quit"),
+        ],
+        _ => &[
+            ("↑↓", "select"),
+            ("Enter", "details"),
+            ("Tab", "switch view"),
+            ("T", "themes"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+    };
+    let mut footer = palette.hints(keys);
+    footer.spans.insert(0, Span::raw(" "));
+    let alert = !app.message.is_empty() && app.message == app.alert;
+    let status = Line::from(vec![
         Span::styled(
-            " MODEL ROUTER ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            if alert { "✗ " } else { "› " },
+            Style::default().fg(if alert { palette.red } else { palette.accent }),
         ),
-        Span::styled(" / ", Style::default().fg(LINE)),
         Span::styled(
-            app.project.display().to_string(),
-            Style::default().fg(MUTED),
+            storage::clean_terminal(&app.message),
+            Style::default().fg(if alert { palette.red } else { palette.fg }),
         ),
     ]);
-    frame.render_widget(Paragraph::new(title), chunks[0]);
-    frame.render_widget(
-        Tabs::new(["1 Workflow", "2 Monitor", "3 Runs", "4 Harnesses"])
-            .select(app.page)
-            .style(Style::default().fg(MUTED))
-            .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
-            .divider("  "),
-        chunks[1],
-    );
+    let body_width = area.width.saturating_sub(2);
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(10),
+        Constraint::Length(rows_for(&status, body_width, 2)),
+        Constraint::Length(rows_for(&footer, area.width, 2)),
+    ])
+    .split(area);
+    draw_header(frame, app, chunks[0], palette);
+    let body = chunks[2].inner(Margin::new(1, 0));
     match app.page {
-        0 => draw_workflow(frame, app, chunks[2]),
-        1 => draw_run(frame, app, chunks[2]),
-        2 => draw_history(frame, app, chunks[2]),
-        _ => draw_harnesses(frame, app, chunks[2]),
+        0 => draw_workflow(frame, app, body, palette),
+        1 => draw_run(frame, app, body, palette),
+        2 => draw_history(frame, app, body, palette),
+        _ => draw_harnesses(frame, app, body, palette),
+    }
+    if !app.message.is_empty() {
+        frame.render_widget(
+            Paragraph::new(status).wrap(Wrap { trim: false }),
+            chunks[3].inner(Margin::new(1, 0)),
+        );
     }
     frame.render_widget(
-        Paragraph::new(storage::clean_terminal(&app.message))
-            .style(Style::default().fg(WARN))
-            .wrap(Wrap { trim: false }),
-        chunks[3],
-    );
-    let help = match app.page {
-        0 => {
-            "p repos  t task  f import  e edit  m models  Space enable  r run  s save  ? help  q quit"
-        }
-        1 if app.worker.is_some() => {
-            "c cancel stage  h handoff  PgUp/PgDn logs  Tab switch view  q stop & exit"
-        }
-        1 => {
-            "a advance  c continue  y retry  i interactive  m model  h handoff  e summary  n workflow"
-        }
-        2 => "↑↓ select  Enter inspect saved run  r refresh  Tab switch view  q quit",
-        _ => "↑↓ select  Enter details  Tab switch view  ? help  q quit",
-    };
-    frame.render_widget(
-        Paragraph::new(help)
-            .style(Style::default().fg(MUTED))
+        Paragraph::new(footer)
+            .style(Style::default().bg(palette.bg))
             .wrap(Wrap { trim: false }),
         chunks[4],
     );
     if let Some(modal) = &mut app.modal {
-        draw_modal(frame, modal);
+        // The theme picker previews live, so keep the page behind it legible.
+        let previewing_theme = matches!(
+            modal,
+            Modal::Picker { items, .. }
+                if items.first().is_some_and(|c| matches!(c.value, PickValue::Theme(_)))
+        );
+        if !previewing_theme {
+            dim(frame, palette);
+        }
+        draw_modal(frame, modal, palette);
     }
 }
 
-fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
+    let mut spans = vec![
+        Span::styled(" ◆ ", Style::default().fg(palette.accent)),
+        Span::styled(
+            "MODEL ROUTER",
+            Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+    ];
+    for (index, name) in TABS.iter().enumerate() {
+        spans.push(Span::styled(
+            format!(" {} {name} ", index + 1),
+            if index == app.page {
+                Style::default()
+                    .fg(palette.bg)
+                    .bg(palette.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.muted)
+            },
+        ));
+    }
+    let left = Line::from(spans);
+    let room = (area.width as usize).saturating_sub(left.width() + 4);
+    frame.render_widget(
+        Paragraph::new(left).style(Style::default().bg(palette.bg)),
+        area,
+    );
+    if room >= 12 {
+        frame.render_widget(
+            Paragraph::new(format!("{} ", short_path(&app.project, room)))
+                .right_aligned()
+                .style(Style::default().fg(palette.muted)),
+            area,
+        );
+    }
+}
+
+fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
     let chunks = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(5),
         Constraint::Min(5),
     ])
     .split(area);
     let workflow = &app.settings.workflows[app.workflow];
     let enabled = workflow.stages.iter().filter(|s| s.enabled).count();
-    let heading = format!(
-        " {}{}  ·  {enabled}/{} stages  ·  {}  ·  repairs ≤ {}",
-        workflow.name,
-        if app.dirty { " *" } else { "" },
-        workflow.stages.len(),
-        if app.worktree {
-            "isolated worktree"
-        } else {
-            "current directory"
-        },
-        workflow.max_repair_passes
-    );
+    let mut heading = vec![Span::styled(
+        workflow.name.clone(),
+        Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
+    )];
+    if app.dirty {
+        heading.push(Span::styled(
+            "  ● unsaved",
+            Style::default().fg(palette.warn),
+        ));
+    }
+    heading.push(Span::styled(
+        format!(
+            "   {enabled}/{} stages  ·  {}  ·  repairs ≤ {}",
+            workflow.stages.len(),
+            if app.worktree {
+                "isolated worktree"
+            } else {
+                "current directory"
+            },
+            workflow.max_repair_passes
+        ),
+        Style::default().fg(palette.muted),
+    ));
+    let heading = Line::from(heading);
+    let actions = palette.hints(&[
+        ("w", "switch"),
+        ("R", "rename"),
+        ("g", "worktree"),
+        ("l", "repairs"),
+    ]);
+    let actions_width = actions.width() as u16;
+    if heading.width() as u16 + actions_width + 2 <= area.width {
+        frame.render_widget(Paragraph::new(actions).right_aligned(), chunks[0]);
+    }
+    frame.render_widget(Paragraph::new(heading), chunks[0]);
+    let task = if app.task.is_empty() {
+        Paragraph::new(Line::styled(
+            "No task yet. Press t to write one, or f to import a file, URL, or GitHub issue.",
+            Style::default()
+                .fg(palette.muted)
+                .add_modifier(Modifier::ITALIC),
+        ))
+    } else {
+        Paragraph::new(storage::clean_terminal(&app.task)).style(Style::default().fg(palette.fg))
+    };
     frame.render_widget(
-        Paragraph::new(heading)
-            .block(panel(
-                " Workflow · w choose · R rename · g worktree · l repair limit ",
-            ))
-            .style(Style::default().fg(ACCENT)),
-        chunks[0],
-    );
-    frame.render_widget(
-        Paragraph::new(if app.task.is_empty() {
-            "Press t to write a task, or f to import a task/spec."
-        } else {
-            &app.task
-        })
-        .wrap(Wrap { trim: false })
-        .block(panel(" Task · t edit · f import file / URL "))
-        .style(Style::default().fg(if app.task.is_empty() { MUTED } else { FG })),
-        chunks[1],
+        task.wrap(Wrap { trim: false })
+            .block(palette.panel_with("Task", &[("t", "edit"), ("f", "import")])),
+        chunks[2],
     );
     let cols = if area.width >= 100 {
-        Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)])
-            .split(chunks[2])
+        Layout::horizontal([Constraint::Percentage(66), Constraint::Percentage(34)])
+            .split(chunks[3])
     } else {
-        Layout::horizontal([Constraint::Percentage(100), Constraint::Length(0)]).split(chunks[2])
+        Layout::horizontal([Constraint::Percentage(100), Constraint::Length(0)]).split(chunks[3])
     };
-    let compact = area.height < 20;
     let rows = workflow.stages.iter().enumerate().map(|(index, stage)| {
+        let on = stage.enabled;
+        let interactive = stage.mode == Mode::Interactive;
         Row::new(vec![
-            Cell::from(if stage.enabled { "●" } else { "○" })
-                .style(Style::default().fg(if stage.enabled { ACCENT } else { MUTED })),
-            Cell::from(format!("{}. {}", index + 1, stage.name)),
+            Cell::from(if on { "●" } else { "○" }).style(Style::default().fg(if on {
+                palette.accent
+            } else {
+                palette.muted
+            })),
+            Cell::from(format!("{}", index + 1)).style(Style::default().fg(palette.muted)),
+            Cell::from(stage.name.clone()),
             Cell::from(stage.harness.clone()),
-            Cell::from(if stage.model.is_empty() {
-                "(default)".into()
+            if stage.model.is_empty() {
+                Cell::from("default").style(Style::default().fg(palette.muted))
             } else {
-                stage.model.clone()
-            }),
-            Cell::from(if stage.mode == Mode::Interactive {
-                "interactive"
-            } else {
-                "auto"
-            }),
+                Cell::from(stage.model.clone())
+            },
+            Cell::from(if interactive { "interactive" } else { "auto" }).style(
+                Style::default().fg(match (on, interactive) {
+                    (false, _) => palette.muted,
+                    (true, true) => palette.blue,
+                    (true, false) => palette.fg,
+                }),
+            ),
         ])
-        .style(Style::default().fg(if stage.enabled { FG } else { MUTED }))
-        .height(if compact { 1 } else { 2 })
+        .style(Style::default().fg(if on { palette.fg } else { palette.muted }))
     });
     let table = Table::new(
         rows,
         [
+            Constraint::Length(1),
             Constraint::Length(2),
-            Constraint::Percentage(29),
-            Constraint::Length(10),
-            Constraint::Percentage(34),
+            Constraint::Fill(4),
+            Constraint::Length(9),
+            Constraint::Fill(3),
             Constraint::Length(11),
         ],
     )
+    .column_spacing(2)
     .header(
-        Row::new(["", "STAGE", "HARNESS", "MODEL / MODE", "EXECUTION"])
-            .style(Style::default().fg(MUTED))
-            .bottom_margin(if compact { 0 } else { 1 }),
+        Row::new(["", "#", "STAGE", "HARNESS", "MODEL", "EXECUTION"])
+            .style(palette.header_style())
+            .bottom_margin(1),
     )
-    .block(panel(" Stages · a add · e edit · J/K reorder "))
-    .row_highlight_style(selected_style());
+    .block(palette.panel_with(
+        "Stages",
+        &[
+            ("c", "harness"),
+            ("e", "edit"),
+            ("a", "add"),
+            ("J/K", "move"),
+        ],
+    ))
+    .highlight_symbol("▌")
+    .highlight_spacing(HighlightSpacing::Always)
+    .row_highlight_style(palette.selected_style());
     frame.render_stateful_widget(
         table,
         cols[0],
         &mut TableState::default().with_selected(Some(app.selected)),
     );
     if cols[1].width > 0 {
-        let stage = app.stage();
-        let body = format!(
-            "{}\n{} · {}\n\n{}\n\nProvider: {}\nEffort: {}\nTimeout: {} min\n\n{}\n\nID: {}",
-            stage.name,
-            stage.role.label(),
-            if stage.enabled { "enabled" } else { "disabled" },
-            stage.instructions,
-            if stage.provider.is_empty() {
-                "harness default"
-            } else {
-                &stage.provider
-            },
-            if stage.effort.is_empty() {
-                "harness default"
-            } else {
-                &stage.effort
-            },
-            stage.timeout_seconds / 60,
-            if stage.role == Role::Review {
-                "Review is optional. Space toggles this stage. Blocking findings request repairs."
-            } else {
-                "Permissions: native settings plus explicit stage arguments."
-            },
-            stage.id
-        );
-        frame.render_widget(
-            Paragraph::new(body)
-                .wrap(Wrap { trim: false })
-                .block(panel(" Selected stage ")),
-            cols[1],
-        );
+        draw_stage_detail(frame, app.stage(), cols[1], palette);
     }
 }
 
-fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let Some(run) = &app.run else {
-        frame.render_widget(
-            Paragraph::new(
-                "No run selected. Start one from Workflow, or open a saved run from Runs.",
-            )
+fn draw_stage_detail(frame: &mut Frame<'_>, stage: &Stage, area: Rect, palette: Palette) {
+    let model = or_default(&stage.model, "harness default");
+    let provider = or_default(&stage.provider, "harness default");
+    let effort = or_default(&stage.effort, "harness default");
+    let mut lines = vec![
+        Line::styled(
+            stage.name.clone(),
+            Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
+        ),
+        Line::from(vec![
+            Span::styled(
+                format!("{}  ·  ", stage.role.label()),
+                Style::default().fg(palette.muted),
+            ),
+            if stage.enabled {
+                Span::styled("● enabled", Style::default().fg(palette.accent))
+            } else {
+                Span::styled("○ disabled", Style::default().fg(palette.muted))
+            },
+        ]),
+        Line::raw(""),
+        kv(palette, "Harness", &stage.harness, true),
+        kv(palette, "Model", model.0, model.1),
+        kv(palette, "Execution", stage.mode.label(), true),
+        kv(palette, "Provider", provider.0, provider.1),
+        kv(palette, "Effort", effort.0, effort.1),
+        kv(
+            palette,
+            "Timeout",
+            &format!("{} min", stage.timeout_seconds / 60),
+            true,
+        ),
+        kv(palette, "ID", &stage.id, true),
+        Line::raw(""),
+        Line::styled("Instructions", palette.header_style()),
+    ];
+    lines.extend(
+        storage::clean_terminal(&stage.instructions)
+            .lines()
+            .map(|line| Line::styled(line.to_string(), Style::default().fg(palette.fg))),
+    );
+    lines.push(Line::raw(""));
+    lines.push(Line::styled("Harness settings", palette.header_style()));
+    lines.extend(
+        harness_settings::summary(stage)
+            .lines()
+            .map(|line| Line::styled(line.to_string(), Style::default().fg(palette.fg))),
+    );
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        if stage.role == Role::Review {
+            "Optional. Space toggles it; blocking findings request repairs."
+        } else {
+            "c configures this stage's harness."
+        },
+        Style::default()
+            .fg(palette.muted)
+            .add_modifier(Modifier::ITALIC),
+    ));
+    frame.render_widget(
+        Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(panel(" Run monitor ")),
+            .block(palette.panel(" Selected stage ")),
+        area,
+    );
+}
+
+fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
+    let Some(run) = &app.run else {
+        empty_state(
+            frame,
+            palette,
             area,
+            palette.panel(" Run monitor "),
+            "No run selected",
+            "Start one from Workflow (r), or open a saved run from Runs (3).",
         );
         return;
     };
     let chunks = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length((run.stages.len() as u16 + 3).min(9)),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length((run.stages.len() as u16 + 3).min(10)),
         Constraint::Min(3),
     ])
     .split(area);
     frame.render_widget(
-        Paragraph::new(format!(
-            "{}  ·  {}  ·  repairs {}/{}",
-            run.id,
-            run.status.label(),
-            run.repair_passes,
-            run.workflow.max_repair_passes
-        ))
-        .style(Style::default().fg(status_color(run.status)))
-        .block(panel(format!(" {} ", run.workflow.name))),
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                run.workflow.name.clone(),
+                Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            palette.status_span(run.status),
+            Span::styled(
+                format!(
+                    "   {}  ·  repairs {}/{}",
+                    run.id, run.repair_passes, run.workflow.max_repair_passes
+                ),
+                Style::default().fg(palette.muted),
+            ),
+        ])),
         chunks[0],
     );
+    let name_width = run
+        .workflow
+        .stages
+        .iter()
+        .map(|s| s.name.chars().count() as u16)
+        .max()
+        .unwrap_or(0)
+        .clamp(16, 40);
     let rows = run.stages.iter().enumerate().map(|(i, state)| {
-        let elapsed = state
-            .attempts
-            .last()
-            .map(|a| {
-                (a.finished_at.unwrap_or_else(chrono::Utc::now) - a.started_at)
-                    .num_seconds()
-                    .max(0)
-            })
-            .unwrap_or(0);
+        let seconds = state.attempts.last().map(|a| {
+            (a.finished_at.unwrap_or_else(chrono::Utc::now) - a.started_at)
+                .num_seconds()
+                .max(0)
+        });
         Row::new([
-            run.workflow.stages[i].name.clone(),
-            state.status.label().into(),
-            format!("{} attempt(s)", state.attempts.len()),
-            format!("{elapsed}s"),
+            Cell::from(run.workflow.stages[i].name.clone()),
+            Cell::from(palette.status_span(state.status)),
+            Cell::from(state.attempts.len().to_string()).style(Style::default().fg(palette.muted)),
+            Cell::from(seconds.map(elapsed).unwrap_or_else(|| "–".into()))
+                .style(Style::default().fg(palette.muted)),
         ])
-        .style(Style::default().fg(status_color(state.status)))
     });
     frame.render_stateful_widget(
         Table::new(
             rows,
             [
-                Constraint::Percentage(40),
-                Constraint::Percentage(30),
-                Constraint::Length(15),
+                Constraint::Length(name_width),
+                Constraint::Length(18),
                 Constraint::Length(8),
+                Constraint::Fill(1),
             ],
         )
-        .block(panel(" Progress "))
-        .row_highlight_style(selected_style()),
-        chunks[1],
+        .column_spacing(3)
+        .header(Row::new(["STAGE", "STATUS", "ATTEMPTS", "ELAPSED"]).style(palette.header_style()))
+        .block(palette.panel(" Progress "))
+        .highlight_symbol("▌")
+        .highlight_spacing(HighlightSpacing::Always)
+        .row_highlight_style(palette.selected_style()),
+        chunks[2],
         &mut TableState::default().with_selected(Some(run.cursor.min(run.stages.len() - 1))),
     );
     let cols = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(chunks[2]);
+        .split(chunks[3]);
     let visible = cols[0].height.saturating_sub(2) as usize;
     let end = app.logs.len().saturating_sub(app.log_scroll);
     let start = end.saturating_sub(visible);
-    let logs = if app.logs.is_empty() {
-        "Harness output appears here. Some harnesses emit their final response only when the stage finishes.".into()
+    let output_block = palette.panel_with("Output", &[("PgUp/PgDn", "scroll")]);
+    if app.logs.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "Harness output appears here. Some harnesses emit their final response only when the stage finishes. Full logs are saved on disk.",
+                Style::default().fg(palette.muted).add_modifier(Modifier::ITALIC),
+            ))
+            .wrap(Wrap { trim: false })
+            .block(output_block),
+            cols[0],
+        );
     } else {
-        app.logs
-            .iter()
-            .skip(start)
-            .take(end - start)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    frame.render_widget(
-        Paragraph::new(logs)
-            .block(panel(" Live output · full logs saved on disk "))
-            .style(Style::default().fg(MUTED)),
-        cols[0],
-    );
-    let summary = if let Some(error) = &run.error {
-        error.clone()
+        frame.render_widget(
+            Paragraph::new(
+                app.logs
+                    .iter()
+                    .skip(start)
+                    .take(end - start)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .block(output_block)
+            .style(Style::default().fg(palette.muted)),
+            cols[0],
+        );
+    }
+    let handoff = run
+        .stages
+        .get(run.cursor.min(run.stages.len() - 1))
+        .and_then(|s| s.handoff.as_ref());
+    let summary: Vec<Line> = if let Some(error) = &run.error {
+        vec![
+            Line::styled(
+                "Error",
+                Style::default()
+                    .fg(palette.red)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+            Line::styled(
+                storage::clean_terminal(error),
+                Style::default().fg(palette.red),
+            ),
+        ]
+    } else if let Some(h) = handoff {
+        let mut lines = vec![
+            Line::styled(
+                if h.structured {
+                    "Structured handoff"
+                } else {
+                    "Text handoff · inspect before advancing"
+                },
+                palette.header_style(),
+            ),
+            Line::raw(""),
+        ];
+        lines.extend(
+            storage::clean_terminal(&h.summary)
+                .lines()
+                .map(|line| Line::raw(line.to_string())),
+        );
+        lines
     } else {
-        run.stages
-            .get(run.cursor.min(run.stages.len() - 1))
-            .and_then(|s| s.handoff.as_ref())
-            .map(|h| {
-                format!(
-                    "{}\n\n{}",
-                    if h.structured {
-                        "Structured handoff"
-                    } else {
-                        "Text handoff · inspect before advancing"
-                    },
-                    h.summary
-                )
-            })
-            .unwrap_or_else(|| {
-                format!(
-                    "{}\n\nWorkspace: {}\n\nArtifacts: {}",
-                    run.current_name(),
-                    run.workspace.display(),
-                    run.directory.display()
-                )
-            })
+        vec![
+            Line::styled(
+                run.current_name().to_string(),
+                Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+            Line::styled("Workspace", palette.header_style()),
+            Line::raw(short_path(&run.workspace, usize::MAX)),
+            Line::raw(""),
+            Line::styled("Artifacts", palette.header_style()),
+            Line::raw(short_path(&run.directory, usize::MAX)),
+        ]
     };
     frame.render_widget(
         Paragraph::new(summary)
             .wrap(Wrap { trim: false })
-            .block(panel(" Handoff / status · h inspect ")),
+            .block(palette.panel_with("Handoff", &[("h", "inspect")])),
         cols[1],
     );
 }
 
-fn draw_history(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_history(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
     if app.history.is_empty() {
-        frame.render_widget(Paragraph::new("No saved runs for this project yet. Start a workflow to create a durable run history.").wrap(Wrap { trim: false }).block(panel(" Run history ")), area);
+        empty_state(
+            frame,
+            palette,
+            area,
+            palette.panel(" Saved runs "),
+            "No saved runs yet",
+            "Runs for this project are saved automatically. Start a workflow from Workflow (r).",
+        );
         return;
     }
     let rows = app.history.iter().map(|run| {
         Row::new([
-            run.created_at.format("%m-%d %H:%M").to_string(),
-            run.status.label().into(),
-            run.workflow.name.clone(),
-            run.task.replace('\n', " "),
+            Cell::from(run.created_at.format("%b %d  %H:%M").to_string())
+                .style(Style::default().fg(palette.muted)),
+            Cell::from(palette.status_span(run.status)),
+            Cell::from(run.workflow.name.clone()),
+            Cell::from(storage::clean_terminal(&run.task.replace('\n', " ")))
+                .style(Style::default().fg(palette.muted)),
         ])
-        .height(2)
     });
-    frame.render_stateful_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Length(13),
-                Constraint::Length(19),
-                Constraint::Percentage(25),
-                Constraint::Percentage(45),
-            ],
-        )
-        .header(
-            Row::new(["STARTED", "STATUS", "WORKFLOW", "TASK"]).style(Style::default().fg(MUTED)),
-        )
-        .block(panel(" Saved runs · Enter opens the monitor "))
-        .row_highlight_style(selected_style()),
-        area,
-        &mut TableState::default()
-            .with_selected(Some(app.history_selected.min(app.history.len() - 1))),
-    );
-}
-fn draw_harnesses(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let rows = catalog::known_harnesses(&app.settings)
-        .into_iter()
-        .map(|name| {
-            let program = adapters::program(&name, &app.settings.adapters);
-            let path = adapters::executable(&program);
-            Row::new([
-                name,
-                if path.is_some() {
-                    "installed".into()
-                } else {
-                    "not installed".into()
-                },
-                path.map(|p| p.display().to_string()).unwrap_or(program),
-            ])
-            .height(2)
-        });
     frame.render_stateful_widget(
         Table::new(
             rows,
             [
                 Constraint::Length(14),
-                Constraint::Length(16),
+                Constraint::Length(18),
+                Constraint::Fill(1),
+                Constraint::Fill(2),
+            ],
+        )
+        .header(
+            Row::new(["STARTED", "STATUS", "WORKFLOW", "TASK"])
+                .style(palette.header_style())
+                .bottom_margin(1),
+        )
+        .block(palette.panel_with("Saved runs", &[("Enter", "open in monitor")]))
+        .highlight_symbol("▌")
+        .highlight_spacing(HighlightSpacing::Always)
+        .row_highlight_style(palette.selected_style()),
+        area,
+        &mut TableState::default()
+            .with_selected(Some(app.history_selected.min(app.history.len() - 1))),
+    );
+}
+fn draw_harnesses(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
+    let rows = catalog::known_harnesses(&app.settings)
+        .into_iter()
+        .map(|name| {
+            let program = adapters::program(&name, &app.settings.adapters);
+            let path = adapters::executable(&program);
+            let found = path.is_some();
+            Row::new([
+                Cell::from(name),
+                Cell::from(if found {
+                    "● installed"
+                } else {
+                    "○ not found"
+                })
+                .style(Style::default().fg(if found {
+                    palette.accent
+                } else {
+                    palette.muted
+                })),
+                Cell::from(path.map(|p| short_path(&p, usize::MAX)).unwrap_or(program))
+                    .style(Style::default().fg(palette.muted)),
+            ])
+        });
+    let block = palette.panel(" Harnesses ").title(
+        Line::styled(
+            " uses existing logins and provider settings ",
+            Style::default().fg(palette.muted),
+        )
+        .right_aligned(),
+    );
+    frame.render_stateful_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(12),
+                Constraint::Length(13),
                 Constraint::Min(20),
             ],
         )
         .header(
-            Row::new(["HARNESS", "EXECUTABLE", "PATH / COMMAND"]).style(Style::default().fg(MUTED)),
+            Row::new(["HARNESS", "STATUS", "PATH / COMMAND"])
+                .style(palette.header_style())
+                .bottom_margin(1),
         )
-        .block(panel(
-            " Harnesses · uses existing logins and provider settings ",
-        ))
-        .row_highlight_style(selected_style()),
+        .block(block)
+        .highlight_symbol("▌")
+        .highlight_spacing(HighlightSpacing::Always)
+        .row_highlight_style(palette.selected_style()),
         area,
         &mut TableState::default().with_selected(Some(app.harness_selected)),
     );
 }
 
-fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
-    let rect = popup(
-        frame.area(),
-        if matches!(modal, Modal::Stage { .. }) {
-            100
-        } else {
-            95
-        },
-        if matches!(modal, Modal::Stage { .. }) {
-            35
-        } else {
-            26
-        },
-    );
+fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, palette: Palette) {
+    let (width, height) = match modal {
+        Modal::Stage { .. } => (100, 35),
+        Modal::Loading(_) => (64, 7),
+        _ => (95, 26),
+    };
+    let rect = popup(frame.area(), width, height);
     frame.render_widget(Clear, rect);
     match modal {
-        Modal::Repositories(picker) => picker.draw(frame, rect),
-        Modal::Import(importer) => importer.draw(frame, rect),
+        Modal::Repositories(picker) => picker.draw(frame, rect, palette),
+        Modal::Import(importer) => importer.draw(frame, rect, palette),
+        Modal::Harness(editor) => editor.draw(frame, rect, palette),
         Modal::Input { title, text, .. } => {
-            let block = panel(format!(" {title} ")).border_style(Style::default().fg(ACCENT));
+            palette.style_textarea(text);
+            let block = palette.modal(title, &[]);
             let inner = block.inner(rect);
             frame.render_widget(block, rect);
             let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(inner);
             frame.render_widget(&*text, chunks[0]);
+            let mut keys = palette.hints(&[("Ctrl+S", "apply"), ("Esc", "cancel")]);
+            keys.spans.push(Span::styled(
+                "   ·  standard text selection and paste",
+                Style::default().fg(palette.muted),
+            ));
             frame.render_widget(
-                Paragraph::new("Ctrl+S apply  ·  Esc cancel  ·  standard text selection and paste")
-                    .style(Style::default().fg(MUTED)),
+                Paragraph::new(vec![Line::raw(""), keys]).wrap(Wrap { trim: false }),
                 chunks[1],
             );
         }
         Modal::Stage { editor, .. } => {
-            let block = panel(" Edit stage · Tab next · ←/→ cycle role, harness, execution ")
-                .border_style(Style::default().fg(ACCENT));
+            let block = palette.modal(
+                "Edit stage",
+                &[("Tab", "next field"), ("←/→", "cycle choice")],
+            );
             let inner = block.inner(rect);
             frame.render_widget(block, rect);
             let chunks = Layout::vertical([Constraint::Min(8), Constraint::Length(2)]).split(inner);
             let halves =
-                Layout::horizontal([Constraint::Percentage(43), Constraint::Percentage(57)])
+                Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
                     .split(chunks[0]);
+            let value_width = halves[0].width.saturating_sub(4) as usize;
             let rows = FIELDS.iter().enumerate().map(|(i, label)| {
+                let value = content(&editor.fields[i]).replace('\n', " ");
+                let choice = [1, 2, 6].contains(&i);
                 ListItem::new(vec![
-                    Line::from(*label),
-                    Line::styled(
-                        storage::truncate(&content(&editor.fields[i]).replace('\n', " "), 36),
-                        Style::default().fg(MUTED),
-                    ),
+                    Line::styled(*label, Style::default().fg(palette.muted)),
+                    if value.is_empty() {
+                        Line::styled("—", Style::default().fg(palette.line))
+                    } else if choice {
+                        Line::styled(
+                            format!(
+                                "‹ {} ›",
+                                storage::truncate(&value, value_width.saturating_sub(4))
+                            ),
+                            Style::default().fg(palette.fg),
+                        )
+                    } else {
+                        Line::styled(
+                            storage::truncate(&value, value_width),
+                            Style::default().fg(palette.fg),
+                        )
+                    },
                 ])
             });
             frame.render_stateful_widget(
                 List::new(rows)
-                    .highlight_style(selected_style())
-                    .block(Block::default().padding(ratatui::widgets::Padding::right(1))),
+                    .highlight_style(Style::default().bg(palette.selection_bg))
+                    .highlight_symbol("▌ ")
+                    .highlight_spacing(HighlightSpacing::Always)
+                    .block(Block::default().padding(Padding::right(2))),
                 halves[0],
                 &mut ListState::default().with_selected(Some(editor.selected)),
             );
             let field = &mut editor.fields[editor.selected];
+            palette.style_textarea(field);
             field.set_block(
-                panel(format!(" {} ", FIELDS[editor.selected]))
-                    .border_style(Style::default().fg(ACCENT)),
+                palette
+                    .panel(format!(" {} ", FIELDS[editor.selected]))
+                    .border_style(Style::default().fg(palette.accent)),
             );
             frame.render_widget(&*field, halves[1]);
-            frame.render_widget(Paragraph::new("Ctrl+S apply stage  ·  Esc cancel  ·  Model IDs are open-ended; blank inherits default").style(Style::default().fg(MUTED)).wrap(Wrap { trim: false }), chunks[1]);
+            let mut keys = palette.hints(&[("Ctrl+S", "apply stage"), ("Esc", "cancel")]);
+            keys.spans.push(Span::styled(
+                "   ·  model IDs are open-ended; blank inherits the default",
+                Style::default().fg(palette.muted),
+            ));
+            frame.render_widget(
+                Paragraph::new(vec![Line::raw(""), keys]).wrap(Wrap { trim: false }),
+                chunks[1],
+            );
         }
         Modal::Picker {
             title,
@@ -1684,14 +2161,10 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
             filter,
             note,
         } => {
-            let block = panel(format!(" {title} ")).border_style(Style::default().fg(ACCENT));
+            let block = palette.modal(title, &[]);
             let inner = block.inner(rect);
             frame.render_widget(block, rect);
-            let query = content(filter).to_lowercase();
-            let choices: Vec<_> = items
-                .iter()
-                .filter(|c| c.label.to_lowercase().contains(&query))
-                .collect();
+            let choices = matching_choices(items, filter);
             *selected = (*selected).min(choices.len().saturating_sub(1));
             let detail = choices.get(*selected).and_then(|c| c.value.detail());
             let chunks = Layout::vertical([
@@ -1701,27 +2174,60 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
                 Constraint::Length(2),
             ])
             .split(inner);
-            filter.set_block(panel(" Filter "));
+            palette.style_textarea(filter);
+            filter.set_block(palette.panel(" Filter "));
             frame.render_widget(&*filter, chunks[0]);
+            if choices.is_empty() {
+                frame.render_widget(
+                    Paragraph::new("No matches. Clear the filter to see every option.")
+                        .style(Style::default().fg(palette.muted)),
+                    chunks[1].inner(Margin::new(2, 1)),
+                );
+            }
             frame.render_stateful_widget(
                 List::new(choices.iter().map(|c| ListItem::new(c.label.clone())))
-                    .highlight_style(selected_style()),
+                    .highlight_style(palette.selected_style())
+                    .highlight_symbol("▌ ")
+                    .highlight_spacing(HighlightSpacing::Always)
+                    .block(Block::default().padding(Padding::vertical(1))),
                 chunks[1],
                 &mut ListState::default().with_selected(Some(*selected)),
             );
+            let mut lines = vec![];
+            if let Some(text) = detail {
+                let mut parts = text.lines();
+                if let Some(first) = parts.next() {
+                    lines.push(Line::styled(
+                        first.to_string(),
+                        Style::default().fg(palette.fg),
+                    ));
+                }
+                lines.extend(
+                    parts.map(|l| Line::styled(l.to_string(), Style::default().fg(palette.muted))),
+                );
+                lines.push(Line::raw(""));
+            }
+            lines.extend(
+                note.lines()
+                    .map(|l| Line::styled(l.to_string(), Style::default().fg(palette.muted))),
+            );
             frame.render_widget(
-                Paragraph::new(format!(
-                    "{}{note}",
-                    detail.map(|text| format!("{text}\n\n")).unwrap_or_default()
-                ))
-                .wrap(Wrap { trim: false })
-                .style(Style::default().fg(MUTED)),
+                Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                    Block::default()
+                        .borders(Borders::TOP)
+                        .border_style(Style::default().fg(palette.line)),
+                ),
                 chunks[2],
             );
             frame.render_widget(
-                Paragraph::new("↑↓ select · Enter choose · Esc cancel")
-                    .wrap(Wrap { trim: false })
-                    .style(Style::default().fg(MUTED)),
+                Paragraph::new(vec![
+                    Line::raw(""),
+                    palette.hints(&[
+                        ("↑↓ / Ctrl+N/P", "select"),
+                        ("Enter", "choose"),
+                        ("Esc", "cancel"),
+                    ]),
+                ]),
                 chunks[3],
             );
         }
@@ -1729,26 +2235,141 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
             title,
             body,
             scroll,
-        } => frame.render_widget(
-            Paragraph::new(storage::clean_terminal(body))
-                .wrap(Wrap { trim: false })
-                .scroll((*scroll, 0))
-                .block(
-                    panel(format!(" {title} · Esc close "))
-                        .border_style(Style::default().fg(ACCENT)),
-                ),
-            rect,
-        ),
-        Modal::Loading(message) => frame.render_widget(
-            Paragraph::new(message.as_str())
-                .wrap(Wrap { trim: false })
-                .block(panel(" Model discovery · no inference ")),
-            rect,
-        ),
+            guide,
+        } => {
+            let body = if *guide {
+                guide_text(body, palette)
+            } else {
+                Text::raw(storage::clean_terminal(body))
+            };
+            frame.render_widget(
+                Paragraph::new(body)
+                    .wrap(Wrap { trim: false })
+                    .scroll((*scroll, 0))
+                    .block(palette.modal(title, &[("↑↓", "scroll"), ("Esc", "close")])),
+                rect,
+            );
+        }
+        Modal::Loading(message) => {
+            const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let tick = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() / 80)
+                .unwrap_or(0) as usize;
+            let block = palette.modal("Model discovery", &[("Esc", "cancel")]);
+            let inner = block.inner(rect);
+            frame.render_widget(block, rect);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::raw(""),
+                    Line::from(vec![
+                        Span::styled(
+                            format!("{} ", SPIN[tick % SPIN.len()]),
+                            Style::default().fg(palette.accent),
+                        ),
+                        Span::raw(message.clone()),
+                    ]),
+                    Line::styled(
+                        "No inference is performed.",
+                        Style::default().fg(palette.muted),
+                    ),
+                ])
+                .wrap(Wrap { trim: false }),
+                inner,
+            );
+        }
     }
 }
 
-const HELP: &str = "WORKFLOW\nt  Edit task (Ctrl+S applies; Enter adds a line)\nf  Import task/spec: browse files; Ctrl+U opens URL import\n   Preview and edit; Tab append/replace; Ctrl+S apply; Esc back\np  Browse repositories (type to filter; Tab for recent)\n   Enter selects a repo or opens a folder; Right browses inside a repo\n   Left goes to parent; Ctrl+L enters a path; Esc cancels\nw  Select/clone workflow or add a preset    R  Rename    X  Delete workflow\ne / Enter  Edit selected stage\nh  Pick harness    m  Discover models\nSpace  Enable/disable stage, including optional review\nv  Toggle unattended/interactive\na  Add stage preset (edit, then Ctrl+S inserts; Esc cancels)\nd  Duplicate    x  Remove\nJ / K  Move stage down/up\ng  Toggle isolated Git worktree\nl  Set automatic repair limit\nP  Preview commands (no model calls)\ns  Save project    S  Save global templates\nr  Start workflow\n\nMONITOR\nc  Cancel active stage; continue when idle\na  Accept interactive handoff and advance\ny  Explicitly retry current stage\ni  Retry current stage interactively\nm  Replace current model and retry\nh  Inspect handoff/error    PgUp / PgDn  Scroll output\nn  Return to workflow editor\n\nINTERACTIVE HARNESS\nNative terminal keys and paste are forwarded.\nExit the harness to inspect its handoff.\nCtrl+] stops a stuck stage.\n\nEVERYWHERE\n1–4 / Tab  Switch views    ?  Guide\nq  Save workflow edits and exit (stops active work first)\nCtrl+C  Cancel work or exit\n\nSaved runs snapshot their workflow. Template edits affect new runs.\nRetries retain filesystem changes. Disabled reviews never gate a run.\nArtifacts: <project>/.model-router/runs/\nProvider credentials stay with each harness. Catalogs do not prove universal access.";
+/// Render the keyboard guide: CAPS lines are headings, `key\tdescription`
+/// lines become aligned bindings, everything else is a muted note.
+fn guide_text(body: &str, palette: Palette) -> Text<'static> {
+    body.lines()
+        .map(|line| match line.split_once('\t') {
+            Some((key, text)) => Line::from(vec![
+                Span::styled(
+                    format!("  {key:<16}"),
+                    Style::default()
+                        .fg(palette.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(text.to_string(), Style::default().fg(palette.fg)),
+            ]),
+            None if !line.is_empty() && line == line.to_uppercase() => Line::styled(
+                line.to_string(),
+                Style::default()
+                    .fg(palette.muted)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            None => Line::styled(line.to_string(), Style::default().fg(palette.muted)),
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
+const HELP: &str = "WORKFLOW
+t\tEdit task (Ctrl+S applies; Enter adds a line)
+f\tImport task/spec: browse files; Ctrl+U opens URL import
+\tPreview and edit; Tab append/replace; Ctrl+S apply; Esc back
+p\tBrowse repositories (type to filter; Tab for recent)
+\tEnter selects a repo or opens a folder; Right browses inside a repo
+\tLeft goes to parent; Ctrl+L enters a path; Esc cancels
+w\tSelect/clone workflow or add a preset
+R\tRename workflow
+X\tDelete workflow
+e / Enter\tEdit selected stage
+c\tConfigure selected harness (model, effort, execution, permissions)
+\tTab or Ctrl+N/P fields; Left/Right choices; F2 models
+\tCtrl+S applies; Esc cancels; s on Workflow saves
+h\tPick harness
+m\tDiscover models
+Space\tEnable/disable stage, including optional review
+v\tToggle unattended/interactive
+a\tAdd stage preset (edit, then Ctrl+S inserts; Esc cancels)
+d\tDuplicate stage
+x\tRemove stage
+J / K\tMove stage down/up
+g\tToggle isolated Git worktree
+l\tSet automatic repair limit
+P\tPreview commands (no model calls)
+s\tSave project
+S\tSave global templates
+r\tStart workflow
+
+MONITOR
+c\tCancel active stage; continue when idle
+a\tAccept interactive handoff and advance
+y\tExplicitly retry current stage
+i\tRetry current stage interactively
+m\tReplace current model and retry
+h\tInspect handoff/error
+PgUp / PgDn\tScroll output
+n\tReturn to workflow editor
+
+INTERACTIVE HARNESS
+\tNative terminal keys and paste are forwarded.
+\tExit the harness to inspect its handoff.
+Ctrl+]\tStop a stuck stage
+
+SELECTION MENUS
+Ctrl+N / Ctrl+P\tNext/previous option (same as Down/Up)
+
+THEMES
+T\tChoose theme (type to filter; arrows or Ctrl+N/P preview)
+Enter\tSave for all projects
+Esc\tRestore the current theme
+
+EVERYWHERE
+1–4 / Tab\tSwitch views
+?\tKeyboard guide
+q\tSave workflow edits and exit (stops active work first)
+Ctrl+C\tCancel work or exit
+
+NOTES
+Saved runs snapshot their workflow. Template edits affect new runs.
+Retries retain filesystem changes. Disabled reviews never gate a run.
+Artifacts: <project>/.model-router/runs/
+Provider credentials stay with each harness. Catalogs do not prove universal access.";
 
 pub fn run(
     project: PathBuf,
@@ -1763,11 +2384,17 @@ pub fn run(
         let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
         old_hook(info);
     }));
+    let mut app = App::new(project, settings, config_path, cancel);
+    match theme::load(&app.theme_path) {
+        Ok(theme) => app.theme = theme,
+        Err(error) => {
+            app.message = format!("{error:#}. Using Model Router colours; T chooses a theme.");
+        }
+    }
     let mut screen = Screen::new()?;
-    if animate && !startup::play(&mut screen.terminal, &cancel)? {
+    if animate && !startup::play(&mut screen.terminal, &app.signal, app.palette())? {
         return Ok(());
     }
-    let mut app = App::new(project, settings, config_path, cancel);
     let _ = storage::remember_project(&app.project);
     loop {
         if app.signal.load(Ordering::Relaxed) {
@@ -1787,11 +2414,15 @@ pub fn run(
             screen.resume()?;
             app.message = match result {
                 Ok(()) => "Stage returned. h inspects the handoff; a advances; i reopens.".into(),
-                Err(e) => format!("{e:#}"),
+                Err(e) => {
+                    app.alert = format!("{e:#}");
+                    app.alert.clone()
+                }
             };
             if let Some(run) = &app.run {
                 if let Some(error) = &run.error {
                     app.message = error.clone();
+                    app.alert = error.clone();
                 }
             }
         }
@@ -1801,7 +2432,10 @@ pub fn run(
                 Event::Key(key) => match app.key(key) {
                     Ok(true) => break,
                     Ok(false) => {}
-                    Err(error) => app.message = format!("{error:#}"),
+                    Err(error) => {
+                        app.message = format!("{error:#}");
+                        app.alert = app.message.clone();
+                    }
                 },
                 Event::Paste(text) => match &mut app.modal {
                     Some(Modal::Input { text: field, .. }) => {
@@ -1815,6 +2449,7 @@ pub fn run(
                     }
                     Some(Modal::Repositories(picker)) => picker.paste(&text),
                     Some(Modal::Import(importer)) => importer.paste(&text),
+                    Some(Modal::Harness(editor)) => editor.paste(&text),
                     _ => {}
                 },
                 _ => {}
@@ -1832,6 +2467,137 @@ mod tests {
     use super::*;
     fn key(code: Key) -> KeyEvent {
         KeyEvent::new(code, Mods::NONE)
+    }
+
+    fn theme_app(project: &std::path::Path) -> App {
+        let mut app = App::new(
+            project.into(),
+            Settings::default(),
+            project.join("config.toml"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.theme_path = project.join("appearance.json");
+        app
+    }
+
+    #[test]
+    fn theme_preview_is_cancelable_and_only_enter_persists() {
+        let project = tempfile::tempdir().unwrap();
+        let mut app = theme_app(project.path());
+        app.task = "Keep my task".into();
+        let settings = toml::to_string(&app.settings).unwrap();
+        app.key(key(Key::Char('T'))).unwrap();
+        app.key(KeyEvent::new(Key::Char('n'), Mods::CONTROL))
+            .unwrap();
+        assert_eq!(app.displayed_theme(), Theme::CatppuccinMocha);
+        assert_eq!(app.theme, Theme::ModelRouter);
+        assert!(!app.theme_path.exists());
+        app.key(KeyEvent::new(Key::Char('p'), Mods::CONTROL))
+            .unwrap();
+        assert_eq!(app.displayed_theme(), Theme::ModelRouter);
+        app.key(key(Key::Down)).unwrap();
+        app.key(key(Key::Esc)).unwrap();
+        assert_eq!(app.displayed_theme(), Theme::ModelRouter);
+        assert!(!app.theme_path.exists());
+
+        app.key(key(Key::Char('T'))).unwrap();
+        for c in "latte".chars() {
+            app.key(key(Key::Char(c))).unwrap();
+        }
+        assert_eq!(app.displayed_theme(), Theme::CatppuccinLatte);
+        app.key(key(Key::Enter)).unwrap();
+        assert!(app.modal.is_none());
+        assert_eq!(app.theme, Theme::CatppuccinLatte);
+        assert_eq!(
+            theme::load(&app.theme_path).unwrap(),
+            Theme::CatppuccinLatte
+        );
+
+        app.key(key(Key::Char('T'))).unwrap();
+        for c in "no-such-theme".chars() {
+            app.key(key(Key::Char(c))).unwrap();
+        }
+        app.key(KeyEvent::new(Key::Char('n'), Mods::CONTROL))
+            .unwrap();
+        app.key(key(Key::Enter)).unwrap();
+        assert!(
+            app.modal.is_some(),
+            "An empty search must not choose a theme"
+        );
+        app.key(key(Key::Esc)).unwrap();
+        assert_eq!(app.displayed_theme(), Theme::CatppuccinLatte);
+        assert_eq!(
+            theme::load(&app.theme_path).unwrap(),
+            Theme::CatppuccinLatte
+        );
+        assert!(!app.dirty);
+        assert_eq!(app.task, "Keep my task");
+        assert_eq!(toml::to_string(&app.settings).unwrap(), settings);
+    }
+
+    #[test]
+    fn failed_theme_save_preserves_committed_theme_and_allows_cancel() {
+        let project = tempfile::tempdir().unwrap();
+        let mut app = theme_app(project.path());
+        let obstruction = project.path().join("not-a-directory");
+        std::fs::write(&obstruction, "keep this file").unwrap();
+        app.theme_path = obstruction.join("appearance.json");
+        app.choose_theme();
+        for c in "dracula".chars() {
+            app.key(key(Key::Char(c))).unwrap();
+        }
+        assert!(app.key(key(Key::Enter)).is_err());
+        assert!(
+            matches!(&app.modal, Some(Modal::Picker { note, .. }) if note.contains("Could not apply selection"))
+        );
+        assert_eq!(app.theme, Theme::ModelRouter);
+        app.key(key(Key::Esc)).unwrap();
+        assert_eq!(app.displayed_theme(), Theme::ModelRouter);
+        assert_eq!(
+            std::fs::read_to_string(obstruction).unwrap(),
+            "keep this file"
+        );
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn every_theme_reaches_pages_dialogs_and_text_inputs() {
+        let project = tempfile::tempdir().unwrap();
+        let mut app = theme_app(project.path());
+        app.task = "Preserve editor content".into();
+        for theme in Theme::ALL {
+            app.theme = theme;
+            let palette = theme.palette();
+            for (width, height) in [(120, 36), (80, 24)] {
+                let mut terminal =
+                    Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+                for action in [
+                    '1', '2', '3', '4', '1', 't', 'e', 'c', 'p', 'f', 'w', '?', 'T',
+                ] {
+                    app.modal = None;
+                    app.key(key(Key::Char(action))).unwrap();
+                    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                    let buffer = terminal.backend().buffer();
+                    assert_eq!(buffer[(0, 0)].bg, palette.bg, "{theme:?} {action}");
+                    assert!(
+                        buffer.content.iter().all(|cell| {
+                            [
+                                palette.bg,
+                                palette.panel,
+                                palette.selection_bg,
+                                palette.accent,
+                            ]
+                            .contains(&cell.bg)
+                        }),
+                        "Unstyled background in {theme:?}, view {action}"
+                    );
+                }
+                app.modal = None;
+            }
+        }
+        assert_eq!(app.task, "Preserve editor content");
+        assert!(!app.theme_path.exists());
+        assert!(!app.dirty);
     }
 
     #[test]
@@ -1948,5 +2714,136 @@ mod tests {
             .unwrap();
         assert_eq!(result.extra_args, stage.extra_args);
         assert_eq!(result.instructions, stage.instructions);
+    }
+
+    #[test]
+    fn harness_editor_applies_only_to_selected_stage_and_supports_cancel() {
+        let project = tempfile::tempdir().unwrap();
+        let mut app = theme_app(project.path());
+        let original = serde_json::to_value(&app.settings).unwrap();
+        app.key(key(Key::Char('c'))).unwrap();
+        for _ in 0..5 {
+            app.key(KeyEvent::new(Key::Char('n'), Mods::CONTROL))
+                .unwrap();
+        }
+        app.key(key(Key::Right)).unwrap();
+        app.key(key(Key::Esc)).unwrap();
+        assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+        assert!(!app.dirty);
+
+        app.key(key(Key::Char('c'))).unwrap();
+        for _ in 0..5 {
+            app.key(KeyEvent::new(Key::Char('n'), Mods::CONTROL))
+                .unwrap();
+        }
+        app.key(key(Key::Right)).unwrap();
+        app.key(key(Key::Right)).unwrap();
+        app.key(KeyEvent::new(Key::Char('n'), Mods::CONTROL))
+            .unwrap();
+        app.key(key(Key::Right)).unwrap();
+        app.key(KeyEvent::new(Key::Char('s'), Mods::CONTROL))
+            .unwrap();
+        assert!(app.modal.is_none());
+        assert!(app.dirty);
+        assert_eq!(app.stage().harness_settings["sandbox"], "workspace-write");
+        assert_eq!(
+            app.stage().harness_settings["approval_policy"],
+            "on-request"
+        );
+        for i in 1..3 {
+            assert_eq!(
+                serde_json::to_value(&app.settings.workflows[0].stages[i]).unwrap(),
+                original["workflows"][0]["stages"][i]
+            );
+        }
+        app.key(key(Key::Char('s'))).unwrap();
+        assert!(!app.dirty);
+        let (saved, _) = config::load(project.path(), Some(&app.config_path)).unwrap();
+        assert_eq!(
+            saved.workflows[0].stages[0].harness_settings,
+            app.stage().harness_settings
+        );
+        let saved_settings = serde_json::to_value(&app.settings).unwrap();
+        app.key(key(Key::Char('c'))).unwrap();
+        for _ in 0..4 {
+            app.key(KeyEvent::new(Key::Char('n'), Mods::CONTROL))
+                .unwrap();
+        }
+        app.key(KeyEvent::new(Key::Char('a'), Mods::CONTROL))
+            .unwrap();
+        app.key(KeyEvent::new(Key::Char('k'), Mods::CONTROL))
+            .unwrap();
+        app.key(key(Key::Char('0'))).unwrap();
+        app.key(KeyEvent::new(Key::Char('s'), Mods::CONTROL))
+            .unwrap();
+        assert!(
+            matches!(&app.modal, Some(Modal::Harness(e)) if e.error.contains("greater than zero"))
+        );
+        assert_eq!(serde_json::to_value(&app.settings).unwrap(), saved_settings);
+        app.key(key(Key::Esc)).unwrap();
+
+        // Both ways of switching harness discard incompatible structured options.
+        let mut editor =
+            StageEditor::new(app.stage().clone(), vec!["codex".into(), "claude".into()]);
+        editor.fields[2] = textarea("claude");
+        assert!(editor.finish().unwrap().harness_settings.is_empty());
+        app.pick(PickValue::Harness("claude".into())).unwrap();
+        assert!(app.stage().harness_settings.is_empty());
+    }
+
+    #[test]
+    fn harness_model_catalog_restores_draft_on_cancel_error_and_selection() {
+        let project = tempfile::tempdir().unwrap();
+        let mut app = theme_app(project.path());
+        let original = serde_json::to_value(&app.settings).unwrap();
+        app.key(key(Key::Char('c'))).unwrap();
+        app.key(KeyEvent::new(Key::Char('a'), Mods::CONTROL))
+            .unwrap();
+        app.key(KeyEvent::new(Key::Char('k'), Mods::CONTROL))
+            .unwrap();
+        for c in "draft-model".chars() {
+            app.key(key(Key::Char(c))).unwrap();
+        }
+        app.key(key(Key::F(2))).unwrap();
+        assert!(app.model_editor.is_some());
+        app.key(key(Key::Esc)).unwrap();
+        assert!(
+            matches!(&app.modal, Some(Modal::Harness(e)) if e.finish().unwrap().model == "draft-model")
+        );
+
+        app.key(key(Key::F(2))).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        sender.send(Err("Offline catalog".into())).unwrap();
+        app.catalog = Some(receiver);
+        app.poll().unwrap();
+        assert!(
+            matches!(&app.modal, Some(Modal::Harness(e)) if e.error.contains("Offline catalog") && e.finish().unwrap().model == "draft-model")
+        );
+
+        app.key(key(Key::F(2))).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(Catalog {
+                note: "Offline fixture".into(),
+                models: vec![Model {
+                    id: "selected-model".into(),
+                    provider: "provider".into(),
+                    label: "Model".into(),
+                    source: "test".into(),
+                    availability: "local".into(),
+                }],
+            }))
+            .unwrap();
+        app.catalog = Some(receiver);
+        app.poll().unwrap();
+        app.key(key(Key::Enter)).unwrap();
+        assert!(
+            matches!(&app.modal, Some(Modal::Harness(e)) if e.finish().unwrap().model == "selected-model")
+        );
+        assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+        app.key(KeyEvent::new(Key::Char('s'), Mods::CONTROL))
+            .unwrap();
+        assert_eq!(app.stage().model, "selected-model");
+        assert_eq!(app.stage().provider, "provider");
     }
 }

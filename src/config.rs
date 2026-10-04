@@ -73,6 +73,9 @@ pub struct Stage {
     pub mode: Mode,
     pub instructions: String,
     pub extra_args: Vec<String>,
+    /// Explicit harness-native settings for this stage; empty inherits native configuration.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub harness_settings: BTreeMap<String, String>,
     pub timeout_seconds: u64,
     /// An upstream implementation stage ID; empty chooses the nearest enabled one.
     pub repair_target: String,
@@ -91,6 +94,7 @@ impl Default for Stage {
             mode: Mode::Unattended,
             instructions: String::new(),
             extra_args: vec![],
+            harness_settings: BTreeMap::new(),
             timeout_seconds: 3600,
             repair_target: String::new(),
         }

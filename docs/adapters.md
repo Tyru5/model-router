@@ -19,6 +19,13 @@ model entitlement database.
 
 The router uses native authentication and forwards explicit user arguments.
 It never silently enables `--yolo`, `--force`, sandbox bypass, or permission bypass.
+The per-stage harness settings dialog (`c` on Workflow) can send explicit
+permission overrides. Codex sandbox and `approval_policy` config overrides,
+Claude `--permission-mode`, and Cursor `--sandbox` were checked against installed
+CLI help on 2026-10-04. Gemini's `--approval-mode` choices were checked against
+its [CLI reference](https://geminicli.com/docs/cli/cli-reference/). Extra arguments
+remain available for other native settings; conflicting permission overrides
+are rejected before execution. No override is emitted for Harness default.
 Unknown effort/provider combinations are rejected rather than ignored. Custom
 adapters can integrate other CLI versions or tools without changing Rust code.
 

@@ -1,4 +1,4 @@
-use super::{ACCENT, BG, FG, LINE, MUTED};
+use super::theme::Palette;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -15,11 +15,13 @@ use std::{
 
 const DURATION: Duration = Duration::from_millis(1700);
 const FRAME: Duration = Duration::from_millis(25);
-const VIOLET: Color = Color::Rgb(166, 145, 249);
-const BLUE: Color = Color::Rgb(115, 184, 255);
 
 /// Returns false when startup was interrupted, leaving terminal cleanup to Screen.
-pub(super) fn play<B: Backend>(terminal: &mut Terminal<B>, cancel: &AtomicBool) -> Result<bool> {
+pub(super) fn play<B: Backend>(
+    terminal: &mut Terminal<B>,
+    cancel: &AtomicBool,
+    palette: Palette,
+) -> Result<bool> {
     let started = Instant::now();
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -29,7 +31,7 @@ pub(super) fn play<B: Backend>(terminal: &mut Terminal<B>, cancel: &AtomicBool) 
         if elapsed >= DURATION {
             return Ok(true);
         }
-        terminal.draw(|frame| draw(frame, elapsed))?;
+        terminal.draw(|frame| draw(frame, elapsed, palette))?;
         if event::poll(FRAME.min(DURATION.saturating_sub(started.elapsed())))? {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
@@ -57,8 +59,7 @@ fn cell(frame: &mut Frame<'_>, area: Rect, x: u16, y: u16, symbol: &str, color: 
     if x < area.width && y < area.height {
         frame.buffer_mut()[(area.x + x, area.y + y)]
             .set_symbol(symbol)
-            .set_fg(color)
-            .set_bg(BG);
+            .set_fg(color);
     }
 }
 
@@ -79,29 +80,38 @@ fn centered(frame: &mut Frame<'_>, y: u16, text: &str, color: Color, bold: bool)
 }
 
 /// A decorative routing signal, independent of configuration, authentication, or model execution.
-fn draw(frame: &mut Frame<'_>, elapsed: Duration) {
+fn draw(frame: &mut Frame<'_>, elapsed: Duration, palette: Palette) {
     let area = frame.area();
     let seconds = elapsed.as_secs_f32();
     let reveal = (seconds / 0.22).clamp(0.12, 1.0);
     let settle = ((seconds - 1.34) / 0.25).clamp(0.0, 1.0);
-    frame.render_widget(Block::default().style(Style::default().bg(BG)), area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette.bg)),
+        area,
+    );
     if area.width < 35 || area.height < 18 {
         let middle = area.height / 2;
         centered(
             frame,
             middle.saturating_sub(1),
             "MODEL ROUTER",
-            mix(BG, ACCENT, reveal),
+            mix(palette.bg, palette.accent, reveal),
             true,
         );
         let symbols = ["·  ·  ·", "●  ·  ·", "·  ●  ·", "·  ·  ●", "●  ●  ●"];
         let step = ((seconds / DURATION.as_secs_f32()) * 5.0) as usize;
-        centered(frame, middle + 1, symbols[step.min(4)], ACCENT, false);
+        centered(
+            frame,
+            middle + 1,
+            symbols[step.min(4)],
+            palette.accent,
+            false,
+        );
         centered(
             frame,
             area.height.saturating_sub(1),
             "Any key to skip",
-            MUTED,
+            palette.muted,
             false,
         );
         return;
@@ -112,14 +122,14 @@ fn draw(frame: &mut Frame<'_>, elapsed: Duration) {
         frame,
         top,
         "M O D E L   R O U T E R",
-        mix(BG, FG, reveal),
+        mix(palette.bg, palette.fg, reveal),
         true,
     );
     centered(
         frame,
         top + 2,
         "Your task. Your models. Your flow.",
-        mix(BG, MUTED, reveal),
+        mix(palette.bg, palette.muted, reveal),
         false,
     );
 
@@ -135,7 +145,7 @@ fn draw(frame: &mut Frame<'_>, elapsed: Duration) {
     let node = width / 2;
     let join = width - split - 1;
     let end = width - 2;
-    let guide = mix(BG, LINE, reveal * (1.0 - settle * 0.35));
+    let guide = mix(palette.bg, palette.line, reveal * (1.0 - settle * 0.35));
 
     for x in start..=end {
         cell(frame, graph, x, 4, "─", guide);
@@ -161,7 +171,7 @@ fn draw(frame: &mut Frame<'_>, elapsed: Duration) {
         cell(frame, graph, x, y, symbol, guide);
     }
 
-    for (lane, (y, color)) in [(1, VIOLET), (4, ACCENT), (7, BLUE)]
+    for (lane, (y, color)) in [(1, palette.violet), (4, palette.accent), (7, palette.blue)]
         .into_iter()
         .enumerate()
     {
@@ -208,20 +218,31 @@ fn draw(frame: &mut Frame<'_>, elapsed: Duration) {
             cell(frame, graph, x, y, "─", glow);
         }
     }
-    cell(frame, graph, start, 4, "◇", mix(BG, ACCENT, reveal));
+    cell(
+        frame,
+        graph,
+        start,
+        4,
+        "◇",
+        mix(palette.bg, palette.accent, reveal),
+    );
     cell(
         frame,
         graph,
         end,
         4,
         "◆",
-        mix(guide, ACCENT, ((seconds - 1.1) / 0.3).clamp(0.0, 1.0)),
+        mix(
+            guide,
+            palette.accent,
+            ((seconds - 1.1) / 0.3).clamp(0.0, 1.0),
+        ),
     );
     centered(
         frame,
         top + 15,
         "Any key to skip · Ctrl+C quit",
-        mix(BG, MUTED, reveal),
+        mix(palette.bg, palette.muted, reveal),
         false,
     );
 }
@@ -232,13 +253,38 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
+    fn startup_uses_each_themes_background() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        for theme in super::super::Theme::ALL {
+            let palette = theme.palette();
+            terminal
+                .draw(|frame| draw(frame, Duration::from_millis(850), palette))
+                .unwrap();
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .all(|cell| cell.bg == palette.bg)
+            );
+        }
+    }
+
+    #[test]
     fn startup_renders_and_animates_at_wide_narrow_and_tiny_sizes() {
         for (width, height) in [(120, 36), (80, 24), (40, 10), (1, 1)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             let mut previous = None;
             for millis in [0, 450, 850, 1300, 1699] {
                 terminal
-                    .draw(|frame| draw(frame, Duration::from_millis(millis)))
+                    .draw(|frame| {
+                        draw(
+                            frame,
+                            Duration::from_millis(millis),
+                            super::super::Theme::default().palette(),
+                        )
+                    })
                     .unwrap();
                 let buffer = terminal.backend().buffer().clone();
                 if let Some(previous) = previous {
