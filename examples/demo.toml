@@ -1,0 +1,38 @@
+version = 1
+
+[adapters.demo]
+command = "python3"
+args = ["examples/mock_harness.py", "--role", "{provider}", "--model", "{model}", "--prompt-file", "{prompt_file}", "--handoff-file", "{handoff_file}", "--review-fail-until", "1"]
+interactive_args = ["examples/mock_harness.py", "--role", "{provider}", "--model", "{model}", "--prompt-file", "{prompt_file}", "--handoff-file", "{handoff_file}", "--interactive"]
+
+[[workflows]]
+name = "Offline demo"
+max_repair_passes = 2
+
+[[workflows.stages]]
+id = "research"
+name = "Research"
+role = "research"
+harness = "demo"
+provider = "research"
+model = "demo-researcher"
+instructions = "Investigate the task. This mock makes no model calls."
+
+[[workflows.stages]]
+id = "implement"
+name = "Implement"
+role = "implementation"
+harness = "demo"
+provider = "implementation"
+model = "demo-implementer"
+instructions = "Use the prior findings."
+
+[[workflows.stages]]
+id = "review"
+name = "Review (optional)"
+role = "review"
+enabled = false
+harness = "demo"
+provider = "review"
+model = "demo-reviewer"
+instructions = "Request one repair, then pass."
