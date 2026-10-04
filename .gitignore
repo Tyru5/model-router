@@ -37,6 +37,7 @@ venv/
 *.profraw
 *.profdata
 .cache/
+.codegraph/
 *.log
 *.tmp
 
