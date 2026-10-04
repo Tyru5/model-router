@@ -41,7 +41,7 @@ Use `model-router --no-animation` to open the editor immediately. Set
 subcommands bypass it automatically; `NO_COLOR` suppresses its colors.
 
 Opening the router does not start a model. Press `p` to choose a repository,
-`t` to describe the task,
+`t` to describe the task or `f` to import a task/spec,
 `e` to edit a stage, `m` to choose a model, and `r` to start. `Space` enables
 or disables a stage. `?` opens the full keyboard guide. Use `Ctrl+S` to apply
 text/form edits; `Esc` cancels them. `q` saves workflow edits and exits.
@@ -57,6 +57,7 @@ text/form edits; `Esc` cancels them. `q` saves workflow edits and exits.
 - Optional review-driven repairs, with two automatic repair passes by default.
 - Saved runs, explicit retry, model replacement, and resume.
 - Interactive repository browser, recent projects, and optional Git worktrees.
+- Editable task/spec imports from local files, text URLs, and GitHub issues/files.
 - CLI execution and previews using the same engine as the TUI.
 
 ## Select a repository
@@ -82,6 +83,52 @@ entire disk or clone remote repositories.
 Switching saves edits to the current workflow, loads the selected project's
 configuration, and resets the task and run view. Saved runs remain on disk.
 Recent projects persist across launches. Stop an active run before switching.
+
+## Import a task/spec
+
+Press `f` on the Workflow page to browse local Markdown or UTF-8 text files.
+The browser starts in the selected project. Type to filter, use `↑`/`↓` to
+select, and press `Enter` to open a folder or preview a file. `←` opens the
+parent folder; `Ctrl+L` accepts an absolute path, a path relative to the displayed
+folder, or a `~/` path.
+
+Press `Ctrl+U` in the browser to paste a URL instead:
+
+- Direct HTTP(S) links to Markdown or plain text.
+- GitHub issue URLs, importing the title, body, and source link.
+- GitHub file links (`blob`, `raw`, or `raw.githubusercontent.com`), including
+  branches with slashes, tags, and commit references.
+
+GitHub links use the GitHub CLI (`gh`) and its existing login, including private
+repositories. Run `gh auth login` if needed. Imports only read the selected
+file or issue; issue comments are not included. Other text URLs are fetched
+without GitHub credentials. Export HTML pages, PDFs, or Word documents to
+Markdown/plain text first.
+
+The preview is editable. `Tab` switches between **Append to task** and
+**Replace task**, preserving edits in each draft. An existing task defaults to
+Append; an empty task defaults to Replace. Append inserts a Markdown separator
+between the existing task and imported text. `Ctrl+S` applies the selected
+draft. `Esc` goes back or cancels a pending download; cancellation and failed
+imports preserve the existing task. Press `r` separately to start the workflow.
+
+The complete task must fit within **32 KiB of UTF-8 text**. Oversized files or
+combined drafts show an error; text is never silently truncated. Imports remove
+a UTF-8 byte-order mark and normalize line endings. The source remains
+unchanged. Starting a run saves a copy of the task for every stage and resume,
+so later source edits or deletion cannot change that run.
+
+CLI imports start the configured workflow directly:
+
+```sh
+model-router run --task-file docs/spec.md
+model-router run --task-url 'https://github.com/owner/repo/issues/123'
+model-router run --task-url 'https://github.com/owner/repo/blob/main/docs/spec.md'
+```
+
+Choose one of `--task`, `--task-file`, or `--task-url`. Relative CLI file paths
+resolve from the shell's working directory. Use the TUI to preview and edit
+before starting a run.
 
 ## Harness and model support
 
@@ -286,6 +333,7 @@ cargo clippy --all-targets -- -D warnings
 cargo build
 uv run --with pyte python scripts/smoke_tui.py
 uv run --with pyte python scripts/smoke_repos.py
+uv run --with pyte python scripts/smoke_imports.py
 uv run --with pyte --with pillow python scripts/smoke_startup.py
 ```
 
@@ -294,6 +342,9 @@ resizing, disabled review, interactive completion, history, and terminal cleanup
 The repository test covers navigation, filtering, recent projects, configuration
 loading, autosave, and recovery from invalid paths/configuration. Screen captures
 are text files in `.model-router/qa/`.
+The import test covers file browsing, text and GitHub URLs, editable previews,
+append/replace, cancellation, errors, and saved task contents using a local HTTP
+server and an offline GitHub CLI fixture.
 The startup test verifies animation, automatic completion, skip/bypass controls,
 resize, and interrupt cleanup. It also records a GIF preview from the real
 terminal at `.model-router/qa/startup.gif`.

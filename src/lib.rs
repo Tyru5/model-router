@@ -5,4 +5,5 @@ pub mod engine;
 pub mod handoff;
 pub mod process;
 pub mod storage;
+pub mod task_import;
 pub mod tui;

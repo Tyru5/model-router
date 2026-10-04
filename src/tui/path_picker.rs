@@ -18,6 +18,7 @@ use tui_textarea::TextArea;
 struct Entry {
     path: PathBuf,
     repository: bool,
+    directory: bool,
 }
 
 impl Entry {
@@ -25,6 +26,7 @@ impl Entry {
         // Linked worktrees and submodules use a .git file instead of a directory.
         let git = path.join(".git");
         Self {
+            directory: path.is_dir(),
             path,
             repository: git.is_dir() || git.is_file(),
         }
@@ -44,7 +46,7 @@ pub(super) enum PickerAction {
     Close,
 }
 
-pub(super) struct RepoPicker {
+pub(super) struct PathPicker {
     directory: PathBuf,
     entries: Vec<Entry>,
     recent: Vec<Entry>,
@@ -53,9 +55,10 @@ pub(super) struct RepoPicker {
     filter: TextArea<'static>,
     path_input: Option<TextArea<'static>>,
     pub error: String,
+    files: bool,
 }
 
-impl RepoPicker {
+impl PathPicker {
     pub fn new(project: &Path, recent: Vec<PathBuf>) -> Result<Self> {
         let mut picker = Self {
             directory: project.into(),
@@ -70,10 +73,27 @@ impl RepoPicker {
             filter: textarea(""),
             path_input: None,
             error: String::new(),
+            files: false,
         };
         let parent = project.parent().unwrap_or(project);
         picker.visit(parent).or_else(|_| picker.visit(project))?;
         picker.select_path(project);
+        Ok(picker)
+    }
+
+    pub fn files(project: &Path) -> Result<Self> {
+        let mut picker = Self {
+            directory: project.into(),
+            entries: vec![],
+            recent: vec![],
+            show_recent: false,
+            selected: 0,
+            filter: textarea(""),
+            path_input: None,
+            error: String::new(),
+            files: true,
+        };
+        picker.visit(project)?;
         Ok(picker)
     }
 
@@ -82,12 +102,19 @@ impl RepoPicker {
         let mut entries: Vec<_> = fs::read_dir(&directory)
             .with_context(|| format!("Cannot browse {}", directory.display()))?
             .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_name() != ".git" && entry.path().is_dir())
+            .filter(|entry| {
+                entry.file_name() != ".git"
+                    && (entry.path().is_dir() || (self.files && entry.path().is_file()))
+            })
             .map(|entry| Entry::new(entry.path()))
             .collect();
         entries.sort_by_cached_key(|entry| {
             (
-                !entry.repository,
+                if self.files {
+                    !entry.directory
+                } else {
+                    !entry.repository
+                },
                 entry.name().to_lowercase(),
                 entry.path.clone(),
             )
@@ -114,7 +141,7 @@ impl RepoPicker {
     fn matches(&self) -> Vec<Option<usize>> {
         let query = content(&self.filter).to_lowercase();
         let mut matches = vec![];
-        if !self.show_recent && query.is_empty() {
+        if !self.files && !self.show_recent && query.is_empty() {
             matches.push(None);
         }
         matches.extend(
@@ -146,7 +173,14 @@ impl RepoPicker {
         match matches.get(self.selected.min(matches.len().saturating_sub(1)))? {
             Some(index) => {
                 let entry = &self.entries()[*index];
-                Some((entry.path.clone(), self.show_recent || entry.repository))
+                Some((
+                    entry.path.clone(),
+                    if self.files {
+                        !entry.directory
+                    } else {
+                        self.show_recent || entry.repository
+                    },
+                ))
             }
             None => Some((self.directory.clone(), true)),
         }
@@ -178,6 +212,9 @@ impl RepoPicker {
                 Key::Enter => {
                     let value = content(input);
                     let path = self.resolve_path(&value)?;
+                    if self.files && !path.is_dir() {
+                        return Ok(PickerAction::Select(path));
+                    }
                     self.visit(&path)?;
                     self.path_input = None;
                 }
@@ -196,9 +233,11 @@ impl RepoPicker {
         match key.code {
             Key::Esc => return Ok(PickerAction::Close),
             Key::Tab | Key::BackTab => {
-                self.show_recent = !self.show_recent;
-                self.filter = textarea("");
-                self.selected = 0;
+                if !self.files {
+                    self.show_recent = !self.show_recent;
+                    self.filter = textarea("");
+                    self.selected = 0;
+                }
             }
             Key::Up => self.selected = self.selected.saturating_sub(1),
             Key::Down => {
@@ -219,7 +258,9 @@ impl RepoPicker {
                     if key.code == Key::Enter && selectable {
                         return Ok(PickerAction::Select(path));
                     }
-                    self.visit(&path)?;
+                    if !self.files || !selectable {
+                        self.visit(&path)?;
+                    }
                 }
             }
             _ => {
@@ -231,7 +272,12 @@ impl RepoPicker {
     }
 
     pub fn draw(&mut self, frame: &mut Frame<'_>, rect: Rect) {
-        let block = panel(" Choose repository ").border_style(Style::default().fg(ACCENT));
+        let block = panel(if self.files {
+            " Import task/spec · choose file "
+        } else {
+            " Choose repository "
+        })
+        .border_style(Style::default().fg(ACCENT));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         let chunks = Layout::vertical([
@@ -243,13 +289,21 @@ impl RepoPicker {
             Constraint::Length(3),
         ])
         .split(inner);
-        frame.render_widget(
-            Tabs::new(["Folders", "Recent"])
-                .select(usize::from(self.show_recent))
-                .style(Style::default().fg(MUTED))
-                .highlight_style(selected_style()),
-            chunks[0],
-        );
+        if self.files {
+            frame.render_widget(
+                Paragraph::new("Markdown / text files · Ctrl+U import a URL")
+                    .style(Style::default().fg(MUTED)),
+                chunks[0],
+            );
+        } else {
+            frame.render_widget(
+                Tabs::new(["Folders", "Recent"])
+                    .select(usize::from(self.show_recent))
+                    .style(Style::default().fg(MUTED))
+                    .highlight_style(selected_style()),
+                chunks[0],
+            );
+        }
         frame.render_widget(
             Paragraph::new(storage::clean_terminal(
                 &self.directory.display().to_string(),
@@ -259,7 +313,11 @@ impl RepoPicker {
             chunks[1],
         );
         if let Some(input) = &mut self.path_input {
-            input.set_block(panel(" Directory path · Enter browse · Esc back "));
+            input.set_block(panel(if self.files {
+                " File or directory path · Enter open · Esc back "
+            } else {
+                " Directory path · Enter browse · Esc back "
+            }));
             frame.render_widget(&*input, chunks[2]);
         } else {
             self.filter
@@ -271,6 +329,8 @@ impl RepoPicker {
         if matches.is_empty() {
             let message = if self.show_recent && content(&self.filter).is_empty() {
                 "No recent projects. Press Tab to browse folders."
+            } else if self.files {
+                "No matching files or folders. Clear the filter or use Ctrl+L."
             } else {
                 "No matching folders. Clear the filter or use Ctrl+L."
             };
@@ -292,7 +352,9 @@ impl RepoPicker {
                     };
                     ListItem::new(Line::from(vec![
                         Span::styled(
-                            if entry.repository {
+                            if !entry.directory {
+                                "[file]    "
+                            } else if entry.repository && !self.files {
                                 "[repo]    "
                             } else {
                                 "[folder]  "
@@ -323,7 +385,11 @@ impl RepoPicker {
             chunks[4],
         );
         frame.render_widget(
-            Paragraph::new("↑↓ select · Enter choose repo / open folder · → browse repo\n← parent · Tab recent/folders · Esc cancel\nSwitching projects saves workflow edits; task/run view resets.")
+            Paragraph::new(if self.files {
+                "↑↓ select · Enter open folder / preview file · ← parent\nCtrl+L enter path · Ctrl+U URL · Esc cancel\nPreview, edit, then append to or replace your task."
+            } else {
+                "↑↓ select · Enter choose repo / open folder · → browse repo\n← parent · Tab recent/folders · Esc cancel\nSwitching projects saves workflow edits; task/run view resets."
+            })
                 .style(Style::default().fg(MUTED)).wrap(Wrap { trim: false }),
             chunks[5],
         );
@@ -334,11 +400,42 @@ impl RepoPicker {
 mod tests {
     use super::*;
 
-    fn key(picker: &mut RepoPicker, code: Key) -> Result<PickerAction> {
+    #[test]
+    fn task_file_mode_browses_directories_and_selects_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        fs::create_dir(&docs).unwrap();
+        let spec = docs.join("Feature 雪.md");
+        fs::write(&spec, "# A task").unwrap();
+        let mut picker = PathPicker::files(dir.path()).unwrap();
+        picker.paste("docs");
+        assert!(matches!(
+            key(&mut picker, Key::Enter).unwrap(),
+            PickerAction::Stay
+        ));
+        assert_eq!(picker.directory, docs);
+        assert!(
+            !picker.matches().contains(&None),
+            "Files mode must not select a directory as a task"
+        );
+        picker.paste("Feature");
+        assert!(
+            matches!(key(&mut picker, Key::Enter).unwrap(), PickerAction::Select(path) if path == spec)
+        );
+        assert!(matches!(
+            key(&mut picker, Key::Right).unwrap(),
+            PickerAction::Stay
+        ));
+        assert!(
+            matches!(open_path(&mut picker, &spec.display().to_string()).unwrap(), PickerAction::Select(path) if path == spec)
+        );
+    }
+
+    fn key(picker: &mut PathPicker, code: Key) -> Result<PickerAction> {
         picker.key(KeyEvent::new(code, Mods::NONE))
     }
 
-    fn open_path(picker: &mut RepoPicker, path: &str) -> Result<PickerAction> {
+    fn open_path(picker: &mut PathPicker, path: &str) -> Result<PickerAction> {
         picker.key(KeyEvent::new(Key::Char('l'), Mods::CONTROL))?;
         picker.paste(path);
         key(picker, Key::Enter)
@@ -355,7 +452,7 @@ mod tests {
         fs::create_dir_all(repo.join(".git")).unwrap();
         fs::create_dir(&linked).unwrap();
         fs::write(linked.join(".git"), "gitdir: /elsewhere/worktrees/linked\n").unwrap();
-        let mut picker = RepoPicker::new(&project, vec![]).unwrap();
+        let mut picker = PathPicker::new(&project, vec![]).unwrap();
         picker.paste("projects");
         assert!(matches!(
             key(&mut picker, Key::Enter).unwrap(),
@@ -388,7 +485,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("current");
         fs::create_dir(&project).unwrap();
-        let mut picker = RepoPicker::new(&project, vec![]).unwrap();
+        let mut picker = PathPicker::new(&project, vec![]).unwrap();
         picker.paste("no such repo");
         assert!(matches!(
             key(&mut picker, Key::Enter).unwrap(),
@@ -416,7 +513,7 @@ mod tests {
         let other = root.path().join("empty folder 雪");
         fs::create_dir(&project).unwrap();
         fs::create_dir(&other).unwrap();
-        let mut picker = RepoPicker::new(&project, vec![]).unwrap();
+        let mut picker = PathPicker::new(&project, vec![]).unwrap();
         open_path(&mut picker, "./empty folder 雪").unwrap();
         assert!(
             matches!(key(&mut picker, Key::Enter).unwrap(), PickerAction::Select(path) if path == other)
@@ -444,7 +541,7 @@ mod tests {
         let second = root.path().join("second");
         fs::create_dir(&project).unwrap();
         fs::create_dir(&second).unwrap();
-        let mut picker = RepoPicker::new(
+        let mut picker = PathPicker::new(
             &project,
             vec![project.clone(), root.path().join("deleted"), second.clone()],
         )
@@ -470,7 +567,7 @@ mod tests {
         symlink(&project, root.path().join("repo-alias")).unwrap();
         symlink(root.path(), root.path().join("loop")).unwrap();
         symlink(root.path().join("missing"), root.path().join("broken")).unwrap();
-        let mut picker = RepoPicker::new(&project, vec![]).unwrap();
+        let mut picker = PathPicker::new(&project, vec![]).unwrap();
         picker.paste("repo-alias");
         assert!(
             matches!(key(&mut picker, Key::Enter).unwrap(), PickerAction::Select(path) if path == root.path().join("repo-alias"))

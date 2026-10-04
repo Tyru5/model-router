@@ -39,9 +39,11 @@ use std::{
 };
 use tui_textarea::TextArea;
 
-mod repo_picker;
+mod path_picker;
 mod startup;
-use repo_picker::{PickerAction, RepoPicker};
+mod task_importer;
+use path_picker::{PathPicker, PickerAction};
+use task_importer::{ImportAction, TaskImporter};
 
 const BG: Color = Color::Rgb(13, 20, 33);
 const PANEL: Color = Color::Rgb(19, 29, 45);
@@ -124,7 +126,8 @@ enum Modal {
         text: TextArea<'static>,
     },
     Stage(Box<StageEditor>),
-    Repositories(Box<RepoPicker>),
+    Repositories(Box<PathPicker>),
+    Import(Box<TaskImporter>),
     Picker {
         title: String,
         items: Vec<Choice>,
@@ -160,7 +163,7 @@ struct StageEditor {
     harnesses: Vec<String>,
 }
 fn textarea(value: &str) -> TextArea<'static> {
-    let mut text = TextArea::from(value.lines().map(str::to_owned).collect::<Vec<_>>());
+    let mut text = TextArea::from(value.split('\n').map(str::to_owned).collect::<Vec<_>>());
     text.set_style(Style::default().fg(FG).bg(PANEL));
     text.set_cursor_line_style(Style::default());
     text.set_cursor_style(Style::default().fg(BG).bg(ACCENT));
@@ -384,6 +387,9 @@ impl App {
         Ok(())
     }
     fn poll(&mut self) -> Result<bool> {
+        if let Some(Modal::Import(importer)) = &mut self.modal {
+            importer.poll();
+        }
         let messages: Vec<_> = self
             .worker
             .as_ref()
@@ -591,7 +597,7 @@ impl App {
         let Some(mut modal) = self.modal.take() else {
             return Ok(());
         };
-        if key.code == Key::Esc && !matches!(modal, Modal::Repositories(_)) {
+        if key.code == Key::Esc && !matches!(modal, Modal::Repositories(_) | Modal::Import(_)) {
             self.catalog = None;
             return Ok(());
         }
@@ -634,6 +640,15 @@ impl App {
                         Err(error) => picker.error = format!("{error:#}"),
                     }
                 }
+                Modal::Import(importer) => match importer.key(key) {
+                    ImportAction::Stay => {}
+                    ImportAction::Close => keep = false,
+                    ImportAction::Apply(task) => {
+                        self.task = task;
+                        self.message = "Task imported. t edits it; r starts the workflow.".into();
+                        keep = false;
+                    }
+                },
                 Modal::Text { scroll, .. } => match key.code {
                     Key::Up | Key::Char('k') => *scroll = scroll.saturating_sub(1),
                     Key::Down | Key::Char('j') => *scroll = scroll.saturating_add(1),
@@ -808,9 +823,15 @@ impl App {
                 &self.task.clone(),
             ),
             Key::Char('p') => {
-                self.modal = Some(Modal::Repositories(Box::new(RepoPicker::new(
+                self.modal = Some(Modal::Repositories(Box::new(PathPicker::new(
                     &self.project,
                     storage::recent_projects(),
+                )?)));
+            }
+            Key::Char('f') => {
+                self.modal = Some(Modal::Import(Box::new(TaskImporter::new(
+                    &self.project,
+                    &self.task,
                 )?)));
             }
             Key::Char('w') => {
@@ -1155,7 +1176,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     );
     let help = match app.page {
         0 => {
-            "p repos  t task  e edit  m models  Space enable  v mode  r run  s save  ? help  q quit"
+            "p repos  t task  f import  e edit  m models  Space enable  r run  s save  ? help  q quit"
         }
         1 if app.worker.is_some() => {
             "c cancel stage  h handoff  PgUp/PgDn logs  Tab switch view  q stop & exit"
@@ -1208,12 +1229,12 @@ fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(if app.task.is_empty() {
-            "Describe what you want done. Press t to write the task."
+            "Press t to write a task, or f to import a task/spec."
         } else {
             &app.task
         })
         .wrap(Wrap { trim: false })
-        .block(panel(" Task · t edit "))
+        .block(panel(" Task · t edit · f import file / URL "))
         .style(Style::default().fg(if app.task.is_empty() { MUTED } else { FG })),
         chunks[1],
     );
@@ -1509,6 +1530,7 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
     frame.render_widget(Clear, rect);
     match modal {
         Modal::Repositories(picker) => picker.draw(frame, rect),
+        Modal::Import(importer) => importer.draw(frame, rect),
         Modal::Input { title, text, .. } => {
             let block = panel(format!(" {title} ")).border_style(Style::default().fg(ACCENT));
             let inner = block.inner(rect);
@@ -1613,7 +1635,7 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
     }
 }
 
-const HELP: &str = "WORKFLOW\nt  Edit task (Ctrl+S applies; Enter adds a line)\np  Browse repositories (type to filter; Tab for recent)\n   Enter selects a repo or opens a folder; Right browses inside a repo\n   Left goes to parent; Ctrl+L enters a path; Esc cancels\nw  Select/create workflow    R  Rename    X  Delete workflow\ne / Enter  Edit selected stage\nh  Pick harness    m  Discover models\nSpace  Enable/disable stage, including optional review\nv  Toggle unattended/interactive\na  Add stage    d  Duplicate    x  Remove\nJ / K  Move stage down/up\ng  Toggle isolated Git worktree\nl  Set automatic repair limit\nP  Preview commands (no model calls)\ns  Save project    S  Save global templates\nr  Start workflow\n\nMONITOR\nc  Cancel active stage; continue when idle\na  Accept interactive handoff and advance\ny  Explicitly retry current stage\ni  Retry current stage interactively\nm  Replace current model and retry\nh  Inspect handoff/error    PgUp / PgDn  Scroll output\nn  Return to workflow editor\n\nINTERACTIVE HARNESS\nNative terminal keys and paste are forwarded.\nExit the harness to inspect its handoff.\nCtrl+] stops a stuck stage.\n\nEVERYWHERE\n1–4 / Tab  Switch views    ?  Guide\nq  Save workflow edits and exit (stops active work first)\nCtrl+C  Cancel work or exit\n\nSaved runs snapshot their workflow. Template edits affect new runs.\nRetries retain filesystem changes. Disabled reviews never gate a run.\nArtifacts: <project>/.model-router/runs/\nProvider credentials stay with each harness. Catalogs do not prove universal access.";
+const HELP: &str = "WORKFLOW\nt  Edit task (Ctrl+S applies; Enter adds a line)\nf  Import task/spec: browse files; Ctrl+U opens URL import\n   Preview and edit; Tab append/replace; Ctrl+S apply; Esc back\np  Browse repositories (type to filter; Tab for recent)\n   Enter selects a repo or opens a folder; Right browses inside a repo\n   Left goes to parent; Ctrl+L enters a path; Esc cancels\nw  Select/create workflow    R  Rename    X  Delete workflow\ne / Enter  Edit selected stage\nh  Pick harness    m  Discover models\nSpace  Enable/disable stage, including optional review\nv  Toggle unattended/interactive\na  Add stage    d  Duplicate    x  Remove\nJ / K  Move stage down/up\ng  Toggle isolated Git worktree\nl  Set automatic repair limit\nP  Preview commands (no model calls)\ns  Save project    S  Save global templates\nr  Start workflow\n\nMONITOR\nc  Cancel active stage; continue when idle\na  Accept interactive handoff and advance\ny  Explicitly retry current stage\ni  Retry current stage interactively\nm  Replace current model and retry\nh  Inspect handoff/error    PgUp / PgDn  Scroll output\nn  Return to workflow editor\n\nINTERACTIVE HARNESS\nNative terminal keys and paste are forwarded.\nExit the harness to inspect its handoff.\nCtrl+] stops a stuck stage.\n\nEVERYWHERE\n1–4 / Tab  Switch views    ?  Guide\nq  Save workflow edits and exit (stops active work first)\nCtrl+C  Cancel work or exit\n\nSaved runs snapshot their workflow. Template edits affect new runs.\nRetries retain filesystem changes. Disabled reviews never gate a run.\nArtifacts: <project>/.model-router/runs/\nProvider credentials stay with each harness. Catalogs do not prove universal access.";
 
 pub fn run(
     project: PathBuf,
@@ -1679,6 +1701,7 @@ pub fn run(
                         filter.insert_str(text);
                     }
                     Some(Modal::Repositories(picker)) => picker.paste(&text),
+                    Some(Modal::Import(importer)) => importer.paste(&text),
                     _ => {}
                 },
                 _ => {}
@@ -1718,7 +1741,7 @@ mod tests {
                 assert!(text.contains("MODEL ROUTER"));
             }
             app.modal = Some(Modal::Repositories(Box::new(
-                RepoPicker::new(&app.project, vec![]).unwrap(),
+                PathPicker::new(&app.project, vec![]).unwrap(),
             )));
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
             if width >= 65 {

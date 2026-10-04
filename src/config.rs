@@ -282,12 +282,14 @@ pub fn load(project: &Path, explicit: Option<&Path>) -> Result<(Settings, PathBu
     Ok((settings, save_path))
 }
 
+pub const MAX_TASK_BYTES: usize = 32 * 1024;
+
 pub fn validate_task(task: &str) -> Result<()> {
     if task.trim().is_empty() {
         bail!("Enter a task before starting a run");
     }
     ensure!(
-        task.len() <= 32768,
+        task.len() <= MAX_TASK_BYTES,
         "Task must be at most 32768 bytes; reference larger files by path"
     );
     Ok(())

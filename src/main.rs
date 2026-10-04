@@ -1,13 +1,12 @@
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use model_router::{
     adapters, catalog,
     config::{self, Mode, Role, Settings},
     engine::{self, Action, Event, Run, Status},
-    storage, tui,
+    storage, task_import, tui,
 };
 use std::{
-    fs,
     io::{self, IsTerminal, Write},
     path::PathBuf,
     sync::{
@@ -55,10 +54,14 @@ enum Commands {
     Run {
         #[arg(short, long)]
         workflow: Option<String>,
-        #[arg(long, conflicts_with = "task_file")]
+        #[arg(long, conflicts_with_all = ["task_file", "task_url"])]
         task: Option<String>,
-        #[arg(long)]
+        /// Import a local Markdown or UTF-8 text task/spec (up to 32 KiB).
+        #[arg(long, conflicts_with = "task_url")]
         task_file: Option<PathBuf>,
+        /// Import a direct text URL or GitHub issue/file URL (up to 32 KiB).
+        #[arg(long)]
+        task_url: Option<String>,
         #[arg(long)]
         worktree: bool,
         #[arg(long)]
@@ -201,14 +204,16 @@ fn main_result() -> Result<()> {
             workflow,
             task,
             task_file,
+            task_url,
             worktree,
             unattended,
             with_review,
         }) => {
-            let task = match (task, task_file) {
-                (Some(task), _) => task,
-                (_, Some(path)) => fs::read_to_string(path).context("Read task file")?,
-                _ => bail!("Supply --task or --task-file"),
+            let task = match (task, task_file, task_url) {
+                (Some(task), _, _) => task,
+                (_, Some(path), _) => task_import::read(&path)?,
+                (_, _, Some(url)) => task_import::read_url(&url, &cancel)?,
+                _ => bail!("Supply --task, --task-file, or --task-url"),
             };
             let mut workflow = settings.workflow(workflow.as_deref())?.clone();
             for stage in &mut workflow.stages {

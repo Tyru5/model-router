@@ -4,6 +4,7 @@
 Run: uv run --with pyte python scripts/smoke_tui.py
 """
 import fcntl
+import codecs
 import json
 import os
 from pathlib import Path
@@ -37,6 +38,7 @@ class Terminal:
         self.screen = pyte.Screen(*size)
         self.stream = pyte.Stream(self.screen)
         self.raw = bytearray()
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.resize(*size)
         self.exited = False
 
@@ -57,7 +59,7 @@ class Terminal:
                 if not data:
                     return
                 self.raw.extend(data)
-                self.stream.feed(data.decode("utf-8", errors="replace"))
+                self.stream.feed(self.decoder.decode(data))
                 if b"\x1b[6n" in data:
                     os.write(self.fd, b"\x1b[1;1R")
 

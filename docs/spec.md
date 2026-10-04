@@ -3,8 +3,8 @@
 ## Product contract
 
 An installable Rust terminal application for personal use on Linux and macOS.
-The user chooses a project, writes a task, selects a workflow, assigns a harness
-and native model/alias/mode to each stage, and starts the workflow. Every stage
+The user chooses a project, writes or imports a task, selects a workflow, assigns
+a harness and native model/alias/mode to each stage, and starts the workflow. Every stage
 can be interactive or unattended. The starter workflow is Codex/Astra research,
 then interactive Claude Code implementation. Review is disabled by default.
 
@@ -73,6 +73,14 @@ API clients, automatic task classification, and embedded IDE control are exclude
 - Workflow editor with task, project, stage order, enable toggle, execution mode,
   model selector, provider, reasoning effort, instructions, and extra arguments.
 - Workflow picker and local/global template saving.
+- Task/spec import from local Markdown/UTF-8 files, direct HTTP(S) text URLs,
+  and GitHub issue/file links. Reuse `gh` authentication for GitHub access.
+  Browse files or enter a path/URL, then edit an append/replace preview.
+  Default to append when a task exists. Apply explicitly; importing never starts
+  execution. Cancellation and errors preserve the current task. Limit the final
+  task to 32 KiB, normalize BOM/line endings, and snapshot its contents into each
+  run. Leave source files and issues unchanged. CLI `--task-file`/`--task-url`
+  use the same importer before starting execution.
 - Repository browser with type-to-filter, folder navigation, direct path entry,
   and persistent recent projects. Recognizes Git directories and `.git` files
   for linked worktrees/submodules; non-Git folders can also be selected.
@@ -101,3 +109,6 @@ API clients, automatic task classification, and embedded IDE control are exclude
    and resulting worktree intact.
 10. Test harness integrations without paid inference; distinguish mock-tested
     command contracts from live authenticated end-to-end verification.
+11. Import a local or remote spec, edit and append/replace it, and pass its saved
+    contents through all stages even after the source is changed or removed.
+    Invalid documents and cancelled downloads must leave the existing task intact.
