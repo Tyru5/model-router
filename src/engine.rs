@@ -267,6 +267,16 @@ impl Run {
             );
             return Ok(());
         }
+        if stage.role == Role::Test
+            && (handoff.requires_repair()
+                || handoff
+                    .tests
+                    .iter()
+                    .any(|test| test.required && test.status == handoff::TestStatus::NotRun))
+        {
+            self.fail(Status::Blocked, "Test stage reports incomplete verification; inspect its findings and required checks before retrying".into());
+            return Ok(());
+        }
         if stage.role == Role::Review && handoff.requires_repair() {
             let feedback = format!(
                 "Review {} requested changes:\n{}",
@@ -535,8 +545,8 @@ fn finish(run: &mut Run, prepared: &Prepared, result: Result<process::Outcome>) 
     // Interactive terminal transcripts can echo the original prompt (including
     // the example JSON). Never infer a structured verdict from an echoed prompt.
     if stage.mode == Mode::Interactive && !prepared.handoff_file.is_file() {
-        if stage.role == Role::Review {
-            run.fail(Status::Blocked, "Interactive review did not write its handoff file. Reopen it to produce an explicit verdict".into());
+        if matches!(stage.role, Role::Review | Role::Test) {
+            run.fail(Status::Blocked, format!("Interactive {} did not write its handoff file. Reopen it to produce a structured verdict and evidence", stage.role.label()));
             return Ok(());
         }
         let handoff = Handoff {

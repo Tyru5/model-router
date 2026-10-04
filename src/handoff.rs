@@ -75,6 +75,7 @@ pub const FORMAT: &str = r#"<router-handoff>
 {"summary":"What was established or changed","verdict":"complete","findings":[],"decisions":[],"files_changed":[],"tests":[{"command":"check actually run","status":"passed","required":true}],"unresolved":[]}
 </router-handoff>
 Use complete for normal successful stages. Reviews MUST use pass or needs_changes.
+Test stages MUST return a structured handoff with actual check results in tests.
 Use blocked if you cannot complete the task (including missing permission).
 Findings use {"severity":"blocking" or "advisory","description":"specific evidence"}.
 Tests use status passed, failed, or not_run. Never claim a test ran if it did not.
@@ -113,6 +114,11 @@ pub fn parse(text: &str, role: Role) -> Result<Handoff> {
     if role == Role::Review {
         bail!(
             "Review did not return a valid structured verdict. Reopen or retry it; it has not passed"
+        );
+    }
+    if role == Role::Test {
+        bail!(
+            "Test stage did not return a valid structured handoff. Reopen or retry it with test evidence; verification has not passed"
         );
     }
     ensure!(

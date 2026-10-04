@@ -49,6 +49,7 @@ text/form edits; `Esc` cancels them. `q` saves workflow edits and exits.
 ## What works
 
 - Named workflow templates and per-run snapshots.
+- Twelve stage presets and four ready-to-edit workflow presets.
 - Explicit harness/model/provider/effort selection and extra CLI arguments.
 - Optional research, planning, implementation, review, testing, and custom stages.
 - Native interactive terminals, including paste, resize, and a saved transcript.
@@ -163,6 +164,63 @@ Model discovery is deliberately labeled:
 Custom IDs always remain editable. Built-in discovery does not send inference requests.
 The router does not silently replace a model that fails or is unavailable.
 
+## Stage and workflow presets
+
+Press `a` on the Workflow page to choose a stage. Type to filter the catalog;
+the selected preset shows its purpose and default routing. `Enter` opens its
+editable name, harness, model, mode, and instructions. `Ctrl+S` inserts the stage
+after the selected stage; `Esc` cancels without changing the workflow.
+
+| Stage | Purpose |
+| --- | --- |
+| Clarify requirements | Scope, acceptance criteria, assumptions, and open questions |
+| Research | Project investigation and evidence gathering |
+| Diagnose bug | Reproduction, root cause, and a regression check |
+| Design solution | Architecture, interfaces, behavior, and tradeoffs |
+| Plan implementation | Ordered changes and validation steps |
+| Implement | Code changes and appropriate tests |
+| Verify tests | Acceptance checks with actual results; no code fixes |
+| Code review | Correctness, regressions, and optional repair requests |
+| Security review | Relevant trust boundaries, permissions, and data handling |
+| Update documentation | Usage, examples, and operational notes |
+| Summarize handoff | Outcome, evidence, limitations, and next actions |
+| Custom stage | Blank instructions and your own routing |
+
+Analysis, verification, and review presets start with unattended Codex/Astra.
+Implementation and documentation use interactive Claude/Sonnet. Custom stages
+inherit Codex's native model default. These are editable starting points using
+the same model choices as the starter workflow; choose IDs available to your
+account. Presets do not change your existing stages or saved runs.
+
+Press `w` and choose **+ Preset:** to add a workflow:
+
+| Workflow | Enabled sequence |
+| --- | --- |
+| Quick task | Implement → verify |
+| Full feature | Clarify → research → design → plan → implement → verify → document → handoff |
+| Bug fix | Diagnose → implement → verify |
+| Investigation | Research → handoff |
+
+The first three include a disabled code review; Full feature also includes a
+disabled security review. Enable either with `Space` when wanted. Adding a
+review through `a` explicitly opts that stage in. All stages can be disabled,
+reordered, duplicated, removed, or reassigned to another harness/model.
+Repeated workflow presets get distinct names and leave existing workflows intact.
+The original short starter workflow remains the default.
+
+```sh
+model-router presets                 # list stage and workflow presets
+model-router init --preset bug-fix    # create a project config from a preset
+```
+
+Initialization refuses to overwrite an existing config unless you pass
+`--force`. Use `w` in the TUI to add presets to an existing configuration.
+
+Verification stages require a structured handoff. Blocking findings, failed
+required checks, or required checks marked `not_run` stop the run for inspection
+and explicit retry, even with reviews disabled. Automatic repair loops remain
+specific to enabled review stages.
+
 ## Workflow files
 
 ```sh
@@ -177,10 +235,10 @@ global config, then the starter workflow. The project file replaces the global
 template set. Global configuration uses your platform's config directory
 (`~/.config/model-router/config.toml` on Linux).
 
-`s` saves project templates; `S` saves global templates. `w` chooses or clones
-a workflow. `a` adds a stage, `d` duplicates it, `J`/`K` move it, and `x` removes
-it. `v` toggles execution mode. `l` sets the repair limit. All fields, including
-instructions and permission arguments, are editable with `e`.
+`s` saves project templates; `S` saves global templates. `w` chooses, clones,
+or adds a workflow preset. `a` adds a stage preset, `d` duplicates it, `J`/`K`
+move it, and `x` removes it. `v` toggles execution mode. `l` sets the repair limit.
+All fields, including instructions and permission arguments, are editable with `e`.
 
 Each stage has a stable `id`, human-readable `name`, semantic `role`, `enabled`
 flag, `harness`, `model`, `provider`, `effort`, `mode`, `instructions`,
@@ -211,9 +269,9 @@ the handoff, `a` advances, `i` reopens interactively, `y` retries, and `m` repla
 the model before retrying. `e` edits a non-review interactive handoff summary.
 The CLI's `--advance` is the equivalent explicit handoff acceptance.
 
-An interactive review must write its handoff file; terminal echoes are not
-accepted as review verdicts. A non-review interactive stage without a structured
-handoff stops at the human checkpoint with an explicit missing-handoff notice.
+Interactive review and verification stages must write their handoff files;
+terminal echoes are not accepted as verdicts. Other interactive stages without
+a structured handoff stop at the human checkpoint with a missing-handoff notice.
 You can supply a summary or reopen the stage.
 
 Unattended stages have no interactive input. The router inherits native
@@ -260,8 +318,8 @@ can report `blocked`. Findings contain `severity` (`blocking` or `advisory`) and
 
 Models can write the given handoff file or, when unattended, emit the object
 between `<router-handoff>` and `</router-handoff>`. Plain text is accepted for
-unattended non-review stages and labeled unstructured. Tool output and echoed
-prompts are not extracted as assistant verdicts.
+unattended stages other than review/verification and labeled unstructured.
+Tool output and echoed prompts are not extracted as assistant verdicts.
 
 ## Workspace and artifacts
 
@@ -334,6 +392,7 @@ cargo build
 uv run --with pyte python scripts/smoke_tui.py
 uv run --with pyte python scripts/smoke_repos.py
 uv run --with pyte python scripts/smoke_imports.py
+uv run --with pyte python scripts/smoke_stages.py
 uv run --with pyte --with pillow python scripts/smoke_startup.py
 ```
 
@@ -345,6 +404,8 @@ are text files in `.model-router/qa/`.
 The import test covers file browsing, text and GitHub URLs, editable previews,
 append/replace, cancellation, errors, and saved task contents using a local HTTP
 server and an offline GitHub CLI fixture.
+The stage test covers preset selection, editing, cancellation, ordering,
+optional reviews, workflow persistence, and interactive verification handoffs.
 The startup test verifies animation, automatic completion, skip/bypass controls,
 resize, and interrupt cleanup. It also records a GIF preview from the real
 terminal at `.model-router/qa/startup.gif`.

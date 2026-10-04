@@ -98,6 +98,85 @@ fn no_review_run_passes_context_and_skips_disabled_review() {
 }
 
 #[test]
+fn all_workflow_presets_execute_in_order_with_optional_reviews_disabled() {
+    for preset in model_router::presets::WORKFLOWS {
+        let mut stages = preset.build().stages;
+        let mut previous = None;
+        for stage in &mut stages {
+            stage.harness = "mock".into();
+            stage.provider = stage.id.clone();
+            stage.model = "test-model".into();
+            stage.mode = Mode::Unattended;
+            if stage.role == Role::Test {
+                stage.extra_args = vec!["--test-status".into(), "passed".into()];
+            }
+            if stage.enabled {
+                if let Some(previous) = previous {
+                    stage
+                        .extra_args
+                        .extend(["--require-context".into(), format!("{previous} evidence")]);
+                }
+                previous = Some(stage.id.clone());
+            }
+        }
+        let (dir, _, mut run) = fixture(stages);
+        assert_eq!(
+            drive(&mut run),
+            Action::Complete,
+            "{}: {:?}",
+            preset.key,
+            run.error
+        );
+        for (stage, state) in run.workflow.stages.iter().zip(&run.stages) {
+            assert_eq!(
+                state.status,
+                if stage.enabled {
+                    Status::Complete
+                } else {
+                    Status::Skipped
+                }
+            );
+            assert_eq!(count(dir.path(), &stage.id), u32::from(stage.enabled));
+            if stage.enabled {
+                let prompt = fs::read_to_string(
+                    dir.path()
+                        .join(format!(".model-router/mock/{}.prompt", stage.id)),
+                )
+                .unwrap();
+                assert!(prompt.contains(&run.task));
+                assert!(prompt.contains(&stage.instructions));
+            }
+        }
+    }
+}
+
+#[test]
+fn verification_blocks_required_failures_missing_checks_and_unstructured_output() {
+    for status in ["failed", "not_run", "unstructured"] {
+        let mut verify = stage("verify", Role::Test);
+        if status == "unstructured" {
+            verify.model = "malformed".into();
+        } else {
+            verify.extra_args = vec!["--test-status".into(), status.into()];
+        }
+        let (dir, _, mut run) = fixture(vec![
+            stage("implementation", Role::Implementation),
+            verify,
+            stage("handoff", Role::Custom),
+        ]);
+        assert_eq!(drive(&mut run), Action::Stopped, "{status}");
+        assert_eq!(run.status, Status::Blocked);
+        assert_eq!(run.cursor, 1);
+        assert_eq!(count(dir.path(), "handoff"), 0);
+        assert_eq!(
+            run.repair_passes, 0,
+            "Verification must not silently enable review repairs"
+        );
+        assert!(run.error.as_ref().unwrap().contains("Test stage"));
+    }
+}
+
+#[test]
 fn failed_stage_resumes_without_rerunning_completed_research() {
     let mut implement = stage("implementation", Role::Implementation);
     implement.model = "fail".into();

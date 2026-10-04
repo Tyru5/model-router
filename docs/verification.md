@@ -5,15 +5,16 @@ Verified locally on Linux with Rust 1.93.0. Installed executable reports
 
 | Check | Result |
 | --- | --- |
-| `cargo test --locked` | 39 tests passed |
+| `cargo test --locked` | 46 tests passed |
 | `cargo clippy --all-targets --locked -- -D warnings` | Passed |
 | `cargo fmt --check` | Passed |
 | `cargo build --release --locked` | Passed; installation rebuilt the final changed code |
 | `cargo install --path . --locked` | Installed successfully in the user's Cargo bin directory |
 | Installed `model-router --version` | `model-router 0.1.0` |
 | Installed import commands | `run --help` exposes `--task-file` and `--task-url`; installed executable matches the release build |
+| Installed preset commands | `presets` lists 12 stages and four workflows; `init --preset` accepts the workflow keys |
 | Installed `model-router preview --task 'Example task'` | Astra research, interactive Claude implementation, review disabled |
-| Real terminal smoke tests | Workflow, repository browser, task import, and startup animation scripts passed using offline fixtures and actual PTYs |
+| Real terminal smoke tests | Workflow, repository browser, task import, stage presets, and startup animation scripts passed using offline fixtures and actual PTYs |
 | Private GitHub task import | Imported `Tyru5/model-router/blob/main/docs/spec.md` into an editable TUI preview using the existing `gh` login; no workflow started |
 | Native model discovery | Codex cache, Pi catalog, Cursor account list, and OpenCode catalog returned selections |
 
@@ -34,6 +35,14 @@ errors, GitHub issues/files/tags, branch names containing slashes, read-only
 GitHub requests, conflicting CLI flags, and source deletion after import.
 Saved run tasks and stage prompts retain the imported contents.
 
+All four workflow presets execute with offline harnesses in their defined order,
+passing the original task, stage instructions, and prior handoffs through each
+enabled stage. Review stages remain skipped by default. Required failed and
+unrun checks, and unstructured verification responses, stop execution before
+downstream stages. Preset configs roundtrip through TOML and initialization
+refuses to overwrite existing files. Cancelled stage drafts leave no new entry;
+repeated stages have distinct IDs and repeated workflows have distinct names.
+
 The terminal smoke test exercises editing/saving, stage toggles, Unicode paste,
 80×24 and 120×36 layouts, native interactive input, handoff inspection, explicit
 advancement, completion, run history, terminal restoration, and rejection of an
@@ -50,6 +59,12 @@ recoverable errors, unchanged source files, and imported task contents across
 research/implementation stages. It exercises 80×24 and 120×36 layouts and
 checks terminal restoration. GitHub fixtures and a local HTTP server keep the
 script independent of network access and account credentials.
+
+`scripts/smoke_stages.py` verifies searchable preset lists and routing details,
+stage editing/cancellation, insertion order, reordering, enable/mode toggles,
+duplication, custom stages, workflow presets, optional reviews, task preservation,
+and persistence across restart at 80×24 and 120×36. It also verifies that an
+interactive test stage cannot pass by printing results without a handoff file.
 
 `scripts/smoke_startup.py` checks visible animation frames, automatic completion,
 consuming the skip key, flag/environment bypass, resizing to a small terminal,
@@ -70,6 +85,10 @@ Local screen captures:
 - `../.model-router/qa/import-preview-80x24.txt`
 - `../.model-router/qa/import-github-120x36.txt`
 - `../.model-router/qa/import-private-github-120x36.txt`
+- `../.model-router/qa/stage-presets-120x36.txt`
+- `../.model-router/qa/stage-presets-80x24.txt`
+- `../.model-router/qa/workflow-presets-80x24.txt`
+- `../.model-router/qa/full-feature-120x36.txt`
 - `../.model-router/qa/startup.gif`
 - `../.model-router/qa/startup.png`
 

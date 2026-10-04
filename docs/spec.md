@@ -12,6 +12,12 @@ Workflows can add, remove, duplicate, reorder, and disable stages. Model IDs are
 open-ended; a catalog is assistance rather than a whitelist. Harness constraints
 remain visible, including Amp's mode selection and provider-specific identifiers.
 
+Provide editable stage presets for requirements, research, diagnosis, design,
+planning, implementation, verification, code/security review, documentation,
+handoff, and a blank custom stage. Provide Quick task, Full feature, Bug fix,
+and Investigation workflow presets. Adding a preset never overwrites an existing
+workflow or changes a saved run; reviews start disabled in workflow presets.
+
 ## Execution and handoff
 
 - Execute argument vectors directly, without constructing shell commands.
@@ -22,6 +28,10 @@ remain visible, including Amp's mode selection and provider-specific identifiers
   changed files, tests, and unresolved issues. Retain complete attempt logs on disk.
 - Use a small structured handoff in subsequent prompts, with artifact paths for
   details. Never treat a missing review verdict as a passing review.
+- Verification (`test`) stages require structured handoffs. Required failed or
+  unrun checks and blocking findings stop the run for inspection and retry.
+  Interactive verification must write its handoff file. Automatic repairs are
+  reserved for enabled reviews.
 - Read-only stage intent is expressed in instructions. Effective execution
   permissions are supplied by the harness and the user's explicit overrides;
   the router is not a universal sandbox.
@@ -72,7 +82,10 @@ API clients, automatic task classification, and embedded IDE control are exclude
   and flag/environment bypass. No model calls or simulated loading operations.
 - Workflow editor with task, project, stage order, enable toggle, execution mode,
   model selector, provider, reasoning effort, instructions, and extra arguments.
-- Workflow picker and local/global template saving.
+- Workflow picker with built-in presets and local/global template saving.
+- Searchable stage catalog with purpose and default routing. Selecting a preset
+  opens an editor; saving inserts after the current stage. Cancelling the picker
+  or editor leaves the workflow unchanged. Preserve freely editable custom stages.
 - Task/spec import from local Markdown/UTF-8 files, direct HTTP(S) text URLs,
   and GitHub issue/file links. Reuse `gh` authentication for GitHub access.
   Browse files or enter a path/URL, then edit an append/replace preview.
@@ -112,3 +125,6 @@ API clients, automatic task classification, and embedded IDE control are exclude
 11. Import a local or remote spec, edit and append/replace it, and pass its saved
     contents through all stages even after the source is changed or removed.
     Invalid documents and cancelled downloads must leave the existing task intact.
+12. Add, edit, reorder, and persist stage/workflow presets through the real TUI.
+    All built-in workflows execute in order with mocked harnesses, keep reviews
+    optional, and stop when verification reports required failures or missing checks.

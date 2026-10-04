@@ -18,6 +18,7 @@ parser.add_argument("--require-context", default="")
 parser.add_argument("--interactive", action="store_true")
 parser.add_argument("--delay", type=float, default=0)
 parser.add_argument("--no-handoff", action="store_true")
+parser.add_argument("--test-status", choices=["passed", "failed", "not_run"])
 args = parser.parse_args()
 
 root = Path(".model-router/mock")
@@ -54,7 +55,7 @@ handoff = {
     "findings": [{"severity": "blocking", "description": "Mock required fix"}] if blocking else [],
     "decisions": ["Offline fixture only"],
     "files_changed": [],
-    "tests": [],
+    "tests": [{"command": "offline acceptance check", "status": args.test_status, "required": True}] if args.test_status else [],
     "unresolved": [],
 }
 if not args.no_handoff:

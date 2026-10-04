@@ -4,7 +4,7 @@ use model_router::{
     adapters, catalog,
     config::{self, Mode, Role, Settings},
     engine::{self, Action, Event, Run, Status},
-    storage, task_import, tui,
+    presets, storage, task_import, tui,
 };
 use std::{
     io::{self, IsTerminal, Write},
@@ -34,13 +34,18 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Commands {
-    /// Write the editable starter workflow (review disabled).
+    /// Write an editable starter or preset workflow (reviews disabled).
     Init {
         #[arg(long)]
         global: bool,
         #[arg(long)]
         force: bool,
+        /// Start from a built-in workflow instead of the default starter.
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(presets::WORKFLOWS.iter().map(|p| p.key)))]
+        preset: Option<String>,
     },
+    /// List built-in stage and workflow presets without starting a harness.
+    Presets,
     /// Validate the workflow file without starting any harness.
     Validate,
     /// Show the exact argument structure without launching a model.
@@ -104,7 +109,16 @@ fn main_result() -> Result<()> {
     ctrlc::set_handler(move || {
         signal.store(true, Ordering::Relaxed);
     })?;
-    if let Some(Commands::Init { global, force }) = &cli.command {
+    if matches!(&cli.command, Some(Commands::Presets)) {
+        print!("{}", presets::listing());
+        return Ok(());
+    }
+    if let Some(Commands::Init {
+        global,
+        force,
+        preset,
+    }) = &cli.command
+    {
         let path = if *global {
             config::config_dir().join("config.toml")
         } else {
@@ -117,10 +131,21 @@ fn main_result() -> Result<()> {
             "{} already exists; use --force to replace it",
             path.display()
         );
-        Settings::default().save(&path)?;
+        let mut settings = Settings::default();
+        if let Some(key) = preset {
+            settings.workflows = vec![
+                presets::WORKFLOWS
+                    .iter()
+                    .find(|p| p.key == key)
+                    .expect("Clap validates workflow preset keys")
+                    .build(),
+            ];
+        }
+        settings.save(&path)?;
         println!(
-            "Saved {}\nStarter: Astra research → interactive Claude implementation. Review is disabled.",
-            path.display()
+            "Saved {}\nWorkflow: {}. Reviews are disabled; edit each stage's model and mode before running.",
+            path.display(),
+            settings.workflows[0].name
         );
         return Ok(());
     }
@@ -136,7 +161,7 @@ fn main_result() -> Result<()> {
                 && std::env::var_os("TERM").is_none_or(|v| v != "dumb");
             tui::run(project, settings, config_path, cancel, animate)?;
         }
-        Some(Commands::Init { .. }) => unreachable!(),
+        Some(Commands::Init { .. } | Commands::Presets) => unreachable!(),
         Some(Commands::Validate) => println!(
             "Valid: {} workflow(s). Save path: {}",
             settings.workflows.len(),

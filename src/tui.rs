@@ -3,7 +3,7 @@ use crate::{
     catalog::{self, Catalog, Model},
     config::{self, Mode, Role, Settings, Stage},
     engine::{self, Action, Event as RunEvent, Run, Status},
-    storage,
+    presets, storage,
 };
 use anyhow::{Context, Result, ensure};
 use crossterm::{
@@ -109,11 +109,40 @@ enum InputTarget {
     RepairLimit,
     Handoff,
 }
+#[derive(Clone)]
 enum PickValue {
     Workflow(usize),
     NewWorkflow,
+    WorkflowPreset(usize),
+    StagePreset(usize),
     Harness(String),
     Model(Model),
+}
+impl PickValue {
+    fn detail(&self) -> Option<String> {
+        match self {
+            Self::StagePreset(index) => {
+                let preset = &presets::STAGES[*index];
+                let stage = preset.build();
+                Some(format!(
+                    "{}\nDefault: {} / {} · {}",
+                    preset.purpose,
+                    stage.harness,
+                    if stage.model.is_empty() {
+                        "native default"
+                    } else {
+                        &stage.model
+                    },
+                    stage.mode.label()
+                ))
+            }
+            Self::WorkflowPreset(index) => {
+                let preset = &presets::WORKFLOWS[*index];
+                Some(format!("{}\n{}", preset.purpose, preset.stages.join(" → ")))
+            }
+            _ => None,
+        }
+    }
 }
 struct Choice {
     label: String,
@@ -125,7 +154,10 @@ enum Modal {
         target: InputTarget,
         text: TextArea<'static>,
     },
-    Stage(Box<StageEditor>),
+    Stage {
+        editor: Box<StageEditor>,
+        insert_at: Option<usize>,
+    },
     Repositories(Box<PathPicker>),
     Import(Box<TaskImporter>),
     Picker {
@@ -502,6 +534,44 @@ impl App {
                 InputTarget::NewWorkflow,
                 "",
             ),
+            PickValue::WorkflowPreset(index) => {
+                let mut workflow = presets::WORKFLOWS[index].build();
+                let base = workflow.name.clone();
+                let mut suffix = 2;
+                while self
+                    .settings
+                    .workflows
+                    .iter()
+                    .any(|w| w.name == workflow.name)
+                {
+                    workflow.name = format!("{base} ({suffix})");
+                    suffix += 1;
+                }
+                let mut candidate = self.settings.clone();
+                candidate.workflows.push(workflow);
+                candidate.validate()?;
+                self.settings = candidate;
+                self.workflow = self.settings.workflows.len() - 1;
+                self.selected = 0;
+                self.dirty = true;
+                self.message =
+                    "Workflow preset added. e edits each stage; reviews start disabled.".into();
+            }
+            PickValue::StagePreset(index) => {
+                ensure!(
+                    self.settings.workflows[self.workflow].stages.len() < 64,
+                    "A workflow can contain at most 64 stages"
+                );
+                let mut stage = presets::STAGES[index].build();
+                stage.id = format!("{}-{}", stage.id, Stage::default().id);
+                self.modal = Some(Modal::Stage {
+                    editor: Box::new(StageEditor::new(
+                        stage,
+                        catalog::known_harnesses(&self.settings),
+                    )),
+                    insert_at: Some(self.selected + 1),
+                });
+            }
             PickValue::Harness(harness) => {
                 let stage = self.stage_mut();
                 stage.harness = harness;
@@ -612,13 +682,24 @@ impl App {
                         text.input(key);
                     }
                 }
-                Modal::Stage(editor) => {
+                Modal::Stage { editor, insert_at } => {
                     if key.modifiers.contains(Mods::CONTROL) && key.code == Key::Char('s') {
                         let stage = editor.finish()?;
                         let mut candidate = self.settings.clone();
-                        candidate.workflows[self.workflow].stages[self.selected] = stage;
+                        if let Some(index) = insert_at {
+                            candidate.workflows[self.workflow]
+                                .stages
+                                .insert(*index, stage);
+                        } else {
+                            candidate.workflows[self.workflow].stages[self.selected] = stage;
+                        }
                         candidate.validate()?;
                         self.settings = candidate;
+                        if let Some(index) = insert_at {
+                            self.selected = *index;
+                            self.message =
+                                "Stage added. J/K reorders; Space enables or disables it.".into();
+                        }
                         self.dirty = true;
                         keep = false;
                     } else {
@@ -677,8 +758,7 @@ impl App {
                         }
                         Key::Enter if !matches.is_empty() => {
                             let index = matches[(*selected).min(matches.len() - 1)];
-                            let choice = items.remove(index);
-                            self.pick(choice.value)?;
+                            self.pick(items[index].value.clone())?;
                             keep = false;
                         }
                         _ => {
@@ -849,12 +929,21 @@ impl App {
                     label: "+ New workflow from current".into(),
                     value: PickValue::NewWorkflow,
                 });
+                items.extend(
+                    presets::WORKFLOWS
+                        .iter()
+                        .enumerate()
+                        .map(|(index, preset)| Choice {
+                            label: format!("+ Preset: {}", preset.name),
+                            value: PickValue::WorkflowPreset(index),
+                        }),
+                );
                 self.modal = Some(Modal::Picker {
                     title: "Choose workflow".into(),
                     items,
                     selected: self.workflow,
                     filter: textarea(""),
-                    note: "Templates retain each stage's harness, model, mode, and instructions."
+                    note: "Presets add an editable workflow. Reviews start disabled; existing workflows are kept."
                         .into(),
                 });
             }
@@ -901,24 +990,36 @@ impl App {
                 });
             }
             Key::Char('e') | Key::Enter => {
-                self.modal = Some(Modal::Stage(Box::new(StageEditor::new(
-                    self.stage().clone(),
-                    catalog::known_harnesses(&self.settings),
-                ))))
+                self.modal = Some(Modal::Stage {
+                    editor: Box::new(StageEditor::new(
+                        self.stage().clone(),
+                        catalog::known_harnesses(&self.settings),
+                    )),
+                    insert_at: None,
+                })
             }
             Key::Char('m') => self.model_picker(),
             Key::Char('a') => {
-                self.settings.workflows[self.workflow]
-                    .stages
-                    .push(Stage::default());
-                self.selected = count;
-                self.dirty = true;
-                self.modal = Some(Modal::Stage(Box::new(StageEditor::new(
-                    self.stage().clone(),
-                    catalog::known_harnesses(&self.settings),
-                ))));
+                ensure!(count < 64, "A workflow can contain at most 64 stages");
+                self.modal = Some(Modal::Picker {
+                    title: "Add stage from preset".into(),
+                    items: presets::STAGES
+                        .iter()
+                        .enumerate()
+                        .map(|(index, preset)| Choice {
+                            label: format!("{} · {}", preset.name, preset.role.label()),
+                            value: PickValue::StagePreset(index),
+                        })
+                        .collect(),
+                    selected: 0,
+                    filter: textarea(""),
+                    note:
+                        "Choose, edit, then Ctrl+S to insert after the selected stage. Esc cancels."
+                            .into(),
+                });
             }
             Key::Char('d') => {
+                ensure!(count < 64, "A workflow can contain at most 64 stages");
                 let mut copy = self.stage().clone();
                 copy.id = Stage::default().id;
                 copy.name.push_str(" copy");
@@ -1280,7 +1381,7 @@ fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .style(Style::default().fg(MUTED))
             .bottom_margin(if compact { 0 } else { 1 }),
     )
-    .block(panel(" Stages · e edit · h harness · J/K reorder "))
+    .block(panel(" Stages · a add · e edit · J/K reorder "))
     .row_highlight_style(selected_style());
     frame.render_stateful_widget(
         table,
@@ -1516,12 +1617,12 @@ fn draw_harnesses(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
     let rect = popup(
         frame.area(),
-        if matches!(modal, Modal::Stage(_)) {
+        if matches!(modal, Modal::Stage { .. }) {
             100
         } else {
             95
         },
-        if matches!(modal, Modal::Stage(_)) {
+        if matches!(modal, Modal::Stage { .. }) {
             35
         } else {
             26
@@ -1543,7 +1644,7 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
                 chunks[1],
             );
         }
-        Modal::Stage(editor) => {
+        Modal::Stage { editor, .. } => {
             let block = panel(" Edit stage · Tab next · ←/→ cycle role, harness, execution ")
                 .border_style(Style::default().fg(ACCENT));
             let inner = block.inner(rect);
@@ -1586,30 +1687,42 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
             let block = panel(format!(" {title} ")).border_style(Style::default().fg(ACCENT));
             let inner = block.inner(rect);
             frame.render_widget(block, rect);
-            let chunks = Layout::vertical([
-                Constraint::Length(3),
-                Constraint::Min(3),
-                Constraint::Length(4),
-            ])
-            .split(inner);
-            filter.set_block(panel(" Filter "));
-            frame.render_widget(&*filter, chunks[0]);
             let query = content(filter).to_lowercase();
             let choices: Vec<_> = items
                 .iter()
                 .filter(|c| c.label.to_lowercase().contains(&query))
-                .map(|c| ListItem::new(c.label.clone()))
                 .collect();
+            *selected = (*selected).min(choices.len().saturating_sub(1));
+            let detail = choices.get(*selected).and_then(|c| c.value.detail());
+            let chunks = Layout::vertical([
+                Constraint::Length(3),
+                Constraint::Min(3),
+                Constraint::Length(if detail.is_some() { 7 } else { 3 }),
+                Constraint::Length(2),
+            ])
+            .split(inner);
+            filter.set_block(panel(" Filter "));
+            frame.render_widget(&*filter, chunks[0]);
             frame.render_stateful_widget(
-                List::new(choices).highlight_style(selected_style()),
+                List::new(choices.iter().map(|c| ListItem::new(c.label.clone())))
+                    .highlight_style(selected_style()),
                 chunks[1],
                 &mut ListState::default().with_selected(Some(*selected)),
             );
             frame.render_widget(
-                Paragraph::new(format!("{note}\n↑↓ select · Enter choose · Esc cancel"))
+                Paragraph::new(format!(
+                    "{}{note}",
+                    detail.map(|text| format!("{text}\n\n")).unwrap_or_default()
+                ))
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(MUTED)),
+                chunks[2],
+            );
+            frame.render_widget(
+                Paragraph::new("↑↓ select · Enter choose · Esc cancel")
                     .wrap(Wrap { trim: false })
                     .style(Style::default().fg(MUTED)),
-                chunks[2],
+                chunks[3],
             );
         }
         Modal::Text {
@@ -1635,7 +1748,7 @@ fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal) {
     }
 }
 
-const HELP: &str = "WORKFLOW\nt  Edit task (Ctrl+S applies; Enter adds a line)\nf  Import task/spec: browse files; Ctrl+U opens URL import\n   Preview and edit; Tab append/replace; Ctrl+S apply; Esc back\np  Browse repositories (type to filter; Tab for recent)\n   Enter selects a repo or opens a folder; Right browses inside a repo\n   Left goes to parent; Ctrl+L enters a path; Esc cancels\nw  Select/create workflow    R  Rename    X  Delete workflow\ne / Enter  Edit selected stage\nh  Pick harness    m  Discover models\nSpace  Enable/disable stage, including optional review\nv  Toggle unattended/interactive\na  Add stage    d  Duplicate    x  Remove\nJ / K  Move stage down/up\ng  Toggle isolated Git worktree\nl  Set automatic repair limit\nP  Preview commands (no model calls)\ns  Save project    S  Save global templates\nr  Start workflow\n\nMONITOR\nc  Cancel active stage; continue when idle\na  Accept interactive handoff and advance\ny  Explicitly retry current stage\ni  Retry current stage interactively\nm  Replace current model and retry\nh  Inspect handoff/error    PgUp / PgDn  Scroll output\nn  Return to workflow editor\n\nINTERACTIVE HARNESS\nNative terminal keys and paste are forwarded.\nExit the harness to inspect its handoff.\nCtrl+] stops a stuck stage.\n\nEVERYWHERE\n1–4 / Tab  Switch views    ?  Guide\nq  Save workflow edits and exit (stops active work first)\nCtrl+C  Cancel work or exit\n\nSaved runs snapshot their workflow. Template edits affect new runs.\nRetries retain filesystem changes. Disabled reviews never gate a run.\nArtifacts: <project>/.model-router/runs/\nProvider credentials stay with each harness. Catalogs do not prove universal access.";
+const HELP: &str = "WORKFLOW\nt  Edit task (Ctrl+S applies; Enter adds a line)\nf  Import task/spec: browse files; Ctrl+U opens URL import\n   Preview and edit; Tab append/replace; Ctrl+S apply; Esc back\np  Browse repositories (type to filter; Tab for recent)\n   Enter selects a repo or opens a folder; Right browses inside a repo\n   Left goes to parent; Ctrl+L enters a path; Esc cancels\nw  Select/clone workflow or add a preset    R  Rename    X  Delete workflow\ne / Enter  Edit selected stage\nh  Pick harness    m  Discover models\nSpace  Enable/disable stage, including optional review\nv  Toggle unattended/interactive\na  Add stage preset (edit, then Ctrl+S inserts; Esc cancels)\nd  Duplicate    x  Remove\nJ / K  Move stage down/up\ng  Toggle isolated Git worktree\nl  Set automatic repair limit\nP  Preview commands (no model calls)\ns  Save project    S  Save global templates\nr  Start workflow\n\nMONITOR\nc  Cancel active stage; continue when idle\na  Accept interactive handoff and advance\ny  Explicitly retry current stage\ni  Retry current stage interactively\nm  Replace current model and retry\nh  Inspect handoff/error    PgUp / PgDn  Scroll output\nn  Return to workflow editor\n\nINTERACTIVE HARNESS\nNative terminal keys and paste are forwarded.\nExit the harness to inspect its handoff.\nCtrl+] stops a stuck stage.\n\nEVERYWHERE\n1–4 / Tab  Switch views    ?  Guide\nq  Save workflow edits and exit (stops active work first)\nCtrl+C  Cancel work or exit\n\nSaved runs snapshot their workflow. Template edits affect new runs.\nRetries retain filesystem changes. Disabled reviews never gate a run.\nArtifacts: <project>/.model-router/runs/\nProvider credentials stay with each harness. Catalogs do not prove universal access.";
 
 pub fn run(
     project: PathBuf,
@@ -1694,7 +1807,7 @@ pub fn run(
                     Some(Modal::Input { text: field, .. }) => {
                         field.insert_str(text);
                     }
-                    Some(Modal::Stage(editor)) if ![1, 2, 6].contains(&editor.selected) => {
+                    Some(Modal::Stage { editor, .. }) if ![1, 2, 6].contains(&editor.selected) => {
                         editor.fields[editor.selected].insert_str(text);
                     }
                     Some(Modal::Picker { filter, .. }) => {
@@ -1717,6 +1830,72 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn key(code: Key) -> KeyEvent {
+        KeyEvent::new(code, Mods::NONE)
+    }
+
+    #[test]
+    fn stage_presets_are_inserted_only_after_save_and_have_unique_ids() {
+        let project = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            project.path().into(),
+            Settings::default(),
+            project.path().join("config.toml"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let original = toml::to_string(&app.settings).unwrap();
+        let preset = presets::STAGES
+            .iter()
+            .position(|p| p.key == "plan")
+            .unwrap();
+        app.pick(PickValue::StagePreset(preset)).unwrap();
+        assert_eq!(toml::to_string(&app.settings).unwrap(), original);
+        app.modal_key(key(Key::Esc)).unwrap();
+        assert!(!app.dirty);
+        assert_eq!(toml::to_string(&app.settings).unwrap(), original);
+        for _ in 0..2 {
+            app.pick(PickValue::StagePreset(preset)).unwrap();
+            app.modal_key(KeyEvent::new(Key::Char('s'), Mods::CONTROL))
+                .unwrap();
+            assert_eq!(app.stage().role, Role::Planning);
+        }
+        let stages = &app.settings.workflows[0].stages;
+        assert_eq!(stages.len(), 5);
+        assert_eq!(stages[0].id, "research");
+        assert_eq!(stages[3].id, "implement");
+        assert_ne!(stages[1].id, stages[2].id);
+        app.settings.validate().unwrap();
+        // Adding or duplicating at the limit must not leave an invalid workflow.
+        app.settings.workflows[0].stages = (0..64).map(|_| Stage::default()).collect();
+        assert!(app.workflow_key(key(Key::Char('a'))).is_err());
+        assert!(app.workflow_key(key(Key::Char('d'))).is_err());
+        assert_eq!(app.settings.workflows[0].stages.len(), 64);
+    }
+
+    #[test]
+    fn workflow_presets_preserve_existing_workflows_and_task() {
+        let project = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            project.path().into(),
+            Settings::default(),
+            project.path().join("config.toml"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let original = toml::to_string(&app.settings.workflows[0]).unwrap();
+        app.task = "Keep the imported spec".into();
+        app.pick(PickValue::WorkflowPreset(2)).unwrap();
+        app.pick(PickValue::WorkflowPreset(2)).unwrap();
+        assert_eq!(app.settings.workflows.len(), 3);
+        assert_eq!(app.settings.workflows[1].name, "Bug fix");
+        assert_eq!(app.settings.workflows[2].name, "Bug fix (2)");
+        assert_eq!(app.task, "Keep the imported spec");
+        assert_eq!(
+            toml::to_string(&app.settings.workflows[0]).unwrap(),
+            original
+        );
+        app.settings.validate().unwrap();
+    }
+
     #[test]
     fn renders_starter_at_common_sizes() {
         let project = tempfile::tempdir().unwrap();

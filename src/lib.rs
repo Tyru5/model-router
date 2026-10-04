@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod config;
 pub mod engine;
 pub mod handoff;
+pub mod presets;
 pub mod process;
 pub mod storage;
 pub mod task_import;
