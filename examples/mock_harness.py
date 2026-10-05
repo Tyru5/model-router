@@ -22,7 +22,9 @@ parser.add_argument("--no-handoff", action="store_true")
 parser.add_argument("--test-status", choices=["passed", "failed", "not_run"])
 parser.add_argument("--test-optional", action="store_true")
 parser.add_argument("--not-applicable", metavar="REASON")
-parser.add_argument("--write-file", metavar="PATH", help="Write a line to PATH in the workspace")
+parser.add_argument(
+    "--write-file", metavar="PATH", help="Write a line to PATH in the workspace"
+)
 args = parser.parse_args()
 
 root = Path(".model-router/mock")
