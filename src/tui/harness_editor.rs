@@ -1,4 +1,7 @@
-use super::{Palette, content, menu_key, textarea};
+use super::{
+    theme::Palette,
+    widgets::{content, menu_key, textarea},
+};
 use crate::{
     adapters,
     catalog::Model,
