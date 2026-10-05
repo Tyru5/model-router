@@ -2,7 +2,7 @@ use super::{
     actions::{self, ActionId, Scope},
     harness_editor::HarnessEditor,
     harnesses::{self, HarnessRow, draw_harnesses},
-    history::draw_history,
+    history::{RunsView, draw_history},
     modal::{Choice, InputTarget, Modal, PickValue, draw_modal, matching_choices},
     monitor::draw_run,
     theme::{self, Palette, Theme},
@@ -13,6 +13,7 @@ use crate::{
     catalog::{self, Catalog},
     config::{self, Settings, Stage},
     engine::{self, Action, Event as RunEvent, Run},
+    history::Entry,
     storage,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -76,8 +77,9 @@ pub(super) struct App {
     pub(super) launch_interactive: bool,
     pub(super) logs: VecDeque<String>,
     pub(super) log_scroll: usize,
-    pub(super) history: Vec<Run>,
+    pub(super) history: Vec<Entry>,
     pub(super) history_selected: usize,
+    pub(super) runs: RunsView,
     pub(super) harness_selected: usize,
     pub(super) harness_rows: Vec<HarnessRow>,
     pub(super) catalog: Option<Receiver<std::result::Result<Catalog, String>>>,
@@ -115,6 +117,7 @@ impl App {
             log_scroll: 0,
             history: vec![],
             history_selected: 0,
+            runs: RunsView::default(),
             harness_selected: 0,
             harness_rows: vec![],
             catalog: None,
@@ -375,6 +378,9 @@ impl App {
         if self.modal.is_some() {
             return self.modal_key(key);
         }
+        if self.runs_filtering() {
+            return self.runs_filter_key(key);
+        }
         if let Some(id) = actions::resolve(self.scope(), key) {
             return self.perform(id);
         }
@@ -444,7 +450,7 @@ impl App {
     fn show(&mut self, page: usize) -> Result<()> {
         self.page = page;
         match page {
-            2 => self.history = engine::history(&self.project)?,
+            2 => self.refresh_runs()?,
             3 => self.harness_rows = harnesses::scan(&self.settings),
             _ => {}
         }

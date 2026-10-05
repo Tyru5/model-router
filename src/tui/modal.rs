@@ -2,6 +2,7 @@ use super::{
     actions::{self, ActionId},
     app::App,
     harness_editor::HarnessEditor,
+    history::{Compare, Confirm},
     path_picker::{PathPicker, PickerAction},
     task_importer::{ImportAction, TaskImporter},
     theme::{self, Palette, Theme},
@@ -46,6 +47,7 @@ pub(super) enum PickValue {
     Model(Model),
     Theme(Theme),
     Action(ActionId),
+    Compare(Compare),
 }
 impl PickValue {
     fn detail(&self) -> Option<String> {
@@ -117,6 +119,7 @@ pub(super) enum Modal {
         guide: bool,
     },
     Loading(String),
+    Confirm(Box<Confirm>),
 }
 
 impl App {
@@ -198,6 +201,7 @@ impl App {
                 self.message = format!("Theme saved: {}. T changes it anytime.", theme.name());
             }
             PickValue::Action(id) => return self.perform(id),
+            PickValue::Compare(choice) => self.show_comparison(&choice)?,
         }
         Ok(false)
     }
@@ -373,6 +377,7 @@ impl App {
                     }
                 }
                 Modal::Loading(_) => {}
+                Modal::Confirm(dialog) => keep = !self.confirm_key(dialog, key),
             }
             Ok(())
         })();
@@ -409,6 +414,7 @@ impl App {
             Some(Modal::Repositories(picker)) => picker.paste(text),
             Some(Modal::Import(importer)) => importer.paste(text),
             Some(Modal::Harness(editor)) => editor.paste(text),
+            None => self.paste_runs_filter(text),
             _ => {}
         }
     }
@@ -426,6 +432,7 @@ pub(super) fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, palette: Pale
         Modal::Repositories(picker) => picker.draw(frame, rect, palette),
         Modal::Import(importer) => importer.draw(frame, rect, palette),
         Modal::Harness(editor) => editor.draw(frame, rect, palette),
+        Modal::Confirm(dialog) => dialog.draw(frame, rect, palette),
         Modal::Input { title, text, .. } => {
             palette.style_textarea(text);
             let block = palette.modal(title, &[]);
