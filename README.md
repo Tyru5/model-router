@@ -288,6 +288,9 @@ model-router resume RUN_ID --retry
 model-router resume RUN_ID --model NEW_NATIVE_MODEL_ID
 model-router resume RUN_ID --interactive
 model-router resume RUN_ID --advance
+model-router report RUN_ID
+model-router report RUN_ID --json
+model-router report RUN_ID --diff
 ```
 
 `--unattended` overrides execution mode for this run. `--with-review` enables
@@ -298,6 +301,19 @@ stop. `Ctrl+]` stops a stuck interactive harness. In the monitor, `h` inspects
 the handoff, `a` advances, `i` reopens interactively, `y` retries, and `m` replaces
 the model before retrying. `e` edits a non-review interactive handoff summary.
 The CLI's `--advance` is the equivalent explicit handoff acceptance.
+
+When a run completes or stops, the monitor shows its results: files changed
+during this run with line counts, checks performed (router or model-reported,
+required or optional), unresolved findings, and each stage's active time,
+attempts, retries, and usage. `d` opens the full diff and `o` switches to the
+output log. The CLI prints the same summary after `Completed`. `report` prints
+it for any saved run, including stopped ones; `--json` gives the data and
+`--diff` the patch. Changes come from Git snapshots taken by the router
+(baseline at run start, then before and after each attempt), so edits made
+before the run are excluded. Outside Git they are labelled unavailable and the
+model-reported `files_changed` list is shown instead. Token counts and cost
+appear only when a harness reports them; nothing is estimated, and totals say
+how many attempts reported.
 
 Interactive review and verification stages must write their handoff files;
 terminal echoes are not accepted as verdicts. Other interactive stages without
@@ -442,12 +458,16 @@ does not merge, commit, or delete worktrees automatically.
   workspace.lock                # prevents simultaneous active runs here
   runs/RUN_ID/
     run.json                    # task, workflow snapshot, state, attempts
+    snapshot.index              # private Git index for change snapshots
+    changes.diff                # patch of changes made during the run
     01-research/attempt-001/
       prompt.md
       command.json              # executable and literal argument vector
       stdout.log
       stderr.log
       handoff.json
+      checks/NN/                # router check stdout.log and stderr.log
+      checks.json               # router check results
   handoffs/RUN_ID/               # model-writable handoff files
   worktrees/RUN_ID/              # only when requested
 ```

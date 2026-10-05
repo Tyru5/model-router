@@ -29,6 +29,9 @@ stream backpressure, configuration roundtrips, and Git worktree isolation.
 Verification tests block test stages lacking a passing required check, require
 one explicit acceptance for not-applicable reasons, and cover router check logs,
 timeouts, cancellation, and optional and required failures.
+Report tests cover Git snapshots (edits, untracked files, deletions, ignored
+files, an untouched index), harness usage parsing, the completion view at 80×24
+and 120×36, and the `report` CLI after an offline run writes a file.
 Repository tests also cover folder navigation, `.git` files, symlink loops,
 non-Git projects, empty searches, and invalid paths. A deterministic regression
 test verifies locks release when their owner drops them, even if another process

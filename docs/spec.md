@@ -106,8 +106,12 @@ API clients, automatic task classification, and embedded IDE control are exclude
   and persistent recent projects. Recognizes Git directories and `.git` files
   for linked worktrees/submodules; non-Git folders can also be selected.
   Saves workflow edits and loads the selected project's configuration.
-- Run monitor with stage state, elapsed time, logs, cancellation, handoff view,
-  and explicit recovery actions.
+- Run monitor with stage state, elapsed time, check results, logs, cancellation,
+  handoff view, and explicit recovery actions. Finished runs show a results view:
+  files changed during the run (from private Git snapshots), checks by source,
+  unresolved findings, per-stage time, retries, and harness-reported usage, with
+  unavailable values labelled; the full diff opens in a dialog. `report` prints
+  the same summary from the CLI.
 - Run history and harness availability/catalog view.
 - CLI equivalents for initialization, validation, previews, execution, discovery,
   history, and resume; all share the same execution engine.
