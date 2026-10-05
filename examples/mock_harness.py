@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline harness fixture. Makes no network requests and uses no credentials."""
+
 import argparse
 import json
 import os
@@ -51,11 +52,23 @@ if args.model == "malformed":
 blocking = args.role.startswith("review") and number <= args.review_fail_until
 handoff = {
     "summary": f"{args.role} evidence from model {args.model}, attempt {number}",
-    "verdict": "needs_changes" if blocking else ("pass" if args.role.startswith("review") else "complete"),
-    "findings": [{"severity": "blocking", "description": "Mock required fix"}] if blocking else [],
+    "verdict": "needs_changes"
+    if blocking
+    else ("pass" if args.role.startswith("review") else "complete"),
+    "findings": [{"severity": "blocking", "description": "Mock required fix"}]
+    if blocking
+    else [],
     "decisions": ["Offline fixture only"],
     "files_changed": [],
-    "tests": [{"command": "offline acceptance check", "status": args.test_status, "required": True}] if args.test_status else [],
+    "tests": [
+        {
+            "command": "offline acceptance check",
+            "status": args.test_status,
+            "required": True,
+        }
+    ]
+    if args.test_status
+    else [],
     "unresolved": [],
 }
 if not args.no_handoff:

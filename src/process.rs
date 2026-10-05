@@ -220,7 +220,7 @@ pub fn interactive(
     let mut transcript = File::create(dir.join("stdout.log"))?;
     File::create(dir.join("stderr.log"))?;
     println!(
-        "\nLaunching {}. Exit the harness to inspect the handoff. Ctrl+] stops this stage.\n",
+        "\nLaunching {}. Exit the harness to inspect the handoff. [Ctrl+]] stops this stage.\n",
         inv.program
     );
     crossterm::terminal::enable_raw_mode()?;

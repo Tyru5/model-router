@@ -305,7 +305,7 @@ impl Palette {
             .border_style(Style::default().fg(self.accent))
     }
 
-    /// Key/label pairs styled as `key label   key label`.
+    /// Key/label pairs styled as `[key] label   [key] label`.
     pub fn hints(self, keys: &[(&str, &str)]) -> Line<'static> {
         let mut spans = Vec::with_capacity(keys.len() * 3);
         for (index, (key, label)) in keys.iter().enumerate() {
@@ -313,7 +313,7 @@ impl Palette {
                 spans.push(Span::raw("   "));
             }
             spans.push(Span::styled(
-                key.to_string(),
+                key_label(key),
                 Style::default()
                     .fg(self.accent)
                     .add_modifier(Modifier::BOLD),
@@ -389,6 +389,14 @@ pub(super) fn load(path: &Path) -> Result<Theme> {
 
 pub(super) fn save(path: &Path, theme: Theme) -> Result<()> {
     storage::write_json(path, &Appearance { theme })
+}
+
+/// Bracket each ` / `-separated alternative: `J / K` -> `[J] / [K]`.
+pub fn key_label(key: &str) -> String {
+    key.split(" / ")
+        .map(|part| format!("[{part}]"))
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 #[cfg(test)]

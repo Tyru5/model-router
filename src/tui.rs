@@ -468,7 +468,7 @@ impl App {
                 .unwrap_or(0),
             filter: textarea(""),
             note: format!(
-                "Preview as you move. Enter saves for every project. Esc restores {}.",
+                "Preview as you move. [Enter] saves for every project. [Esc] restores {}.",
                 self.theme.name()
             ),
         });
@@ -556,7 +556,7 @@ impl App {
                         Ok(Action::Interactive) => self.launch_interactive = !self.quit_after_stop,
                         Ok(Action::Confirm) => {
                             self.message =
-                                "Inspect the handoff: h. Advance: a. Reopen: i. Save and exit: q."
+                                "Inspect the handoff: [h]. Advance: [a]. Reopen: [i]. Save and exit: [q]."
                                     .into()
                         }
                         Ok(Action::Complete) => {
@@ -611,7 +611,7 @@ impl App {
                     }
                     Err(error) => {
                         self.message =
-                            format!("{error}. Enter a model ID manually in harness settings (c).");
+                            format!("{error}. Enter a model ID manually in harness settings [c].");
                         self.alert = self.message.clone();
                         self.modal = self.model_editor.take().map(|mut editor| {
                             editor.error = self.message.clone();
@@ -834,7 +834,8 @@ impl App {
                         if let Some(index) = insert_at {
                             self.selected = *index;
                             self.message =
-                                "Stage added. J/K reorders; Space enables or disables it.".into();
+                                "Stage added. [J]/[K] reorders; [Space] enables or disables it."
+                                    .into();
                         }
                         self.dirty = true;
                         keep = false;
@@ -1038,7 +1039,7 @@ impl App {
                     }
                     Key::Enter => {
                         let harness = &harnesses[self.harness_selected];
-                        self.text(harness, format!("Executable: {}\n\n{}\n\nSelect this harness with h on the workflow page, then press m to load model selections. Use c on Workflow to configure the selected stage, including permissions and extra arguments.\n\nPermissions inherit the harness configuration unless overridden for a stage. Authentication stays with the harness.\n\nCustom adapters are defined in TOML. See README.md for the template contract.", adapters::program(harness, &self.settings.adapters), if harness == "amp" { "Amp uses mode keys. A mode determines its model and tools." } else { "A model must be supported by the selected harness/provider." }));
+                        self.text(harness, format!("Executable: {}\n\n{}\n\nSelect this harness with [h] on the workflow page, then press [m] to load model selections. Use [c] on Workflow to configure the selected stage, including permissions and extra arguments.\n\nPermissions inherit the harness configuration unless overridden for a stage. Authentication stays with the harness.\n\nCustom adapters are defined in TOML. See README.md for the template contract.", adapters::program(harness, &self.settings.adapters), if harness == "amp" { "Amp uses mode keys. A mode determines its model and tools." } else { "A model must be supported by the selected harness/provider." }));
                     }
                     _ => {}
                 }
@@ -1067,7 +1068,7 @@ impl App {
                 self.dirty = true;
             }
             Key::Char('t') => self.input(
-                "Task · Ctrl+S applies · Enter adds a line",
+                "Task · [Ctrl+S] applies · [Enter] adds a line",
                 InputTarget::Task,
                 &self.task.clone(),
             ),
@@ -1188,7 +1189,7 @@ impl App {
                     selected: 0,
                     filter: textarea(""),
                     note:
-                        "Choose, edit, then Ctrl+S to insert after the selected stage. Esc cancels."
+                        "Choose, edit, then [Ctrl+S] to insert after the selected stage. [Esc] cancels."
                             .into(),
                 });
             }
@@ -1295,7 +1296,7 @@ impl App {
                         run.directory.display()
                     )
                 });
-            self.text("Handoff · arrows scroll · Esc closes", body);
+            self.text("Handoff · [↑↓] scroll · [Esc] closes", body);
             return Ok(());
         }
         if self.worker.is_some() {
@@ -1477,7 +1478,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
                     "Resize to at least 65 × 20.",
                     Style::default().fg(palette.fg),
                 ),
-                Line::styled("Press q to exit.", Style::default().fg(palette.muted)),
+                Line::styled("Press [q] to exit.", Style::default().fg(palette.muted)),
             ])
             .centered()
             .wrap(Wrap { trim: false }),
@@ -1677,7 +1678,7 @@ fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette)
     frame.render_widget(Paragraph::new(heading), chunks[0]);
     let task = if app.task.is_empty() {
         Paragraph::new(Line::styled(
-            "No task yet. Press t to write one, or f to import a file, URL, or GitHub issue.",
+            "No task yet. Press [t] to write one, or [f] to import a file, URL, or GitHub issue.",
             Style::default()
                 .fg(palette.muted)
                 .add_modifier(Modifier::ITALIC),
@@ -1813,7 +1814,7 @@ fn draw_stage_detail(frame: &mut Frame<'_>, stage: &Stage, area: Rect, palette: 
     lines.push(Line::raw(""));
     lines.push(Line::styled(
         if stage.role == Role::Review {
-            "Optional. Space toggles it; blocking findings request repairs."
+            "Optional. [Space] toggles it; blocking findings request repairs."
         } else {
             "c configures this stage's harness."
         },
@@ -1837,7 +1838,7 @@ fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
             area,
             palette.panel(" Run monitor "),
             "No run selected",
-            "Start one from Workflow (r), or open a saved run from Runs (3).",
+            "Start one from Workflow [r], or open a saved run from Runs [3].",
         );
         return;
     };
@@ -2005,7 +2006,7 @@ fn draw_history(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) 
             area,
             palette.panel(" Saved runs "),
             "No saved runs yet",
-            "Runs for this project are saved automatically. Start a workflow from Workflow (r).",
+            "Runs for this project are saved automatically. Start a workflow from Workflow [r].",
         );
         return;
     }
@@ -2321,7 +2322,14 @@ fn guide_text(body: &str, palette: Palette) -> Text<'static> {
         .map(|line| match line.split_once('\t') {
             Some((key, text)) => Line::from(vec![
                 Span::styled(
-                    format!("  {key:<16}"),
+                    format!(
+                        "  {:<20}",
+                        if key.is_empty() {
+                            String::new()
+                        } else {
+                            theme::key_label(key)
+                        }
+                    ),
                     Style::default()
                         .fg(palette.accent)
                         .add_modifier(Modifier::BOLD),
@@ -2341,24 +2349,24 @@ fn guide_text(body: &str, palette: Palette) -> Text<'static> {
 }
 
 const HELP: &str = "WORKFLOW
-t\tEdit task (Ctrl+S applies; Enter adds a line)
-f\tImport task/spec: browse files; Ctrl+U opens URL import
-\tPreview and edit; Tab append/replace; Ctrl+S apply; Esc back
-p\tBrowse repositories (type to filter; Tab for recent)
-\tEnter selects a repo or opens a folder; Right browses inside a repo
-\tLeft goes to parent; /, ~ or Ctrl+L enters a path; Esc cancels
+t\tEdit task ([Ctrl+S] applies; [Enter] adds a line)
+f\tImport task/spec: browse files; [Ctrl+U] opens URL import
+\tPreview and edit; [Tab] append/replace; [Ctrl+S] apply; [Esc] back
+p\tBrowse repositories (type to filter; [Tab] for recent)
+\t[Enter] selects a repo or opens a folder; [→] browses inside a repo
+\t[←] goes to parent; [/], [~] or [Ctrl+L] enters a path; [Esc] cancels
 w\tSelect/clone workflow or add a preset
 R\tRename workflow
 X\tDelete workflow
 e / Enter\tEdit selected stage
 c\tConfigure selected harness (model, effort, execution, permissions)
-\tTab or Ctrl+N/P fields; Left/Right choices; F7 models
-\tCtrl+S applies; Esc cancels; s on Workflow saves
+\t[Tab] or [Ctrl+N/P] fields; [←/→] choices; [F7] models
+\t[Ctrl+S] applies; [Esc] cancels; [s] on Workflow saves
 h\tPick harness
 m\tDiscover models
 Space\tEnable/disable stage, including optional review
 v\tToggle unattended/interactive
-a\tAdd stage preset (edit, then Ctrl+S inserts; Esc cancels)
+a\tAdd stage preset (edit, then [Ctrl+S] inserts; [Esc] cancels)
 d\tDuplicate stage
 x\tRemove stage
 J / K\tMove stage down/up
@@ -2385,10 +2393,10 @@ INTERACTIVE HARNESS
 Ctrl+]\tStop a stuck stage
 
 SELECTION MENUS
-Ctrl+N / Ctrl+P\tNext/previous option (same as Down/Up)
+Ctrl+N / Ctrl+P\tNext/previous option (same as [↓]/[↑])
 
 THEMES
-T\tChoose theme (type to filter; arrows or Ctrl+N/P preview)
+T\tChoose theme (type to filter; [↑↓] or [Ctrl+N/P] preview)
 Enter\tSave for all projects
 Esc\tRestore the current theme
 

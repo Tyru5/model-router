@@ -305,7 +305,7 @@ impl PathPicker {
         .split(inner);
         if self.files {
             frame.render_widget(
-                Paragraph::new("Markdown / text files · Ctrl+U import a URL")
+                Paragraph::new("Markdown / text files · [Ctrl+U] import a URL")
                     .style(Style::default().fg(palette.muted)),
                 chunks[0],
             );
@@ -329,26 +329,26 @@ impl PathPicker {
         if let Some(input) = &mut self.path_input {
             palette.style_textarea(input);
             input.set_block(palette.panel(if self.files {
-                " File or directory path · Enter open · Esc back "
+                " File or directory path · [Enter] open · [Esc] back "
             } else {
-                " Directory path · Enter browse · Esc back "
+                " Directory path · [Enter] browse · [Esc] back "
             }));
             frame.render_widget(&*input, chunks[2]);
         } else {
             palette.style_textarea(&mut self.filter);
             self.filter
-                .set_block(palette.panel(" Type to filter · / ~ or Ctrl+L enter path "));
+                .set_block(palette.panel(" Type to filter · [/] [~] or [Ctrl+L] enter path "));
             frame.render_widget(&self.filter, chunks[2]);
         }
         let matches = self.matches();
         self.selected = self.selected.min(matches.len().saturating_sub(1));
         if matches.is_empty() {
             let message = if self.show_recent && content(&self.filter).is_empty() {
-                "No recent projects. Press Tab to browse folders."
+                "No recent projects. Press [Tab] to browse folders."
             } else if self.files {
-                "No matching files or folders. Clear the filter, then type / or ~ (or Ctrl+L)."
+                "No matching files or folders. Clear the filter, then type [/] or [~] (or [Ctrl+L])."
             } else {
-                "No matching folders. Clear the filter, then type / or ~ (or Ctrl+L)."
+                "No matching folders. Clear the filter, then type [/] or [~] (or [Ctrl+L])."
             };
             frame.render_widget(
                 Paragraph::new(message)
@@ -428,7 +428,7 @@ impl PathPicker {
                         ("←", "parent"),
                     ]),
                     palette.hints(&[
-                        ("/ or Ctrl+L", "enter path"),
+                        ("/ / ~ / Ctrl+L", "enter path"),
                         ("Ctrl+U", "URL"),
                         ("Esc", "cancel"),
                     ]),

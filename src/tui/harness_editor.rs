@@ -60,7 +60,7 @@ impl HarnessEditor {
             } else {
                 "Model / alias"
             },
-            help: "Type a native model ID, alias, or Amp mode. Blank inherits the harness default. F7 browses available selections without starting a model.",
+            help: "Type a native model ID, alias, or Amp mode. Blank inherits the harness default. [F7] browses available selections without starting a model.",
             text: textarea(&stage.model),
         }];
         if harness_settings::supports_provider(&stage.harness) {

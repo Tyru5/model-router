@@ -241,7 +241,7 @@ fn draw(frame: &mut Frame<'_>, elapsed: Duration, palette: Palette) {
     centered(
         frame,
         top + 15,
-        "Any key to skip · Ctrl+C quit",
+        "Any key to skip · [Ctrl+C] quit",
         mix(palette.bg, palette.muted, reveal),
         false,
     );

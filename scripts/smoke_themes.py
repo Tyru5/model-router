@@ -3,6 +3,7 @@
 
 Run: uv run --with pyte python scripts/smoke_themes.py
 """
+
 import json
 from pathlib import Path
 import tempfile
@@ -32,7 +33,9 @@ def background(terminal):
 
 def choose(terminal, name):
     terminal.send("T")
-    terminal.wait(lambda: "Choose theme" in terminal.text(), "Theme picker did not open")
+    terminal.wait(
+        lambda: "Choose theme" in terminal.text(), "Theme picker did not open"
+    )
     terminal.send(name)
 
 
@@ -47,19 +50,27 @@ def main():
             folder.mkdir()
             (folder / ".model-router.toml").write_text(config)
             (folder / "notes.md").write_text("A theme must not change task contents")
-        env = {"XDG_CONFIG_HOME": str(config_home), "NO_COLOR": "", "MODEL_ROUTER_NO_ANIMATION": "0"}
+        env = {
+            "XDG_CONFIG_HOME": str(config_home),
+            "NO_COLOR": "",
+            "MODEL_ROUTER_NO_ANIMATION": "0",
+        }
         terminal = Terminal(project, ["--no-animation"], extra_env=env, size=(80, 24))
         try:
             terminal.wait(lambda: "1 Workflow" in terminal.text(), "App did not start")
             assert background(terminal) == "0d1421"
-            assert "T themes" in terminal.text()
+            assert "[T] themes" in terminal.text()
             terminal.send("tKeep my task")
             terminal.send(b"\x13")
             terminal.send("T")
             terminal.send(b"\x0e")
-            assert background(terminal) == "181825", "Ctrl+N did not preview the next theme"
+            assert background(terminal) == "181825", (
+                "Ctrl+N did not preview the next theme"
+            )
             terminal.send(b"\x10")
-            assert background(terminal) == "0d1421", "Ctrl+P did not preview the previous theme"
+            assert background(terminal) == "0d1421", (
+                "Ctrl+P did not preview the previous theme"
+            )
             terminal.send(b"\x1b[B")
             terminal.send(b"\x1b")
             assert background(terminal) == "0d1421", "Esc did not restore the theme"
@@ -67,8 +78,13 @@ def main():
 
             for label, theme_id, bg in THEMES:
                 choose(terminal, label)
-                assert background(terminal) == bg, f"{label} preview did not repaint the app"
-                assert "Ctrl+N/P select" in terminal.text() and "Enter saves" in terminal.text()
+                assert background(terminal) == bg, (
+                    f"{label} preview did not repaint the app"
+                )
+                assert (
+                    "[Ctrl+N/P] select" in terminal.text()
+                    and "[Enter] saves" in terminal.text()
+                )
                 terminal.send("\r")
                 assert "Choose theme" not in terminal.text()
                 assert json.loads(prefs.read_text())["theme"] == theme_id
@@ -88,7 +104,9 @@ def main():
                 terminal.send(page)
                 choose(terminal, "Dracula")
                 terminal.send(b"\x1b")
-                assert background(terminal) == "fdf6e3", "Preview changed the saved theme"
+                assert background(terminal) == "fdf6e3", (
+                    "Preview changed the saved theme"
+                )
 
             choose(terminal, "Nord")
             terminal.send("\r")
@@ -96,7 +114,10 @@ def main():
             terminal.send(b"\x0c")
             terminal.send(f"\x1b[200~{other}\x1b[201~\r")
             terminal.send("\r")
-            terminal.wait(lambda: "Choose repository" not in terminal.text(), "Repository switch failed")
+            terminal.wait(
+                lambda: "Choose repository" not in terminal.text(),
+                "Repository switch failed",
+            )
             assert background(terminal) == "2e3440", "Repository switch lost the theme"
             terminal.send("q")
             terminal.exit()
@@ -106,10 +127,14 @@ def main():
         # A new process loads the global choice before drawing its startup animation.
         terminal = Terminal(other, extra_env=env, size=(120, 36))
         try:
-            terminal.wait(lambda: "Any key to skip" in terminal.text(), "Intro did not appear")
+            terminal.wait(
+                lambda: "Any key to skip" in terminal.text(), "Intro did not appear"
+            )
             assert background(terminal) == "2e3440", "Startup ignored the saved theme"
             terminal.send(" ")
-            terminal.wait(lambda: "1 Workflow" in terminal.text(), "Intro did not finish")
+            terminal.wait(
+                lambda: "1 Workflow" in terminal.text(), "Intro did not finish"
+            )
             terminal.send("T")
             assert "Nord · dark (current)" in terminal.text()
             terminal.snapshot("theme-picker-120x36.txt")
@@ -123,7 +148,10 @@ def main():
         prefs.write_text('{"theme":"removed-theme"}')
         terminal = Terminal(project, ["--no-animation"], extra_env=env)
         try:
-            terminal.wait(lambda: "1 Workflow" in terminal.text(), "Bad preferences blocked startup")
+            terminal.wait(
+                lambda: "1 Workflow" in terminal.text(),
+                "Bad preferences blocked startup",
+            )
             assert background(terminal) == "0d1421"
             assert "Read theme" in terminal.text()
             choose(terminal, "Catppuccin Latte")
@@ -135,9 +163,13 @@ def main():
             terminal.cleanup()
 
         for folder in (project, other):
-            assert (folder / ".model-router.toml").read_text() == config, "Theme changed a workflow"
+            assert (folder / ".model-router.toml").read_text() == config, (
+                "Theme changed a workflow"
+            )
             assert not records(folder), "Theme selection started a run"
-    print("PASS: all 12 themes, live colour previews, Ctrl+N/P, cancel/apply, empty searches, global persistence, repository switching, themed startup, corrupt preferences, and unchanged workflows.")
+    print(
+        "PASS: all 12 themes, live colour previews, Ctrl+N/P, cancel/apply, empty searches, global persistence, repository switching, themed startup, corrupt preferences, and unchanged workflows."
+    )
     print(f"Artifacts: {ARTIFACTS}")
 
 

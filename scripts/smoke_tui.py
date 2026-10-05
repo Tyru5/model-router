@@ -3,6 +3,7 @@
 
 Run: uv run --with pyte python scripts/smoke_tui.py
 """
+
 import fcntl
 import codecs
 import json
@@ -31,9 +32,20 @@ class Terminal:
         self.project = project
         self.pid, self.fd = pty.fork()
         if not self.pid:
-            env = dict(os.environ, TERM="xterm-256color", XDG_CONFIG_HOME=str(project / "config-home"))
+            env = dict(
+                os.environ,
+                TERM="xterm-256color",
+                XDG_CONFIG_HOME=str(project / "config-home"),
+            )
             env.update(extra_env or {})
-            argv = [str(BINARY), "-C", str(project), "--config", str(project / ".model-router.toml"), *extra]
+            argv = [
+                str(BINARY),
+                "-C",
+                str(project),
+                "--config",
+                str(project / ".model-router.toml"),
+                *extra,
+            ]
             os.execve(str(BINARY), argv, env)
         self.screen = pyte.Screen(*size)
         self.stream = pyte.Stream(self.screen)
@@ -49,7 +61,11 @@ class Terminal:
         os.kill(self.pid, signal.SIGWINCH)
         if wait:
             # Keys sent before the full-screen redraw can race the resize on slow machines.
-            self.wait(lambda: b"\x1b[2J" in self.raw[start:], "No redraw after resize", timeout=5)
+            self.wait(
+                lambda: b"\x1b[2J" in self.raw[start:],
+                "No redraw after resize",
+                timeout=5,
+            )
 
     def pump(self, duration=0.15):
         end = time.monotonic() + duration
@@ -92,7 +108,10 @@ class Terminal:
             pid, status = os.waitpid(self.pid, os.WNOHANG)
             if pid:
                 self.exited = True
-                assert os.waitstatus_to_exitcode(status) == expected, (status, self.text())
+                assert os.waitstatus_to_exitcode(status) == expected, (
+                    status,
+                    self.text(),
+                )
                 attributes = termios.tcgetattr(self.fd)
                 assert attributes[3] & termios.ICANON, "Terminal left in raw mode"
                 (ARTIFACTS / "terminal-transcript.ansi").write_bytes(self.raw)
@@ -111,14 +130,24 @@ class Terminal:
 
 
 def records(project):
-    return sorted((json.loads(p.read_text()) for p in project.glob(".model-router/runs/*/run.json")), key=lambda r: r["created_at"])
+    return sorted(
+        (
+            json.loads(p.read_text())
+            for p in project.glob(".model-router/runs/*/run.json")
+        ),
+        key=lambda r: r["created_at"],
+    )
 
 
 def main():
     assert BINARY.exists(), "Run cargo build first"
     with tempfile.TemporaryDirectory(prefix="router terminal test ") as name:
         project = Path(name)
-        config = (ROOT / "examples/demo.toml").read_text().replace("examples/mock_harness.py", str(ROOT / "examples/mock_harness.py"))
+        config = (
+            (ROOT / "examples/demo.toml")
+            .read_text()
+            .replace("examples/mock_harness.py", str(ROOT / "examples/mock_harness.py"))
+        )
         path = project / ".model-router.toml"
         path.write_text(config)
         terminal = Terminal(project)
@@ -127,11 +156,16 @@ def main():
             assert not records(project), "Opening the router started a run"
             terminal.snapshot("workflow-120x36.txt")
             terminal.resize(80, 24)
-            terminal.wait(lambda: "Review" in terminal.text(), "Optional review is hidden at 80x24")
+            terminal.wait(
+                lambda: "Review" in terminal.text(),
+                "Optional review is hidden at 80x24",
+            )
             terminal.snapshot("workflow-80x24.txt")
             terminal.resize(120, 36)
             terminal.send("t")
-            terminal.send("\x1b[200~Build a feature with 雪\nand preserve context between stages.\x1b[201~")
+            terminal.send(
+                "\x1b[200~Build a feature with 雪\nand preserve context between stages.\x1b[201~"
+            )
             terminal.send(b"\x13")
             terminal.send("jj ")  # enable review
             terminal.send(" ")  # disable it again
@@ -142,35 +176,63 @@ def main():
             terminal.send("s")
             saved = tomllib.loads(path.read_text())
             assert saved["workflows"][0]["stages"][1]["mode"] == "interactive"
-            assert saved["workflows"][0]["stages"][1]["name"] == "Interactive implementation"
+            assert (
+                saved["workflows"][0]["stages"][1]["name"]
+                == "Interactive implementation"
+            )
             assert not saved["workflows"][0]["stages"][2]["enabled"]
             terminal.send("r")
-            terminal.wait(lambda: "MOCK INTERACTIVE READY" in terminal.text(), "Interactive stage did not receive a terminal")
+            terminal.wait(
+                lambda: "MOCK INTERACTIVE READY" in terminal.text(),
+                "Interactive stage did not receive a terminal",
+            )
             terminal.send("done 雪\n")
-            terminal.wait(lambda: records(project) and records(project)[-1]["status"] == "awaiting_confirmation", "No interactive checkpoint")
-            terminal.wait(lambda: "MODEL ROUTER" in terminal.text(), "TUI was not restored")
+            terminal.wait(
+                lambda: (
+                    records(project)
+                    and records(project)[-1]["status"] == "awaiting_confirmation"
+                ),
+                "No interactive checkpoint",
+            )
+            terminal.wait(
+                lambda: "MODEL ROUTER" in terminal.text(), "TUI was not restored"
+            )
             terminal.snapshot("interactive-checkpoint.txt")
             terminal.send("h")
-            terminal.wait(lambda: "implementation evidence" in terminal.text(), "Handoff inspector missing")
+            terminal.wait(
+                lambda: "implementation evidence" in terminal.text(),
+                "Handoff inspector missing",
+            )
             terminal.snapshot("handoff.txt")
             terminal.send(b"\x1b")
             terminal.send("a")
-            terminal.wait(lambda: records(project)[-1]["status"] == "complete", "Run did not complete")
+            terminal.wait(
+                lambda: records(project)[-1]["status"] == "complete",
+                "Run did not complete",
+            )
             record = records(project)[-1]
             assert record["stages"][2]["status"] == "skipped"
             assert not (project / ".model-router/mock/review.count").exists()
-            assert (project / ".model-router/mock/interactive-input.txt").read_text() == "done 雪"
-            assert "research evidence" in (project / ".model-router/mock/implementation.prompt").read_text()
+            assert (
+                project / ".model-router/mock/interactive-input.txt"
+            ).read_text() == "done 雪"
+            assert (
+                "research evidence"
+                in (project / ".model-router/mock/implementation.prompt").read_text()
+            )
             terminal.snapshot("completed.txt")
             terminal.send("3\r")
-            terminal.wait(lambda: "Saved run loaded" in terminal.text(), "History did not reload run")
+            terminal.wait(
+                lambda: "Saved run loaded" in terminal.text(),
+                "History did not reload run",
+            )
             terminal.send("q")
             terminal.exit()
         finally:
             terminal.cleanup()
 
         # An echoed valid-looking review verdict in a PTY must not approve work.
-        review = f'''version = 1
+        review = f"""version = 1
 [adapters.mock]
 command = "python3"
 args = []
@@ -183,17 +245,22 @@ name = "Review"
 role = "review"
 harness = "mock"
 mode = "interactive"
-'''
+"""
         path.write_text(review)
         terminal = Terminal(project, ["run", "--task", "Review without a handoff file"])
         try:
-            terminal.wait(lambda: "MOCK INTERACTIVE READY" in terminal.text(), "Review did not open")
+            terminal.wait(
+                lambda: "MOCK INTERACTIVE READY" in terminal.text(),
+                "Review did not open",
+            )
             terminal.send("done\n")
             terminal.exit(expected=1)
             assert records(project)[-1]["status"] == "blocked"
         finally:
             terminal.cleanup()
-    print("PASS: real TUI editing, Unicode paste, 80x24 resize, optional review, PTY input, handoff checkpoint, completion, history, terminal restoration, and rejection of unrecorded review verdicts.")
+    print(
+        "PASS: real TUI editing, Unicode paste, 80x24 resize, optional review, PTY input, handoff checkpoint, completion, history, terminal restoration, and rejection of unrecorded review verdicts."
+    )
     print(f"Artifacts: {ARTIFACTS}")
 
 

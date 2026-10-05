@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline, read-only GitHub CLI fixture for task import tests."""
+
 import base64
 import json
 import os
@@ -23,9 +24,25 @@ if "/git/matching-refs/heads/" in endpoint:
 elif "/git/matching-refs/tags/" in endpoint:
     print(json.dumps(["refs/tags/v1.0"]))
 elif "/issues/" in endpoint:
-    print(json.dumps({"title": "GitHub issue spec", "body": "## Acceptance criteria\n\n- Preserve context 雪\n- Keep $(literal) text\n"}))
+    print(
+        json.dumps(
+            {
+                "title": "GitHub issue spec",
+                "body": "## Acceptance criteria\n\n- Preserve context 雪\n- Keep $(literal) text\n",
+            }
+        )
+    )
 elif "/contents/" in endpoint:
     body = "# GitHub file spec\n\n- Preserve context 雪\n".encode()
-    print(json.dumps({"type": "file", "encoding": "base64", "size": len(body), "content": base64.b64encode(body).decode()}))
+    print(
+        json.dumps(
+            {
+                "type": "file",
+                "encoding": "base64",
+                "size": len(body),
+                "content": base64.b64encode(body).decode(),
+            }
+        )
+    )
 else:
     raise AssertionError(f"Unexpected GitHub endpoint: {endpoint}")

@@ -136,7 +136,7 @@ impl TaskImporter {
             if key.code == Key::Esc {
                 self.job = None;
                 self.error =
-                    "Import cancelled. Edit the URL or press Esc to return to files.".into();
+                    "Import cancelled. Edit the URL or press [Esc] to return to files.".into();
             }
             return Ok(ImportAction::Stay);
         }
