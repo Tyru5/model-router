@@ -1,7 +1,7 @@
 use super::{
     actions::{self, ActionId, Scope},
     harness_editor::HarnessEditor,
-    harnesses::draw_harnesses,
+    harnesses::{self, HarnessRow, draw_harnesses},
     history::draw_history,
     modal::{Choice, InputTarget, Modal, PickValue, draw_modal, matching_choices},
     monitor::draw_run,
@@ -79,6 +79,7 @@ pub(super) struct App {
     pub(super) history: Vec<Run>,
     pub(super) history_selected: usize,
     pub(super) harness_selected: usize,
+    pub(super) harness_rows: Vec<HarnessRow>,
     pub(super) catalog: Option<Receiver<std::result::Result<Catalog, String>>>,
     pub(super) model_editor: Option<Box<HarnessEditor>>,
     pub(super) quit_after_stop: bool,
@@ -115,6 +116,7 @@ impl App {
             history: vec![],
             history_selected: 0,
             harness_selected: 0,
+            harness_rows: vec![],
             catalog: None,
             model_editor: None,
             quit_after_stop: false,
@@ -355,6 +357,7 @@ impl App {
         self.history.clear();
         self.history_selected = 0;
         self.harness_selected = 0;
+        self.harness_rows.clear();
         self.logs.clear();
         self.log_scroll = 0;
         self.page = 0;
@@ -440,8 +443,10 @@ impl App {
     }
     fn show(&mut self, page: usize) -> Result<()> {
         self.page = page;
-        if page == 2 {
-            self.history = engine::history(&self.project)?;
+        match page {
+            2 => self.history = engine::history(&self.project)?,
+            3 => self.harness_rows = harnesses::scan(&self.settings),
+            _ => {}
         }
         Ok(())
     }

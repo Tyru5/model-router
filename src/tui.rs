@@ -137,7 +137,7 @@ pub fn run(
         return Ok(());
     }
     let _ = storage::remember_project(&app.project);
-    loop {
+    'run: loop {
         if app.signal.load(Ordering::Relaxed) {
             app.cancel.store(true, Ordering::Relaxed);
             app.quit_after_stop = true;
@@ -169,17 +169,24 @@ pub fn run(
         }
         screen.terminal.draw(|frame| draw(frame, &mut app))?;
         if event::poll(Duration::from_millis(70))? {
-            match event::read()? {
-                Event::Key(key) => match app.key(key) {
-                    Ok(true) => break,
-                    Ok(false) => {}
-                    Err(error) => {
-                        app.message = format!("{error:#}");
-                        app.alert = app.message.clone();
-                    }
-                },
-                Event::Paste(text) => app.paste(&text),
-                _ => {}
+            // Handle all queued input before drawing again, so slow frames do
+            // not make typing lag one event per frame.
+            for _ in 0..64 {
+                match event::read()? {
+                    Event::Key(key) => match app.key(key) {
+                        Ok(true) => break 'run,
+                        Ok(false) => {}
+                        Err(error) => {
+                            app.message = format!("{error:#}");
+                            app.alert = app.message.clone();
+                        }
+                    },
+                    Event::Paste(text) => app.paste(&text),
+                    _ => {}
+                }
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
         }
         if app.cancel.load(Ordering::Relaxed) && app.worker.is_none() {

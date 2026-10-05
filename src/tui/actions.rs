@@ -66,6 +66,7 @@ pub(super) enum ActionId {
     PreviousHarness,
     NextHarness,
     HarnessDetails,
+    RefreshHarnesses,
     // Everywhere
     NextView,
     ShowWorkflow,
@@ -274,6 +275,7 @@ const ACTIONS: &[Entry] = {
         act(PreviousHarness, Harnesses, key(KeyCode::Up), "select", "Select previous harness").also(&[ch('k')]).alias("↑↓").footer(),
         act(NextHarness, Harnesses, key(KeyCode::Down), "select", "Select next harness").also(&[ch('j')]).alias("↑↓").footer(),
         act(HarnessDetails, Harnesses, key(KeyCode::Enter), "details", "Show harness details").footer(),
+        act(RefreshHarnesses, Harnesses, ch('r'), "refresh", "Check installations again").footer(),
         // Everywhere
         act(NextView, Global, key(KeyCode::Tab), "switch view", "Switch to the next view")
             .footer_in(&[MonitorRunning, Runs, Harnesses]),
@@ -491,7 +493,7 @@ mod tests {
         );
         assert_eq!(
             shown(Scope::Harnesses),
-            "↑↓ select, Enter details, Tab switch view, T themes, ? help, q quit, : commands"
+            "↑↓ select, Enter details, r refresh, Tab switch view, T themes, ? help, q quit, : commands"
         );
     }
 }

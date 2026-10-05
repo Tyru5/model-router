@@ -1,5 +1,5 @@
 use super::{actions::ActionId, app::App, theme::Palette, widgets::short_path};
-use crate::{adapters, catalog};
+use crate::{adapters, catalog, config::Settings};
 use anyhow::{Result, bail};
 use ratatui::{
     Frame,
@@ -8,22 +8,49 @@ use ratatui::{
     text::Line,
     widgets::{Cell, HighlightSpacing, Row, Table, TableState},
 };
+use std::path::PathBuf;
+
+/// An installation check for the Harnesses page. Checks scan PATH, which is
+/// slow on some systems (e.g. WSL), so they run when the page opens.
+pub(super) struct HarnessRow {
+    name: String,
+    program: String,
+    path: Option<PathBuf>,
+}
+
+pub(super) fn scan(settings: &Settings) -> Vec<HarnessRow> {
+    catalog::known_harnesses(settings)
+        .into_iter()
+        .map(|name| {
+            let program = adapters::program(&name, &settings.adapters);
+            let path = adapters::executable(&program);
+            HarnessRow {
+                name,
+                program,
+                path,
+            }
+        })
+        .collect()
+}
 
 impl App {
     pub(super) fn perform_harnesses(&mut self, id: ActionId) -> Result<()> {
-        let harnesses = catalog::known_harnesses(&self.settings);
         match id {
             ActionId::NextHarness => {
                 self.harness_selected =
-                    (self.harness_selected + 1).min(harnesses.len().saturating_sub(1))
+                    (self.harness_selected + 1).min(self.harness_rows.len().saturating_sub(1))
             }
             ActionId::PreviousHarness => {
                 self.harness_selected = self.harness_selected.saturating_sub(1)
             }
             ActionId::HarnessDetails => {
-                let harness = &harnesses[self.harness_selected];
-                self.text(harness, format!("Executable: {}\n\n{}\n\nSelect this harness with [h] on the workflow page, then press [m] to load model selections. Use [c] on Workflow to configure the selected stage, including permissions and extra arguments.\n\nPermissions inherit the harness configuration unless overridden for a stage. Authentication stays with the harness.\n\nCustom adapters are defined in TOML. See README.md for the template contract.", adapters::program(harness, &self.settings.adapters), if harness == "amp" { "Amp uses mode keys. A mode determines its model and tools." } else { "A model must be supported by the selected harness/provider." }));
+                let Some(row) = self.harness_rows.get(self.harness_selected) else {
+                    return Ok(());
+                };
+                let (harness, program) = (row.name.clone(), row.program.clone());
+                self.text(&harness, format!("Executable: {}\n\n{}\n\nSelect this harness with [h] on the workflow page, then press [m] to load model selections. Use [c] on Workflow to configure the selected stage, including permissions and extra arguments.\n\nPermissions inherit the harness configuration unless overridden for a stage. Authentication stays with the harness.\n\nCustom adapters are defined in TOML. See README.md for the template contract.", program, if harness == "amp" { "Amp uses mode keys. A mode determines its model and tools." } else { "A model must be supported by the selected harness/provider." }));
             }
+            ActionId::RefreshHarnesses => self.harness_rows = scan(&self.settings),
             other => bail!("{other:?} is not a Harnesses action"),
         }
         Ok(())
@@ -31,28 +58,28 @@ impl App {
 }
 
 pub(super) fn draw_harnesses(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
-    let rows = catalog::known_harnesses(&app.settings)
-        .into_iter()
-        .map(|name| {
-            let program = adapters::program(&name, &app.settings.adapters);
-            let path = adapters::executable(&program);
-            let found = path.is_some();
-            Row::new([
-                Cell::from(name),
-                Cell::from(if found {
-                    "● installed"
-                } else {
-                    "○ not found"
-                })
-                .style(Style::default().fg(if found {
-                    palette.accent
-                } else {
-                    palette.muted
-                })),
-                Cell::from(path.map(|p| short_path(&p, usize::MAX)).unwrap_or(program))
-                    .style(Style::default().fg(palette.muted)),
-            ])
-        });
+    let rows = app.harness_rows.iter().map(|row| {
+        let found = row.path.is_some();
+        Row::new([
+            Cell::from(row.name.clone()),
+            Cell::from(if found {
+                "● installed"
+            } else {
+                "○ not found"
+            })
+            .style(Style::default().fg(if found {
+                palette.accent
+            } else {
+                palette.muted
+            })),
+            Cell::from(
+                row.path
+                    .as_ref()
+                    .map_or_else(|| row.program.clone(), |p| short_path(p, usize::MAX)),
+            )
+            .style(Style::default().fg(palette.muted)),
+        ])
+    });
     let block = palette.panel(" Harnesses ").title(
         Line::styled(
             " uses existing logins and provider settings ",
