@@ -1,6 +1,7 @@
 use super::{
     actions::ActionId,
     app::App,
+    completion::{checks_cell, draw_completion},
     modal::InputTarget,
     theme::Palette,
     widgets::{elapsed, empty_state, short_path},
@@ -23,10 +24,18 @@ impl App {
                 self.cancel.store(true, Ordering::Relaxed);
                 self.message = "Stopping stage…".into();
             }
+            ActionId::ScrollUp if self.results_shown() => {
+                self.results_scroll = self.results_scroll.saturating_sub(5)
+            }
+            ActionId::ScrollDown if self.results_shown() => {
+                self.results_scroll = self.results_scroll.saturating_add(5)
+            }
             ActionId::ScrollUp => {
                 self.log_scroll = self.log_scroll.saturating_add(10).min(self.logs.len())
             }
             ActionId::ScrollDown => self.log_scroll = self.log_scroll.saturating_sub(10),
+            ActionId::Diff => self.show_diff()?,
+            ActionId::ToggleResults => self.toggle_results()?,
             ActionId::Handoff => {
                 let run = self.run.as_ref().context("No run selected")?;
                 let index = run.cursor.min(run.stages.len().saturating_sub(1));
@@ -133,6 +142,15 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
         ])),
         chunks[0],
     );
+    if app.results_shown() {
+        let rest = Rect {
+            y: chunks[1].y,
+            height: area.height.saturating_sub(chunks[1].y - area.y),
+            ..area
+        };
+        draw_completion(frame, app, run, rest, palette);
+        return;
+    }
     let name_width = run
         .workflow
         .stages
@@ -151,6 +169,14 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
             Cell::from(run.workflow.stages[i].name.clone()),
             Cell::from(palette.status_span(state.status)),
             Cell::from(state.attempts.len().to_string()).style(Style::default().fg(palette.muted)),
+            Cell::from(checks_cell(
+                state
+                    .attempts
+                    .last()
+                    .into_iter()
+                    .flat_map(|a| a.checks.iter().map(|c| c.status)),
+            ))
+            .style(Style::default().fg(palette.muted)),
             Cell::from(seconds.map(elapsed).unwrap_or_else(|| "–".into()))
                 .style(Style::default().fg(palette.muted)),
         ])
@@ -162,11 +188,15 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
                 Constraint::Length(name_width),
                 Constraint::Length(18),
                 Constraint::Length(8),
+                Constraint::Length(6),
                 Constraint::Fill(1),
             ],
         )
         .column_spacing(3)
-        .header(Row::new(["STAGE", "STATUS", "ATTEMPTS", "ELAPSED"]).style(palette.header_style()))
+        .header(
+            Row::new(["STAGE", "STATUS", "ATTEMPTS", "CHECKS", "ELAPSED"])
+                .style(palette.header_style()),
+        )
         .block(palette.panel(" Progress "))
         .highlight_symbol("▌")
         .highlight_spacing(HighlightSpacing::Always)
@@ -223,6 +253,28 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
                 storage::clean_terminal(error),
                 Style::default().fg(palette.red),
             ),
+        ]
+    } else if let Some(reason) = run.pending_waiver() {
+        vec![
+            Line::styled(
+                "Verification not applicable",
+                Style::default()
+                    .fg(palette.warn)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+            Line::raw("The test stage reported that no check applies:"),
+            Line::styled(
+                storage::clean_terminal(reason),
+                Style::default().fg(palette.fg),
+            ),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("[a]", Style::default().fg(palette.accent)),
+                Span::raw(" accepts without checks   "),
+                Span::styled("[y]", Style::default().fg(palette.accent)),
+                Span::raw(" retries"),
+            ]),
         ]
     } else if let Some(h) = handoff {
         let mut lines = vec![

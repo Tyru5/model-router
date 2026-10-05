@@ -18,6 +18,7 @@ use std::{
 
 mod actions;
 mod app;
+mod completion;
 mod harness_editor;
 mod harnesses;
 mod history;

@@ -9,6 +9,8 @@ pub mod harness_settings;
 pub mod history;
 pub mod presets;
 pub mod process;
+pub mod report;
+pub mod snapshot;
 pub mod storage;
 pub mod task_import;
 pub mod tui;

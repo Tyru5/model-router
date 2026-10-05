@@ -1,5 +1,6 @@
 use super::{
     actions::{self, ActionId, Scope},
+    completion,
     harness_editor::HarnessEditor,
     harnesses::{HarnessChecks, draw_harnesses},
     history::{RunsView, draw_history},
@@ -77,6 +78,13 @@ pub(super) struct App {
     pub(super) launch_interactive: bool,
     pub(super) logs: VecDeque<String>,
     pub(super) log_scroll: usize,
+    /// A finished run shows results unless the output log was chosen.
+    pub(super) show_output: bool,
+    pub(super) results_scroll: u16,
+    pub(super) changes: Option<completion::Loaded>,
+    pub(super) changes_job: Option<(String, Receiver<completion::Loaded>)>,
+    /// The run checkpoint whose waiver the status line last announced.
+    pub(super) waiver_shown: String,
     pub(super) history: Vec<Entry>,
     pub(super) history_selected: usize,
     pub(super) runs: RunsView,
@@ -115,6 +123,11 @@ impl App {
             launch_interactive: false,
             logs: VecDeque::new(),
             log_scroll: 0,
+            show_output: false,
+            results_scroll: 0,
+            changes: None,
+            changes_job: None,
+            waiver_shown: String::new(),
             history: vec![],
             history_selected: 0,
             runs: RunsView::default(),
@@ -335,6 +348,7 @@ impl App {
             }
             None => {}
         }
+        self.poll_completion();
         Ok(self.quit_after_stop && self.worker.is_none())
     }
     pub(super) fn model_picker(&mut self) {

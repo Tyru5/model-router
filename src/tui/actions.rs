@@ -56,6 +56,8 @@ pub(super) enum ActionId {
     EditSummary,
     ScrollUp,
     ScrollDown,
+    Diff,
+    ToggleResults,
     BackToWorkflow,
     // Runs
     PreviousRun,
@@ -257,7 +259,7 @@ const ACTIONS: &[Entry] = {
         act(SaveGlobal, Workflow, ch('S'), "save global", "Save global templates"),
         // Monitor: while running, while idle, or both
         act(CancelStage, MonitorRunning, ch('c'), "cancel stage", "Cancel active stage").footer(),
-        act(Advance, MonitorIdle, ch('a'), "advance", "Accept interactive handoff and advance").footer(),
+        act(Advance, MonitorIdle, ch('a'), "advance", "Accept handoff and advance; also accepts a test stage's not-applicable waiver").footer(),
         act(Continue, MonitorIdle, ch('c'), "continue", "Continue the run when idle").footer(),
         act(Retry, MonitorIdle, ch('y'), "retry", "Explicitly retry current stage").footer(),
         act(RetryInteractive, MonitorIdle, ch('i'), "interactive", "Retry current stage interactively").footer(),
@@ -270,6 +272,8 @@ const ACTIONS: &[Entry] = {
         act(ScrollDown, Monitor, key(KeyCode::PageDown), "scroll", "Scroll output down")
             .alias("PgUp/PgDn")
             .footer_in(&[MonitorRunning]),
+        act(Diff, MonitorIdle, ch('d'), "diff", "Show the diff of changes made during a finished run"),
+        act(ToggleResults, MonitorIdle, ch('o'), "output", "Switch a finished run between results and output log"),
         act(BackToWorkflow, MonitorIdle, ch('n'), "workflow", "Return to workflow editor").footer(),
         // Runs
         act(PreviousRun, Runs, key(KeyCode::Up), "select", "Select previous run").also(&[ch('k')]).alias("↑↓").footer(),

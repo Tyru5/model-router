@@ -130,10 +130,18 @@ fn every_theme_reaches_pages_dialogs_and_text_inputs() {
         for (width, height) in [(120, 36), (80, 24)] {
             let mut terminal =
                 Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-            for action in [
-                '1', '2', '3', '4', '1', 't', 'e', 'c', 'p', 'f', 'w', '?', 'T', ':',
-            ] {
+            // `2 o o` revisits the Monitor with a finished run: results, the
+            // output log, then results again.
+            for (step, action) in [
+                '1', '2', '3', '4', '1', 't', 'e', 'c', 'p', 'f', 'w', '?', 'T', ':', '2', 'o', 'o',
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 app.modal = None;
+                if step == 14 {
+                    app.run = Some(crate::report::tests::sample());
+                }
                 app.key(key(Key::Char(action))).unwrap();
                 terminal.draw(|frame| draw(frame, &mut app)).unwrap();
                 let buffer = terminal.backend().buffer();
@@ -151,6 +159,8 @@ fn every_theme_reaches_pages_dialogs_and_text_inputs() {
                     "Unstyled background in {theme:?}, view {action}"
                 );
             }
+            assert!(app.results_shown());
+            app.run = None;
             app.modal = None;
         }
     }

@@ -3,7 +3,7 @@ use crate::{
     checks::{self, CheckResult},
     config::{CustomAdapter, Mode, Role, Settings, Workflow},
     handoff::{self, Handoff, TestStatus, Verdict},
-    process, storage,
+    process, snapshot, storage,
 };
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
@@ -61,6 +61,15 @@ pub struct Attempt {
     /// Router-executed check results; empty when the stage has no checks.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<CheckResult>,
+    /// Workspace Git trees before the harness starts and after its checks;
+    /// None outside Git or when Git failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_after: Option<String>,
+    /// Tokens and cost the harness reported; None when it reported none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<handoff::Usage>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageState {
@@ -85,6 +94,9 @@ pub struct Run {
     pub updated_at: DateTime<Utc>,
     pub project: PathBuf,
     pub workspace: PathBuf,
+    /// Workspace Git tree when the run was created; None outside Git.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<String>,
     pub directory: PathBuf,
     pub worktree: bool,
     pub task: String,
@@ -171,6 +183,7 @@ impl Run {
         };
         let directory = storage::metadata_dir(&project)?.join("runs").join(&id);
         fs::create_dir_all(&directory)?;
+        let baseline = snapshot::tree(&workspace, &directory);
         let now = Utc::now();
         let mut run = Self {
             version: 1,
@@ -180,6 +193,7 @@ impl Run {
             updated_at: now,
             project,
             workspace,
+            baseline,
             directory,
             worktree,
             task,
@@ -308,6 +322,28 @@ impl Run {
             .handoff
             .as_ref()?
             .not_applicable_reason()
+    }
+
+    /// Trees bounding the changes made during this run: the baseline and the
+    /// latest attempt's final snapshot, so earlier user changes are excluded.
+    pub fn change_range(&self) -> std::result::Result<(&str, &str), &'static str> {
+        let from = self
+            .baseline
+            .as_deref()
+            .ok_or("no baseline snapshot was recorded")?;
+        let latest = self
+            .stages
+            .iter()
+            .flat_map(|s| &s.attempts)
+            .max_by_key(|a| a.started_at);
+        let to = match latest {
+            Some(attempt) => attempt
+                .tree_after
+                .as_deref()
+                .ok_or("the latest attempt has no snapshot")?,
+            None => from,
+        };
+        Ok((from, to))
     }
 
     fn gate(&self) -> Option<Gate> {
@@ -573,6 +609,9 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
         handoff_file: handoff_file.clone(),
         error: None,
         checks: vec![],
+        tree_before: snapshot::tree(&run.workspace, &run.directory),
+        tree_after: None,
+        usage: None,
     });
     run.stages[index].status = Status::Running;
     run.status = Status::Running;
@@ -603,6 +642,13 @@ fn finish(
     if let Some(attempt) = run.stages[index].attempts.last_mut() {
         attempt.exit_code = outcome.code;
         attempt.finished_at = Some(Utc::now());
+        // Spend counts whether or not the stage succeeded. Usage events can be
+        // spread through the log, so read far more than the final response needs.
+        if attempt.mode == Mode::Unattended {
+            attempt.usage = process::read_tail(&prepared.directory.join("stdout.log"), 64 << 20)
+                .ok()
+                .and_then(|raw| handoff::usage(&raw, prepared.invocation.kind));
+        }
     }
     if outcome.cancelled {
         run.fail(
@@ -764,6 +810,7 @@ fn execute_stage(
     interactive: bool,
     emit: &mut impl FnMut(Event),
 ) -> Result<()> {
+    let index = run.cursor;
     let prepared = match prepare(run) {
         Ok(p) => p,
         Err(e) => {
@@ -803,9 +850,24 @@ fn execute_stage(
             format!("Could not complete stage bookkeeping: {error:#}"),
         );
     }
+    // Finishing may move the cursor, so record the stage that ran.
+    let tree = snapshot::tree(&run.workspace, &run.directory);
+    if let Some(attempt) = run.stages[index].attempts.last_mut() {
+        attempt.tree_after = tree;
+    }
     run.persist()?;
     emit(Event::State(Box::new(run.clone())));
     Ok(())
+}
+
+/// Saves the patch of this run's changes to changes.diff; best effort, like
+/// the snapshots it compares.
+fn save_changes(run: &Run) {
+    if let Ok((from, to)) = run.change_range() {
+        if let Ok(patch) = snapshot::patch(&run.workspace, from, to, snapshot::PATCH_LIMIT) {
+            let _ = storage::atomic_write(&run.directory.join("changes.diff"), patch.as_bytes());
+        }
+    }
 }
 
 /// Drive until completion, failure, or a terminal/confirmation is required.
@@ -818,6 +880,7 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
         match run.status {
             Status::AwaitingConfirmation => return Ok(Action::Confirm),
             Status::Failed | Status::Blocked | Status::Cancelled => {
+                save_changes(run);
                 run.persist()?;
                 return Ok(Action::Stopped);
             }
@@ -840,6 +903,7 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
             run.status = Status::Complete;
             run.error = None;
             run.persist()?;
+            save_changes(run);
             emit(Event::State(Box::new(run.clone())));
             return Ok(Action::Complete);
         }
@@ -849,6 +913,7 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
                 "Run cancelled before the next stage".into(),
             );
             run.persist()?;
+            save_changes(run);
             return Ok(Action::Stopped);
         }
         if run.workflow.stages[run.cursor].mode == Mode::Interactive {
@@ -877,7 +942,14 @@ pub fn run_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
             let _ = stdout.write_all(text.as_bytes());
             let _ = stdout.flush();
         }
-    })
+    })?;
+    if matches!(
+        run.status,
+        Status::Failed | Status::Blocked | Status::Cancelled
+    ) {
+        save_changes(run);
+    }
+    Ok(())
 }
 
 pub fn edit_handoff(run: &mut Run, summary: String) -> Result<()> {
