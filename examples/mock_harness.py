@@ -22,6 +22,7 @@ parser.add_argument("--no-handoff", action="store_true")
 parser.add_argument("--test-status", choices=["passed", "failed", "not_run"])
 parser.add_argument("--test-optional", action="store_true")
 parser.add_argument("--not-applicable", metavar="REASON")
+parser.add_argument("--write-file", metavar="PATH", help="Write a line to PATH in the workspace")
 args = parser.parse_args()
 
 root = Path(".model-router/mock")
@@ -48,6 +49,11 @@ if args.interactive:
     print("MOCK INTERACTIVE READY — type done to finish", flush=True)
     reply = input()
     (root / "interactive-input.txt").write_text(reply)
+if args.write_file:
+    target = Path(args.write_file)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a") as file:
+        file.write(f"written by {args.role} attempt {number}\n")
 if args.model == "malformed":
     print("Looks fine, probably!")
     sys.exit(0)
@@ -61,7 +67,7 @@ handoff = {
     if blocking
     else [],
     "decisions": ["Offline fixture only"],
-    "files_changed": [],
+    "files_changed": [args.write_file] if args.write_file else [],
     "tests": [
         {
             "command": "offline acceptance check",
