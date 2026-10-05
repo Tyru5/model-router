@@ -26,6 +26,9 @@ repair limits, invalid verdicts, rerunning affected reviews, explicit model
 replacement, durable resume, timeouts, process-tree cancellation, SIGTERM cleanup,
 workspace locks, stale run revisions, literal shell metacharacters, Unicode paths,
 stream backpressure, configuration roundtrips, and Git worktree isolation.
+Verification tests block test stages lacking a passing required check, require
+one explicit acceptance for not-applicable reasons, and cover router check logs,
+timeouts, cancellation, and optional and required failures.
 Repository tests also cover folder navigation, `.git` files, symlink loops,
 non-Git projects, empty searches, and invalid paths. A deterministic regression
 test verifies locks release when their owner drops them, even if another process

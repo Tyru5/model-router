@@ -1,7 +1,8 @@
 use crate::{
     adapters::{self, ContextPaths, Invocation},
+    checks::{self, CheckResult},
     config::{CustomAdapter, Mode, Role, Settings, Workflow},
-    handoff::{self, Handoff, Verdict},
+    handoff::{self, Handoff, TestStatus, Verdict},
     process, storage,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -56,12 +58,23 @@ pub struct Attempt {
     pub directory: PathBuf,
     pub handoff_file: PathBuf,
     pub error: Option<String>,
+    /// Router-executed check results; empty when the stage has no checks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<CheckResult>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageState {
     pub status: Status,
     pub attempts: Vec<Attempt>,
     pub handoff: Option<Handoff>,
+    /// User acceptance of a test stage that reported no applicable check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiver: Option<Waiver>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Waiver {
+    pub reason: String,
+    pub accepted_at: DateTime<Utc>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Run {
@@ -96,6 +109,12 @@ pub enum Action {
     Interactive,
     Confirm,
     Stopped,
+}
+
+/// Holds applied to a stage's handoff before review repairs and advancing.
+enum Gate {
+    Block(String),
+    Waiver,
 }
 
 impl Run {
@@ -174,6 +193,7 @@ impl Run {
                     },
                     attempts: vec![],
                     handoff: None,
+                    waiver: None,
                 })
                 .collect(),
             cursor: 0,
@@ -228,24 +248,38 @@ impl Run {
         if let Some(model) = model {
             self.workflow.stages[self.cursor].model = model;
         }
-        for i in self.cursor..self.stages.len() {
-            self.stages[i].status = if self.workflow.stages[i].enabled {
-                Status::Pending
-            } else {
-                Status::Skipped
-            };
-            self.stages[i].handoff = None;
-        }
+        self.reset(self.cursor);
         self.status = Status::Pending;
         self.error = None;
         Ok(())
     }
 
+    /// Return stages from `from` onward to pending, discarding handoffs and acceptances.
+    fn reset(&mut self, from: usize) {
+        for i in from..self.stages.len() {
+            let state = &mut self.stages[i];
+            state.status = if self.workflow.stages[i].enabled {
+                Status::Pending
+            } else {
+                Status::Skipped
+            };
+            state.handoff = None;
+            state.waiver = None;
+        }
+    }
+
+    /// Confirming a checkpoint also accepts its pending waiver; it never needs a second step.
     pub fn confirm(&mut self) -> Result<()> {
         ensure!(
             self.status == Status::AwaitingConfirmation,
-            "No interactive handoff awaits confirmation"
+            "No handoff awaits confirmation"
         );
+        if let Some(reason) = self.pending_waiver().map(str::to_owned) {
+            self.stages[self.cursor].waiver = Some(Waiver {
+                reason,
+                accepted_at: Utc::now(),
+            });
+        }
         self.stages[self.cursor].status = Status::Complete;
         if let Some(attempt) = self.stages[self.cursor].attempts.last_mut() {
             attempt.status = Status::Complete;
@@ -254,29 +288,94 @@ impl Run {
         Ok(())
     }
 
+    /// The not-applicable reason when this checkpoint awaits acceptance of a test
+    /// stage without verification evidence.
+    pub fn pending_waiver(&self) -> Option<&str> {
+        if self.status != Status::AwaitingConfirmation || !matches!(self.gate(), Some(Gate::Waiver))
+        {
+            return None;
+        }
+        self.stages[self.cursor]
+            .handoff
+            .as_ref()?
+            .not_applicable_reason()
+    }
+
+    fn gate(&self) -> Option<Gate> {
+        let stage = self.workflow.stages.get(self.cursor)?;
+        let state = &self.stages[self.cursor];
+        let handoff = state.handoff.as_ref()?;
+        if handoff.verdict == Verdict::Blocked {
+            return Some(Gate::Block(format!(
+                "Stage reports a block: {}",
+                handoff.summary
+            )));
+        }
+        let checks = state.attempts.last().map_or(&[][..], |a| &a.checks);
+        let mut failed = checks
+            .iter()
+            .filter(|c| c.required && c.status != TestStatus::Passed);
+        if let Some(check) = failed.next() {
+            let more = failed.count();
+            return Some(Gate::Block(format!(
+                "Required check failed: {} ({}){}. Logs: {}",
+                shell_words::join(&check.command),
+                check.outcome(),
+                if more > 0 {
+                    format!("; {more} more failed")
+                } else {
+                    String::new()
+                },
+                check.directory.display()
+            )));
+        }
+        if stage.role != Role::Test {
+            return None;
+        }
+        if handoff.requires_repair()
+            || handoff
+                .tests
+                .iter()
+                .any(|test| test.required && test.status == TestStatus::NotRun)
+        {
+            return Some(Gate::Block("Test stage reports incomplete verification; inspect its findings and required checks before retrying".into()));
+        }
+        if handoff.has_passing_required_check()
+            || checks
+                .iter()
+                .any(|c| c.required && c.status == TestStatus::Passed)
+            || state.waiver.is_some()
+        {
+            return None;
+        }
+        Some(match handoff.not_applicable_reason() {
+            Some(_) => Gate::Waiver,
+            None => Gate::Block("Test stage reported no passing required check. Retry it with evidence, or have it report not_applicable with a reason, which requires your explicit acceptance".into()),
+        })
+    }
+
     fn apply_handoff(&mut self) -> Result<()> {
+        ensure!(
+            self.stages[self.cursor].handoff.is_some(),
+            "Missing handoff"
+        );
+        match self.gate() {
+            Some(Gate::Block(message)) => {
+                self.fail(Status::Blocked, message);
+                return Ok(());
+            }
+            Some(Gate::Waiver) => {
+                self.stages[self.cursor].status = Status::AwaitingConfirmation;
+                self.status = Status::AwaitingConfirmation;
+                return Ok(());
+            }
+            None => {}
+        }
         let stage = &self.workflow.stages[self.cursor];
         let handoff = self.stages[self.cursor]
             .handoff
             .as_ref()
             .context("Missing handoff")?;
-        if handoff.verdict == Verdict::Blocked {
-            self.fail(
-                Status::Blocked,
-                format!("Stage reports a block: {}", handoff.summary),
-            );
-            return Ok(());
-        }
-        if stage.role == Role::Test
-            && (handoff.requires_repair()
-                || handoff
-                    .tests
-                    .iter()
-                    .any(|test| test.required && test.status == handoff::TestStatus::NotRun))
-        {
-            self.fail(Status::Blocked, "Test stage reports incomplete verification; inspect its findings and required checks before retrying".into());
-            return Ok(());
-        }
         if stage.role == Role::Review && handoff.requires_repair() {
             let feedback = format!(
                 "Review {} requested changes:\n{}",
@@ -303,14 +402,7 @@ impl Run {
             self.repair_feedback = Some(feedback);
             self.repair_passes += 1;
             // Invalidate all downstream handoffs, including previously passing reviews.
-            for i in target..self.stages.len() {
-                self.stages[i].status = if self.workflow.stages[i].enabled {
-                    Status::Pending
-                } else {
-                    Status::Skipped
-                };
-                self.stages[i].handoff = None;
-            }
+            self.reset(target);
             self.cursor = target;
             self.status = Status::Pending;
             return Ok(());
@@ -407,6 +499,20 @@ pub fn prompt(run: &Run, handoff_path: &Path) -> String {
             storage::truncate(feedback, 4000)
         ));
     }
+    if !stage.checks.is_empty() {
+        text.push_str("\nROUTER CHECKS\nAfter you finish, the router runs these commands in the working directory and records their results independently of your handoff:\n");
+        for check in &stage.checks {
+            text.push_str(&format!(
+                "- {} ({})\n",
+                shell_words::join(&check.command),
+                if check.required {
+                    "required"
+                } else {
+                    "optional"
+                }
+            ));
+        }
+    }
     text.push_str(&format!("\nHANDOFF CONTRACT\nFinish with the JSON below between the exact markers. Replace example values with evidence. Also write the JSON object (without markers) to {} if your tools permit it. This file is router bookkeeping; research/review may write this file while leaving project code untouched. In interactive mode, complete this handoff before exiting.\n{}", handoff_path.display(), handoff::FORMAT));
     text
 }
@@ -465,6 +571,7 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
         directory: directory.clone(),
         handoff_file: handoff_file.clone(),
         error: None,
+        checks: vec![],
     });
     run.stages[index].status = Status::Running;
     run.status = Status::Running;
@@ -477,7 +584,13 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
     })
 }
 
-fn finish(run: &mut Run, prepared: &Prepared, result: Result<process::Outcome>) -> Result<()> {
+fn finish(
+    run: &mut Run,
+    prepared: &Prepared,
+    result: Result<process::Outcome>,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(Event),
+) -> Result<()> {
     let index = run.cursor;
     let outcome = match result {
         Ok(outcome) => outcome,
@@ -518,9 +631,12 @@ fn finish(run: &mut Run, prepared: &Prepared, result: Result<process::Outcome>) 
         );
         return Ok(());
     }
-    let stage = &run.workflow.stages[index];
+    let (mode, role) = (
+        run.workflow.stages[index].mode,
+        run.workflow.stages[index].role,
+    );
     let raw = process::read_tail(&prepared.directory.join("stdout.log"), 4 * 1024 * 1024)?;
-    let normalized = if stage.mode == Mode::Interactive {
+    let normalized = if mode == Mode::Interactive {
         handoff::Normalized {
             text: storage::clean_terminal(&raw),
             ..handoff::Normalized::default()
@@ -544,9 +660,9 @@ fn finish(run: &mut Run, prepared: &Prepared, result: Result<process::Outcome>) 
     }
     // Interactive terminal transcripts can echo the original prompt (including
     // the example JSON). Never infer a structured verdict from an echoed prompt.
-    if stage.mode == Mode::Interactive && !prepared.handoff_file.is_file() {
-        if matches!(stage.role, Role::Review | Role::Test) {
-            run.fail(Status::Blocked, format!("Interactive {} did not write its handoff file. Reopen it to produce a structured verdict and evidence", stage.role.label()));
+    if mode == Mode::Interactive && !prepared.handoff_file.is_file() {
+        if matches!(role, Role::Review | Role::Test) {
+            run.fail(Status::Blocked, format!("Interactive {} did not write its handoff file. Reopen it to produce a structured verdict and evidence", role.label()));
             return Ok(());
         }
         let handoff = Handoff {
@@ -560,10 +676,14 @@ fn finish(run: &mut Run, prepared: &Prepared, result: Result<process::Outcome>) 
             files_changed: vec![],
             tests: vec![],
             unresolved: vec!["No model-authored handoff was produced".into()],
+            not_applicable: None,
             structured: false,
         };
         storage::write_json(&prepared.directory.join("handoff.json"), &handoff)?;
         run.stages[index].handoff = Some(handoff);
+        if !run_checks(run, prepared, cancel, emit)? {
+            return Ok(());
+        }
         run.stages[index].status = Status::AwaitingConfirmation;
         run.status = Status::AwaitingConfirmation;
         if let Some(attempt) = run.stages[index].attempts.last_mut() {
@@ -578,7 +698,7 @@ fn finish(run: &mut Run, prepared: &Prepared, result: Result<process::Outcome>) 
     } else {
         normalized.text
     };
-    let handoff = match handoff::parse(&source, stage.role) {
+    let handoff = match handoff::parse(&source, role) {
         Ok(handoff) => handoff,
         Err(error) => {
             run.fail(Status::Blocked, format!("{error:#}"));
@@ -586,18 +706,55 @@ fn finish(run: &mut Run, prepared: &Prepared, result: Result<process::Outcome>) 
         }
     };
     storage::write_json(&prepared.directory.join("handoff.json"), &handoff)?;
+    // A reported block stops the stage regardless of check results.
+    let blocked = handoff.verdict == Verdict::Blocked;
     run.stages[index].handoff = Some(handoff);
+    if !blocked && !run_checks(run, prepared, cancel, emit)? {
+        return Ok(());
+    }
     run.stages[index].status = Status::Complete;
     if let Some(attempt) = run.stages[index].attempts.last_mut() {
         attempt.status = Status::Complete;
     }
-    if stage.mode == Mode::Interactive {
+    if mode == Mode::Interactive {
         run.status = Status::AwaitingConfirmation;
         run.stages[index].status = Status::AwaitingConfirmation;
     } else {
         run.apply_handoff()?;
     }
     Ok(())
+}
+
+/// Runs the current stage's router checks. False when cancellation stopped the run.
+fn run_checks(
+    run: &mut Run,
+    prepared: &Prepared,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(Event),
+) -> Result<bool> {
+    let index = run.cursor;
+    let configured = run.workflow.stages[index].checks.clone();
+    if configured.is_empty() {
+        return Ok(true);
+    }
+    let (results, cancelled) = checks::run(
+        &configured,
+        &run.workspace,
+        &prepared.directory,
+        cancel,
+        |text| emit(Event::Output(text)),
+    )?;
+    if let Some(attempt) = run.stages[index].attempts.last_mut() {
+        attempt.checks = results;
+    }
+    if cancelled {
+        run.fail(
+            Status::Cancelled,
+            "Stage cancelled during checks. Filesystem changes are retained; retry explicitly"
+                .into(),
+        );
+    }
+    Ok(!cancelled)
 }
 
 fn execute_stage(
@@ -639,7 +796,7 @@ fn execute_stage(
             },
         )
     };
-    if let Err(error) = finish(run, &prepared, result) {
+    if let Err(error) = finish(run, &prepared, result, cancel, emit) {
         run.fail(
             Status::Failed,
             format!("Could not complete stage bookkeeping: {error:#}"),
@@ -712,7 +869,14 @@ pub fn run_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
     let _workspace_lock =
         storage::lock(&storage::metadata_dir(&run.workspace)?.join("workspace.lock"))?;
     run.check_revision()?;
-    execute_stage(run, cancel, true, &mut |_| {})
+    // The terminal is still ours after the harness exits; show check output there.
+    execute_stage(run, cancel, true, &mut |event| {
+        if let Event::Output(text) = event {
+            let mut stdout = io::stdout();
+            let _ = stdout.write_all(text.as_bytes());
+            let _ = stdout.flush();
+        }
+    })
 }
 
 pub fn edit_handoff(run: &mut Run, summary: String) -> Result<()> {
@@ -783,6 +947,18 @@ pub fn preview(
                 ""
             }
         ));
+        for check in &stage.checks {
+            text.push_str(&format!(
+                "   check: {} ({}, {}s)\n",
+                shell_words::join(&check.command),
+                if check.required {
+                    "required"
+                } else {
+                    "optional"
+                },
+                check.timeout_seconds
+            ));
+        }
     }
     Ok(text)
 }
@@ -792,4 +968,141 @@ pub fn ensure_runnable(run: &Run) -> Result<()> {
         bail!("{error}\nArtifacts: {}", run.directory.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Check, Stage};
+
+    const NOT_APPLICABLE: &str = r#"{"summary":"Docs only","verdict":"complete","tests":[],"not_applicable":"No code changed"}"#;
+
+    /// Finishes an interactive attempt as if its harness wrote `handoff` and exited 0.
+    fn interactive(stage: Stage, handoff: Option<&str>) -> (tempfile::TempDir, Run) {
+        let dir = tempfile::tempdir().unwrap();
+        let next = Stage {
+            id: "next".into(),
+            harness: "mock".into(),
+            ..Stage::default()
+        };
+        let settings = Settings {
+            workflows: vec![Workflow {
+                name: "Interactive".into(),
+                max_repair_passes: 0,
+                stages: vec![
+                    Stage {
+                        harness: "mock".into(),
+                        mode: Mode::Interactive,
+                        ..stage
+                    },
+                    next,
+                ],
+            }],
+            adapters: BTreeMap::from([(
+                "mock".into(),
+                CustomAdapter {
+                    command: "python3".into(),
+                    interactive_args: Some(vec![]),
+                    ..CustomAdapter::default()
+                },
+            )]),
+            ..Settings::default()
+        };
+        let mut run = Run::create(
+            dir.path(),
+            &settings,
+            &settings.workflows[0],
+            "Task".into(),
+            false,
+        )
+        .unwrap();
+        let prepared = prepare(&mut run).unwrap();
+        fs::write(prepared.directory.join("stdout.log"), "transcript").unwrap();
+        if let Some(handoff) = handoff {
+            fs::write(&prepared.handoff_file, handoff).unwrap();
+        }
+        let outcome = process::Outcome {
+            code: Some(0),
+            cancelled: false,
+            timed_out: false,
+        };
+        finish(
+            &mut run,
+            &prepared,
+            Ok(outcome),
+            &AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .unwrap();
+        (dir, run)
+    }
+    fn python(code: &str) -> Check {
+        Check {
+            command: vec!["python3".into(), "-c".into(), code.into()],
+            ..Check::default()
+        }
+    }
+
+    #[test]
+    fn interactive_not_applicable_is_accepted_by_one_confirmation() {
+        let verify = Stage {
+            id: "verify".into(),
+            role: Role::Test,
+            ..Stage::default()
+        };
+        let (_dir, mut run) = interactive(verify, Some(NOT_APPLICABLE));
+        assert_eq!(run.status, Status::AwaitingConfirmation);
+        assert_eq!(run.pending_waiver(), Some("No code changed"));
+        run.confirm().unwrap();
+        assert_eq!((run.status, run.cursor), (Status::Pending, 1));
+        assert_eq!(run.stages[0].status, Status::Complete);
+        assert_eq!(
+            run.stages[0].waiver.as_ref().unwrap().reason,
+            "No code changed"
+        );
+        assert!(run.confirm().is_err());
+        // Retry resets from the cursor; point it back at the accepted stage.
+        run.cursor = 0;
+        run.retry(false, None).unwrap();
+        assert!(run.stages[0].waiver.is_none());
+    }
+
+    #[test]
+    fn interactive_test_with_router_evidence_needs_no_waiver() {
+        let verify = Stage {
+            id: "verify".into(),
+            role: Role::Test,
+            checks: vec![python("pass")],
+            ..Stage::default()
+        };
+        let (_dir, mut run) = interactive(verify, Some(NOT_APPLICABLE));
+        assert_eq!(run.status, Status::AwaitingConfirmation);
+        assert_eq!(
+            run.stages[0].attempts[0].checks[0].status,
+            TestStatus::Passed
+        );
+        assert_eq!(run.pending_waiver(), None);
+        run.confirm().unwrap();
+        assert_eq!(run.cursor, 1);
+        assert!(run.stages[0].waiver.is_none());
+    }
+
+    #[test]
+    fn interactive_checkpoint_shows_checks_before_blocking() {
+        let implement = Stage {
+            id: "implement".into(),
+            role: Role::Implementation,
+            checks: vec![python("raise SystemExit(4)")],
+            ..Stage::default()
+        };
+        // No handoff file: the placeholder checkpoint still runs checks.
+        let (_dir, mut run) = interactive(implement, None);
+        assert_eq!(run.status, Status::AwaitingConfirmation);
+        assert!(!run.stages[0].handoff.as_ref().unwrap().structured);
+        assert_eq!(run.stages[0].attempts[0].checks[0].exit_code, Some(4));
+        assert_eq!(run.pending_waiver(), None);
+        run.confirm().unwrap();
+        assert_eq!((run.status, run.cursor), (Status::Blocked, 0));
+        assert!(run.error.as_deref().unwrap().contains("(exit 4)"));
+    }
 }

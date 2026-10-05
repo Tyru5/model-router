@@ -51,6 +51,9 @@ pub struct Handoff {
     pub tests: Vec<TestEvidence>,
     #[serde(default)]
     pub unresolved: Vec<String>,
+    /// Why no verification check can apply; a test stage then needs user acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_applicable: Option<String>,
     #[serde(default = "yes")]
     pub structured: bool,
 }
@@ -69,13 +72,25 @@ impl Handoff {
                 .iter()
                 .any(|t| t.required && t.status == TestStatus::Failed)
     }
+    pub fn has_passing_required_check(&self) -> bool {
+        self.tests
+            .iter()
+            .any(|t| t.required && t.status == TestStatus::Passed)
+    }
+    pub fn not_applicable_reason(&self) -> Option<&str> {
+        self.not_applicable
+            .as_deref()
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+    }
 }
 
 pub const FORMAT: &str = r#"<router-handoff>
 {"summary":"What was established or changed","verdict":"complete","findings":[],"decisions":[],"files_changed":[],"tests":[{"command":"check actually run","status":"passed","required":true}],"unresolved":[]}
 </router-handoff>
 Use complete for normal successful stages. Reviews MUST use pass or needs_changes.
-Test stages MUST return a structured handoff with actual check results in tests.
+Test stages MUST return a structured handoff reporting each check actually run in tests.
+Only if no check can apply, a test stage may set "not_applicable":"reason"; the user must accept it.
 Use blocked if you cannot complete the task (including missing permission).
 Findings use {"severity":"blocking" or "advisory","description":"specific evidence"}.
 Tests use status passed, failed, or not_run. Never claim a test ran if it did not.
@@ -138,6 +153,7 @@ pub fn parse(text: &str, role: Role) -> Result<Handoff> {
         files_changed: vec![],
         tests: vec![],
         unresolved: vec![],
+        not_applicable: None,
         structured: false,
     })
 }
@@ -293,6 +309,52 @@ mod tests {
     fn required_failed_test_requests_repair() {
         let h = parse(r#"{"summary":"review","verdict":"pass","tests":[{"command":"test","status":"failed","required":true}]}"#, Role::Review).unwrap();
         assert!(h.requires_repair());
+    }
+    #[test]
+    fn only_passing_required_tests_are_evidence() {
+        for (tests, evidence) in [
+            ("[]", false),
+            (r#"[{"command":"a","status":"passed"}]"#, false),
+            (
+                r#"[{"command":"a","status":"passed","required":false},{"command":"b","status":"not_run","required":true}]"#,
+                false,
+            ),
+            (
+                r#"[{"command":"a","status":"passed","required":true}]"#,
+                true,
+            ),
+        ] {
+            let h = parse(
+                &format!(r#"{{"summary":"Verified","verdict":"complete","tests":{tests}}}"#),
+                Role::Test,
+            )
+            .unwrap();
+            assert_eq!(h.has_passing_required_check(), evidence, "{tests}");
+        }
+    }
+    #[test]
+    fn not_applicable_needs_a_reason_and_stays_out_of_ordinary_handoffs() {
+        let h = parse(
+            r#"{"summary":"Docs only","verdict":"complete","tests":[],"not_applicable":" No code changed "}"#,
+            Role::Test,
+        )
+        .unwrap();
+        assert_eq!(h.not_applicable_reason(), Some("No code changed"));
+        let blank = parse(
+            r#"{"summary":"Docs only","verdict":"complete","not_applicable":"  "}"#,
+            Role::Test,
+        )
+        .unwrap();
+        assert_eq!(blank.not_applicable_reason(), None);
+        let example = FORMAT.lines().nth(1).unwrap();
+        assert!(!example.contains("not_applicable"));
+        let plain = parse(example, Role::Test).unwrap();
+        assert!(plain.has_passing_required_check());
+        assert!(
+            !serde_json::to_string(&plain)
+                .unwrap()
+                .contains("not_applicable")
+        );
     }
     #[test]
     fn tool_output_cannot_spoof_review() {

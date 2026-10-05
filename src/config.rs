@@ -79,6 +79,9 @@ pub struct Stage {
     pub timeout_seconds: u64,
     /// An upstream implementation stage ID; empty chooses the nearest enabled one.
     pub repair_target: String,
+    /// Commands the router runs after the harness succeeds, independent of its handoff.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<Check>,
 }
 impl Default for Stage {
     fn default() -> Self {
@@ -97,6 +100,25 @@ impl Default for Stage {
             harness_settings: BTreeMap::new(),
             timeout_seconds: 3600,
             repair_target: String::new(),
+            checks: vec![],
+        }
+    }
+}
+
+/// An argument vector run in the workspace; no shell evaluates it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Check {
+    pub command: Vec<String>,
+    pub required: bool,
+    pub timeout_seconds: u64,
+}
+impl Default for Check {
+    fn default() -> Self {
+        Self {
+            command: vec![],
+            required: true,
+            timeout_seconds: 600,
         }
     }
 }
@@ -210,6 +232,30 @@ impl Settings {
                     "Unknown harness {}",
                     stage.harness
                 );
+                ensure!(
+                    stage.checks.len() <= 16,
+                    "Stage {} can have at most 16 checks",
+                    stage.name
+                );
+                for check in &stage.checks {
+                    ensure!(
+                        check
+                            .command
+                            .first()
+                            .is_some_and(|program| !program.trim().is_empty()),
+                        "Stage {} has a check without a command",
+                        stage.name
+                    );
+                    ensure!(
+                        !check.command.iter().any(|arg| arg.contains('\0')),
+                        "Check commands cannot contain NUL"
+                    );
+                    ensure!(
+                        check.timeout_seconds > 0,
+                        "Stage {} needs a positive check timeout",
+                        stage.name
+                    );
+                }
                 if stage.enabled && !stage.repair_target.is_empty() {
                     ensure!(
                         stage.role == Role::Review,
@@ -297,4 +343,67 @@ pub fn validate_task(task: &str) -> Result<()> {
         "Task must be at most 32768 bytes; reference larger files by path"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CHECKS: &str = r#"
+version = 1
+[[workflows]]
+name = "Verify"
+[[workflows.stages]]
+id = "verify"
+role = "test"
+checks = [
+  { command = ["cargo", "test", "--locked"] },
+  { command = ["cargo", "clippy", "--", "-D", "warnings"], required = false, timeout_seconds = 300 },
+]
+"#;
+
+    #[test]
+    fn checks_parse_with_defaults_and_roundtrip() {
+        let settings: Settings = toml::from_str(CHECKS).unwrap();
+        settings.validate().unwrap();
+        let checks = &settings.workflows[0].stages[0].checks;
+        assert_eq!(checks[0].command, ["cargo", "test", "--locked"]);
+        assert!(checks[0].required && checks[0].timeout_seconds == 600);
+        assert!(!checks[1].required && checks[1].timeout_seconds == 300);
+        let saved: Settings = toml::from_str(&toml::to_string_pretty(&settings).unwrap()).unwrap();
+        assert_eq!(
+            saved.workflows[0].stages[0].checks[1].command,
+            checks[1].command
+        );
+        let plain: toml::Value =
+            toml::from_str(&toml::to_string_pretty(&Settings::default()).unwrap()).unwrap();
+        assert!(
+            plain["workflows"][0]["stages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|stage| stage.get("checks").is_none()),
+            "Unused checks must not be saved"
+        );
+    }
+
+    #[test]
+    fn invalid_checks_are_rejected() {
+        let error = |edit: fn(&mut Vec<Check>)| {
+            let mut settings: Settings = toml::from_str(CHECKS).unwrap();
+            edit(&mut settings.workflows[0].stages[0].checks);
+            settings.validate().unwrap_err().to_string()
+        };
+        assert!(error(|c| *c = vec![Check::default()]).contains("without a command"));
+        assert!(
+            error(|c| c[0].command = vec![" ".into(), "x".into()]).contains("without a command")
+        );
+        assert!(error(|c| c[0].command.push("a\0b".into())).contains("NUL"));
+        assert!(error(|c| c[0].timeout_seconds = 0).contains("positive check timeout"));
+        assert!(error(|c| *c = vec![c[0].clone(); 17]).contains("at most 16"));
+        assert!(
+            toml::from_str::<Settings>(&CHECKS.replace("required = false", "shell = true"))
+                .is_err()
+        );
+    }
 }

@@ -28,10 +28,18 @@ workflow or changes a saved run; reviews start disabled in workflow presets.
   changed files, tests, and unresolved issues. Retain complete attempt logs on disk.
 - Use a small structured handoff in subsequent prompts, with artifact paths for
   details. Never treat a missing review verdict as a passing review.
-- Verification (`test`) stages require structured handoffs. Required failed or
-  unrun checks and blocking findings stop the run for inspection and retry.
+- Verification (`test`) stages require structured handoffs and evidence: at
+  least one passing required check, reported by the model or run by the router.
+  Required failed or unrun checks, blocking findings, and missing evidence stop
+  the run for inspection and retry. A stage that reports `not_applicable` with a
+  reason waits at the human checkpoint and continues only after explicit
+  acceptance, which is saved on the stage until a retry or repair resets it.
   Interactive verification must write its handoff file. Automatic repairs are
   reserved for enabled reviews.
+- Any stage may declare router checks: argument vectors run in the workspace
+  after the harness succeeds, each with a timeout. Results and logs are saved
+  with the attempt, independent of the handoff. A required check that fails,
+  times out, or cannot start blocks the stage; optional failures are recorded.
 - Read-only stage intent is expressed in instructions. Effective execution
   permissions are supplied by the harness and the user's explicit overrides;
   the router is not a universal sandbox.
