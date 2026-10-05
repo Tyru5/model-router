@@ -1,10 +1,11 @@
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use model_router::{
     adapters, catalog,
     config::{self, Mode, Role, Settings},
     engine::{self, Action, Event, Run, Status},
-    presets, storage, task_import, tui,
+    history::{self, Criteria, Entry, StatusFilter},
+    presets, task_import, tui,
 };
 use std::{
     io::{self, IsTerminal, Write},
@@ -86,8 +87,64 @@ enum Commands {
         #[arg(long, conflicts_with_all = ["retry", "interactive", "model"])]
         advance: bool,
     },
-    /// List saved runs for the selected project.
-    History,
+    /// Start a new run from a saved run's task and workflow snapshot.
+    Rerun {
+        id: String,
+        /// Use an isolated Git worktree. Default: the saved run's choice.
+        #[arg(long)]
+        worktree: bool,
+        #[arg(long)]
+        unattended: bool,
+    },
+    /// Compare two attempts of a stage, or a rerun's stage with its source's.
+    Compare {
+        id: String,
+        /// Stage ID. Default: the stage retried most recently.
+        #[arg(long)]
+        stage: Option<String>,
+        /// Attempt numbers. Default: the stage's last two.
+        #[arg(long, num_args = 2, value_names = ["A", "B"], conflicts_with = "source")]
+        attempts: Vec<usize>,
+        /// Compare the stage's last attempt with the rerun source's last attempt.
+        #[arg(long)]
+        source: bool,
+    },
+    /// Preview removing saved runs and their artifacts; --yes removes them.
+    Clean {
+        /// Only runs last updated more than DAYS days ago.
+        #[arg(long, value_name = "DAYS")]
+        older_than: Option<u64>,
+        /// Only these statuses, comma-separated (as for history --status).
+        #[arg(long, value_name = "S,..", value_delimiter = ',')]
+        status: Vec<StatusFilter>,
+        /// Never remove the N newest runs.
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        keep: usize,
+        /// Also remove each run's worktree when it is clean. Branches stay.
+        #[arg(long)]
+        worktrees: bool,
+        /// Remove instead of previewing.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// List saved runs, newest first, including damaged records.
+    History {
+        /// Only these statuses: active, pending, running, interactive,
+        /// awaiting_confirmation, complete, failed, blocked, cancelled, damaged.
+        #[arg(long, value_name = "S", value_delimiter = ',')]
+        status: Vec<StatusFilter>,
+        /// Only runs whose ID, workflow, task, or status contains every word.
+        #[arg(long, value_name = "TEXT")]
+        search: Option<String>,
+        /// Show at most N runs.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+        #[arg(long)]
+        json: bool,
+        /// Include sizes of run and handoff directories.
+        #[arg(long)]
+        sizes: bool,
+    },
     /// List model/mode selections without sending an inference request.
     Models { harness: String },
     /// Check executable availability. Authentication is left to each harness.
@@ -211,19 +268,58 @@ fn main_result() -> Result<()> {
             }
             println!("\n{}", catalog.note);
         }
-        Some(Commands::History) => {
-            let runs = engine::history(&project)?;
-            if runs.is_empty() {
-                println!("No saved runs in {}", project.display());
+        Some(Commands::History {
+            status,
+            search,
+            limit,
+            json,
+            sizes,
+        }) => {
+            let entries = history::list(&project)?;
+            let mut shown = history::filter(&entries, &status, search.as_deref().unwrap_or(""));
+            shown.truncate(limit.unwrap_or(usize::MAX));
+            let size = |entry: &Entry| sizes.then(|| history::run_size(&project, entry));
+            if json {
+                let mut values = vec![];
+                for entry in &shown {
+                    let mut value = match entry {
+                        Entry::Summary(summary) => serde_json::to_value(summary)?,
+                        Entry::Damaged { id, path, error } => serde_json::json!({
+                            "id": id, "status": "damaged", "path": path, "error": error
+                        }),
+                    };
+                    if let Some(bytes) = size(entry) {
+                        value["size"] = bytes.into();
+                    }
+                    values.push(value);
+                }
+                println!("{}", serde_json::to_string_pretty(&values)?);
+                return Ok(());
             }
-            for run in runs {
-                println!(
-                    "{}  {:18} {}  {}",
-                    run.id,
-                    run.status.label(),
-                    run.workflow.name,
-                    storage::truncate(&run.task.replace('\n', " "), 90)
-                );
+            if entries.is_empty() {
+                println!("No saved runs in {}", project.display());
+            } else if shown.is_empty() {
+                println!("No runs match ({} saved)", entries.len());
+            }
+            let mut total = 0;
+            for entry in &shown {
+                let bytes = size(entry).map_or_else(String::new, |bytes| {
+                    total += bytes;
+                    format!("{:>8}  ", history::human(bytes))
+                });
+                match entry {
+                    Entry::Summary(run) => println!(
+                        "{}  {:18} {bytes}{}  {}",
+                        run.id,
+                        run.status.label(),
+                        run.workflow,
+                        run.task
+                    ),
+                    Entry::Damaged { id, error, .. } => println!("DAMAGED {id}  {bytes}{error}"),
+                }
+            }
+            if sizes && !shown.is_empty() {
+                println!("Total {} in {} runs", history::human(total), shown.len());
             }
         }
         Some(Commands::Run {
@@ -269,6 +365,95 @@ fn main_result() -> Result<()> {
                 run.retry(interactive, model)?;
             }
             cli_drive(&mut run, &cancel)?;
+        }
+        Some(Commands::Rerun {
+            id,
+            worktree,
+            unattended,
+        }) => {
+            let mut run = history::rerun(&project, &settings, &id, worktree.then_some(true))?;
+            if unattended {
+                for stage in &mut run.workflow.stages {
+                    stage.mode = Mode::Unattended;
+                }
+                run.persist()?;
+            }
+            println!(
+                "Run: {}\nRerun of: {id}\nArtifacts: {}",
+                run.id,
+                run.directory.display()
+            );
+            cli_drive(&mut run, &cancel)?;
+        }
+        Some(Commands::Compare {
+            id,
+            stage,
+            attempts,
+            source,
+        }) => {
+            let run = engine::load(&project, &id)?;
+            let index = match &stage {
+                Some(stage) => run
+                    .workflow
+                    .stages
+                    .iter()
+                    .position(|s| s.id == *stage)
+                    .with_context(|| format!("Run {id} has no stage {stage}"))?,
+                None if source => run
+                    .stages
+                    .iter()
+                    .rposition(|s| !s.attempts.is_empty())
+                    .context("This run has no attempts yet")?,
+                None => history::retried_stage(&run)
+                    .context("No stage in this run has two attempts to compare")?,
+            };
+            let comparison = if source {
+                let origin = run.rerun_of.as_deref().context("This run is not a rerun")?;
+                let origin = engine::load(&project, origin)?;
+                history::compare_rerun(&origin, &run, &run.workflow.stages[index].id)?
+            } else {
+                let numbers: Vec<_> = run.stages[index]
+                    .attempts
+                    .iter()
+                    .map(|a| a.number)
+                    .collect();
+                let (a, b) = match (attempts.as_slice(), numbers.as_slice()) {
+                    ([a, b], _) | ([], [.., a, b]) => (*a, *b),
+                    _ => bail!(
+                        "Stage {} has {} attempt(s); give two with --attempts A B",
+                        run.workflow.stages[index].id,
+                        numbers.len()
+                    ),
+                };
+                history::compare(&run, index, a, b)?
+            };
+            print!("{}", comparison.text());
+        }
+        Some(Commands::Clean {
+            older_than,
+            status,
+            keep,
+            worktrees,
+            yes,
+        }) => {
+            let plan = history::cleanup_plan(
+                &project,
+                &Criteria {
+                    older_than_days: older_than,
+                    statuses: status,
+                    keep,
+                    worktrees,
+                    ..Criteria::default()
+                },
+            )?;
+            if yes {
+                print!("{}", history::apply(&plan).text(true));
+            } else {
+                print!("{}", plan.text(false));
+                if !plan.items.is_empty() {
+                    println!("Preview only. Add --yes to remove them.");
+                }
+            }
         }
     }
     Ok(())

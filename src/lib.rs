@@ -5,6 +5,7 @@ pub mod config;
 pub mod engine;
 pub mod handoff;
 pub mod harness_settings;
+pub mod history;
 pub mod presets;
 pub mod process;
 pub mod storage;
