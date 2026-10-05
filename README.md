@@ -194,7 +194,11 @@ The router does not silently replace a model that fails or is unavailable.
 
 `model-router doctor` checks each harness's executable, version, and the flags
 the router passes, using only `--version` and `--help`. It cannot check logins.
-See [compatibility checks](docs/adapters.md#compatibility-checks).
+See [compatibility checks](docs/adapters.md#compatibility-checks). The
+**Harnesses** page (**4**) runs the same checks in the background and shows each
+harness's version, tested status, and capabilities; **Enter** lists each flag
+and note. After it runs, the Workflow stage panel warns when the selected
+stage's harness lacks a flag.
 
 ## Stage and workflow presets
 
@@ -426,6 +430,12 @@ prompt lists these commands. Results are recorded independently of the model's
 handoff, in `run.json` and the attempt's `checks.json`, with logs under
 `checks/NN/`. A required check that fails, times out, or cannot start blocks the
 stage, whatever its role. Optional failures are only recorded.
+
+In the TUI, **e** on a stage edits **Router checks**: one command per line,
+shell-quoted (`npm run 'lint fix'`) but never run by a shell. A leading `?`
+(`?cargo clippy` or `? cargo clippy`) marks a check optional. Timeouts are set
+in TOML: a line whose command and required flag are unchanged keeps its
+`timeout_seconds`; new lines get 600.
 
 When no check can apply, a test stage may report `not_applicable` with a reason.
 The run then waits at the human checkpoint. Accept it with `a` in the monitor,

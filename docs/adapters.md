@@ -65,7 +65,9 @@ Authentication is not checked: that needs a model request. Log in through each h
 `doctor --json` prints the full reports, including each flag and the help
 command checked. `doctor --strict` exits non-zero when an installed harness
 lacks a flag. Probes run in parallel and finish within about 10 seconds.
-`model_router::doctor::inspect_all` returns the same data for the TUI.
+The TUI's Harnesses page runs `model_router::doctor::inspect_all` in the
+background when opened or on `r`, shows the same columns, and lists each flag
+on Enter.
 
 ### Parser fixtures
 

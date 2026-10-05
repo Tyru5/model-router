@@ -107,6 +107,12 @@ modes, old configuration compatibility, unsupported settings, stage isolation,
 and returning to the draft after model discovery failure. Permission controls
 inherit native settings until explicitly changed. No test starts a paid model.
 
+TUI tests cover the router checks editor (required, optional, and quoted lines,
+kept timeouts, quoting errors, the detail panel) and, with a stubbed doctor
+probe, the Harnesses page: background checking, version/tested/capability
+columns at 80 and 140 columns, per-flag details, and the Workflow missing-flag
+warning. No test runs a harness.
+
 Local screen captures:
 
 - `../.model-router/qa/workflow-120x36.txt`
