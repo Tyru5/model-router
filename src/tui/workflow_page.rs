@@ -633,11 +633,19 @@ pub(super) fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palett
         &mut TableState::default().with_selected(Some(app.selected)),
     );
     if cols[1].width > 0 {
-        draw_stage_detail(frame, app.stage(), cols[1], palette);
+        let warning = app.harness_checks.warning(&app.stage().harness);
+        draw_stage_detail(frame, app.stage(), warning, cols[1], palette);
     }
 }
 
-fn draw_stage_detail(frame: &mut Frame<'_>, stage: &Stage, area: Rect, palette: Palette) {
+/// `warning` flags missing harness flags from cached doctor results.
+fn draw_stage_detail(
+    frame: &mut Frame<'_>,
+    stage: &Stage,
+    warning: Option<String>,
+    area: Rect,
+    palette: Palette,
+) {
     let model = or_default(&stage.model, "harness default");
     let provider = or_default(&stage.provider, "harness default");
     let effort = or_default(&stage.effort, "harness default");
@@ -659,6 +667,11 @@ fn draw_stage_detail(frame: &mut Frame<'_>, stage: &Stage, area: Rect, palette: 
         ]),
         Line::raw(""),
         kv(palette, "Harness", &stage.harness, true),
+    ];
+    if let Some(warning) = warning {
+        lines.push(Line::styled(warning, Style::default().fg(palette.warn)));
+    }
+    lines.extend([
         kv(palette, "Model", model.0, model.1),
         kv(palette, "Execution", stage.mode.label(), true),
         kv(palette, "Provider", provider.0, provider.1),
@@ -672,7 +685,7 @@ fn draw_stage_detail(frame: &mut Frame<'_>, stage: &Stage, area: Rect, palette: 
         kv(palette, "ID", &stage.id, true),
         Line::raw(""),
         Line::styled("Instructions", palette.header_style()),
-    ];
+    ]);
     lines.extend(
         storage::clean_terminal(&stage.instructions)
             .lines()
@@ -858,7 +871,7 @@ mod tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 50)).unwrap();
         terminal
-            .draw(|frame| draw_stage_detail(frame, stage, frame.area(), palette))
+            .draw(|frame| draw_stage_detail(frame, stage, None, frame.area(), palette))
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)

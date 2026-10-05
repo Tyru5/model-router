@@ -274,8 +274,8 @@ const ACTIONS: &[Entry] = {
         // Harnesses
         act(PreviousHarness, Harnesses, key(KeyCode::Up), "select", "Select previous harness").also(&[ch('k')]).alias("↑↓").footer(),
         act(NextHarness, Harnesses, key(KeyCode::Down), "select", "Select next harness").also(&[ch('j')]).alias("↑↓").footer(),
-        act(HarnessDetails, Harnesses, key(KeyCode::Enter), "details", "Show harness details").footer(),
-        act(RefreshHarnesses, Harnesses, ch('r'), "refresh", "Check installations again").footer(),
+        act(HarnessDetails, Harnesses, key(KeyCode::Enter), "details", "Show version, flag checks, and notes").footer(),
+        act(RefreshHarnesses, Harnesses, ch('r'), "refresh", "Run version and flag checks again").footer(),
         // Everywhere
         act(NextView, Global, key(KeyCode::Tab), "switch view", "Switch to the next view")
             .footer_in(&[MonitorRunning, Runs, Harnesses]),
