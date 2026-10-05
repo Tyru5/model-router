@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a release binary and install it to ~/.cargo/bin.
+# Build a release binary and install it to ~/.cargo/bin (plus `mr` symlink).
 #
 # Usage: scripts/build.sh [options]
 #   -c, --check         run fmt, clippy, and tests first (mirrors CI)
@@ -60,7 +60,9 @@ cargo build --release --locked
 if [[ $install -eq 1 ]]; then
   echo "==> install"
   cargo install --path . --locked --force
-  echo "==> installed $(command -v model-router || echo "$HOME/.cargo/bin/model-router")"
+  bin_dir="${CARGO_HOME:-$HOME/.cargo}/bin"
+  ln -sfn model-router "$bin_dir/mr"
+  echo "==> installed $bin_dir/model-router (alias: mr)"
 fi
 
 echo "==> model-router $(current_version) ($(git rev-parse --short HEAD 2>/dev/null || echo unknown))"

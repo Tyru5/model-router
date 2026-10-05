@@ -35,6 +35,13 @@ cargo install --path . --locked
 model-router -C /path/to/project
 ```
 
+`scripts/build.sh` builds, installs, and symlinks `mr` -> `model-router`:
+
+```sh
+scripts/build.sh
+mr -C /path/to/project
+```
+
 The TUI opens with a 1.7-second animation: a signal branches through model nodes
 and converges into a route. Press any key to skip, or `Ctrl+C` to exit. The skip
 key is consumed so it cannot trigger an action in the editor. The animation
