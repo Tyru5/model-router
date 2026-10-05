@@ -2,6 +2,7 @@ use super::{
     theme::Palette,
     widgets::{content, menu_key, textarea},
 };
+use crate::providers::Provider;
 use crate::{
     adapters,
     catalog::Model,
@@ -17,6 +18,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, HighlightSpacing, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
+use std::collections::BTreeMap;
 use tui_textarea::TextArea;
 
 enum FieldKind {
@@ -50,12 +52,13 @@ impl Field {
 
 pub(super) struct HarnessEditor {
     stage: Stage,
+    providers: BTreeMap<String, Provider>,
     fields: Vec<Field>,
     selected: usize,
     pub error: String,
 }
 impl HarnessEditor {
-    pub fn new(stage: Stage) -> Self {
+    pub fn new(stage: Stage, providers: BTreeMap<String, Provider>) -> Self {
         let mut fields = vec![Field {
             kind: FieldKind::Model,
             label: if stage.harness == "amp" {
@@ -66,11 +69,11 @@ impl HarnessEditor {
             help: "Type a native model ID, alias, or Amp mode. Blank inherits the harness default. [F7] browses available selections without starting a model.",
             text: textarea(&stage.model),
         }];
-        if harness_settings::supports_provider(&stage.harness) {
+        if harness_settings::supports_provider(&stage.harness) || stage.harness == "claude" {
             fields.push(Field {
                 kind: FieldKind::Provider,
                 label: "Provider",
-                help: "Blank inherits the harness provider. A provider override requires a model. Authentication stays with the harness.",
+                help: "Blank inherits the harness provider. A provider override requires a model. Router providers (openrouter, groq, deepseek, … or [providers.NAME]) read their key from the environment; `model-router providers` lists them.",
                 text: textarea(&stage.provider),
             });
         }
@@ -123,6 +126,7 @@ impl HarnessEditor {
         });
         Self {
             stage,
+            providers,
             fields,
             selected: 0,
             error: String::new(),
@@ -177,7 +181,7 @@ impl HarnessEditor {
                 }
             }
         }
-        adapters::validate_options(&stage)?;
+        adapters::validate_options(&stage, &self.providers)?;
         Ok(stage)
     }
 

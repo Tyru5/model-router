@@ -48,6 +48,7 @@ fn query(
         stdin: None,
         kind: OutputKind::Text,
         final_file: temp.path().join("unused"),
+        env: vec![],
     };
     let result = process::capture(
         &inv,

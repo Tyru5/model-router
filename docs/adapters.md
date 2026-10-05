@@ -34,6 +34,34 @@ local cache; Claude's native SDK model discovery is not implemented. The other
 non-enumerating adapters permit manual IDs and configured defaults. CLI catalog
 parsers fail back to manual entry instead of making paid access-test requests.
 
+## Provider routing references
+
+Router providers (`src/providers.rs`) follow the shape other tools use for
+user-defined OpenAI-compatible endpoints: a name, a base URL, and the
+environment variable holding the key. Without a `[providers.NAME]` entry, built-in presets are emitted only for
+Claude Code. Other harnesses receive built-in names unchanged, because the
+router cannot reliably resolve their effective native configuration (Codex
+system, user, and profile layers; native registries). `[providers.NAME]`
+entries, including empty opt-ins to a preset, are emitted for every supported
+harness except Pi. Codex and OpenCode receive injected providers under an
+isolated `model-router-NAME` id; OpenCode also gets model limits so
+compaction works.
+
+| Tool | Mechanism the router mirrors or emits |
+| --- | --- |
+| Codex | [`model_providers.<id>`](https://github.com/openai/codex/blob/main/docs/config.md#model_providers) with `base_url` and `env_key`, set via `--config`. |
+| OpenCode | [Custom providers](https://opencode.ai/docs/providers/#custom-provider) with `@ai-sdk/openai-compatible`, `options.baseURL`, `{env:VAR}`; passed inline via `OPENCODE_CONFIG_CONTENT`. |
+| Crush | [`providers`](https://github.com/charmbracelet/crush#custom-providers) with `type: openai`, `base_url`, `api_key: $VAR`. Same schema shape as `[providers.NAME]`. |
+| Goose | [OpenAI-compatible provider](https://github.com/aaif-goose/goose/blob/main/documentation/docs/getting-started/providers.md) via `OPENAI_HOST` and `OPENAI_BASE_PATH`. |
+| Aider | [OpenAI-compatible APIs](https://aider.chat/docs/llms/openai-compat.html): `OPENAI_API_BASE`, `openai/` model prefix. |
+| Claude Code | [LLM gateway](https://docs.claude.com/en/docs/claude-code/llm-gateway) `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`; [OpenRouter's Claude Code guide](https://openrouter.ai/docs/guides/guides/claude-code-integration) sets `ANTHROPIC_API_KEY` empty. |
+
+Built-in presets' URLs and key variable names come from each provider's
+OpenAI-compatibility documentation (endpoints probed without credentials on 2026-10-04; no inference requests). Anthropic-compatible
+URLs are only set where the provider documents Claude Code support. Bedrock and
+Vertex use cloud credentials rather than API keys; use their native harness
+settings or an OpenAI-compatible gateway such as LiteLLM.
+
 ## Compatibility checks
 
 `model-router doctor` checks each harness without sending a model request:

@@ -244,11 +244,12 @@ pub fn filter<'a>(entries: &'a [Entry], statuses: &[StatusFilter], search: &str)
 }
 
 /// Starts a new run from a saved run's task, workflow snapshot, and adapter
-/// snapshot, leaving the saved run unchanged. `worktree` defaults to its mode.
+/// and provider snapshots, leaving the saved run unchanged. `worktree` defaults to its mode.
 pub fn rerun(project: &Path, settings: &Settings, id: &str, worktree: Option<bool>) -> Result<Run> {
     let source = engine::load(project, id)?;
     let settings = Settings {
         adapters: source.adapters.clone(),
+        providers: source.providers.clone(),
         ..settings.clone()
     };
     let mut run = Run::create(

@@ -1,3 +1,4 @@
+use crate::providers::Provider;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -164,6 +165,9 @@ pub struct Settings {
     pub version: u32,
     pub workflows: Vec<Workflow>,
     pub adapters: BTreeMap<String, CustomAdapter>,
+    /// OpenAI-compatible providers routed into harnesses; see `providers`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, Provider>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -171,6 +175,7 @@ impl Default for Settings {
             version: 1,
             workflows: vec![Workflow::default()],
             adapters: BTreeMap::new(),
+            providers: BTreeMap::new(),
         }
     }
 }
@@ -272,7 +277,7 @@ impl Settings {
                     );
                 }
                 if stage.enabled {
-                    crate::adapters::validate_options(stage)?;
+                    crate::adapters::validate_options(stage, &self.providers)?;
                 }
             }
         }
@@ -285,6 +290,9 @@ impl Settings {
                 !adapter.command.trim().is_empty(),
                 "Custom adapter {name} needs a command"
             );
+        }
+        for (name, provider) in &self.providers {
+            crate::providers::validate(name, provider)?;
         }
         Ok(())
     }

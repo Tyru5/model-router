@@ -69,6 +69,7 @@ fn native_settings_reach_both_execution_modes_and_survive_reload() {
             let inv = adapters::build(
                 &loaded.workflows[0].stages[0],
                 &loaded.adapters,
+                &loaded.providers,
                 "Task",
                 &paths,
             )
@@ -122,26 +123,26 @@ fn invalid_native_settings_and_conflicting_raw_overrides_are_rejected() {
     ] {
         stage.extra_args = arguments.into_iter().map(str::to_owned).collect();
         assert!(
-            adapters::validate_options(&stage)
+            adapters::validate_options(&stage, &BTreeMap::new())
                 .unwrap_err()
                 .to_string()
                 .contains("Extra arguments")
         );
     }
     stage.extra_args = vec!["--config".into(), "features.example=true".into()];
-    adapters::validate_options(&stage).unwrap();
+    adapters::validate_options(&stage, &BTreeMap::new()).unwrap();
     stage
         .harness_settings
         .insert("sandbox".into(), "made-up".into());
-    assert!(adapters::validate_options(&stage).is_err());
+    assert!(adapters::validate_options(&stage, &BTreeMap::new()).is_err());
     stage
         .harness_settings
         .insert("sandbox".into(), "workspace-write".into());
     stage.harness = "claude".into();
-    assert!(adapters::validate_options(&stage).is_err());
+    assert!(adapters::validate_options(&stage, &BTreeMap::new()).is_err());
     stage.harness_settings = BTreeMap::from([("permission_mode".into(), "plan".into())]);
     stage.extra_args = vec!["--permission-mode=bypassPermissions".into()];
-    assert!(adapters::validate_options(&stage).is_err());
+    assert!(adapters::validate_options(&stage, &BTreeMap::new()).is_err());
     stage.harness_settings.clear();
-    adapters::validate_options(&stage).unwrap(); // Existing explicit raw arguments still work.
+    adapters::validate_options(&stage, &BTreeMap::new()).unwrap(); // Existing explicit raw arguments still work.
 }

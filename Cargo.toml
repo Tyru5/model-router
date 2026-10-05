@@ -19,7 +19,8 @@ libc = "0.2"
 portable-pty = "0.9"
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order: merged OpenCode config keeps last-match permission rule order.
+serde_json = { version = "1", features = ["preserve_order"] }
 shell-words = "1"
 strip-ansi-escapes = "0.2"
 tempfile = "3"

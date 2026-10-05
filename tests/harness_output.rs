@@ -106,7 +106,7 @@ fn kind_of(harness: &str) -> OutputKind {
                 mode,
                 ..Stage::default()
             };
-            adapters::build(&stage, &BTreeMap::new(), "task", &paths)
+            adapters::build(&stage, &BTreeMap::new(), &BTreeMap::new(), "task", &paths)
                 .unwrap()
                 .kind
         })

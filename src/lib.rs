@@ -9,6 +9,7 @@ pub mod harness_settings;
 pub mod history;
 pub mod presets;
 pub mod process;
+pub mod providers;
 pub mod report;
 pub mod snapshot;
 pub mod storage;

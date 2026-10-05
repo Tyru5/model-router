@@ -405,6 +405,7 @@ impl App {
             ActionId::HarnessSettings => {
                 self.modal = Some(Modal::Harness(Box::new(HarnessEditor::new(
                     self.stage().clone(),
+                    self.settings.providers.clone(),
                 ))))
             }
             ActionId::Models => self.model_picker(),

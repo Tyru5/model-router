@@ -153,12 +153,11 @@ mode = "interactive"
                 ),
                 "Claude settings missing",
             )
-            assert (
-                "Provider" not in terminal.text() and "Sandbox" not in terminal.text()
-            )
+            # Claude takes router providers (OpenRouter etc.), not Codex sandbox.
+            assert "Provider" in terminal.text() and "Sandbox" not in terminal.text()
             terminal.send(
-                NEXT * 4
-            )  # Claude: model, effort, execution, timeout, permissions
+                NEXT * 5
+            )  # Claude: model, provider, effort, execution, timeout, permissions
             terminal.send(RIGHT * 3)  # default -> manual -> acceptEdits -> plan
             terminal.snapshot("harness-settings-claude-80x24.txt")
             assert (

@@ -175,11 +175,71 @@ before starting a run.
 | GitHub Copilot CLI | Copilot model ID | Programmatic prompt; native interactive CLI |
 | Custom | Whatever your tool accepts | Executable and argument templates; optional catalog command |
 
-Model IDs are not restricted to a hardcoded list. OpenAI, Anthropic, Google,
-OpenRouter, xAI, DeepSeek, Mistral, local models, and other providers can be routed
-through a harness that supports and is configured for them. Selecting a model
-does not add provider support to a harness. Amp's mode determines more than its
-underlying model. Direct provider API clients are outside this version's scope.
+Model IDs are not restricted to a hardcoded list. Amp's mode determines more
+than its underlying model.
+
+### Providers (OpenRouter and others)
+
+Set a stage's **Provider** to route its harness through any OpenAI-compatible
+API. The router wires the endpoint into the harness's own provider mechanism;
+the harness still runs the agent. Built-in names (`model-router providers`):
+
+`openrouter`, `vercel`, `requesty`, `google`, `xai`, `mistral`, `deepseek`,
+`moonshot`, `zai`, `minimax`, `groq`, `cerebras`, `together`, `fireworks`,
+`deepinfra`, `huggingface`, `nebius`, `sambanova`, `perplexity`, `ollama`,
+`lmstudio`.
+
+Add any other provider (Azure OpenAI, LiteLLM, vLLM, a corporate gateway) in
+the workflow TOML. An entry for a built-in name without `base_url` opts into
+that preset, optionally overriding its other fields:
+
+```toml
+[providers.litellm]
+base_url = "http://localhost:4000/v1"    # OpenAI-compatible root
+api_key_env = "LITELLM_KEY"              # empty for keyless local servers
+anthropic_base_url = "http://localhost:4000"  # optional; enables Claude Code
+context_limit = 128000                   # optional; OpenCode compaction
+output_limit = 16384                     # optional
+
+[providers.openrouter]                   # use the built-in preset everywhere
+```
+
+| Harness | How the provider is applied |
+| --- | --- |
+| Codex | `--config model_providers.model-router-NAME.{name,base_url,env_key}` and `model_provider`. Needs a Responses API endpoint. |
+| Claude Code | `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, empty `ANTHROPIC_API_KEY`. Removes inherited `ANTHROPIC_CUSTOM_HEADERS` and every `CLAUDE_CODE_USE_*` backend selector, and pins them with `--settings` (no secrets) so user/project `settings.json` `env` cannot redirect. Also removes `ANTHROPIC_UNIX_SOCKET`. Fails before launch if any Claude settings file (project, parent, Git worktree main checkout, user) sets `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, or `apiKeyHelper`; if `~/.claude.json` has a saved `primaryApiKey`; or if managed settings set a routed variable or `policyHelper`, or a macOS MDM policy exists. Needs `anthropic_base_url`. |
+| OpenCode | Adds an `@ai-sdk/openai-compatible` provider `model-router-NAME` to `OPENCODE_CONFIG_CONTENT`, keeping inherited inline config and its order. Model limits default to 32,768 context and, when unset, an output limit of a quarter of the context (at most 8,192), so compaction works; set `context_limit`/`output_limit` for the real values. Output must be below context. |
+| Aider | `--model openai/MODEL` with `OPENAI_API_BASE`/`OPENAI_API_KEY`. |
+| Goose | `--provider openai` with `OPENAI_HOST`/`OPENAI_BASE_PATH`/`OPENAI_API_KEY`. |
+| Custom | `{provider}`, `{base_url}`, and `{api_key_env}` placeholders (configured entries only). |
+| Cursor, Gemini, Amp, Copilot | Not supported; they use only their own accounts. |
+
+Which providers are injected:
+
+- **`[providers.NAME]` entries** route into every harness in the table above,
+  custom adapters included. Pi always uses its own registry.
+- **Built-in names without an entry** route only into Claude Code, which has no
+  provider registry of its own.
+- **Every other harness** gets a built-in name unchanged, so its own
+  definition wins: Codex config layers and profiles (including `--oss` for
+  `ollama`/`lmstudio`), and the OpenCode, Aider, Goose, and Pi registries with
+  their auth (including OAuth). A custom adapter sees only `{provider}`;
+  `{base_url}` and `{api_key_env}` stay empty and no key is required. Add
+  `[providers.NAME]` to route a built-in into these harnesses instead.
+
+Codex and OpenCode see injected providers as `model-router-NAME`, so they never
+merge with a native or reserved entry (`openai`, `ollama`, …) and inherit no
+native endpoint, key, header, or stored login.
+
+Routing Claude Code is best-effort: Claude reads credentials from several
+sources the router cannot fully control (for example the macOS Keychain). The
+router fails closed on the sources it knows; leave the provider blank for
+Claude stages unless you need a third-party endpoint.
+
+Keys stay in your environment. The router copies the named variable at launch,
+fails before a run starts if it is unset, and records only variable names in
+`command.json` and previews. `model-router providers NAME` lists the provider's
+models via `GET /models` (no inference request).
 
 Model discovery is deliberately labeled:
 
@@ -536,6 +596,11 @@ prompt_stdin = false
 
 Supported placeholders: `{prompt}`, `{prompt_file}`, `{handoff_file}`, `{model}`,
 `{provider}`, `{effort}`, `{workspace}`, and `{run_dir}` (the attempt directory).
+With a configured `[providers.NAME]` entry (see
+[Providers](#providers-openrouter-and-others)), `{base_url}` and
+`{api_key_env}` hold its endpoint and key variable name, and the key variable
+is passed through to the process. Built-in provider names are not injected:
+`{provider}` holds the name, and `{base_url}`/`{api_key_env}` expand empty.
 Arguments are passed directly; no shell evaluates them. Placeholder substitution
 does not recursively interpret content supplied by a task or model.
 

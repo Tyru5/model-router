@@ -1,3 +1,4 @@
+use crate::providers::{self, Provider};
 use crate::{
     adapters::{self, ContextPaths, Invocation},
     checks::{self, CheckResult},
@@ -105,6 +106,8 @@ pub struct Run {
     pub rerun_of: Option<String>,
     pub workflow: Workflow,
     pub adapters: BTreeMap<String, CustomAdapter>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, Provider>,
     pub stages: Vec<StageState>,
     pub cursor: usize,
     pub repair_passes: u32,
@@ -159,6 +162,18 @@ impl Run {
                 stage.harness,
                 program
             );
+            if let Some(provider) =
+                providers::route(&stage.harness, &stage.provider, &settings.providers)
+            {
+                ensure!(
+                    provider.api_key_env.is_empty()
+                        || std::env::var_os(&provider.api_key_env).is_some_and(|v| !v.is_empty()),
+                    "Set {} to use provider {} in stage {}",
+                    provider.api_key_env,
+                    stage.provider,
+                    stage.name
+                );
+            }
             if stage.mode == Mode::Interactive {
                 if let Some(custom) = settings.adapters.get(&stage.harness) {
                     ensure!(
@@ -200,6 +215,7 @@ impl Run {
             rerun_of: None,
             workflow: workflow.clone(),
             adapters: settings.adapters.clone(),
+            providers: settings.providers.clone(),
             stages: workflow
                 .stages
                 .iter()
@@ -585,6 +601,7 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
     let invocation = adapters::build(
         stage,
         &run.adapters,
+        &run.providers,
         &text,
         &ContextPaths {
             workspace: &run.workspace,
@@ -595,7 +612,7 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
     )?;
     storage::write_json(
         &directory.join("command.json"),
-        &serde_json::json!({ "program": invocation.program, "args": invocation.args, "stdin_from": invocation.stdin.as_ref().map(|_| "prompt.md"), "workspace": run.workspace, "model": stage.model, "provider": stage.provider, "effort": stage.effort, "mode": stage.mode }),
+        &serde_json::json!({ "program": invocation.program, "args": invocation.args, "stdin_from": invocation.stdin.as_ref().map(|_| "prompt.md"), "env": invocation.env.iter().map(|(name, _)| name).collect::<Vec<_>>(), "workspace": run.workspace, "model": stage.model, "provider": stage.provider, "effort": stage.effort, "mode": stage.mode }),
     )?;
     run.stages[index].attempts.push(Attempt {
         number,
@@ -1004,6 +1021,7 @@ pub fn preview(
         let command = adapters::build(
             stage,
             &settings.adapters,
+            &settings.providers,
             "<task + stage instructions + prior handoffs>",
             &paths,
         )?;

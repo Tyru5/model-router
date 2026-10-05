@@ -6,7 +6,7 @@ use model_router::{
     doctor,
     engine::{self, Action, Event, Run, Status},
     history::{self, Criteria, Entry, StatusFilter},
-    presets, task_import, tui,
+    presets, providers, task_import, tui,
 };
 use std::{
     io::{self, IsTerminal, Write},
@@ -157,6 +157,11 @@ enum Commands {
     },
     /// List model/mode selections without sending an inference request.
     Models { harness: String },
+    /// List router providers, or a provider's model IDs (one listing request).
+    Providers {
+        /// Query this provider's OpenAI-compatible /models endpoint.
+        name: Option<String>,
+    },
     /// Check harness executables, versions, and flags without a model request.
     Doctor {
         /// Print machine-readable JSON.
@@ -307,6 +312,45 @@ fn main_result() -> Result<()> {
                 );
             }
             println!("\n{}", catalog.note);
+        }
+        Some(Commands::Providers { name: Some(name) }) => {
+            let provider = providers::resolve(&name, &settings.providers).with_context(|| {
+                format!("Unknown provider {name}; see `model-router providers`")
+            })?;
+            for id in providers::models(&provider)? {
+                println!("{id}");
+            }
+        }
+        Some(Commands::Providers { name: None }) => {
+            println!("PROVIDER\tSOURCE\tKEY\tCLAUDE\tBASE URL");
+            for (name, provider) in providers::all(&settings.providers) {
+                let key = if provider.api_key_env.is_empty() {
+                    "none needed".into()
+                } else {
+                    let set =
+                        std::env::var_os(&provider.api_key_env).is_some_and(|v| !v.is_empty());
+                    format!(
+                        "{} {}",
+                        provider.api_key_env,
+                        if set { "set" } else { "unset" }
+                    )
+                };
+                println!(
+                    "{name}\t{}\t{key}\t{}\t{}",
+                    if settings.providers.contains_key(&name) {
+                        "configured"
+                    } else {
+                        "built-in"
+                    },
+                    if provider.anthropic_base_url.is_some() {
+                        "yes"
+                    } else {
+                        "no"
+                    },
+                    provider.base_url
+                );
+            }
+            println!("\n{}", providers::NOTE);
         }
         Some(Commands::History {
             status,

@@ -277,6 +277,7 @@ fn adapter_contracts_keep_prompt_and_models_literal() {
             let invocation = adapters::build(
                 &stage,
                 &BTreeMap::new(),
+                &BTreeMap::new(),
                 "A task with 'quotes' and 雪",
                 &paths,
             )
@@ -321,7 +322,7 @@ fn structured_native_errors_override_success_exit_and_tool_echoes_are_ignored() 
 #[test]
 fn capture_drains_both_streams_without_deadlock_and_handles_early_closed_stdin() {
     let dir = tempfile::tempdir().unwrap();
-    let inv = adapters::Invocation { program: "python3".into(), args: vec!["-c".into(), "import sys; sys.stdin.close(); sys.stdout.write('x'*200000); sys.stderr.write('y'*200000)".into()], stdin: Some("z".repeat(100000)), kind: OutputKind::Text, final_file: dir.path().join("unused") };
+    let inv = adapters::Invocation { program: "python3".into(), args: vec!["-c".into(), "import sys; sys.stdin.close(); sys.stdout.write('x'*200000); sys.stderr.write('y'*200000)".into()], stdin: Some("z".repeat(100000)), kind: OutputKind::Text, final_file: dir.path().join("unused"), env: vec![] };
     let result = process::capture(
         &inv,
         dir.path(),
@@ -460,4 +461,38 @@ fn terminating_cli_stops_its_stage_and_persists_cancellation() {
         .unwrap();
     assert_eq!(stopped.status, Status::Cancelled);
     assert!(stopped.stages[0].attempts[0].finished_at.is_some());
+}
+
+#[test]
+fn capture_applies_and_removes_environment_variables() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(std::env::var_os("HOME").is_some());
+    let inv = adapters::Invocation {
+        program: "python3".into(),
+        args: vec![
+            "-c".into(),
+            "import os; print(os.environ.get('HOME', 'unset'), os.environ['ROUTED'])".into(),
+        ],
+        stdin: None,
+        kind: OutputKind::Text,
+        final_file: dir.path().join("unused"),
+        env: vec![
+            ("HOME".into(), adapters::EnvValue::Unset),
+            ("ROUTED".into(), adapters::EnvValue::Literal("yes".into())),
+        ],
+    };
+    let result = process::capture(
+        &inv,
+        dir.path(),
+        dir.path(),
+        Duration::from_secs(5),
+        &AtomicBool::new(false),
+        |_, _| {},
+    )
+    .unwrap();
+    assert!(result.success());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("stdout.log")).unwrap(),
+        "unset yes\n"
+    );
 }

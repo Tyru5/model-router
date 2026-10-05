@@ -186,6 +186,15 @@ fn filters_match_status_and_words() {
 fn rerun_creates_a_new_run_from_the_snapshot() {
     let (dir, settings, mut source) = fixture(vec![stage("research", Role::Research)]);
     assert_eq!(drive(&mut source), Action::Complete);
+    // Provider definitions also come from the snapshot, not current settings.
+    source.providers.insert(
+        "snapshot-proxy".into(),
+        model_router::providers::Provider {
+            base_url: "http://localhost:4000/v1".into(),
+            ..Default::default()
+        },
+    );
+    source.persist().unwrap();
     let before = fs::read(source.directory.join("run.json")).unwrap();
     // The saved adapter snapshot supplies the mock harness.
     let bare = Settings {
@@ -194,6 +203,7 @@ fn rerun_creates_a_new_run_from_the_snapshot() {
     };
     let mut rerun = history::rerun(dir.path(), &bare, &source.id, None).unwrap();
     assert_ne!(rerun.id, source.id);
+    assert_eq!(rerun.providers, source.providers);
     assert_eq!(rerun.task, source.task);
     assert_eq!(rerun.rerun_of.as_deref(), Some(source.id.as_str()));
     assert_eq!(

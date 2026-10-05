@@ -308,6 +308,7 @@ fn flag_uses(harness: &str) -> Result<Vec<FlagUse>> {
             let invocation = adapters::build(
                 &sample(harness, mode, provider),
                 &BTreeMap::new(),
+                &BTreeMap::new(),
                 SAMPLE_PROMPT,
                 &paths,
             )?;
@@ -398,6 +399,7 @@ fn probe(program: &str, args: &[String], cwd: &Path, timeout: Duration) -> Resul
         stdin: None,
         kind: OutputKind::Text,
         final_file: temp.path().join("unused"),
+        env: vec![],
     };
     let outcome = process::capture(
         &invocation,
