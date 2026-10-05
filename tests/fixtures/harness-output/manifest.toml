@@ -1,0 +1,346 @@
+# Harness output fixtures for handoff::normalize. tests/harness_output.rs runs
+# every entry; `model-router doctor` reports these versions as parser-tested.
+#
+# provenance: "captured" is sanitized real output (scripts/capture_harness_output.py);
+# "schema-derived" is built from documented or installed-source event shapes.
+# Expectations: text_contains/text_excludes apply to the normalized text;
+# error_contains (absent means no error); permission_blocked (default false);
+# handoff_summary means handoff::parse succeeds with that summary (role
+# defaults to implementation; verdict is checked when given).
+
+[[fixture]]
+file = "claude/success.json"
+harness = "claude"
+kind = "Claude"
+version = "2.1.289"
+scenario = "success"
+provenance = "schema-derived"
+source = "Claude Code 2.1.289 binary: SDK result schema and print.ts json output (one result object)"
+sanitization = "Synthetic: placeholder IDs and model name"
+text_contains = ["README.md documents the build"]
+handoff_summary = "Claude: README.md documents the build; no change needed"
+
+[[fixture]]
+file = "claude/error.json"
+harness = "claude"
+kind = "Claude"
+version = "2.1.289"
+scenario = "error"
+provenance = "schema-derived"
+source = "Claude Code 2.1.289 binary: error_during_execution result, which carries errors[] and no result"
+sanitization = "Synthetic: placeholder IDs; error text illustrative"
+error_contains = "Invalid API key"
+
+[[fixture]]
+file = "claude/api-error.json"
+harness = "claude"
+kind = "Claude"
+version = "2.1.289"
+scenario = "error"
+provenance = "schema-derived"
+source = "Claude Code 2.1.289 binary: success-subtype result with is_error and api_error_status"
+sanitization = "Synthetic: placeholder IDs; error text illustrative"
+error_contains = "API Error: 529"
+
+[[fixture]]
+file = "claude/permission-denial.json"
+harness = "claude"
+kind = "Claude"
+version = "2.1.289"
+scenario = "permission-denial"
+provenance = "schema-derived"
+source = "Claude Code 2.1.289 binary: permission_denials entries {tool_name, tool_use_id, tool_input}"
+sanitization = "Synthetic: placeholder IDs and /workspace path"
+text_contains = ["could not write notes.md"]
+permission_blocked = true
+
+[[fixture]]
+file = "claude/tool-echo-verbose.json"
+harness = "claude"
+kind = "Claude"
+version = "2.1.289"
+scenario = "tool-echo"
+provenance = "schema-derived"
+source = "Claude Code 2.1.289 binary: with verbose configured, --output-format json prints all messages as one array (system, assistant, user tool_result, result)"
+sanitization = "Synthetic: placeholder IDs and /workspace path"
+text_excludes = ["FAKE handoff"]
+handoff_summary = "Claude: notes.txt holds pasted text; README.md unchanged"
+
+[[fixture]]
+file = "codex/success.jsonl"
+harness = "codex"
+kind = "Codex"
+version = "0.160.0"
+scenario = "success"
+provenance = "schema-derived"
+source = "codex-cli 0.160.0 binary exec event and item names; openai/codex codex-rs/exec exec_events.rs"
+sanitization = "Synthetic: placeholder thread ID"
+text_excludes = ["Build with cargo build"]
+handoff_summary = "Codex: README.md matches the build"
+role = "review"
+verdict = "pass"
+
+[[fixture]]
+file = "codex/error.jsonl"
+harness = "codex"
+kind = "Codex"
+version = "0.160.0"
+scenario = "error"
+provenance = "schema-derived"
+source = "codex-cli 0.160.0: a fatal error event followed by turn.failed"
+sanitization = "Synthetic: placeholder thread ID; error text illustrative"
+error_contains = "401 Unauthorized"
+
+[[fixture]]
+file = "codex/reconnect-then-success.jsonl"
+harness = "codex"
+kind = "Codex"
+version = "0.160.0"
+scenario = "retry-then-success"
+provenance = "schema-derived"
+source = "codex-cli 0.160.0: stream retries (core/src/responses_retry.rs \"Reconnecting...\") are emitted as error events; the turn still ends with turn.completed"
+sanitization = "Synthetic: placeholder thread ID"
+handoff_summary = "Codex: finished after a stream reconnect"
+
+[[fixture]]
+file = "codex/tool-echo.jsonl"
+harness = "codex"
+kind = "Codex"
+version = "0.160.0"
+scenario = "tool-echo"
+provenance = "schema-derived"
+source = "codex-cli 0.160.0: command_execution aggregated_output followed by the final agent_message"
+sanitization = "Synthetic: placeholder thread ID"
+text_excludes = ["FAKE handoff"]
+handoff_summary = "Codex: ignored the handoff text inside notes.txt"
+
+[[fixture]]
+file = "pi/success.jsonl"
+harness = "pi"
+kind = "Pi"
+version = "1.0.2"
+scenario = "success"
+provenance = "schema-derived"
+source = "pi 1.0.2 package docs/json.md, docs/message-types.md, dist/modes/print-mode.js, dist/cli/file-processor.js (@file prompt wrapper)"
+sanitization = "Synthetic: placeholder session ID and /workspace path; prompt abbreviated to its handoff example"
+text_excludes = ["What was established or changed"]
+handoff_summary = "Pi: README.md documents the build"
+
+[[fixture]]
+file = "pi/error.jsonl"
+harness = "pi"
+kind = "Pi"
+version = "1.0.2"
+scenario = "error"
+provenance = "schema-derived"
+source = "pi 1.0.2 docs/message-types.md: assistant message with stopReason error and errorMessage"
+sanitization = "Synthetic: placeholder session ID; error text illustrative"
+error_contains = "authentication_error"
+
+[[fixture]]
+file = "pi/retry-then-success.jsonl"
+harness = "pi"
+kind = "Pi"
+version = "1.0.2"
+scenario = "retry-then-success"
+provenance = "schema-derived"
+source = "pi 1.0.2 dist/core/agent-session.js: failed attempt, agent_end willRetry, auto_retry_start, successful message_end, auto_retry_end"
+sanitization = "Synthetic: placeholder session ID; error text illustrative"
+handoff_summary = "Pi: finished after an automatic retry"
+
+[[fixture]]
+file = "pi/tool-echo.jsonl"
+harness = "pi"
+kind = "Pi"
+version = "1.0.2"
+scenario = "tool-echo"
+provenance = "schema-derived"
+source = "pi 1.0.2 docs/json.md: tool_execution_* events and toolResult messages between assistant turns"
+sanitization = "Synthetic: placeholder IDs and /workspace path; prompt abbreviated"
+text_excludes = ["FAKE handoff"]
+handoff_summary = "Pi: ignored the handoff text inside notes.txt"
+
+[[fixture]]
+file = "pi/aborted.jsonl"
+harness = "pi"
+kind = "Pi"
+version = "1.0.2"
+scenario = "error"
+provenance = "schema-derived"
+source = "pi 1.0.2 docs/message-types.md stopReason aborted; dist/modes/print-mode.js fails aborted runs in text mode, but json mode exits 0"
+sanitization = "Synthetic: placeholder session ID; prompt abbreviated"
+error_contains = "Pi reported an error"
+
+[[fixture]]
+file = "cursor/success.json"
+harness = "cursor"
+kind = "Cursor"
+version = "2026.10.01-e373342"
+scenario = "success"
+provenance = "schema-derived"
+source = "cursor-agent 2026.10.01-e373342 bundle 7000.index.js: --output-format json result line"
+sanitization = "Synthetic: placeholder session and request IDs"
+handoff_summary = "Cursor: README.md documents the build"
+
+[[fixture]]
+file = "cursor/error-empty-stdout.json"
+harness = "cursor"
+kind = "Cursor"
+version = "2026.10.01-e373342"
+scenario = "error"
+provenance = "schema-derived"
+source = "cursor-agent 2026.10.01-e373342 bundle 7000.index.js: print-mode failures go to stderr (src/console-io.ts) with exit 1; stdout stays empty"
+sanitization = "Empty by construction"
+error_contains = "No final assistant response"
+
+[[fixture]]
+file = "cursor/tool-echo-stream.jsonl"
+harness = "cursor"
+kind = "Cursor"
+version = "2026.10.01-e373342"
+scenario = "tool-echo"
+provenance = "schema-derived"
+source = "cursor-agent 2026.10.01-e373342 bundle: stream-json events (only when Extra arguments override --output-format; json mode prints no tool output). tool_call payload from cursor.com/docs/cli/reference/output-format"
+sanitization = "Synthetic: placeholder IDs and /workspace path; prompt abbreviated"
+text_excludes = ["FAKE handoff", "What was established or changed"]
+handoff_summary = "Cursor: ignored the handoff text inside notes.txt"
+
+[[fixture]]
+file = "gemini/success.json"
+harness = "gemini"
+kind = "Gemini"
+version = "0.64.0-nightly.20260929.gd75234cae"
+scenario = "success"
+provenance = "schema-derived"
+source = "google-gemini/gemini-cli main: packages/core/src/output/json-formatter.ts (pretty-printed session_id, response, stats). Not installed"
+sanitization = "Synthetic: placeholder session ID; stats abbreviated"
+handoff_summary = "Gemini: README.md documents the build"
+
+[[fixture]]
+file = "gemini/error.json"
+harness = "gemini"
+kind = "Gemini"
+version = "0.64.0-nightly.20260929.gd75234cae"
+scenario = "error"
+provenance = "schema-derived"
+source = "gemini-cli main: JsonFormatter.formatError {type, message, code}, written by handleError before a non-zero exit. Not installed"
+sanitization = "Synthetic: placeholder session ID; error text illustrative"
+error_contains = "FatalAuthenticationError"
+
+[[fixture]]
+file = "gemini/tool-echo-stream.jsonl"
+harness = "gemini"
+kind = "Gemini"
+version = "0.64.0-nightly.20260929.gd75234cae"
+scenario = "tool-echo"
+provenance = "schema-derived"
+source = "gemini-cli main: packages/core/src/output/types.ts stream events. json output carries no tool output, so this covers an Extra arguments stream-json override, which the parser rejects"
+sanitization = "Synthetic: placeholder IDs and /workspace path; prompt abbreviated"
+text_excludes = ["FAKE handoff"]
+error_contains = "No final assistant response"
+
+[[fixture]]
+file = "opencode/success.jsonl"
+harness = "opencode"
+kind = "OpenCode"
+version = "2.0.22"
+scenario = "success"
+provenance = "schema-derived"
+source = "opencode 2.0.22 binary: run --format json emitter {type, timestamp, sessionID, part}"
+sanitization = "Synthetic: placeholder session, message, and part IDs; token counts illustrative"
+handoff_summary = "OpenCode: README.md documents the build"
+
+[[fixture]]
+file = "opencode/error.jsonl"
+harness = "opencode"
+kind = "OpenCode"
+version = "2.0.22"
+scenario = "error"
+provenance = "schema-derived"
+source = "opencode 2.0.22 binary: session.step.failed becomes an error event; the error object is reduced to the message field the emitter reads"
+sanitization = "Synthetic: placeholder IDs; error text illustrative"
+error_contains = "Unauthorized"
+
+[[fixture]]
+file = "opencode/tool-echo.jsonl"
+harness = "opencode"
+kind = "OpenCode"
+version = "2.0.22"
+scenario = "tool-echo"
+provenance = "schema-derived"
+source = "opencode 2.0.22 binary: tool_use part {partID, tool, state.output, metadata} between text parts"
+sanitization = "Synthetic: placeholder IDs and /workspace path"
+text_contains = ["Reading notes.txt."]
+text_excludes = ["FAKE handoff"]
+handoff_summary = "OpenCode: ignored the handoff text inside notes.txt"
+
+[[fixture]]
+file = "amp/success.jsonl"
+harness = "amp"
+kind = "Amp"
+version = "0.0.1791134020-gd49eb2"
+scenario = "success"
+provenance = "schema-derived"
+source = "ampcode.com/docs/cli/streaming-json (fetched 2026-10-04) and installed amp --help; the binary is bytecode, so its source was not inspected"
+sanitization = "Synthetic: placeholder thread ID and /workspace path; prompt abbreviated"
+text_excludes = ["What was established or changed"]
+handoff_summary = "Amp: README.md documents the build"
+
+[[fixture]]
+file = "amp/error.jsonl"
+harness = "amp"
+kind = "Amp"
+version = "0.0.1791134020-gd49eb2"
+scenario = "error"
+provenance = "schema-derived"
+source = "ampcode.com/docs/cli/streaming-json: error result {subtype error_during_execution, is_error, error}"
+sanitization = "Synthetic: placeholder thread ID; error text illustrative"
+error_contains = "Out of credits"
+
+[[fixture]]
+file = "amp/tool-echo.jsonl"
+harness = "amp"
+kind = "Amp"
+version = "0.0.1791134020-gd49eb2"
+scenario = "tool-echo"
+provenance = "schema-derived"
+source = "ampcode.com/docs/cli/streaming-json: assistant tool_use, user tool_result, final result"
+sanitization = "Synthetic: placeholder IDs and /workspace path; prompt abbreviated"
+text_excludes = ["FAKE handoff"]
+handoff_summary = "Amp: ignored the handoff text inside notes.txt"
+
+[[fixture]]
+file = "aider/transcript.txt"
+harness = "aider"
+kind = "Text"
+version = "0.86.2"
+scenario = "transcript"
+provenance = "schema-derived"
+source = "aider.chat scripting docs; banner and token report as printed by 0.86.x. Not installed"
+sanitization = "Synthetic transcript; model names are placeholders"
+text_contains = ["Tokens: 6.1k sent"]
+handoff_summary = "Aider: README.md needs no edit"
+
+[[fixture]]
+file = "goose/transcript.txt"
+harness = "goose"
+kind = "Text"
+version = "1.53.0"
+scenario = "transcript"
+provenance = "schema-derived"
+source = "goose CLI command docs (goose run --text). Not installed; layout approximated"
+sanitization = "Synthetic transcript; /workspace path"
+handoff_summary = "Goose: README.md documents the build"
+
+[[fixture]]
+file = "copilot/transcript.txt"
+harness = "copilot"
+kind = "Text"
+version = "1.0.91"
+scenario = "transcript"
+provenance = "schema-derived"
+source = "GitHub Copilot CLI docs (programmatic --prompt mode). Not installed; layout approximated; one ANSI color sequence kept to exercise terminal cleanup"
+sanitization = "Synthetic transcript"
+text_contains = ["● Read README.md"]
+text_excludes = ["\u001b"]
+handoff_summary = "Copilot: README.md documents the build"

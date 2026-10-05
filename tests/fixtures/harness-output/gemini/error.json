@@ -1,0 +1,8 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000062",
+  "error": {
+    "type": "FatalAuthenticationError",
+    "message": "Failed to sign in. Set GEMINI_API_KEY or run gemini to log in.",
+    "code": 41
+  }
+}

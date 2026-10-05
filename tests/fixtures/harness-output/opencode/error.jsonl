@@ -1,0 +1,2 @@
+{"type":"step_start","timestamp":1791115200100,"sessionID":"ses_00000000000000000000000001","part":{"id":"prt_00000000000000000000000001","sessionID":"ses_00000000000000000000000001","messageID":"msg_00000000000000000000000001","type":"step-start","snapshot":"0000000000000000000000000000000000000000"}}
+{"type":"error","timestamp":1791115200400,"sessionID":"ses_00000000000000000000000001","error":{"message":"Unauthorized: invalid API key for provider anthropic"}}

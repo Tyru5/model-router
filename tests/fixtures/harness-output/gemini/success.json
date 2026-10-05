@@ -1,0 +1,54 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000061",
+  "response": "README.md documents the build.\n\n<router-handoff>\n{\"summary\":\"Gemini: README.md documents the build\",\"verdict\":\"complete\",\"findings\":[],\"decisions\":[],\"files_changed\":[],\"tests\":[],\"unresolved\":[]}\n</router-handoff>",
+  "stats": {
+    "models": {
+      "gemini-fixture": {
+        "api": {
+          "totalRequests": 2,
+          "totalErrors": 0,
+          "totalLatencyMs": 6120
+        },
+        "tokens": {
+          "input": 9120,
+          "prompt": 9120,
+          "candidates": 260,
+          "total": 9480,
+          "cached": 0,
+          "thoughts": 100,
+          "tool": 0
+        }
+      }
+    },
+    "tools": {
+      "totalCalls": 1,
+      "totalSuccess": 1,
+      "totalFail": 0,
+      "totalDurationMs": 35,
+      "totalDecisions": {
+        "accept": 0,
+        "reject": 0,
+        "modify": 0,
+        "auto_accept": 1
+      },
+      "byName": {
+        "read_file": {
+          "count": 1,
+          "success": 1,
+          "fail": 0,
+          "durationMs": 35,
+          "decisions": {
+            "accept": 0,
+            "reject": 0,
+            "modify": 0,
+            "auto_accept": 1
+          }
+        }
+      }
+    },
+    "files": {
+      "totalLinesAdded": 0,
+      "totalLinesRemoved": 0
+    }
+  }
+}
