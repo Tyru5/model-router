@@ -1,7 +1,6 @@
-use super::{app::App, theme::Palette, widgets::empty_state};
+use super::{actions::ActionId, app::App, theme::Palette, widgets::empty_state};
 use crate::{engine, storage};
-use anyhow::Result;
-use crossterm::event::{KeyCode as Key, KeyEvent};
+use anyhow::{Result, bail};
 use ratatui::{
     Frame,
     layout::{Constraint, Rect},
@@ -10,26 +9,29 @@ use ratatui::{
 };
 
 impl App {
-    pub(super) fn history_key(&mut self, key: KeyEvent) -> Result<()> {
-        match key.code {
-            Key::Down | Key::Char('j') => {
+    pub(super) fn perform_runs(&mut self, id: ActionId) -> Result<()> {
+        match id {
+            ActionId::NextRun => {
                 self.history_selected =
                     (self.history_selected + 1).min(self.history.len().saturating_sub(1))
             }
-            Key::Up | Key::Char('k') => {
+            ActionId::PreviousRun => {
                 self.history_selected = self.history_selected.saturating_sub(1)
             }
-            Key::Char('r') => self.history = engine::history(&self.project)?,
-            Key::Enter if self.worker.is_none() => {
-                if let Some(run) = self.history.get(self.history_selected).cloned() {
-                    self.run = Some(run);
-                    self.page = 1;
-                    self.logs.clear();
-                    self.message =
-                        "Saved run loaded. c continues; y retries; i reopens interactively.".into();
+            ActionId::RefreshRuns => self.history = engine::history(&self.project)?,
+            ActionId::OpenRun => {
+                if self.worker.is_none() {
+                    if let Some(run) = self.history.get(self.history_selected).cloned() {
+                        self.run = Some(run);
+                        self.page = 1;
+                        self.logs.clear();
+                        self.message =
+                            "Saved run loaded. c continues; y retries; i reopens interactively."
+                                .into();
+                    }
                 }
             }
-            _ => {}
+            other => bail!("{other:?} is not a Runs action"),
         }
         Ok(())
     }

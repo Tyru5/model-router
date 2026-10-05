@@ -1,12 +1,12 @@
 use super::{
+    actions::ActionId,
     app::App,
     modal::InputTarget,
     theme::Palette,
     widgets::{elapsed, empty_state, short_path},
 };
 use crate::{engine::Status, storage};
-use anyhow::{Context, Result, ensure};
-use crossterm::event::{KeyCode as Key, KeyEvent};
+use anyhow::{Context, Result, bail, ensure};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -17,58 +17,49 @@ use ratatui::{
 use std::sync::atomic::Ordering;
 
 impl App {
-    pub(super) fn run_key(&mut self, key: KeyEvent) -> Result<()> {
-        if key.code == Key::Char('c') && self.worker.is_some() {
-            self.cancel.store(true, Ordering::Relaxed);
-            self.message = "Stopping stage…".into();
-            return Ok(());
-        }
-        if key.code == Key::PageUp {
-            self.log_scroll = self.log_scroll.saturating_add(10).min(self.logs.len());
-            return Ok(());
-        }
-        if key.code == Key::PageDown {
-            self.log_scroll = self.log_scroll.saturating_sub(10);
-            return Ok(());
-        }
-        if key.code == Key::Char('h') {
-            let run = self.run.as_ref().context("No run selected")?;
-            let index = run.cursor.min(run.stages.len().saturating_sub(1));
-            let handoff = run.stages[index]
-                .handoff
-                .as_ref()
-                .or_else(|| run.stages.iter().rev().find_map(|s| s.handoff.as_ref()));
-            let body = handoff
-                .map(serde_json::to_string_pretty)
-                .transpose()?
-                .unwrap_or_else(|| {
-                    format!(
-                        "No completed handoff yet.\n\n{}\n\nArtifacts: {}",
-                        run.error.as_deref().unwrap_or(""),
-                        run.directory.display()
-                    )
-                });
-            self.text("Handoff · [↑↓] scroll · [Esc] closes", body);
-            return Ok(());
-        }
-        if self.worker.is_some() {
-            return Ok(());
-        }
-        match key.code {
-            Key::Char('c') => self.start_driver()?,
-            Key::Char('a') => {
+    pub(super) fn perform_monitor(&mut self, id: ActionId) -> Result<()> {
+        match id {
+            ActionId::CancelStage => {
+                self.cancel.store(true, Ordering::Relaxed);
+                self.message = "Stopping stage…".into();
+            }
+            ActionId::ScrollUp => {
+                self.log_scroll = self.log_scroll.saturating_add(10).min(self.logs.len())
+            }
+            ActionId::ScrollDown => self.log_scroll = self.log_scroll.saturating_sub(10),
+            ActionId::Handoff => {
+                let run = self.run.as_ref().context("No run selected")?;
+                let index = run.cursor.min(run.stages.len().saturating_sub(1));
+                let handoff = run.stages[index]
+                    .handoff
+                    .as_ref()
+                    .or_else(|| run.stages.iter().rev().find_map(|s| s.handoff.as_ref()));
+                let body = handoff
+                    .map(serde_json::to_string_pretty)
+                    .transpose()?
+                    .unwrap_or_else(|| {
+                        format!(
+                            "No completed handoff yet.\n\n{}\n\nArtifacts: {}",
+                            run.error.as_deref().unwrap_or(""),
+                            run.directory.display()
+                        )
+                    });
+                self.text("Handoff · [↑↓] scroll · [Esc] closes", body);
+            }
+            ActionId::Continue => self.start_driver()?,
+            ActionId::Advance => {
                 self.run.as_mut().context("No run")?.confirm()?;
                 self.start_driver()?;
             }
-            Key::Char('y') => {
+            ActionId::Retry => {
                 self.run.as_mut().context("No run")?.retry(false, None)?;
                 self.start_driver()?;
             }
-            Key::Char('i') => {
+            ActionId::RetryInteractive => {
                 self.run.as_mut().context("No run")?.retry(true, None)?;
                 self.start_driver()?;
             }
-            Key::Char('m') => {
+            ActionId::ReplaceModel => {
                 let run = self.run.as_ref().context("No run")?;
                 let stage = run
                     .workflow
@@ -81,7 +72,7 @@ impl App {
                     &stage.model.clone(),
                 );
             }
-            Key::Char('e') => {
+            ActionId::EditSummary => {
                 let run = self.run.as_ref().context("No run")?;
                 ensure!(
                     run.status == Status::AwaitingConfirmation,
@@ -98,8 +89,8 @@ impl App {
                     &summary,
                 );
             }
-            Key::Char('n') => self.page = 0,
-            _ => {}
+            ActionId::BackToWorkflow => self.page = 0,
+            other => bail!("{other:?} is not a monitor action"),
         }
         Ok(())
     }

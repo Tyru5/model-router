@@ -1,4 +1,5 @@
 use super::{
+    actions::ActionId,
     app::App,
     harness_editor::HarnessEditor,
     modal::{Choice, InputTarget, Modal, PickValue},
@@ -13,7 +14,7 @@ use crate::{
     engine::{self, Run},
     harness_settings, presets, storage,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use crossterm::event::{KeyCode as Key, KeyEvent, KeyModifiers as Mods};
 use ratatui::{
     Frame,
@@ -216,17 +217,17 @@ impl StageEditor {
 }
 
 impl App {
-    pub(super) fn workflow_key(&mut self, key: KeyEvent) -> Result<()> {
+    pub(super) fn perform_workflow(&mut self, id: ActionId) -> Result<()> {
         let count = self.settings.workflows[self.workflow].stages.len();
-        match key.code {
-            Key::Down | Key::Char('j') => self.selected = (self.selected + 1).min(count - 1),
-            Key::Up | Key::Char('k') => self.selected = self.selected.saturating_sub(1),
-            Key::Char(' ') => {
+        match id {
+            ActionId::NextStage => self.selected = (self.selected + 1).min(count - 1),
+            ActionId::PreviousStage => self.selected = self.selected.saturating_sub(1),
+            ActionId::ToggleStage => {
                 let stage = self.stage_mut();
                 stage.enabled = !stage.enabled;
                 self.dirty = true;
             }
-            Key::Char('v') => {
+            ActionId::ToggleMode => {
                 let stage = self.stage_mut();
                 stage.mode = if stage.mode == Mode::Interactive {
                     Mode::Unattended
@@ -235,24 +236,24 @@ impl App {
                 };
                 self.dirty = true;
             }
-            Key::Char('t') => self.input(
+            ActionId::EditTask => self.input(
                 "Task · [Ctrl+S] applies · [Enter] adds a line",
                 InputTarget::Task,
                 &self.task.clone(),
             ),
-            Key::Char('p') => {
+            ActionId::Repositories => {
                 self.modal = Some(Modal::Repositories(Box::new(PathPicker::new(
                     &self.project,
                     storage::recent_projects(),
                 )?)));
             }
-            Key::Char('f') => {
+            ActionId::ImportTask => {
                 self.modal = Some(Modal::Import(Box::new(TaskImporter::new(
                     &self.project,
                     &self.task,
                 )?)));
             }
-            Key::Char('w') => {
+            ActionId::ChooseWorkflow => {
                 let mut items: Vec<_> = self
                     .settings
                     .workflows
@@ -285,19 +286,19 @@ impl App {
                         .into(),
                 });
             }
-            Key::Char('R') => self.input(
+            ActionId::RenameWorkflow => self.input(
                 "Rename workflow",
                 InputTarget::RenameWorkflow,
                 &self.settings.workflows[self.workflow].name.clone(),
             ),
-            Key::Char('l') => self.input(
+            ActionId::RepairLimit => self.input(
                 "Maximum automatic repair passes (0 disables repairs)",
                 InputTarget::RepairLimit,
                 &self.settings.workflows[self.workflow]
                     .max_repair_passes
                     .to_string(),
             ),
-            Key::Char('h') => {
+            ActionId::PickHarness => {
                 let items = catalog::known_harnesses(&self.settings)
                     .into_iter()
                     .map(|name| Choice {
@@ -327,7 +328,7 @@ impl App {
                         .into(),
                 });
             }
-            Key::Char('e') | Key::Enter => {
+            ActionId::EditStage => {
                 self.modal = Some(Modal::Stage {
                     editor: Box::new(StageEditor::new(
                         self.stage().clone(),
@@ -336,13 +337,13 @@ impl App {
                     insert_at: None,
                 })
             }
-            Key::Char('c') => {
+            ActionId::HarnessSettings => {
                 self.modal = Some(Modal::Harness(Box::new(HarnessEditor::new(
                     self.stage().clone(),
                 ))))
             }
-            Key::Char('m') => self.model_picker(),
-            Key::Char('a') => {
+            ActionId::Models => self.model_picker(),
+            ActionId::AddStage => {
                 ensure!(count < 64, "A workflow can contain at most 64 stages");
                 self.modal = Some(Modal::Picker {
                     title: "Add stage from preset".into(),
@@ -361,7 +362,7 @@ impl App {
                             .into(),
                 });
             }
-            Key::Char('d') => {
+            ActionId::DuplicateStage => {
                 ensure!(count < 64, "A workflow can contain at most 64 stages");
                 let mut copy = self.stage().clone();
                 copy.id = Stage::default().id;
@@ -372,7 +373,7 @@ impl App {
                 self.selected += 1;
                 self.dirty = true;
             }
-            Key::Char('x') => {
+            ActionId::RemoveStage => {
                 ensure!(count > 1, "Keep at least one stage");
                 self.settings.workflows[self.workflow]
                     .stages
@@ -380,7 +381,7 @@ impl App {
                 self.selected = self.selected.min(count - 2);
                 self.dirty = true;
             }
-            Key::Char('X') => {
+            ActionId::DeleteWorkflow => {
                 ensure!(
                     self.settings.workflows.len() > 1,
                     "Keep at least one workflow"
@@ -390,24 +391,28 @@ impl App {
                 self.selected = 0;
                 self.dirty = true;
             }
-            Key::Char('K') if self.selected > 0 => {
-                self.settings.workflows[self.workflow]
-                    .stages
-                    .swap(self.selected, self.selected - 1);
-                self.selected -= 1;
-                self.dirty = true;
+            ActionId::MoveStageUp => {
+                if self.selected > 0 {
+                    self.settings.workflows[self.workflow]
+                        .stages
+                        .swap(self.selected, self.selected - 1);
+                    self.selected -= 1;
+                    self.dirty = true;
+                }
             }
-            Key::Char('J') if self.selected + 1 < count => {
-                self.settings.workflows[self.workflow]
-                    .stages
-                    .swap(self.selected, self.selected + 1);
-                self.selected += 1;
-                self.dirty = true;
+            ActionId::MoveStageDown => {
+                if self.selected + 1 < count {
+                    self.settings.workflows[self.workflow]
+                        .stages
+                        .swap(self.selected, self.selected + 1);
+                    self.selected += 1;
+                    self.dirty = true;
+                }
             }
-            Key::Char('g') => self.worktree = !self.worktree,
-            Key::Char('s') => self.save(false)?,
-            Key::Char('S') => self.save(true)?,
-            Key::Char('P') => self.text(
+            ActionId::ToggleWorktree => self.worktree = !self.worktree,
+            ActionId::Save => self.save(false)?,
+            ActionId::SaveGlobal => self.save(true)?,
+            ActionId::Preview => self.text(
                 "Launch preview · no model is started",
                 engine::preview(
                     &self.settings,
@@ -416,7 +421,7 @@ impl App {
                     &self.task,
                 )?,
             ),
-            Key::Char('r') => {
+            ActionId::Run => {
                 self.run = Some(Run::create(
                     &self.project,
                     &self.settings,
@@ -429,7 +434,7 @@ impl App {
                 self.message = "Starting workflow…".into();
                 self.start_driver()?;
             }
-            _ => {}
+            other => bail!("{other:?} is not a workflow action"),
         }
         Ok(())
     }

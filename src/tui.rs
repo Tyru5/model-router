@@ -16,6 +16,7 @@ use std::{
     time::Duration,
 };
 
+mod actions;
 mod app;
 mod harness_editor;
 mod harnesses;

@@ -1,6 +1,6 @@
-use super::{app::App, theme::Palette, widgets::short_path};
+use super::{actions::ActionId, app::App, theme::Palette, widgets::short_path};
 use crate::{adapters, catalog};
-use crossterm::event::{KeyCode as Key, KeyEvent};
+use anyhow::{Result, bail};
 use ratatui::{
     Frame,
     layout::{Constraint, Rect},
@@ -10,22 +10,23 @@ use ratatui::{
 };
 
 impl App {
-    pub(super) fn harnesses_key(&mut self, key: KeyEvent) {
+    pub(super) fn perform_harnesses(&mut self, id: ActionId) -> Result<()> {
         let harnesses = catalog::known_harnesses(&self.settings);
-        match key.code {
-            Key::Down | Key::Char('j') => {
+        match id {
+            ActionId::NextHarness => {
                 self.harness_selected =
                     (self.harness_selected + 1).min(harnesses.len().saturating_sub(1))
             }
-            Key::Up | Key::Char('k') => {
+            ActionId::PreviousHarness => {
                 self.harness_selected = self.harness_selected.saturating_sub(1)
             }
-            Key::Enter => {
+            ActionId::HarnessDetails => {
                 let harness = &harnesses[self.harness_selected];
                 self.text(harness, format!("Executable: {}\n\n{}\n\nSelect this harness with [h] on the workflow page, then press [m] to load model selections. Use [c] on Workflow to configure the selected stage, including permissions and extra arguments.\n\nPermissions inherit the harness configuration unless overridden for a stage. Authentication stays with the harness.\n\nCustom adapters are defined in TOML. See README.md for the template contract.", adapters::program(harness, &self.settings.adapters), if harness == "amp" { "Amp uses mode keys. A mode determines its model and tools." } else { "A model must be supported by the selected harness/provider." }));
             }
-            _ => {}
+            other => bail!("{other:?} is not a Harnesses action"),
         }
+        Ok(())
     }
 }
 

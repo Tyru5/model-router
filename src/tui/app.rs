@@ -1,10 +1,11 @@
 use super::{
+    actions::{self, ActionId, Scope},
     harness_editor::HarnessEditor,
     harnesses::draw_harnesses,
     history::draw_history,
-    modal::{Choice, HELP, InputTarget, Modal, PickValue, draw_modal, matching_choices},
+    modal::{Choice, InputTarget, Modal, PickValue, draw_modal, matching_choices},
     monitor::draw_run,
-    theme::{Palette, Theme},
+    theme::{self, Palette, Theme},
     widgets::{dim, rows_for, short_path, textarea},
     workflow_page::draw_workflow,
 };
@@ -14,8 +15,8 @@ use crate::{
     engine::{self, Action, Event as RunEvent, Run},
     storage,
 };
-use anyhow::{Context, Result, ensure};
-use crossterm::event::{KeyCode as Key, KeyEvent, KeyEventKind, KeyModifiers as Mods};
+use anyhow::{Context, Result, bail, ensure};
+use crossterm::event::{KeyEvent, KeyEventKind};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Margin, Rect},
@@ -41,6 +42,16 @@ enum WorkerMessage {
 pub(super) struct Worker {
     receiver: Receiver<WorkerMessage>,
     thread: Option<JoinHandle<()>>,
+}
+#[cfg(test)]
+impl Worker {
+    /// A worker without a thread, so tests can put the app in its running state.
+    pub(super) fn stub() -> Self {
+        Self {
+            receiver: mpsc::sync_channel(1).1,
+            thread: None,
+        }
+    }
 }
 pub(super) struct App {
     pub(super) project: PathBuf,
@@ -359,75 +370,118 @@ impl App {
             return Ok(false);
         }
         if self.modal.is_some() {
-            self.modal_key(key)?;
-            return Ok(false);
+            return self.modal_key(key);
         }
-        if key.code == Key::Char('c') && key.modifiers.contains(Mods::CONTROL) {
-            if self.worker.is_some() {
-                self.cancel.store(true, Ordering::Relaxed);
-                self.message = "Stopping the stage and saving its artifacts…".into();
-                return Ok(false);
-            }
-            return Ok(true);
-        }
-        if key.code == Key::Char('q') {
-            if self.dirty {
-                self.save(false)?;
-            }
-            if self.worker.is_some() {
-                self.cancel.store(true, Ordering::Relaxed);
-                self.quit_after_stop = true;
-                self.message = "Stopping and saving before exit…".into();
-                return Ok(false);
-            }
-            return Ok(true);
-        }
-        match key.code {
-            Key::Char('T') => {
-                self.choose_theme();
-                return Ok(false);
-            }
-            Key::Char('?') => {
-                self.modal = Some(Modal::Text {
-                    title: "Keyboard guide".into(),
-                    body: HELP.into(),
-                    scroll: 0,
-                    guide: true,
-                });
-                return Ok(false);
-            }
-            Key::Tab => {
-                self.page = (self.page + 1) % 4;
-                if self.page == 2 {
-                    self.history = engine::history(&self.project)?;
-                }
-                return Ok(false);
-            }
-            Key::Char('1'..='4') => {
-                self.page = match key.code {
-                    Key::Char(c) => (c as usize) - ('1' as usize),
-                    _ => 0,
-                };
-                if self.page == 2 {
-                    self.history = engine::history(&self.project)?;
-                }
-                return Ok(false);
-            }
-            _ => {}
+        if let Some(id) = actions::resolve(self.scope(), key) {
+            return self.perform(id);
         }
         if self.worker.is_some() && self.page == 0 {
             self.message =
                 "Workflow is running. Use the monitor to cancel; edit after it stops.".into();
-            return Ok(false);
-        }
-        match self.page {
-            0 => self.workflow_key(key)?,
-            1 => self.run_key(key)?,
-            2 => self.history_key(key)?,
-            3 => self.harnesses_key(key),
-            _ => {}
         }
         Ok(false)
+    }
+    /// Run an action exactly as its key does; true means exit.
+    pub(super) fn perform(&mut self, id: ActionId) -> Result<bool> {
+        let entry = actions::entry(id).with_context(|| format!("{id:?} has no action entry"))?;
+        // A command menu can outlive its context, e.g. when the run stops.
+        if !entry.scope.covers(self.scope()) {
+            return Ok(false);
+        }
+        match entry.scope {
+            Scope::Global => return self.perform_global(id),
+            Scope::Workflow => self.perform_workflow(id)?,
+            Scope::Monitor | Scope::MonitorRunning | Scope::MonitorIdle => {
+                self.perform_monitor(id)?
+            }
+            Scope::Runs => self.perform_runs(id)?,
+            Scope::Harnesses => self.perform_harnesses(id)?,
+        }
+        Ok(false)
+    }
+    fn perform_global(&mut self, id: ActionId) -> Result<bool> {
+        match id {
+            ActionId::Interrupt => {
+                if self.worker.is_none() {
+                    return Ok(true);
+                }
+                self.cancel.store(true, Ordering::Relaxed);
+                self.message = "Stopping the stage and saving its artifacts…".into();
+            }
+            ActionId::Quit => {
+                if self.dirty {
+                    self.save(false)?;
+                }
+                if self.worker.is_none() {
+                    return Ok(true);
+                }
+                self.cancel.store(true, Ordering::Relaxed);
+                self.quit_after_stop = true;
+                self.message = "Stopping and saving before exit…".into();
+            }
+            ActionId::Themes => self.choose_theme(),
+            ActionId::Help => {
+                self.modal = Some(Modal::Text {
+                    title: "Keyboard guide".into(),
+                    body: actions::guide(),
+                    scroll: 0,
+                    guide: true,
+                })
+            }
+            ActionId::Commands => self.command_menu(),
+            ActionId::NextView => self.show((self.page + 1) % TABS.len())?,
+            ActionId::ShowWorkflow => self.show(0)?,
+            ActionId::ShowMonitor => self.show(1)?,
+            ActionId::ShowRuns => self.show(2)?,
+            ActionId::ShowHarnesses => self.show(3)?,
+            other => bail!("{other:?} is not a global action"),
+        }
+        Ok(false)
+    }
+    fn show(&mut self, page: usize) -> Result<()> {
+        self.page = page;
+        if page == 2 {
+            self.history = engine::history(&self.project)?;
+        }
+        Ok(())
+    }
+    fn command_menu(&mut self) {
+        let items = actions::available(self.scope())
+            .map(|entry| Choice {
+                label: format!(
+                    "{:<15}{:<14}{}",
+                    theme::key_label(&entry.keys()),
+                    entry.label,
+                    entry.help
+                ),
+                value: PickValue::Action(entry.id),
+            })
+            .collect();
+        self.modal = Some(Modal::Picker {
+            title: format!("Commands · {}", TABS[self.page]),
+            items,
+            selected: 0,
+            filter: textarea(""),
+            note: "Actions available here. Type to filter by key, name, or description.".into(),
+        });
+    }
+    /// The page's scope; Monitor depends on whether a run is active.
+    fn page_scope(&self) -> Scope {
+        match self.page {
+            0 => Scope::Workflow,
+            1 if self.worker.is_some() => Scope::MonitorRunning,
+            1 => Scope::MonitorIdle,
+            2 => Scope::Runs,
+            _ => Scope::Harnesses,
+        }
+    }
+    /// Where actions apply: workflow edits wait until the run stops.
+    fn scope(&self) -> Scope {
+        if self.page == 0 && self.worker.is_some() {
+            Scope::Global
+        } else {
+            self.page_scope()
+        }
     }
 }
 impl Drop for App {
@@ -473,58 +527,12 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         );
         return;
     }
-    let keys: &[(&str, &str)] = match app.page {
-        0 => &[
-            ("r", "run"),
-            ("t", "task"),
-            ("f", "import"),
-            ("p", "repos"),
-            ("c", "harness"),
-            ("m", "models"),
-            ("Space", "toggle"),
-            ("s", "save"),
-            ("T", "themes"),
-            ("?", "help"),
-            ("q", "quit"),
-        ],
-        1 if app.worker.is_some() => &[
-            ("c", "cancel stage"),
-            ("h", "handoff"),
-            ("PgUp/PgDn", "scroll"),
-            ("Tab", "switch view"),
-            ("T", "themes"),
-            ("q", "stop & exit"),
-        ],
-        1 => &[
-            ("a", "advance"),
-            ("c", "continue"),
-            ("y", "retry"),
-            ("i", "interactive"),
-            ("m", "model"),
-            ("h", "handoff"),
-            ("e", "summary"),
-            ("n", "workflow"),
-            ("T", "themes"),
-            ("?", "help"),
-        ],
-        2 => &[
-            ("↑↓", "select"),
-            ("Enter", "open run"),
-            ("r", "refresh"),
-            ("Tab", "switch view"),
-            ("T", "themes"),
-            ("q", "quit"),
-        ],
-        _ => &[
-            ("↑↓", "select"),
-            ("Enter", "details"),
-            ("Tab", "switch view"),
-            ("T", "themes"),
-            ("?", "help"),
-            ("q", "quit"),
-        ],
-    };
-    let mut footer = palette.hints(keys);
+    let hints = actions::footer(app.page_scope());
+    let keys: Vec<_> = hints
+        .iter()
+        .map(|(key, label)| (key.as_str(), *label))
+        .collect();
+    let mut footer = palette.hints(&keys);
     footer.spans.insert(0, Span::raw(" "));
     let alert = !app.message.is_empty() && app.message == app.alert;
     let status = Line::from(vec![

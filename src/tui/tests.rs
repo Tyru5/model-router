@@ -1,5 +1,6 @@
 use super::{
-    app::{App, draw},
+    actions::{self, ActionId, Scope},
+    app::{App, Worker, draw},
     modal::{Modal, PickValue},
     path_picker::PathPicker,
     theme::{self, Theme},
@@ -15,7 +16,11 @@ use crossterm::event::{KeyCode as Key, KeyEvent, KeyModifiers as Mods};
 use ratatui::Terminal;
 use std::{
     path::PathBuf,
-    sync::{Arc, atomic::AtomicBool, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
 };
 
 fn key(code: Key) -> KeyEvent {
@@ -125,7 +130,7 @@ fn every_theme_reaches_pages_dialogs_and_text_inputs() {
             let mut terminal =
                 Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
             for action in [
-                '1', '2', '3', '4', '1', 't', 'e', 'c', 'p', 'f', 'w', '?', 'T',
+                '1', '2', '3', '4', '1', 't', 'e', 'c', 'p', 'f', 'w', '?', 'T', ':',
             ] {
                 app.modal = None;
                 app.key(key(Key::Char(action))).unwrap();
@@ -186,8 +191,8 @@ fn stage_presets_are_inserted_only_after_save_and_have_unique_ids() {
     app.settings.validate().unwrap();
     // Adding or duplicating at the limit must not leave an invalid workflow.
     app.settings.workflows[0].stages = (0..64).map(|_| Stage::default()).collect();
-    assert!(app.workflow_key(key(Key::Char('a'))).is_err());
-    assert!(app.workflow_key(key(Key::Char('d'))).is_err());
+    assert!(app.key(key(Key::Char('a'))).is_err());
+    assert!(app.key(key(Key::Char('d'))).is_err());
     assert_eq!(app.settings.workflows[0].stages.len(), 64);
 }
 
@@ -381,4 +386,130 @@ fn harness_model_catalog_restores_draft_on_cancel_error_and_selection() {
         .unwrap();
     assert_eq!(app.stage().model, "selected-model");
     assert_eq!(app.stage().provider, "provider");
+}
+
+/// Choose `id` from the command menu, as a user would.
+fn choose(app: &mut App, id: ActionId) -> bool {
+    app.key(key(Key::Char(':'))).unwrap();
+    let Some(Modal::Picker { items, .. }) = &app.modal else {
+        panic!("The command menu did not open");
+    };
+    let position = items
+        .iter()
+        .position(|choice| matches!(choice.value, PickValue::Action(a) if a == id))
+        .unwrap_or_else(|| panic!("{id:?} is not in the menu"));
+    for _ in 0..position {
+        app.key(key(Key::Down)).unwrap();
+    }
+    app.key(key(Key::Enter)).unwrap()
+}
+
+fn menu(app: &mut App) -> Vec<ActionId> {
+    app.key(key(Key::Char(':'))).unwrap();
+    let Some(Modal::Picker { items, .. }) = app.modal.take() else {
+        panic!("The command menu did not open");
+    };
+    items
+        .into_iter()
+        .map(|choice| match choice.value {
+            PickValue::Action(id) => id,
+            _ => panic!("The command menu lists a non-action"),
+        })
+        .collect()
+}
+
+fn dialog(app: &App) -> Option<&str> {
+    app.modal.as_ref().map(|modal| match modal {
+        Modal::Picker { title, .. } | Modal::Text { title, .. } | Modal::Input { title, .. } => {
+            title.as_str()
+        }
+        _ => "another dialog",
+    })
+}
+
+#[test]
+fn command_menu_actions_match_their_keys() {
+    let project = tempfile::tempdir().unwrap();
+    for (id, code) in [
+        (ActionId::ToggleStage, Key::Char(' ')),
+        (ActionId::NextView, Key::Tab),
+        (ActionId::ShowRuns, Key::Char('3')),
+        (ActionId::Themes, Key::Char('T')),
+        (ActionId::Help, Key::Char('?')),
+        (ActionId::Quit, Key::Char('q')),
+    ] {
+        let mut pressed = theme_app(project.path());
+        let mut chosen = theme_app(project.path());
+        let exit = pressed.key(key(code)).unwrap();
+        assert_eq!(choose(&mut chosen, id), exit, "{id:?}");
+        assert_eq!(
+            serde_json::to_value(&chosen.settings).unwrap(),
+            serde_json::to_value(&pressed.settings).unwrap(),
+            "{id:?}"
+        );
+        assert_eq!(
+            (chosen.page, chosen.dirty, &chosen.message, dialog(&chosen)),
+            (
+                pressed.page,
+                pressed.dirty,
+                &pressed.message,
+                dialog(&pressed)
+            ),
+            "{id:?}"
+        );
+    }
+    // Errors surface as a key's do: the menu closes and the caller reports them.
+    let mut app = theme_app(project.path());
+    app.settings.workflows[0].stages.truncate(1);
+    let pressed = app.key(key(Key::Char('x'))).unwrap_err().to_string();
+    app.key(key(Key::Char(':'))).unwrap();
+    for c in "remove".chars() {
+        app.key(key(Key::Char(c))).unwrap();
+    }
+    assert_eq!(app.key(key(Key::Enter)).unwrap_err().to_string(), pressed);
+    assert!(app.modal.is_none());
+}
+
+#[test]
+fn command_menu_lists_only_actions_for_the_current_context() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    let workflow = menu(&mut app);
+    assert!(workflow.contains(&ActionId::Run) && workflow.contains(&ActionId::Commands));
+    assert!(!workflow.contains(&ActionId::CancelStage) && !workflow.contains(&ActionId::OpenRun));
+
+    app.page = 1;
+    let idle = menu(&mut app);
+    assert!(idle.contains(&ActionId::Continue) && idle.contains(&ActionId::Handoff));
+    assert!(!idle.contains(&ActionId::CancelStage) && !idle.contains(&ActionId::Run));
+
+    app.worker = Some(Worker::stub());
+    let running = menu(&mut app);
+    assert!(running.contains(&ActionId::CancelStage) && running.contains(&ActionId::Handoff));
+    assert!(!running.contains(&ActionId::Continue) && !running.contains(&ActionId::Advance));
+
+    // Workflow edits wait for the run to stop, so only global actions remain.
+    app.page = 0;
+    let locked = menu(&mut app);
+    assert!(locked.contains(&ActionId::Quit));
+    assert!(
+        locked
+            .iter()
+            .all(|id| actions::entry(*id).unwrap().scope == Scope::Global)
+    );
+
+    // A menu opened during a run does nothing once the run has stopped.
+    app.page = 1;
+    app.key(key(Key::Char(':'))).unwrap();
+    app.worker = None;
+    for c in "cancel stage".chars() {
+        app.key(key(Key::Char(c))).unwrap();
+    }
+    app.key(key(Key::Enter)).unwrap();
+    assert!(app.modal.is_none() && !app.cancel.load(Ordering::Relaxed));
+
+    app.page = 2;
+    assert!(menu(&mut app).contains(&ActionId::OpenRun));
+    app.page = 3;
+    assert!(menu(&mut app).contains(&ActionId::HarnessDetails));
 }

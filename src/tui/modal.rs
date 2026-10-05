@@ -1,4 +1,5 @@
 use super::{
+    actions::{self, ActionId},
     app::App,
     harness_editor::HarnessEditor,
     path_picker::{PathPicker, PickerAction},
@@ -44,6 +45,7 @@ pub(super) enum PickValue {
     Harness(String),
     Model(Model),
     Theme(Theme),
+    Action(ActionId),
 }
 impl PickValue {
     fn detail(&self) -> Option<String> {
@@ -67,6 +69,12 @@ impl PickValue {
                 let preset = &presets::WORKFLOWS[*index];
                 Some(format!("{}\n{}", preset.purpose, preset.stages.join(" → ")))
             }
+            Self::Action(id) => actions::entry(*id).map(|entry| {
+                std::iter::once(entry.help)
+                    .chain(entry.more.iter().copied())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }),
             _ => None,
         }
     }
@@ -112,7 +120,8 @@ pub(super) enum Modal {
 }
 
 impl App {
-    pub(super) fn pick(&mut self, choice: PickValue) -> Result<()> {
+    /// Apply a picker choice; true means exit, for menu actions such as quit.
+    pub(super) fn pick(&mut self, choice: PickValue) -> Result<bool> {
         match choice {
             PickValue::Workflow(index) => {
                 self.workflow = index;
@@ -188,8 +197,9 @@ impl App {
                 self.theme = theme;
                 self.message = format!("Theme saved: {}. T changes it anytime.", theme.name());
             }
+            PickValue::Action(id) => return self.perform(id),
         }
-        Ok(())
+        Ok(false)
     }
     fn submit_input(&mut self, target: InputTarget, value: String) -> Result<()> {
         match target {
@@ -235,23 +245,24 @@ impl App {
         }
         Ok(())
     }
-    pub(super) fn modal_key(&mut self, key: KeyEvent) -> Result<()> {
+    pub(super) fn modal_key(&mut self, key: KeyEvent) -> Result<bool> {
         let Some(mut modal) = self.modal.take() else {
-            return Ok(());
+            return Ok(false);
         };
         if key.code == Key::Esc && !matches!(modal, Modal::Repositories(_) | Modal::Import(_)) {
             self.catalog = None;
             self.modal = self.model_editor.take().map(Modal::Harness);
-            return Ok(());
+            return Ok(false);
         }
         if key.code == Key::F(7) && matches!(modal, Modal::Harness(_)) {
             if let Modal::Harness(editor) = modal {
                 self.model_editor = Some(editor);
             }
             self.model_picker();
-            return Ok(());
+            return Ok(false);
         }
         let mut keep = true;
+        let mut exit = false;
         let result: Result<()> = (|| {
             match &mut modal {
                 Modal::Input { target, text, .. } => {
@@ -346,8 +357,13 @@ impl App {
                             *selected = (*selected + 1).min(matches.len().saturating_sub(1))
                         }
                         Key::Enter if !matches.is_empty() => {
-                            let choice = matches[(*selected).min(matches.len() - 1)];
-                            self.pick(choice.value.clone())?;
+                            let value = matches[(*selected).min(matches.len() - 1)].value.clone();
+                            // The menu closes before its action runs, so the action can open
+                            // its own dialog and its errors reach the status line like a key's.
+                            if matches!(value, PickValue::Action(_)) {
+                                keep = false;
+                            }
+                            exit = self.pick(value)?;
                             keep = false;
                         }
                         _ => {
@@ -376,9 +392,9 @@ impl App {
         if matches!(self.modal, Some(Modal::Harness(_))) {
             // Validation is shown in the draft, so it cannot leave a stale
             // error behind the dialog after the user corrects the field.
-            Ok(())
+            Ok(exit)
         } else {
-            result
+            result.map(|()| exit)
         }
     }
     pub(super) fn paste(&mut self, text: &str) {
@@ -587,67 +603,3 @@ fn guide_text(body: &str, palette: Palette) -> Text<'static> {
         .collect::<Vec<_>>()
         .into()
 }
-
-pub(super) const HELP: &str = "WORKFLOW
-t\tEdit task ([Ctrl+S] applies; [Enter] adds a line)
-f\tImport task/spec: browse files; [Ctrl+U] opens URL import
-\tPreview and edit; [Tab] append/replace; [Ctrl+S] apply; [Esc] back
-p\tBrowse repositories (type to filter; [Tab] for recent)
-\t[Enter] selects a repo or opens a folder; [→] browses inside a repo
-\t[←] goes to parent; [/], [~] or [Ctrl+L] enters a path; [Esc] cancels
-w\tSelect/clone workflow or add a preset
-R\tRename workflow
-X\tDelete workflow
-e / Enter\tEdit selected stage
-c\tConfigure selected harness (model, effort, execution, permissions)
-\t[Tab] or [Ctrl+N/P] fields; [←/→] choices; [F7] models
-\t[Ctrl+S] applies; [Esc] cancels; [s] on Workflow saves
-h\tPick harness
-m\tDiscover models
-Space\tEnable/disable stage, including optional review
-v\tToggle unattended/interactive
-a\tAdd stage preset (edit, then [Ctrl+S] inserts; [Esc] cancels)
-d\tDuplicate stage
-x\tRemove stage
-J / K\tMove stage down/up
-g\tToggle isolated Git worktree
-l\tSet automatic repair limit
-P\tPreview commands (no model calls)
-s\tSave project
-S\tSave global templates
-r\tStart workflow
-
-MONITOR
-c\tCancel active stage; continue when idle
-a\tAccept interactive handoff and advance
-y\tExplicitly retry current stage
-i\tRetry current stage interactively
-m\tReplace current model and retry
-h\tInspect handoff/error
-PgUp / PgDn\tScroll output
-n\tReturn to workflow editor
-
-INTERACTIVE HARNESS
-\tNative terminal keys and paste are forwarded.
-\tExit the harness to inspect its handoff.
-Ctrl+]\tStop a stuck stage
-
-SELECTION MENUS
-Ctrl+N / Ctrl+P\tNext/previous option (same as [↓]/[↑])
-
-THEMES
-T\tChoose theme (type to filter; [↑↓] or [Ctrl+N/P] preview)
-Enter\tSave for all projects
-Esc\tRestore the current theme
-
-EVERYWHERE
-1–4 / Tab\tSwitch views
-?\tKeyboard guide
-q\tSave workflow edits and exit (stops active work first)
-Ctrl+C\tCancel work or exit
-
-NOTES
-Saved runs snapshot their workflow. Template edits affect new runs.
-Retries retain filesystem changes. Disabled reviews never gate a run.
-Artifacts: <project>/.model-router/runs/
-Provider credentials stay with each harness. Catalogs do not prove universal access.";
