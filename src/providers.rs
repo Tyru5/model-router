@@ -15,9 +15,6 @@ pub struct Provider {
     pub base_url: String,
     /// Environment variable holding the API key. Empty for keyless local servers.
     pub api_key_env: String,
-    /// Anthropic Messages-compatible root. Required for Claude Code.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub anthropic_base_url: Option<String>,
     /// Model context window in tokens, for harnesses that need it to compact
     /// (OpenCode). Unset uses a conservative default.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -44,128 +41,80 @@ impl Provider {
     }
 }
 
-/// `(name, base_url, api_key_env, anthropic_base_url)`. On 2026-10-04 every
-/// hosted URL answered unauthenticated probes (200/401 on `/models`, 401 on
-/// Anthropic `/v1/messages`); no inference request was made. Perplexity has no
-/// `/models` listing.
-/// `openai` and `anthropic` are omitted: Codex and Claude Code reach them natively.
-const BUILTINS: &[(&str, &str, &str, Option<&str>)] = &[
+/// `(name, base_url, api_key_env)`. On 2026-10-04 every hosted URL answered
+/// unauthenticated probes (200/401 on `/models`); no inference request was
+/// made. Perplexity has no `/models` listing. `openai` is omitted: Codex
+/// reaches it natively.
+const BUILTINS: &[(&str, &str, &str)] = &[
     (
         "openrouter",
         "https://openrouter.ai/api/v1",
         "OPENROUTER_API_KEY",
-        Some("https://openrouter.ai/api"),
     ),
     (
         "vercel",
         "https://ai-gateway.vercel.sh/v1",
         "AI_GATEWAY_API_KEY",
-        Some("https://ai-gateway.vercel.sh"),
     ),
     (
         "requesty",
         "https://router.requesty.ai/v1",
         "REQUESTY_API_KEY",
-        None,
     ),
     (
         "google",
         "https://generativelanguage.googleapis.com/v1beta/openai",
         "GEMINI_API_KEY",
-        None,
     ),
-    ("xai", "https://api.x.ai/v1", "XAI_API_KEY", None),
-    (
-        "mistral",
-        "https://api.mistral.ai/v1",
-        "MISTRAL_API_KEY",
-        None,
-    ),
+    ("xai", "https://api.x.ai/v1", "XAI_API_KEY"),
+    ("mistral", "https://api.mistral.ai/v1", "MISTRAL_API_KEY"),
     (
         "deepseek",
         "https://api.deepseek.com/v1",
         "DEEPSEEK_API_KEY",
-        Some("https://api.deepseek.com/anthropic"),
     ),
-    (
-        "moonshot",
-        "https://api.moonshot.ai/v1",
-        "MOONSHOT_API_KEY",
-        Some("https://api.moonshot.ai/anthropic"),
-    ),
-    (
-        "zai",
-        "https://api.z.ai/api/paas/v4",
-        "ZAI_API_KEY",
-        Some("https://api.z.ai/api/anthropic"),
-    ),
-    (
-        "minimax",
-        "https://api.minimax.io/v1",
-        "MINIMAX_API_KEY",
-        Some("https://api.minimax.io/anthropic"),
-    ),
-    (
-        "groq",
-        "https://api.groq.com/openai/v1",
-        "GROQ_API_KEY",
-        None,
-    ),
-    (
-        "cerebras",
-        "https://api.cerebras.ai/v1",
-        "CEREBRAS_API_KEY",
-        None,
-    ),
+    ("moonshot", "https://api.moonshot.ai/v1", "MOONSHOT_API_KEY"),
+    ("zai", "https://api.z.ai/api/paas/v4", "ZAI_API_KEY"),
+    ("minimax", "https://api.minimax.io/v1", "MINIMAX_API_KEY"),
+    ("groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY"),
+    ("cerebras", "https://api.cerebras.ai/v1", "CEREBRAS_API_KEY"),
     (
         "together",
         "https://api.together.xyz/v1",
         "TOGETHER_API_KEY",
-        None,
     ),
     (
         "fireworks",
         "https://api.fireworks.ai/inference/v1",
         "FIREWORKS_API_KEY",
-        None,
     ),
     (
         "deepinfra",
         "https://api.deepinfra.com/v1/openai",
         "DEEPINFRA_API_KEY",
-        None,
     ),
     (
         "huggingface",
         "https://router.huggingface.co/v1",
         "HF_TOKEN",
-        None,
     ),
     (
         "nebius",
         "https://api.studio.nebius.com/v1",
         "NEBIUS_API_KEY",
-        None,
     ),
     (
         "sambanova",
         "https://api.sambanova.ai/v1",
         "SAMBANOVA_API_KEY",
-        None,
     ),
     (
         "perplexity",
         "https://api.perplexity.ai",
         "PERPLEXITY_API_KEY",
-        None,
     ),
-    (
-        "ollama",
-        "http://localhost:11434/v1",
-        "",
-        Some("http://localhost:11434"),
-    ),
-    ("lmstudio", "http://localhost:1234/v1", "", None),
+    ("ollama", "http://localhost:11434/v1", ""),
+    ("lmstudio", "http://localhost:1234/v1", ""),
 ];
 
 /// Providers available without configuration. A `[providers.NAME]` entry with
@@ -173,13 +122,12 @@ const BUILTINS: &[(&str, &str, &str, Option<&str>)] = &[
 pub fn builtins() -> BTreeMap<String, Provider> {
     BUILTINS
         .iter()
-        .map(|(name, base_url, key, anthropic)| {
+        .map(|(name, base_url, key)| {
             (
                 (*name).into(),
                 Provider {
                     base_url: (*base_url).into(),
                     api_key_env: (*key).into(),
-                    anthropic_base_url: anthropic.map(Into::into),
                     ..Provider::default()
                 },
             )
@@ -187,26 +135,22 @@ pub fn builtins() -> BTreeMap<String, Provider> {
         .collect()
 }
 
-pub const NOTE: &str = "Set a stage's provider to one of these names. Add others with [providers.NAME] base_url/api_key_env in the workflow TOML. Built-in names route automatically only into Claude Code (needs an Anthropic-compatible URL). Other harnesses receive them unchanged, so their own provider definitions win; add an empty [providers.NAME] to route a built-in into codex (needs Responses API support), opencode, aider, goose, or custom adapters. Pi always uses its own registry. Cursor, Gemini, Amp, and Copilot use only their own accounts.";
+pub const NOTE: &str = "Built-in names are presets: add an empty [providers.NAME] to route one into codex (needs Responses API support), opencode, aider, goose, or custom adapters; without it the name passes to the harness unchanged, so its own provider definition wins. Add other providers with [providers.NAME] base_url/api_key_env. Pi always uses its own registry. Claude Code, Cursor, Gemini, Amp, and Copilot use only their own accounts.";
 
 /// The provider the router injects for `harness`, or None to pass the name to
-/// the harness unchanged. `[providers.NAME]` entries route everywhere but Pi,
-/// which has no runtime injection. Built-ins route only into Claude Code, which
-/// has no provider registry; every other harness may define the same name
-/// natively (Codex config layers and profiles, OpenCode/Aider/Goose
-/// registries), so it gets the name unchanged unless the workflow opts in
-/// with `[providers.NAME]`.
+/// the harness unchanged. Only `[providers.NAME]` entries route: harnesses may
+/// define the same name natively (Codex config layers and profiles,
+/// OpenCode/Aider/Goose registries), so built-in presets need an explicit
+/// opt-in. Pi has no runtime injection and always uses its own registry.
 pub fn route<'a>(
     harness: &str,
     name: &str,
     configured: &'a BTreeMap<String, Provider>,
 ) -> Option<Cow<'a, Provider>> {
-    match harness {
-        "pi" => None,
-        _ if configured.contains_key(name) => resolve(name, configured),
-        "claude" => resolve(name, configured),
-        _ => None,
+    if harness == "pi" || !configured.contains_key(name) {
+        return None;
     }
+    resolve(name, configured)
 }
 
 /// A configured entry, or else the built-in preset. A configured entry without
@@ -230,10 +174,6 @@ pub fn resolve<'a>(
                 } else {
                     entry.api_key_env.clone()
                 },
-                anthropic_base_url: entry
-                    .anthropic_base_url
-                    .clone()
-                    .or(preset.anthropic_base_url),
                 ..entry.clone()
             }))
         }
@@ -270,13 +210,13 @@ pub fn validate(name: &str, provider: &Provider) -> Result<()> {
         !provider.base_url.is_empty() || builtins().contains_key(name),
         "Provider {name} needs base_url (only built-in names can omit it)"
     );
-    let base = Some(&provider.base_url).filter(|url| !url.is_empty());
-    for url in base.into_iter().chain(&provider.anthropic_base_url) {
+    if !provider.base_url.is_empty() {
+        let url = &provider.base_url;
         let parsed = reqwest::Url::parse(url)
             .with_context(|| format!("Provider {name} has an invalid URL: {url:?}"))?;
         ensure!(
             matches!(parsed.scheme(), "http" | "https") && parsed.host().is_some(),
-            "Provider {name} URLs must be http:// or https://"
+            "Provider {name} base_url must be http:// or https://"
         );
     }
     ensure!(
@@ -366,13 +306,14 @@ mod tests {
         assert!(validate("a/b", &good).is_err());
     }
     #[test]
-    fn builtins_route_only_into_claude_unless_opted_in() {
+    fn builtins_route_only_when_opted_in() {
         for (name, provider) in builtins() {
             validate(&name, &provider).unwrap();
         }
         let none = BTreeMap::new();
-        assert!(route("claude", "deepseek", &none).is_some());
-        for harness in ["codex", "opencode", "aider", "goose", "pi", "custom"] {
+        for harness in [
+            "codex", "claude", "opencode", "aider", "goose", "pi", "custom",
+        ] {
             assert!(route(harness, "openrouter", &none).is_none(), "{harness}");
         }
         // An empty entry opts into the preset; Pi still uses its registry.
@@ -402,7 +343,6 @@ mod tests {
         assert_eq!(provider.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(provider.api_key_env, "TEAM_OPENROUTER_KEY");
         assert_eq!(provider.context_limit, Some(200_000));
-        assert!(provider.anthropic_base_url.is_some());
         assert_eq!(all(&configured)["openrouter"], *provider);
     }
     #[test]

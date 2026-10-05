@@ -322,7 +322,7 @@ fn main_result() -> Result<()> {
             }
         }
         Some(Commands::Providers { name: None }) => {
-            println!("PROVIDER\tSOURCE\tKEY\tCLAUDE\tBASE URL");
+            println!("PROVIDER\tSOURCE\tKEY\tBASE URL");
             for (name, provider) in providers::all(&settings.providers) {
                 let key = if provider.api_key_env.is_empty() {
                     "none needed".into()
@@ -336,16 +336,11 @@ fn main_result() -> Result<()> {
                     )
                 };
                 println!(
-                    "{name}\t{}\t{key}\t{}\t{}",
+                    "{name}\t{}\t{key}\t{}",
                     if settings.providers.contains_key(&name) {
                         "configured"
                     } else {
                         "built-in"
-                    },
-                    if provider.anthropic_base_url.is_some() {
-                        "yes"
-                    } else {
-                        "no"
                     },
                     provider.base_url
                 );

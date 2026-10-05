@@ -464,22 +464,15 @@ fn terminating_cli_stops_its_stage_and_persists_cancellation() {
 }
 
 #[test]
-fn capture_applies_and_removes_environment_variables() {
+fn capture_applies_environment_variables() {
     let dir = tempfile::tempdir().unwrap();
-    assert!(std::env::var_os("HOME").is_some());
     let inv = adapters::Invocation {
         program: "python3".into(),
-        args: vec![
-            "-c".into(),
-            "import os; print(os.environ.get('HOME', 'unset'), os.environ['ROUTED'])".into(),
-        ],
+        args: vec!["-c".into(), "import os; print(os.environ['ROUTED'])".into()],
         stdin: None,
         kind: OutputKind::Text,
         final_file: dir.path().join("unused"),
-        env: vec![
-            ("HOME".into(), adapters::EnvValue::Unset),
-            ("ROUTED".into(), adapters::EnvValue::Literal("yes".into())),
-        ],
+        env: vec![("ROUTED".into(), adapters::EnvValue::Literal("yes".into()))],
     };
     let result = process::capture(
         &inv,
@@ -493,6 +486,6 @@ fn capture_applies_and_removes_environment_variables() {
     assert!(result.success());
     assert_eq!(
         fs::read_to_string(dir.path().join("stdout.log")).unwrap(),
-        "unset yes\n"
+        "yes\n"
     );
 }

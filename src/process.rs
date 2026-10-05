@@ -100,12 +100,7 @@ pub fn capture(
             Stdio::null()
         })
         .process_group(0);
-    for (name, value) in inv.environment()? {
-        match value {
-            Some(value) => command.env(name, value),
-            None => command.env_remove(name),
-        };
-    }
+    command.envs(inv.environment()?);
     let mut child = ChildGuard(
         command
             .spawn()
@@ -211,10 +206,7 @@ pub fn interactive(
     let mut cmd = CommandBuilder::new(&inv.program);
     cmd.args(&inv.args);
     for (name, value) in inv.environment()? {
-        match value {
-            Some(value) => cmd.env(name, value),
-            None => cmd.env_remove(name),
-        }
+        cmd.env(name, value);
     }
     cmd.cwd(cwd);
     let mut child = PtyChild {

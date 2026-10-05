@@ -27,8 +27,6 @@ pub enum OutputKind {
 pub enum EnvValue {
     Literal(String),
     Var(String),
-    /// Removes an inherited variable.
-    Unset,
     /// Sets `path` to the JSON `value` inside the inherited JSON object of the
     /// same variable, replacing only that entry. Other inline config
     /// (permissions, providers) is kept in its original order.
@@ -52,7 +50,6 @@ impl Invocation {
         let env = self.env.iter().map(|(name, value)| match value {
             EnvValue::Literal(v) => format!("{name}={}", shell_words::quote(v)),
             EnvValue::Var(var) => format!("{name}=${var}"),
-            EnvValue::Unset => format!("-u {name}"),
             EnvValue::JsonInsert { path, value } => {
                 format!(
                     "{name}=${name}+{}={}",
@@ -69,16 +66,14 @@ impl Invocation {
         .collect::<Vec<_>>()
         .join(" ")
     }
-    /// Resolves `env` for launch (None removes the variable); fails when a
-    /// referenced variable is unset.
-    pub fn environment(&self) -> Result<Vec<(String, Option<String>)>> {
+    /// Resolves `env` for launch; fails when a referenced variable is unset.
+    pub fn environment(&self) -> Result<Vec<(String, String)>> {
         self.env
             .iter()
             .map(|(name, value)| {
                 Ok((
                     name.clone(),
                     match value {
-                        EnvValue::Unset => return Ok((name.clone(), None)),
                         EnvValue::Literal(v) => v.clone(),
                         EnvValue::Var(var) => env::var(var)
                             .ok()
@@ -88,8 +83,7 @@ impl Invocation {
                             json_insert(env::var(name).ok().as_deref(), path, value)
                                 .with_context(|| format!("Add provider config to {name}"))?
                         }
-                    }
-                    .into(),
+                    },
                 ))
             })
             .collect()
@@ -141,19 +135,14 @@ pub fn program(harness: &str, custom: &BTreeMap<String, CustomAdapter>) -> Strin
 }
 
 /// Harnesses that cannot be pointed at a router-defined provider.
-const UNROUTABLE: &[&str] = &["cursor", "gemini", "amp", "copilot"];
+const UNROUTABLE: &[&str] = &["claude", "cursor", "gemini", "amp", "copilot"];
 
 pub fn validate_options(stage: &Stage, configured: &BTreeMap<String, Provider>) -> Result<()> {
-    if let Some(provider) = providers::route(&stage.harness, &stage.provider, configured) {
+    if providers::route(&stage.harness, &stage.provider, configured).is_some() {
         ensure!(
             !UNROUTABLE.contains(&stage.harness.as_str()),
             "{} cannot use router provider {}; it only uses its own account",
             stage.harness,
-            stage.provider
-        );
-        ensure!(
-            stage.harness != "claude" || provider.anthropic_base_url.is_some(),
-            "Claude Code needs an Anthropic-compatible endpoint; set anthropic_base_url for provider {}",
             stage.provider
         );
     } else if !stage.provider.is_empty() && !harness_settings::supports_provider(&stage.harness) {
@@ -297,16 +286,6 @@ pub fn build(
             }
             if !stage.effort.is_empty() {
                 append(&["--effort", &stage.effort]);
-            }
-            if let Some(provider) = &routed {
-                ensure!(
-                    !extra_args
-                        .iter()
-                        .any(|a| a == "--settings" || a.starts_with("--settings=")),
-                    "A routed Claude stage sets --settings itself; remove it from Extra arguments"
-                );
-                claude_settings_conflicts(paths.workspace)?;
-                append(&["--settings", &claude_route_settings(provider)?]);
             }
             a.extend(extra_args.clone());
             if interactive {
@@ -536,182 +515,6 @@ fn router_provider_id(name: &str) -> String {
     format!("model-router-{safe}")
 }
 
-/// Inherited Claude Code variables removed for a routed launch: headers that
-/// could carry another gateway's credentials, a socket relay that bypasses the
-/// base URL, an inherited API-key descriptor, and every backend selector in
-/// Claude Code 2.1.289 (each would bypass `ANTHROPIC_BASE_URL`).
-const CLAUDE_ROUTE_CONFLICTS: &[&str] = &[
-    "ANTHROPIC_CUSTOM_HEADERS",
-    "ANTHROPIC_UNIX_SOCKET",
-    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
-    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
-    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_FOUNDRY",
-    "CLAUDE_CODE_USE_GATEWAY",
-    "CLAUDE_CODE_USE_MANTLE",
-    "CLAUDE_CODE_USE_VERTEX",
-];
-/// Key file Claude reads on remote hosts when no other API key is set.
-const CLAUDE_REMOTE_API_KEY: &str = "/home/claude/.claude/remote/.api_key";
-/// Claude settings that would replace the routed credential. `--settings`
-/// cannot override them without putting the secret in arguments.
-const CLAUDE_CREDENTIAL_ENV: &[&str] = &["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"];
-
-/// `--settings` JSON for a routed Claude launch. Command-line settings outrank
-/// user and project settings, so their `env` cannot move the endpoint, restore
-/// headers, or select another backend. Contains no secrets.
-fn claude_route_settings(provider: &Provider) -> Result<String> {
-    let url = provider
-        .anthropic_base_url
-        .as_deref()
-        .context("Provider has no anthropic_base_url")?;
-    let mut env = serde_json::Map::new();
-    env.insert("ANTHROPIC_BASE_URL".into(), url.into());
-    for name in CLAUDE_ROUTE_CONFLICTS {
-        env.insert((*name).into(), "".into());
-    }
-    Ok(serde_json::json!({ "env": env }).to_string())
-}
-
-/// Fails when Claude configuration could undo routing; see
-/// [`claude_conflicts_in`]. Unit tests skip user and system configuration.
-fn claude_settings_conflicts(workspace: &Path) -> Result<()> {
-    let user = (!cfg!(test))
-        .then(
-            || match env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from) {
-                Some(dir) => Some((dir.clone(), dir.join(".claude.json"))),
-                None => directories::BaseDirs::new().map(|d| {
-                    (
-                        d.home_dir().join(".claude"),
-                        d.home_dir().join(".claude.json"),
-                    )
-                }),
-            },
-        )
-        .flatten()
-        // Claude prefers a legacy `.config.json` in its config dir when present.
-        .map(|(dir, global)| (dir.join(".config.json"), dir, global))
-        .map(|(legacy, dir, global)| (dir, vec![legacy, global]));
-    claude_conflicts_in(workspace, user, !cfg!(test))
-}
-
-/// Checks, failing closed:
-/// - project settings in `workspace`, its ancestors, and the main checkout of
-///   a Git worktree, plus user settings: no credential (`env` key or
-///   `apiKeyHelper`);
-/// - the user's global config (legacy `.config.json` and `.claude.json`) and
-///   the remote-host key file: no saved key, which Claude sends alongside
-///   the routed token;
-/// - managed settings, which outrank `--settings`: no routed variable or
-///   `policyHelper`, and no macOS MDM policy, whose content is not inspected.
-fn claude_conflicts_in(
-    workspace: &Path,
-    user: Option<(PathBuf, Vec<PathBuf>)>,
-    system: bool,
-) -> Result<()> {
-    let conflict = |what: String| {
-        anyhow::anyhow!(
-            "{what}, which would override or leak alongside the router provider. Remove it or leave this stage's provider blank."
-        )
-    };
-    let main_checkout = std::process::Command::new("git")
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .current_dir(workspace)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|dir| Path::new(dir.trim()).parent().map(Path::to_path_buf));
-    let mut files: Vec<(PathBuf, bool)> = workspace
-        .ancestors()
-        .chain(main_checkout.as_deref())
-        .flat_map(|dir| {
-            ["settings.json", "settings.local.json"]
-                .map(|name| (dir.join(".claude").join(name), false))
-        })
-        .collect();
-    if let Some((dir, globals)) = &user {
-        files.push((dir.join("settings.json"), false));
-        for global in globals {
-            let Ok(text) = fs::read_to_string(global) else {
-                continue;
-            };
-            let config: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-            if config
-                .get("primaryApiKey")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|key| !key.is_empty())
-            {
-                return Err(conflict(format!(
-                    "Claude config {} has a saved API key (primaryApiKey)",
-                    global.display()
-                )));
-            }
-        }
-    }
-    if system {
-        let remote = Path::new(CLAUDE_REMOTE_API_KEY);
-        if fs::metadata(remote).is_ok_and(|m| m.len() > 0) {
-            return Err(conflict(format!(
-                "Claude remote API key {} exists",
-                remote.display()
-            )));
-        }
-    }
-    if system {
-        let mdm = Path::new("/Library/Managed Preferences/com.anthropic.claudecode.plist");
-        if mdm.exists() {
-            return Err(conflict(format!(
-                "macOS MDM policy {} applies",
-                mdm.display()
-            )));
-        }
-        for dir in [
-            "/etc/claude-code",
-            "/Library/Application Support/ClaudeCode",
-        ] {
-            let dir = Path::new(dir);
-            files.push((dir.join("managed-settings.json"), true));
-            if let Ok(entries) = fs::read_dir(dir.join("managed-settings.d")) {
-                files.extend(entries.flatten().map(|e| (e.path(), true)));
-            }
-        }
-    }
-    for (path, managed) in files {
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let settings: serde_json::Value = serde_json::from_str(&text)
-            .with_context(|| format!("Claude settings {} are not JSON", path.display()))?;
-        let env = settings.get("env").and_then(serde_json::Value::as_object);
-        let set = |name: &str| env.is_some_and(|env| env.contains_key(name));
-        let has = |key: &str| settings.get(key).is_some();
-        let found = CLAUDE_CREDENTIAL_ENV
-            .iter()
-            .copied()
-            .find(|name| set(name))
-            .or_else(|| has("apiKeyHelper").then_some("apiKeyHelper"))
-            .or_else(|| {
-                managed
-                    .then(|| {
-                        std::iter::once("ANTHROPIC_BASE_URL")
-                            .chain(CLAUDE_ROUTE_CONFLICTS.iter().copied())
-                            .find(|name| set(name))
-                            .or_else(|| has("policyHelper").then_some("policyHelper"))
-                    })
-                    .flatten()
-            });
-        if let Some(name) = found {
-            return Err(conflict(format!(
-                "Claude settings {} set {name}",
-                path.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// Environment that points a harness at a router-defined provider. The key
 /// variable is always listed so a missing key fails before launch.
 fn route_env(stage: &Stage, provider: &Provider) -> Result<Vec<(String, EnvValue)>> {
@@ -730,25 +533,6 @@ fn route_env(stage: &Stage, provider: &Provider) -> Result<Vec<(String, EnvValue
         env.push((provider.api_key_env.clone(), key()));
     }
     match stage.harness.as_str() {
-        // OpenRouter's Claude Code integration: bearer token, empty API key.
-        "claude" => {
-            let url = provider
-                .anthropic_base_url
-                .as_deref()
-                .context("Provider has no anthropic_base_url")?;
-            env.extend([
-                ("ANTHROPIC_BASE_URL".into(), literal(url)),
-                ("ANTHROPIC_AUTH_TOKEN".into(), key()),
-                ("ANTHROPIC_API_KEY".into(), literal("")),
-            ]);
-            // Inherited headers would carry another gateway's credentials to
-            // this endpoint; backend selectors would bypass it entirely.
-            env.extend(
-                CLAUDE_ROUTE_CONFLICTS
-                    .iter()
-                    .map(|n| ((*n).into(), EnvValue::Unset)),
-            );
-        }
         "opencode" => {
             let mut options = serde_json::json!({ "baseURL": &provider.base_url });
             if !keyless {
@@ -920,39 +704,7 @@ mod tests {
         }
         assert_eq!(env(&codex, "OPENROUTER_API_KEY"), Some(&key));
 
-        let claude = routed("claude", "openrouter", Mode::Interactive).unwrap();
-        assert_eq!(
-            env(&claude, "ANTHROPIC_BASE_URL"),
-            Some(&EnvValue::Literal("https://openrouter.ai/api".into()))
-        );
-        assert_eq!(env(&claude, "ANTHROPIC_AUTH_TOKEN"), Some(&key));
-        assert_eq!(
-            env(&claude, "ANTHROPIC_API_KEY"),
-            Some(&EnvValue::Literal(String::new()))
-        );
-        assert!(
-            claude
-                .display()
-                .contains("ANTHROPIC_AUTH_TOKEN=$OPENROUTER_API_KEY")
-        );
-        for name in [
-            "ANTHROPIC_CUSTOM_HEADERS",
-            "CLAUDE_CODE_USE_BEDROCK",
-            "CLAUDE_CODE_USE_VERTEX",
-            "CLAUDE_CODE_USE_FOUNDRY",
-        ] {
-            assert_eq!(env(&claude, name), Some(&EnvValue::Unset), "{name}");
-        }
-        let unattended = routed("claude", "openrouter", Mode::Unattended).unwrap();
-        assert_eq!(unattended.env, claude.env);
-        assert!(
-            claude
-                .environment()
-                .is_ok_and(|e| e.contains(&("CLAUDE_CODE_USE_BEDROCK".into(), None)))
-                || std::env::var_os("OPENROUTER_API_KEY").is_none()
-        );
-        assert!(routed("claude", "groq", Mode::Unattended).is_err());
-        assert!(routed("claude", "openai", Mode::Unattended).is_err());
+        assert!(routed("claude", "openrouter", Mode::Unattended).is_err());
         assert!(routed("cursor", "openrouter", Mode::Unattended).is_err());
 
         // Native registries keep built-in names; codex keeps --oss for Ollama.
@@ -977,7 +729,6 @@ mod tests {
             Provider {
                 base_url: "http://localhost:4000/v1".into(),
                 api_key_env: "PROXY_KEY".into(),
-                anthropic_base_url: None,
                 ..Provider::default()
             },
         )]);
@@ -1054,7 +805,6 @@ mod tests {
             Provider {
                 base_url: "http://localhost:4000/v1".into(),
                 api_key_env: "PROXY_KEY".into(),
-                anthropic_base_url: None,
                 ..Provider::default()
             },
         )]);
@@ -1100,7 +850,6 @@ mod tests {
         let gateway = Provider {
             base_url: "http://gateway.local/v1".into(),
             api_key_env: String::new(),
-            anthropic_base_url: None,
             ..Provider::default()
         };
         for (name, id) in [
@@ -1186,151 +935,5 @@ mod tests {
             panic!()
         };
         assert!(!value.contains("apiKey"), "{value}");
-    }
-
-    #[test]
-    fn routed_claude_pins_settings_and_rejects_credential_overrides() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = dir.path().join("repo");
-        fs::create_dir_all(workspace.join(".claude")).unwrap();
-        let paths = ContextPaths {
-            workspace: &workspace,
-            attempt_dir: dir.path(),
-            prompt_file: dir.path(),
-            handoff_file: dir.path(),
-        };
-        let stage = |extra: &[&str]| Stage {
-            harness: "claude".into(),
-            provider: "openrouter".into(),
-            model: "m".into(),
-            extra_args: extra.iter().map(|a| (*a).into()).collect(),
-            ..Stage::default()
-        };
-        let none = BTreeMap::new();
-        let build_with = |stage: &Stage| build(stage, &BTreeMap::new(), &none, "t", &paths);
-
-        // Project env that only moves the endpoint is outranked by --settings.
-        fs::write(
-            workspace.join(".claude/settings.json"),
-            r#"{"env":{"ANTHROPIC_BASE_URL":"https://old.gateway","CLAUDE_CODE_USE_MANTLE":"1"}}"#,
-        )
-        .unwrap();
-        let i = build_with(&stage(&[])).unwrap();
-        let at = i.args.iter().position(|a| a == "--settings").unwrap();
-        let settings: serde_json::Value = serde_json::from_str(&i.args[at + 1]).unwrap();
-        assert_eq!(
-            settings["env"]["ANTHROPIC_BASE_URL"],
-            "https://openrouter.ai/api"
-        );
-        for name in CLAUDE_ROUTE_CONFLICTS {
-            assert_eq!(settings["env"][name], "", "{name}");
-            assert_eq!(env(&i, name), Some(&EnvValue::Unset), "{name}");
-        }
-        assert!(
-            !["ANTHROPIC_AUTH_TOKEN", "OPENROUTER_API_KEY"]
-                .iter()
-                .any(|k| i.args[at + 1].contains(k))
-        );
-        assert!(build_with(&stage(&["--settings", "{}"])).is_err());
-
-        // Credentials in any layer, here a parent's local settings, are rejected.
-        for (file, body) in [
-            (
-                "settings.local.json",
-                r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"old"}}"#,
-            ),
-            ("settings.json", r#"{"env":{"ANTHROPIC_API_KEY":"old"}}"#),
-            ("settings.json", r#"{"apiKeyHelper":"print-key"}"#),
-        ] {
-            fs::create_dir_all(dir.path().join(".claude")).unwrap();
-            fs::write(dir.path().join(".claude").join(file), body).unwrap();
-            let error = build_with(&stage(&[])).unwrap_err().to_string();
-            assert!(
-                error.contains("would override or leak alongside the router provider"),
-                "{error}"
-            );
-            fs::remove_dir_all(dir.path().join(".claude")).unwrap();
-        }
-        // Unrouted Claude stages ignore those settings.
-        fs::write(
-            workspace.join(".claude/settings.json"),
-            r#"{"apiKeyHelper":"x"}"#,
-        )
-        .unwrap();
-        let native = Stage {
-            provider: String::new(),
-            ..stage(&[])
-        };
-        assert!(build_with(&native).is_ok());
-    }
-
-    #[test]
-    fn claude_conflicts_cover_saved_keys_and_sibling_worktrees() {
-        let dir = tempfile::tempdir().unwrap();
-        let git = |args: &[&str], cwd: &Path| {
-            assert!(
-                std::process::Command::new("git")
-                    .args(args)
-                    .current_dir(cwd)
-                    .output()
-                    .unwrap()
-                    .status
-                    .success()
-            )
-        };
-        let main = dir.path().join("main");
-        fs::create_dir_all(&main).unwrap();
-        git(&["init", "-q"], &main);
-        git(
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                "i",
-            ],
-            &main,
-        );
-        let sibling = dir.path().join("sibling");
-        git(&["worktree", "add", "-q", sibling.to_str().unwrap()], &main);
-        claude_conflicts_in(&sibling, None, false).unwrap();
-        fs::create_dir_all(main.join(".claude")).unwrap();
-        fs::write(
-            main.join(".claude/settings.local.json"),
-            r#"{"env":{"ANTHROPIC_API_KEY":"x"}}"#,
-        )
-        .unwrap();
-        assert!(claude_conflicts_in(&sibling, None, false).is_err());
-
-        let user = dir.path().join("user");
-        fs::create_dir_all(&user).unwrap();
-        let global = dir.path().join(".claude.json");
-        let elsewhere = dir.path().join("elsewhere");
-        fs::create_dir_all(&elsewhere).unwrap();
-        let legacy = user.join(".config.json");
-        let check = || {
-            claude_conflicts_in(
-                &elsewhere,
-                Some((user.clone(), vec![legacy.clone(), global.clone()])),
-                false,
-            )
-        };
-        check().unwrap();
-        fs::write(&global, r#"{"primaryApiKey":""}"#).unwrap();
-        check().unwrap();
-        fs::write(&global, r#"{"primaryApiKey":"sk-saved"}"#).unwrap();
-        assert!(check().unwrap_err().to_string().contains("primaryApiKey"));
-        fs::remove_file(&global).unwrap();
-        fs::write(&legacy, r#"{"primaryApiKey":"sk-legacy"}"#).unwrap();
-        assert!(check().unwrap_err().to_string().contains(".config.json"));
-        fs::remove_file(&legacy).unwrap();
-        fs::write(user.join("settings.json"), r#"{"apiKeyHelper":"x"}"#).unwrap();
-        assert!(check().is_err());
-        assert!(CLAUDE_ROUTE_CONFLICTS.contains(&"ANTHROPIC_UNIX_SOCKET"));
-        assert!(CLAUDE_ROUTE_CONFLICTS.contains(&"CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR"));
     }
 }

@@ -69,11 +69,11 @@ impl HarnessEditor {
             help: "Type a native model ID, alias, or Amp mode. Blank inherits the harness default. [F7] browses available selections without starting a model.",
             text: textarea(&stage.model),
         }];
-        if harness_settings::supports_provider(&stage.harness) || stage.harness == "claude" {
+        if harness_settings::supports_provider(&stage.harness) {
             fields.push(Field {
                 kind: FieldKind::Provider,
                 label: "Provider",
-                help: "Blank inherits the harness provider. A provider override requires a model. Router providers (openrouter, groq, deepseek, … or [providers.NAME]) read their key from the environment; `model-router providers` lists them.",
+                help: "Blank inherits the harness provider. A provider override requires a model. [providers.NAME] entries in the workflow (openrouter, groq, … or your own) are routed by the router, reading their key from the environment; `model-router providers` lists them.",
                 text: textarea(&stage.provider),
             });
         }
