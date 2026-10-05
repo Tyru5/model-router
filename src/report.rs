@@ -453,17 +453,18 @@ pub fn item_text(item: &Item) -> String {
     }
 }
 
-pub fn changes_heading(changes: &Changes) -> String {
+/// E.g. "3 files, +42 -7" or "unavailable (not a Git repository)".
+pub fn changes_status(changes: &Changes) -> String {
     match changes {
-        Changes::Tracked { files } if files.is_empty() => {
-            "Changed during this run: no files".into()
-        }
-        Changes::Tracked { files } => format!("Changed during this run: {}", files_summary(files)),
-        Changes::NotGit => "Changed during this run: unavailable (not a Git repository)".into(),
-        Changes::Unavailable { reason } => {
-            format!("Changed during this run: unavailable: {reason}")
-        }
+        Changes::Tracked { files } if files.is_empty() => "no files".into(),
+        Changes::Tracked { files } => files_summary(files),
+        Changes::NotGit => "unavailable (not a Git repository)".into(),
+        Changes::Unavailable { reason } => format!("unavailable: {reason}"),
     }
+}
+
+pub fn changes_heading(changes: &Changes) -> String {
+    format!("Changed during this run: {}", changes_status(changes))
 }
 
 const LISTED_FILES: usize = 40;
@@ -565,66 +566,68 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
-        checks::CheckResult,
-        config::{Mode, Settings, Stage, Workflow},
-        engine::{StageState, Waiver},
-        handoff::{Finding, Handoff, TestEvidence, Verdict},
+        config::{Stage, Workflow},
+        engine::StageState,
     };
     use chrono::{DateTime, Duration};
-    use std::path::PathBuf;
+    use serde_json::{Value, json};
 
     fn at(seconds: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000 + seconds, 0).unwrap()
     }
+    // Fixtures deserialize from JSON, as saved runs do, so fields added
+    // elsewhere with serde defaults don't break them.
     fn attempt(start: i64, end: i64, status: Status, usage: Option<Usage>) -> Attempt {
-        Attempt {
-            number: 1,
-            started_at: at(start),
-            finished_at: Some(at(end)),
-            model: "model-a".into(),
-            mode: Mode::Unattended,
-            status,
-            exit_code: Some(0),
-            directory: PathBuf::from("/attempt"),
-            handoff_file: PathBuf::from("/handoff.json"),
-            error: None,
-            checks: vec![],
-            tree_before: None,
-            tree_after: None,
-            usage,
-        }
+        serde_json::from_value(json!({
+            "number": 1,
+            "started_at": at(start),
+            "finished_at": at(end),
+            "model": "model-a",
+            "mode": "unattended",
+            "status": status,
+            "exit_code": 0,
+            "directory": "/attempt",
+            "handoff_file": "/handoff.json",
+            "error": null,
+            "usage": usage,
+        }))
+        .unwrap()
     }
-    fn handoff(summary: &str) -> Handoff {
-        Handoff {
-            summary: summary.into(),
-            verdict: Verdict::Complete,
-            findings: vec![],
-            decisions: vec![],
-            files_changed: vec![],
-            tests: vec![],
-            unresolved: vec![],
-            not_applicable: None,
-            structured: true,
-        }
+    fn handoff(fields: Value) -> crate::handoff::Handoff {
+        let mut value = json!({ "summary": "Done", "verdict": "complete" });
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        serde_json::from_value(value).unwrap()
     }
-    fn check(code: Option<i32>, status: TestStatus, required: bool) -> CheckResult {
-        CheckResult {
-            command: vec!["cargo".into(), "test".into()],
-            required,
-            status,
-            exit_code: code,
-            started_at: at(0),
-            finished_at: at(1),
-            directory: PathBuf::from("/checks/01"),
-            error: None,
-        }
+    fn check(code: i32, status: TestStatus, required: bool) -> crate::checks::CheckResult {
+        serde_json::from_value(json!({
+            "command": ["cargo", "test"],
+            "required": required,
+            "status": status,
+            "exit_code": code,
+            "started_at": at(0),
+            "finished_at": at(1),
+            "directory": "/checks/01",
+            "error": null,
+        }))
+        .unwrap()
+    }
+    fn stage(status: Status, attempts: Vec<Attempt>) -> StageState {
+        serde_json::from_value(json!({ "status": status, "attempts": [], "handoff": null }))
+            .map(|mut state: StageState| {
+                state.attempts = attempts;
+                state
+            })
+            .unwrap()
     }
 
     /// Implement (retried once), Verify (waived, checks), Review (disabled).
-    fn sample() -> Run {
+    pub(crate) fn sample() -> Run {
         let names = [
             ("implement", "Implement"),
             ("verify", "Verify"),
@@ -656,77 +659,58 @@ mod tests {
             output_tokens: Some(100),
             ..Usage::default()
         };
-        let mut implement = handoff("Implemented");
-        implement.findings = vec![
-            Finding {
-                severity: Severity::Advisory,
-                description: "Rename later".into(),
-            },
-            Finding {
-                severity: Severity::Blocking,
-                description: "Data loss".into(),
-            },
-        ];
-        implement.unresolved = vec!["Docs pending".into()];
-        implement.files_changed = vec!["src/lib.rs".into(), "src/lib.rs".into()];
-        let mut verify = handoff("Verified");
-        verify.structured = false;
-        verify.tests = vec![TestEvidence {
-            command: "pytest".into(),
-            status: TestStatus::NotRun,
-            required: true,
-        }];
+        let mut implement = stage(
+            Status::Complete,
+            vec![
+                attempt(10, 40, Status::Failed, Some(paid)),
+                attempt(50, 90, Status::Complete, None),
+            ],
+        );
+        implement.handoff = Some(handoff(json!({
+            "findings": [
+                { "severity": "advisory", "description": "Rename later" },
+                { "severity": "blocking", "description": "Data loss" },
+            ],
+            "unresolved": ["Docs pending"],
+            "files_changed": ["src/lib.rs", "src/lib.rs"],
+        })));
         let mut verify_attempt = attempt(100, 130, Status::Complete, Some(tokens_only));
         verify_attempt.checks = vec![
-            check(Some(0), TestStatus::Passed, true),
-            check(Some(3), TestStatus::Failed, false),
+            check(0, TestStatus::Passed, true),
+            check(3, TestStatus::Failed, false),
         ];
-        Run {
-            version: 1,
-            revision: 3,
-            id: "20261004-000000-abcd1234".into(),
-            created_at: at(0),
-            updated_at: at(500),
-            project: PathBuf::from("/project"),
-            workspace: PathBuf::from("/project"),
-            baseline: None,
-            directory: PathBuf::from("/project/.model-router/runs/x"),
-            worktree: false,
-            task: "Task".into(),
-            workflow,
-            adapters: Settings::default().adapters,
-            stages: vec![
-                StageState {
-                    status: Status::Complete,
-                    attempts: vec![
-                        attempt(10, 40, Status::Failed, Some(paid)),
-                        attempt(50, 90, Status::Complete, None),
-                    ],
-                    handoff: Some(implement),
-                    waiver: None,
-                },
-                StageState {
-                    status: Status::Complete,
-                    attempts: vec![verify_attempt],
-                    handoff: Some(verify),
-                    waiver: Some(Waiver {
-                        reason: "Docs only".into(),
-                        accepted_at: at(140),
-                    }),
-                },
-                StageState {
-                    status: Status::Skipped,
-                    attempts: vec![],
-                    handoff: None,
-                    waiver: None,
-                },
-            ],
-            cursor: 3,
-            repair_passes: 1,
-            repair_feedback: None,
-            status: Status::Complete,
-            error: None,
-        }
+        let mut verify = stage(Status::Complete, vec![verify_attempt]);
+        verify.handoff = Some(handoff(json!({
+            "structured": false,
+            "tests": [{ "command": "pytest", "status": "not_run", "required": true }],
+        })));
+        verify.waiver = Some(crate::engine::Waiver {
+            reason: "Docs only".into(),
+            accepted_at: at(140),
+        });
+        let mut run: Run = serde_json::from_value(json!({
+            "version": 1,
+            "revision": 3,
+            "id": "20231114-221320-abcd1234",
+            "created_at": at(0),
+            "updated_at": at(500),
+            "project": "/project",
+            "workspace": "/project",
+            "directory": "/project/.model-router/runs/x",
+            "worktree": false,
+            "task": "Task",
+            "workflow": workflow,
+            "adapters": {},
+            "stages": [],
+            "cursor": 3,
+            "repair_passes": 1,
+            "repair_feedback": null,
+            "status": "complete",
+            "error": null,
+        }))
+        .unwrap();
+        run.stages = vec![implement, verify, stage(Status::Skipped, vec![])];
+        run
     }
 
     #[test]
