@@ -1,0 +1,16 @@
+starting session | provider: openai model: gpt-fixture
+    session id: 20261004_1
+    working directory: /workspace/project
+
+─── shell | developer ──────────────────────────
+command: cat README.md
+
+# Project
+
+Build with cargo build.
+
+README.md documents the build.
+
+<router-handoff>
+{"summary":"Goose: README.md documents the build","verdict":"complete","findings":[],"decisions":[],"files_changed":[],"tests":[],"unresolved":[]}
+</router-handoff>

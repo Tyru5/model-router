@@ -176,6 +176,8 @@ pub fn normalize(raw: &str, kind: OutputKind) -> Normalized {
     }
     let cleaned = storage::clean_terminal(raw);
     let events: Vec<Value> = match serde_json::from_str(&cleaned) {
+        // Claude prints every message as one array when verbose output is on.
+        Ok(Value::Array(events)) => events,
         Ok(value) => vec![value],
         Err(_) => cleaned
             .lines()
@@ -186,12 +188,21 @@ pub fn normalize(raw: &str, kind: OutputKind) -> Normalized {
     let mut recognized = false;
     for event in events {
         if event.get("is_error").and_then(Value::as_bool) == Some(true) {
+            // Claude's error results carry `errors` instead of `result`.
+            let errors: Vec<&str> = event
+                .get("errors")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
             result.error = Some(
                 event
                     .get("result")
                     .and_then(Value::as_str)
-                    .unwrap_or("Harness reported an error")
-                    .into(),
+                    .map(str::to_owned)
+                    .or_else(|| (!errors.is_empty()).then(|| errors.join("\n")))
+                    .unwrap_or_else(|| "Harness reported an error".into()),
             );
         }
         if event
@@ -246,21 +257,29 @@ pub fn normalize(raw: &str, kind: OutputKind) -> Normalized {
                         recognized = true;
                     }
                 }
+                // Stream retries ("Reconnecting...") arrive as error events; a
+                // fatal error ends the turn with turn.failed instead.
+                if kind_name == "turn.completed" {
+                    result.error = None;
+                }
             }
             OutputKind::Pi => {
                 if kind_name == "message_end"
                     && event.pointer("/message/role").and_then(Value::as_str) == Some("assistant")
                 {
-                    if event.pointer("/message/stopReason").and_then(Value::as_str) == Some("error")
-                    {
-                        result.error = Some(
-                            event
-                                .pointer("/message/errorMessage")
-                                .and_then(Value::as_str)
-                                .unwrap_or("Pi reported an error")
-                                .into(),
-                        );
-                    }
+                    // The latest assistant message decides: Pi retries failed
+                    // attempts automatically.
+                    result.error = matches!(
+                        event.pointer("/message/stopReason").and_then(Value::as_str),
+                        Some("error" | "aborted")
+                    )
+                    .then(|| {
+                        event
+                            .pointer("/message/errorMessage")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Pi reported an error")
+                            .into()
+                    });
                     if let Some(content) =
                         event.pointer("/message/content").and_then(Value::as_array)
                     {

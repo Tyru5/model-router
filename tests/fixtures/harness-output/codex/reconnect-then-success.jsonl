@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"00000000-0000-4000-8000-000000000033"}
+{"type":"turn.started"}
+{"type":"error","message":"Reconnecting... 1/5 (stream disconnected before completion: connection reset)"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"<router-handoff>\n{\"summary\":\"Codex: finished after a stream reconnect\",\"verdict\":\"complete\",\"findings\":[],\"decisions\":[],\"files_changed\":[],\"tests\":[],\"unresolved\":[]}\n</router-handoff>"}}
+{"type":"turn.completed","usage":{"input_tokens":14210,"cached_input_tokens":11008,"cache_write_input_tokens":0,"output_tokens":402,"reasoning_output_tokens":128}}

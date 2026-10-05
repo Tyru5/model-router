@@ -1,0 +1,14 @@
+[32m●[0m Read README.md
+  └ 12 lines read
+
+README.md documents the build.
+
+<router-handoff>
+{"summary":"Copilot: README.md documents the build","verdict":"complete","findings":[],"decisions":[],"files_changed":[],"tests":[],"unresolved":[]}
+</router-handoff>
+
+
+Total usage est:       1 Premium request
+Total duration (API):  4.2s
+Total duration (wall): 5.0s
+Total code changes:    0 lines added, 0 lines removed
