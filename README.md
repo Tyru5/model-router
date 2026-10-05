@@ -49,7 +49,8 @@ Opening the router does not start a model. Press `p` to choose a repository,
 `c` to configure the selected stage's harness, `e` to edit the stage,
 `m` to choose a model, and `r` to start. `Space` enables
 or disables a stage. `T` chooses a theme. `1`–`4` or `Tab` switch views.
-`?` opens the full keyboard guide. Use `Ctrl+S` to apply
+`?` opens the full keyboard guide. `:` opens a command menu: type to search
+the current view's actions, then press `Enter` to run one. Use `Ctrl+S` to apply
 text/form edits; `Esc` cancels them. `q` saves workflow edits and exits.
 
 In selection menus, including repository and file browsers, `Ctrl+N` moves to

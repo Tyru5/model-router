@@ -1,5 +1,5 @@
 use super::theme::Palette;
-use super::{content, menu_key, textarea};
+use super::widgets::{content, menu_key, textarea};
 use crate::{catalog, storage};
 use anyhow::{Context, Result, ensure};
 use crossterm::event::{KeyCode as Key, KeyEvent, KeyModifiers as Mods};
@@ -233,14 +233,13 @@ impl PathPicker {
         }
         // Multiplexers often claim Ctrl+L, so starting a path with / or ~ also
         // opens path entry; folder names cannot contain / anyway.
-        if let Key::Char(c @ ('/' | '~')) = key.code
-            && !key.modifiers.contains(Mods::CONTROL)
-            && content(&self.filter).is_empty()
-        {
-            let mut input = textarea(&c.to_string());
-            input.move_cursor(CursorMove::End);
-            self.path_input = Some(input);
-            return Ok(PickerAction::Stay);
+        if let Key::Char(c @ ('/' | '~')) = key.code {
+            if !key.modifiers.contains(Mods::CONTROL) && content(&self.filter).is_empty() {
+                let mut input = textarea(&c.to_string());
+                input.move_cursor(CursorMove::End);
+                self.path_input = Some(input);
+                return Ok(PickerAction::Stay);
+            }
         }
         match menu_key(key) {
             Key::Esc => return Ok(PickerAction::Close),

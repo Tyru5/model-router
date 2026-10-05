@@ -1,6 +1,6 @@
 use super::path_picker::{PathPicker, PickerAction};
 use super::theme::Palette;
-use super::{content, textarea};
+use super::widgets::{content, textarea};
 use crate::{config, storage, task_import};
 use anyhow::{Result, ensure};
 use crossterm::event::{KeyCode as Key, KeyEvent, KeyModifiers as Mods};

@@ -255,7 +255,7 @@ mod tests {
     #[test]
     fn startup_uses_each_themes_background() {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        for theme in super::super::Theme::ALL {
+        for theme in super::super::theme::Theme::ALL {
             let palette = theme.palette();
             terminal
                 .draw(|frame| draw(frame, Duration::from_millis(850), palette))
@@ -282,7 +282,7 @@ mod tests {
                         draw(
                             frame,
                             Duration::from_millis(millis),
-                            super::super::Theme::default().palette(),
+                            super::super::theme::Theme::default().palette(),
                         )
                     })
                     .unwrap();
