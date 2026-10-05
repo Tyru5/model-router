@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
     adapters, catalog,
-    config::{Mode, Role, Stage},
+    config::{Check, Mode, Role, Stage},
     engine::{self, Run},
     harness_settings, presets, storage,
 };
@@ -39,8 +39,13 @@ const FIELDS: &[&str] = &[
     "Timeout (seconds)",
     "Review repair target (stage ID; blank = nearest)",
     "Extra arguments (shell quoting; no shell execution)",
+    "Router checks (one per line; ? prefix = optional)",
     "Stage instructions",
 ];
+/// Multiline fields, where Enter inserts a newline.
+const CHECKS: usize = 10;
+const INSTRUCTIONS: usize = 11;
+const CHOICES: [usize; 3] = [1, 2, 6];
 pub(super) struct StageEditor {
     stage: Stage,
     pub(super) fields: Vec<TextArea<'static>>,
@@ -55,6 +60,19 @@ impl StageEditor {
             .map(|a| shell_words::quote(a).into_owned())
             .collect::<Vec<_>>()
             .join(" ");
+        let checks = stage
+            .checks
+            .iter()
+            .map(|c| {
+                let command = shell_words::join(&c.command);
+                if c.required {
+                    command
+                } else {
+                    format!("? {command}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         let fields = [
             &stage.name,
             stage.role.label(),
@@ -66,6 +84,7 @@ impl StageEditor {
             &stage.timeout_seconds.to_string(),
             &stage.repair_target,
             &args,
+            &checks,
             &stage.instructions,
         ]
         .into_iter()
@@ -104,7 +123,8 @@ impl StageEditor {
         stage.repair_target = content(&self.fields[8]).trim().into();
         stage.extra_args = shell_words::split(&content(&self.fields[9]))
             .context("Extra arguments have unmatched quotes")?;
-        stage.instructions = content(&self.fields[10]);
+        stage.checks = parse_checks(&content(&self.fields[CHECKS]), &self.stage.checks)?;
+        stage.instructions = content(&self.fields[INSTRUCTIONS]);
         Ok(stage)
     }
     pub(super) fn key(&mut self, key: KeyEvent) {
@@ -116,7 +136,7 @@ impl StageEditor {
             || (key.code == Key::Char('p') && key.modifiers.contains(Mods::CONTROL))
         {
             self.selected = (self.selected + self.fields.len() - 1) % self.fields.len();
-        } else if [1, 2, 6].contains(&self.selected) {
+        } else if CHOICES.contains(&self.selected) {
             if matches!(
                 key.code,
                 Key::Left | Key::Right | Key::Char(' ') | Key::Enter
@@ -142,14 +162,14 @@ impl StageEditor {
                     }
                 }
             }
-        } else if key.code == Key::Enter && self.selected != 10 {
+        } else if key.code == Key::Enter && ![CHECKS, INSTRUCTIONS].contains(&self.selected) {
             self.selected = (self.selected + 1) % self.fields.len();
         } else {
             self.fields[self.selected].input(key);
         }
     }
     pub(super) fn paste(&mut self, text: &str) {
-        if ![1, 2, 6].contains(&self.selected) {
+        if !CHOICES.contains(&self.selected) {
             self.fields[self.selected].insert_str(text);
         }
     }
@@ -166,7 +186,7 @@ impl StageEditor {
         let value_width = halves[0].width.saturating_sub(4) as usize;
         let rows = FIELDS.iter().enumerate().map(|(i, label)| {
             let value = content(&self.fields[i]).replace('\n', " ");
-            let choice = [1, 2, 6].contains(&i);
+            let choice = CHOICES.contains(&i);
             ListItem::new(vec![
                 Line::styled(*label, Style::default().fg(palette.muted)),
                 if value.is_empty() {
@@ -206,13 +226,58 @@ impl StageEditor {
         frame.render_widget(&*field, halves[1]);
         let mut keys = palette.hints(&[("Ctrl+S", "apply stage"), ("Esc", "cancel")]);
         keys.spans.push(Span::styled(
-            "   ·  model IDs are open-ended; blank inherits the default",
+            if self.selected == CHECKS {
+                "   ·  argv per line, no shell; edit timeout_seconds in TOML"
+            } else {
+                "   ·  model IDs are open-ended; blank inherits the default"
+            },
             Style::default().fg(palette.muted),
         ));
         frame.render_widget(
             Paragraph::new(vec![Line::raw(""), keys]).wrap(Wrap { trim: false }),
             chunks[1],
         );
+    }
+}
+
+/// Parses the router checks field: one shell-quoted argv per nonempty line, a
+/// leading `?` marks it optional. Unchanged lines keep their TOML timeout.
+fn parse_checks(text: &str, existing: &[Check]) -> Result<Vec<Check>> {
+    let mut checks = vec![];
+    for (number, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (required, line) = match line.strip_prefix('?') {
+            Some(rest) => (false, rest),
+            None => (true, line),
+        };
+        let command = shell_words::split(line)
+            .with_context(|| format!("Router check line {} has unmatched quotes", number + 1))?;
+        ensure!(
+            !command.is_empty(),
+            "Router check line {} has no command",
+            number + 1
+        );
+        let timeout_seconds = existing
+            .iter()
+            .find(|c| c.command == command && c.required == required)
+            .map_or(Check::default().timeout_seconds, |c| c.timeout_seconds);
+        checks.push(Check {
+            command,
+            required,
+            timeout_seconds,
+        });
+    }
+    Ok(checks)
+}
+
+fn duration(seconds: u64) -> String {
+    if seconds % 60 == 0 {
+        format!("{} min", seconds / 60)
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -613,6 +678,30 @@ fn draw_stage_detail(frame: &mut Frame<'_>, stage: &Stage, area: Rect, palette: 
             .lines()
             .map(|line| Line::styled(line.to_string(), Style::default().fg(palette.fg))),
     );
+    if !stage.checks.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("Router checks", palette.header_style()));
+        for check in &stage.checks {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    storage::clean_terminal(&shell_words::join(&check.command)),
+                    Style::default().fg(palette.fg),
+                ),
+                Span::styled(
+                    format!(
+                        "  {} · {}",
+                        if check.required {
+                            "required"
+                        } else {
+                            "optional"
+                        },
+                        duration(check.timeout_seconds)
+                    ),
+                    Style::default().fg(palette.muted),
+                ),
+            ]));
+        }
+    }
     lines.push(Line::raw(""));
     lines.push(Line::styled("Harness settings", palette.header_style()));
     lines.extend(
@@ -655,5 +744,147 @@ mod tests {
             .unwrap();
         assert_eq!(result.extra_args, stage.extra_args);
         assert_eq!(result.instructions, stage.instructions);
+    }
+
+    fn check(command: &[&str], required: bool, timeout_seconds: u64) -> Check {
+        Check {
+            command: command.iter().map(|a| (*a).into()).collect(),
+            required,
+            timeout_seconds,
+        }
+    }
+
+    fn edit_checks(checks: Vec<Check>, text: &str) -> Result<Vec<Check>> {
+        let mut editor = StageEditor::new(
+            Stage {
+                checks,
+                ..Stage::default()
+            },
+            vec!["codex".into()],
+        );
+        editor.fields[CHECKS] = textarea(text);
+        editor.finish().map(|stage| stage.checks)
+    }
+
+    #[test]
+    fn router_checks_roundtrip_required_optional_and_literal_args() {
+        let checks = vec![
+            check(&["cargo", "test", "--locked"], true, 600),
+            check(&["sh", "-c", "echo $(date) > out"], false, 600),
+            check(&["npm", "run", "lint fix"], true, 600),
+        ];
+        let editor = StageEditor::new(
+            Stage {
+                checks: checks.clone(),
+                ..Stage::default()
+            },
+            vec!["codex".into()],
+        );
+        let text = content(&editor.fields[CHECKS]);
+        assert_eq!(
+            text,
+            "cargo test --locked\n? sh -c 'echo $(date) > out'\nnpm run 'lint fix'"
+        );
+        let result = editor.finish().unwrap().checks;
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            serde_json::to_value(&checks).unwrap()
+        );
+        // Both optional spellings parse; blank lines are skipped.
+        let parsed = edit_checks(vec![], "?make lint\n\n  ? make  'a b'  \n").unwrap();
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            serde_json::to_value([
+                check(&["make", "lint"], false, 600),
+                check(&["make", "a b"], false, 600)
+            ])
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn router_checks_keep_timeouts_of_unchanged_lines() {
+        let existing = vec![
+            check(&["cargo", "test"], true, 90),
+            check(&["cargo", "clippy"], false, 300),
+        ];
+        let result = edit_checks(
+            existing,
+            "cargo test\ncargo clippy\ncargo fmt --check\n? cargo test",
+        )
+        .unwrap();
+        let timeouts: Vec<_> = result
+            .iter()
+            .map(|c| (c.required, c.timeout_seconds))
+            .collect();
+        // `cargo clippy` became required, so it is a new check with the default.
+        assert_eq!(
+            timeouts,
+            [(true, 90), (true, 600), (true, 600), (false, 600)]
+        );
+    }
+
+    #[test]
+    fn empty_router_checks_field_yields_no_checks() {
+        let existing = vec![check(&["cargo", "test"], true, 90)];
+        assert!(edit_checks(existing.clone(), "").unwrap().is_empty());
+        assert!(edit_checks(existing, " \n\n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalid_router_checks_are_editor_errors() {
+        let error = edit_checks(vec![], "cargo test\necho 'open").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Router check line 2 has unmatched quotes"
+        );
+        let error = edit_checks(vec![], "?").unwrap_err();
+        assert_eq!(error.to_string(), "Router check line 1 has no command");
+    }
+
+    #[test]
+    fn enter_adds_lines_to_router_checks() {
+        let mut editor = StageEditor::new(Stage::default(), vec!["codex".into()]);
+        editor.selected = CHECKS;
+        for code in [Key::Char('a'), Key::Enter, Key::Char('b')] {
+            editor.key(KeyEvent::new(code, Mods::NONE));
+        }
+        assert_eq!(editor.selected, CHECKS);
+        assert_eq!(content(&editor.fields[CHECKS]), "a\nb");
+    }
+
+    fn render(stage: &Stage) -> String {
+        let palette = super::super::theme::Theme::default().palette();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 50)).unwrap();
+        terminal
+            .draw(|frame| draw_stage_detail(frame, stage, frame.area(), palette))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    #[test]
+    fn detail_panel_lists_router_checks_only_when_present() {
+        let mut stage = Stage::default();
+        assert!(!render(&stage).contains("Router checks"));
+        stage.checks = vec![
+            check(&["cargo", "test"], true, 600),
+            check(&["npm", "run", "lint fix"], false, 90),
+        ];
+        let text = render(&stage);
+        assert!(text.contains("Router checks"), "{text}");
+        assert!(text.contains("cargo test  required · 10 min"), "{text}");
+        assert!(
+            text.contains("npm run 'lint fix'  optional · 90s"),
+            "{text}"
+        );
     }
 }
