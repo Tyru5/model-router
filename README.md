@@ -388,12 +388,45 @@ and artifact paths. Full logs stay on disk. Prompts request this handoff format:
 
 Normal stages use `complete`; reviews use `pass` or `needs_changes`. Any stage
 can report `blocked`. Findings contain `severity` (`blocking` or `advisory`) and
-`description`. Test status is `passed`, `failed`, or `not_run`.
+`description`. Test status is `passed`, `failed`, or `not_run`. A test stage
+that cannot apply any check may add `"not_applicable": "reason"`.
 
 Models can write the given handoff file or, when unattended, emit the object
 between `<router-handoff>` and `</router-handoff>`. Plain text is accepted for
 unattended stages other than review/verification and labeled unstructured.
 Tool output and echoed prompts are not extracted as assistant verdicts.
+
+### Verification
+
+A `test` stage advances only with evidence: at least one required check that
+passed. The model can report it in `tests`, or the router can run it. An empty
+`tests` list, or one with only optional checks, stops the run.
+
+Any stage can list checks for the router to run after its harness succeeds:
+
+```toml
+[[workflows.stages]]
+id = "verify"
+role = "test"
+# ...
+checks = [
+  { command = ["cargo", "test", "--locked"] },
+  { command = ["cargo", "clippy", "--", "-D", "warnings"], required = false, timeout_seconds = 300 },
+]
+```
+
+Each `command` is an argument vector run in the run's workspace; no shell
+evaluates it. `required` defaults to `true` and `timeout_seconds` to 600. The
+prompt lists these commands. Results are recorded independently of the model's
+handoff, in `run.json` and the attempt's `checks.json`, with logs under
+`checks/NN/`. A required check that fails, times out, or cannot start blocks the
+stage, whatever its role. Optional failures are only recorded.
+
+When no check can apply, a test stage may report `not_applicable` with a reason.
+The run then waits at the human checkpoint. Accept it with `a` in the monitor,
+`resume RUN_ID --advance`, or `a` at the CLI prompt. At an interactive
+checkpoint, that one confirmation is the acceptance. It is saved on the stage;
+a retry or repair discards it, so the rerun needs a new acceptance.
 
 ## Workspace and artifacts
 

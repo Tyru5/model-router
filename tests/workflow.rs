@@ -1,13 +1,15 @@
+mod common;
+
+use common::{count, drive, fixture, stage};
 use model_router::{
     adapters::{self, ContextPaths, OutputKind},
-    config::{CustomAdapter, Mode, Role, Settings, Stage, Workflow},
-    engine::{self, Action, Run, Status},
+    config::{Mode, Role, Settings, Stage},
+    engine::{self, Action, Status},
     handoff, process, storage,
 };
 use std::{
     collections::BTreeMap,
     fs,
-    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -15,66 +17,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
-fn fixture(stages: Vec<Stage>) -> (tempfile::TempDir, Settings, Run) {
-    let dir = tempfile::Builder::new()
-        .prefix("router test 雪 ")
-        .tempdir()
-        .unwrap();
-    let adapter = CustomAdapter {
-        command: "python3".into(),
-        args: vec![
-            format!("{}/examples/mock_harness.py", env!("CARGO_MANIFEST_DIR")),
-            "--role".into(),
-            "{provider}".into(),
-            "--model".into(),
-            "{model}".into(),
-            "--prompt-file".into(),
-            "{prompt_file}".into(),
-            "--handoff-file".into(),
-            "{handoff_file}".into(),
-        ],
-        ..CustomAdapter::default()
-    };
-    let settings = Settings {
-        workflows: vec![Workflow {
-            name: "Test".into(),
-            max_repair_passes: 2,
-            stages,
-        }],
-        adapters: BTreeMap::from([("mock".into(), adapter)]),
-        ..Settings::default()
-    };
-    let run = Run::create(
-        dir.path(),
-        &settings,
-        &settings.workflows[0],
-        "Original task: preserve 雪 and $(touch NEVER) literally".into(),
-        false,
-    )
-    .unwrap();
-    (dir, settings, run)
-}
-fn stage(id: &str, role: Role) -> Stage {
-    Stage {
-        id: id.into(),
-        name: id.into(),
-        role,
-        harness: "mock".into(),
-        provider: id.into(),
-        model: "test-model".into(),
-        ..Stage::default()
-    }
-}
-fn drive(run: &mut Run) -> Action {
-    engine::drive(run, &AtomicBool::new(false), |_| {}).unwrap()
-}
-fn count(path: &Path, role: &str) -> u32 {
-    fs::read_to_string(path.join(format!(".model-router/mock/{role}.count")))
-        .unwrap_or_else(|_| "0".into())
-        .parse()
-        .unwrap()
-}
 
 #[test]
 fn no_review_run_passes_context_and_skips_disabled_review() {

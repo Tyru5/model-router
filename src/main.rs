@@ -310,13 +310,33 @@ fn cli_drive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
                 if let Some(handoff) = &run.stages[run.cursor].handoff {
                     println!("\n{}\n", serde_json::to_string_pretty(handoff)?);
                 }
+                let waiver = run.pending_waiver().map(str::to_owned);
+                if let Some(reason) = &waiver {
+                    println!(
+                        "{} reported no passing required check. Not applicable: {reason}\n",
+                        run.current_name()
+                    );
+                }
                 if !io::stdin().is_terminal() {
+                    if waiver.is_some() {
+                        bail!(
+                            "Run awaits acceptance of a not-applicable verification. Use resume {} --advance to accept it",
+                            run.id
+                        );
+                    }
                     bail!(
                         "Interactive handoff awaits inspection. Use resume {} --advance after inspecting it",
                         run.id
                     );
                 }
-                print!("[a] Advance  [r] Reopen stage  [q] Save and stop: ");
+                print!(
+                    "{}",
+                    if waiver.is_some() {
+                        "[a] Accept without checks  [r] Reopen stage  [q] Save and stop: "
+                    } else {
+                        "[a] Advance  [r] Reopen stage  [q] Save and stop: "
+                    }
+                );
                 io::stdout().flush()?;
                 let mut answer = String::new();
                 io::stdin().read_line(&mut answer)?;

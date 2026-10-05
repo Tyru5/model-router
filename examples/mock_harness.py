@@ -20,6 +20,8 @@ parser.add_argument("--interactive", action="store_true")
 parser.add_argument("--delay", type=float, default=0)
 parser.add_argument("--no-handoff", action="store_true")
 parser.add_argument("--test-status", choices=["passed", "failed", "not_run"])
+parser.add_argument("--test-optional", action="store_true")
+parser.add_argument("--not-applicable", metavar="REASON")
 args = parser.parse_args()
 
 root = Path(".model-router/mock")
@@ -64,13 +66,15 @@ handoff = {
         {
             "command": "offline acceptance check",
             "status": args.test_status,
-            "required": True,
+            "required": not args.test_optional,
         }
     ]
-    if args.test_status
+    if args.test_status and not args.not_applicable
     else [],
     "unresolved": [],
 }
+if args.not_applicable:
+    handoff["not_applicable"] = args.not_applicable
 if not args.no_handoff:
     Path(args.handoff_file).write_text(json.dumps(handoff))
 print("<router-handoff>" + json.dumps(handoff) + "</router-handoff>", flush=True)
