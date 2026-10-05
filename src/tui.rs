@@ -800,7 +800,7 @@ impl App {
             self.modal = self.model_editor.take().map(Modal::Harness);
             return Ok(());
         }
-        if key.code == Key::F(2) && matches!(modal, Modal::Harness(_)) {
+        if key.code == Key::F(7) && matches!(modal, Modal::Harness(_)) {
             if let Modal::Harness(editor) = modal {
                 self.model_editor = Some(editor);
             }
@@ -2346,13 +2346,13 @@ f\tImport task/spec: browse files; Ctrl+U opens URL import
 \tPreview and edit; Tab append/replace; Ctrl+S apply; Esc back
 p\tBrowse repositories (type to filter; Tab for recent)
 \tEnter selects a repo or opens a folder; Right browses inside a repo
-\tLeft goes to parent; Ctrl+L enters a path; Esc cancels
+\tLeft goes to parent; /, ~ or Ctrl+L enters a path; Esc cancels
 w\tSelect/clone workflow or add a preset
 R\tRename workflow
 X\tDelete workflow
 e / Enter\tEdit selected stage
 c\tConfigure selected harness (model, effort, execution, permissions)
-\tTab or Ctrl+N/P fields; Left/Right choices; F2 models
+\tTab or Ctrl+N/P fields; Left/Right choices; F7 models
 \tCtrl+S applies; Esc cancels; s on Workflow saves
 h\tPick harness
 m\tDiscover models
@@ -2837,14 +2837,14 @@ mod tests {
         for c in "draft-model".chars() {
             app.key(key(Key::Char(c))).unwrap();
         }
-        app.key(key(Key::F(2))).unwrap();
+        app.key(key(Key::F(7))).unwrap();
         assert!(app.model_editor.is_some());
         app.key(key(Key::Esc)).unwrap();
         assert!(
             matches!(&app.modal, Some(Modal::Harness(e)) if e.finish().unwrap().model == "draft-model")
         );
 
-        app.key(key(Key::F(2))).unwrap();
+        app.key(key(Key::F(7))).unwrap();
         let (sender, receiver) = mpsc::channel();
         sender.send(Err("Offline catalog".into())).unwrap();
         app.catalog = Some(receiver);
@@ -2853,7 +2853,7 @@ mod tests {
             matches!(&app.modal, Some(Modal::Harness(e)) if e.error.contains("Offline catalog") && e.finish().unwrap().model == "draft-model")
         );
 
-        app.key(key(Key::F(2))).unwrap();
+        app.key(key(Key::F(7))).unwrap();
         let (sender, receiver) = mpsc::channel();
         sender
             .send(Ok(Catalog {

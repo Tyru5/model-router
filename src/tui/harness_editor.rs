@@ -60,7 +60,7 @@ impl HarnessEditor {
             } else {
                 "Model / alias"
             },
-            help: "Type a native model ID, alias, or Amp mode. Blank inherits the harness default. F2 browses available selections without starting a model.",
+            help: "Type a native model ID, alias, or Amp mode. Blank inherits the harness default. F7 browses available selections without starting a model.",
             text: textarea(&stage.model),
         }];
         if harness_settings::supports_provider(&stage.harness) {
@@ -227,7 +227,7 @@ impl HarnessEditor {
                 "Harness settings · {} · {}",
                 self.stage.harness, self.stage.name
             ),
-            &[("Tab", "next field"), ("←/→", "choices"), ("F2", "models")],
+            &[("Tab", "next field"), ("←/→", "choices"), ("F7", "models")],
         );
         let inner = block.inner(rect);
         frame.render_widget(block, rect);

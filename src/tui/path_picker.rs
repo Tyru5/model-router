@@ -14,7 +14,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use tui_textarea::TextArea;
+use tui_textarea::{CursorMove, TextArea};
 
 struct Entry {
     path: PathBuf,
@@ -231,6 +231,17 @@ impl PathPicker {
             self.path_input = Some(input);
             return Ok(PickerAction::Stay);
         }
+        // Multiplexers often claim Ctrl+L, so starting a path with / or ~ also
+        // opens path entry; folder names cannot contain / anyway.
+        if let Key::Char(c @ ('/' | '~')) = key.code
+            && !key.modifiers.contains(Mods::CONTROL)
+            && content(&self.filter).is_empty()
+        {
+            let mut input = textarea(&c.to_string());
+            input.move_cursor(CursorMove::End);
+            self.path_input = Some(input);
+            return Ok(PickerAction::Stay);
+        }
         match menu_key(key) {
             Key::Esc => return Ok(PickerAction::Close),
             Key::Tab | Key::BackTab => {
@@ -326,7 +337,7 @@ impl PathPicker {
         } else {
             palette.style_textarea(&mut self.filter);
             self.filter
-                .set_block(palette.panel(" Type to filter · Ctrl+L enter path "));
+                .set_block(palette.panel(" Type to filter · / ~ or Ctrl+L enter path "));
             frame.render_widget(&self.filter, chunks[2]);
         }
         let matches = self.matches();
@@ -335,9 +346,9 @@ impl PathPicker {
             let message = if self.show_recent && content(&self.filter).is_empty() {
                 "No recent projects. Press Tab to browse folders."
             } else if self.files {
-                "No matching files or folders. Clear the filter or use Ctrl+L."
+                "No matching files or folders. Clear the filter, then type / or ~ (or Ctrl+L)."
             } else {
-                "No matching folders. Clear the filter or use Ctrl+L."
+                "No matching folders. Clear the filter, then type / or ~ (or Ctrl+L)."
             };
             frame.render_widget(
                 Paragraph::new(message)
@@ -417,7 +428,7 @@ impl PathPicker {
                         ("←", "parent"),
                     ]),
                     palette.hints(&[
-                        ("Ctrl+L", "enter path"),
+                        ("/ or Ctrl+L", "enter path"),
                         ("Ctrl+U", "URL"),
                         ("Esc", "cancel"),
                     ]),
@@ -495,6 +506,27 @@ mod tests {
         picker.key(KeyEvent::new(Key::Char('l'), Mods::CONTROL))?;
         picker.paste(path);
         key(picker, Key::Enter)
+    }
+
+    #[test]
+    fn slash_or_tilde_opens_path_entry_when_filter_is_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let target = root.join("target");
+        fs::create_dir(&target).unwrap();
+        let mut picker = PathPicker::new(&root, vec![]).unwrap();
+        key(&mut picker, Key::Char('/')).unwrap();
+        picker.paste(&target.display().to_string()[1..]);
+        key(&mut picker, Key::Enter).unwrap();
+        assert_eq!(picker.directory, target);
+        assert!(picker.path_input.is_none());
+
+        key(&mut picker, Key::Char('~')).unwrap();
+        assert_eq!(content(picker.path_input.as_ref().unwrap()), "~");
+        key(&mut picker, Key::Esc).unwrap();
+        picker.paste("ab");
+        key(&mut picker, Key::Char('/')).unwrap();
+        assert!(picker.path_input.is_none());
     }
 
     #[test]

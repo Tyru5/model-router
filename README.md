@@ -99,7 +99,7 @@ use `↑`/`↓` and `Enter` to choose a repo or open a folder.
 | `→` | Browse inside the highlighted folder or repo |
 | `←` | Go to the parent folder |
 | `Tab` | Switch between folders and recent projects |
-| `Ctrl+L` | Enter or paste a directory path; `Enter` opens it |
+| `/`, `~`, or `Ctrl+L` | Enter or paste a directory path; `Enter` opens it |
 | `Esc` | Cancel path entry, or close the browser |
 
 Paths can be absolute, relative to the displayed folder, or start with `~/`.
@@ -117,7 +117,7 @@ Recent projects persist across launches. Stop an active run before switching.
 Press `f` on the Workflow page to browse local Markdown or UTF-8 text files.
 The browser starts in the selected project. Type to filter, use `↑`/`↓` to
 select, and press `Enter` to open a folder or preview a file. `←` opens the
-parent folder; `Ctrl+L` accepts an absolute path, a path relative to the displayed
+parent folder; typing `/` or `~`, or `Ctrl+L`, accepts an absolute path, a path relative to the displayed
 folder, or a `~/` path.
 
 Press `Ctrl+U` in the browser to paste a URL instead:
@@ -314,7 +314,7 @@ execution needs permissions configured explicitly in its native settings/flags.
 
 Select a stage in **Workflow** and press **c**. Edit its model, provider and effort
 (where supported), execution mode, timeout, native permissions, and extra
-arguments. **F2** browses models and returns to the settings draft.
+arguments. **F7** browses models and returns to the settings draft.
 
 - **Tab**, **Shift+Tab**, or **Ctrl+N/P** move between fields.
 - **Left/Right**, **Space**, or **Enter** cycle choice fields. Type in text fields.

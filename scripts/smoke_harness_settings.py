@@ -11,7 +11,7 @@ import tomllib
 from smoke_tui import ARTIFACTS, Terminal, records
 
 NEXT, PREVIOUS, APPLY, ESC = b"\x0e", b"\x10", b"\x13", b"\x1b"
-RIGHT, F2 = b"\x1b[C", b"\x1bOQ"
+RIGHT, F7 = b"\x1b[C", b"\x1b[18~"
 
 
 def replace(terminal, text):
@@ -64,12 +64,12 @@ mode = "interactive"
 
             terminal.send("c")
             replace(terminal, "draft-model")
-            terminal.send(F2)
+            terminal.send(F7)
             terminal.wait(lambda: "codex selections" in terminal.text(), "Model picker missing")
             terminal.send(ESC)
             terminal.wait(lambda: "Harness settings" in terminal.text(), "Esc lost the draft")
             assert "draft-model" in terminal.text()
-            terminal.send(F2)
+            terminal.send(F7)
             terminal.wait(lambda: "codex selections" in terminal.text(), "Model picker missing")
             terminal.send(NEXT)
             terminal.send(PREVIOUS)
