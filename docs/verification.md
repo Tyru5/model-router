@@ -5,9 +5,11 @@ Verified locally on Linux with Rust 1.93.0. Installed executable reports
 
 | Check | Result |
 | --- | --- |
-| `cargo test --locked` | 58 tests passed |
+| `cargo test --locked` | 141 tests passed |
 | `cargo clippy --all-targets --locked -- -D warnings` | Passed |
 | `cargo fmt --check` | Passed |
+| `cargo +1.85 check --all-targets --locked` (MSRV) | Passed |
+| `cargo +1.99 clippy --all-targets --locked -- -D warnings` | Passed |
 | `cargo build --release --locked` | Passed; installation rebuilt the final changed code |
 | `cargo install --path . --locked` | Installed successfully in the user's Cargo bin directory |
 | Installed `model-router --version` | `model-router 0.1.0` |
