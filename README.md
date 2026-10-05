@@ -191,6 +191,10 @@ Model discovery is deliberately labeled:
 Custom IDs always remain editable. Built-in discovery does not send inference requests.
 The router does not silently replace a model that fails or is unavailable.
 
+`model-router doctor` checks each harness's executable, version, and the flags
+the router passes, using only `--version` and `--help`. It cannot check logins.
+See [compatibility checks](docs/adapters.md#compatibility-checks).
+
 ## Stage and workflow presets
 
 Press `a` on the Workflow page to choose a stage. Type to filter the catalog;

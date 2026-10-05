@@ -1,8 +1,9 @@
 use anyhow::{Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use model_router::{
-    adapters, catalog,
+    catalog,
     config::{self, Mode, Role, Settings},
+    doctor,
     engine::{self, Action, Event, Run, Status},
     presets, storage, task_import, tui,
 };
@@ -90,8 +91,15 @@ enum Commands {
     History,
     /// List model/mode selections without sending an inference request.
     Models { harness: String },
-    /// Check executable availability. Authentication is left to each harness.
-    Doctor,
+    /// Check harness executables, versions, and flags without a model request.
+    Doctor {
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+        /// Fail when an installed harness lacks a flag the router passes.
+        #[arg(long)]
+        strict: bool,
+    },
 }
 
 fn main() {
@@ -177,17 +185,18 @@ fn main_result() -> Result<()> {
                 &task
             )?
         ),
-        Some(Commands::Doctor) => {
-            for name in catalog::known_harnesses(&settings) {
-                let program = adapters::program(&name, &settings.adapters);
-                println!(
-                    "{name:12} {}",
-                    adapters::executable(&program)
-                        .map(|p| format!("installed  {}", p.display()))
-                        .unwrap_or_else(|| format!("missing    {program}"))
-                );
+        Some(Commands::Doctor { json, strict }) => {
+            let reports = doctor::inspect_all(&settings, &project);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&reports)?);
+            } else {
+                print!("{}", doctor::table(&reports));
+                println!("\n{}", doctor::AUTH_NOTE);
             }
-            println!("\nAvailability only. Log in and configure providers using each harness.");
+            ensure!(
+                !strict || !reports.iter().any(doctor::Report::missing_flags),
+                "An installed harness lacks a flag the router passes"
+            );
         }
         Some(Commands::Models { harness }) => {
             let catalog = catalog::discover(&harness, &settings, &project)?;

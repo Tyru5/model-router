@@ -1,6 +1,7 @@
 pub mod adapters;
 pub mod catalog;
 pub mod config;
+pub mod doctor;
 pub mod engine;
 pub mod handoff;
 pub mod harness_settings;
