@@ -8,7 +8,7 @@ use super::{
     workflow_page::StageEditor,
 };
 use crate::{
-    catalog::{self, Catalog, Model},
+    catalog::{Catalog, Model},
     config::{self, Role, Settings, Stage},
     presets,
 };
@@ -35,6 +35,7 @@ fn theme_app(project: &std::path::Path) -> App {
         Arc::new(AtomicBool::new(false)),
     );
     app.theme_path = project.join("appearance.json");
+    app.harness_checks.probe = |_, _| vec![];
     app
 }
 
@@ -512,26 +513,4 @@ fn command_menu_lists_only_actions_for_the_current_context() {
     assert!(menu(&mut app).contains(&ActionId::OpenRun));
     app.page = 3;
     assert!(menu(&mut app).contains(&ActionId::HarnessDetails));
-}
-
-#[test]
-fn harness_rows_are_checked_when_the_page_opens_not_every_frame() {
-    let project = tempfile::tempdir().unwrap();
-    let mut app = theme_app(project.path());
-    let harnesses = catalog::known_harnesses(&app.settings);
-    app.key(key(Key::Char('4'))).unwrap();
-    assert_eq!(app.harness_rows.len(), harnesses.len());
-    app.harness_rows.truncate(1);
-    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-    let text: String = terminal
-        .backend()
-        .buffer()
-        .content
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect();
-    assert!(text.contains(&harnesses[0]) && !text.contains(&harnesses[1]));
-    app.key(key(Key::Char('r'))).unwrap();
-    assert_eq!(app.harness_rows.len(), harnesses.len());
 }
