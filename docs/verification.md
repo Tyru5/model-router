@@ -41,6 +41,10 @@ errors, GitHub issues/files/tags, branch names containing slashes, read-only
 GitHub requests, conflicting CLI flags, and source deletion after import.
 Saved run tasks and stage prompts retain the imported contents.
 
+History tests cover summary listing without run records, damaged records,
+filters, reruns from snapshots, attempt comparison, symlink-safe sizes, cleanup
+selection with held locks, the CLI commands, and the Runs page dialogs.
+
 All four workflow presets execute with offline harnesses in their defined order,
 passing the original task, stage instructions, and prior handoffs through each
 enabled stage. Review stages remain skipped by default. Required failed and

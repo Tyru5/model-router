@@ -72,6 +72,16 @@ committed HEAD, remain on disk, and are never merged or committed automatically.
 Store generated artifacts in a self-ignored `.model-router` directory. Retain
 history until the user removes it. Aider's automatic commits are disabled.
 
+Each save also writes a run summary that history lists instead of full records;
+older runs fall back to their record. Listing never writes and reports
+unreadable or invalid records as damaged rather than hiding them. Full records
+load on demand. A rerun creates a new run from a saved run's task, workflow, and
+adapter snapshot and records its source; the source stays unchanged. Attempt
+comparison reads saved attempts and per-attempt handoffs, marking missing ones.
+Cleanup previews selected runs and sizes before removing anything, skips runs
+whose lock is held or that are open, and removes worktrees only when Git can
+without force; branches stay.
+
 ## Adapters and model discovery
 
 Built-in targets: Codex, Claude Code, Pi, Cursor Agent, Gemini CLI, OpenCode,
@@ -108,9 +118,12 @@ API clients, automatic task classification, and embedded IDE control are exclude
   Saves workflow edits and loads the selected project's configuration.
 - Run monitor with stage state, elapsed time, logs, cancellation, handoff view,
   and explicit recovery actions.
-- Run history and harness availability/catalog view.
+- Run history with live text and status filters, damaged-record rows,
+  background-computed sizes, confirmed reruns, attempt comparison, and cleanup
+  previews; harness availability/catalog view.
 - CLI equivalents for initialization, validation, previews, execution, discovery,
-  history, and resume; all share the same execution engine.
+  history (filters, JSON, sizes), rerun, compare, clean, and resume; all share
+  the same execution engine.
 
 ## Acceptance checks
 

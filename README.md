@@ -283,6 +283,10 @@ model-router run --task-file task.md --unattended
 model-router run --task 'Implement the feature' --with-review
 model-router run --task 'Implement the feature' --worktree
 model-router history
+model-router history --status failed,blocked --search parser --limit 10 --sizes
+model-router rerun RUN_ID --unattended
+model-router compare RUN_ID --stage research --attempts 1 2
+model-router clean --older-than 30 --keep 5
 model-router resume RUN_ID
 model-router resume RUN_ID --retry
 model-router resume RUN_ID --model NEW_NATIVE_MODEL_ID
@@ -298,6 +302,21 @@ stop. `Ctrl+]` stops a stuck interactive harness. In the monitor, `h` inspects
 the handoff, `a` advances, `i` reopens interactively, `y` retries, and `m` replaces
 the model before retrying. `e` edits a non-review interactive handoff summary.
 The CLI's `--advance` is the equivalent explicit handoff acceptance.
+
+`history` lists runs newest first from their summaries, including damaged
+records (`DAMAGED RUN_ID  error`). Filter with `--status` (`active`, a status
+name, or `damaged`) and `--search` words matched against ID, workflow, task, and
+status; `--json` prints the list and `--sizes` adds artifact sizes. `rerun`
+starts a new run from a saved run's task, workflow, and adapter snapshot (not
+the current template) and leaves the original unchanged. `compare` shows
+model, mode, status, exit code, duration, router checks, and handoff differences
+between two attempts of a stage, defaulting to the last two of the stage
+retried most recently; `--source` compares a rerun with its source run.
+
+On the Runs page (`3`), `/` filters as you type (`Enter` keeps, `Esc` clears),
+`f` cycles the status filter, `n` reruns after a confirmation, `c` compares
+attempts, and `D` previews removing the selected run. Sizes load in the
+background. `Enter` on a damaged row shows its error and path.
 
 Interactive review and verification stages must write their handoff files;
 terminal echoes are not accepted as verdicts. Other interactive stages without
@@ -442,6 +461,7 @@ does not merge, commit, or delete worktrees automatically.
   workspace.lock                # prevents simultaneous active runs here
   runs/RUN_ID/
     run.json                    # task, workflow snapshot, state, attempts
+    summary.json                # what history lists; rewritten with run.json
     01-research/attempt-001/
       prompt.md
       command.json              # executable and literal argument vector
@@ -454,8 +474,14 @@ does not merge, commit, or delete worktrees automatically.
 
 For worktree runs, run records remain in the original project's history;
 model-writable handoffs are inside the worktree. Writes to run state are atomic,
-and execution uses run/workspace locks. Remove old artifacts manually when you
-no longer need their history. Native harness session storage is independent.
+and execution uses run/workspace locks. Native harness session storage is
+independent.
+
+`model-router clean [--older-than DAYS] [--status S,..] [--keep N] [--worktrees]`
+previews which runs it would remove, with sizes and skipped runs; add `--yes`
+to remove them. It deletes each run directory and its handoffs. With
+`--worktrees` it runs `git worktree remove` only on clean worktrees, never
+forces, and keeps branches. Runs whose `run.lock` is held are skipped.
 
 Read-only stage instructions are intent; effective tool access comes from the
 harness. Credentials stay in native configuration/environment variables. Extra
