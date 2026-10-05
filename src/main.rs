@@ -48,6 +48,15 @@ enum Commands {
     Presets,
     /// Validate the workflow file without starting any harness.
     Validate,
+    /// Summarize a saved run: changes, checks, unresolved items, time, usage.
+    Report {
+        id: String,
+        #[arg(long)]
+        json: bool,
+        /// Print the patch of changes made during the run.
+        #[arg(long, conflicts_with = "json")]
+        diff: bool,
+    },
     /// Show the exact argument structure without launching a model.
     Preview {
         #[arg(short, long)]
@@ -168,6 +177,28 @@ fn main_result() -> Result<()> {
             settings.workflows.len(),
             config_path.display()
         ),
+        Some(Commands::Report { id, json, diff }) => {
+            use model_router::report;
+            let run = engine::load(&project, &id)?;
+            if diff {
+                print!("{}", report::diff(&run)?);
+            } else if json {
+                let mut value = serde_json::to_value(report::build(&run))?;
+                value["changes"] = serde_json::to_value(report::changes(&run))?;
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!(
+                    "Run {} · {}\nArtifacts: {}\n",
+                    run.id,
+                    run.workflow.name,
+                    run.directory.display()
+                );
+                print!(
+                    "{}",
+                    report::render(&report::build(&run), Some(&report::changes(&run)))
+                );
+            }
+        }
         Some(Commands::Preview { workflow, task }) => println!(
             "{}",
             engine::preview(
@@ -285,10 +316,15 @@ fn cli_drive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
         })?;
         match action {
             Action::Complete => {
+                use model_router::report;
                 println!(
                     "\nCompleted {}\nArtifacts: {}",
                     run.id,
                     run.directory.display()
+                );
+                print!(
+                    "\n{}",
+                    report::render(&report::build(run), Some(&report::changes(run)))
                 );
                 return Ok(());
             }
