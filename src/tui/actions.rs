@@ -62,6 +62,11 @@ pub(super) enum ActionId {
     NextRun,
     OpenRun,
     RefreshRuns,
+    FilterRuns,
+    CycleStatus,
+    Rerun,
+    CompareAttempts,
+    CleanUp,
     // Harnesses
     PreviousHarness,
     NextHarness,
@@ -269,8 +274,15 @@ const ACTIONS: &[Entry] = {
         // Runs
         act(PreviousRun, Runs, key(KeyCode::Up), "select", "Select previous run").also(&[ch('k')]).alias("↑↓").footer(),
         act(NextRun, Runs, key(KeyCode::Down), "select", "Select next run").also(&[ch('j')]).alias("↑↓").footer(),
-        act(OpenRun, Runs, key(KeyCode::Enter), "open run", "Open selected run in the monitor").footer(),
-        act(RefreshRuns, Runs, ch('r'), "refresh", "Reload saved runs").footer(),
+        act(OpenRun, Runs, key(KeyCode::Enter), "open", "Open selected run in the monitor (damaged: show its error)").footer(),
+        act(RefreshRuns, Runs, ch('r'), "refresh", "Reload saved runs and sizes"),
+        act(FilterRuns, Runs, ch('/'), "filter", "Filter by ID, workflow, task, or status")
+            .more(&["Type to filter; [Enter] keeps it; [Esc] clears it"])
+            .footer(),
+        act(CycleStatus, Runs, ch('f'), "status", "Cycle status: all, active, complete, failed/blocked, cancelled, damaged").footer(),
+        act(Rerun, Runs, ch('n'), "rerun", "Rerun as a new run from the saved snapshot (confirm first)").footer(),
+        act(CompareAttempts, Runs, ch('c'), "compare", "Compare two attempts of a stage").footer(),
+        act(CleanUp, Runs, ch('D'), "clean", "Preview removing the run and its artifacts ([y] confirms)").footer(),
         // Harnesses
         act(PreviousHarness, Harnesses, key(KeyCode::Up), "select", "Select previous harness").also(&[ch('k')]).alias("↑↓").footer(),
         act(NextHarness, Harnesses, key(KeyCode::Down), "select", "Select next harness").also(&[ch('j')]).alias("↑↓").footer(),
@@ -489,7 +501,7 @@ mod tests {
         );
         assert_eq!(
             shown(Scope::Runs),
-            "↑↓ select, Enter open run, r refresh, Tab switch view, T themes, q quit, : commands"
+            "↑↓ select, Enter open, / filter, f status, n rerun, c compare, D clean, Tab switch view, T themes, q quit, : commands"
         );
         assert_eq!(
             shown(Scope::Harnesses),

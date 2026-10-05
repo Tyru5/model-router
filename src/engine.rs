@@ -88,6 +88,9 @@ pub struct Run {
     pub directory: PathBuf,
     pub worktree: bool,
     pub task: String,
+    /// The saved run this one reran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerun_of: Option<String>,
     pub workflow: Workflow,
     pub adapters: BTreeMap<String, CustomAdapter>,
     pub stages: Vec<StageState>,
@@ -180,6 +183,7 @@ impl Run {
             directory,
             worktree,
             task,
+            rerun_of: None,
             workflow: workflow.clone(),
             adapters: settings.adapters.clone(),
             stages: workflow
@@ -206,10 +210,15 @@ impl Run {
         Ok(run)
     }
 
+    /// Saves run.json, then the summary that history listing reads instead.
     pub fn persist(&mut self) -> Result<()> {
         self.revision += 1;
         self.updated_at = Utc::now();
-        storage::write_json(&self.directory.join("run.json"), self)
+        storage::write_json(&self.directory.join("run.json"), self)?;
+        storage::write_json(
+            &self.directory.join("summary.json"),
+            &crate::history::RunSummary::from(&*self),
+        )
     }
     pub fn current_name(&self) -> &str {
         self.workflow
@@ -438,6 +447,7 @@ pub fn load(project: &Path, id: &str) -> Result<Run> {
     let run: Run = storage::read_json(&storage::run_dir(project, id)?.join("run.json"))?;
     ensure!(
         run.version == 1
+            && run.id == id
             && run.stages.len() == run.workflow.stages.len()
             && run.cursor <= run.stages.len(),
         "Invalid or unsupported run record"
@@ -445,22 +455,13 @@ pub fn load(project: &Path, id: &str) -> Result<Run> {
     Ok(run)
 }
 
+/// Every readable run, newest first. Listing should use `history::list`,
+/// which reads summaries and reports damaged records.
 pub fn history(project: &Path) -> Result<Vec<Run>> {
-    let directory = project.join(".model-router/runs");
-    if !directory.exists() {
-        return Ok(vec![]);
-    }
-    let mut runs = Vec::new();
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            if let Ok(run) = storage::read_json::<Run>(&entry.path().join("run.json")) {
-                runs.push(run);
-            }
-        }
-    }
-    runs.sort_by_key(|run| std::cmp::Reverse(run.created_at));
-    Ok(runs)
+    Ok(crate::history::list(project)?
+        .iter()
+        .filter_map(|entry| load(project, entry.id()).ok())
+        .collect())
 }
 
 pub fn prompt(run: &Run, handoff_path: &Path) -> String {
