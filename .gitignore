@@ -41,6 +41,9 @@ venv/
 *.log
 *.tmp
 
+# Amp's generated local portal metadata.
+/.amp/portals/
+
 # Editor state; allow shared VS Code project configuration.
 .idea/
 .vscode/*

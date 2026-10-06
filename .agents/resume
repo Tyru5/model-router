@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Tools and build caches survive pause/resume. No services or auth are required.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+for tool in cargo rustup uv python3 just ruff; do
+    command -v "$tool" >/dev/null
+done
+echo "Orb tools ready; model harnesses use their own credentials when needed."

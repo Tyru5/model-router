@@ -663,5 +663,20 @@ versions, native permissions, and account access can affect compatibility.
 Linux is tested locally and in CI. On macOS, CI runs the Rust test suite; the
 terminal smoke tests and live harness runs are Linux-only so far.
 
+### Amp orbs
+
+`.agents/setup` prepares fresh orbs with stable Rust (rustfmt and clippy),
+Rust 1.85 for the MSRV check, Python 3.12, `uv`, `just`, and Ruff. It caches
+the Python smoke-test dependencies (`pyte` and Pillow), fetches `Cargo.lock`
+dependencies, and warms debug/test and MSRV build caches. Repeated setup runs
+reuse installed tools and Cargo's incremental build state. Python 3.12 is
+selected for `uv` commands in this checkout's non-interactive login shells.
+
+Amp snapshots the prepared environment for later orbs. `.agents/resume`
+only checks that tools are available; it installs nothing and starts no
+services. Neither script authenticates harnesses or sends model requests.
+The offline checks above need no API keys; live workflows still require
+each harness's own credentials.
+
 See [design decisions](docs/design-interview.md), [build specification](docs/spec.md),
 and [adapter references](docs/adapters.md).

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Prepare tools and caches for Amp's reusable orb snapshot; no model requests.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+SECONDS=0
+echo "==> System prerequisites (${SECONDS}s)"
+missing=()
+for package in build-essential pkg-config ca-certificates curl git python3 fonts-dejavu-core; do
+    if [[ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != "install ok installed" ]]; then
+        missing+=("$package")
+    fi
+done
+if ((${#missing[@]})); then
+    sudo apt-get update
+    sudo apt-get install -y "${missing[@]}"
+fi
+
+echo "==> Rust toolchains (${SECONDS}s)"
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+if ! command -v rustup >/dev/null; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+        sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+fi
+for toolchain in stable 1.85; do
+    if ! rustup toolchain list | grep -q "^${toolchain}-"; then
+        rustup toolchain install "$toolchain" --profile minimal --no-self-update
+    fi
+done
+rustup default stable
+rustup component add --toolchain stable rustfmt clippy
+if ! command -v just >/dev/null; then
+    cargo +stable install just --locked
+fi
+
+echo "==> Python tools and smoke-test environments (${SECONDS}s)"
+if ! command -v uv >/dev/null; then
+    curl --proto '=https' --tlsv1.2 -LsSf https://astral.sh/uv/install.sh |
+        env UV_NO_MODIFY_PATH=1 sh
+fi
+uv python install 3.12
+export UV_PYTHON=3.12
+uv tool install ruff --python 3.12
+uv run --with pyte python -c 'import pyte'
+uv run --with pyte --with pillow python -c 'import pyte; from PIL import Image'
+# Cache the invocation used by `just fmt` as well as the installed ruff command.
+uvx ruff --version
+
+echo "==> Persist tools for non-interactive login shells (${SECONDS}s)"
+marker='# model-router orb tools'
+if ! grep -Fqx "$marker" "$HOME/.bash_profile" 2>/dev/null; then
+    cat >> "$HOME/.bash_profile" <<EOF
+
+$marker
+export PATH="\$HOME/.cargo/bin:\$HOME/.local/bin:\$PATH"
+if [[ "\$PWD" == "$PWD" || "\$PWD" == "$PWD/"* ]]; then
+    export UV_PYTHON=3.12
+fi
+EOF
+fi
+
+echo "==> Locked Cargo dependencies and debug/test build (${SECONDS}s)"
+cargo +stable fetch --locked
+cargo +stable build --all-targets --locked
+echo "==> MSRV build cache (${SECONDS}s)"
+cargo +1.85 check --all-targets --locked
+echo "==> Orb setup ready (${SECONDS}s)"
