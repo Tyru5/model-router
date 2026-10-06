@@ -237,3 +237,67 @@ pub fn check_project(project: &Path) -> Result<std::path::PathBuf> {
     ensure!(path.is_dir(), "Project must be a directory");
     Ok(path)
 }
+
+/// Where `-C` was omitted: the project the current directory belongs to.
+///
+/// Walks from `start` upward and returns the nearest ancestor that holds a
+/// `.model-router.toml`, or failing that the nearest Git root (`.git`
+/// directory, or `.git` file for linked worktrees and submodules). The walk
+/// never crosses a Git root, so a configuration outside the repository is not
+/// picked up. Outside any repository and configuration, `start` itself is the
+/// project.
+pub fn detect_project(start: &Path) -> Result<std::path::PathBuf> {
+    let start = check_project(start)?;
+    for dir in start.ancestors() {
+        if dir.join(".model-router.toml").is_file() {
+            return Ok(dir.to_path_buf());
+        }
+        let git = dir.join(".git");
+        if git.is_dir() || git.is_file() {
+            return Ok(dir.to_path_buf());
+        }
+    }
+    Ok(start)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detect_project;
+    use std::fs;
+
+    #[test]
+    fn detect_project_prefers_nearest_config_then_git_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let repo = root.join("repo");
+        let deep = repo.join("src").join("nested");
+        fs::create_dir_all(&deep).unwrap();
+
+        // Plain directories: the start itself.
+        assert_eq!(detect_project(&deep).unwrap(), deep);
+
+        // Git root without configuration.
+        fs::create_dir(repo.join(".git")).unwrap();
+        assert_eq!(detect_project(&deep).unwrap(), repo);
+        assert_eq!(detect_project(&repo).unwrap(), repo);
+
+        // Configuration at the Git root.
+        fs::write(repo.join(".model-router.toml"), "version = 1\n").unwrap();
+        assert_eq!(detect_project(&deep).unwrap(), repo);
+
+        // A nearer configuration wins (monorepo sub-project).
+        fs::write(repo.join("src/.model-router.toml"), "version = 1\n").unwrap();
+        assert_eq!(detect_project(&deep).unwrap(), repo.join("src"));
+
+        // A configuration outside the repository is never used.
+        fs::write(root.join(".model-router.toml"), "version = 1\n").unwrap();
+        let other = root.join("other");
+        fs::create_dir_all(other.join("a")).unwrap();
+        fs::write(other.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        assert_eq!(detect_project(&other.join("a")).unwrap(), other);
+        // Outside any repository the nearest configuration still applies.
+        let bare = root.join("bare");
+        fs::create_dir(&bare).unwrap();
+        assert_eq!(detect_project(&bare).unwrap(), root);
+    }
+}

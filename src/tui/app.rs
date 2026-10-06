@@ -8,7 +8,7 @@ use super::{
     monitor::draw_run,
     theme::{self, Palette, Theme},
     widgets::{dim, rows_for, short_path, textarea},
-    workflow_page::draw_workflow,
+    workflow_page::{StageEditor, draw_workflow},
 };
 use crate::{
     catalog::{self, Catalog},
@@ -92,6 +92,12 @@ pub(super) struct App {
     pub(super) harness_checks: HarnessChecks,
     pub(super) catalog: Option<Receiver<std::result::Result<Catalog, String>>>,
     pub(super) model_editor: Option<Box<HarnessEditor>>,
+    /// Stage editor parked while its model picker is open.
+    pub(super) stage_editor: Option<(Box<StageEditor>, Option<usize>)>,
+    /// Harness whose catalog is being read.
+    pub(super) catalog_harness: String,
+    /// Git facts for the project, refreshed on start and project switch.
+    pub(super) repo: Option<storage::RepoInfo>,
     pub(super) quit_after_stop: bool,
 }
 impl App {
@@ -101,6 +107,7 @@ impl App {
         config_path: PathBuf,
         cancel: Arc<AtomicBool>,
     ) -> Self {
+        let repo = storage::repo_info(&project);
         Self {
             project,
             settings,
@@ -135,6 +142,9 @@ impl App {
             harness_checks: HarnessChecks::new(),
             catalog: None,
             model_editor: None,
+            stage_editor: None,
+            catalog_harness: String::new(),
+            repo,
             quit_after_stop: false,
         }
     }
@@ -317,7 +327,7 @@ impl App {
                             })
                             .collect();
                         self.modal = Some(Modal::Picker {
-                            title: format!("{} selections · type to filter", self.stage().harness),
+                            title: format!("{} selections · type to filter", self.catalog_harness),
                             items,
                             selected: 0,
                             filter: textarea(""),
@@ -332,6 +342,11 @@ impl App {
                             editor.error = self.message.clone();
                             Modal::Harness(editor)
                         });
+                        if let Some((editor, insert_at)) = self.stage_editor.take() {
+                            self.message = format!("{error}. Type a model ID with [i] instead.");
+                            self.alert = self.message.clone();
+                            self.modal = Some(Modal::Stage { editor, insert_at });
+                        }
                     }
                 }
             }
@@ -352,7 +367,10 @@ impl App {
         Ok(self.quit_after_stop && self.worker.is_none())
     }
     pub(super) fn model_picker(&mut self) {
-        let harness = self.stage().harness.clone();
+        self.model_picker_for(self.stage().harness.clone());
+    }
+    pub(super) fn model_picker_for(&mut self, harness: String) {
+        self.catalog_harness = harness.clone();
         let settings = self.settings.clone();
         let project = self.project.clone();
         let (sender, receiver) = mpsc::channel();
@@ -376,6 +394,7 @@ impl App {
             self.save(false)?;
         }
         let (settings, config_path) = config::load(&project, None)?;
+        self.repo = storage::repo_info(&project);
         self.project = project;
         self.settings = settings;
         self.config_path = config_path;
@@ -592,6 +611,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     ])
     .split(area);
     draw_header(frame, app, chunks[0], palette);
+    draw_repository(frame, app, chunks[1], palette);
     let body = chunks[2].inner(Margin::new(1, 0));
     match app.page {
         0 => draw_workflow(frame, app, body, palette),
@@ -647,18 +667,62 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
             },
         ));
     }
-    let left = Line::from(spans);
-    let room = (area.width as usize).saturating_sub(left.width() + 4);
     frame.render_widget(
-        Paragraph::new(left).style(Style::default().bg(palette.bg)),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(palette.bg)),
         area,
     );
+}
+
+/// The project line: repository name and branch first, then the path.
+fn draw_repository(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
+    let mut spans = match &app.repo {
+        Some(repo) => {
+            let mut spans = vec![
+                Span::styled(" ⎇ ", Style::default().fg(palette.accent)),
+                Span::styled(
+                    repo.name.clone(),
+                    Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    if repo.detached {
+                        format!("@ {}", repo.head)
+                    } else {
+                        repo.head.clone()
+                    },
+                    Style::default().fg(palette.accent),
+                ),
+            ];
+            if repo.changes > 0 {
+                spans.push(Span::styled(
+                    format!("  ● {} changed", repo.changes),
+                    Style::default().fg(palette.warn),
+                ));
+            }
+            spans
+        }
+        None => vec![
+            Span::styled(" ▫ ", Style::default().fg(palette.muted)),
+            Span::styled(
+                app.project
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| app.project.display().to_string()),
+                Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  not a Git repository", Style::default().fg(palette.muted)),
+        ],
+    };
+    let used = Line::from(spans.clone()).width();
+    let room = (area.width as usize).saturating_sub(used + 4);
     if room >= 12 {
-        frame.render_widget(
-            Paragraph::new(format!("{} ", short_path(&app.project, room)))
-                .right_aligned()
-                .style(Style::default().fg(palette.muted)),
-            area,
-        );
+        spans.push(Span::styled(
+            format!("  {}", short_path(&app.project, room)),
+            Style::default().fg(palette.muted),
+        ));
     }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(palette.bg)),
+        area,
+    );
 }

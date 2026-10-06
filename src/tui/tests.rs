@@ -344,6 +344,121 @@ fn harness_editor_applies_only_to_selected_stage_and_supports_cancel() {
 }
 
 #[test]
+fn stage_editor_model_field_picks_from_catalog_and_keeps_draft() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    let original = serde_json::to_value(&app.settings).unwrap();
+    app.key(key(Key::Char('e'))).unwrap();
+    // Name, then a typed edit survives the round trip through the picker.
+    for c in " draft".chars() {
+        app.key(key(Key::Char(c))).unwrap();
+    }
+    for _ in 0..3 {
+        app.key(key(Key::Tab)).unwrap();
+    }
+    // The model field does not take typing; Enter opens the catalog.
+    app.key(key(Key::Char('x'))).unwrap();
+    assert!(
+        matches!(&app.modal, Some(Modal::Stage { editor, .. }) if !editor.finish().unwrap().model.contains('x'))
+    );
+    app.key(key(Key::Enter)).unwrap();
+    assert!(app.stage_editor.is_some());
+    assert!(matches!(app.modal, Some(Modal::Loading(_))));
+    app.key(key(Key::Esc)).unwrap();
+    assert!(app.stage_editor.is_none());
+    assert!(
+        matches!(&app.modal, Some(Modal::Stage { editor, .. }) if editor.finish().unwrap().name.contains("draft"))
+    );
+
+    // A failed catalog returns to the editor with the error shown.
+    app.key(key(Key::Enter)).unwrap();
+    let (sender, receiver) = mpsc::channel();
+    sender.send(Err("Offline catalog".into())).unwrap();
+    app.catalog = Some(receiver);
+    app.poll().unwrap();
+    assert!(matches!(&app.modal, Some(Modal::Stage { .. })));
+    assert!(app.alert.contains("Offline catalog"));
+
+    // A pick fills model and provider in the draft, not the saved stage.
+    app.key(key(Key::Enter)).unwrap();
+    let (sender, receiver) = mpsc::channel();
+    sender
+        .send(Ok(Catalog {
+            note: "Offline fixture".into(),
+            models: vec![Model {
+                id: "picked-model".into(),
+                provider: "prov".into(),
+                label: "Model".into(),
+                source: "test".into(),
+                availability: "local".into(),
+            }],
+        }))
+        .unwrap();
+    app.catalog = Some(receiver);
+    app.poll().unwrap();
+    assert!(matches!(&app.modal, Some(Modal::Picker { title, .. }) if title.starts_with("codex ")));
+    app.key(key(Key::Enter)).unwrap();
+    let draft = match &app.modal {
+        Some(Modal::Stage { editor, .. }) => editor.finish().unwrap(),
+        other => panic!("expected stage editor, got {}", other.is_some()),
+    };
+    assert_eq!(draft.model, "picked-model");
+    assert_eq!(draft.provider, "prov");
+    assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+
+    // Backspace returns to the harness default; i allows a custom ID.
+    app.key(key(Key::Backspace)).unwrap();
+    app.key(key(Key::Char('i'))).unwrap();
+    for c in "custom-id".chars() {
+        app.key(key(Key::Char(c))).unwrap();
+    }
+    app.key(KeyEvent::new(Key::Char('s'), Mods::CONTROL))
+        .unwrap();
+    assert!(app.modal.is_none());
+    assert_eq!(app.stage().model, "custom-id");
+    assert_eq!(app.stage().provider, "prov");
+}
+
+#[test]
+fn repository_line_follows_the_project() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    assert!(app.repo.is_none());
+    let repo = project.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "trunk"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    ] {
+        crate::storage::git(&repo, &args).unwrap();
+    }
+    std::fs::write(repo.join("new.txt"), "x").unwrap();
+    app.switch_project(repo.clone()).unwrap();
+    let info = app.repo.clone().unwrap();
+    assert_eq!(info.name, "repo");
+    assert_eq!(info.head, "trunk");
+    assert!(!info.detached);
+    assert_eq!(info.changes, 1);
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let line: String = terminal.backend().buffer().content()[120..240]
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(line.contains("⎇ repo  trunk  ● 1 changed"), "{line}");
+}
+
+#[test]
 fn harness_model_catalog_restores_draft_on_cancel_error_and_selection() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());

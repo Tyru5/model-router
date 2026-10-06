@@ -7,7 +7,7 @@ use super::{
     task_importer::{ImportAction, TaskImporter},
     theme::{self, Palette, Theme},
     widgets::{content, menu_key, popup},
-    workflow_page::StageEditor,
+    workflow_page::{StageEditor, StageRequest},
 };
 use crate::{
     catalog::{self, Model},
@@ -188,6 +188,9 @@ impl App {
                 if let Some(mut editor) = self.model_editor.take() {
                     editor.set_model(model);
                     self.modal = Some(Modal::Harness(editor));
+                } else if let Some((mut editor, insert_at)) = self.stage_editor.take() {
+                    editor.set_model(model);
+                    self.modal = Some(Modal::Stage { editor, insert_at });
                 } else {
                     let stage = self.stage_mut();
                     stage.model = model.id;
@@ -256,6 +259,9 @@ impl App {
         if key.code == Key::Esc && !matches!(modal, Modal::Repositories(_) | Modal::Import(_)) {
             self.catalog = None;
             self.modal = self.model_editor.take().map(Modal::Harness);
+            if let Some((editor, insert_at)) = self.stage_editor.take() {
+                self.modal = Some(Modal::Stage { editor, insert_at });
+            }
             return Ok(false);
         }
         if key.code == Key::F(7) && matches!(modal, Modal::Harness(_)) {
@@ -267,6 +273,7 @@ impl App {
         }
         let mut keep = true;
         let mut exit = false;
+        let mut pick_model = false;
         let result: Result<()> = (|| {
             match &mut modal {
                 Modal::Input { target, text, .. } => {
@@ -298,8 +305,8 @@ impl App {
                         }
                         self.dirty = true;
                         keep = false;
-                    } else {
-                        editor.key(key);
+                    } else if editor.key(key) == StageRequest::PickModel {
+                        pick_model = true;
                     }
                 }
                 Modal::Harness(editor) => {
@@ -389,6 +396,14 @@ impl App {
                 *note = storage::clean_terminal(&format!(
                     "Could not apply selection: {error:#}\nEsc cancels."
                 ));
+            }
+        }
+        if pick_model {
+            if let Modal::Stage { editor, insert_at } = modal {
+                let harness = editor.harness();
+                self.stage_editor = Some((editor, insert_at));
+                self.model_picker_for(harness);
+                return Ok(false);
             }
         }
         if keep {

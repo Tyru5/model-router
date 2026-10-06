@@ -10,7 +10,7 @@ use model_router::{
 };
 use std::{
     io::{self, IsTerminal, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -24,8 +24,10 @@ use std::{
     long_about = "A native TUI and CLI for cross-harness workflows. Running without a subcommand opens the TUI. No models are launched until you start a run."
 )]
 struct Cli {
-    #[arg(short = 'C', long, global = true, default_value = ".")]
-    project: PathBuf,
+    /// Project directory. Default: the nearest directory above the current
+    /// one with a .model-router.toml, else the Git root, else the current one.
+    #[arg(short = 'C', long, global = true, value_name = "DIR")]
+    project: Option<PathBuf>,
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     /// Open the TUI immediately, without its startup animation.
@@ -183,7 +185,13 @@ fn main() {
 
 fn main_result() -> Result<()> {
     let cli = Cli::parse();
-    let project = catalog::check_project(&cli.project)?;
+    let cwd = catalog::check_project(Path::new("."))?;
+    let project = match &cli.project {
+        Some(path) => catalog::check_project(path)?,
+        None => catalog::detect_project(&cwd)?,
+    };
+    // Tell the TUI when the project was found above the current directory.
+    let detected_from = (cli.project.is_none() && project != cwd).then_some(cwd);
     let cancel = Arc::new(AtomicBool::new(false));
     let signal = cancel.clone();
     ctrlc::set_handler(move || {
@@ -239,7 +247,14 @@ fn main_result() -> Result<()> {
             let animate = !cli.no_animation
                 && std::env::var_os("MODEL_ROUTER_NO_ANIMATION").is_none_or(|v| v != "1")
                 && std::env::var_os("TERM").is_none_or(|v| v != "dumb");
-            tui::run(project, settings, config_path, cancel, animate)?;
+            tui::run(
+                project,
+                settings,
+                config_path,
+                cancel,
+                animate,
+                detected_from,
+            )?;
         }
         Some(Commands::Init { .. } | Commands::Presets) => unreachable!(),
         Some(Commands::Validate) => println!(

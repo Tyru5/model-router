@@ -112,6 +112,15 @@ API clients, automatic task classification, and embedded IDE control are exclude
   task to 32 KiB, normalize BOM/line endings, and snapshot its contents into each
   run. Leave source files and issues unchanged. CLI `--task-file`/`--task-url`
   use the same importer before starting execution.
+- Repository line under the header: name, branch or detached commit, changed
+  file count, path; non-Git folders say so. Refreshed on project switch.
+- Stage editor model field is a catalog selection (Enter), with Backspace for
+  the harness default and `i` for an unlisted ID; a picked provider fills the
+  Provider field. The draft survives cancel and catalog errors.
+- Project detection when `-C` is omitted: the nearest ancestor of the current
+  directory with `.model-router.toml`, else the Git root, else the current
+  directory; never above a Git root. `-C` is literal. The TUI says so when the
+  project differs from the current directory.
 - Repository browser with type-to-filter, folder navigation, direct path entry,
   and persistent recent projects. Recognizes Git directories and `.git` files
   for linked worktrees/submodules; non-Git folders can also be selected.

@@ -119,6 +119,7 @@ pub fn run(
     config_path: PathBuf,
     cancel: Arc<AtomicBool>,
     animate: bool,
+    detected_from: Option<PathBuf>,
 ) -> Result<()> {
     let old_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -127,6 +128,13 @@ pub fn run(
         old_hook(info);
     }));
     let mut app = App::new(project, settings, config_path, cancel);
+    if let Some(cwd) = detected_from {
+        app.message = format!(
+            "Project: {} (detected above {}). p changes it.",
+            app.project.display(),
+            cwd.display()
+        );
+    }
     match theme::load(&app.theme_path) {
         Ok(theme) => app.theme = theme,
         Err(error) => {

@@ -42,6 +42,18 @@ scripts/build.sh
 mr -C /path/to/project
 ```
 
+The line under the title shows where `mr` is working: the repository name,
+branch (or detached commit), and the count of changed files, followed by the
+path; non-Git folders are labelled as such. It refreshes when you switch
+projects with `p`.
+
+Without `-C`, the router detects the project from the current directory: the
+nearest parent with a `.model-router.toml`, otherwise the Git root (including
+linked worktrees and submodules), otherwise the current directory itself. So
+`mr` from any subdirectory of a configured repository loads that repository's
+workflow, runs, and metadata. The walk stops at the Git root. CLI subcommands
+use the same detection; `-C` always takes the given directory literally.
+
 The TUI opens with a 1.7-second animation: a signal branches through model nodes
 and converges into a route. Press any key to skip, or `Ctrl+C` to exit. The skip
 key is consumed so it cannot trigger an action in the editor. The animation
@@ -249,7 +261,11 @@ Model discovery is deliberately labeled:
 - **Claude/Amp:** documented aliases/modes plus your saved selections.
 - **Other adapters:** native default, saved selections, and manual entry.
 
-Custom IDs always remain editable. Built-in discovery does not send inference requests.
+In the stage editor (`e`), the **Model** field is a selection, not a text box:
+`Enter` lists the stage's harness catalog, `Backspace` returns to the harness
+default, and `i` types an ID the catalog does not list. Picking a catalog entry
+with a provider fills the Provider field too. Built-in discovery does not send
+inference requests.
 The router does not silently replace a model that fails or is unavailable.
 
 `model-router doctor` checks each harness's executable, version, and the flags

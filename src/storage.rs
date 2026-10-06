@@ -95,6 +95,42 @@ pub fn remember_project(project: &Path) -> Result<()> {
     )
 }
 
+/// What the UI shows about the project's repository, if it is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoInfo {
+    /// Top-level directory name.
+    pub name: String,
+    /// Branch, or a short commit hash when HEAD is detached.
+    pub head: String,
+    pub detached: bool,
+    /// Modified, staged, or untracked entries in `git status`.
+    pub changes: usize,
+}
+
+pub fn repo_info(project: &Path) -> Option<RepoInfo> {
+    let top = git(project, &["rev-parse", "--show-toplevel"]).ok()?;
+    let name = Path::new(&top)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| top.clone());
+    let (head, detached) = match git(project, &["symbolic-ref", "--short", "-q", "HEAD"]) {
+        Ok(branch) if !branch.is_empty() => (branch, false),
+        _ => (
+            git(project, &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|_| "no commits".into()),
+            true,
+        ),
+    };
+    let changes = git(project, &["status", "--porcelain"])
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    Some(RepoInfo {
+        name,
+        head,
+        detached,
+        changes,
+    })
+}
+
 pub fn git(project: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(args)

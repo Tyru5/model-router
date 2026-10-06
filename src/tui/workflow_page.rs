@@ -46,11 +46,22 @@ const FIELDS: &[&str] = &[
 const CHECKS: usize = 10;
 const INSTRUCTIONS: usize = 11;
 const CHOICES: [usize; 3] = [1, 2, 6];
+/// The model field: chosen from the harness catalog, typed only on request.
+pub(super) const MODEL: usize = 3;
+/// What the stage editor asks the app to do after a key.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum StageRequest {
+    None,
+    /// Open the model catalog for the editor's current harness.
+    PickModel,
+}
 pub(super) struct StageEditor {
     stage: Stage,
     pub(super) fields: Vec<TextArea<'static>>,
     selected: usize,
     harnesses: Vec<String>,
+    /// The model field accepts typing until the next catalog pick.
+    typing_model: bool,
 }
 impl StageEditor {
     pub(super) fn new(stage: Stage, harnesses: Vec<String>) -> Self {
@@ -95,7 +106,16 @@ impl StageEditor {
             fields,
             selected: 0,
             harnesses,
+            typing_model: false,
         }
+    }
+    pub(super) fn harness(&self) -> String {
+        content(&self.fields[2])
+    }
+    pub(super) fn set_model(&mut self, model: catalog::Model) {
+        self.fields[MODEL] = textarea(&model.id);
+        self.fields[4] = textarea(&model.provider);
+        self.typing_model = false;
     }
     pub(super) fn finish(&self) -> Result<Stage> {
         let mut stage = self.stage.clone();
@@ -127,15 +147,29 @@ impl StageEditor {
         stage.instructions = content(&self.fields[INSTRUCTIONS]);
         Ok(stage)
     }
-    pub(super) fn key(&mut self, key: KeyEvent) {
+    pub(super) fn key(&mut self, key: KeyEvent) -> StageRequest {
         if key.code == Key::Tab
             || (key.code == Key::Char('n') && key.modifiers.contains(Mods::CONTROL))
         {
             self.selected = (self.selected + 1) % self.fields.len();
+            self.typing_model = false;
         } else if key.code == Key::BackTab
             || (key.code == Key::Char('p') && key.modifiers.contains(Mods::CONTROL))
         {
             self.selected = (self.selected + self.fields.len() - 1) % self.fields.len();
+            self.typing_model = false;
+        } else if self.selected == MODEL && !self.typing_model {
+            match key.code {
+                Key::Enter | Key::Char(' ') | Key::Left | Key::Right | Key::Down | Key::Up => {
+                    return StageRequest::PickModel;
+                }
+                Key::Backspace | Key::Delete => self.fields[MODEL] = textarea(""),
+                Key::Char('i') => self.typing_model = true,
+                _ => {}
+            }
+        } else if self.selected == MODEL && key.code == Key::Enter {
+            self.typing_model = false;
+            self.selected += 1;
         } else if CHOICES.contains(&self.selected) {
             if matches!(
                 key.code,
@@ -167,9 +201,10 @@ impl StageEditor {
         } else {
             self.fields[self.selected].input(key);
         }
+        StageRequest::None
     }
     pub(super) fn paste(&mut self, text: &str) {
-        if !CHOICES.contains(&self.selected) {
+        if !CHOICES.contains(&self.selected) && (self.selected != MODEL || self.typing_model) {
             self.fields[self.selected].insert_str(text);
         }
     }
@@ -186,7 +221,7 @@ impl StageEditor {
         let value_width = halves[0].width.saturating_sub(4) as usize;
         let rows = FIELDS.iter().enumerate().map(|(i, label)| {
             let value = content(&self.fields[i]).replace('\n', " ");
-            let choice = CHOICES.contains(&i);
+            let choice = CHOICES.contains(&i) || (i == MODEL && !self.typing_model);
             ListItem::new(vec![
                 Line::styled(*label, Style::default().fg(palette.muted)),
                 if value.is_empty() {
@@ -216,20 +251,57 @@ impl StageEditor {
             halves[0],
             &mut ListState::default().with_selected(Some(self.selected)),
         );
-        let field = &mut self.fields[self.selected];
-        palette.style_textarea(field);
-        field.set_block(
-            palette
-                .panel(format!(" {} ", FIELDS[self.selected]))
-                .border_style(Style::default().fg(palette.accent)),
-        );
-        frame.render_widget(&*field, halves[1]);
+        if self.selected == MODEL && !self.typing_model {
+            let harness = self.harness();
+            let current = content(&self.fields[MODEL]);
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled("Current  ", Style::default().fg(palette.muted)),
+                    Span::styled(
+                        if current.is_empty() {
+                            format!("{harness} default")
+                        } else {
+                            current
+                        },
+                        Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::raw(""),
+                palette.hints(&[("Enter", &format!("choose from the {harness} catalog"))]),
+                palette.hints(&[("Backspace", "use the harness default")]),
+                palette.hints(&[("i", "type a model ID the catalog does not list")]),
+                Line::raw(""),
+                Line::styled(
+                    "The catalog is read from the harness without starting a model; a provider from the catalog fills the Provider field.",
+                    Style::default().fg(palette.muted),
+                ),
+            ];
+            frame.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+                    palette
+                        .panel(format!(" {} ", FIELDS[MODEL]))
+                        .border_style(Style::default().fg(palette.accent)),
+                ),
+                halves[1],
+            );
+        } else {
+            let field = &mut self.fields[self.selected];
+            palette.style_textarea(field);
+            field.set_block(
+                palette
+                    .panel(format!(" {} ", FIELDS[self.selected]))
+                    .border_style(Style::default().fg(palette.accent)),
+            );
+            frame.render_widget(&*field, halves[1]);
+        }
         let mut keys = palette.hints(&[("Ctrl+S", "apply stage"), ("Esc", "cancel")]);
         keys.spans.push(Span::styled(
             if self.selected == CHECKS {
                 "   ·  argv per line, no shell; edit timeout_seconds in TOML"
+            } else if self.selected == MODEL {
+                "   ·  Enter lists the harness's models; blank inherits its default"
             } else {
-                "   ·  model IDs are open-ended; blank inherits the default"
+                "   ·  blank model inherits the harness default"
             },
             Style::default().fg(palette.muted),
         ));
