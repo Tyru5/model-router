@@ -44,6 +44,13 @@ def escape(terminal, count):
         terminal.send(b"\x1b")
 
 
+def verify_task(terminal, text):
+    # The Workflow summary shows only three lines; inspect the full task editor.
+    terminal.send("t")
+    terminal.wait(lambda: text in terminal.text(), "Task editor lost imported edits")
+    escape(terminal, 1)
+
+
 def url_import(terminal, url):
     terminal.send("f")
     terminal.send(b"\x15")  # Ctrl+U
@@ -177,9 +184,13 @@ def main():
                 paste(terminal, "Edited draft\n\n")
                 terminal.send(b"\x13")
                 terminal.wait(
-                    lambda: "Edited draft" in terminal.text(),
+                    lambda: (
+                        "Preview task/spec" not in terminal.text()
+                        and "Task imported" in terminal.text()
+                    ),
                     "Editable URL draft did not apply",
                 )
+                verify_task(terminal, "Edited draft")
 
                 url_import(terminal, base + "/slow.md")
                 terminal.wait(
@@ -188,17 +199,17 @@ def main():
                 )
                 escape(terminal, 3)
                 terminal.pump(1.1)
-                assert (
-                    "Edited draft" in terminal.text()
-                    and "Preview task/spec" not in terminal.text()
-                ), "Cancelled result overwrote the task"
+                assert "Preview task/spec" not in terminal.text(), (
+                    "Cancelled result reopened the preview"
+                )
+                verify_task(terminal, "Edited draft")
                 url_import(terminal, base + "/denied.md")
                 terminal.wait(
                     lambda: "returned an error" in terminal.text(),
                     "HTTP failure did not report an error",
                 )
                 escape(terminal, 2)
-                assert "Edited draft" in terminal.text()
+                verify_task(terminal, "Edited draft")
 
                 terminal.resize(120, 36)
                 url_import(terminal, "https://github.com/acme/project/issues/7")

@@ -53,7 +53,15 @@ mode = "interactive"
             json.dumps(
                 {
                     "models": [
-                        {"slug": "fixture-model", "display_name": "Fixture model"},
+                        {
+                            "slug": "fixture-model",
+                            "display_name": "Fixture model",
+                            "supported_reasoning_levels": [
+                                {"effort": "low"},
+                                {"effort": "high"},
+                            ],
+                            "default_reasoning_level": "low",
+                        },
                     ]
                 }
             )
@@ -97,7 +105,11 @@ mode = "interactive"
             )
             assert "fixture-model" in terminal.text()
             terminal.send(NEXT * 2)  # effort
-            replace(terminal, "high")
+            terminal.wait(
+                lambda: "Levels from Codex local cache" in terminal.text(),
+                "Catalog effort choices did not load",
+            )
+            terminal.send(RIGHT * 2)  # default -> low -> high
             terminal.send(NEXT * 2)  # timeout
             replace(terminal, "0")
             terminal.send(APPLY)
