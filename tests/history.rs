@@ -352,7 +352,12 @@ fn cleanup_selects_and_removes_only_the_plan() {
     };
     let plan = history::cleanup_plan(dir.path(), &only_failed).unwrap();
     assert_eq!(plan.items.len(), 1);
-    assert_eq!(plan.items[0].paths[0].0, failed.directory);
+    // Run creation canonicalizes the project; cleanup preserves its supplied path.
+    // On macOS, the temporary directory can be under the /var -> /private/var symlink.
+    assert_eq!(
+        fs::canonicalize(&plan.items[0].paths[0].0).unwrap(),
+        failed.directory
+    );
     assert_eq!(plan.items[0].paths[1].0, handoffs);
     assert!(plan.bytes() > 0);
     let recent = Criteria {
