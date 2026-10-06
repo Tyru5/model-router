@@ -18,7 +18,7 @@ use crate::{
     storage,
 };
 use anyhow::{Context, Result, bail, ensure};
-use crossterm::event::{KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Margin, Rect},
@@ -60,6 +60,7 @@ pub(super) struct App {
     pub(super) config_path: PathBuf,
     pub(super) theme: Theme,
     pub(super) theme_path: PathBuf,
+    pub(super) vim_motions: bool,
     pub(super) settings: Settings,
     pub(super) workflow: usize,
     pub(super) selected: usize,
@@ -119,6 +120,7 @@ impl App {
             config_path,
             theme: Theme::default(),
             theme_path: config::config_dir().join("appearance.json"),
+            vim_motions: false,
             workflow: 0,
             selected: 0,
             task: String::new(),
@@ -507,6 +509,9 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Ok(false);
         }
+        if key.code == KeyCode::F(8) && key.modifiers.is_empty() {
+            return self.perform_global(ActionId::ToggleVim);
+        }
         if self.modal.is_some() {
             return self.modal_key(key);
         }
@@ -561,6 +566,20 @@ impl App {
                 self.message = "Stopping and saving before exit…".into();
             }
             ActionId::Themes => self.choose_theme(),
+            ActionId::ToggleVim => {
+                let enabled = !self.vim_motions;
+                theme::save(&self.theme_path, self.theme, enabled)?;
+                self.vim_motions = enabled;
+                self.runs.set_vim(enabled);
+                if let Some(field) = self.modal.as_mut().and_then(Modal::active_input) {
+                    field.set_vim(enabled);
+                }
+                self.message = if enabled {
+                    "Vim motions enabled for all projects. Inputs start in Insert mode; Esc enters Normal mode. F8 disables."
+                } else {
+                    "Vim motions disabled for all projects. F8 enables."
+                }.into();
+            }
             ActionId::Help => {
                 self.modal = Some(Modal::Text {
                     title: "Keyboard guide".into(),
@@ -689,14 +708,15 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         ),
     ]);
     let body_width = area.width.saturating_sub(2);
-    let tabs = header_line(app, palette);
+    let mut headers = header_lines(app, palette, area.width);
     let repo = repository_line(app, palette);
-    // Repository sits on the right of the header row when it fits, otherwise
-    // on the right of a second row so it still lines up above the page actions.
-    let beside = tabs.width() + repo.width() + 4 <= area.width as usize;
+    // Repository details move to another row when the header is full.
+    let last_width = headers.last().map_or(0, Line::width);
+    let beside = last_width + repo.width() + 4 <= area.width as usize;
+    let header_height = headers.len() as u16 + u16::from(!beside);
     let chunks = Layout::vertical([
-        Constraint::Length(if beside { 1 } else { 2 }),
-        Constraint::Length(1), // breathing room between header and page
+        Constraint::Length(header_height),
+        Constraint::Length(1), // Vim toggle below the header, aligned right
         Constraint::Min(10),
         Constraint::Length(rows_for(&status, body_width, 2)),
         Constraint::Length(rows_for(&footer, area.width, 2)),
@@ -705,15 +725,21 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let header = chunks[0];
     let row = |y: u16| Rect::new(header.x, header.y + y, header.width, 1);
     let (repo_area, used) = if beside {
-        (row(0), tabs.width() + 2)
+        (row(headers.len() as u16 - 1), last_width + 2)
     } else {
-        (row(1), 0)
+        (row(headers.len() as u16), 0)
     };
-    frame.render_widget(
-        Paragraph::new(tabs).style(Style::default().bg(palette.bg)),
-        row(0),
-    );
+    for (index, line) in headers.drain(..).enumerate() {
+        frame.render_widget(
+            Paragraph::new(line).style(Style::default().bg(palette.bg)),
+            row(index as u16),
+        );
+    }
     draw_repository(frame, app, repo, repo_area, used, palette);
+    frame.render_widget(
+        Paragraph::new(vim_toggle(app.vim_motions, palette)).right_aligned(),
+        chunks[1].inner(Margin::new(1, 0)),
+    );
     let body = chunks[2].inner(Margin::new(1, 0));
     match app.page {
         0 => draw_workflow(frame, app, body, palette),
@@ -734,6 +760,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         chunks[4],
     );
     if let Some(modal) = &mut app.modal {
+        if let Some(field) = modal.active_input() {
+            field.set_vim(app.vim_motions);
+        }
         // The theme picker previews live, so keep the page behind it legible.
         let previewing_theme = matches!(
             modal,
@@ -747,7 +776,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-fn header_line(app: &App, palette: Palette) -> Line<'static> {
+fn header_lines(app: &App, palette: Palette, width: u16) -> Vec<Line<'static>> {
     let mut spans = vec![
         Span::styled(" ◆ ", Style::default().fg(palette.accent)),
         Span::styled(
@@ -756,8 +785,9 @@ fn header_line(app: &App, palette: Palette) -> Line<'static> {
         ),
         Span::raw("  "),
     ];
+    let mut tabs = Vec::new();
     for (index, name) in TABS.iter().enumerate() {
-        spans.push(Span::styled(
+        tabs.push(Span::styled(
             format!(" {} {name} ", index + 1),
             if index == app.page {
                 Style::default()
@@ -769,7 +799,33 @@ fn header_line(app: &App, palette: Palette) -> Line<'static> {
             },
         ));
     }
-    Line::from(spans)
+    let tabs = Line::from(tabs);
+    if spans.iter().map(Span::width).sum::<usize>() + tabs.width() <= usize::from(width) {
+        spans.extend(tabs.spans);
+        vec![Line::from(spans)]
+    } else {
+        vec![Line::from(spans), tabs]
+    }
+}
+
+fn vim_toggle(enabled: bool, palette: Palette) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("[F8] ", Style::default().fg(palette.muted)),
+        Span::styled(
+            if enabled { "VIM ON" } else { "Vim OFF" },
+            Style::default()
+                .fg(if enabled {
+                    palette.accent
+                } else {
+                    palette.muted
+                })
+                .add_modifier(if enabled {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ),
+    ])
 }
 
 /// Repository name and branch, or the project directory when not a Git repository.

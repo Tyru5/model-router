@@ -1,3 +1,4 @@
+use super::input::InputField;
 use crate::{engine::Status, storage};
 use anyhow::{Context, Result};
 use ratatui::{
@@ -7,7 +8,6 @@ use ratatui::{
 };
 use serde::{Deserialize, Serialize};
 use std::{fs, io::ErrorKind, path::Path};
-use tui_textarea::TextArea;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -362,7 +362,7 @@ impl Palette {
         )
     }
 
-    pub fn style_textarea(self, text: &mut TextArea<'_>) {
+    pub fn style_textarea(self, text: &mut InputField<'_>) {
         text.set_style(Style::default().fg(self.fg).bg(self.panel));
         text.set_cursor_line_style(Style::default());
         text.set_cursor_style(Style::default().fg(self.bg).bg(self.accent));
@@ -372,23 +372,24 @@ impl Palette {
 
 #[derive(Default, Deserialize, Serialize)]
 #[serde(default)]
-struct Appearance {
-    theme: Theme,
+pub(super) struct Appearance {
+    pub theme: Theme,
+    pub vim_motions: bool,
 }
 
-pub(super) fn load(path: &Path) -> Result<Theme> {
+pub(super) fn load(path: &Path) -> Result<Appearance> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Theme::default()),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Appearance::default()),
         Err(error) => return Err(error).with_context(|| format!("Read {}", path.display())),
     };
     let appearance: Appearance = serde_json::from_slice(&bytes)
         .with_context(|| format!("Read theme from {}", path.display()))?;
-    Ok(appearance.theme)
+    Ok(appearance)
 }
 
-pub(super) fn save(path: &Path, theme: Theme) -> Result<()> {
-    storage::write_json(path, &Appearance { theme })
+pub(super) fn save(path: &Path, theme: Theme, vim_motions: bool) -> Result<()> {
+    storage::write_json(path, &Appearance { theme, vim_motions })
 }
 
 /// Bracket each ` / `-separated alternative: `J / K` -> `[J] / [K]`.
@@ -407,9 +408,9 @@ mod tests {
     fn appearance_defaults_and_invalid_files_are_recoverable() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("appearance.json");
-        assert_eq!(load(&path).unwrap(), Theme::ModelRouter);
+        assert_eq!(load(&path).unwrap().theme, Theme::ModelRouter);
         fs::write(&path, "{}").unwrap();
-        assert_eq!(load(&path).unwrap(), Theme::ModelRouter);
+        assert_eq!(load(&path).unwrap().theme, Theme::ModelRouter);
         for invalid in [
             r#"{"theme":"unknown-theme"}"#,
             "not json",
@@ -418,8 +419,8 @@ mod tests {
             fs::write(&path, invalid).unwrap();
             assert!(load(&path).is_err());
         }
-        save(&path, Theme::CatppuccinLatte).unwrap();
-        assert_eq!(load(&path).unwrap(), Theme::CatppuccinLatte);
+        save(&path, Theme::CatppuccinLatte, false).unwrap();
+        assert_eq!(load(&path).unwrap().theme, Theme::CatppuccinLatte);
         assert!(
             fs::read_to_string(path)
                 .unwrap()
@@ -434,8 +435,8 @@ mod tests {
         let mut ids = std::collections::HashSet::new();
         for theme in Theme::ALL {
             assert!(ids.insert(serde_json::to_string(&theme).unwrap()));
-            save(&path, theme).unwrap();
-            assert_eq!(load(&path).unwrap(), theme);
+            save(&path, theme, false).unwrap();
+            assert_eq!(load(&path).unwrap().theme, theme);
         }
     }
 

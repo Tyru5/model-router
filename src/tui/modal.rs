@@ -1,3 +1,4 @@
+use super::input::InputField;
 use super::{
     actions::{self, ActionId},
     app::App,
@@ -26,7 +27,6 @@ use ratatui::{
         Wrap,
     },
 };
-use tui_textarea::TextArea;
 
 #[derive(Clone, Copy)]
 pub(super) enum InputTarget {
@@ -85,7 +85,10 @@ pub(super) struct Choice {
     pub(super) label: String,
     pub(super) value: PickValue,
 }
-pub(super) fn matching_choices<'a>(items: &'a [Choice], filter: &TextArea<'_>) -> Vec<&'a Choice> {
+pub(super) fn matching_choices<'a>(
+    items: &'a [Choice],
+    filter: &InputField<'_>,
+) -> Vec<&'a Choice> {
     let query = content(filter).to_lowercase();
     items
         .iter()
@@ -96,7 +99,7 @@ pub(super) enum Modal {
     Input {
         title: String,
         target: InputTarget,
-        text: TextArea<'static>,
+        text: InputField<'static>,
     },
     Stage {
         editor: Box<StageEditor>,
@@ -109,7 +112,7 @@ pub(super) enum Modal {
         title: String,
         items: Vec<Choice>,
         selected: usize,
-        filter: TextArea<'static>,
+        filter: InputField<'static>,
         note: String,
     },
     Text {
@@ -120,6 +123,20 @@ pub(super) enum Modal {
     },
     Loading(String),
     Confirm(Box<Confirm>),
+}
+
+impl Modal {
+    pub(super) fn active_input(&mut self) -> Option<&mut InputField<'static>> {
+        match self {
+            Self::Input { text, .. } => Some(text),
+            Self::Picker { filter, .. } => Some(filter),
+            Self::Stage { editor, .. } => editor.active_input(),
+            Self::Harness(editor) => editor.active_input(),
+            Self::Repositories(picker) => Some(picker.active_input()),
+            Self::Import(importer) => importer.active_input(),
+            _ => None,
+        }
+    }
 }
 
 impl App {
@@ -201,7 +218,7 @@ impl App {
                 }
             }
             PickValue::Theme(theme) => {
-                theme::save(&self.theme_path, theme)?;
+                theme::save(&self.theme_path, theme, self.vim_motions)?;
                 self.theme = theme;
                 self.message = format!("Theme saved: {}. T changes it anytime.", theme.name());
             }
@@ -258,6 +275,13 @@ impl App {
         let Some(mut modal) = self.modal.take() else {
             return Ok(false);
         };
+        if let Some(field) = modal.active_input() {
+            field.set_vim(self.vim_motions);
+            if field.vim_key(key) {
+                self.modal = Some(modal);
+                return Ok(false);
+            }
+        }
         if key.code == Key::Esc && !matches!(modal, Modal::Repositories(_) | Modal::Import(_)) {
             self.catalog = None;
             self.modal = self.model_editor.take().map(Modal::Harness);
@@ -598,6 +622,16 @@ pub(super) fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, palette: Pale
                 ])
                 .wrap(Wrap { trim: false }),
                 inner,
+            );
+        }
+    }
+    if let Some(hint) = modal.active_input().and_then(|field| field.mode_hint()) {
+        if rect.width > 4 && rect.height > 0 {
+            frame.render_widget(
+                Paragraph::new(format!(" {hint} "))
+                    .style(Style::default().fg(palette.accent).bg(palette.panel))
+                    .centered(),
+                ratatui::layout::Rect::new(rect.x + 2, rect.bottom() - 1, rect.width - 4, 1),
             );
         }
     }

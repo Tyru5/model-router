@@ -1,6 +1,7 @@
+use super::input::InputField;
 use super::path_picker::{PathPicker, PickerAction};
 use super::theme::Palette;
-use super::widgets::{content, textarea};
+use super::widgets::{content, focus_textarea, textarea};
 use crate::{config, storage, task_import};
 use anyhow::{Result, ensure};
 use crossterm::event::{KeyCode as Key, KeyEvent, KeyModifiers as Mods};
@@ -20,7 +21,6 @@ use std::{
     },
     thread,
 };
-use tui_textarea::TextArea;
 
 pub(super) enum ImportAction {
     Stay,
@@ -30,7 +30,7 @@ pub(super) enum ImportAction {
 
 struct Draft {
     source: String,
-    fields: [TextArea<'static>; 2],
+    fields: [InputField<'static>; 2],
     mode: usize,
 }
 impl Draft {
@@ -63,12 +63,23 @@ pub(super) struct TaskImporter {
     picker: PathPicker,
     existing: String,
     draft: Option<Draft>,
-    url: Option<TextArea<'static>>,
+    url: Option<InputField<'static>>,
     job: Option<ImportJob>,
     error: String,
 }
 
 impl TaskImporter {
+    pub(super) fn active_input(&mut self) -> Option<&mut InputField<'static>> {
+        if self.job.is_some() {
+            None
+        } else if let Some(draft) = &mut self.draft {
+            Some(&mut draft.fields[draft.mode])
+        } else if let Some(url) = &mut self.url {
+            Some(url)
+        } else {
+            Some(self.picker.active_input())
+        }
+    }
     pub fn new(project: &Path, existing: &str) -> Result<Self> {
         Ok(Self {
             picker: PathPicker::files(project)?,
@@ -143,7 +154,10 @@ impl TaskImporter {
         if let Some(draft) = &mut self.draft {
             match key.code {
                 Key::Esc => self.draft = None,
-                Key::Tab | Key::BackTab => draft.mode = 1 - draft.mode,
+                Key::Tab | Key::BackTab => {
+                    draft.mode = 1 - draft.mode;
+                    focus_textarea(&mut draft.fields[draft.mode]);
+                }
                 Key::Char('s') if key.modifiers.contains(Mods::CONTROL) => {
                     let text = content(&draft.fields[draft.mode]);
                     config::validate_task(&text)?;
@@ -337,11 +351,13 @@ mod tests {
             format!("Keep existing instructions\n\n---\n\n{text}")
         );
         press(&mut importer, Key::Tab);
-        importer.paste("Edited: ");
+        importer.paste("Additional instructions");
         press(&mut importer, Key::Tab);
         press(&mut importer, Key::Tab);
         let action = importer.key(KeyEvent::new(Key::Char('s'), Mods::CONTROL));
-        assert!(matches!(action, ImportAction::Apply(value) if value == format!("Edited: {text}")));
+        assert!(
+            matches!(action, ImportAction::Apply(value) if value == format!("{text}Additional instructions"))
+        );
         assert_eq!(std::fs::read_to_string(source).unwrap(), text);
     }
 

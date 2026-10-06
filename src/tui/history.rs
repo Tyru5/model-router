@@ -1,3 +1,4 @@
+use super::input::InputField;
 use super::{
     actions::ActionId,
     app::App,
@@ -24,7 +25,6 @@ use std::{
     sync::{Arc, Mutex},
     thread,
 };
-use tui_textarea::TextArea;
 
 /// The status filters `f` cycles through.
 const STATUSES: [(&str, &[StatusFilter]); 6] = [
@@ -45,13 +45,19 @@ const STATUSES: [(&str, &[StatusFilter]); 6] = [
 /// Runs page state besides the list and its selection.
 #[derive(Default)]
 pub(super) struct RunsView {
-    filter: TextArea<'static>,
+    filter: InputField<'static>,
     /// Keys go to the filter field.
     filtering: bool,
     /// Index into `STATUSES`.
     status: usize,
     /// Artifact sizes by run ID, filled in by a background thread.
     sizes: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+impl RunsView {
+    pub(super) fn set_vim(&mut self, enabled: bool) {
+        self.filter.set_vim(enabled);
+    }
 }
 
 /// A Runs page confirmation dialog.
@@ -134,7 +140,11 @@ impl App {
                 self.history_selected = self.history_selected.saturating_sub(1)
             }
             ActionId::RefreshRuns => self.refresh_runs()?,
-            ActionId::FilterRuns => self.runs.filtering = true,
+            ActionId::FilterRuns => {
+                self.runs.filtering = true;
+                self.runs.filter.set_vim(self.vim_motions);
+                super::widgets::focus_textarea(&mut self.runs.filter);
+            }
             ActionId::CycleStatus => {
                 let selected = self.selected_run().map(|entry| entry.id().to_owned());
                 self.runs.status = (self.runs.status + 1) % STATUSES.len();
@@ -213,10 +223,14 @@ impl App {
     }
     /// Keys while the filter field has focus. True means exit.
     pub(super) fn runs_filter_key(&mut self, key: KeyEvent) -> Result<bool> {
+        self.runs.filter.set_vim(self.vim_motions);
+        if self.runs.filter.vim_key(key) {
+            return Ok(false);
+        }
         let selected = self.selected_run().map(|entry| entry.id().to_owned());
         match menu_key(key) {
             Key::Esc => {
-                self.runs.filter = TextArea::default();
+                self.runs.filter = InputField::default();
                 self.runs.filtering = false;
             }
             Key::Enter => self.runs.filtering = false,
@@ -545,7 +559,11 @@ pub(super) fn draw_history(frame: &mut Frame<'_>, app: &App, area: Rect, palette
             Constraint::Min(1),
         ])
         .split(area);
-        let hint = palette.hints(&[("Enter", "keep"), ("Esc", "clear")]);
+        let hint = if let Some(mode) = app.runs.filter.mode_hint() {
+            Line::styled(mode, Style::default().fg(palette.accent))
+        } else {
+            palette.hints(&[("Enter", "keep"), ("Esc", "clear")])
+        };
         let cols = Layout::horizontal([
             Constraint::Length(2),
             Constraint::Min(8),

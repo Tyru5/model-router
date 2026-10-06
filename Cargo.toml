@@ -26,6 +26,7 @@ strip-ansi-escapes = "0.2"
 tempfile = "3"
 toml = "0.8"
 tui-textarea = "0.7"
+unicode-segmentation = "1"
 uuid = { version = "1", features = ["v4"] }
 ctrlc = { version = "3", features = ["termination"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

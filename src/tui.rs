@@ -22,6 +22,7 @@ mod completion;
 mod harness_editor;
 mod harnesses;
 mod history;
+mod input;
 mod modal;
 mod monitor;
 mod path_picker;
@@ -136,7 +137,10 @@ pub fn run(
         );
     }
     match theme::load(&app.theme_path) {
-        Ok(theme) => app.theme = theme,
+        Ok(preferences) => {
+            app.theme = preferences.theme;
+            app.vim_motions = preferences.vim_motions;
+        }
         Err(error) => {
             app.message = format!("{error:#}. Using Model Router colours; T chooses a theme.");
         }

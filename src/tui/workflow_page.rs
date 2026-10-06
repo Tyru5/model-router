@@ -1,3 +1,4 @@
+use super::input::InputField;
 use super::{
     actions::ActionId,
     app::App,
@@ -6,7 +7,7 @@ use super::{
     path_picker::PathPicker,
     task_importer::TaskImporter,
     theme::Palette,
-    widgets::{content, kv, or_default, textarea},
+    widgets::{content, focus_textarea, kv, or_default, textarea, wrapped_textarea},
 };
 use crate::{
     adapters, catalog,
@@ -26,7 +27,6 @@ use ratatui::{
         TableState, Wrap,
     },
 };
-use tui_textarea::TextArea;
 
 const FIELDS: &[&str] = &[
     "Name",
@@ -62,7 +62,7 @@ pub(super) enum StageRequest {
 }
 pub(super) struct StageEditor {
     stage: Stage,
-    pub(super) fields: Vec<TextArea<'static>>,
+    pub(super) fields: Vec<InputField<'static>>,
     selected: usize,
     harnesses: Vec<String>,
     /// The model field accepts typing until the next catalog pick.
@@ -71,6 +71,13 @@ pub(super) struct StageEditor {
     catalog: Option<catalog::Catalog>,
 }
 impl StageEditor {
+    pub(super) fn active_input(&mut self) -> Option<&mut InputField<'static>> {
+        if self.is_choice(self.selected) || (self.selected == MODEL && !self.typing_model) {
+            None
+        } else {
+            Some(&mut self.fields[self.selected])
+        }
+    }
     pub(super) fn new(stage: Stage, harnesses: Vec<String>) -> Self {
         let args = stage
             .extra_args
@@ -184,29 +191,34 @@ impl StageEditor {
         stage.instructions = content(&self.fields[INSTRUCTIONS]);
         Ok(stage)
     }
+    fn focus(&mut self, index: usize) {
+        self.selected = index;
+        self.typing_model = false;
+        focus_textarea(&mut self.fields[index]);
+    }
     pub(super) fn key(&mut self, key: KeyEvent) -> StageRequest {
-        if key.code == Key::Tab
+        if matches!(key.code, Key::Tab | Key::Down)
             || (key.code == Key::Char('n') && key.modifiers.contains(Mods::CONTROL))
         {
-            self.selected = (self.selected + 1) % self.fields.len();
-            self.typing_model = false;
-        } else if key.code == Key::BackTab
+            self.focus((self.selected + 1) % self.fields.len());
+        } else if matches!(key.code, Key::BackTab | Key::Up)
             || (key.code == Key::Char('p') && key.modifiers.contains(Mods::CONTROL))
         {
-            self.selected = (self.selected + self.fields.len() - 1) % self.fields.len();
-            self.typing_model = false;
+            self.focus((self.selected + self.fields.len() - 1) % self.fields.len());
         } else if self.selected == MODEL && !self.typing_model {
             match key.code {
-                Key::Enter | Key::Char(' ') | Key::Left | Key::Right | Key::Down | Key::Up => {
+                Key::Enter | Key::Char(' ') | Key::Left | Key::Right => {
                     return StageRequest::PickModel;
                 }
                 Key::Backspace | Key::Delete => self.fields[MODEL] = textarea(""),
-                Key::Char('i') => self.typing_model = true,
+                Key::Char('i') => {
+                    self.typing_model = true;
+                    focus_textarea(&mut self.fields[MODEL]);
+                }
                 _ => {}
             }
         } else if self.selected == MODEL && key.code == Key::Enter {
-            self.typing_model = false;
-            self.selected += 1;
+            self.focus(self.selected + 1);
         } else if self.is_choice(self.selected) {
             if matches!(
                 key.code,
@@ -232,7 +244,7 @@ impl StageEditor {
                 }
             }
         } else if key.code == Key::Enter && ![CHECKS, INSTRUCTIONS].contains(&self.selected) {
-            self.selected = (self.selected + 1) % self.fields.len();
+            self.focus((self.selected + 1) % self.fields.len());
         } else {
             self.fields[self.selected].input(key);
         }
@@ -246,7 +258,7 @@ impl StageEditor {
     pub(super) fn draw(&mut self, frame: &mut Frame<'_>, rect: Rect, palette: Palette) {
         let block = palette.modal(
             "Edit stage",
-            &[("Tab", "next field"), ("←/→", "cycle choice")],
+            &[("↑/↓ / Tab", "switch field"), ("←/→", "cycle choice")],
         );
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
@@ -370,12 +382,14 @@ impl StageEditor {
         } else {
             let field = &mut self.fields[self.selected];
             palette.style_textarea(field);
-            field.set_block(
+            wrapped_textarea(
+                frame,
+                field,
+                halves[1],
                 palette
                     .panel(format!(" {} ", FIELDS[self.selected]))
                     .border_style(Style::default().fg(palette.accent)),
             );
-            frame.render_widget(&*field, halves[1]);
         }
         let mut keys = palette.hints(&[("Ctrl+S", "apply stage"), ("Esc", "cancel")]);
         keys.spans.push(Span::styled(
@@ -945,6 +959,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn arrow_keys_navigate_every_stage_field_including_model_and_multiline_fields() {
+        let mut editor = StageEditor::new(Stage::default(), vec!["codex".into()]);
+        let original = editor.finish().unwrap();
+        for expected in (1..FIELDS.len()).chain(std::iter::once(0)) {
+            assert_eq!(
+                editor.key(KeyEvent::new(Key::Down, Mods::NONE)),
+                StageRequest::None
+            );
+            assert_eq!(editor.selected, expected);
+        }
+        for expected in (0..FIELDS.len()).rev() {
+            assert_eq!(
+                editor.key(KeyEvent::new(Key::Up, Mods::NONE)),
+                StageRequest::None
+            );
+            assert_eq!(editor.selected, expected);
+        }
+        assert_eq!(
+            serde_json::to_value(editor.finish().unwrap()).unwrap(),
+            serde_json::to_value(original).unwrap()
+        );
+    }
+
+    #[test]
+    fn entering_and_revisiting_fields_places_cursor_at_end() {
+        let mut editor = StageEditor::new(
+            Stage {
+                name: "Example".into(),
+                instructions: "first\nlast".into(),
+                ..Stage::default()
+            },
+            vec!["codex".into()],
+        );
+        editor.key(KeyEvent::new(Key::Char('!'), Mods::NONE));
+        assert_eq!(content(&editor.fields[0]), "Example!");
+        for (next, previous) in [
+            (
+                KeyEvent::new(Key::Down, Mods::NONE),
+                KeyEvent::new(Key::Up, Mods::NONE),
+            ),
+            (
+                KeyEvent::new(Key::Tab, Mods::NONE),
+                KeyEvent::new(Key::BackTab, Mods::NONE),
+            ),
+            (
+                KeyEvent::new(Key::Char('n'), Mods::CONTROL),
+                KeyEvent::new(Key::Char('p'), Mods::CONTROL),
+            ),
+            (
+                KeyEvent::new(Key::Enter, Mods::NONE),
+                KeyEvent::new(Key::Up, Mods::NONE),
+            ),
+        ] {
+            editor.key(KeyEvent::new(Key::Home, Mods::NONE));
+            assert_eq!(editor.fields[0].cursor(), (0, 0));
+            editor.key(next);
+            editor.key(previous);
+            assert_eq!(editor.fields[0].cursor(), (0, 8));
+        }
+        editor.key(KeyEvent::new(Key::Up, Mods::NONE));
+        assert_eq!(editor.selected, INSTRUCTIONS);
+        assert_eq!(editor.fields[INSTRUCTIONS].cursor(), (1, 4));
+        editor.key(KeyEvent::new(Key::Char('!'), Mods::NONE));
+        assert_eq!(editor.finish().unwrap().instructions, "first\nlast!");
+    }
+
+    #[test]
     fn editor_preserves_multiline_instructions_and_literal_args() {
         let stage = Stage {
             instructions: "line one\nline two".into(),
@@ -956,6 +1037,35 @@ mod tests {
             .unwrap();
         assert_eq!(result.extra_args, stage.extra_args);
         assert_eq!(result.instructions, stage.instructions);
+    }
+
+    #[test]
+    fn stage_editor_wraps_instructions_without_changing_saved_lines() {
+        let instructions = "abcdefghijklmnopqrstuvwxyz".repeat(3);
+        let mut editor = StageEditor::new(
+            Stage {
+                instructions: instructions.clone(),
+                ..Stage::default()
+            },
+            vec!["codex".into()],
+        );
+        editor.selected = INSTRUCTIONS;
+        let palette = super::super::theme::Theme::default().palette();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 30)).unwrap();
+        terminal
+            .draw(|frame| editor.draw(frame, frame.area(), palette))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        // The editable pane fits one alphabet per row at this terminal width.
+        assert_eq!(text.matches("abcdefghijklmnopqrstuvwxyz").count(), 1);
+        assert!(text.contains("hijklmnopqrstuvwxyzabcdefg"), "{text}");
+        assert_eq!(editor.finish().unwrap().instructions, instructions);
     }
 
     fn check(command: &[&str], required: bool, timeout_seconds: u64) -> Check {

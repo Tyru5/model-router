@@ -1,3 +1,4 @@
+use super::input::InputField;
 use super::theme::Palette;
 use crate::storage;
 use crossterm::event::{KeyCode as Key, KeyEvent, KeyModifiers as Mods};
@@ -8,13 +9,90 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Paragraph, Wrap},
 };
-use tui_textarea::TextArea;
+use tui_textarea::CursorMove;
+use unicode_segmentation::UnicodeSegmentation;
 
-pub(super) fn textarea(value: &str) -> TextArea<'static> {
-    TextArea::from(value.split('\n').map(str::to_owned).collect::<Vec<_>>())
+pub(super) fn textarea(value: &str) -> InputField<'static> {
+    let mut field = InputField::from(value.split('\n').map(str::to_owned).collect::<Vec<_>>());
+    focus_textarea(&mut field);
+    field
 }
-pub(super) fn content(text: &TextArea<'_>) -> String {
+/// Newly focused inputs are ready to append, including multiline values.
+pub(super) fn focus_textarea(field: &mut InputField<'_>) {
+    field.insert_mode();
+    field.cancel_selection();
+    field.move_cursor(CursorMove::Bottom);
+    if field.cursor().1 != field.lines().last().map_or(0, |line| line.chars().count()) {
+        field.move_cursor(CursorMove::End);
+    }
+}
+pub(super) fn content(text: &InputField<'_>) -> String {
     text.lines().join("\n")
+}
+/// Soft-wrap the editor's display while keeping its buffer and undo history intact.
+pub(super) fn wrapped_textarea(
+    frame: &mut Frame<'_>,
+    field: &mut InputField<'_>,
+    area: Rect,
+    block: Block<'_>,
+) {
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+    let width = usize::from(inner.width);
+    let cursor = field.cursor();
+    let selection = field.selection_range();
+    let selection_style = field.selection_style();
+    let mut lines = Vec::new();
+    let mut cursor_row = 0;
+    for (row, source) in field.lines().iter().enumerate() {
+        let mut line = Line::default();
+        let mut used = 0;
+        let mut column = 0;
+        // The trailing space gives the cursor a cell at the end of a line,
+        // including when the text fills the entire display width.
+        let end_cursor = cursor == (row, source.chars().count());
+        for grapheme in source.graphemes(true).chain(end_cursor.then_some(" ")) {
+            let count = grapheme.chars().count();
+            let value = if grapheme == "\t" {
+                let tab = usize::from(field.tab_length()).max(1);
+                " ".repeat(tab - used % tab)
+            } else {
+                grapheme.to_owned()
+            };
+            let mut style = Style::default();
+            if selection
+                .is_some_and(|(start, end)| start < (row, column + count) && (row, column) < end)
+            {
+                style = selection_style;
+            }
+            for (part, display) in value.graphemes(true).enumerate() {
+                let span = Span::raw(display.to_owned());
+                let size = span.width();
+                if used > 0 && used + size > width {
+                    lines.push(line);
+                    line = Line::default();
+                    used = 0;
+                }
+                let mut display_style = style;
+                if part == 0 && cursor.0 == row && (column..column + count).contains(&cursor.1) {
+                    cursor_row = lines.len();
+                    display_style = field.cursor_style();
+                }
+                line.spans.push(span.style(display_style));
+                used += size;
+            }
+            column += count;
+        }
+        lines.push(line);
+    }
+    let top = cursor_row.saturating_sub(usize::from(inner.height) - 1);
+    frame.render_widget(
+        Paragraph::new(lines.into_iter().skip(top).collect::<Vec<_>>()).style(field.style()),
+        inner,
+    );
 }
 pub(super) fn menu_key(key: KeyEvent) -> Key {
     match key.code {
@@ -111,5 +189,85 @@ pub(super) fn dim(frame: &mut Frame<'_>, palette: Palette) {
                 .bg(palette.bg)
                 .remove_modifier(Modifier::all()),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, style::Color};
+    use tui_textarea::CursorMove;
+
+    fn render(field: &mut InputField<'_>, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| wrapped_textarea(frame, field, frame.area(), Block::default()))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn row(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn soft_wrap_reflows_and_scrolls_without_editing_the_buffer() {
+        let mut field = textarea("abcdefghij\nnext");
+        field.move_cursor(CursorMove::Jump(0, 0));
+        field.set_cursor_style(Style::default().bg(Color::Red));
+        let buffer = render(&mut field, 5, 4);
+        assert_eq!(row(&buffer, 0), "abcde");
+        assert_eq!(row(&buffer, 1), "fghij");
+        assert_eq!(row(&buffer, 2), "next ");
+        let buffer = render(&mut field, 7, 4);
+        assert_eq!(row(&buffer, 0), "abcdefg");
+        assert_eq!(row(&buffer, 1), "hij    ");
+
+        field.move_cursor(CursorMove::End);
+        let buffer = render(&mut field, 5, 2);
+        assert_eq!(row(&buffer, 0), "fghij");
+        assert_eq!(buffer[(0, 1)].bg, Color::Red);
+        field.insert_char('!');
+        render(&mut field, 5, 2);
+        assert_eq!(content(&field), "abcdefghij!\nnext");
+        field.undo();
+        assert_eq!(content(&field), "abcdefghij\nnext");
+    }
+
+    #[test]
+    fn soft_wrap_preserves_graphemes_and_selection_across_rows() {
+        let mut field = textarea("界界e\u{301}xy");
+        field.move_cursor(CursorMove::Jump(0, 0));
+        field.set_selection_style(Style::default().bg(Color::Blue));
+        field.set_cursor_style(Style::default().bg(Color::Red));
+        field.start_selection();
+        field.move_cursor(CursorMove::End);
+        let buffer = render(&mut field, 4, 3);
+        assert_eq!(buffer[(0, 0)].symbol(), "界");
+        assert_eq!(buffer[(2, 0)].symbol(), "界");
+        assert_eq!(buffer[(0, 1)].symbol(), "e\u{301}");
+        assert_eq!(buffer[(0, 1)].bg, Color::Blue);
+        assert_eq!(buffer[(3, 1)].bg, Color::Red);
+        assert_eq!(content(&field), "界界e\u{301}xy");
+    }
+
+    #[test]
+    fn focusing_inputs_appends_to_existing_text_and_clears_selection() {
+        for value in ["", "name", "first\n界é", "first\n"] {
+            let mut field = textarea(value);
+            let last = field.lines().len() - 1;
+            let end = (last, field.lines()[last].chars().count());
+            assert_eq!(field.cursor(), end);
+            field.select_all();
+            focus_textarea(&mut field);
+            assert_eq!(field.cursor(), end);
+            assert!(!field.is_selecting());
+            focus_textarea(&mut field);
+            assert_eq!(field.cursor(), end);
+            field.insert_char('!');
+            assert_eq!(content(&field), format!("{value}!"));
+        }
     }
 }

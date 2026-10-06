@@ -40,6 +40,225 @@ fn theme_app(project: &std::path::Path) -> App {
 }
 
 #[test]
+fn vim_opt_in_persists_without_changing_the_theme_or_project() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    assert!(!app.vim_motions);
+    assert!(!theme::load(&app.theme_path).unwrap().vim_motions);
+    std::fs::write(&app.theme_path, r#"{"theme":"dracula"}"#).unwrap();
+    let legacy = theme::load(&app.theme_path).unwrap();
+    assert!(!legacy.vim_motions);
+    app.theme = legacy.theme;
+    app.key(key(Key::F(8))).unwrap();
+    let saved = theme::load(&app.theme_path).unwrap();
+    assert!(app.vim_motions && saved.vim_motions);
+    assert_eq!(saved.theme, app.theme);
+    assert!(!app.dirty);
+    app.pick(PickValue::Theme(Theme::CatppuccinLatte)).unwrap();
+    assert!(theme::load(&app.theme_path).unwrap().vim_motions);
+    app.key(key(Key::Char(':'))).unwrap();
+    app.paste("Vim motions");
+    app.key(key(Key::Enter)).unwrap();
+    assert!(!app.vim_motions);
+    assert!(!theme::load(&app.theme_path).unwrap().vim_motions);
+    assert_eq!(app.theme, Theme::CatppuccinLatte);
+    let obstruction = project.path().join("file");
+    std::fs::write(&obstruction, "unchanged").unwrap();
+    app.theme_path = obstruction.join("appearance.json");
+    assert!(app.key(key(Key::F(8))).is_err());
+    assert!(!app.vim_motions);
+}
+
+#[test]
+fn vim_toggle_sits_below_header_options_on_the_right() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    for width in [65, 80, 120] {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
+        for enabled in [false, true] {
+            app.vim_motions = enabled;
+            for page in 0..4 {
+                app.page = page;
+                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let first_row = (0..width)
+                    .map(|x| buffer[(x, 0)].symbol())
+                    .collect::<String>();
+                assert!(!first_row.contains("[F8]"), "{first_row}");
+                let label = if enabled {
+                    "[F8] VIM ON"
+                } else {
+                    "[F8] Vim OFF"
+                };
+                let toggle_row = (1..4)
+                    .find_map(|y| {
+                        let row = (0..width)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>();
+                        row.contains(label).then_some(row)
+                    })
+                    .expect("Vim toggle below the header");
+                assert_eq!(
+                    toggle_row,
+                    format!("{:>width$} ", label, width = usize::from(width) - 1)
+                );
+                let header = buffer.content[..usize::from(width) * 3]
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                assert!(header.contains("4 Harnesses"), "{header}");
+            }
+        }
+    }
+    app.page = 0;
+    app.task = "Keep this draft".into();
+    app.key(key(Key::Char('t'))).unwrap();
+    app.key(key(Key::Esc)).unwrap();
+    app.key(key(Key::F(8))).unwrap();
+    assert!(!app.vim_motions && app.modal.is_some());
+    app.key(key(Key::F(8))).unwrap();
+    assert!(app.vim_motions && app.modal.is_some());
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(65, 20)).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let display = buffer
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    assert!(display.contains("VIM INSERT"));
+    let field = app.modal.as_mut().unwrap().active_input().unwrap();
+    assert_eq!(super::widgets::content(field), "Keep this draft");
+    assert!(field.mode_hint().unwrap().contains("INSERT"));
+}
+
+#[test]
+fn vim_task_editing_routes_escape_motions_paste_and_save() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    app.task = "first\nsecond".into();
+    app.key(key(Key::Char('t'))).unwrap();
+    app.key(key(Key::Char('h'))).unwrap();
+    assert_eq!(
+        super::widgets::content(app.modal.as_mut().unwrap().active_input().unwrap()),
+        "first\nsecondh"
+    );
+    app.key(key(Key::Esc)).unwrap();
+    assert!(app.modal.is_none(), "default Esc still cancels immediately");
+    app.key(key(Key::F(8))).unwrap();
+    app.key(key(Key::Char('t'))).unwrap();
+    app.key(key(Key::Esc)).unwrap();
+    assert!(app.modal.is_some());
+    for c in "gg0i".chars() {
+        app.key(key(Key::Char(c))).unwrap();
+    }
+    app.paste("Prefix ");
+    app.key(key(Key::Esc)).unwrap();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let display = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    assert!(display.contains("VIM NORMAL"));
+    app.key(KeyEvent::new(Key::Char('s'), Mods::CONTROL))
+        .unwrap();
+    assert!(app.modal.is_none());
+    assert_eq!(app.task, "Prefix first\nsecond");
+    app.key(key(Key::Char('t'))).unwrap();
+    assert_eq!(
+        app.modal.as_mut().unwrap().active_input().unwrap().cursor(),
+        (1, 6)
+    );
+    app.key(key(Key::Esc)).unwrap();
+    app.key(key(Key::Esc)).unwrap();
+    assert!(app.modal.is_none());
+}
+
+#[test]
+fn vim_stage_navigation_keeps_choices_and_refocus_behavior() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    app.key(key(Key::F(8))).unwrap();
+    app.key(key(Key::Char('e'))).unwrap();
+    let original = super::widgets::content(app.modal.as_mut().unwrap().active_input().unwrap());
+    app.key(key(Key::Esc)).unwrap();
+    app.key(key(Key::Char('0'))).unwrap();
+    app.key(key(Key::Char('g'))).unwrap();
+    app.key(key(Key::Down)).unwrap(); // Role remains a choice, not a Vim input.
+    assert!(app.modal.as_mut().unwrap().active_input().is_none());
+    app.key(key(Key::Up)).unwrap();
+    app.key(key(Key::Char('!'))).unwrap();
+    let field = app.modal.as_mut().unwrap().active_input().unwrap();
+    assert_eq!(super::widgets::content(field), format!("{original}!"));
+    assert!(field.mode_hint().unwrap().contains("INSERT"));
+    // Up goes to instructions; j/k move within the multiline input instead.
+    app.key(key(Key::Up)).unwrap();
+    app.paste("\nlast line");
+    app.key(key(Key::Esc)).unwrap();
+    app.key(key(Key::Char('k'))).unwrap();
+    assert!(app.modal.as_mut().unwrap().active_input().is_some());
+    app.key(key(Key::Down)).unwrap();
+    assert_eq!(
+        super::widgets::content(app.modal.as_mut().unwrap().active_input().unwrap()),
+        format!("{original}!")
+    );
+}
+
+#[test]
+fn vim_motions_reach_harness_path_import_and_filter_inputs() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    app.vim_motions = true;
+    for modal in [
+        Modal::Harness(Box::new(super::harness_editor::HarnessEditor::new(
+            Stage::default(),
+            Default::default(),
+        ))),
+        Modal::Repositories(Box::new(PathPicker::new(project.path(), vec![]).unwrap())),
+        Modal::Import(Box::new(
+            super::task_importer::TaskImporter::new(project.path(), "").unwrap(),
+        )),
+        Modal::Picker {
+            title: "Picker".into(),
+            items: vec![],
+            selected: 0,
+            filter: textarea(""),
+            note: String::new(),
+        },
+    ] {
+        app.modal = Some(modal);
+        app.paste("abc");
+        app.key(key(Key::Esc)).unwrap();
+        app.key(key(Key::Char('0'))).unwrap();
+        let field = app.modal.as_mut().unwrap().active_input().unwrap();
+        assert_eq!(field.cursor(), (0, 0));
+        assert_eq!(super::widgets::content(field), "abc");
+        app.key(key(Key::Char('A'))).unwrap();
+        app.key(key(Key::Char('!'))).unwrap();
+        assert_eq!(
+            super::widgets::content(app.modal.as_mut().unwrap().active_input().unwrap()),
+            "abc!"
+        );
+    }
+    app.modal = None;
+    app.page = 2;
+    app.key(key(Key::Char('/'))).unwrap();
+    app.paste("abc");
+    app.key(key(Key::Esc)).unwrap();
+    assert!(app.runs_filtering());
+    app.key(key(Key::Char('0'))).unwrap();
+    app.key(key(Key::Char('i'))).unwrap();
+    app.key(key(Key::Char('x'))).unwrap();
+    app.key(key(Key::Esc)).unwrap();
+    app.key(key(Key::Esc)).unwrap();
+    assert!(!app.runs_filtering());
+}
+
+#[test]
 fn theme_preview_is_cancelable_and_only_enter_persists() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
@@ -68,7 +287,7 @@ fn theme_preview_is_cancelable_and_only_enter_persists() {
     assert!(app.modal.is_none());
     assert_eq!(app.theme, Theme::CatppuccinLatte);
     assert_eq!(
-        theme::load(&app.theme_path).unwrap(),
+        theme::load(&app.theme_path).unwrap().theme,
         Theme::CatppuccinLatte
     );
 
@@ -86,7 +305,7 @@ fn theme_preview_is_cancelable_and_only_enter_persists() {
     app.key(key(Key::Esc)).unwrap();
     assert_eq!(app.displayed_theme(), Theme::CatppuccinLatte);
     assert_eq!(
-        theme::load(&app.theme_path).unwrap(),
+        theme::load(&app.theme_path).unwrap().theme,
         Theme::CatppuccinLatte
     );
     assert!(!app.dirty);

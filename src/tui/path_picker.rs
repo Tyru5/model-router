@@ -1,3 +1,4 @@
+use super::input::InputField;
 use super::theme::Palette;
 use super::widgets::{content, menu_key, textarea};
 use crate::{catalog, storage};
@@ -14,7 +15,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use tui_textarea::{CursorMove, TextArea};
+use tui_textarea::CursorMove;
 
 struct Entry {
     path: PathBuf,
@@ -53,13 +54,16 @@ pub(super) struct PathPicker {
     recent: Vec<Entry>,
     show_recent: bool,
     selected: usize,
-    filter: TextArea<'static>,
-    path_input: Option<TextArea<'static>>,
+    filter: InputField<'static>,
+    path_input: Option<InputField<'static>>,
     pub error: String,
     files: bool,
 }
 
 impl PathPicker {
+    pub(super) fn active_input(&mut self) -> &mut InputField<'static> {
+        self.path_input.as_mut().unwrap_or(&mut self.filter)
+    }
     pub fn new(project: &Path, recent: Vec<PathBuf>) -> Result<Self> {
         let mut picker = Self {
             directory: project.into(),

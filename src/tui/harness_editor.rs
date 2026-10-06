@@ -1,6 +1,7 @@
+use super::input::InputField;
 use super::{
     theme::Palette,
-    widgets::{content, menu_key, textarea},
+    widgets::{content, focus_textarea, menu_key, textarea},
 };
 use crate::providers::Provider;
 use crate::{
@@ -19,7 +20,6 @@ use ratatui::{
     widgets::{Block, HighlightSpacing, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
 use std::collections::BTreeMap;
-use tui_textarea::TextArea;
 
 enum FieldKind {
     Model,
@@ -34,7 +34,7 @@ struct Field {
     kind: FieldKind,
     label: &'static str,
     help: &'static str,
-    text: TextArea<'static>,
+    text: InputField<'static>,
 }
 
 pub(super) struct HarnessEditor {
@@ -47,6 +47,13 @@ pub(super) struct HarnessEditor {
     pub error: String,
 }
 impl HarnessEditor {
+    pub(super) fn active_input(&mut self) -> Option<&mut InputField<'static>> {
+        if self.choices(self.selected).is_some() {
+            None
+        } else {
+            Some(&mut self.fields[self.selected].text)
+        }
+    }
     pub fn new(stage: Stage, providers: BTreeMap<String, Provider>) -> Self {
         let mut fields = vec![Field {
             kind: FieldKind::Model,
@@ -253,6 +260,7 @@ impl HarnessEditor {
     }
 
     pub fn key(&mut self, key: KeyEvent) {
+        let previous = self.selected;
         match menu_key(key) {
             Key::Tab | Key::Down => self.selected = (self.selected + 1) % self.fields.len(),
             Key::BackTab | Key::Up => {
@@ -285,6 +293,9 @@ impl HarnessEditor {
                     self.error.clear();
                 }
             }
+        }
+        if self.selected != previous {
+            focus_textarea(&mut self.fields[self.selected].text);
         }
     }
 

@@ -982,6 +982,7 @@ dependencies = [
  "tempfile",
  "toml",
  "tui-textarea",
+ "unicode-segmentation",
  "uuid",
 ]
 

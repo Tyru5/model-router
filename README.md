@@ -108,6 +108,37 @@ The preference is saved automatically in your user config directory
 It applies to every project without changing workflow files. Native harness
 terminals keep their own theme settings. See [theme details and palette sources](docs/themes.md).
 
+## Optional Vim motions
+
+Press **F8** (including while editing), or open `:` and choose **Vim motions**, to
+enable or disable Vim motions for text inputs. They are **off by default**.
+The preference is saved alongside the theme in `appearance.json` and applies
+across projects and restarts.
+
+The toggle sits below the header options, aligned to the right. It shows
+**[F8] Vim OFF** when disabled and **[F8] VIM ON** in the accent color when enabled.
+
+Inputs open in **Insert mode**, with the cursor at the end of their content.
+`Esc` switches to **Normal mode**; another `Esc` cancels or goes back.
+The current mode appears at the bottom of the dialog (beside the Runs filter
+when filtering runs).
+
+| Normal-mode key | Motion |
+| --- | --- |
+| `h`, `j`, `k`, `l` | Left, next line, previous line, right |
+| `w`, `b`, `e` | Next word, previous word, end of word |
+| `0`, `^`, `$` | Start of line, first nonblank character, end of line |
+| `gg`, `G` | First line, last line |
+| `i`, `a` | Insert before, append after the cursor |
+| `I`, `A` | Insert at first nonblank character, append at end of line |
+
+`Up`/`Down` and `Tab` retain their form/list navigation behavior; `Ctrl+S`
+still applies edits. Refocusing a field returns to Insert mode at the end.
+Pasting inserts literal text and returns to Insert mode. `j`/`k` move between
+original lines, not soft-wrapped screen rows. This is basic motion support:
+counts, operators such as `dw`, visual mode, registers, and repeat `.` are not
+implemented. `Esc` clears an unfinished `g` before it can close a dialog.
+
 ## Select a repository
 
 Press `p` on the Workflow page. The browser starts beside your current project,
@@ -261,7 +292,11 @@ Model discovery is deliberately labeled:
 - **Claude/Amp:** documented aliases/modes plus your saved selections.
 - **Other adapters:** native default, saved selections, and manual entry.
 
-In the stage editor (`e`), the **Model** field is a selection, not a text box:
+In the stage editor (`e`), `Up`/`Down`, `Tab`/`Shift+Tab`, or `Ctrl+N/P`
+move between fields. Focusing an input places its cursor at the end of the
+existing content, ready to append.
+
+The **Model** field is a selection, not a text box:
 `Enter` lists the stage's harness catalog, `Backspace` returns to the harness
 default, and `i` types an ID the catalog does not list. Picking a catalog entry
 with a provider fills the Provider field too. Built-in discovery does not send
