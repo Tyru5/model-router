@@ -99,7 +99,7 @@ This reproduces the former full-core CPU loop on terminal EOF. Crossterm's
 forwarder also cancels on hangup, invalid input descriptors, or EOF. Terminal cleanup and
 error reporting tolerate disconnected stdout/stderr.
 
-`scripts/smoke_themes.py` checks all 12 themes in a real terminal, including
+`scripts/smoke_themes.py` checks all 13 themes in a real terminal, including
 Ctrl+N/P previews, cancellation, saved preferences, repository switching,
 restart, startup colours, and recovery from invalid preferences. Rust tests
 cover failed saves, unchanged task/workflow contents, text contrast, and every

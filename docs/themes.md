@@ -16,6 +16,7 @@ preview the highlighted theme immediately, including the page behind the picker.
 | One Dark | Dark; blue and charcoal | `one-dark` |
 | Monokai | Dark; green and pink | `monokai` |
 | Solarized Dark | Dark; blue-green | `solarized-dark` |
+| Poimandres | Dark; mint and pale blue | `poimandres` |
 | Catppuccin Latte | Light; pastel purple | `catppuccin-latte` |
 | Gruvbox Light | Light; warm cream | `gruvbox-light` |
 | Solarized Light | Light; cream and blue | `solarized-light` |
@@ -54,12 +55,17 @@ Built-in themes adapt these upstream editor and terminal palettes:
 - [One Dark syntax colours](https://github.com/atom/one-dark-syntax/blob/master/styles/colors.less)
 - [VS Code's Monokai palette](https://github.com/microsoft/vscode/blob/main/extensions/theme-monokai/themes/monokai-color-theme.json)
 - [Solarized values](https://ethanschoonover.com/solarized/#the-values)
+- [Poimandres palette](https://github.com/drcmda/poimandres-theme/blob/main/src/theme.js)
 
 UI backgrounds and highlights are mapped to each theme's available tones.
 Dracula's secondary text and the light themes' foreground/status accents include
 contrast adjustments for small terminal text. Body and selection text are checked
 for at least 4.5:1 contrast; secondary text for at least 3:1. The original
 Model Router palette remains the default.
+
+Poimandres uses the upstream dark background, mint accent, pale blue, and pink
+status colours. Panels use its hover-widget background; selections use its
+opaque focus colour because terminal cells do not support alpha blending.
 
 ## Verification
 

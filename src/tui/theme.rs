@@ -22,13 +22,14 @@ pub(super) enum Theme {
     OneDark,
     Monokai,
     SolarizedDark,
+    Poimandres,
     CatppuccinLatte,
     GruvboxLight,
     SolarizedLight,
 }
 
 impl Theme {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::ModelRouter,
         Self::CatppuccinMocha,
         Self::Dracula,
@@ -38,6 +39,7 @@ impl Theme {
         Self::OneDark,
         Self::Monokai,
         Self::SolarizedDark,
+        Self::Poimandres,
         Self::CatppuccinLatte,
         Self::GruvboxLight,
         Self::SolarizedLight,
@@ -54,6 +56,7 @@ impl Theme {
             Self::OneDark => "One Dark",
             Self::Monokai => "Monokai",
             Self::SolarizedDark => "Solarized Dark",
+            Self::Poimandres => "Poimandres",
             Self::CatppuccinLatte => "Catppuccin Latte",
             Self::GruvboxLight => "Gruvbox Light",
             Self::SolarizedLight => "Solarized Light",
@@ -204,6 +207,21 @@ impl Theme {
                 red: rgb(0xdc322f),
                 blue: rgb(0x268bd2),
                 violet: rgb(0x6c71c4),
+            },
+            Self::Poimandres => Palette {
+                bg: rgb(0x1b1e28),
+                panel: rgb(0x202430),
+                fg: rgb(0xe4f0fb),
+                muted: rgb(0xa6accd),
+                accent: rgb(0x5de4c7),
+                line: rgb(0x506477),
+                selection_bg: rgb(0x303340),
+                selection_fg: rgb(0xe4f0fb),
+                success: rgb(0x5de4c7),
+                warn: rgb(0xfffac2),
+                red: rgb(0xd0679d),
+                blue: rgb(0xadd7ff),
+                violet: rgb(0xf087bd),
             },
             Self::CatppuccinLatte => Palette {
                 bg: rgb(0xeff1f5),

@@ -77,7 +77,7 @@ the next option and `Ctrl+P` to the previous option, just like `↓` and `↑`.
 
 ## What works
 
-- Twelve colour themes with live preview and a saved preference across projects.
+- Thirteen colour themes with live preview and a saved preference across projects.
 - Named workflow templates and per-run snapshots.
 - Twelve stage presets and four ready-to-edit workflow presets.
 - Explicit harness/model/provider/effort selection and extra CLI arguments.
@@ -100,8 +100,8 @@ Press `T` (Shift+T) from any main view. Type to filter, then use `↑`/`↓` or
 
 Choose from **Model Router** (the original default), **Catppuccin Mocha / Latte**,
 **Dracula**, **Nord**, **Tokyo Night**, **Gruvbox Dark / Light**, **One Dark**,
-**Monokai**, and **Solarized Dark / Light**. Editors, file browsers, status colours,
-and the startup animation all follow the selected theme.
+**Monokai**, **Solarized Dark / Light**, and **Poimandres**. Editors, file browsers,
+status colours, and the startup animation all follow the selected theme.
 
 The preference is saved automatically in your user config directory
 (`~/.config/model-router/appearance.json` on Linux, respecting `XDG_CONFIG_HOME`).
@@ -698,7 +698,7 @@ append/replace, cancellation, errors, and saved task contents using a local HTTP
 server and an offline GitHub CLI fixture.
 The stage test covers preset selection, editing, cancellation, ordering,
 optional reviews, workflow persistence, and interactive verification handoffs.
-The theme test previews and saves all 12 themes, including cancellation,
+The theme test previews and saves all 13 themes, including cancellation,
 restart, repository switching, and invalid preferences.
 The harness settings test covers per-stage isolation, native permission
 arguments, conflict validation, model browsing from the draft, cancellation,

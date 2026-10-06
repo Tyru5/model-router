@@ -21,6 +21,7 @@ THEMES = [
     ("One Dark", "one-dark", "21252b"),
     ("Monokai", "monokai", "272822"),
     ("Solarized Dark", "solarized-dark", "002b36"),
+    ("Poimandres", "poimandres", "1b1e28"),
     ("Catppuccin Latte", "catppuccin-latte", "eff1f5"),
     ("Gruvbox Light", "gruvbox-light", "fbf1c7"),
     ("Solarized Light", "solarized-light", "fdf6e3"),
@@ -102,13 +103,13 @@ def main():
             terminal.send(b"\x1b")
             for page in "2341":
                 terminal.send(page)
-                choose(terminal, "Dracula")
+                choose(terminal, "Poimandres")
                 terminal.send(b"\x1b")
                 assert background(terminal) == "fdf6e3", (
                     "Preview changed the saved theme"
                 )
 
-            choose(terminal, "Nord")
+            choose(terminal, "Poimandres")
             terminal.send("\r")
             terminal.send("p")
             terminal.send(b"\x0c")
@@ -118,7 +119,7 @@ def main():
                 lambda: "Choose repository" not in terminal.text(),
                 "Repository switch failed",
             )
-            assert background(terminal) == "2e3440", "Repository switch lost the theme"
+            assert background(terminal) == "1b1e28", "Repository switch lost the theme"
             terminal.send("q")
             terminal.exit()
         finally:
@@ -130,13 +131,13 @@ def main():
             terminal.wait(
                 lambda: "Any key to skip" in terminal.text(), "Intro did not appear"
             )
-            assert background(terminal) == "2e3440", "Startup ignored the saved theme"
+            assert background(terminal) == "1b1e28", "Startup ignored the saved theme"
             terminal.send(" ")
             terminal.wait(
                 lambda: "1 Workflow" in terminal.text(), "Intro did not finish"
             )
             terminal.send("T")
-            assert "Nord · dark (current)" in terminal.text()
+            assert "Poimandres · dark (current)" in terminal.text()
             terminal.snapshot("theme-picker-120x36.txt")
             terminal.send(b"\x1b")
             terminal.send("q")
@@ -168,7 +169,7 @@ def main():
             )
             assert not records(folder), "Theme selection started a run"
     print(
-        "PASS: all 12 themes, live colour previews, Ctrl+N/P, cancel/apply, empty searches, global persistence, repository switching, themed startup, corrupt preferences, and unchanged workflows."
+        f"PASS: all {len(THEMES)} themes, live colour previews, Ctrl+N/P, cancel/apply, empty searches, global persistence, repository switching, themed startup, corrupt preferences, and unchanged workflows."
     )
     print(f"Artifacts: {ARTIFACTS}")
 
