@@ -8,23 +8,62 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, fs, path::Path, sync::atomic::AtomicBool, time::Duration};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
     pub provider: String,
     pub label: String,
     pub source: String,
     pub availability: String,
+    /// Reasoning levels the harness reports for this model; empty when it
+    /// reports none, in which case the harness-wide levels apply.
+    #[serde(default)]
+    pub efforts: Vec<String>,
+    #[serde(default)]
+    pub default_effort: String,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Catalog {
     pub models: Vec<Model>,
     pub note: String,
+    /// Reasoning levels the harness accepts for any model; empty when unknown.
+    pub efforts: Vec<String>,
+    /// Where the levels were read from, e.g. `claude --help`.
+    pub effort_source: String,
+}
+/// Reasoning levels that apply to one selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Efforts {
+    pub levels: Vec<String>,
+    pub default: String,
+    pub source: String,
+}
+impl Catalog {
+    /// Levels for a selection: the model's own when it lists them, else the
+    /// harness-wide set. None when the harness reports nothing.
+    pub fn efforts_for(&self, id: &str, provider: &str) -> Option<Efforts> {
+        let model = self
+            .models
+            .iter()
+            .find(|m| m.id == id && m.provider == provider && !m.efforts.is_empty());
+        match model {
+            Some(model) => Some(Efforts {
+                levels: model.efforts.clone(),
+                default: model.default_effort.clone(),
+                source: model.source.clone(),
+            }),
+            None if self.efforts.is_empty() => None,
+            None => Some(Efforts {
+                levels: self.efforts.clone(),
+                default: String::new(),
+                source: self.effort_source.clone(),
+            }),
+        }
+    }
 }
 fn entry(id: &str, source: &str, availability: &str) -> Model {
     Model {
         id: id.into(),
-        provider: String::new(),
         label: if id.is_empty() {
             "Harness default".into()
         } else {
@@ -32,7 +71,69 @@ fn entry(id: &str, source: &str, availability: &str) -> Model {
         },
         source: source.into(),
         availability: availability.into(),
+        ..Model::default()
     }
+}
+
+const CLAUDE_ALIASES: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
+const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+const CODEX_EFFORTS: [&str; 5] = ["minimal", "low", "medium", "high", "xhigh"];
+const PI_THINKING: [&str; 6] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+
+/// The text of one `--flag` entry in a clap/commander style help page.
+fn help_option(help: &str, flag: &str) -> Option<String> {
+    let mut lines = help.lines();
+    let first = lines.find(|l| {
+        let l = l.trim_start();
+        l.starts_with(flag)
+            && l[flag.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| c.is_whitespace() || c == '=' || c == ',')
+    })?;
+    let mut text = first.trim().to_owned();
+    for line in lines {
+        if line.trim_start().starts_with('-') || line.trim().is_empty() {
+            break;
+        }
+        text.push(' ');
+        text.push_str(line.trim());
+    }
+    Some(text)
+}
+
+/// Aliases and effort levels documented by `claude --help`.
+fn parse_claude_help(help: &str) -> (Vec<String>, Vec<String>) {
+    let aliases = help_option(help, "--model")
+        .map(|text| {
+            text.split('\'')
+                .skip(1)
+                .step_by(2)
+                .filter(|a| {
+                    !a.is_empty() && a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                })
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let efforts = help_option(help, "--effort")
+        .and_then(|text| {
+            let start = text.find('(')? + 1;
+            let end = text[start..].find(')')? + start;
+            Some(
+                text[start..end]
+                    .split(',')
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty() && !s.contains(' '))
+                    .collect(),
+            )
+        })
+        .unwrap_or_default();
+    (aliases, efforts)
+}
+
+fn strings(ids: &[&str]) -> Vec<String> {
+    ids.iter().map(|s| (*s).to_owned()).collect()
 }
 
 fn query(
@@ -73,6 +174,8 @@ fn query(
 
 pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Catalog> {
     let mut models = vec![entry("", "harness setting", "inherits configured default")];
+    let mut efforts: Vec<String> = vec![];
+    let mut effort_source = String::new();
 
     let note: String = match harness {
         "codex" => {
@@ -101,6 +204,29 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
                                         .and_then(Value::as_str)
                                         .unwrap_or(id)
                                         .into();
+                                    model.efforts = value
+                                        .get("supported_reasoning_levels")
+                                        .and_then(Value::as_array)
+                                        .map(|levels| {
+                                            levels
+                                                .iter()
+                                                .filter_map(|l| {
+                                                    l.get("effort").and_then(Value::as_str)
+                                                })
+                                                .map(str::to_owned)
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    model.default_effort = value
+                                        .get("default_reasoning_level")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .into();
+                                    for level in &model.efforts {
+                                        if !efforts.contains(level) {
+                                            efforts.push(level.clone());
+                                        }
+                                    }
                                     models.push(model);
                                 }
                             }
@@ -108,17 +234,55 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
                     }
                 }
             }
-            "Reads Codex's local model cache. Open Codex to refresh its account catalog; custom IDs remain editable.".into()
+            if efforts.is_empty() {
+                efforts = strings(&CODEX_EFFORTS);
+                effort_source = "documented Codex levels".into();
+            } else {
+                effort_source = "Codex local cache".into();
+            }
+            "Reads Codex's local model cache, including each model's reasoning levels. Open Codex to refresh its account catalog; custom IDs remain editable.".into()
         }
         "claude" => {
-            for id in ["sonnet", "opus", "haiku"] {
+            let help = query(harness, vec!["--help".into()], &settings.adapters, project);
+            let (aliases, levels) = help
+                .as_deref()
+                .map(parse_claude_help)
+                .unwrap_or_default();
+            let documented = !aliases.is_empty();
+            for id in &aliases {
                 models.push(entry(
                     id,
-                    "documented alias",
+                    "claude --help alias",
                     "unverified; depends on account/provider",
                 ));
             }
-            "Claude aliases follow your native account/provider settings. Enter a full model ID for an explicit selection.".into()
+            for id in CLAUDE_ALIASES {
+                if !aliases.iter().any(|a| a == id) {
+                    models.push(entry(
+                        id,
+                        "documented alias",
+                        "unverified; depends on account/provider",
+                    ));
+                }
+            }
+            if levels.is_empty() {
+                efforts = strings(&CLAUDE_EFFORTS);
+                effort_source = "documented Claude levels".into();
+            } else {
+                efforts = levels;
+                effort_source = "claude --help".into();
+            }
+            match help {
+                Ok(_) if documented => "Aliases and effort levels read from `claude --help`; they follow your native account/provider settings. Enter a full model ID for an explicit selection.".into(),
+                Ok(_) => "`claude --help` did not list aliases; showing documented ones. Enter a full model ID for an explicit selection.".into(),
+                Err(error) => format!(
+                    "Could not run `claude --help` ({}); showing documented aliases and levels.",
+                    storage::clean_terminal(&error.to_string())
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                ),
+            }
         }
         "amp" => {
             for id in ["low", "medium", "high", "ultra"] {
@@ -145,10 +309,18 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
                         "configured provider; entitlement not checked",
                     );
                     m.provider = cols[0].into();
+                    // The `thinking` column says whether --thinking levels apply.
+                    m.efforts = match cols.get(4).copied() {
+                        Some("yes") => strings(&PI_THINKING),
+                        Some("no") => vec!["off".into()],
+                        _ => vec![],
+                    };
                     models.push(m);
                 }
             }
-            "Pi lists models from configured providers and extensions. Exact provider/model selections avoid fuzzy routing.".into()
+            efforts = strings(&PI_THINKING);
+            effort_source = "Pi thinking levels".into();
+            "Pi lists models from configured providers and extensions, with whether each supports thinking. Exact provider/model selections avoid fuzzy routing.".into()
         }
         "opencode" => {
             let output = query(harness, vec!["models".into()], &settings.adapters, project)?;
@@ -220,7 +392,12 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
     ensure!(models.len() <= 20000, "Catalog contains too many entries");
     models.sort_by(|a, b| (&a.provider, &a.id).cmp(&(&b.provider, &b.id)));
     models.dedup_by(|a, b| a.id == b.id && a.provider == b.provider);
-    Ok(Catalog { models, note })
+    Ok(Catalog {
+        models,
+        note,
+        efforts,
+        effort_source,
+    })
 }
 
 pub fn known_harnesses(settings: &Settings) -> Vec<String> {
@@ -262,8 +439,51 @@ pub fn detect_project(start: &Path) -> Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::detect_project;
+    use super::*;
     use std::fs;
+
+    #[test]
+    fn claude_help_yields_aliases_and_effort_levels() {
+        let help = "\
+  --effort <level>                      Effort level for the current session
+                                        (low, medium, high, xhigh, max)
+  --environment <environment_id>        Create a new cloud session
+  --model <model>                       Model for the current session. Provide
+                                        an alias for the latest model (e.g.
+                                        'fable', 'opus', or 'sonnet') or a
+                                        model's full name.
+  -n, --name <name>                     Set a display name
+";
+        let (aliases, efforts) = parse_claude_help(help);
+        assert_eq!(aliases, ["fable", "opus", "sonnet"]);
+        assert_eq!(efforts, ["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(parse_claude_help("usage: claude"), (vec![], vec![]));
+    }
+
+    #[test]
+    fn efforts_prefer_the_model_then_the_harness() {
+        let mut gpt = entry("gpt", "cache", "");
+        gpt.efforts = vec!["low".into(), "max".into()];
+        gpt.default_effort = "low".into();
+        let catalog = Catalog {
+            models: vec![entry("", "", ""), gpt, entry("other", "cache", "")],
+            note: String::new(),
+            efforts: vec!["low".into(), "high".into()],
+            effort_source: "harness".into(),
+        };
+        let model = catalog.efforts_for("gpt", "").unwrap();
+        assert_eq!(model.levels, ["low", "max"]);
+        assert_eq!(model.default, "low");
+        assert_eq!(model.source, "cache");
+        let other = catalog.efforts_for("other", "").unwrap();
+        assert_eq!(other.levels, ["low", "high"]);
+        assert_eq!(other.source, "harness");
+        assert_eq!(
+            catalog.efforts_for("typed", "").unwrap().levels,
+            ["low", "high"]
+        );
+        assert!(Catalog::default().efforts_for("gpt", "").is_none());
+    }
 
     #[test]
     fn detect_project_prefers_nearest_config_then_git_root() {

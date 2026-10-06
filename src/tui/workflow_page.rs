@@ -48,12 +48,17 @@ const INSTRUCTIONS: usize = 11;
 const CHOICES: [usize; 3] = [1, 2, 6];
 /// The model field: chosen from the harness catalog, typed only on request.
 pub(super) const MODEL: usize = 3;
+const PROVIDER: usize = 4;
+/// The effort field: a choice list once the catalog reports levels.
+pub(super) const EFFORT: usize = 5;
 /// What the stage editor asks the app to do after a key.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum StageRequest {
     None,
     /// Open the model catalog for the editor's current harness.
     PickModel,
+    /// The harness changed; its catalog supplies the effort levels.
+    Catalog,
 }
 pub(super) struct StageEditor {
     stage: Stage,
@@ -62,6 +67,8 @@ pub(super) struct StageEditor {
     harnesses: Vec<String>,
     /// The model field accepts typing until the next catalog pick.
     typing_model: bool,
+    /// The catalog of the field's harness, once read.
+    catalog: Option<catalog::Catalog>,
 }
 impl StageEditor {
     pub(super) fn new(stage: Stage, harnesses: Vec<String>) -> Self {
@@ -107,6 +114,7 @@ impl StageEditor {
             selected: 0,
             harnesses,
             typing_model: false,
+            catalog: None,
         }
     }
     pub(super) fn harness(&self) -> String {
@@ -114,8 +122,37 @@ impl StageEditor {
     }
     pub(super) fn set_model(&mut self, model: catalog::Model) {
         self.fields[MODEL] = textarea(&model.id);
-        self.fields[4] = textarea(&model.provider);
+        self.fields[PROVIDER] = textarea(&model.provider);
         self.typing_model = false;
+    }
+    pub(super) fn set_catalog(&mut self, catalog: catalog::Catalog) {
+        self.catalog = Some(catalog);
+    }
+    /// Effort levels the catalog reports for the current model selection.
+    fn efforts(&self) -> Option<catalog::Efforts> {
+        self.catalog.as_ref()?.efforts_for(
+            content(&self.fields[MODEL]).trim(),
+            content(&self.fields[PROVIDER]).trim(),
+        )
+    }
+    fn is_choice(&self, index: usize) -> bool {
+        CHOICES.contains(&index) || (index == EFFORT && self.efforts().is_some())
+    }
+    fn choices(&self, index: usize) -> Vec<String> {
+        match index {
+            1 => Role::ALL.iter().map(|r| r.label().into()).collect(),
+            2 => self.harnesses.clone(),
+            EFFORT => {
+                let mut levels = self.efforts().map(|e| e.levels).unwrap_or_default();
+                let current = content(&self.fields[EFFORT]).trim().to_owned();
+                if !current.is_empty() && !levels.contains(&current) {
+                    levels.push(current);
+                }
+                levels.insert(0, String::new());
+                levels
+            }
+            _ => vec!["unattended".into(), "interactive".into()],
+        }
     }
     pub(super) fn finish(&self) -> Result<Stage> {
         let mut stage = self.stage.clone();
@@ -170,16 +207,12 @@ impl StageEditor {
         } else if self.selected == MODEL && key.code == Key::Enter {
             self.typing_model = false;
             self.selected += 1;
-        } else if CHOICES.contains(&self.selected) {
+        } else if self.is_choice(self.selected) {
             if matches!(
                 key.code,
                 Key::Left | Key::Right | Key::Char(' ') | Key::Enter
             ) {
-                let values: Vec<String> = match self.selected {
-                    1 => Role::ALL.iter().map(|r| r.label().into()).collect(),
-                    2 => self.harnesses.clone(),
-                    _ => vec!["unattended".into(), "interactive".into()],
-                };
+                let values = self.choices(self.selected);
                 let current = values
                     .iter()
                     .position(|v| *v == content(&self.fields[self.selected]))
@@ -191,9 +224,11 @@ impl StageEditor {
                 };
                 self.fields[self.selected] = textarea(&values[next]);
                 if self.selected == 2 {
-                    for index in 3..=5 {
+                    for index in MODEL..=EFFORT {
                         self.fields[index] = textarea("");
                     }
+                    self.catalog = None;
+                    return StageRequest::Catalog;
                 }
             }
         } else if key.code == Key::Enter && ![CHECKS, INSTRUCTIONS].contains(&self.selected) {
@@ -204,7 +239,7 @@ impl StageEditor {
         StageRequest::None
     }
     pub(super) fn paste(&mut self, text: &str) {
-        if !CHOICES.contains(&self.selected) && (self.selected != MODEL || self.typing_model) {
+        if !self.is_choice(self.selected) && (self.selected != MODEL || self.typing_model) {
             self.fields[self.selected].insert_str(text);
         }
     }
@@ -221,7 +256,7 @@ impl StageEditor {
         let value_width = halves[0].width.saturating_sub(4) as usize;
         let rows = FIELDS.iter().enumerate().map(|(i, label)| {
             let value = content(&self.fields[i]).replace('\n', " ");
-            let choice = CHOICES.contains(&i) || (i == MODEL && !self.typing_model);
+            let choice = self.is_choice(i) || (i == MODEL && !self.typing_model);
             ListItem::new(vec![
                 Line::styled(*label, Style::default().fg(palette.muted)),
                 if value.is_empty() {
@@ -284,6 +319,54 @@ impl StageEditor {
                 ),
                 halves[1],
             );
+        } else if self.selected == EFFORT && self.is_choice(EFFORT) {
+            let efforts = self.efforts().unwrap_or_default();
+            let choices = self.choices(EFFORT);
+            let current = content(&self.fields[EFFORT]);
+            let index = choices.iter().position(|v| *v == current).unwrap_or(0);
+            let model = content(&self.fields[MODEL]);
+            let panes = Layout::vertical([
+                Constraint::Length(choices.len() as u16 + 2),
+                Constraint::Min(1),
+            ])
+            .split(halves[1]);
+            frame.render_stateful_widget(
+                List::new(choices.iter().map(|value| {
+                    ListItem::new(if value.is_empty() {
+                        Line::raw("Harness default")
+                    } else if !efforts.levels.contains(value) {
+                        Line::from(vec![
+                            Span::raw(value.clone()),
+                            Span::styled("  not listed", Style::default().fg(palette.warn)),
+                        ])
+                    } else if *value == efforts.default {
+                        Line::from(vec![
+                            Span::raw(value.clone()),
+                            Span::styled("  default", Style::default().fg(palette.muted)),
+                        ])
+                    } else {
+                        Line::raw(value.clone())
+                    })
+                }))
+                .block(
+                    palette
+                        .panel(format!(" {} ", FIELDS[EFFORT]))
+                        .border_style(Style::default().fg(palette.accent)),
+                )
+                .highlight_style(palette.selected_style()),
+                panes[0],
+                &mut ListState::default().with_selected(Some(index)),
+            );
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "Levels from {} for {}. ←/→ or Space cycles; blank inherits the harness default.",
+                    efforts.source,
+                    if model.is_empty() { "any model".to_owned() } else { model }
+                ))
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(palette.muted)),
+                panes[1],
+            );
         } else {
             let field = &mut self.fields[self.selected];
             palette.style_textarea(field);
@@ -300,6 +383,8 @@ impl StageEditor {
                 "   ·  argv per line, no shell; edit timeout_seconds in TOML"
             } else if self.selected == MODEL {
                 "   ·  Enter lists the harness's models; blank inherits its default"
+            } else if self.selected == EFFORT && self.catalog.is_none() {
+                "   ·  reading the harness catalog for its levels…"
             } else {
                 "   ·  blank model inherits the harness default"
             },
@@ -472,13 +557,15 @@ impl App {
                         catalog::known_harnesses(&self.settings),
                     )),
                     insert_at: None,
-                })
+                });
+                self.request_catalog(self.stage().harness.clone());
             }
             ActionId::HarnessSettings => {
                 self.modal = Some(Modal::Harness(Box::new(HarnessEditor::new(
                     self.stage().clone(),
                     self.settings.providers.clone(),
-                ))))
+                ))));
+                self.request_catalog(self.stage().harness.clone());
             }
             ActionId::Models => self.model_picker(),
             ActionId::AddStage => {
@@ -706,16 +793,47 @@ pub(super) fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palett
         &mut TableState::default().with_selected(Some(app.selected)),
     );
     if cols[1].width > 0 {
-        let warning = app.harness_checks.warning(&app.stage().harness);
-        draw_stage_detail(frame, app.stage(), warning, cols[1], palette);
+        let stage = app.stage();
+        let warning = app.harness_checks.warning(&stage.harness);
+        let effort = app
+            .catalogs
+            .get(&stage.harness)
+            .and_then(|c| c.efforts_for(&stage.model, &stage.provider))
+            .map(|efforts| effort_note(stage, &efforts));
+        draw_stage_detail(frame, stage, warning, effort, cols[1], palette);
     }
 }
 
-/// `warning` flags missing harness flags from cached doctor results.
+/// How the stage's effort compares with what its harness catalog lists.
+fn effort_note(stage: &Stage, efforts: &catalog::Efforts) -> (String, bool) {
+    if stage.effort.is_empty() {
+        let default = if efforts.default.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", efforts.default)
+        };
+        (format!("{} default{default}", efforts.source), true)
+    } else if efforts.levels.contains(&stage.effort) {
+        (format!("listed by {}", efforts.source), true)
+    } else {
+        (
+            format!(
+                "not listed by {}: {}",
+                efforts.source,
+                efforts.levels.join(", ")
+            ),
+            false,
+        )
+    }
+}
+
+/// `warning` flags missing harness flags from cached doctor results;
+/// `effort` says whether the catalog lists the stage's effort level.
 fn draw_stage_detail(
     frame: &mut Frame<'_>,
     stage: &Stage,
     warning: Option<String>,
+    effort_note: Option<(String, bool)>,
     area: Rect,
     palette: Palette,
 ) {
@@ -749,6 +867,14 @@ fn draw_stage_detail(
         kv(palette, "Execution", stage.mode.label(), true),
         kv(palette, "Provider", provider.0, provider.1),
         kv(palette, "Effort", effort.0, effort.1),
+    ]);
+    if let Some((note, listed)) = effort_note {
+        lines.push(Line::styled(
+            format!("         {note}"),
+            Style::default().fg(if listed { palette.muted } else { palette.warn }),
+        ));
+    }
+    lines.extend([
         kv(
             palette,
             "Timeout",
@@ -944,7 +1070,7 @@ mod tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 50)).unwrap();
         terminal
-            .draw(|frame| draw_stage_detail(frame, stage, None, frame.area(), palette))
+            .draw(|frame| draw_stage_detail(frame, stage, None, None, frame.area(), palette))
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)

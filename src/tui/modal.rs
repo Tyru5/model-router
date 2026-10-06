@@ -165,6 +165,7 @@ impl App {
                 );
                 let mut stage = presets::STAGES[index].build();
                 stage.id = format!("{}-{}", stage.id, Stage::default().id);
+                let harness = stage.harness.clone();
                 self.modal = Some(Modal::Stage {
                     editor: Box::new(StageEditor::new(
                         stage,
@@ -172,6 +173,7 @@ impl App {
                     )),
                     insert_at: Some(self.selected + 1),
                 });
+                self.request_catalog(harness);
             }
             PickValue::Harness(harness) => {
                 let stage = self.stage_mut();
@@ -274,6 +276,7 @@ impl App {
         let mut keep = true;
         let mut exit = false;
         let mut pick_model = false;
+        let mut refresh_catalog = None;
         let result: Result<()> = (|| {
             match &mut modal {
                 Modal::Input { target, text, .. } => {
@@ -305,8 +308,12 @@ impl App {
                         }
                         self.dirty = true;
                         keep = false;
-                    } else if editor.key(key) == StageRequest::PickModel {
-                        pick_model = true;
+                    } else {
+                        match editor.key(key) {
+                            StageRequest::PickModel => pick_model = true,
+                            StageRequest::Catalog => refresh_catalog = Some(editor.harness()),
+                            StageRequest::None => {}
+                        }
                     }
                 }
                 Modal::Harness(editor) => {
@@ -408,6 +415,9 @@ impl App {
         }
         if keep {
             self.modal = Some(modal);
+        }
+        if let Some(harness) = refresh_catalog {
+            self.request_catalog(harness);
         }
         if matches!(self.modal, Some(Modal::Harness(_))) {
             // Validation is shown in the draft, so it cannot leave a stale

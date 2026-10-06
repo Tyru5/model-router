@@ -310,7 +310,7 @@ fn main_result() -> Result<()> {
             let catalog = catalog::discover(&harness, &settings, &project)?;
             for model in catalog.models {
                 println!(
-                    "{}{}{}\t{}\t{}",
+                    "{}{}{}\t{}\t{}\t{}",
                     if model.provider.is_empty() {
                         ""
                     } else {
@@ -323,7 +323,15 @@ fn main_result() -> Result<()> {
                         &model.id
                     },
                     model.source,
-                    model.availability
+                    model.availability,
+                    model.efforts.join("/")
+                );
+            }
+            if !catalog.efforts.is_empty() {
+                println!(
+                    "\nEffort levels ({}): {}",
+                    catalog.effort_source,
+                    catalog.efforts.join(", ")
                 );
             }
             println!("\n{}", catalog.note);

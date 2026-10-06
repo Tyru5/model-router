@@ -27,7 +27,7 @@ use ratatui::{
     widgets::{Block, Paragraph, Wrap},
 };
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     path::PathBuf,
     sync::{
         Arc,
@@ -96,6 +96,11 @@ pub(super) struct App {
     pub(super) stage_editor: Option<(Box<StageEditor>, Option<usize>)>,
     /// Harness whose catalog is being read.
     pub(super) catalog_harness: String,
+    /// Catalogs read so far, by harness; they supply effort levels to editors.
+    pub(super) catalogs: BTreeMap<String, Catalog>,
+    /// A catalog being read for an editor, without a picker.
+    prefetch: Option<(String, Receiver<std::result::Result<Catalog, String>>)>,
+    prefetch_queue: VecDeque<String>,
     /// Git facts for the project, refreshed on start and project switch.
     pub(super) repo: Option<storage::RepoInfo>,
     pub(super) quit_after_stop: bool,
@@ -144,6 +149,9 @@ impl App {
             model_editor: None,
             stage_editor: None,
             catalog_harness: String::new(),
+            catalogs: BTreeMap::new(),
+            prefetch: None,
+            prefetch_queue: VecDeque::new(),
             repo,
             quit_after_stop: false,
         }
@@ -303,36 +311,28 @@ impl App {
                 }
             }
         }
+        if let Some((harness, receiver)) = &self.prefetch {
+            if let Ok(result) = receiver.try_recv() {
+                let harness = harness.clone();
+                self.prefetch = None;
+                if let Ok(catalog) = result {
+                    self.catalogs.insert(harness.clone(), catalog);
+                    self.push_catalog(&harness);
+                }
+                if let Some(next) = self.prefetch_queue.pop_front() {
+                    self.request_catalog(next);
+                }
+            }
+        }
         if let Some(receiver) = &self.catalog {
             if let Ok(result) = receiver.try_recv() {
                 self.catalog = None;
                 match result {
                     Ok(catalog) => {
-                        let items = catalog
-                            .models
-                            .into_iter()
-                            .map(|model| Choice {
-                                label: format!(
-                                    "{}{}{}  ·  {}",
-                                    if model.provider.is_empty() {
-                                        ""
-                                    } else {
-                                        &model.provider
-                                    },
-                                    if model.provider.is_empty() { "" } else { "/" },
-                                    model.label,
-                                    model.availability
-                                ),
-                                value: PickValue::Model(model),
-                            })
-                            .collect();
-                        self.modal = Some(Modal::Picker {
-                            title: format!("{} selections · type to filter", self.catalog_harness),
-                            items,
-                            selected: 0,
-                            filter: textarea(""),
-                            note: catalog.note,
-                        });
+                        let harness = self.catalog_harness.clone();
+                        self.catalogs.insert(harness.clone(), catalog.clone());
+                        self.push_catalog(&harness);
+                        self.show_catalog(catalog);
                     }
                     Err(error) => {
                         self.message =
@@ -366,11 +366,98 @@ impl App {
         self.poll_completion();
         Ok(self.quit_after_stop && self.worker.is_none())
     }
+    fn show_catalog(&mut self, catalog: Catalog) {
+        let items = catalog
+            .models
+            .into_iter()
+            .map(|model| Choice {
+                label: format!(
+                    "{}{}{}  ·  {}{}",
+                    if model.provider.is_empty() {
+                        ""
+                    } else {
+                        &model.provider
+                    },
+                    if model.provider.is_empty() { "" } else { "/" },
+                    model.label,
+                    model.availability,
+                    if model.efforts.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  ·  {}", model.efforts.join("/"))
+                    }
+                ),
+                value: PickValue::Model(model),
+            })
+            .collect();
+        self.modal = Some(Modal::Picker {
+            title: format!("{} selections · type to filter", self.catalog_harness),
+            items,
+            selected: 0,
+            filter: textarea(""),
+            note: catalog.note,
+        });
+    }
+    /// Hands a cached catalog to the open or parked editors for `harness`.
+    fn push_catalog(&mut self, harness: &str) {
+        let Some(catalog) = self.catalogs.get(harness).cloned() else {
+            return;
+        };
+        match &mut self.modal {
+            Some(Modal::Harness(editor)) if editor.harness() == harness => {
+                editor.set_catalog(catalog.clone());
+            }
+            Some(Modal::Stage { editor, .. }) if editor.harness() == harness => {
+                editor.set_catalog(catalog.clone());
+            }
+            _ => {}
+        }
+        if let Some(editor) = &mut self.model_editor {
+            if editor.harness() == harness {
+                editor.set_catalog(catalog.clone());
+            }
+        }
+        if let Some((editor, _)) = &mut self.stage_editor {
+            if editor.harness() == harness {
+                editor.set_catalog(catalog);
+            }
+        }
+    }
+    /// Makes `harness`'s catalog available to editors: from the cache now, or
+    /// read in the background without opening a picker.
+    pub(super) fn request_catalog(&mut self, harness: String) {
+        if self.catalogs.contains_key(&harness) {
+            self.push_catalog(&harness);
+            return;
+        }
+        if self.prefetch_queue.contains(&harness)
+            || self.prefetch.as_ref().is_some_and(|(h, _)| *h == harness)
+        {
+            return;
+        }
+        if self.prefetch.is_some() {
+            self.prefetch_queue.push_back(harness);
+            return;
+        }
+        let settings = self.settings.clone();
+        let project = self.project.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.prefetch = Some((harness.clone(), receiver));
+        thread::spawn(move || {
+            let _ = sender.send(
+                catalog::discover(&harness, &settings, &project).map_err(|e| format!("{e:#}")),
+            );
+        });
+    }
     pub(super) fn model_picker(&mut self) {
         self.model_picker_for(self.stage().harness.clone());
     }
     pub(super) fn model_picker_for(&mut self, harness: String) {
         self.catalog_harness = harness.clone();
+        if let Some(catalog) = self.catalogs.get(&harness).cloned() {
+            self.show_catalog(catalog);
+            return;
+        }
         let settings = self.settings.clone();
         let project = self.project.clone();
         let (sender, receiver) = mpsc::channel();
@@ -602,16 +689,31 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         ),
     ]);
     let body_width = area.width.saturating_sub(2);
+    let tabs = header_line(app, palette);
+    let repo = repository_line(app, palette);
+    // Repository sits on the right of the header row when it fits, otherwise
+    // on the right of a second row so it still lines up above the page actions.
+    let beside = tabs.width() + repo.width() + 4 <= area.width as usize;
     let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(if beside { 1 } else { 2 }),
+        Constraint::Length(1), // breathing room between header and page
         Constraint::Min(10),
         Constraint::Length(rows_for(&status, body_width, 2)),
         Constraint::Length(rows_for(&footer, area.width, 2)),
     ])
     .split(area);
-    draw_header(frame, app, chunks[0], palette);
-    draw_repository(frame, app, chunks[1], palette);
+    let header = chunks[0];
+    let row = |y: u16| Rect::new(header.x, header.y + y, header.width, 1);
+    let (repo_area, used) = if beside {
+        (row(0), tabs.width() + 2)
+    } else {
+        (row(1), 0)
+    };
+    frame.render_widget(
+        Paragraph::new(tabs).style(Style::default().bg(palette.bg)),
+        row(0),
+    );
+    draw_repository(frame, app, repo, repo_area, used, palette);
     let body = chunks[2].inner(Margin::new(1, 0));
     match app.page {
         0 => draw_workflow(frame, app, body, palette),
@@ -645,7 +747,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
+fn header_line(app: &App, palette: Palette) -> Line<'static> {
     let mut spans = vec![
         Span::styled(" ◆ ", Style::default().fg(palette.accent)),
         Span::styled(
@@ -667,15 +769,12 @@ fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
             },
         ));
     }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(palette.bg)),
-        area,
-    );
+    Line::from(spans)
 }
 
-/// The project line: repository name and branch first, then the path.
-fn draw_repository(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
-    let mut spans = match &app.repo {
+/// Repository name and branch, or the project directory when not a Git repository.
+fn repository_line(app: &App, palette: Palette) -> Line<'static> {
+    let spans = match &app.repo {
         Some(repo) => {
             let mut spans = vec![
                 Span::styled(" ⎇ ", Style::default().fg(palette.accent)),
@@ -713,16 +812,31 @@ fn draw_repository(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palett
             Span::styled("  not a Git repository", Style::default().fg(palette.muted)),
         ],
     };
-    let used = Line::from(spans.clone()).width();
-    let room = (area.width as usize).saturating_sub(used + 4);
+    Line::from(spans)
+}
+
+/// Right-align the repository line, adding the path when there is room.
+/// `used` is how much of the row the left-hand content already takes.
+fn draw_repository(
+    frame: &mut Frame<'_>,
+    app: &App,
+    mut line: Line<'static>,
+    area: Rect,
+    used: usize,
+    palette: Palette,
+) {
+    let room = (area.width as usize).saturating_sub(used + line.width() + 4);
     if room >= 12 {
-        spans.push(Span::styled(
+        line.spans.push(Span::styled(
             format!("  {}", short_path(&app.project, room)),
             Style::default().fg(palette.muted),
         ));
     }
+    line.spans.push(Span::raw(" "));
+    let width = (line.width() as u16).min(area.width.saturating_sub(used as u16));
+    let x = area.x + area.width - width;
     frame.render_widget(
-        Paragraph::new(Line::from(spans)).style(Style::default().bg(palette.bg)),
-        area,
+        Paragraph::new(line).right_aligned(),
+        Rect::new(x, area.y, width, 1),
     );
 }

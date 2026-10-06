@@ -5,7 +5,7 @@ use super::{
 use crate::providers::Provider;
 use crate::{
     adapters,
-    catalog::Model,
+    catalog::{Catalog, Efforts, Model},
     config::{Mode, Stage},
     harness_settings, storage,
 };
@@ -36,25 +36,14 @@ struct Field {
     help: &'static str,
     text: TextArea<'static>,
 }
-impl Field {
-    fn choices(&self) -> Option<Vec<&'static str>> {
-        match self.kind {
-            FieldKind::Execution => Some(vec!["unattended", "interactive"]),
-            FieldKind::Native(setting) => Some(
-                std::iter::once("")
-                    .chain(setting.choices.iter().copied())
-                    .collect(),
-            ),
-            _ => None,
-        }
-    }
-}
 
 pub(super) struct HarnessEditor {
     stage: Stage,
     providers: BTreeMap<String, Provider>,
     fields: Vec<Field>,
     selected: usize,
+    /// The harness catalog, once read; it supplies the effort choices.
+    catalog: Option<Catalog>,
     pub error: String,
 }
 impl HarnessEditor {
@@ -129,7 +118,85 @@ impl HarnessEditor {
             providers,
             fields,
             selected: 0,
+            catalog: None,
             error: String::new(),
+        }
+    }
+
+    pub fn harness(&self) -> &str {
+        &self.stage.harness
+    }
+
+    pub fn set_catalog(&mut self, catalog: Catalog) {
+        self.catalog = Some(catalog);
+    }
+
+    fn value(&self, kind: fn(&FieldKind) -> bool) -> String {
+        self.fields
+            .iter()
+            .find(|f| kind(&f.kind))
+            .map(|f| content(&f.text).trim().to_owned())
+            .unwrap_or_default()
+    }
+
+    /// Effort levels the catalog reports for the current model selection.
+    fn efforts(&self) -> Option<Efforts> {
+        self.catalog.as_ref()?.efforts_for(
+            &self.value(|k| matches!(k, FieldKind::Model)),
+            &self.value(|k| matches!(k, FieldKind::Provider)),
+        )
+    }
+
+    fn choices(&self, index: usize) -> Option<Vec<String>> {
+        let field = &self.fields[index];
+        match field.kind {
+            FieldKind::Execution => Some(vec!["unattended".into(), "interactive".into()]),
+            FieldKind::Native(setting) => Some(
+                std::iter::once("")
+                    .chain(setting.choices.iter().copied())
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+            FieldKind::Effort => {
+                let mut levels = self.efforts()?.levels;
+                let current = content(&field.text).trim().to_owned();
+                if !current.is_empty() && !levels.contains(&current) {
+                    levels.push(current);
+                }
+                levels.insert(0, String::new());
+                Some(levels)
+            }
+            _ => None,
+        }
+    }
+
+    fn help(&self, index: usize) -> String {
+        let field = &self.fields[index];
+        if !matches!(field.kind, FieldKind::Effort) {
+            return field.help.into();
+        }
+        match self.efforts() {
+            Some(efforts) => {
+                let model = self.value(|k| matches!(k, FieldKind::Model));
+                let mut help = format!(
+                    "Levels from {} for {}.",
+                    efforts.source,
+                    if model.is_empty() {
+                        "any model".to_owned()
+                    } else {
+                        model
+                    }
+                );
+                if !efforts.default.is_empty() {
+                    help.push_str(&format!(" {} is the model's default.", efforts.default));
+                }
+                help.push_str(" Blank inherits the harness default.");
+                help
+            }
+            None if self.catalog.is_none() => {
+                format!("{} Reading the harness catalog for its levels…", field.help)
+            }
+            None => format!("{} The catalog did not list levels.", field.help),
         }
     }
 
@@ -192,8 +259,9 @@ impl HarnessEditor {
                 self.selected = (self.selected + self.fields.len() - 1) % self.fields.len()
             }
             _ => {
+                let choices = self.choices(self.selected);
                 let field = &mut self.fields[self.selected];
-                if let Some(choices) = field.choices() {
+                if let Some(choices) = choices {
                     if matches!(
                         key.code,
                         Key::Left | Key::Right | Key::Char(' ') | Key::Enter
@@ -208,7 +276,7 @@ impl HarnessEditor {
                         } else {
                             (index + 1) % choices.len()
                         };
-                        field.text = textarea(choices[next]);
+                        field.text = textarea(&choices[next]);
                         self.error.clear();
                     }
                 } else if key.code == Key::Enter {
@@ -221,9 +289,10 @@ impl HarnessEditor {
     }
 
     pub fn paste(&mut self, text: &str) {
-        let field = &mut self.fields[self.selected];
-        if field.choices().is_none() {
-            field.text.insert_str(text.replace(['\r', '\n'], " "));
+        if self.choices(self.selected).is_none() {
+            self.fields[self.selected]
+                .text
+                .insert_str(text.replace(['\r', '\n'], " "));
             self.error.clear();
         }
     }
@@ -286,26 +355,45 @@ impl HarnessEditor {
             halves[0],
             &mut ListState::default().with_selected(Some(self.selected)),
         );
+        let choices = self.choices(self.selected);
+        let help = self.help(self.selected);
+        let efforts = self.efforts();
         let field = &mut self.fields[self.selected];
         let detail = Layout::vertical([
             Constraint::Length(
-                field
-                    .choices()
+                choices
+                    .as_ref()
                     .map(|choices| choices.len() as u16 + 2)
                     .unwrap_or(3),
             ),
             Constraint::Min(1),
         ])
         .split(halves[1]);
-        if let Some(choices) = field.choices() {
+        if let Some(choices) = choices {
             let current = content(&field.text);
             let index = choices.iter().position(|v| *v == current).unwrap_or(0);
+            let (listed, default) = match (&field.kind, &efforts) {
+                (FieldKind::Effort, Some(efforts)) => {
+                    (efforts.levels.clone(), efforts.default.clone())
+                }
+                _ => (choices.clone(), String::new()),
+            };
             frame.render_stateful_widget(
                 List::new(choices.iter().map(|value| {
                     ListItem::new(if value.is_empty() {
-                        "Harness default"
+                        Line::raw("Harness default")
+                    } else if !listed.contains(value) {
+                        Line::from(vec![
+                            Span::raw(value.clone()),
+                            Span::styled("  not listed", Style::default().fg(palette.warn)),
+                        ])
+                    } else if *value == default {
+                        Line::from(vec![
+                            Span::raw(value.clone()),
+                            Span::styled("  default", Style::default().fg(palette.muted)),
+                        ])
                     } else {
-                        value
+                        Line::raw(value.clone())
                     })
                 }))
                 .block(palette.panel(format!(" {} ", field.label)))
@@ -323,7 +411,7 @@ impl HarnessEditor {
             frame.render_widget(&field.text, detail[0]);
         }
         frame.render_widget(
-            Paragraph::new(field.help)
+            Paragraph::new(help)
                 .wrap(Wrap { trim: false })
                 .style(Style::default().fg(palette.muted)),
             detail[1],

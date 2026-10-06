@@ -391,7 +391,9 @@ fn stage_editor_model_field_picks_from_catalog_and_keeps_draft() {
                 label: "Model".into(),
                 source: "test".into(),
                 availability: "local".into(),
+                ..Model::default()
             }],
+            ..Catalog::default()
         }))
         .unwrap();
     app.catalog = Some(receiver);
@@ -451,11 +453,21 @@ fn repository_line_follows_the_project() {
     assert_eq!(info.changes, 1);
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-    let line: String = terminal.backend().buffer().content()[120..240]
+    let header: String = terminal.backend().buffer().content()[..240]
         .iter()
         .map(|c| c.symbol())
         .collect();
-    assert!(line.contains("⎇ repo  trunk  ● 1 changed"), "{line}");
+    assert!(header.contains("⎇ repo  trunk  ● 1 changed"), "{header}");
+    // Wide enough: the repository shares the header row, flush right.
+    let row: String = terminal.backend().buffer().content()[..120]
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        row.contains("4 Harnesses") && row.contains("⎇ repo"),
+        "{row}"
+    );
+    assert!(row.trim_end().ends_with("repo"), "{row}");
 }
 
 #[test]
@@ -498,7 +510,9 @@ fn harness_model_catalog_restores_draft_on_cancel_error_and_selection() {
                 label: "Model".into(),
                 source: "test".into(),
                 availability: "local".into(),
+                ..Model::default()
             }],
+            ..Catalog::default()
         }))
         .unwrap();
     app.catalog = Some(receiver);
@@ -638,4 +652,105 @@ fn command_menu_lists_only_actions_for_the_current_context() {
     assert!(menu(&mut app).contains(&ActionId::OpenRun));
     app.page = 3;
     assert!(menu(&mut app).contains(&ActionId::HarnessDetails));
+}
+
+fn screen(terminal: &Terminal<ratatui::backend::TestBackend>) -> String {
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect()
+}
+
+#[test]
+fn effort_levels_come_from_the_harness_catalog_in_both_editors() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    let harness = app.stage().harness.clone();
+    let mut listed = Model {
+        id: "listed-model".into(),
+        efforts: vec!["low".into(), "max".into()],
+        default_effort: "max".into(),
+        source: "fixture cache".into(),
+        ..Model::default()
+    };
+    listed.label = listed.id.clone();
+    app.catalogs.insert(
+        harness.clone(),
+        Catalog {
+            models: vec![listed],
+            efforts: vec!["low".into(), "high".into()],
+            effort_source: "fixture help".into(),
+            ..Catalog::default()
+        },
+    );
+    app.stage_mut().effort = "custom".into();
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+
+    // Workflow detail flags a level the catalog does not list.
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = screen(&terminal);
+    assert!(text.contains("not listed by fixture help"), "{text}");
+
+    // Stage editor: the effort field cycles through harness-wide levels, keeping
+    // the unlisted value selectable, and the catalog arrives from the cache.
+    app.key(key(Key::Char('e'))).unwrap();
+    for _ in 0..5 {
+        app.key(key(Key::Tab)).unwrap();
+    }
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = screen(&terminal);
+    assert!(text.contains("custom  not listed"), "{text}");
+    assert!(
+        text.contains("Levels from fixture help for gpt-6-astra"),
+        "{text}"
+    );
+    app.key(key(Key::Right)).unwrap(); // custom → wraps to Harness default
+    app.key(key(Key::Right)).unwrap(); // low
+    app.key(key(Key::Right)).unwrap(); // high
+    app.key(KeyEvent::new(Key::Char('s'), Mods::CONTROL))
+        .unwrap();
+    assert_eq!(app.stage().effort, "high");
+
+    // Harness editor: a listed model narrows the levels to its own.
+    app.stage_mut().model = "listed-model".into();
+    app.key(key(Key::Char('c'))).unwrap();
+    app.key(key(Key::Tab)).unwrap(); // provider
+    app.key(key(Key::Tab)).unwrap(); // effort
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = screen(&terminal);
+    assert!(text.contains("max  default"), "{text}");
+    assert!(text.contains("high  not listed"), "{text}");
+    assert!(
+        text.contains("Levels from fixture cache for listed-model"),
+        "{text}"
+    );
+    app.key(key(Key::Right)).unwrap(); // high (unlisted, last) → wraps to default
+    app.key(key(Key::Right)).unwrap(); // low
+    app.key(KeyEvent::new(Key::Char('s'), Mods::CONTROL))
+        .unwrap();
+    assert_eq!(app.stage().effort, "low");
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert!(screen(&terminal).contains("listed by fixture cache"));
+
+    // Switching harness in the stage editor clears the levels and asks again.
+    app.key(key(Key::Char('e'))).unwrap();
+    app.key(key(Key::Tab)).unwrap();
+    app.key(key(Key::Tab)).unwrap();
+    app.key(key(Key::Right)).unwrap();
+    let changed = match &app.modal {
+        Some(Modal::Stage { editor, .. }) => editor.harness(),
+        _ => panic!("stage editor expected"),
+    };
+    assert_ne!(changed, harness);
+    app.catalogs.insert(changed.clone(), Catalog::default());
+    app.request_catalog(changed);
+    for _ in 0..3 {
+        app.key(key(Key::Tab)).unwrap();
+    }
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let text = screen(&terminal);
+    assert!(!text.contains("Levels from"), "{text}");
 }
