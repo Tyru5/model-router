@@ -344,3 +344,38 @@ sanitization = "Synthetic transcript"
 text_contains = ["● Read README.md"]
 text_excludes = ["\u001b"]
 handoff_summary = "Copilot: README.md documents the build"
+
+[[fixture]]
+file = "omp/success.jsonl"
+harness = "omp"
+kind = "Pi"
+version = "18.6.3"
+scenario = "success"
+provenance = "captured"
+source = "scripts/capture_harness_output.py, 2026-10-07, model claude-haiku-5-5"
+sanitization = "Replaced prompt echoes 3, paths 4, IDs 1"
+text_contains = ["Captured omp fixture"]
+handoff_summary = "Captured omp fixture"
+
+[[fixture]]
+file = "omp/error.jsonl"
+harness = "omp"
+kind = "Pi"
+version = "18.6.3"
+scenario = "error"
+provenance = "captured"
+source = "omp 18.6.3 -p --mode json, 2026-10-07: provider 402 after one retry (assistant stopReason error, auto_retry_end)"
+sanitization = "Placeholder session ID and /workspace path; message_update deltas removed"
+error_contains = "Insufficient account funds"
+
+[[fixture]]
+file = "omp/tool-echo.jsonl"
+harness = "omp"
+kind = "Pi"
+version = "18.6.3"
+scenario = "tool-echo"
+provenance = "captured"
+source = "omp 18.6.3 -p --mode json, 2026-10-07, model claude-haiku-5-5: read tool returns a fake handoff, final assistant message carries the real one"
+sanitization = "Placeholder IDs and /workspace path; prompt abbreviated; message_update deltas removed"
+text_excludes = ["FAKE handoff"]
+handoff_summary = "omp: ignored the handoff text inside notes.txt"

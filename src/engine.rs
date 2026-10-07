@@ -3,6 +3,7 @@ use crate::{
     adapters::{self, ContextPaths, Invocation},
     checks::{self, CheckResult},
     config::{CustomAdapter, Mode, Role, Settings, Workflow},
+    events,
     handoff::{self, Handoff, TestStatus, Verdict},
     process, snapshot, storage,
 };
@@ -71,6 +72,10 @@ pub struct Attempt {
     /// Tokens and cost the harness reported; None when it reported none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<handoff::Usage>,
+    /// Harness session the router assigned at launch, so the stage can be
+    /// taken over interactively. Codex reports its own in stdout.log instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageState {
@@ -114,6 +119,29 @@ pub struct Run {
     pub repair_feedback: Option<String>,
     pub status: Status,
     pub error: Option<String>,
+    /// The next interactive attempt resumes this harness session instead of
+    /// starting a new one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<Resume>,
+}
+
+/// An unattended attempt's session, reopened in the native interactive CLI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Resume {
+    pub session: String,
+    /// The handoff path the session's original prompt named.
+    pub handoff_file: PathBuf,
+}
+
+/// Where a new run works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    Project,
+    /// A new Git worktree from committed HEAD; refuses uncommitted changes.
+    Worktree,
+    /// A worktree from HEAD although the project has uncommitted changes,
+    /// e.g. another run's edits in progress. Those changes are not included.
+    WorktreeFromHead,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +170,21 @@ impl Run {
         workflow: &Workflow,
         task: String,
         worktree: bool,
+    ) -> Result<Self> {
+        let placement = if worktree {
+            Placement::Worktree
+        } else {
+            Placement::Project
+        };
+        Self::create_at(project, settings, workflow, task, placement)
+    }
+
+    pub fn create_at(
+        project: &Path,
+        settings: &Settings,
+        workflow: &Workflow,
+        task: String,
+        placement: Placement,
     ) -> Result<Self> {
         crate::config::validate_task(&task)?;
         let snapshot = Settings {
@@ -191,8 +234,9 @@ impl Run {
             Utc::now().format("%Y%m%d-%H%M%S"),
             &uuid::Uuid::new_v4().to_string()[..8]
         );
+        let worktree = placement != Placement::Project;
         let workspace = if worktree {
-            storage::create_worktree(&project, &id)?
+            storage::create_worktree(&project, &id, placement == Placement::Worktree)?
         } else {
             project.clone()
         };
@@ -235,6 +279,7 @@ impl Run {
             repair_feedback: None,
             status: Status::Pending,
             error: None,
+            resume: None,
         };
         run.persist()?;
         Ok(run)
@@ -289,6 +334,52 @@ impl Run {
         }
         self.reset(self.cursor);
         self.status = Status::Pending;
+        self.error = None;
+        self.resume = None;
+        Ok(())
+    }
+
+    /// Reopens the current stage's last session in the harness's native
+    /// interactive CLI: an unattended attempt, or an interactive one awaiting
+    /// review. The stage must have stopped; filesystem changes are kept, as
+    /// with retry.
+    pub fn take_over(&mut self) -> Result<()> {
+        ensure!(
+            self.cursor < self.stages.len(),
+            "This run is already complete"
+        );
+        ensure!(
+            matches!(
+                self.status,
+                Status::Failed | Status::Blocked | Status::Cancelled | Status::AwaitingConfirmation
+            ),
+            "Stop the stage before taking it over"
+        );
+        let stage = &self.workflow.stages[self.cursor];
+        ensure!(
+            adapters::resumable(&stage.harness, &self.adapters),
+            "{} sessions cannot be resumed; retry interactively with [i] instead",
+            stage.harness
+        );
+        let attempt = self.stages[self.cursor]
+            .attempts
+            .last()
+            .context("This stage has not run yet")?;
+        let session = attempt
+            .session
+            .clone()
+            .or_else(|| {
+                let head = read_head(&attempt.directory.join("stdout.log"), 256 * 1024).ok()?;
+                handoff::session_id(&head)
+            })
+            .context("The harness did not report a session for this attempt; retry interactively with [i] instead")?;
+        self.resume = Some(Resume {
+            session,
+            handoff_file: attempt.handoff_file.clone(),
+        });
+        self.workflow.stages[self.cursor].mode = Mode::Interactive;
+        self.reset(self.cursor);
+        self.status = Status::Interactive;
         self.error = None;
         Ok(())
     }
@@ -589,27 +680,51 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
         .join("handoffs")
         .join(&run.id);
     fs::create_dir_all(&handoff_dir)?;
-    let handoff_file = handoff_dir.join(format!("{}-{number:03}.json", stage.id));
+    let resume = run.resume.clone();
+    let handoff_file = match &resume {
+        // The resumed session already knows its handoff path.
+        Some(resume) => resume.handoff_file.clone(),
+        None => handoff_dir.join(format!("{}-{number:03}.json", stage.id)),
+    };
     ensure!(
-        !handoff_file.exists(),
+        resume.is_some() || !handoff_file.exists(),
         "Handoff path already exists: {}",
         handoff_file.display()
     );
     let prompt_file = directory.join("prompt.md");
-    let text = prompt(run, &handoff_file);
+    let text = match &resume {
+        Some(resume) => format!(
+            "Interactive takeover of harness session {}. The session's own history holds the stage prompt; write its handoff to {}.\n",
+            resume.session,
+            handoff_file.display()
+        ),
+        None => prompt(run, &handoff_file),
+    };
     storage::atomic_write(&prompt_file, text.as_bytes())?;
-    let invocation = adapters::build(
-        stage,
-        &run.adapters,
-        &run.providers,
-        &text,
-        &ContextPaths {
-            workspace: &run.workspace,
-            attempt_dir: &directory,
-            prompt_file: &prompt_file,
-            handoff_file: &handoff_file,
-        },
-    )?;
+    let paths = ContextPaths {
+        workspace: &run.workspace,
+        attempt_dir: &directory,
+        prompt_file: &prompt_file,
+        handoff_file: &handoff_file,
+    };
+    let (invocation, session) = match &resume {
+        Some(resume) => (
+            adapters::resume(
+                stage,
+                &run.adapters,
+                &run.providers,
+                &resume.session,
+                &paths,
+            )?,
+            Some(resume.session.clone()),
+        ),
+        None => {
+            let mut invocation =
+                adapters::build(stage, &run.adapters, &run.providers, &text, &paths)?;
+            let session = adapters::assign_session(&mut invocation, &stage.harness);
+            (invocation, session)
+        }
+    };
     storage::write_json(
         &directory.join("command.json"),
         &serde_json::json!({ "program": invocation.program, "args": invocation.args, "stdin_from": invocation.stdin.as_ref().map(|_| "prompt.md"), "env": invocation.env.iter().map(|(name, _)| name).collect::<Vec<_>>(), "workspace": run.workspace, "model": stage.model, "provider": stage.provider, "effort": stage.effort, "mode": stage.mode }),
@@ -629,7 +744,9 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
         tree_before: snapshot::tree(&run.workspace, &run.directory),
         tree_after: None,
         usage: None,
+        session,
     });
+    run.resume = None;
     run.stages[index].status = Status::Running;
     run.status = Status::Running;
     run.error = None;
@@ -639,6 +756,13 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
         directory,
         handoff_file,
     })
+}
+
+/// The first `max` bytes of a log, where harnesses report their session.
+fn read_head(path: &Path, max: u64) -> Result<String> {
+    let mut bytes = Vec::new();
+    io::Read::read_to_end(&mut io::Read::take(fs::File::open(path)?, max), &mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn finish(
@@ -683,15 +807,23 @@ fn finish(
         return Ok(());
     }
     if !outcome.success() {
-        let stderr =
-            process::read_tail(&prepared.directory.join("stderr.log"), 3000).unwrap_or_default();
+        // A JSON error event names the cause; stderr often holds only warnings.
+        let reported = (run.workflow.stages[index].mode == Mode::Unattended)
+            .then(|| {
+                process::read_tail(&prepared.directory.join("stdout.log"), 4 * 1024 * 1024).ok()
+            })
+            .flatten()
+            .and_then(|raw| handoff::normalize(&raw, prepared.invocation.kind).error);
+        let detail = match reported {
+            Some(error) => error,
+            None => storage::clean_terminal(
+                &process::read_tail(&prepared.directory.join("stderr.log"), 3000)
+                    .unwrap_or_default(),
+            ),
+        };
         run.fail(
             Status::Failed,
-            format!(
-                "Harness exited with code {:?}. {}",
-                outcome.code,
-                storage::clean_terminal(&stderr)
-            ),
+            format!("Harness exited with code {:?}. {detail}", outcome.code),
         );
         return Ok(());
     }
@@ -770,6 +902,13 @@ fn finish(
         }
     };
     storage::write_json(&prepared.directory.join("handoff.json"), &handoff)?;
+    if role == Role::Summary {
+        // The brief is for a person: keep it readable outside the router.
+        storage::atomic_write(
+            &run.directory.join("review.md"),
+            format!("{}\n", handoff.summary.trim_end()).as_bytes(),
+        )?;
+    }
     // A reported block stops the stage regardless of check results.
     let blocked = handoff.verdict == Verdict::Blocked;
     run.stages[index].handoff = Some(handoff);
@@ -838,6 +977,15 @@ fn execute_stage(
         }
     };
     emit(Event::State(Box::new(run.clone())));
+    let stage = &run.workflow.stages[index];
+    emit(Event::Output(format!(
+        "── {} · attempt {} · {}{}{} ──\n",
+        stage.name,
+        run.stages[index].attempts.len(),
+        stage.harness,
+        if stage.model.is_empty() { "" } else { " " },
+        stage.model
+    )));
     let result = if interactive {
         process::interactive(
             &prepared.invocation,
@@ -846,20 +994,29 @@ fn execute_stage(
             cancel,
         )
     } else {
-        process::capture(
+        // Events become readable lines; stdout.log keeps them raw.
+        let mut formatter = events::Formatter::new(prepared.invocation.kind);
+        let result = process::capture(
             &prepared.invocation,
             &run.workspace,
             &prepared.directory,
             Duration::from_secs(run.workflow.stages[run.cursor].timeout_seconds),
             cancel,
             |err, text| {
-                emit(Event::Output(format!(
-                    "{}{}",
-                    if err { "[stderr] " } else { "" },
-                    storage::clean_terminal(text)
-                )))
+                if err {
+                    emit(Event::Output(format!(
+                        "[stderr] {}",
+                        storage::clean_terminal(text)
+                    )));
+                } else if let Some(lines) = formatter.push(text) {
+                    emit(Event::Output(lines));
+                }
             },
-        )
+        );
+        if let Some(rest) = formatter.finish() {
+            emit(Event::Output(rest));
+        }
+        result
     };
     if let Err(error) = finish(run, &prepared, result, cancel, emit) {
         run.fail(
@@ -1065,6 +1222,49 @@ pub fn ensure_runnable(run: &Run) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::{Check, Stage};
+
+    #[test]
+    fn take_over_reopens_the_stopped_attempts_session() {
+        let mut run = crate::report::tests::sample();
+        run.cursor = 0;
+        assert!(
+            run.take_over().is_err(),
+            "a stage must stop before it is taken over"
+        );
+        run.status = Status::Cancelled;
+        let attempt = run.stages[0].attempts.last_mut().unwrap();
+        attempt.session = Some("s-1".into());
+        let handoff_file = attempt.handoff_file.clone();
+        run.take_over().unwrap();
+        assert_eq!(run.status, Status::Interactive);
+        assert_eq!(run.workflow.stages[0].mode, Mode::Interactive);
+        let resume = run.resume.clone().unwrap();
+        assert_eq!(
+            (resume.session.as_str(), resume.handoff_file),
+            ("s-1", handoff_file)
+        );
+        run.retry(false, None).unwrap();
+        assert!(run.resume.is_none(), "retry starts a new session");
+
+        // Codex reports its thread in the attempt's log.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("stdout.log"),
+            "{\"type\":\"thread.started\",\"thread_id\":\"t-1\"}\n",
+        )
+        .unwrap();
+        run.workflow.stages[0].harness = "codex".into();
+        run.status = Status::Failed;
+        let attempt = run.stages[0].attempts.last_mut().unwrap();
+        attempt.session = None;
+        attempt.directory = dir.path().into();
+        run.take_over().unwrap();
+        assert_eq!(run.resume.as_ref().unwrap().session, "t-1");
+
+        run.status = Status::Failed;
+        run.workflow.stages[0].harness = "gemini".into();
+        assert!(run.take_over().is_err());
+    }
 
     const NOT_APPLICABLE: &str = r#"{"summary":"Docs only","verdict":"complete","tests":[],"not_applicable":"No code changed"}"#;
 

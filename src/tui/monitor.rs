@@ -6,7 +6,7 @@ use super::{
     theme::Palette,
     widgets::{elapsed, empty_state, short_path},
 };
-use crate::{engine::Status, storage};
+use crate::{adapters, config::Mode, engine::Status, storage};
 use anyhow::{Context, Result, bail, ensure};
 use ratatui::{
     Frame,
@@ -15,29 +15,67 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Cell, HighlightSpacing, Paragraph, Row, Table, TableState, Wrap},
 };
-use std::sync::atomic::Ordering;
+use std::{collections::VecDeque, sync::atomic::Ordering};
 
 impl App {
     pub(super) fn perform_monitor(&mut self, id: ActionId) -> Result<()> {
         match id {
             ActionId::CancelStage => {
-                self.cancel.store(true, Ordering::Relaxed);
+                self.focused.cancel.store(true, Ordering::Relaxed);
                 self.message = "Stopping stage…".into();
             }
+            ActionId::TakeOver => {
+                let run = self.focused.run.as_ref().context("No run selected")?;
+                let stage = run
+                    .workflow
+                    .stages
+                    .get(run.cursor)
+                    .context("Run is complete")?;
+                ensure!(
+                    adapters::resumable(&stage.harness, &run.adapters),
+                    "{} sessions cannot be resumed; [i] retries the stage interactively",
+                    stage.harness
+                );
+                if self.focused.worker.is_some() {
+                    ensure!(
+                        stage.mode == Mode::Unattended,
+                        "This stage is already interactive"
+                    );
+                    self.focused.takeover = true;
+                    self.focused.cancel.store(true, Ordering::Relaxed);
+                    self.message = "Stopping the unattended stage to open its session…".into();
+                } else {
+                    self.focused.run.as_mut().context("No run")?.take_over()?;
+                    self.launch_interactive = true;
+                }
+            }
+            ActionId::PreviousSessionRun => self.cycle_focus(false),
+            ActionId::NextSessionRun => self.cycle_focus(true),
+            ActionId::CloseRun => {
+                self.dismiss()?;
+                self.message = "Run closed here; Runs [3] reopens it.".into();
+            }
             ActionId::ScrollUp if self.results_shown() => {
-                self.results_scroll = self.results_scroll.saturating_sub(5)
+                self.focused.results_scroll = self.focused.results_scroll.saturating_sub(5)
             }
             ActionId::ScrollDown if self.results_shown() => {
-                self.results_scroll = self.results_scroll.saturating_add(5)
+                self.focused.results_scroll = self.focused.results_scroll.saturating_add(5)
             }
+            // Wrapped lines can outnumber log entries; drawing clamps the offset.
             ActionId::ScrollUp => {
-                self.log_scroll = self.log_scroll.saturating_add(10).min(self.logs.len())
+                self.focused.log_scroll = self
+                    .focused
+                    .log_scroll
+                    .saturating_add(10)
+                    .min(self.focused.logs.len() * 4)
             }
-            ActionId::ScrollDown => self.log_scroll = self.log_scroll.saturating_sub(10),
+            ActionId::ScrollDown => {
+                self.focused.log_scroll = self.focused.log_scroll.saturating_sub(10)
+            }
             ActionId::Diff => self.show_diff()?,
             ActionId::ToggleResults => self.toggle_results()?,
             ActionId::Handoff => {
-                let run = self.run.as_ref().context("No run selected")?;
+                let run = self.focused.run.as_ref().context("No run selected")?;
                 let index = run.cursor.min(run.stages.len().saturating_sub(1));
                 let handoff = run.stages[index]
                     .handoff
@@ -57,19 +95,29 @@ impl App {
             }
             ActionId::Continue => self.start_driver()?,
             ActionId::Advance => {
-                self.run.as_mut().context("No run")?.confirm()?;
+                self.focused.run.as_mut().context("No run")?.confirm()?;
                 self.start_driver()?;
             }
             ActionId::Retry => {
-                self.run.as_mut().context("No run")?.retry(false, None)?;
+                self.focused
+                    .run
+                    .as_mut()
+                    .context("No run")?
+                    .retry(false, None)?;
                 self.start_driver()?;
             }
             ActionId::RetryInteractive => {
-                self.run.as_mut().context("No run")?.retry(true, None)?;
-                self.start_driver()?;
+                let run = self.focused.run.as_mut().context("No run")?;
+                // A stage already waiting for the terminal opens as it is.
+                if run.status == Status::Interactive {
+                    self.launch_interactive = true;
+                } else {
+                    run.retry(true, None)?;
+                    self.start_driver()?;
+                }
             }
             ActionId::ReplaceModel => {
-                let run = self.run.as_ref().context("No run")?;
+                let run = self.focused.run.as_ref().context("No run")?;
                 let stage = run
                     .workflow
                     .stages
@@ -82,7 +130,7 @@ impl App {
                 );
             }
             ActionId::EditSummary => {
-                let run = self.run.as_ref().context("No run")?;
+                let run = self.focused.run.as_ref().context("No run")?;
                 ensure!(
                     run.status == Status::AwaitingConfirmation,
                     "Only interactive handoffs can be edited"
@@ -105,8 +153,78 @@ impl App {
     }
 }
 
+/// One line listing this session's runs when there is more than one;
+/// false when there is nothing to list.
+fn draw_session(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) -> bool {
+    if app.slots().nth(1).is_none() {
+        return false;
+    }
+    let mut spans = vec![Span::styled("[ ] ", Style::default().fg(palette.accent))];
+    for (index, (slot, focused)) in app.slots().enumerate() {
+        let Some(run) = &slot.run else { continue };
+        let label = format!(
+            " {} {} · {} ",
+            index + 1,
+            run.workflow.name,
+            run.current_name()
+        );
+        spans.push(if focused {
+            Span::styled(label, palette.selected_style())
+        } else {
+            Span::styled(label, Style::default().fg(palette.muted))
+        });
+        spans.push(palette.status_span(run.status));
+        spans.push(Span::raw("  "));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    true
+}
+
+/// Output lines wrapped to `width` columns and coloured by what they show:
+/// stage headers, assistant text, tool calls, results, and errors.
+fn output_lines(logs: &VecDeque<String>, width: usize, palette: Palette) -> Vec<Line<'static>> {
+    let width = width.max(10);
+    let mut lines = Vec::new();
+    let mut style = Style::default().fg(palette.muted);
+    for log in logs {
+        style = if log.starts_with("── ") {
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD)
+        } else if log.starts_with("● ") {
+            Style::default().fg(palette.fg)
+        } else if log.starts_with("⚙ ") || log.starts_with("$ ") || log.starts_with("⌕ ") {
+            Style::default().fg(palette.blue)
+        } else if log.starts_with("✎ ") {
+            Style::default().fg(palette.warn)
+        } else if log.starts_with("✓ ") {
+            Style::default().fg(palette.success)
+        } else if log.starts_with("✗ ") || log.starts_with("[stderr]") || log.contains("↳ ✗")
+        {
+            Style::default().fg(palette.red)
+        } else if log.starts_with("∴ ") {
+            Style::default()
+                .fg(palette.muted)
+                .add_modifier(Modifier::ITALIC)
+        } else if log.starts_with("  ") && !log.starts_with("  ↳") {
+            // A message's later lines keep its style.
+            style
+        } else {
+            Style::default().fg(palette.muted)
+        };
+        let chars: Vec<char> = log.chars().collect();
+        if chars.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        for row in chars.chunks(width) {
+            lines.push(Line::styled(row.iter().collect::<String>(), style));
+        }
+    }
+    lines
+}
+
 pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
-    let Some(run) = &app.run else {
+    let Some(run) = &app.focused.run else {
         empty_state(
             frame,
             palette,
@@ -142,10 +260,12 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
         ])),
         chunks[0],
     );
+    let listed = draw_session(frame, app, chunks[1], palette);
     if app.results_shown() {
+        let top = if listed { chunks[2].y } else { chunks[1].y };
         let rest = Rect {
-            y: chunks[1].y,
-            height: area.height.saturating_sub(chunks[1].y - area.y),
+            y: top,
+            height: area.height.saturating_sub(top - area.y),
             ..area
         };
         draw_completion(frame, app, run, rest, palette);
@@ -207,10 +327,8 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
     let cols = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(chunks[3]);
     let visible = cols[0].height.saturating_sub(2) as usize;
-    let end = app.logs.len().saturating_sub(app.log_scroll);
-    let start = end.saturating_sub(visible);
     let output_block = palette.panel_with("Output", &[("PgUp/PgDn", "scroll")]);
-    if app.logs.is_empty() {
+    if app.focused.logs.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::styled(
                 "Harness output appears here. Some harnesses emit their final response only when the stage finishes. Full logs are saved on disk.",
@@ -221,18 +339,19 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
             cols[0],
         );
     } else {
+        let lines = output_lines(
+            &app.focused.logs,
+            cols[0].width.saturating_sub(2) as usize,
+            palette,
+        );
+        let scroll = app
+            .focused
+            .log_scroll
+            .min(lines.len().saturating_sub(visible));
+        let end = lines.len() - scroll;
+        let start = end.saturating_sub(visible);
         frame.render_widget(
-            Paragraph::new(
-                app.logs
-                    .iter()
-                    .skip(start)
-                    .take(end - start)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            )
-            .block(output_block)
-            .style(Style::default().fg(palette.muted)),
+            Paragraph::new(lines[start..end].to_vec()).block(output_block),
             cols[0],
         );
     }

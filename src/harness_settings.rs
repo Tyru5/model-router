@@ -78,9 +78,20 @@ const GEMINI: &[Setting] = &[Setting {
     conflicts: &["--yolo", "-y"],
 }];
 
+const OMP: &[Setting] = &[Setting {
+    key: "approval_mode",
+    label: "Approval mode",
+    choices: &["always-ask", "write", "yolo"],
+    help: "always-ask: prompt before tools run. write: approve edits automatically. yolo: approve all tool calls. Unattended runs cannot answer prompts.",
+    flag: "--approval-mode",
+    config_key: None,
+    conflicts: &["--auto-approve"],
+}];
+
 pub fn settings(harness: &str) -> &'static [Setting] {
     match harness {
         "codex" => CODEX,
+        "omp" => OMP,
         "claude" => CLAUDE,
         "cursor" => CURSOR,
         "gemini" => GEMINI,

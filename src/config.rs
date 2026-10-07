@@ -8,7 +8,8 @@ use std::{
 };
 
 pub const BUILTINS: &[&str] = &[
-    "codex", "claude", "pi", "cursor", "gemini", "opencode", "aider", "goose", "amp", "copilot",
+    "codex", "claude", "pi", "omp", "cursor", "gemini", "opencode", "aider", "goose", "amp",
+    "copilot",
 ];
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,16 +36,19 @@ pub enum Role {
     Implementation,
     Review,
     Test,
+    /// Summarizes the run's work for the person reviewing it.
+    Summary,
     #[default]
     Custom,
 }
 impl Role {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Research,
         Self::Planning,
         Self::Implementation,
         Self::Review,
         Self::Test,
+        Self::Summary,
         Self::Custom,
     ];
     pub fn label(self) -> &'static str {
@@ -54,6 +58,7 @@ impl Role {
             Self::Implementation => "implementation",
             Self::Review => "review",
             Self::Test => "test",
+            Self::Summary => "summary",
             Self::Custom => "custom",
         }
     }
@@ -144,6 +149,7 @@ impl Default for Workflow {
             instructions: "Implement the task using the prior findings. Follow project conventions, run appropriate checks, and report what changed and any remaining issues.".into(), ..Stage::default() },
         Stage { id: "review".into(), name: "Review (optional)".into(), role: Role::Review, enabled: false, model: "gpt-6-astra".into(),
             instructions: "Review the implementation and test evidence. Do not modify code. Distinguish blocking correctness issues and failed required checks from advisory suggestions. Give an explicit pass or needs_changes verdict.".into(), ..Stage::default() },
+        crate::presets::stage("summary").build(),
     ] }
     }
 }

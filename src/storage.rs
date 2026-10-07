@@ -148,9 +148,11 @@ pub fn git(project: &Path, args: &[&str]) -> Result<String> {
         .to_owned())
 }
 
-pub fn create_worktree(project: &Path, id: &str) -> Result<PathBuf> {
+/// A worktree on a new branch from HEAD. `require_clean` refuses when the
+/// project has uncommitted changes, which the worktree would not include.
+pub fn create_worktree(project: &Path, id: &str, require_clean: bool) -> Result<PathBuf> {
     ensure!(
-        git(project, &["status", "--porcelain"])?.is_empty(),
+        !require_clean || git(project, &["status", "--porcelain"])?.is_empty(),
         "Worktree mode starts from committed HEAD. Commit or stash project changes, or use the current directory instead"
     );
     let base = metadata_dir(project)?.join("worktrees");

@@ -79,6 +79,9 @@ const CLAUDE_ALIASES: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
 const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 const CODEX_EFFORTS: [&str; 5] = ["minimal", "low", "medium", "high", "xhigh"];
 const PI_THINKING: [&str; 6] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+const OMP_THINKING: [&str; 8] = [
+    "off", "minimal", "low", "medium", "high", "xhigh", "max", "auto",
+];
 
 /// The text of one `--flag` entry in a clap/commander style help page.
 fn help_option(help: &str, flag: &str) -> Option<String> {
@@ -322,6 +325,18 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
             effort_source = "Pi thinking levels".into();
             "Pi lists models from configured providers and extensions, with whether each supports thinking. Exact provider/model selections avoid fuzzy routing.".into()
         }
+        "omp" => {
+            let output = query(
+                harness,
+                vec!["models".into(), "--json".into()],
+                &settings.adapters,
+                project,
+            )?;
+            models.extend(parse_omp_models(&output)?);
+            efforts = strings(&OMP_THINKING);
+            effort_source = "omp thinking levels".into();
+            "omp lists chat models from its configured providers, with each model's thinking levels. The router passes provider/model as omp's --model selector.".into()
+        }
         "opencode" => {
             let output = query(harness, vec!["models".into()], &settings.adapters, project)?;
             for line in output.lines().map(str::trim) {
@@ -437,10 +452,66 @@ pub fn detect_project(start: &Path) -> Result<std::path::PathBuf> {
     Ok(start)
 }
 
+/// Chat models from `omp models --json`, with each model's thinking levels.
+fn parse_omp_models(output: &str) -> Result<Vec<Model>> {
+    let listed: serde_json::Value =
+        serde_json::from_str(output).context("omp models --json was not JSON")?;
+    Ok(listed["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|model| {
+            model["kind"] == "chat" && model["id"].as_str().is_some_and(|id| !id.is_empty())
+        })
+        .map(|model| {
+            let field = |key: &str| model[key].as_str().unwrap_or_default();
+            let mut m = entry(
+                field("id"),
+                "omp model catalog",
+                "configured provider; entitlement not checked",
+            );
+            m.provider = field("provider").into();
+            m.efforts = model["thinking"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|level| level.as_str().map(str::to_owned))
+                .collect();
+            m
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn omp_catalog_keeps_chat_models_with_provider_and_thinking() {
+        let output = r#"{"models":[
+            {"provider":"cursor","kind":"chat","id":"claude-haiku-5-5","selector":"cursor/claude-haiku-5-5","thinking":["low","high"]},
+            {"provider":"openai","kind":"embedding","id":"text-embed","thinking":[]},
+            {"provider":"zai","kind":"chat","id":"glm","thinking":null}
+        ]}"#;
+        let models = parse_omp_models(output).unwrap();
+        let ids: Vec<_> = models
+            .iter()
+            .map(|m| (m.provider.as_str(), m.id.as_str(), m.efforts.clone()))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                (
+                    "cursor",
+                    "claude-haiku-5-5",
+                    vec!["low".to_owned(), "high".to_owned()]
+                ),
+                ("zai", "glm", vec![])
+            ]
+        );
+        assert!(parse_omp_models("not json").is_err());
+    }
 
     #[test]
     fn claude_help_yields_aliases_and_effort_levels() {

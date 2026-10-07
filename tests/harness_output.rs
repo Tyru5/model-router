@@ -228,6 +228,10 @@ fn doctor_reports_versions_and_flags_from_help_without_running_a_model() {
                 "--help",
                 "  -m, --model <MODEL>\n  -c, --config <key=value>\n      --oss\n      --local-provider <P>\n  -s, --sandbox <MODE>",
             ),
+            (
+                "resume --help",
+                "Usage: codex resume [OPTIONS] [SESSION_ID]\n  -m, --model <MODEL>\n  -c, --config <key=value>\n      --oss\n      --local-provider <P>\n  -s, --sandbox <MODE>",
+            ),
         ],
     );
     shell_harness(
@@ -238,7 +242,7 @@ fn doctor_reports_versions_and_flags_from_help_without_running_a_model() {
             ("--version", "2.1.289 (Claude Code)"),
             (
                 "--help",
-                "  -p, --print       Print response and exit\n  --output-format <format>  Output format\n  --model <model>   Model\n  --effort <level>  Effort\n  --permission-mode <mode>  Mode",
+                "  -p, --print       Print response and exit\n  --output-format <format>  Output format\n  --verbose  Verbose\n  --session-id <uuid>  Session\n  -r, --resume [value]  Resume\n  --model <model>   Model\n  --effort <level>  Effort\n  --permission-mode <mode>  Mode",
             ),
         ],
     );
@@ -251,6 +255,10 @@ fn doctor_reports_versions_and_flags_from_help_without_running_a_model() {
             (
                 "--help",
                 "  -m, --mode <value>\n  -x, --execute [message]\n  --stream-json\n      Stream JSON",
+            ),
+            (
+                "threads --help",
+                "Commands:\n  continue  Continue an existing thread\nGlobal options:\n  -m, --mode <value>",
             ),
         ],
     );

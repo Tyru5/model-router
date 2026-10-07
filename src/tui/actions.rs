@@ -47,6 +47,10 @@ pub(super) enum ActionId {
     SaveGlobal,
     // Monitor
     CancelStage,
+    TakeOver,
+    PreviousSessionRun,
+    NextSessionRun,
+    CloseRun,
     Advance,
     Continue,
     Retry,
@@ -260,6 +264,11 @@ const ACTIONS: &[Entry] = {
         act(SaveGlobal, Workflow, ch('S'), "save global", "Save global templates"),
         // Monitor: while running, while idle, or both
         act(CancelStage, MonitorRunning, ch('c'), "cancel stage", "Cancel active stage").footer(),
+        act(TakeOver, Monitor, ch('t'), "take over", "Open the stage's session in its native terminal (Claude Code, Codex, Pi, Cursor, OpenCode, Amp); stops it first if unattended")
+            .footer_in(&[MonitorRunning]),
+        act(PreviousSessionRun, Monitor, ch('['), "runs", "Show the previous run of this session").alias("[ ]").footer_in(&[MonitorRunning]),
+        act(NextSessionRun, Monitor, ch(']'), "runs", "Show the next run of this session").alias("[ ]").footer_in(&[MonitorRunning]),
+        act(CloseRun, MonitorIdle, ch('x'), "close", "Close this run in the session; its files stay and Runs [3] reopens it"),
         act(Advance, MonitorIdle, ch('a'), "advance", "Accept handoff and advance; also accepts a test stage's not-applicable waiver").footer(),
         act(Continue, MonitorIdle, ch('c'), "continue", "Continue the run when idle").footer(),
         act(Retry, MonitorIdle, ch('y'), "retry", "Explicitly retry current stage").footer(),
@@ -500,7 +509,7 @@ mod tests {
         );
         assert_eq!(
             shown(Scope::MonitorRunning),
-            "c cancel stage, h handoff, PgUp/PgDn scroll, Tab switch view, T themes, q quit, : commands"
+            "c cancel stage, t take over, [ ] runs, h handoff, PgUp/PgDn scroll, Tab switch view, T themes, q quit, : commands"
         );
         assert_eq!(
             shown(Scope::MonitorIdle),

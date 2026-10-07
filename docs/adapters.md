@@ -6,15 +6,16 @@ model entitlement database.
 
 | Adapter | Reference | Integration detail |
 | --- | --- | --- |
-| Codex | Installed `codex exec --help` and model-cache metadata | `--model`, `--config model_reasoning_effort`, JSON events, `--output-last-message`; interactive prompt is positional. |
-| Claude Code | Installed `claude --help`; [model configuration](https://code.claude.com/docs/en/model-config) | `--print --output-format json`, stdin prompt, `--model`, `--effort`; explicit permission denials are handled. |
-| Pi | Installed `pi --help`; [CLI source/documentation](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) | `--print --mode json`, `@prompt-file`, `--provider`, `--model`, `--thinking`. Provider catalogs include extension-defined models. |
-| Cursor Agent | Installed `cursor-agent --help`; [CLI documentation](https://cursor.com/docs/cli/overview) | Print-mode JSON and account model listing. Uses `cursor-agent` when installed, otherwise `agent`. |
+| Codex | Installed `codex exec --help` and model-cache metadata | `--model`, `--config model_reasoning_effort`, JSON events, `--output-last-message`; interactive prompt is positional. Takeover runs `codex resume THREAD_ID`. |
+| Claude Code | Installed `claude --help`; [model configuration](https://code.claude.com/docs/en/model-config) | `--print --output-format stream-json --verbose`, stdin prompt, `--model`, `--effort`, `--session-id` (unattended and interactive) for takeover with `--resume`; explicit permission denials are handled. |
+| Pi | Installed `pi --help`; [CLI source/documentation](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) | `--print --mode json`, `@prompt-file`, `--provider`, `--model`, `--thinking`. Provider catalogs include extension-defined models. Takeover: router-chosen `--session-id`. |
+| omp (oh-my-pi) | Installed `omp --help` and `omp models --json` | `--print --mode json` (Pi's event format), `@prompt-file`, `--model provider/model`, `--thinking`, `--approval-mode`. Catalog from `omp models --json`, with per-model thinking levels. Takeover: `omp --resume ID` from its `session` event. |
+| Cursor Agent | Installed `cursor-agent --help`; [CLI documentation](https://cursor.com/docs/cli/overview) | Print-mode JSON and account model listing. Uses `cursor-agent` when installed, otherwise `agent`. Unattended uses `--output-format stream-json`; takeover `--resume ID`. |
 | Gemini CLI | [Headless reference](https://geminicli.com/docs/cli/headless/) and [CLI reference](https://geminicli.com/docs/cli/cli-reference/) | `--prompt`, JSON `response`, native `--model`; interactive uses `--prompt-interactive`. |
-| OpenCode | Installed `opencode run --help`; [CLI reference](https://opencode.ai/docs/cli/) | `run --format json`; `run --interactive` for terminal mode. `--model provider/model` and `--variant`. OpenCode 2.x removed `run --interactive` and `--variant`; `doctor` reports both. |
+| OpenCode | Installed `opencode run --help`; [CLI reference](https://opencode.ai/docs/cli/) | `run --format json`; `run --interactive` for terminal mode. `--model provider/model` and `--variant`. OpenCode 2.x removed `run --interactive` and `--variant`; `doctor` reports both. Takeover: `opencode --session ID`. |
 | Aider | [Scripting](https://aider.chat/docs/scripting.html) and [options](https://aider.chat/docs/config/options.html) | `--message-file` unattended; interactive `--read` plus `--load` command file. Disable auto/dirty commits. |
 | Goose | [CLI command reference](https://github.com/aaif-goose/goose/blob/main/documentation/docs/guides/goose-cli-commands.md) | `run --text`, `--provider`, `--model`; `--interactive` continues the conversation. |
-| Amp | Installed `amp --help`; [modes](https://ampcode.com/docs/models-and-subagents) | `--execute --stream-json` reads stdin. `--mode` selects a mode, which can change its underlying model. |
+| Amp | Installed `amp --help`; [modes](https://ampcode.com/docs/models-and-subagents) | `--execute --stream-json` reads stdin. `--mode` selects a mode, which can change its underlying model. Takeover: `amp threads continue ID`. |
 | Copilot CLI | [Command reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference) | `--prompt` or `--interactive`, plus `--model`. Programmatic tool permissions must be explicitly configured by the user. |
 
 The router uses native authentication and forwards explicit user arguments.

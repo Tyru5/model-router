@@ -72,53 +72,59 @@ fn load(run: &Run) -> Loaded {
 impl App {
     /// Whether the Monitor shows results rather than the output log.
     pub(super) fn results_shown(&self) -> bool {
-        self.worker.is_none() && !self.show_output && self.run.as_ref().is_some_and(finished)
+        self.focused.worker.is_none()
+            && !self.focused.show_output
+            && self.focused.run.as_ref().is_some_and(finished)
     }
 
     fn loaded(&self) -> Option<&Loaded> {
-        let run = self.run.as_ref()?;
-        self.changes.as_ref().filter(|l| l.key == key(run))
+        let run = self.focused.run.as_ref()?;
+        self.focused.changes.as_ref().filter(|l| l.key == key(run))
     }
 
     /// Collects finished Git work, starts it for a newly finished run, and
     /// announces a pending waiver once per checkpoint.
     pub(super) fn poll_completion(&mut self) {
-        if let Some((_, receiver)) = &self.changes_job {
+        if let Some((_, receiver)) = &self.focused.changes_job {
             match receiver.try_recv() {
                 Ok(loaded) => {
-                    self.changes = Some(loaded);
-                    self.changes_job = None;
+                    self.focused.changes = Some(loaded);
+                    self.focused.changes_job = None;
                 }
-                Err(TryRecvError::Disconnected) => self.changes_job = None,
+                Err(TryRecvError::Disconnected) => self.focused.changes_job = None,
                 Err(TryRecvError::Empty) => {}
             }
         }
-        let Some(run) = &self.run else { return };
+        let Some(run) = &self.focused.run else { return };
         if let Some(reason) = run.pending_waiver() {
             let shown = format!("{} {}", run.id, run.revision);
-            if self.waiver_shown != shown {
+            if self.focused.waiver_shown != shown {
                 self.message = format!(
                     "The test stage reported verification is not applicable: {}. [a] accepts without checks; [y] retries.",
                     storage::clean_terminal(reason)
                 );
-                self.waiver_shown = shown;
+                self.focused.waiver_shown = shown;
             }
         }
-        if self.worker.is_some() || !finished(run) {
+        if self.focused.worker.is_some() || !finished(run) {
             return;
         }
         let key = key(run);
-        let current = self.changes.as_ref().is_some_and(|l| l.key == key)
-            || self.changes_job.as_ref().is_some_and(|(k, _)| *k == key);
+        let current = self.focused.changes.as_ref().is_some_and(|l| l.key == key)
+            || self
+                .focused
+                .changes_job
+                .as_ref()
+                .is_some_and(|(k, _)| *k == key);
         if current {
             return;
         }
         // A newly finished run opens on its results.
-        self.show_output = false;
-        self.results_scroll = 0;
+        self.focused.show_output = false;
+        self.focused.results_scroll = 0;
         let run = run.clone();
         let (sender, receiver) = mpsc::channel();
-        self.changes_job = Some((key, receiver));
+        self.focused.changes_job = Some((key, receiver));
         thread::spawn(move || {
             let _ = sender.send(load(&run));
         });
@@ -126,16 +132,16 @@ impl App {
 
     pub(super) fn toggle_results(&mut self) -> Result<()> {
         ensure!(
-            self.worker.is_none() && self.run.as_ref().is_some_and(finished),
+            self.focused.worker.is_none() && self.focused.run.as_ref().is_some_and(finished),
             "Results appear when the run finishes"
         );
-        self.show_output = !self.show_output;
+        self.focused.show_output = !self.focused.show_output;
         Ok(())
     }
 
     pub(super) fn show_diff(&mut self) -> Result<()> {
         ensure!(
-            self.worker.is_none() && self.run.as_ref().is_some_and(finished),
+            self.focused.worker.is_none() && self.focused.run.as_ref().is_some_and(finished),
             "The diff is available when the run finishes"
         );
         let Some(loaded) = self.loaded() else {
@@ -259,6 +265,29 @@ fn changes_lines(
         }
         _ => {}
     }
+    lines
+}
+
+/// The review summary stage's Markdown brief, with headings emphasized.
+fn review_lines(report: &RunReport, palette: Palette) -> Vec<Line<'static>> {
+    let Some(review) = &report.review else {
+        return vec![];
+    };
+    let mut lines = vec![Line::styled("Review summary", palette.header_style())];
+    for line in storage::clean_terminal(review).lines() {
+        let heading = line.trim_start_matches('#');
+        lines.push(if heading.len() < line.len() {
+            Line::styled(
+                heading.trim().to_owned(),
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Line::styled(line.to_owned(), Style::default().fg(palette.fg))
+        });
+    }
+    lines.push(Line::raw(""));
     lines
 }
 
@@ -412,10 +441,20 @@ pub(super) fn draw_completion(
         chunks[1],
     );
     let loaded = app.loaded();
-    let changes = changes_lines(loaded, &report, palette);
+    // The review brief leads: it is what the person reads first.
+    let mut changes = review_lines(&report, palette);
+    changes.extend(changes_lines(loaded, &report, palette));
+    let left = if report.review.is_some() {
+        "Review summary · Changes"
+    } else {
+        "Changes"
+    };
     let findings = findings_lines(&report, palette);
     let mut panel = |title: &str, lines: Vec<Line<'static>>, keys: &[(&str, &str)], rect: Rect| {
-        let scroll = app.results_scroll.min(lines.len().saturating_sub(1) as u16);
+        let scroll = app
+            .focused
+            .results_scroll
+            .min(lines.len().saturating_sub(1) as u16);
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
@@ -424,11 +463,10 @@ pub(super) fn draw_completion(
             rect,
         );
     };
-    let keys: &[(&str, &str)] = &[("d", "diff"), ("o", "output")];
     if chunks[2].width >= 110 {
         let cols = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
             .split(chunks[2]);
-        panel("Changes", changes, keys, cols[0]);
+        panel(left, changes, &[("d", "diff"), ("o", "output")], cols[0]);
         panel(
             "Checks · Unresolved",
             findings,
@@ -463,7 +501,7 @@ mod tests {
             dir.join("model-router-test-config.toml"),
             Arc::new(AtomicBool::new(false)),
         );
-        app.run = Some(run);
+        app.focused.run = Some(run);
         app.page = 1;
         app
     }
@@ -503,7 +541,7 @@ mod tests {
         assert!(app.results_shown());
         let text = screen(&mut app, 80, 24);
         assert!(text.contains("Computing changes…"), "{text}");
-        app.changes = Some(tracked());
+        app.focused.changes = Some(tracked());
         for (width, height) in [(80, 24), (120, 36)] {
             let text = screen(&mut app, width, height);
             for expected in [
@@ -545,8 +583,8 @@ mod tests {
         run.status = Status::Failed;
         run.error = Some("Required check failed".into());
         let mut app = app(run);
-        app.changes = Some(Loaded {
-            key: key(app.run.as_ref().unwrap()),
+        app.focused.changes = Some(Loaded {
+            key: key(app.focused.run.as_ref().unwrap()),
             changes: Changes::NotGit,
             patch: Err("Changes are unavailable (not a Git repository)".into()),
         });
@@ -568,7 +606,7 @@ mod tests {
         app.show_diff().unwrap();
         assert_eq!(app.message, "Computing changes…");
         assert!(app.modal.is_none());
-        app.changes = Some(tracked());
+        app.focused.changes = Some(tracked());
         app.show_diff().unwrap();
         assert!(
             matches!(&app.modal, Some(super::super::modal::Modal::Text { body, .. }) if body.contains("+fresh line"))
@@ -581,7 +619,7 @@ mod tests {
         assert!(app.results_shown());
         let mut running = sample();
         running.status = Status::AwaitingConfirmation;
-        app.run = Some(running);
+        app.focused.run = Some(running);
         assert!(app.toggle_results().is_err());
         assert!(app.show_diff().is_err());
     }
@@ -594,16 +632,16 @@ mod tests {
         run.workspace = dir.path().into();
         run.directory = dir.path().join("run");
         let mut app = app(run);
-        app.show_output = true;
+        app.focused.show_output = true;
         app.poll_completion();
-        assert!(app.changes_job.is_some());
+        assert!(app.focused.changes_job.is_some());
         assert!(
-            !app.show_output,
+            !app.focused.show_output,
             "A newly finished run opens on its results"
         );
         for _ in 0..500 {
             app.poll_completion();
-            if app.changes_job.is_none() {
+            if app.focused.changes_job.is_none() {
                 break;
             }
             thread::sleep(std::time::Duration::from_millis(10));
@@ -612,7 +650,7 @@ mod tests {
         assert!(matches!(loaded.changes, Changes::NotGit));
         // The same state does not start another job.
         app.poll_completion();
-        assert!(app.changes_job.is_none());
+        assert!(app.focused.changes_job.is_none());
     }
 
     #[test]
@@ -634,7 +672,7 @@ mod tests {
             "The test stage reported verification is not applicable: Docs only. [a] accepts without checks; [y] retries."
         );
         assert!(
-            app.changes_job.is_none(),
+            app.focused.changes_job.is_none(),
             "Unfinished runs compute no changes"
         );
         // Announced once per checkpoint, so later messages stay visible.

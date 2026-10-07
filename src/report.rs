@@ -31,6 +31,8 @@ pub struct RunReport {
     pub unresolved: Vec<Item>,
     /// `files_changed` claimed by the final handoffs; unverified.
     pub reported_files: Vec<String>,
+    /// The latest review summary stage's brief, Markdown; also review.md.
+    pub review: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -267,6 +269,15 @@ pub fn build(run: &Run) -> RunReport {
         stages,
         unresolved,
         reported_files,
+        review: run
+            .workflow
+            .stages
+            .iter()
+            .zip(&run.stages)
+            .rev()
+            .filter(|(stage, _)| stage.role == Role::Summary)
+            .find_map(|(_, state)| state.handoff.as_ref())
+            .map(|handoff| handoff.summary.trim().to_owned()),
     }
 }
 
@@ -481,6 +492,9 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
     let _ = writeln!(text, "Usage: {}", usage_text(&report.usage));
     if let Some(error) = &report.error {
         let _ = writeln!(text, "Error: {error}");
+    }
+    if let Some(review) = &report.review {
+        let _ = writeln!(text, "\nReview summary:\n{review}");
     }
     if let Some(changes) = changes {
         let _ = writeln!(text, "\n{}", changes_heading(changes));

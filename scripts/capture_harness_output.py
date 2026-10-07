@@ -38,6 +38,7 @@ HARNESSES = {
     "codex": ("Codex", "jsonl", {"sandbox": "read-only"}),
     "claude": ("Claude", "json", {"permission_mode": "plan"}),
     "pi": ("Pi", "jsonl", {}),
+    "omp": ("Pi", "jsonl", {"approval_mode": "always-ask"}),
     "cursor": ("Cursor", "json", {"sandbox": "enabled"}),
     "gemini": ("Gemini", "json", {"approval_mode": "plan"}),
     "opencode": ("OpenCode", "jsonl", {}),
@@ -171,7 +172,7 @@ def version_of(program):
         sys.exit(f"{program} --version failed: {error}")
     lines = (result.stdout or result.stderr).splitlines()
     line = next((line.strip() for line in lines if line.strip()), "")
-    for token in re.split(r"[\s(),;]+", line):
+    for token in re.split(r"[\s(),;/]+", line):
         token = token.removeprefix("v")
         if token[:1].isdigit():
             return token

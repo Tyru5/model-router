@@ -46,6 +46,8 @@ fn all_workflow_presets_execute_in_order_with_optional_reviews_disabled() {
         let mut previous = None;
         for stage in &mut stages {
             stage.harness = "mock".into();
+            // Native settings belong to the preset's harness, not the mock.
+            stage.harness_settings.clear();
             stage.provider = stage.id.clone();
             stage.model = "test-model".into();
             stage.mode = Mode::Unattended;
@@ -89,6 +91,27 @@ fn all_workflow_presets_execute_in_order_with_optional_reviews_disabled() {
                 assert!(prompt.contains(&stage.instructions));
             }
         }
+        // A review summary stage leaves its brief beside the run for the reviewer.
+        let summary = run
+            .workflow
+            .stages
+            .iter()
+            .zip(&run.stages)
+            .find(|(stage, _)| stage.role == Role::Summary);
+        let review = fs::read_to_string(run.directory.join("review.md"));
+        match summary {
+            Some((_, state)) => assert_eq!(
+                review.unwrap().trim(),
+                state.handoff.as_ref().unwrap().summary.trim(),
+                "{}",
+                preset.key
+            ),
+            None => assert!(review.is_err(), "{}", preset.key),
+        }
+        assert_eq!(
+            model_router::report::build(&run).review.is_some(),
+            summary.is_some()
+        );
     }
 }
 
@@ -344,6 +367,56 @@ fn capture_drains_both_streams_without_deadlock_and_handles_early_closed_stdin()
 }
 
 #[test]
+fn cancelling_lets_a_harness_save_before_it_is_killed() {
+    let dir = tempfile::tempdir().unwrap();
+    let shell = |script: &str| adapters::Invocation {
+        program: "sh".into(),
+        args: vec!["-c".into(), script.into()],
+        stdin: None,
+        kind: OutputKind::Text,
+        final_file: dir.path().join("unused"),
+        env: vec![],
+    };
+    // Cancel once the script's trap is installed.
+    let cancel = AtomicBool::new(false);
+    let ready = |_: bool, text: &str| {
+        if text.contains("ready") {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    };
+    // A harness that saves its session on SIGTERM gets to finish doing so.
+    let saved = process::capture(
+        &shell("trap 'echo saved; exit 0' TERM; echo ready; sleep 30 & wait"),
+        dir.path(),
+        dir.path(),
+        Duration::from_secs(60),
+        &cancel,
+        ready,
+    )
+    .unwrap();
+    assert!(saved.cancelled);
+    assert!(
+        fs::read_to_string(dir.path().join("stdout.log"))
+            .unwrap()
+            .contains("saved")
+    );
+    // One that ignores SIGTERM is killed after the grace period.
+    let started = std::time::Instant::now();
+    cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+    let stubborn = process::capture(
+        &shell("trap '' TERM; echo ready; sleep 30"),
+        dir.path(),
+        dir.path(),
+        Duration::from_secs(60),
+        &cancel,
+        ready,
+    )
+    .unwrap();
+    assert!(stubborn.cancelled && !stubborn.success());
+    assert!(started.elapsed() < Duration::from_secs(15));
+}
+
+#[test]
 fn workspace_lock_and_revision_prevent_concurrent_or_stale_execution() {
     let (dir, _, mut run) = fixture(vec![stage("research", Role::Research)]);
     let lock = storage::lock(&dir.path().join(".model-router/workspace.lock")).unwrap();
@@ -406,7 +479,7 @@ fn worktree_is_isolated_and_original_checkout_is_not_changed() {
         format!("{name} <{email}>")
     );
     let before = run_git(&["rev-parse", "HEAD"]);
-    let path = storage::create_worktree(dir.path(), "fixture-run").unwrap();
+    let path = storage::create_worktree(dir.path(), "fixture-run", true).unwrap();
     fs::write(path.join("tracked.txt"), "changed in worktree").unwrap();
     assert_eq!(
         fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),

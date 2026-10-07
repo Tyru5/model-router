@@ -11,12 +11,13 @@ stage runs unattended or opens its native interactive terminal.
 The starter workflow is:
 
 ```text
-Codex / gpt-6-astra          Claude Code / sonnet          Optional review
-Investigate, unattended  →  Implement, interactive  →     Disabled initially
+Codex / gpt-6-astra       Claude Code / sonnet      Optional review        Codex / gpt-6-astra
+Investigate, unattended → Implement, interactive → Disabled initially → Review summary, unattended
 ```
 
 Every stage is editable, movable, repeatable, and optional. Review is never
-required. The Astra ID is taken from the local account catalog used during this
+required. The last stage writes a brief for you: what changed, how it was
+verified, and what to read closely (see [Review summary](#review-summary)). The Astra ID is taken from the local account catalog used during this
 project's design; select another ID or leave it blank if your account differs.
 
 ## Start
@@ -79,11 +80,14 @@ the next option and `Ctrl+P` to the previous option, just like `↓` and `↑`.
 
 - Thirteen colour themes with live preview and a saved preference across projects.
 - Named workflow templates and per-run snapshots.
-- Twelve stage presets and four ready-to-edit workflow presets.
+- Thirteen stage presets and four ready-to-edit workflow presets.
+- A closing review summary stage that briefs you on the finished work.
 - Explicit harness/model/provider/effort selection and extra CLI arguments.
 - In-app harness settings for each stage, including native permission controls.
 - Optional research, planning, implementation, review, testing, and custom stages.
 - Native interactive terminals, including paste, resize, and a saved transcript.
+- Several runs at once; a busy checkout sends the next run to its own worktree.
+- Readable live output; take over a running stage's session in its native terminal.
 - Unattended execution with live output, cancellation, and timeouts.
 - Structured handoffs plus the original task carried between stages.
 - Optional review-driven repairs, with two automatic repair passes by default.
@@ -161,7 +165,8 @@ entire disk or clone remote repositories.
 
 Switching saves edits to the current workflow, loads the selected project's
 configuration, and resets the task and run view. Saved runs remain on disk.
-Recent projects persist across launches. Stop an active run before switching.
+Recent projects persist across launches. Active runs keep going in their own
+projects; the Monitor still shows them.
 
 ## Import a task/spec
 
@@ -216,6 +221,7 @@ before starting a run.
 | Codex | Native model ID, optional provider and reasoning effort | `exec` JSON events; native interactive CLI; final response file |
 | Claude Code | Alias or full model ID; optional effort | Print-mode JSON; native interactive CLI |
 | Pi | Provider and exact model ID; optional thinking | Print-mode JSON events; native interactive CLI |
+| omp (oh-my-pi) | Provider and model ID, passed as its `provider/model` selector; optional thinking | Print-mode JSON events (Pi's format); native interactive CLI; approval mode |
 | Cursor Agent | Cursor model slug | Print-mode JSON; native interactive CLI |
 | Gemini CLI | Gemini model ID | Headless JSON; interactive prompt |
 | OpenCode | `provider/model`; optional variant | Run-mode JSON; interactive run |
@@ -267,7 +273,7 @@ output_limit = 16384                     # optional
 Which providers are injected:
 
 - **`[providers.NAME]` entries** route into every harness in the table above,
-  custom adapters included. Pi always uses its own registry.
+  custom adapters included. Pi and omp always use their own registries.
 - **Names without an entry**, presets included, pass to the harness unchanged,
   so its own definition wins: Codex config layers and profiles (including
   `--oss` for `ollama`/`lmstudio`), and the OpenCode, Aider, Goose, and Pi
@@ -287,7 +293,7 @@ models via `GET /models` (no inference request).
 Model discovery is deliberately labeled:
 
 - **Codex:** local cache, which may be stale. Refresh it through Codex.
-- **Pi/OpenCode:** configured-provider catalogs, not an entitlement guarantee.
+- **Pi/omp/OpenCode:** configured-provider catalogs, not an entitlement guarantee.
 - **Cursor:** account-reported CLI list.
 - **Claude/Amp:** documented aliases/modes plus your saved selections.
 - **Other adapters:** native default, saved selections, and manual entry.
@@ -330,6 +336,7 @@ after the selected stage; `Esc` cancels without changing the workflow.
 | Code review | Correctness, regressions, and optional repair requests |
 | Security review | Relevant trust boundaries, permissions, and data handling |
 | Update documentation | Usage, examples, and operational notes |
+| Review summary | A brief for you: outcome, changes, verification, review focus, open questions |
 | Summarize handoff | Outcome, evidence, limitations, and next actions |
 | Custom stage | Blank instructions and your own routing |
 
@@ -343,9 +350,9 @@ Press `w` and choose **+ Preset:** to add a workflow:
 
 | Workflow | Enabled sequence |
 | --- | --- |
-| Quick task | Implement → verify |
-| Full feature | Clarify → research → design → plan → implement → verify → document → handoff |
-| Bug fix | Diagnose → implement → verify |
+| Quick task | Implement → verify → review summary |
+| Full feature | Clarify → research → design → plan → implement → verify → document → review summary |
+| Bug fix | Diagnose → implement → verify → review summary |
 | Investigation | Research → handoff |
 
 The first three include a disabled code review; Full feature also includes a
@@ -418,6 +425,77 @@ model-router report RUN_ID --diff
 
 `--unattended` overrides execution mode for this run. `--with-review` enables
 existing review stages. It does not add one to a workflow that has none.
+
+### Several runs at once
+
+`r` starts the run and clears the task, leaving Workflow ready for the next
+one. Runs snapshot their workflow, so editing, switching workflows or projects,
+and starting more runs never touch active ones. The Monitor tab counts runs in
+progress (`2 Monitor ●2`). When there is more than one, the Monitor lists them
+under its title; `[` and `]` switch between them, and `x` closes a stopped run
+here (its files stay; Runs reopens it). The status line reports runs that stop,
+complete, or wait for you while you are elsewhere.
+
+A run that starts while another run of this session (or another router
+process) is using the checkout gets its own Git worktree from committed HEAD,
+on branch `model-router/RUN_ID`. Uncommitted changes in the checkout, including
+the first run's edits, are not part of it. Outside Git, the second run is
+refused instead. `g` still chooses a worktree explicitly.
+
+An interactive stage takes over the screen only while its run is shown in the
+Monitor. Otherwise the run waits, and `i` opens the stage when you are ready.
+A workflow whose first enabled stage is interactive opens the Monitor right
+away. `q` and `Ctrl+C` stop every active run.
+
+### Take over an unattended stage
+
+The Monitor's Output pane shows each stage's events as readable lines:
+assistant text (`●`), tool calls and shell commands (`⚙`, `$`) with a one-line
+result (`↳`), file edits (`✎`), reasoning (`∴`), and errors (`✗`). Hook, delta,
+and bookkeeping events are hidden. `stdout.log` keeps the raw events.
+
+To work in the session yourself, press `t` in the Monitor: the router stops the
+unattended process and reopens the same session in the harness's native
+terminal, with its history, including the stage prompt and handoff path:
+
+| Harness | Session | Reopened with |
+| --- | --- | --- |
+| Claude Code | `--session-id` chosen by the router | `claude --resume ID` + model, effort, permissions |
+| Codex | `thread.started` event | `codex resume … ID` + model, effort, permissions |
+| Pi | `--session-id` chosen by the router | `pi … --session-id ID` + model, provider, thinking |
+| omp | `session` event | `omp --resume ID` + model, thinking, approval mode |
+| Cursor Agent | `session_id` stream events | `cursor-agent … --resume ID` + model, permissions |
+| OpenCode | `sessionID` events | `opencode --session ID` (the session keeps its model) |
+| Amp | `session_id` stream events | `amp threads continue --mode MODE ID` |
+
+Leaving the harness normally (`/exit`, `Ctrl+C`, or its own quit key) ends that
+process and returns to the usual interactive checkpoint; the run is not
+cancelled and the session stays saved. `t` there reopens the same session
+again. `t` also works on a stage that failed, was blocked, or was cancelled,
+and on interactive Claude Code and Pi stages. `Ctrl+]` still stops a stage
+outright. Cancelling sends SIGTERM and allows five seconds before SIGKILL, so a harness
+can save its session first (omp only saves on a clean exit). Gemini, Copilot,
+Goose, Aider, and custom adapters cannot be reopened;
+use `i` to retry the stage interactively.
+
+### Review summary
+
+New workflows end with an enabled **Review summary** stage (role `summary`).
+It runs unattended (Codex, read-only sandbox) after everything else, reads the
+task, every earlier handoff, and the actual Git changes, and writes a Markdown
+brief for the person reviewing the work:
+
+- **Outcome**: done, partly done, or not.
+- **Changes**: each changed file or area, what changed and why.
+- **Verification**: checks actually run and their results, and what was not verified.
+- **Review focus**: the places to read closely, with file references.
+- **Open questions**: decisions for you, limitations, follow-ups.
+- **Try it**: commands to exercise the change.
+
+The brief leads the Monitor's results when the run finishes, appears in
+`model-router report` and the CLI's completion output, and is saved as
+`.model-router/runs/RUN_ID/review.md`. Existing workflow files are unchanged;
+add the stage with `a` → **Review summary**, or disable it with `Space`.
 
 When an interactive harness exits, inspect its handoff and advance, reopen, or
 stop. `Ctrl+]` stops a stuck interactive harness. In the monitor, `h` inspects

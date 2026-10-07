@@ -182,6 +182,14 @@ def main():
             )
             assert not saved["workflows"][0]["stages"][2]["enabled"]
             terminal.send("r")
+            # The editor stays open for the next workflow; the run announces
+            # its interactive stage instead of taking over the screen.
+            terminal.wait(
+                lambda: "ready in its native terminal" in terminal.text(),
+                "Interactive stage was not announced",
+            )
+            assert "1 Workflow" in terminal.text() and "Monitor ●1" in terminal.text()
+            terminal.send("2i")
             terminal.wait(
                 lambda: "MOCK INTERACTIVE READY" in terminal.text(),
                 "Interactive stage did not receive a terminal",
@@ -222,9 +230,10 @@ def main():
             )
             terminal.snapshot("completed.txt")
             terminal.send("3\r")
+            # The run is still in this session, so Runs focuses it.
             terminal.wait(
-                lambda: "Saved run loaded" in terminal.text(),
-                "History did not reload run",
+                lambda: "Run already open in this session" in terminal.text(),
+                "History did not focus the session's run",
             )
             terminal.send("q")
             terminal.exit()

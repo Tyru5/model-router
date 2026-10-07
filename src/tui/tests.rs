@@ -1,5 +1,5 @@
 use super::{
-    actions::{self, ActionId, Scope},
+    actions::ActionId,
     app::{App, Worker, draw},
     modal::{Modal, PickValue},
     path_picker::PathPicker,
@@ -359,7 +359,7 @@ fn every_theme_reaches_pages_dialogs_and_text_inputs() {
             {
                 app.modal = None;
                 if step == 14 {
-                    app.run = Some(crate::report::tests::sample());
+                    app.focused.run = Some(crate::report::tests::sample());
                 }
                 app.key(key(Key::Char(action))).unwrap();
                 terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -379,7 +379,7 @@ fn every_theme_reaches_pages_dialogs_and_text_inputs() {
                 );
             }
             assert!(app.results_shown());
-            app.run = None;
+            app.focused.run = None;
             app.modal = None;
         }
     }
@@ -414,9 +414,10 @@ fn stage_presets_are_inserted_only_after_save_and_have_unique_ids() {
         assert_eq!(app.stage().role, Role::Planning);
     }
     let stages = &app.settings.workflows[0].stages;
-    assert_eq!(stages.len(), 5);
+    assert_eq!(stages.len(), 6);
     assert_eq!(stages[0].id, "research");
     assert_eq!(stages[3].id, "implement");
+    assert_eq!(stages[5].id, "summary");
     assert_ne!(stages[1].id, stages[2].id);
     app.settings.validate().unwrap();
     // Adding or duplicating at the limit must not leave an invalid workflow.
@@ -842,30 +843,26 @@ fn command_menu_lists_only_actions_for_the_current_context() {
     assert!(idle.contains(&ActionId::Continue) && idle.contains(&ActionId::Handoff));
     assert!(!idle.contains(&ActionId::CancelStage) && !idle.contains(&ActionId::Run));
 
-    app.worker = Some(Worker::stub());
+    app.focused.worker = Some(Worker::stub());
     let running = menu(&mut app);
     assert!(running.contains(&ActionId::CancelStage) && running.contains(&ActionId::Handoff));
     assert!(!running.contains(&ActionId::Continue) && !running.contains(&ActionId::Advance));
 
-    // Workflow edits wait for the run to stop, so only global actions remain.
+    // Runs snapshot their workflow, so editing and starting another continue.
     app.page = 0;
-    let locked = menu(&mut app);
-    assert!(locked.contains(&ActionId::Quit));
-    assert!(
-        locked
-            .iter()
-            .all(|id| actions::entry(*id).unwrap().scope == Scope::Global)
-    );
+    let editing = menu(&mut app);
+    assert!(editing.contains(&ActionId::Run) && editing.contains(&ActionId::EditTask));
+    assert!(!editing.contains(&ActionId::CancelStage));
 
     // A menu opened during a run does nothing once the run has stopped.
     app.page = 1;
     app.key(key(Key::Char(':'))).unwrap();
-    app.worker = None;
+    app.focused.worker = None;
     for c in "cancel stage".chars() {
         app.key(key(Key::Char(c))).unwrap();
     }
     app.key(key(Key::Enter)).unwrap();
-    assert!(app.modal.is_none() && !app.cancel.load(Ordering::Relaxed));
+    assert!(app.modal.is_none() && !app.focused.cancel.load(Ordering::Relaxed));
 
     app.page = 2;
     assert!(menu(&mut app).contains(&ActionId::OpenRun));
@@ -972,4 +969,83 @@ fn effort_levels_come_from_the_harness_catalog_in_both_editors() {
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let text = screen(&terminal);
     assert!(!text.contains("Levels from"), "{text}");
+}
+
+fn sample_run(id: &str) -> crate::engine::Run {
+    let mut run = crate::report::tests::sample();
+    run.id = id.into();
+    run
+}
+
+fn session(app: &App) -> String {
+    app.slots()
+        .map(|(slot, focused)| {
+            let id = slot.run.as_ref().unwrap().id.clone();
+            if focused { format!("{id}*") } else { id }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn session_runs_keep_their_order_as_focus_moves_and_runs_close() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    for id in ["a", "b", "c"] {
+        app.adopt(sample_run(id));
+    }
+    assert_eq!(session(&app), "a b c*");
+    app.cycle_focus(true);
+    assert_eq!(session(&app), "a* b c");
+    app.cycle_focus(false);
+    assert_eq!(session(&app), "a b c*");
+    assert!(app.focus_run("b") && !app.focus_run("missing"));
+    assert_eq!(session(&app), "a b* c");
+
+    // An active run cannot be closed; closing focuses its neighbour.
+    app.focused.worker = Some(Worker::stub());
+    assert!(app.dismiss().is_err());
+    app.focused.worker = None;
+    app.dismiss().unwrap();
+    assert_eq!(session(&app), "a c*");
+    app.adopt(sample_run("d"));
+    assert_eq!(session(&app), "a c d*");
+    for _ in 0..3 {
+        app.dismiss().unwrap();
+    }
+    assert_eq!(session(&app), "");
+    assert!(app.focused.run.is_none() && app.parked.is_empty());
+}
+
+#[test]
+fn a_busy_checkout_sends_the_next_run_to_a_worktree() {
+    use crate::engine::{Placement, Status};
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    assert_eq!(app.placement(false).unwrap(), (Placement::Project, None));
+    let mut busy = sample_run("busy");
+    busy.workspace = std::fs::canonicalize(project.path()).unwrap();
+    busy.status = Status::AwaitingConfirmation;
+    app.adopt(busy);
+    assert!(
+        app.placement(false)
+            .unwrap_err()
+            .to_string()
+            .contains("not a Git repository")
+    );
+    let init = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(project.path())
+        .status()
+        .unwrap();
+    assert!(init.success());
+    app.repo = crate::storage::repo_info(project.path());
+    assert_eq!(
+        app.placement(false).unwrap(),
+        (Placement::WorktreeFromHead, Some("run busy".into()))
+    );
+    assert_eq!(app.placement(true).unwrap().0, Placement::Worktree);
+    // A finished run frees the checkout.
+    app.focused.run.as_mut().unwrap().status = Status::Complete;
+    assert_eq!(app.placement(false).unwrap(), (Placement::Project, None));
 }

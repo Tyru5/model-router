@@ -252,7 +252,8 @@ impl App {
                 self.dirty = true;
             }
             InputTarget::RetryModel => {
-                self.run
+                self.focused
+                    .run
                     .as_mut()
                     .context("No run")?
                     .retry(false, Some(value.trim().into()))?;
@@ -266,7 +267,7 @@ impl App {
                 self.dirty = true;
             }
             InputTarget::Handoff => {
-                engine::edit_handoff(self.run.as_mut().context("No run")?, value)?
+                engine::edit_handoff(self.focused.run.as_mut().context("No run")?, value)?
             }
         }
         Ok(())

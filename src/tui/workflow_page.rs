@@ -7,7 +7,7 @@ use super::{
     path_picker::PathPicker,
     task_importer::TaskImporter,
     theme::Palette,
-    widgets::{content, focus_textarea, kv, or_default, textarea, wrapped_textarea},
+    widgets::{content, focus_textarea, kv, or_default, short_path, textarea, wrapped_textarea},
 };
 use crate::{
     adapters, catalog,
@@ -661,17 +661,39 @@ impl App {
                 )?,
             ),
             ActionId::Run => {
-                self.run = Some(Run::create(
+                let (placement, holder) = self.placement(self.worktree)?;
+                let run = Run::create_at(
                     &self.project,
                     &self.settings,
                     &self.settings.workflows[self.workflow],
                     self.task.clone(),
-                    self.worktree,
-                )?);
-                self.logs.clear();
-                self.log_scroll = 0;
-                self.message = "Starting workflow…".into();
+                    placement,
+                )?;
+                // An interactive first stage needs the terminal right away.
+                let interactive = run
+                    .workflow
+                    .stages
+                    .iter()
+                    .find(|s| s.enabled)
+                    .is_some_and(|s| s.mode == Mode::Interactive);
+                let (id, workspace) = (run.id.clone(), run.workspace.clone());
+                self.adopt(run);
                 self.start_driver()?;
+                // The run has its own snapshot; the editor is free for the next one.
+                self.task.clear();
+                self.message = match holder {
+                    Some(holder) => format!(
+                        "Started {id} in worktree {}: {holder} is using the checkout, whose uncommitted changes are not included. ",
+                        short_path(&workspace, 60)
+                    ),
+                    None => format!("Started {id}. "),
+                };
+                if interactive {
+                    self.page = 1;
+                } else {
+                    self.message
+                        .push_str("Monitor [2] follows it. Define the next task here.");
+                }
             }
             other => bail!("{other:?} is not a workflow action"),
         }

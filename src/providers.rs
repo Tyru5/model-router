@@ -141,13 +141,14 @@ pub const NOTE: &str = "Built-in names are presets: add an empty [providers.NAME
 /// the harness unchanged. Only `[providers.NAME]` entries route: harnesses may
 /// define the same name natively (Codex config layers and profiles,
 /// OpenCode/Aider/Goose registries), so built-in presets need an explicit
-/// opt-in. Pi has no runtime injection and always uses its own registry.
+/// opt-in. Pi and omp have no runtime injection and always use their own
+/// registries.
 pub fn route<'a>(
     harness: &str,
     name: &str,
     configured: &'a BTreeMap<String, Provider>,
 ) -> Option<Cow<'a, Provider>> {
-    if harness == "pi" || !configured.contains_key(name) {
+    if matches!(harness, "pi" | "omp") || !configured.contains_key(name) {
         return None;
     }
     resolve(name, configured)

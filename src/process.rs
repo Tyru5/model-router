@@ -35,13 +35,21 @@ fn nonblocking(fd: i32) -> io::Result<()> {
 }
 
 fn kill_group(pid: u32) {
+    signal_group(pid, libc::SIGKILL);
+}
+
+fn signal_group(pid: u32, signal: i32) {
     // SAFETY: spawned children have a dedicated process group/session; never use 0.
     if pid > 1 {
         unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
+            libc::kill(-(pid as i32), signal);
         }
     }
 }
+
+/// How long a cancelled or timed-out harness may take to save its session
+/// (for takeover) after SIGTERM, before SIGKILL.
+const GRACE: Duration = Duration::from_secs(5);
 
 struct ChildGuard(Child, bool);
 impl Drop for ChildGuard {
@@ -142,9 +150,26 @@ pub fn capture(
         cancelled = cancel.load(Ordering::Relaxed);
         timed_out = started.elapsed() >= timeout;
         if cancelled || timed_out {
-            kill_group(child.0.id());
-            let _ = child.0.kill();
-            break child.0.wait()?;
+            // Ask first: harnesses such as omp only save a session they can
+            // resume when they exit cleanly.
+            signal_group(child.0.id(), libc::SIGTERM);
+            let deadline = Instant::now() + GRACE;
+            let status = loop {
+                drain(&mut stdout, &mut stdout_log, false, &mut on_output)?;
+                drain(&mut stderr, &mut stderr_log, true, &mut on_output)?;
+                if let Some(status) = child.0.try_wait()? {
+                    // Leftover group members never get the grace period twice.
+                    kill_group(child.0.id());
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    kill_group(child.0.id());
+                    let _ = child.0.kill();
+                    break child.0.wait()?;
+                }
+                thread::sleep(Duration::from_millis(25));
+            };
+            break status;
         }
         thread::sleep(Duration::from_millis(25));
     };

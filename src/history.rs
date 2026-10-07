@@ -3,7 +3,7 @@
 //! artifact sizes, and cleanup.
 use crate::{
     config::Settings,
-    engine::{self, Attempt, Run, Status},
+    engine::{self, Attempt, Placement, Run, Status},
     handoff::Handoff,
     storage,
 };
@@ -246,18 +246,37 @@ pub fn filter<'a>(entries: &'a [Entry], statuses: &[StatusFilter], search: &str)
 /// Starts a new run from a saved run's task, workflow snapshot, and adapter
 /// and provider snapshots, leaving the saved run unchanged. `worktree` defaults to its mode.
 pub fn rerun(project: &Path, settings: &Settings, id: &str, worktree: Option<bool>) -> Result<Run> {
+    let worktree = match worktree {
+        Some(worktree) => worktree,
+        None => engine::load(project, id)?.worktree,
+    };
+    let placement = if worktree {
+        Placement::Worktree
+    } else {
+        Placement::Project
+    };
+    rerun_at(project, settings, id, placement)
+}
+
+/// Reruns saved run `id` as a new run working at `placement`.
+pub fn rerun_at(
+    project: &Path,
+    settings: &Settings,
+    id: &str,
+    placement: Placement,
+) -> Result<Run> {
     let source = engine::load(project, id)?;
     let settings = Settings {
         adapters: source.adapters.clone(),
         providers: source.providers.clone(),
         ..settings.clone()
     };
-    let mut run = Run::create(
+    let mut run = Run::create_at(
         project,
         &settings,
         &source.workflow,
         source.task.clone(),
-        worktree.unwrap_or(source.worktree),
+        placement,
     )?;
     run.rerun_of = Some(source.id);
     run.persist()?;

@@ -81,6 +81,7 @@ impl HarnessEditor {
                     "codex" => "Native reasoning effort, e.g. low, medium, high, xhigh. Availability depends on the model. Blank inherits the harness default.",
                     "claude" => "Native effort: low, medium, high, xhigh, max. Availability depends on the model. Blank inherits the harness default.",
                     "pi" => "Native thinking level: off, minimal, low, medium, high, xhigh. Availability depends on the model. Blank inherits the default.",
+                    "omp" => "Native thinking level: off, minimal, low, medium, high, xhigh, max, auto. Availability depends on the model. Blank inherits the default.",
                     _ => "Native effort or model variant. Blank inherits the harness default. Accepted values depend on the model and harness.",
                 },
                 text: textarea(&stage.effort),

@@ -165,6 +165,26 @@ pub struct Normalized {
     pub permission_blocked: bool,
 }
 
+/// The harness session an unattended log reports: Codex's `thread.started`
+/// thread, Pi's `session` event, OpenCode's `sessionID`, or the `session_id`
+/// on Claude Code, Cursor, and Amp stream events.
+pub fn session_id(raw: &str) -> Option<String> {
+    raw.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .find_map(|event| {
+            let fields: &[&str] = match event.get("type").and_then(Value::as_str) {
+                Some("thread.started") => &["thread_id"],
+                Some("session") => &["id"],
+                _ => &["session_id", "sessionID"],
+            };
+            fields
+                .iter()
+                .find_map(|field| event.get(*field).and_then(Value::as_str))
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+        })
+}
+
 /// Only assistant/final-response fields become handoffs. Tool arguments and
 /// echoed prompts must never become a review verdict.
 pub fn normalize(raw: &str, kind: OutputKind) -> Normalized {
@@ -609,6 +629,18 @@ mod usage_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn logs_report_codex_threads_and_claude_sessions() {
+        let codex =
+            "{\"type\":\"thread.started\",\"thread_id\":\"t-1\"}\n{\"type\":\"turn.started\"}";
+        assert_eq!(session_id(codex).as_deref(), Some("t-1"));
+        let claude = "not json\n{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-1\"}";
+        assert_eq!(session_id(claude).as_deref(), Some("s-1"));
+        assert_eq!(
+            session_id("{\"type\":\"result\",\"session_id\":\"\"}"),
+            None
+        );
+    }
     #[test]
     fn review_cannot_pass_on_unstructured_output() {
         assert!(parse("Looks good!", Role::Review).is_err());

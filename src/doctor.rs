@@ -305,27 +305,38 @@ fn flag_uses(harness: &str) -> Result<Vec<FlagUse>> {
     for mode in [Mode::Unattended, Mode::Interactive] {
         // A hosted and a local provider reach both provider code paths.
         for provider in ["openai", "ollama"] {
-            let invocation = adapters::build(
-                &sample(harness, mode, provider),
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                SAMPLE_PROMPT,
-                &paths,
-            )?;
-            let help: Vec<String> = subcommand(&invocation.args)
-                .into_iter()
-                .chain(["--help"])
-                .map(String::from)
-                .collect();
-            for flag in invocation.args.iter().filter_map(|arg| flag_name(arg)) {
-                match uses.iter_mut().find(|u| u.help == help && u.flag == flag) {
-                    Some(found) if !found.modes.contains(&mode) => found.modes.push(mode),
-                    Some(_) => {}
-                    None => uses.push(FlagUse {
-                        help: help.clone(),
-                        flag: flag.into(),
-                        modes: vec![mode],
-                    }),
+            let stage = sample(harness, mode, provider);
+            let none = BTreeMap::new();
+            let mut invocation =
+                adapters::build(&stage, &none, &BTreeMap::new(), SAMPLE_PROMPT, &paths)?;
+            adapters::assign_session(&mut invocation, harness);
+            let mut invocations = vec![invocation];
+            // Takeover reopens an unattended session in the interactive CLI.
+            if mode == Mode::Interactive && adapters::resumable(harness, &none) {
+                invocations.push(adapters::resume(
+                    &stage,
+                    &none,
+                    &BTreeMap::new(),
+                    "sample-session",
+                    &paths,
+                )?);
+            }
+            for invocation in invocations {
+                let help: Vec<String> = subcommand(&invocation.args)
+                    .into_iter()
+                    .chain(["--help"])
+                    .map(String::from)
+                    .collect();
+                for flag in invocation.args.iter().filter_map(|arg| flag_name(arg)) {
+                    match uses.iter_mut().find(|u| u.help == help && u.flag == flag) {
+                        Some(found) if !found.modes.contains(&mode) => found.modes.push(mode),
+                        Some(_) => {}
+                        None => uses.push(FlagUse {
+                            help: help.clone(),
+                            flag: flag.into(),
+                            modes: vec![mode],
+                        }),
+                    }
                 }
             }
         }
@@ -435,7 +446,8 @@ fn first_line(text: &str) -> Option<String> {
 
 /// Version-like tokens: `opencode v2.0.22` yields `2.0.22`.
 fn version_tokens(line: &str) -> impl Iterator<Item = &str> {
-    line.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';'))
+    // `omp/18.6.3` separates its name with a slash.
+    line.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';' | '/'))
         .map(|token| token.strip_prefix('v').unwrap_or(token))
         .filter(|token| token.starts_with(|c: char| c.is_ascii_digit()))
 }
@@ -573,14 +585,27 @@ mod tests {
             find("codex", "--model"),
             [
                 ("exec --help".to_owned(), vec![Mode::Unattended]),
-                ("--help".to_owned(), vec![Mode::Interactive])
+                ("--help".to_owned(), vec![Mode::Interactive]),
+                ("resume --help".to_owned(), vec![Mode::Interactive])
             ]
+        );
+        assert_eq!(
+            find("claude", "--session-id"),
+            [(
+                "--help".to_owned(),
+                vec![Mode::Unattended, Mode::Interactive]
+            )]
+        );
+        assert_eq!(
+            find("claude", "--resume"),
+            [("--help".to_owned(), vec![Mode::Interactive])]
         );
         assert_eq!(
             find("codex", "--oss"),
             [
                 ("exec --help".to_owned(), vec![Mode::Unattended]),
-                ("--help".to_owned(), vec![Mode::Interactive])
+                ("--help".to_owned(), vec![Mode::Interactive]),
+                ("resume --help".to_owned(), vec![Mode::Interactive])
             ],
             "the local-provider path is sampled"
         );
@@ -656,6 +681,7 @@ mod tests {
 
     #[test]
     fn versions_match_tested_tokens_not_prefixes() {
+        assert_eq!(version_tokens("omp/18.6.3").collect::<Vec<_>>(), ["18.6.3"]);
         let tokens: Vec<_> = version_tokens("opencode v2.0.22").collect();
         assert_eq!(tokens, ["2.0.22"]);
         let amp: Vec<_> =

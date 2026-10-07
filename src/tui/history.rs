@@ -11,7 +11,7 @@ use crate::{
     history::{self, Criteria, Entry, Plan, StatusFilter},
     storage,
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use crossterm::event::{KeyCode as Key, KeyEvent, KeyModifiers as Mods};
 use ratatui::{
     Frame,
@@ -151,23 +151,23 @@ impl App {
                 self.reselect(selected);
             }
             ActionId::OpenRun => {
-                ensure!(
-                    self.worker.is_none(),
-                    "Stop the active run before opening another"
-                );
-                if let Some(run) = self.selected_run().and_then(|entry| self.load_run(&entry)) {
-                    self.run = Some(run);
+                // A run of this session is already live; never load a stale copy.
+                let open = self
+                    .selected_run()
+                    .is_some_and(|entry| self.focus_run(entry.id()));
+                if open {
                     self.page = 1;
-                    self.logs.clear();
+                    self.message = "Run already open in this session.".into();
+                } else if let Some(run) =
+                    self.selected_run().and_then(|entry| self.load_run(&entry))
+                {
+                    self.adopt(run);
+                    self.page = 1;
                     self.message =
-                        "Saved run loaded. c continues; y retries; i reopens interactively.".into();
+                        "Saved run loaded. c continues; y retries; t reopens its session; i retries interactively.".into();
                 }
             }
             ActionId::Rerun => {
-                ensure!(
-                    self.worker.is_none(),
-                    "Stop the active run before starting another"
-                );
                 if let Some(source) = self.selected_run().and_then(|entry| self.load_run(&entry)) {
                     let worktree = source.worktree;
                     self.modal = Some(Modal::Confirm(Box::new(Confirm {
@@ -328,7 +328,11 @@ impl App {
             &Criteria {
                 worktrees,
                 ids: vec![id.to_owned()],
-                protect: self.run.iter().map(|run| run.id.clone()).collect(),
+                protect: self
+                    .slots()
+                    .filter_map(|(slot, _)| slot.run.as_ref())
+                    .map(|run| run.id.clone())
+                    .collect(),
                 ..Criteria::default()
             },
         )
@@ -368,15 +372,17 @@ impl App {
     }
     /// Starts a rerun through the same worker path as Workflow [r].
     fn start_rerun(&mut self, id: &str, worktree: bool) -> Result<()> {
-        ensure!(
-            self.worker.is_none(),
-            "Stop the active run before starting another"
+        let (placement, holder) = self.placement(worktree)?;
+        let run = history::rerun_at(&self.project, &self.settings, id, placement)?;
+        self.message = format!(
+            "Rerunning {id} as {}{}…",
+            run.id,
+            holder.map_or_else(String::new, |h| format!(
+                " in a worktree ({h} is using the checkout)"
+            ))
         );
-        let run = history::rerun(&self.project, &self.settings, id, Some(worktree))?;
-        self.message = format!("Rerunning {id} as {}…", run.id);
-        self.run = Some(run);
-        self.logs.clear();
-        self.log_scroll = 0;
+        self.adopt(run);
+        self.page = 1;
         self.start_driver()
     }
     fn clean_up(&mut self, plan: &Plan) -> Result<()> {
@@ -835,7 +841,7 @@ mod tests {
         press(&mut app, "3");
         assert!(shows(&mut app, "✗ damaged"));
         app.key(key(Key::Enter)).unwrap();
-        assert!(app.run.is_none());
+        assert!(app.focused.run.is_none());
         assert_eq!(app.page, 2);
         match &app.modal {
             Some(Modal::Text { title, body, .. }) => {
@@ -863,20 +869,20 @@ mod tests {
         assert!(shows(&mut app, "Port the parser"));
         assert!(shows(&mut app, "not the current template"));
         app.key(key(Key::Esc)).unwrap();
-        assert!(app.modal.is_none() && app.worker.is_none() && app.run.is_none());
+        assert!(app.modal.is_none() && app.focused.worker.is_none() && app.focused.run.is_none());
         assert_eq!(run_dirs(project.path()), 1);
 
         press(&mut app, "n");
         app.key(key(Key::Enter)).unwrap();
         assert!(app.modal.is_none());
-        assert!(app.worker.is_some());
+        assert!(app.focused.worker.is_some());
         assert_eq!(app.page, 1);
         let deadline = Instant::now() + Duration::from_secs(20);
-        while app.worker.is_some() && Instant::now() < deadline {
+        while app.focused.worker.is_some() && Instant::now() < deadline {
             app.poll().unwrap();
             thread::sleep(Duration::from_millis(20));
         }
-        let run = app.run.as_ref().unwrap();
+        let run = app.focused.run.as_ref().unwrap();
         assert_eq!(run.rerun_of.as_deref(), Some(source.id.as_str()));
         assert_eq!(run.status, Status::Complete);
         assert_eq!(run_dirs(project.path()), 2);
@@ -945,7 +951,7 @@ mod tests {
         assert_eq!(app.history_selected, 0);
 
         // The run open in the monitor stays.
-        app.run = Some(engine::load(project.path(), &kept.id).unwrap());
+        app.focused.run = Some(engine::load(project.path(), &kept.id).unwrap());
         press(&mut app, "D");
         app.key(key(Key::Enter)).unwrap();
         assert!(kept.directory.exists());

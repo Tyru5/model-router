@@ -31,9 +31,23 @@ impl StagePreset {
                 Mode::Unattended
             },
             instructions: self.instructions.into(),
+            // Summaries read the work; Codex can enforce that.
+            harness_settings: if self.role == Role::Summary {
+                [("sandbox".to_owned(), "read-only".to_owned())].into()
+            } else {
+                Default::default()
+            },
             ..Stage::default()
         }
     }
+}
+
+/// The stage preset named `key`.
+pub fn stage(key: &str) -> &'static StagePreset {
+    STAGES
+        .iter()
+        .find(|p| p.key == key)
+        .expect("Stage preset exists")
 }
 
 pub const STAGES: &[StagePreset] = &[
@@ -108,6 +122,13 @@ pub const STAGES: &[StagePreset] = &[
         instructions: "Update the documentation needed for the implemented behavior: usage, configuration, examples, and migration or operational notes where relevant. Verify examples against the code and available checks. Keep edits limited to documentation and avoid claiming unverified support. Report changed documents and any gaps requiring follow-up.",
     },
     StagePreset {
+        key: "summary",
+        name: "Review summary",
+        role: Role::Summary,
+        purpose: "Brief you on what changed, how it was verified, and what to review.",
+        instructions: "Write a review brief for the person who will review this work. Use the original task, the prior stage handoffs and artifacts, and the actual changes in the working directory; inspect them with read-only commands such as git status, git diff --stat, and git diff, and never run commands that change files or Git state. Put the whole brief in the handoff summary as Markdown with these sections: ## Outcome (whether the task was done, partly done, or not, in one or two sentences); ## Changes (each changed file or area: what changed and why); ## Verification (checks actually run and their results as reported by prior stages or the router, and plainly what was not verified); ## Review focus (the specific places to read closely: risky logic, behavior changes, assumptions, deviations from the plan, with file references); ## Open questions (decisions for the reviewer, known limitations, follow-ups); ## Try it (commands or steps to exercise the change, if any). Be concrete and brief and cite files. List changed files in files_changed. Leave findings, tests, and unresolved empty because earlier stages already report them. If the sandbox stops you writing the handoff file, finish with the handoff block in your final message and do not mention it in the brief. Do not modify project files, commit, push, or publish.",
+    },
+    StagePreset {
         key: "handoff",
         name: "Summarize handoff",
         role: Role::Custom,
@@ -139,11 +160,7 @@ impl WorkflowPreset {
                 .stages
                 .iter()
                 .map(|key| {
-                    let mut stage = STAGES
-                        .iter()
-                        .find(|p| p.key == *key)
-                        .expect("Workflow preset references an existing stage")
-                        .build();
+                    let mut stage = stage(key).build();
                     // Selecting a workflow must never implicitly opt into a review.
                     stage.enabled = stage.role != Role::Review;
                     stage
@@ -157,13 +174,13 @@ pub const WORKFLOWS: &[WorkflowPreset] = &[
     WorkflowPreset {
         key: "quick-task",
         name: "Quick task",
-        purpose: "Implement a clear task, verify it, then optionally review.",
-        stages: &["implement", "verify", "review"],
+        purpose: "Implement a clear task, verify it, optionally review, and summarize for you.",
+        stages: &["implement", "verify", "review", "summary"],
     },
     WorkflowPreset {
         key: "full-feature",
         name: "Full feature",
-        purpose: "Clarify, research, design, plan, implement, verify, document, and hand off.",
+        purpose: "Clarify, research, design, plan, implement, verify, document, and summarize for you.",
         stages: &[
             "clarify",
             "research",
@@ -174,14 +191,14 @@ pub const WORKFLOWS: &[WorkflowPreset] = &[
             "review",
             "security",
             "document",
-            "handoff",
+            "summary",
         ],
     },
     WorkflowPreset {
         key: "bug-fix",
         name: "Bug fix",
-        purpose: "Diagnose the cause, implement a fix, and verify the regression.",
-        stages: &["diagnose", "implement", "verify", "review"],
+        purpose: "Diagnose the cause, implement a fix, verify the regression, and summarize for you.",
+        stages: &["diagnose", "implement", "verify", "review", "summary"],
     },
     WorkflowPreset {
         key: "investigation",
@@ -253,6 +270,30 @@ mod tests {
                     .all(|s| !s.enabled)
             );
             assert_eq!(loaded.workflows[0].stages.len(), preset.stages.len());
+        }
+    }
+
+    #[test]
+    fn work_ends_with_an_enabled_read_only_review_summary() {
+        let summary = stage("summary").build();
+        assert_eq!(summary.role, Role::Summary);
+        assert_eq!(
+            (summary.harness.as_str(), summary.mode),
+            ("codex", Mode::Unattended)
+        );
+        assert_eq!(summary.harness_settings["sandbox"], "read-only");
+        for workflow in [Workflow::default()].into_iter().chain(
+            WORKFLOWS
+                .iter()
+                .filter(|p| p.key != "investigation")
+                .map(WorkflowPreset::build),
+        ) {
+            let last = workflow.stages.last().unwrap();
+            assert!(
+                last.role == Role::Summary && last.enabled,
+                "{}",
+                workflow.name
+            );
         }
     }
 }

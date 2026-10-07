@@ -13,7 +13,7 @@ use super::{
 use crate::{
     catalog::{self, Catalog},
     config::{self, Settings, Stage},
-    engine::{self, Action, Event as RunEvent, Run},
+    engine::{self, Action, Event as RunEvent, Placement, Run, Status},
     history::Entry,
     storage,
 };
@@ -55,6 +55,133 @@ impl Worker {
         }
     }
 }
+
+/// A run started or opened in this session, with its Monitor view state.
+pub(super) struct RunSlot {
+    pub(super) run: Option<Run>,
+    pub(super) worker: Option<Worker>,
+    pub(super) cancel: Arc<AtomicBool>,
+    pub(super) logs: VecDeque<String>,
+    pub(super) log_scroll: usize,
+    /// A finished run shows results unless the output log was chosen.
+    pub(super) show_output: bool,
+    pub(super) results_scroll: u16,
+    pub(super) changes: Option<completion::Loaded>,
+    pub(super) changes_job: Option<(String, Receiver<completion::Loaded>)>,
+    /// The run checkpoint whose waiver the status line last announced.
+    pub(super) waiver_shown: String,
+    /// Reopen the stage's session interactively once its worker stops.
+    pub(super) takeover: bool,
+}
+impl Default for RunSlot {
+    fn default() -> Self {
+        Self {
+            run: None,
+            worker: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            logs: VecDeque::new(),
+            log_scroll: 0,
+            show_output: false,
+            results_scroll: 0,
+            changes: None,
+            changes_job: None,
+            waiver_shown: String::new(),
+            takeover: false,
+        }
+    }
+}
+impl RunSlot {
+    /// Whether the run still needs the router: driving, or waiting on the user.
+    pub(super) fn in_progress(&self) -> bool {
+        self.worker.is_some()
+            || self.run.as_ref().is_some_and(|run| {
+                matches!(
+                    run.status,
+                    Status::Pending
+                        | Status::Running
+                        | Status::Interactive
+                        | Status::AwaitingConfirmation
+                )
+            })
+    }
+    /// Applies worker messages; returns the driver's result once it stops.
+    fn poll(&mut self) -> Option<std::result::Result<Action, String>> {
+        let messages: Vec<_> = self
+            .worker
+            .as_ref()
+            .map(|w| w.receiver.try_iter().collect())
+            .unwrap_or_default();
+        let mut stopped = None;
+        for message in messages {
+            match message {
+                WorkerMessage::Event(RunEvent::State(run)) => self.run = Some(*run),
+                WorkerMessage::Event(RunEvent::Output(text)) => {
+                    for line in text.lines() {
+                        self.logs.push_back(storage::truncate(line, 1500));
+                    }
+                    while self.logs.len() > 400 {
+                        self.logs.pop_front();
+                    }
+                }
+                WorkerMessage::Done(run, result) => {
+                    self.run = Some(*run);
+                    if let Some(mut worker) = self.worker.take() {
+                        if let Some(handle) = worker.thread.take() {
+                            let _ = handle.join();
+                        }
+                    }
+                    stopped = Some(self.settle(result));
+                }
+            }
+        }
+        if self.worker.is_none() {
+            self.cancel.store(false, Ordering::Relaxed);
+        }
+        stopped
+    }
+    /// A takeover turns the cancelled stage into one waiting for the terminal.
+    fn settle(
+        &mut self,
+        result: std::result::Result<Action, String>,
+    ) -> std::result::Result<Action, String> {
+        if !std::mem::take(&mut self.takeover) || result != Ok(Action::Stopped) {
+            return result;
+        }
+        let run = self.run.as_mut().ok_or("No run to take over")?;
+        run.take_over()
+            .map(|()| Action::Interactive)
+            .map_err(|e| format!("{e:#}"))
+    }
+}
+impl Drop for RunSlot {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(mut worker) = self.worker.take() {
+            drop(worker.receiver);
+            if let Some(thread) = worker.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+/// What the status line says when a run outside the Monitor stops driving.
+fn notice(run: &Run, result: &std::result::Result<Action, String>) -> String {
+    let stage = run.current_name();
+    let id = &run.id;
+    match result {
+        Ok(Action::Interactive) => format!(
+            "Run {id}: {stage} is ready in its native terminal. Monitor [2], [ ] to select the run, then [i]."
+        ),
+        Ok(Action::Confirm) => format!("Run {id}: {stage} awaits handoff review in Monitor [2]."),
+        Ok(Action::Complete) => format!("Run {id} ({}) complete.", run.workflow.name),
+        Ok(Action::Stopped) => format!(
+            "Run {id} stopped: {}",
+            run.error.as_deref().unwrap_or("no error recorded")
+        ),
+        Err(error) => format!("Run {id}: {error}"),
+    }
+}
 pub(super) struct App {
     pub(super) project: PathBuf,
     pub(super) config_path: PathBuf,
@@ -72,20 +199,15 @@ pub(super) struct App {
     pub(super) message: String,
     /// Last error shown; the status line turns red while it is current.
     pub(super) alert: String,
-    pub(super) run: Option<Run>,
-    pub(super) worker: Option<Worker>,
-    pub(super) cancel: Arc<AtomicBool>,
+    /// The run the Monitor shows. Other runs of this session keep going in
+    /// `parked`; switching focus swaps a parked slot in.
+    pub(super) focused: RunSlot,
+    pub(super) parked: Vec<RunSlot>,
+    /// Position of `focused` among the session's runs, in start order.
+    pub(super) focus_index: usize,
     pub(super) signal: Arc<AtomicBool>,
+    /// The focused run's interactive stage gets the terminal on the next frame.
     pub(super) launch_interactive: bool,
-    pub(super) logs: VecDeque<String>,
-    pub(super) log_scroll: usize,
-    /// A finished run shows results unless the output log was chosen.
-    pub(super) show_output: bool,
-    pub(super) results_scroll: u16,
-    pub(super) changes: Option<completion::Loaded>,
-    pub(super) changes_job: Option<(String, Receiver<completion::Loaded>)>,
-    /// The run checkpoint whose waiver the status line last announced.
-    pub(super) waiver_shown: String,
     pub(super) history: Vec<Entry>,
     pub(super) history_selected: usize,
     pub(super) runs: RunsView,
@@ -130,18 +252,11 @@ impl App {
             modal: None,
             message: "Define a task, choose your stages, then run. Review is optional.".into(),
             alert: String::new(),
-            run: None,
-            worker: None,
+            focused: RunSlot::default(),
+            parked: vec![],
+            focus_index: 0,
             signal: cancel,
-            cancel: Arc::new(AtomicBool::new(false)),
             launch_interactive: false,
-            logs: VecDeque::new(),
-            log_scroll: 0,
-            show_output: false,
-            results_scroll: 0,
-            changes: None,
-            changes_job: None,
-            waiver_shown: String::new(),
             history: vec![],
             history_selected: 0,
             runs: RunsView::default(),
@@ -240,11 +355,133 @@ impl App {
         self.message = format!("Saved {}", path.display());
         Ok(())
     }
+    /// Every run of this session, in start order, with whether it is focused.
+    pub(super) fn slots(&self) -> impl Iterator<Item = (&RunSlot, bool)> {
+        let focused = self.focused.run.is_some().then_some(&self.focused);
+        let at = self.focus_index.min(self.parked.len());
+        self.parked[..at]
+            .iter()
+            .map(|slot| (slot, false))
+            .chain(focused.map(|slot| (slot, true)))
+            .chain(self.parked[at..].iter().map(|slot| (slot, false)))
+    }
+    pub(super) fn any_active(&self) -> bool {
+        self.focused.worker.is_some() || self.parked.iter().any(|slot| slot.worker.is_some())
+    }
+    pub(super) fn cancel_all(&mut self) {
+        for slot in std::iter::once(&self.focused).chain(&self.parked) {
+            if slot.worker.is_some() {
+                slot.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+    /// Focuses `run` in a fresh slot. A focused run keeps going, parked.
+    pub(super) fn adopt(&mut self, run: Run) {
+        let mut slot = RunSlot::default();
+        std::mem::swap(&mut self.focused, &mut slot);
+        if slot.run.is_some() {
+            self.parked
+                .insert(self.focus_index.min(self.parked.len()), slot);
+        }
+        self.focus_index = self.parked.len();
+        self.focused.run = Some(run);
+    }
+    /// Focuses the session's run at `index` (start order).
+    pub(super) fn focus(&mut self, index: usize) {
+        let has_focus = self.focused.run.is_some();
+        let total = self.parked.len() + usize::from(has_focus);
+        if index >= total || (has_focus && index == self.focus_index) {
+            return;
+        }
+        let at = if has_focus && index > self.focus_index {
+            index - 1
+        } else {
+            index
+        };
+        let mut slot = self.parked.remove(at);
+        std::mem::swap(&mut self.focused, &mut slot);
+        if slot.run.is_some() {
+            // The old focus keeps its place in start order.
+            let back = if self.focus_index < index {
+                self.focus_index
+            } else {
+                self.focus_index - 1
+            };
+            self.parked.insert(back.min(self.parked.len()), slot);
+        }
+        self.focus_index = index;
+    }
+    /// Focuses the next or previous run of the session, wrapping.
+    pub(super) fn cycle_focus(&mut self, forward: bool) {
+        let total = self.parked.len() + usize::from(self.focused.run.is_some());
+        if total < 2 {
+            return;
+        }
+        self.focus(if forward {
+            (self.focus_index + 1) % total
+        } else {
+            (self.focus_index + total - 1) % total
+        });
+    }
+    /// Focuses the session's slot holding run `id`; false when none does.
+    pub(super) fn focus_run(&mut self, id: &str) -> bool {
+        let index = self
+            .slots()
+            .position(|(slot, _)| slot.run.as_ref().is_some_and(|run| run.id == id));
+        if let Some(index) = index {
+            self.focus(index);
+        }
+        index.is_some()
+    }
+    /// Removes the focused run from this session; its files stay on disk.
+    pub(super) fn dismiss(&mut self) -> Result<()> {
+        ensure!(
+            self.focused.worker.is_none(),
+            "Cancel the stage before closing its run"
+        );
+        self.focused = RunSlot::default();
+        if self.parked.is_empty() {
+            self.focus_index = 0;
+        } else {
+            let at = self.focus_index.min(self.parked.len() - 1);
+            self.focused = self.parked.remove(at);
+            self.focus_index = at;
+        }
+        Ok(())
+    }
+    /// Where a new run in the project works. A checkout another run is using
+    /// gets a worktree from HEAD, so the runs cannot edit the same files.
+    /// Also returns what was using it.
+    pub(super) fn placement(&self, worktree: bool) -> Result<(Placement, Option<String>)> {
+        if worktree {
+            return Ok((Placement::Worktree, None));
+        }
+        let project = std::fs::canonicalize(&self.project).unwrap_or_else(|_| self.project.clone());
+        let holder = self
+            .slots()
+            .filter(|(slot, _)| slot.in_progress())
+            .filter_map(|(slot, _)| slot.run.as_ref())
+            .find(|run| run.workspace == project)
+            .map(|run| format!("run {}", run.id))
+            .or_else(|| {
+                let lock = storage::metadata_dir(&project).ok()?.join("workspace.lock");
+                (lock.is_file() && storage::lock(&lock).is_err())
+                    .then(|| "another router process".to_owned())
+            });
+        let Some(holder) = holder else {
+            return Ok((Placement::Project, None));
+        };
+        ensure!(
+            self.repo.is_some(),
+            "{holder} is using this folder. It is not a Git repository, so a second run cannot get its own worktree; wait for the first to finish"
+        );
+        Ok((Placement::WorktreeFromHead, Some(holder)))
+    }
     pub(super) fn start_driver(&mut self) -> Result<()> {
-        ensure!(self.worker.is_none(), "A stage is still running");
-        let mut run = self.run.clone().context("No run selected")?;
-        self.cancel.store(false, Ordering::Relaxed);
-        let cancel = self.cancel.clone();
+        ensure!(self.focused.worker.is_none(), "A stage is still running");
+        let mut run = self.focused.run.clone().context("No run selected")?;
+        self.focused.cancel.store(false, Ordering::Relaxed);
+        let cancel = self.focused.cancel.clone();
         let (sender, receiver) = mpsc::sync_channel(128);
         let handle = thread::spawn(move || {
             let action = engine::drive(&mut run, &cancel, |event| {
@@ -253,62 +490,25 @@ impl App {
             .map_err(|e| format!("{e:#}"));
             let _ = sender.send(WorkerMessage::Done(Box::new(run), action));
         });
-        self.worker = Some(Worker {
+        self.focused.worker = Some(Worker {
             receiver,
             thread: Some(handle),
         });
-        self.page = 1;
         Ok(())
     }
     pub(super) fn poll(&mut self) -> Result<bool> {
         if let Some(Modal::Import(importer)) = &mut self.modal {
             importer.poll();
         }
-        let messages: Vec<_> = self
-            .worker
-            .as_ref()
-            .map(|w| w.receiver.try_iter().collect())
-            .unwrap_or_default();
-        for message in messages {
-            match message {
-                WorkerMessage::Event(RunEvent::State(run)) => self.run = Some(*run),
-                WorkerMessage::Event(RunEvent::Output(text)) => {
-                    for line in text.lines() {
-                        self.logs.push_back(storage::truncate(line, 1500));
-                    }
-                    while self.logs.len() > 400 {
-                        self.logs.pop_front();
-                    }
-                }
-                WorkerMessage::Done(run, result) => {
-                    self.run = Some(*run);
-                    if let Some(mut worker) = self.worker.take() {
-                        if let Some(handle) = worker.thread.take() {
-                            let _ = handle.join();
-                        }
-                    }
-                    match result {
-                        Ok(Action::Interactive) => self.launch_interactive = !self.quit_after_stop,
-                        Ok(Action::Confirm) => {
-                            self.message =
-                                "Inspect the handoff: [h]. Advance: [a]. Reopen: [i]. Save and exit: [q]."
-                                    .into()
-                        }
-                        Ok(Action::Complete) => {
-                            self.message =
-                                "Workflow complete. Artifacts and handoffs are saved.".into()
-                        }
-                        Ok(Action::Stopped) => {
-                            self.message = self
-                                .run
-                                .as_ref()
-                                .and_then(|r| r.error.clone())
-                                .unwrap_or_else(|| "Run stopped".into())
-                        }
-                        Err(error) => {
-                            self.alert = error.clone();
-                            self.message = error;
-                        }
+        if let Some(result) = self.focused.poll() {
+            self.focused_stopped(result);
+        }
+        for index in 0..self.parked.len() {
+            if let Some(result) = self.parked[index].poll() {
+                if let Some(run) = &self.parked[index].run {
+                    self.message = notice(run, &result);
+                    if result.is_err() || result == Ok(Action::Stopped) {
+                        self.alert = self.message.clone();
                     }
                 }
             }
@@ -366,7 +566,42 @@ impl App {
             None => {}
         }
         self.poll_completion();
-        Ok(self.quit_after_stop && self.worker.is_none())
+        Ok(self.quit_after_stop && !self.any_active())
+    }
+    fn focused_stopped(&mut self, result: std::result::Result<Action, String>) {
+        // Away from the Monitor, a terminal never takes over the screen.
+        if self.page != 1 {
+            if let Some(run) = &self.focused.run {
+                self.message = notice(run, &result);
+                if result.is_err() || result == Ok(Action::Stopped) {
+                    self.alert = self.message.clone();
+                }
+            }
+            return;
+        }
+        match result {
+            Ok(Action::Interactive) => self.launch_interactive = !self.quit_after_stop,
+            Ok(Action::Confirm) => {
+                self.message =
+                    "Inspect the handoff: [h]. Advance: [a]. Reopen session: [t]. Restart: [i]. Save and exit: [q]."
+                        .into()
+            }
+            Ok(Action::Complete) => {
+                self.message = "Workflow complete. Artifacts and handoffs are saved.".into()
+            }
+            Ok(Action::Stopped) => {
+                self.message = self
+                    .focused
+                    .run
+                    .as_ref()
+                    .and_then(|r| r.error.clone())
+                    .unwrap_or_else(|| "Run stopped".into())
+            }
+            Err(error) => {
+                self.alert = error.clone();
+                self.message = error;
+            }
+        }
     }
     fn show_catalog(&mut self, catalog: Catalog) {
         let items = catalog
@@ -473,11 +708,8 @@ impl App {
             );
         });
     }
+    /// Runs of this session keep going in their own projects.
     pub(super) fn switch_project(&mut self, path: PathBuf) -> Result<()> {
-        ensure!(
-            self.worker.is_none(),
-            "Stop the active run before changing projects"
-        );
         let project = catalog::check_project(&path)?;
         if self.dirty {
             self.save(false)?;
@@ -489,14 +721,11 @@ impl App {
         self.config_path = config_path;
         self.workflow = 0;
         self.selected = 0;
-        self.run = None;
         self.task.clear();
         self.history.clear();
         self.history_selected = 0;
         self.harness_selected = 0;
         self.harness_checks.clear();
-        self.logs.clear();
-        self.log_scroll = 0;
         self.page = 0;
         self.message = format!("Project: {}", self.project.display());
         if let Err(error) = storage::remember_project(&self.project) {
@@ -521,10 +750,6 @@ impl App {
         if let Some(id) = actions::resolve(self.scope(), key) {
             return self.perform(id);
         }
-        if self.worker.is_some() && self.page == 0 {
-            self.message =
-                "Workflow is running. Use the monitor to cancel; edit after it stops.".into();
-        }
         Ok(false)
     }
     /// Run an action exactly as its key does; true means exit.
@@ -548,22 +773,22 @@ impl App {
     fn perform_global(&mut self, id: ActionId) -> Result<bool> {
         match id {
             ActionId::Interrupt => {
-                if self.worker.is_none() {
+                if !self.any_active() {
                     return Ok(true);
                 }
-                self.cancel.store(true, Ordering::Relaxed);
-                self.message = "Stopping the stage and saving its artifacts…".into();
+                self.cancel_all();
+                self.message = "Stopping active stages and saving their artifacts…".into();
             }
             ActionId::Quit => {
                 if self.dirty {
                     self.save(false)?;
                 }
-                if self.worker.is_none() {
+                if !self.any_active() {
                     return Ok(true);
                 }
-                self.cancel.store(true, Ordering::Relaxed);
+                self.cancel_all();
                 self.quit_after_stop = true;
-                self.message = "Stopping and saving before exit…".into();
+                self.message = "Stopping active runs and saving before exit…".into();
             }
             ActionId::Themes => self.choose_theme(),
             ActionId::ToggleVim => {
@@ -631,30 +856,16 @@ impl App {
     fn page_scope(&self) -> Scope {
         match self.page {
             0 => Scope::Workflow,
-            1 if self.worker.is_some() => Scope::MonitorRunning,
+            1 if self.focused.worker.is_some() => Scope::MonitorRunning,
             1 => Scope::MonitorIdle,
             2 => Scope::Runs,
             _ => Scope::Harnesses,
         }
     }
-    /// Where actions apply: workflow edits wait until the run stops.
+    /// Where actions apply. Runs snapshot their workflow, so editing and
+    /// starting more runs continue while others are active.
     fn scope(&self) -> Scope {
-        if self.page == 0 && self.worker.is_some() {
-            Scope::Global
-        } else {
-            self.page_scope()
-        }
-    }
-}
-impl Drop for App {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
-        if let Some(mut worker) = self.worker.take() {
-            drop(worker.receiver);
-            if let Some(thread) = worker.thread.take() {
-                let _ = thread.join();
-            }
-        }
+        self.page_scope()
     }
 }
 
@@ -785,10 +996,18 @@ fn header_lines(app: &App, palette: Palette, width: u16) -> Vec<Line<'static>> {
         ),
         Span::raw("  "),
     ];
+    // The Monitor tab counts runs still in progress, so they stay visible
+    // while the next workflow is being set up.
+    let live = app.slots().filter(|(slot, _)| slot.in_progress()).count();
     let mut tabs = Vec::new();
     for (index, name) in TABS.iter().enumerate() {
+        let count = if index == 1 && live > 0 {
+            format!(" ●{live}")
+        } else {
+            String::new()
+        };
         tabs.push(Span::styled(
-            format!(" {} {name} ", index + 1),
+            format!(" {} {name}{count} ", index + 1),
             if index == app.page {
                 Style::default()
                     .fg(palette.bg)

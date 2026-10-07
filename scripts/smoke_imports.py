@@ -156,7 +156,14 @@ def main():
                         expected
                         in (project / f".model-router/mock/{stage}.prompt").read_text()
                     )
-                terminal.send("n")
+                # Starting a run frees the editor for the next task.
+                terminal.wait(
+                    lambda: "Existing instructions" not in terminal.text(),
+                    "Starting a run did not clear the task",
+                )
+                terminal.send("t")
+                paste(terminal, "Existing instructions")
+                terminal.send(b"\x13")
 
                 # Invalid local documents keep the current task and browser available.
                 for file, error in (

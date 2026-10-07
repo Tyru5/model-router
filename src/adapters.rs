@@ -166,6 +166,101 @@ pub fn validate_options(stage: &Stage, configured: &BTreeMap<String, Provider>) 
     harness_settings::validate(stage)
 }
 
+/// Whether `harness` can reopen a stage's session in its interactive CLI.
+pub fn resumable(harness: &str, custom: &BTreeMap<String, CustomAdapter>) -> bool {
+    !custom.contains_key(harness)
+        && matches!(
+            harness,
+            "claude" | "codex" | "pi" | "omp" | "cursor" | "opencode" | "amp"
+        )
+}
+
+/// Gives a Claude Code or Pi launch a known session ID, which it returns, so
+/// the stage can be taken over or reopened later. The others report their own
+/// session in their JSON events.
+pub fn assign_session(invocation: &mut Invocation, harness: &str) -> Option<String> {
+    let chosen = |flag: &str| {
+        invocation
+            .args
+            .iter()
+            .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
+    };
+    // Flags that already pick, continue, or disable a session.
+    let session_flags: &[&str] = match harness {
+        "claude" => &["--session-id", "--resume", "-r", "--continue", "-c"],
+        // omp shares Pi's output but has no --session-id; it reports its own.
+        "pi" => &[
+            "--session-id",
+            "--session",
+            "--resume",
+            "-r",
+            "--continue",
+            "-c",
+            "--fork",
+            "--no-session",
+        ],
+        _ => return None,
+    };
+    if session_flags.iter().any(|flag| chosen(flag)) {
+        return None;
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let flag = ["--session-id".to_owned(), id.clone()];
+    if harness == "claude" {
+        // Interactive Claude Code takes its prompt last.
+        invocation.args.splice(0..0, flag);
+    } else {
+        invocation.args.extend(flag);
+    }
+    Some(id)
+}
+
+/// The native interactive command that resumes `session` with the stage's
+/// model and permission settings, where the harness accepts them on resume.
+pub fn resume(
+    stage: &Stage,
+    custom: &BTreeMap<String, CustomAdapter>,
+    configured: &BTreeMap<String, Provider>,
+    session: &str,
+    paths: &ContextPaths<'_>,
+) -> Result<Invocation> {
+    ensure!(
+        resumable(&stage.harness, custom),
+        "{} sessions cannot be resumed",
+        stage.harness
+    );
+    let stage = Stage {
+        mode: Mode::Interactive,
+        ..stage.clone()
+    };
+    let mut invocation = build(&stage, custom, configured, "", paths)?;
+    let args = &mut invocation.args;
+    // Interactive builds end with the prompt (Pi, omp: its @file); the session replaces it.
+    args.pop();
+    match stage.harness.as_str() {
+        "claude" => {
+            args.splice(0..0, ["--resume".to_owned(), session.to_owned()]);
+        }
+        "codex" => {
+            args.insert(0, "resume".into());
+            args.push(session.into());
+        }
+        "pi" => args.extend(["--session-id".to_owned(), session.to_owned()]),
+        "omp" => {
+            args.splice(0..0, ["--resume".to_owned(), session.to_owned()]);
+        }
+        "cursor" => args.extend(["--resume".to_owned(), session.to_owned()]),
+        "amp" => {
+            args.splice(0..0, ["threads".to_owned(), "continue".to_owned()]);
+            args.push(session.into());
+        }
+        // The OpenCode TUI keeps the session's model; `run` options do not apply.
+        "opencode" => *args = vec!["--session".into(), session.into()],
+        other => bail!("{other} sessions cannot be resumed"),
+    }
+    Ok(invocation)
+}
+
 pub struct ContextPaths<'a> {
     pub workspace: &'a Path,
     pub attempt_dir: &'a Path,
@@ -279,7 +374,9 @@ pub fn build(
         "claude" => {
             invocation.kind = OutputKind::Claude;
             if !interactive {
-                append(&["--print", "--output-format", "json"]);
+                // Stream events so the monitor shows progress; print mode
+                // requires --verbose for stream-json.
+                append(&["--print", "--output-format", "stream-json", "--verbose"]);
             }
             if !stage.model.is_empty() {
                 append(&["--model", &stage.model]);
@@ -311,10 +408,26 @@ pub fn build(
             a.extend(extra_args.clone());
             a.push(format!("@{}", paths.prompt_file.display()));
         }
+        // oh-my-pi prints Pi's JSON events. Its provider is part of the model
+        // selector; it reads the prompt file and needs no stdin.
+        "omp" => {
+            invocation.kind = OutputKind::Pi;
+            if !interactive {
+                append(&["--print", "--mode", "json"]);
+            }
+            if !qualified.is_empty() {
+                append(&["--model", &qualified]);
+            }
+            if !stage.effort.is_empty() {
+                append(&["--thinking", &stage.effort]);
+            }
+            a.extend(extra_args.clone());
+            a.push(format!("@{}", paths.prompt_file.display()));
+        }
         "cursor" => {
             invocation.kind = OutputKind::Cursor;
             if !interactive {
-                append(&["--print", "--output-format", "json"]);
+                append(&["--print", "--output-format", "stream-json"]);
             }
             if !stage.model.is_empty() {
                 append(&["--model", &stage.model]);
@@ -674,6 +787,115 @@ mod tests {
     }
     fn env<'a>(i: &'a Invocation, name: &str) -> Option<&'a EnvValue> {
         i.env.iter().find(|(n, _)| n == name).map(|(_, v)| v)
+    }
+
+    #[test]
+    fn takeover_assigns_sessions_and_resumes_in_the_native_cli() {
+        let none = BTreeMap::new();
+        let providers = BTreeMap::new();
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ContextPaths {
+            workspace: dir.path(),
+            attempt_dir: dir.path(),
+            prompt_file: &dir.path().join("prompt.md"),
+            handoff_file: dir.path(),
+        };
+        let stage = |harness: &str, mode| Stage {
+            harness: harness.into(),
+            model: "m".into(),
+            effort: if harness_settings::supports_effort(harness) {
+                "high".into()
+            } else {
+                String::new()
+            },
+            mode,
+            ..Stage::default()
+        };
+        let launch =
+            |harness, mode| build(&stage(harness, mode), &none, &providers, "task", &paths);
+
+        // Claude Code and Pi accept a session ID chosen by the router.
+        let mut claude = launch("claude", Mode::Unattended).unwrap();
+        assert_eq!(
+            claude.args,
+            [
+                "--print",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--model",
+                "m",
+                "--effort",
+                "high"
+            ]
+        );
+        let id = assign_session(&mut claude, "claude").unwrap();
+        assert_eq!(claude.args[..2], ["--session-id".to_owned(), id]);
+        let mut interactive = launch("claude", Mode::Interactive).unwrap();
+        let id = assign_session(&mut interactive, "claude").unwrap();
+        assert_eq!(interactive.args[..2], ["--session-id".to_owned(), id]);
+        assert_eq!(interactive.args.last().map(String::as_str), Some("task"));
+        let mut pi = launch("pi", Mode::Unattended).unwrap();
+        let id = assign_session(&mut pi, "pi").unwrap();
+        assert_eq!(
+            pi.args[pi.args.len() - 2..],
+            ["--session-id".to_owned(), id]
+        );
+        // The others report their own; explicit session flags are kept.
+        for harness in ["codex", "omp", "cursor", "opencode", "amp"] {
+            assert_eq!(
+                assign_session(&mut launch(harness, Mode::Unattended).unwrap(), harness),
+                None
+            );
+        }
+        let mut chosen = launch("claude", Mode::Unattended).unwrap();
+        chosen.args.push("--continue".into());
+        assert_eq!(assign_session(&mut chosen, "claude"), None);
+
+        let resumed = |harness| {
+            resume(
+                &stage(harness, Mode::Unattended),
+                &none,
+                &providers,
+                "s-1",
+                &paths,
+            )
+            .unwrap()
+        };
+        let claude = resumed("claude");
+        assert_eq!(
+            claude.args,
+            ["--resume", "s-1", "--model", "m", "--effort", "high"]
+        );
+        assert!(claude.stdin.is_none());
+        let codex = resumed("codex");
+        assert_eq!(codex.args.first().map(String::as_str), Some("resume"));
+        assert_eq!(codex.args.last().map(String::as_str), Some("s-1"));
+        assert!(codex.args.contains(&"--model".into()) && !codex.args.contains(&"exec".into()));
+        assert_eq!(
+            resumed("pi").args,
+            ["--model", "m", "--thinking", "high", "--session-id", "s-1"]
+        );
+        assert_eq!(resumed("cursor").args, ["--model", "m", "--resume", "s-1"]);
+        assert_eq!(
+            resumed("amp").args,
+            ["threads", "continue", "--mode", "m", "s-1"]
+        );
+        assert_eq!(resumed("opencode").args, ["--session", "s-1"]);
+
+        assert!(!resumable("gemini", &none));
+        assert!(
+            resume(
+                &stage("gemini", Mode::Unattended),
+                &none,
+                &providers,
+                "x",
+                &paths
+            )
+            .is_err()
+        );
+        let custom = BTreeMap::from([("claude".to_owned(), CustomAdapter::default())]);
+        assert!(!resumable("claude", &custom));
     }
 
     #[test]

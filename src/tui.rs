@@ -152,7 +152,7 @@ pub fn run(
     let _ = storage::remember_project(&app.project);
     'run: loop {
         if app.signal.load(Ordering::Relaxed) {
-            app.cancel.store(true, Ordering::Relaxed);
+            app.cancel_all();
             app.quit_after_stop = true;
         }
         if app.poll()? {
@@ -162,18 +162,18 @@ pub fn run(
             app.launch_interactive = false;
             screen.restore();
             let result = engine::run_interactive(
-                app.run.as_mut().context("No interactive run")?,
+                app.focused.run.as_mut().context("No interactive run")?,
                 &app.signal,
             );
             screen.resume()?;
             app.message = match result {
-                Ok(()) => "Stage returned. h inspects the handoff; a advances; i reopens.".into(),
+                Ok(()) => "Stage returned. h inspects the handoff; a advances; t reopens the session; i starts the stage over.".into(),
                 Err(e) => {
                     app.alert = format!("{e:#}");
                     app.alert.clone()
                 }
             };
-            if let Some(run) = &app.run {
+            if let Some(run) = &app.focused.run {
                 if let Some(error) = &run.error {
                     app.message = error.clone();
                     app.alert = error.clone();
@@ -201,9 +201,6 @@ pub fn run(
                     break;
                 }
             }
-        }
-        if app.cancel.load(Ordering::Relaxed) && app.worker.is_none() {
-            app.cancel.store(false, Ordering::Relaxed);
         }
     }
     Ok(())
