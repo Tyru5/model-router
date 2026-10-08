@@ -1,5 +1,5 @@
-use crate::{config::Settings, engine, storage};
-use anyhow::{Context, Result};
+use crate::{config::Settings, process::AttachOutcome, storage};
+use anyhow::Result;
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
     execute,
@@ -160,25 +160,27 @@ pub fn run(
         }
         if app.launch_interactive {
             app.launch_interactive = false;
-            screen.restore();
-            let result = engine::run_interactive(
-                app.focused.run.as_mut().context("No interactive run")?,
-                &app.signal,
-            );
-            screen.resume()?;
+            let result = match app.interactive_terminal() {
+                Ok(session) => {
+                    screen.restore();
+                    let result = session.attach(&app.focused.cancel, &app.signal);
+                    screen.resume()?;
+                    result
+                }
+                Err(error) => Err(error),
+            };
             app.message = match result {
-                Ok(()) => "Stage returned. h inspects the handoff; a advances; t reopens the session; i starts the stage over.".into(),
-                Err(e) => {
-                    app.alert = format!("{e:#}");
+                Ok(AttachOutcome::Detached) => {
+                    "Interactive session detached and still running. [t] reattaches; [c] stops it. /exit quits the harness.".into()
+                }
+                Ok(AttachOutcome::Finished) => "Harness returned. Finishing stage…".into(),
+                Err(error) => {
+                    app.alert = format!("{error:#}");
                     app.alert.clone()
                 }
             };
-            if let Some(run) = &app.focused.run {
-                if let Some(error) = &run.error {
-                    app.message = error.clone();
-                    app.alert = error.clone();
-                }
-            }
+            // Apply completion or shutdown before accepting another action.
+            continue;
         }
         screen.terminal.draw(|frame| draw(frame, &mut app))?;
         if event::poll(Duration::from_millis(70))? {

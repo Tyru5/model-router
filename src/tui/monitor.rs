@@ -25,6 +25,10 @@ impl App {
                 self.message = "Stopping stage…".into();
             }
             ActionId::TakeOver => {
+                if self.focused.terminal().is_some() {
+                    self.launch_interactive = true;
+                    return Ok(());
+                }
                 let run = self.focused.run.as_ref().context("No run selected")?;
                 let stage = run
                     .workflow
@@ -256,6 +260,14 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
                     run.id, run.repair_passes, run.workflow.max_repair_passes
                 ),
                 Style::default().fg(palette.muted),
+            ),
+            Span::styled(
+                if app.focused.terminal().is_some() {
+                    "   detached · [t] attach"
+                } else {
+                    ""
+                },
+                Style::default().fg(palette.accent),
             ),
         ])),
         chunks[0],

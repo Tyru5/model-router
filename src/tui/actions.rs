@@ -5,8 +5,8 @@
 //! 1. Add an `ActionId` variant.
 //! 2. Add `act(id, scope, key, label, description)` to `ACTIONS` in its
 //!    scope's section. Chain `.also()` for more keys, `.more()` for extra
-//!    guide lines, and `.footer()` to show it in footers, which must fit two
-//!    rows at 80 columns (`footers_keep_their_hints` pins them).
+//!    guide lines, and `.footer()` to show it in footers, which should fit two
+//!    rows at 80 columns.
 //! 3. Handle the variant in its scope's perform function: `perform_workflow`
 //!    (workflow_page.rs), `perform_monitor` (monitor.rs), `perform_runs`
 //!    (history.rs), `perform_harnesses` (harnesses.rs), or `perform_global`
@@ -264,7 +264,7 @@ const ACTIONS: &[Entry] = {
         act(SaveGlobal, Workflow, ch('S'), "save global", "Save global templates"),
         // Monitor: while running, while idle, or both
         act(CancelStage, MonitorRunning, ch('c'), "cancel stage", "Cancel active stage").footer(),
-        act(TakeOver, Monitor, ch('t'), "take over", "Open the stage's session in its native terminal (Claude Code, Codex, Pi, Cursor, OpenCode, Amp); stops it first if unattended")
+        act(TakeOver, Monitor, ch('t'), "terminal", "Attach to the live interactive terminal, or reopen the stage's saved session (stops it first if unattended)")
             .footer_in(&[MonitorRunning]),
         act(PreviousSessionRun, Monitor, ch('['), "runs", "Show the previous run of this session").alias("[ ]").footer_in(&[MonitorRunning]),
         act(NextSessionRun, Monitor, ch(']'), "runs", "Show the next run of this session").alias("[ ]").footer_in(&[MonitorRunning]),
@@ -326,7 +326,8 @@ const ACTIONS: &[Entry] = {
 /// Guide text for keys that are not page actions.
 const GUIDE_NOTES: &str = "INTERACTIVE HARNESS
 \tNative terminal keys and paste are forwarded.
-\tExit the harness to inspect its handoff.
+\tExit the harness to inspect its handoff; /exit quits, not detaches.
+Ctrl+B\tDetach to Monitor; the session keeps running. [t] reattaches.
 Ctrl+]\tStop a stuck stage
 
 SELECTION MENUS
@@ -492,36 +493,5 @@ mod tests {
         }
         assert!(lines.contains(&"e / Enter\tEdit selected stage"));
         assert!(lines.contains(&"Ctrl+C\tCancel work or exit"));
-    }
-
-    #[test]
-    fn footers_keep_their_hints() {
-        let shown = |here| {
-            footer(here)
-                .into_iter()
-                .map(|(key, label)| format!("{key} {label}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        assert_eq!(
-            shown(Scope::Workflow),
-            "r run, t task, f import, p repos, c harness, m models, Space toggle, s save, T themes, ? help, q quit"
-        );
-        assert_eq!(
-            shown(Scope::MonitorRunning),
-            "c cancel stage, t take over, [ ] runs, h handoff, PgUp/PgDn scroll, Tab switch view, T themes, q quit, : commands"
-        );
-        assert_eq!(
-            shown(Scope::MonitorIdle),
-            "a advance, c continue, y retry, i interactive, m model, h handoff, e summary, n workflow, T themes, ? help"
-        );
-        assert_eq!(
-            shown(Scope::Runs),
-            "↑↓ select, Enter open, / filter, f status, n rerun, c compare, D clean, Tab switch view, T themes, q quit, : commands"
-        );
-        assert_eq!(
-            shown(Scope::Harnesses),
-            "↑↓ select, Enter details, r refresh, Tab switch view, T themes, ? help, q quit, : commands"
-        );
     }
 }

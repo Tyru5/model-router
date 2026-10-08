@@ -6,7 +6,7 @@ use model_router::{
     doctor,
     engine::{self, Action, Event, Run, Status},
     history::{self, Criteria, Entry, StatusFilter},
-    presets, providers, task_import, tui,
+    presets, process, providers, task_import, tui,
 };
 use std::{
     io::{self, IsTerminal, Write},
@@ -14,6 +14,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
 };
 
@@ -589,14 +590,14 @@ fn cli_drive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
                 bail!("Run stopped");
             }
             Action::Interactive => {
-                if !io::stdin().is_terminal() {
+                if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
                     bail!(
                         "Stage {} is interactive. Resume {} from a terminal",
                         run.current_name(),
                         run.id
                     );
                 }
-                engine::run_interactive(run, cancel)?;
+                cli_interactive(run, cancel)?;
             }
             Action::Confirm => {
                 if let Some(handoff) = &run.stages[run.cursor].handoff {
@@ -650,4 +651,140 @@ fn cli_drive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
             engine::ensure_runnable(run)?;
         }
     }
+}
+
+fn cli_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
+    use process::{AttachOutcome, InteractiveSession};
+
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((100, 30));
+    let session = InteractiveSession::new(cols, rows);
+    std::thread::scope(|scope| {
+        let (tx, rx) = mpsc::sync_channel(128);
+        let session = &session;
+        let worker = scope.spawn(move || {
+            engine::run_interactive(run, cancel, session, |event| {
+                let _ = tx.try_send(event);
+            })
+        });
+        let foreground = (|| -> Result<()> {
+            let mut finished = matches!(session.attach(cancel, cancel)?, AttachOutcome::Finished);
+            crossterm::terminal::enable_raw_mode()?;
+            struct RestoreTerminal;
+            impl Drop for RestoreTerminal {
+                fn drop(&mut self) {
+                    let _ = crossterm::terminal::disable_raw_mode();
+                }
+            }
+            let _terminal = RestoreTerminal;
+            if !finished {
+                write!(
+                    io::stdout(),
+                    "\r\nHarness still running. [t] Reattach  [c] Cancel  [q] Stop\r\n"
+                )?;
+                io::stdout().flush()?;
+            }
+            while !worker.is_finished() {
+                cli_interactive_events(&rx)?;
+                let mut input = libc::pollfd {
+                    fd: 0,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: stdin is borrowed; input is one initialized pollfd.
+                let ready = unsafe { libc::poll(&mut input, 1, 50) };
+                if ready < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error.into());
+                }
+                ensure!(
+                    input.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) == 0,
+                    "Terminal disconnected while waiting for the harness"
+                );
+                if input.revents & libc::POLLIN == 0 {
+                    continue;
+                }
+                let mut bytes = [0u8; 64];
+                // SAFETY: bytes is writable and stdin was reported readable.
+                let count = unsafe { libc::read(0, bytes.as_mut_ptr().cast(), bytes.len()) };
+                if count < 0 {
+                    let error = io::Error::last_os_error();
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                    ) {
+                        continue;
+                    }
+                    return Err(error.into());
+                }
+                ensure!(
+                    count != 0,
+                    "Terminal input closed while waiting for the harness"
+                );
+                let keys = &bytes[..count as usize];
+                if keys
+                    .iter()
+                    .any(|key| matches!(key, b'c' | b'q' | 0x03 | 0x1d))
+                {
+                    cancel.store(true, Ordering::Relaxed);
+                    write!(io::stdout(), "\r\nStopping the stage...\r\n")?;
+                    io::stdout().flush()?;
+                } else if keys.contains(&b't') && !finished && !cancel.load(Ordering::Relaxed) {
+                    crossterm::terminal::disable_raw_mode()?;
+                    finished = matches!(session.attach(cancel, cancel)?, AttachOutcome::Finished);
+                    crossterm::terminal::enable_raw_mode()?;
+                    if !finished {
+                        write!(
+                            io::stdout(),
+                            "\r\nHarness still running. [t] Reattach  [c] Cancel  [q] Stop\r\n"
+                        )?;
+                        io::stdout().flush()?;
+                    }
+                }
+            }
+            cli_interactive_events(&rx)?;
+            crossterm::terminal::disable_raw_mode()?;
+            Ok(())
+        })();
+        // Never join a live child after losing the foreground terminal.
+        if foreground.is_err() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        let result = worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("Interactive worker panicked"))?;
+        foreground?;
+        result
+    })
+}
+
+fn cli_interactive_events(events: &mpsc::Receiver<Event>) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    for event in events.try_iter() {
+        match event {
+            Event::State(run) => {
+                write!(
+                    stdout,
+                    "\r\n[{}] {}\r\n",
+                    run.status.label(),
+                    run.current_name()
+                )?;
+            }
+            Event::Output(text) => {
+                // Raw mode disables newline translation. Keep check output readable.
+                for line in text.split_inclusive('\n') {
+                    if let Some(line) = line.strip_suffix('\n') {
+                        stdout.write_all(line.as_bytes())?;
+                        stdout.write_all(b"\r\n")?;
+                    } else {
+                        stdout.write_all(line.as_bytes())?;
+                    }
+                }
+            }
+        }
+    }
+    stdout.flush()?;
+    Ok(())
 }

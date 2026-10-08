@@ -15,7 +15,7 @@ use crate::{
     config::{self, Settings, Stage},
     engine::{self, Action, Event as RunEvent, Placement, Run, Status},
     history::Entry,
-    storage,
+    process, storage,
 };
 use anyhow::{Context, Result, bail, ensure};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
@@ -44,6 +44,7 @@ enum WorkerMessage {
 pub(super) struct Worker {
     receiver: Receiver<WorkerMessage>,
     thread: Option<JoinHandle<()>>,
+    terminal: Option<process::InteractiveSession>,
 }
 #[cfg(test)]
 impl Worker {
@@ -52,6 +53,7 @@ impl Worker {
         Self {
             receiver: mpsc::sync_channel(1).1,
             thread: None,
+            terminal: None,
         }
     }
 }
@@ -91,6 +93,9 @@ impl Default for RunSlot {
     }
 }
 impl RunSlot {
+    pub(super) fn terminal(&self) -> Option<&process::InteractiveSession> {
+        self.worker.as_ref()?.terminal.as_ref()
+    }
     /// Whether the run still needs the router: driving, or waiting on the user.
     pub(super) fn in_progress(&self) -> bool {
         self.worker.is_some()
@@ -493,8 +498,47 @@ impl App {
         self.focused.worker = Some(Worker {
             receiver,
             thread: Some(handle),
+            terminal: None,
         });
         Ok(())
+    }
+    /// Start the stage once; subsequent attachments reuse this worker's PTY.
+    pub(super) fn interactive_terminal(&mut self) -> Result<process::InteractiveSession> {
+        if let Some(session) = self.focused.terminal() {
+            return Ok(session.clone());
+        }
+        ensure!(self.focused.worker.is_none(), "A stage is still running");
+        let mut run = self.focused.run.clone().context("No run selected")?;
+        ensure!(
+            run.status == Status::Interactive,
+            "No interactive stage is ready"
+        );
+        let (cols, rows) = crossterm::terminal::size()?;
+        let session = process::InteractiveSession::new(cols, rows);
+        let terminal = session.clone();
+        self.focused.cancel.store(false, Ordering::Relaxed);
+        let cancel = self.focused.cancel.clone();
+        let (sender, receiver) = mpsc::sync_channel(128);
+        let handle = thread::spawn(move || {
+            let result = engine::run_interactive(&mut run, &cancel, &terminal, |event| {
+                let _ = sender.try_send(WorkerMessage::Event(event));
+            })
+            .map(|()| {
+                if run.status == Status::AwaitingConfirmation {
+                    Action::Confirm
+                } else {
+                    Action::Stopped
+                }
+            })
+            .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(WorkerMessage::Done(Box::new(run), result));
+        });
+        self.focused.worker = Some(Worker {
+            receiver,
+            thread: Some(handle),
+            terminal: Some(session.clone()),
+        });
+        Ok(session)
     }
     pub(super) fn poll(&mut self) -> Result<bool> {
         if let Some(Modal::Import(importer)) = &mut self.modal {

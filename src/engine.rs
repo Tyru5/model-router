@@ -12,8 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs,
-    io::{self, Write},
+    fs, io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -963,7 +962,7 @@ fn run_checks(
 fn execute_stage(
     run: &mut Run,
     cancel: &AtomicBool,
-    interactive: bool,
+    interactive: Option<&process::InteractiveSession>,
     emit: &mut impl FnMut(Event),
 ) -> Result<()> {
     let index = run.cursor;
@@ -986,12 +985,13 @@ fn execute_stage(
         if stage.model.is_empty() { "" } else { " " },
         stage.model
     )));
-    let result = if interactive {
+    let result = if let Some(session) = interactive {
         process::interactive(
             &prepared.invocation,
             &run.workspace,
             &prepared.directory,
             cancel,
+            session,
         )
     } else {
         // Events become readable lines; stdout.log keeps them raw.
@@ -1096,11 +1096,24 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
             emit(Event::State(Box::new(run.clone())));
             return Ok(Action::Interactive);
         }
-        execute_stage(run, cancel, false, &mut emit)?;
+        execute_stage(run, cancel, None, &mut emit)?;
     }
 }
 
-pub fn run_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
+/// Own the stage on a worker; its foreground terminal can attach independently.
+pub fn run_interactive(
+    run: &mut Run,
+    cancel: &AtomicBool,
+    session: &process::InteractiveSession,
+    mut emit: impl FnMut(Event),
+) -> Result<()> {
+    struct FinishSession<'a>(&'a process::InteractiveSession);
+    impl Drop for FinishSession<'_> {
+        fn drop(&mut self) {
+            self.0.finish();
+        }
+    }
+    let _session = FinishSession(session);
     ensure!(
         run.status == Status::Interactive,
         "No interactive stage is ready"
@@ -1109,14 +1122,7 @@ pub fn run_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
     let _workspace_lock =
         storage::lock(&storage::metadata_dir(&run.workspace)?.join("workspace.lock"))?;
     run.check_revision()?;
-    // The terminal is still ours after the harness exits; show check output there.
-    execute_stage(run, cancel, true, &mut |event| {
-        if let Event::Output(text) = event {
-            let mut stdout = io::stdout();
-            let _ = stdout.write_all(text.as_bytes());
-            let _ = stdout.flush();
-        }
-    })?;
+    execute_stage(run, cancel, Some(session), &mut emit)?;
     if matches!(
         run.status,
         Status::Failed | Status::Blocked | Status::Cancelled

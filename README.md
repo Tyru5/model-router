@@ -85,7 +85,7 @@ the next option and `Ctrl+P` to the previous option, just like `↓` and `↑`.
 - Explicit harness/model/provider/effort selection and extra CLI arguments.
 - In-app harness settings for each stage, including native permission controls.
 - Optional research, planning, implementation, review, testing, and custom stages.
-- Native interactive terminals, including paste, resize, and a saved transcript.
+- Native interactive terminals, including detach/reattach, paste, resize, and a saved transcript.
 - Several runs at once; a busy checkout sends the next run to its own worktree.
 - Readable live output; take over a running stage's session in its native terminal.
 - Unattended execution with live output, cancellation, and timeouts.
@@ -442,10 +442,29 @@ on branch `model-router/RUN_ID`. Uncommitted changes in the checkout, including
 the first run's edits, are not part of it. Outside Git, the second run is
 refused instead. `g` still chooses a worktree explicitly.
 
-An interactive stage takes over the screen only while its run is shown in the
-Monitor. Otherwise the run waits, and `i` opens the stage when you are ready.
-A workflow whose first enabled stage is interactive opens the Monitor right
-away. `q` and `Ctrl+C` stop every active run.
+A new interactive stage takes over the screen only while its run is shown in
+the Monitor. Otherwise it waits, and `i` opens it when you are ready. A workflow
+whose first enabled stage is interactive opens the Monitor right away.
+
+### Detach and reattach an interactive session
+
+Press **Ctrl+B** inside a native harness to return to the Monitor without
+stopping it. The same process and PTY keep running and recording output.
+Press **t** in that run's Monitor to reattach, restoring its current screen
+and terminal size. Detaching does not create an attempt, finish the stage,
+or advance the workflow. This works with custom adapters too; it does not
+require the harness to support saved-session resume.
+
+The harness still waits when it needs input or approval. `/exit` (or the
+harness's own quit command) **quits the harness**, rather than detaching.
+After it exits, the router performs the usual checks and handoff inspection.
+`Ctrl+]` stops the attached stage; `c` stops it from the Monitor.
+
+CLI runs use the same **Ctrl+B** shortcut. Their detached waiting view accepts
+`t` to reattach and `c` or `q` to stop, and notices completion without a keypress.
+Detached sessions live only for the current `mr` process: quitting the router
+or losing its terminal still cancels its active runs. In the TUI, `q` quits
+after stopping all active runs; `Ctrl+C` stops them without quitting.
 
 ### Take over an unattended stage
 
@@ -475,8 +494,9 @@ again. `t` also works on a stage that failed, was blocked, or was cancelled,
 and on interactive Claude Code and Pi stages. `Ctrl+]` still stops a stage
 outright. Cancelling sends SIGTERM and allows five seconds before SIGKILL, so a harness
 can save its session first (omp only saves on a clean exit). Gemini, Copilot,
-Goose, Aider, and custom adapters cannot be reopened;
-use `i` to retry the stage interactively.
+Goose, Aider, and custom adapters cannot reopen a saved session after exit;
+use `i` to retry the stage interactively. Live detached sessions can always
+be reattached with `t`, regardless of harness.
 
 ### Review summary
 

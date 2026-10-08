@@ -80,9 +80,12 @@ class Terminal:
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             self.pump()
+            # Snapshot exit before the predicate, which may itself await exit.
+            # A second poll afterwards races a successful termination.
+            code = self.process.poll()
             if predicate():
                 return
-            assert self.process.poll() is None, (
+            assert code is None, (
                 f"Router exited before {message}: {self.process.returncode}"
             )
         raise AssertionError(message)
