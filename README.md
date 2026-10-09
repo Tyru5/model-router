@@ -353,7 +353,7 @@ Press `w` and choose **+ Preset:** to add a workflow:
 | Quick task | Implement → verify → review summary |
 | Full feature | Clarify → research → design → plan → implement → verify → document → review summary |
 | Bug fix | Diagnose → implement → verify → review summary |
-| Investigation | Research → handoff |
+| Investigation | Research → review summary |
 
 The first three include a disabled code review; Full feature also includes a
 disabled security review. Enable either with `Space` when wanted. Adding a
@@ -500,7 +500,7 @@ be reattached with `t`, regardless of harness.
 
 ### Review summary
 
-New workflows end with an enabled **Review summary** stage (role `summary`).
+Every workflow ends with an enabled **Review summary** stage (role `summary`).
 It runs unattended (Codex, read-only sandbox) after everything else, reads the
 task, every earlier handoff, and the actual Git changes, and writes a Markdown
 brief for the person reviewing the work:
@@ -514,8 +514,9 @@ brief for the person reviewing the work:
 
 The brief leads the Monitor's results when the run finishes, appears in
 `model-router report` and the CLI's completion output, and is saved as
-`.model-router/runs/RUN_ID/review.md`. Existing workflow files are unchanged;
-add the stage with `a` → **Review summary**, or disable it with `Space`.
+`.model-router/runs/RUN_ID/review.md`. Loading a workflow with no `summary`
+stage, such as one saved before the stage existed, appends it enabled. To opt
+out, disable it with `Space`; a deleted stage comes back on the next load.
 
 When an interactive harness exits, inspect its handoff and advance, reopen, or
 stop. `Ctrl+]` stops a stuck interactive harness. In the monitor, `h` inspects

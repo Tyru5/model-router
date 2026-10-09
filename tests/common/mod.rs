@@ -26,19 +26,28 @@ pub fn fixture(stages: Vec<Stage>) -> (tempfile::TempDir, Settings, Run) {
         ],
         ..CustomAdapter::default()
     };
+    let workflow = Workflow {
+        name: "Test".into(),
+        max_repair_passes: 2,
+        stages,
+    };
+    // Saved configs gain an enabled Codex summary on load; opt out to stay offline.
+    let mut saved = workflow.clone();
+    if !saved.stages.iter().any(|s| s.role == Role::Summary) {
+        saved.stages.push(Stage {
+            enabled: false,
+            ..stage("summary", Role::Summary)
+        });
+    }
     let settings = Settings {
-        workflows: vec![Workflow {
-            name: "Test".into(),
-            max_repair_passes: 2,
-            stages,
-        }],
+        workflows: vec![saved],
         adapters: BTreeMap::from([("mock".into(), adapter)]),
         ..Settings::default()
     };
     let run = Run::create(
         dir.path(),
         &settings,
-        &settings.workflows[0],
+        &workflow,
         "Original task: preserve 雪 and $(touch NEVER) literally".into(),
         false,
     )

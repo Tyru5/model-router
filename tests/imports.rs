@@ -15,16 +15,25 @@ fn project() -> tempfile::TempDir {
         workflows: vec![Workflow {
             name: "Import test".into(),
             max_repair_passes: 0,
-            stages: vec![Stage {
-                id: "implementation".into(),
-                name: "Implement".into(),
-                role: Role::Implementation,
-                mode: Mode::Unattended,
-                harness: "mock".into(),
-                provider: "implementation".into(),
-                model: "offline-test".into(),
-                ..Stage::default()
-            }],
+            stages: vec![
+                Stage {
+                    id: "implementation".into(),
+                    name: "Implement".into(),
+                    role: Role::Implementation,
+                    mode: Mode::Unattended,
+                    harness: "mock".into(),
+                    provider: "implementation".into(),
+                    model: "offline-test".into(),
+                    ..Stage::default()
+                },
+                Stage {
+                    // Otherwise loading appends an enabled Codex summary.
+                    id: "summary".into(),
+                    role: Role::Summary,
+                    enabled: false,
+                    ..Stage::default()
+                },
+            ],
         }],
         adapters: BTreeMap::from([(
             "mock".into(),

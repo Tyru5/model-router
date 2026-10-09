@@ -140,6 +140,24 @@ pub struct Workflow {
 fn two() -> u32 {
     2
 }
+impl Workflow {
+    /// Appends the review summary unless a stage already has the summary role,
+    /// so configs saved before it existed still brief the reviewer. Disabling
+    /// the stage, not deleting it, opts out.
+    pub fn ensure_summary(&mut self) {
+        if self.stages.len() >= 64 || self.stages.iter().any(|s| s.role == Role::Summary) {
+            return;
+        }
+        let mut stage = crate::presets::stage("summary").build();
+        let base = stage.id.clone();
+        let mut suffix = 2;
+        while self.stages.iter().any(|s| s.id == stage.id) {
+            stage.id = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+        self.stages.push(stage);
+    }
+}
 impl Default for Workflow {
     fn default() -> Self {
         Self { name: "Feature development".into(), max_repair_passes: 2, stages: vec![
@@ -333,13 +351,17 @@ pub fn load(project: &Path, explicit: Option<&Path>) -> Result<(Settings, PathBu
         .map(Path::to_path_buf)
         .or_else(|| project_path.is_file().then(|| project_path.clone()))
         .or_else(|| global.is_file().then_some(global));
-    let settings = match &source {
+    let mut settings = match &source {
         Some(path) => toml::from_str::<Settings>(
             &fs::read_to_string(path).with_context(|| format!("Read {}", path.display()))?,
         )
         .with_context(|| format!("Parse {}", path.display()))?,
         None => Settings::default(),
     };
+    settings
+        .workflows
+        .iter_mut()
+        .for_each(Workflow::ensure_summary);
     settings.validate()?;
     // Inherited templates save into this project unless a config was explicitly selected.
     let save_path = explicit.map(Path::to_path_buf).unwrap_or(project_path);
@@ -419,5 +441,24 @@ checks = [
             toml::from_str::<Settings>(&CHECKS.replace("required = false", "shell = true"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn loading_adds_an_enabled_summary_only_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".model-router.toml");
+        fs::write(&path, CHECKS).unwrap();
+        let (settings, _) = load(dir.path(), None).unwrap();
+        let stages = &settings.workflows[0].stages;
+        let last = stages.last().unwrap();
+        assert_eq!(stages.len(), 2);
+        assert!(last.role == Role::Summary && last.enabled && last.id == "summary");
+
+        let mut opted_out = settings.clone();
+        opted_out.workflows[0].stages[1].enabled = false;
+        opted_out.save(&path).unwrap();
+        let (settings, _) = load(dir.path(), None).unwrap();
+        assert_eq!(settings.workflows[0].stages.len(), 2);
+        assert!(!settings.workflows[0].stages[1].enabled);
     }
 }

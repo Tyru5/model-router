@@ -209,6 +209,9 @@ def config(args, settings):
     lines += ["[[workflows.stages]]", *toml_lines(stage)]
     if settings:
         lines += ["", "[workflows.stages.harness_settings]", *toml_lines(settings)]
+    # Without a summary stage the router appends an enabled one: a second paid request.
+    summary = {"id": "summary", "name": "Summary", "role": "summary", "enabled": False}
+    lines += ["", "[[workflows.stages]]", *toml_lines(summary)]
     return "\n".join(lines) + "\n"
 
 

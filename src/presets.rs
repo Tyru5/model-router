@@ -204,7 +204,7 @@ pub const WORKFLOWS: &[WorkflowPreset] = &[
         key: "investigation",
         name: "Investigation",
         purpose: "Research a question and summarize findings without implementation.",
-        stages: &["research", "handoff"],
+        stages: &["research", "summary"],
     },
 ];
 
@@ -282,12 +282,10 @@ mod tests {
             ("codex", Mode::Unattended)
         );
         assert_eq!(summary.harness_settings["sandbox"], "read-only");
-        for workflow in [Workflow::default()].into_iter().chain(
-            WORKFLOWS
-                .iter()
-                .filter(|p| p.key != "investigation")
-                .map(WorkflowPreset::build),
-        ) {
+        for workflow in [Workflow::default()]
+            .into_iter()
+            .chain(WORKFLOWS.iter().map(WorkflowPreset::build))
+        {
             let last = workflow.stages.last().unwrap();
             assert!(
                 last.role == Role::Summary && last.enabled,
