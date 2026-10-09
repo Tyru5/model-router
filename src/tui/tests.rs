@@ -267,7 +267,7 @@ fn theme_preview_is_cancelable_and_only_enter_persists() {
     app.key(key(Key::Char('T'))).unwrap();
     app.key(KeyEvent::new(Key::Char('n'), Mods::CONTROL))
         .unwrap();
-    assert_eq!(app.displayed_theme(), Theme::CatppuccinMocha);
+    assert_eq!(app.displayed_theme(), Theme::Terminal);
     assert_eq!(app.theme, Theme::ModelRouter);
     assert!(!app.theme_path.exists());
     app.key(KeyEvent::new(Key::Char('p'), Mods::CONTROL))

@@ -14,6 +14,8 @@ use std::{fs, io::ErrorKind, path::Path};
 pub(super) enum Theme {
     #[default]
     ModelRouter,
+    /// ANSI colours, so the terminal's own scheme draws the UI.
+    Terminal,
     CatppuccinMocha,
     Dracula,
     Nord,
@@ -29,8 +31,9 @@ pub(super) enum Theme {
 }
 
 impl Theme {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::ModelRouter,
+        Self::Terminal,
         Self::CatppuccinMocha,
         Self::Dracula,
         Self::Nord,
@@ -48,6 +51,7 @@ impl Theme {
     pub fn name(self) -> &'static str {
         match self {
             Self::ModelRouter => "Model Router",
+            Self::Terminal => "Terminal",
             Self::CatppuccinMocha => "Catppuccin Mocha",
             Self::Dracula => "Dracula",
             Self::Nord => "Nord",
@@ -65,6 +69,7 @@ impl Theme {
 
     pub fn appearance(self) -> &'static str {
         match self {
+            Self::Terminal => "follows terminal",
             Self::CatppuccinLatte | Self::GruvboxLight | Self::SolarizedLight => "light",
             _ => "dark",
         }
@@ -87,6 +92,22 @@ impl Theme {
                 red: rgb(0xfa7e7e),
                 blue: rgb(0x73b8ff),
                 violet: rgb(0xa691f9),
+            },
+            // Reset keeps the terminal's own background and text; selections reverse them.
+            Self::Terminal => Palette {
+                bg: Color::Reset,
+                panel: Color::Reset,
+                fg: Color::Reset,
+                muted: Color::DarkGray,
+                accent: Color::Cyan,
+                line: Color::DarkGray,
+                selection_bg: Color::Reset,
+                selection_fg: Color::Reset,
+                success: Color::Green,
+                warn: Color::Yellow,
+                red: Color::Red,
+                blue: Color::Blue,
+                violet: Color::Magenta,
             },
             Self::CatppuccinMocha => Palette {
                 bg: rgb(0x181825),
@@ -348,11 +369,33 @@ impl Palette {
         Style::default().fg(self.muted).add_modifier(Modifier::BOLD)
     }
 
+    /// Whether the terminal's own colours draw the UI (the Terminal theme).
+    fn follows_terminal(self) -> bool {
+        self.bg == Color::Reset
+    }
+
+    /// Text drawn on an accent background.
+    pub fn on_accent(self) -> Color {
+        if self.follows_terminal() {
+            Color::Black
+        } else {
+            self.bg
+        }
+    }
+
     pub fn selected_style(self) -> Style {
-        Style::default()
-            .bg(self.selection_bg)
+        self.highlight_style()
             .fg(self.selection_fg)
             .add_modifier(Modifier::BOLD)
+    }
+
+    /// Background of a highlighted list row; terminal colours reverse instead.
+    pub fn highlight_style(self) -> Style {
+        if self.follows_terminal() {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().bg(self.selection_bg)
+        }
     }
 
     pub fn status_color(self, status: Status) -> Color {
@@ -383,7 +426,7 @@ impl Palette {
     pub fn style_textarea(self, text: &mut InputField<'_>) {
         text.set_style(Style::default().fg(self.fg).bg(self.panel));
         text.set_cursor_line_style(Style::default());
-        text.set_cursor_style(Style::default().fg(self.bg).bg(self.accent));
+        text.set_cursor_style(Style::default().fg(self.on_accent()).bg(self.accent));
         text.set_selection_style(self.selected_style());
     }
 }
@@ -480,7 +523,8 @@ mod tests {
 
     #[test]
     fn light_and_dark_themes_keep_text_and_selections_readable() {
-        for theme in Theme::ALL {
+        // The terminal's own scheme decides Terminal's contrast.
+        for theme in Theme::ALL.into_iter().filter(|t| *t != Theme::Terminal) {
             let p = theme.palette();
             for background in [p.bg, p.panel] {
                 assert!(contrast(p.fg, background) >= 4.5, "{theme:?}: body text");
@@ -494,5 +538,26 @@ mod tests {
                 "{theme:?}: selection"
             );
         }
+    }
+
+    #[test]
+    fn terminal_theme_uses_ansi_colours_and_reverses_selections() {
+        let p = Theme::Terminal.palette();
+        assert!(p.follows_terminal());
+        let fields = [
+            p.bg, p.panel, p.fg, p.muted, p.accent, p.line, p.success, p.warn, p.red, p.blue,
+            p.violet,
+        ];
+        assert!(fields.iter().all(|c| !matches!(c, Color::Rgb(..))));
+        assert!(p.selected_style().add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(p.on_accent(), Color::Black);
+        let model_router = Theme::ModelRouter.palette();
+        assert!(
+            !model_router
+                .selected_style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert_eq!(model_router.on_accent(), model_router.bg);
     }
 }

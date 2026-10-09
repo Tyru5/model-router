@@ -13,6 +13,8 @@ from smoke_tui import ARTIFACTS, ROOT, Terminal, records
 
 THEMES = [
     ("Model Router", "model-router", "0d1421"),
+    # The terminal's own background, which pyte reports as "default".
+    ("Terminal", "terminal", "default"),
     ("Catppuccin Mocha", "catppuccin-mocha", "181825"),
     ("Dracula", "dracula", "282a36"),
     ("Nord", "nord", "2e3440"),
@@ -65,7 +67,7 @@ def main():
             terminal.send(b"\x13")
             terminal.send("T")
             terminal.send(b"\x0e")
-            assert background(terminal) == "181825", (
+            assert background(terminal) == "default", (
                 "Ctrl+N did not preview the next theme"
             )
             terminal.send(b"\x10")

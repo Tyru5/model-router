@@ -1054,7 +1054,7 @@ fn header_lines(app: &App, palette: Palette, width: u16) -> Vec<Line<'static>> {
             format!(" {} {name}{count} ", index + 1),
             if index == app.page {
                 Style::default()
-                    .fg(palette.bg)
+                    .fg(palette.on_accent())
                     .bg(palette.accent)
                     .add_modifier(Modifier::BOLD)
             } else {

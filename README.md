@@ -78,7 +78,7 @@ the next option and `Ctrl+P` to the previous option, just like `↓` and `↑`.
 
 ## What works
 
-- Thirteen colour themes with live preview and a saved preference across projects.
+- Fourteen colour themes, including one that follows your terminal's colours, with live preview and a saved preference across projects.
 - Named workflow templates and per-run snapshots.
 - Thirteen stage presets and four ready-to-edit workflow presets.
 - A closing review summary stage that briefs you on the finished work.
@@ -102,10 +102,12 @@ Press `T` (Shift+T) from any main view. Type to filter, then use `↑`/`↓` or
 `Ctrl+N`/`Ctrl+P` to preview a theme across the app. `Enter` applies and saves it;
 `Esc` restores your current theme.
 
-Choose from **Model Router** (the original default), **Catppuccin Mocha / Latte**,
+Choose from **Model Router** (the original default), **Terminal**, **Catppuccin Mocha / Latte**,
 **Dracula**, **Nord**, **Tokyo Night**, **Gruvbox Dark / Light**, **One Dark**,
 **Monokai**, **Solarized Dark / Light**, and **Poimandres**. Editors, file browsers,
 status colours, and the startup animation all follow the selected theme.
+**Terminal** draws with your terminal's own background, text, and ANSI colours,
+so it matches your terminal's colour scheme and updates when you change it.
 
 The preference is saved automatically in your user config directory
 (`~/.config/model-router/appearance.json` on Linux, respecting `XDG_CONFIG_HOME`).
@@ -797,7 +799,7 @@ append/replace, cancellation, errors, and saved task contents using a local HTTP
 server and an offline GitHub CLI fixture.
 The stage test covers preset selection, editing, cancellation, ordering,
 optional reviews, workflow persistence, and interactive verification handoffs.
-The theme test previews and saves all 13 themes, including cancellation,
+The theme test previews and saves all 14 themes, including cancellation,
 restart, repository switching, and invalid preferences.
 The harness settings test covers per-stage isolation, native permission
 arguments, conflict validation, model browsing from the draft, cancellation,

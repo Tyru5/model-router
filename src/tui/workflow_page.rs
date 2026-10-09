@@ -291,7 +291,7 @@ impl StageEditor {
         });
         frame.render_stateful_widget(
             List::new(rows)
-                .highlight_style(Style::default().bg(palette.selection_bg))
+                .highlight_style(palette.highlight_style())
                 .highlight_symbol("▌ ")
                 .highlight_spacing(HighlightSpacing::Always)
                 .block(Block::default().padding(Padding::right(2))),

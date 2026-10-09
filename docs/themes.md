@@ -8,6 +8,7 @@ preview the highlighted theme immediately, including the page behind the picker.
 | Theme | Appearance | Saved ID |
 | --- | --- | --- |
 | Model Router | Dark; original colours | `model-router` |
+| Terminal | Your terminal's colour scheme | `terminal` |
 | Catppuccin Mocha | Dark; pastel purple | `catppuccin-mocha` |
 | Dracula | Dark; purple and pink | `dracula` |
 | Nord | Dark; cool blues | `nord` |
@@ -58,6 +59,17 @@ Built-in themes adapt these upstream editor and terminal palettes:
 - [Poimandres palette](https://github.com/drcmda/poimandres-theme/blob/main/src/theme.js)
 
 UI backgrounds and highlights are mapped to each theme's available tones.
+
+## Terminal theme
+
+**Terminal** uses no fixed colours. It keeps the terminal's default background
+and text, and draws the rest with ANSI colours, which the terminal maps to its
+own scheme: accent cyan, success green, warnings yellow, errors red, and
+secondary text and borders bright black. Selections reverse the terminal's
+foreground and background. Changing the terminal's scheme recolours the app
+immediately, with no restart. The terminal decides contrast, so a scheme whose
+bright black matches its background (some Solarized ports) hides secondary text.
+The startup animation appears without its fade.
 Dracula's secondary text and the light themes' foreground/status accents include
 contrast adjustments for small terminal text. Body and selection text are checked
 for at least 4.5:1 contrast; secondary text for at least 3:1. The original
