@@ -284,3 +284,27 @@ fn bench_command_dry_runs_and_runs() {
     assert!(text.contains("bench-"), "{text}");
     assert!(project.path().join(".model-router/bench").is_dir());
 }
+
+#[test]
+fn example_bench_file_plans() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/bench.toml");
+    let bench = bench::load(&path).unwrap();
+    let settings = Settings::default();
+    let refused = Plan::new(&path, &bench, &settings, &options(1))
+        .err()
+        .unwrap();
+    assert!(
+        refused.to_string().contains("--allow-interactive"),
+        "{refused}"
+    );
+    let allowed = Options {
+        jobs: 1,
+        allow_interactive: true,
+    };
+    let plan = Plan::new(&path, &bench, &settings, &allowed).unwrap();
+    let labels: Vec<_> = plan.variants.iter().map(|v| v.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        ["implement=claude/opus", "implement=codex/gpt-6-astra"]
+    );
+}
