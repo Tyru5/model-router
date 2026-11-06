@@ -259,7 +259,7 @@ impl RunSlot {
             return result;
         }
         let run = self.run.as_mut().ok_or("No run to take over")?;
-        run.take_over()
+        run.command(engine::Cmd::TakeOver)
             .map(|()| Action::Interactive)
             .map_err(|e| format!("{e:#}"))
     }

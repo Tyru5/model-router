@@ -659,6 +659,7 @@ fn drive_stops_a_harness_group_left_by_a_dead_router() {
     assert!(process::group_alive(pgid));
     run.cursor = 0;
     run.status = Status::Running;
+    run.stages[0].status = Status::Running;
     let attempt = run.stages[0].attempts.last_mut().unwrap();
     attempt.status = Status::Running;
     attempt.process_group = Some(pgid);

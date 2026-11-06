@@ -39,7 +39,9 @@ workflow or changes a saved run; reviews start disabled in workflow presets.
 - Any stage may declare router checks: argument vectors run in the workspace
   after the harness succeeds, each with a timeout. Results and logs are saved
   with the attempt, independent of the handoff. A required check that fails,
-  times out, or cannot start blocks the stage; optional failures are recorded.
+  times out, or cannot start blocks the stage, except in an enabled review,
+  where it requests a repair (see Optional reviews); optional failures are
+  recorded.
 - Read-only stage intent is expressed in instructions. Effective execution
   permissions are supplied by the harness and the user's explicit overrides;
   the router is not a universal sandbox.
@@ -49,8 +51,8 @@ workflow or changes a saved run; reviews start disabled in workflow presets.
 
 ## Optional reviews
 
-Any number of review stages may be enabled. A structured blocking finding or a
-failed required test requests a repair at the selected upstream implementation
+Any number of review stages may be enabled. A structured blocking finding, a
+failed required test, or a failed required router check requests a repair at the selected upstream implementation
 stage (nearest implementation by default). Invalidate and rerun subsequent stages
 so stale reviews cannot approve changed code. Allow two repair passes per run by
 default. Suggestions alone do not trigger repair. Disabled reviews never gate a
@@ -81,8 +83,12 @@ explicit `--config` file are trusted. `model-router trust [--yes]` approves and
 ## Persistence and recovery
 
 Save reusable workflows as TOML and snapshot them into each run. Save every
-attempt, handoff, status transition, and explicit model override. Use atomic
-writes and locks to protect run state and active workspaces. A crash, failure,
+attempt, handoff, status transition, and explicit model override: each run,
+stage, or attempt status change is validated and appended, with its time, run
+revision, cause, and reason, to the run's `transitions.jsonl`. Recovery and
+checkpoint commands (retry, take over, confirm, allow repair) apply and save
+under the run lock. Use atomic writes and locks to protect run state and active
+workspaces. A crash, failure,
 timeout, or cancellation never silently retries a possibly mutating stage.
 A harness's whole process group ends with its stage (SIGTERM, a grace period,
 then SIGKILL), including after a normal exit, and on Linux when mr dies. Each

@@ -4,8 +4,9 @@ use crate::{
     checks::{self, CheckResult},
     config::{CustomAdapter, Mode, Role, Settings, Workflow},
     events,
-    handoff::{self, Handoff, TestStatus, Verdict},
+    handoff::{self, Handoff, ProtocolError, TestStatus, Verdict},
     process, snapshot, storage,
+    transitions::{self, Actor, Level, Target},
 };
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
@@ -45,6 +46,118 @@ impl Status {
             Self::Skipped => "disabled",
         }
     }
+    /// The saved name, as in run.json.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Interactive => "interactive",
+            Self::AwaitingConfirmation => "awaiting_confirmation",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
+            Self::Cancelled => "cancelled",
+            Self::Skipped => "skipped",
+        }
+    }
+    fn stopped(self) -> bool {
+        matches!(self, Self::Failed | Self::Blocked | Self::Cancelled)
+    }
+}
+
+/// Whether a run, stage, or attempt may move from `from` to `to`. One status
+/// type serves all three, so each level admits only its own values: a run is
+/// never skipped, a stage never waits for a terminal, and an attempt only runs
+/// and ends. `enabled` is the stage's switch; disabled stages are skipped.
+fn legal(level: Level, from: Status, to: Status, enabled: bool) -> bool {
+    use Status::*;
+    match level {
+        Level::Run => match from {
+            Pending => matches!(
+                to,
+                Running | Interactive | Complete | Failed | Blocked | Cancelled
+            ),
+            Running => matches!(
+                to,
+                Pending | AwaitingConfirmation | Failed | Blocked | Cancelled
+            ),
+            Interactive => matches!(to, Running | Pending | Failed | Cancelled),
+            AwaitingConfirmation => matches!(to, Pending | Interactive | Failed | Blocked),
+            Failed | Blocked | Cancelled => matches!(to, Pending | Interactive),
+            Complete | Skipped => false,
+        },
+        Level::Stage => match (from, to) {
+            (_, Interactive) => false,
+            (_, Skipped) => !enabled,
+            (_, Pending) => enabled,
+            (Pending, Running | Failed | Blocked | Cancelled) => true,
+            (Running, Complete | AwaitingConfirmation | Failed | Blocked | Cancelled) => true,
+            (AwaitingConfirmation, Complete | Failed | Blocked) => true,
+            _ => false,
+        },
+        Level::Attempt => match (from, to) {
+            (Pending, Running) => true,
+            (Running, Complete | Failed | Blocked | Cancelled) => true,
+            // A checkpoint or bookkeeping stops a finished attempt.
+            (Complete, Failed | Blocked) => true,
+            // `allow_repair`: the review completed; only the limit held it.
+            (Blocked, Complete) => true,
+            // Saved by versions that left interactive attempts waiting.
+            (AwaitingConfirmation, Complete | Failed | Blocked) => true,
+            _ => false,
+        },
+    }
+}
+
+/// One status change of the run, a stage, or a stage's latest attempt.
+#[derive(Debug, Clone)]
+pub struct Transition {
+    pub target: Target,
+    pub to: Status,
+    pub actor: Actor,
+    pub reason: String,
+}
+impl Transition {
+    pub fn new(target: Target, to: Status, actor: Actor, reason: impl Into<String>) -> Self {
+        Self {
+            target,
+            to,
+            actor,
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Where a stage's handoff came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffSource {
+    /// The handoff file the prompt asked the harness to write.
+    File,
+    /// The harness's own final-message file.
+    Final,
+    /// The final assistant message in the harness's output stream.
+    Stream,
+    /// An interactive stage wrote none; the router's placeholder stands in.
+    Placeholder,
+}
+
+/// A recovery or checkpoint command, applied by `command` under the run lock.
+#[derive(Debug, Clone)]
+pub enum Cmd {
+    /// Rerun the current stage, optionally interactively or with another model.
+    Retry {
+        interactive: bool,
+        model: Option<String>,
+    },
+    /// Reopen the stopped stage's session interactively.
+    TakeOver,
+    /// Accept the handoff at the checkpoint.
+    Confirm,
+    /// One more review repair pass beyond the limit.
+    AllowRepair,
+    /// Replace the summary of the handoff awaiting confirmation.
+    EditSummary(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +193,9 @@ pub struct Attempt {
     /// so the next `drive` can stop the orphaned group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_group: Option<u32>,
+    /// Where the attempt's handoff came from; None when it produced none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_source: Option<HandoffSource>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageState {
@@ -135,6 +251,9 @@ pub struct Run {
     /// starting a new one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<Resume>,
+    /// Status changes not yet saved; `persist` appends them to transitions.jsonl.
+    #[serde(skip)]
+    journal: Vec<transitions::Record>,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -173,10 +292,16 @@ pub enum Action {
     Stopped,
 }
 
-/// Holds applied to a stage's handoff before review repairs and advancing.
-enum Gate {
+/// What a finished stage's handoff and checks lead to.
+enum Decision {
     Block(String),
-    Waiver,
+    /// A test stage without evidence waits for the user to accept its reason.
+    AwaitWaiver,
+    Repair {
+        target: usize,
+        feedback: String,
+    },
+    Advance,
 }
 
 impl Run {
@@ -298,6 +423,7 @@ impl Run {
             status: Status::Pending,
             error: None,
             resume: None,
+            journal: vec![],
         };
         run.persist()?;
         Ok(run)
@@ -315,7 +441,93 @@ impl Run {
             run_bytes: Some(record.len() as u64),
             ..crate::history::RunSummary::from(&*self)
         };
-        storage::write_json(&self.directory.join("summary.json"), &summary)
+        storage::write_json(&self.directory.join("summary.json"), &summary)?;
+        let mut journal = std::mem::take(&mut self.journal);
+        for record in &mut journal {
+            record.run_revision = self.revision;
+        }
+        transitions::append(&self.directory, &journal)
+    }
+
+    /// The only place run, stage, and attempt statuses change. Refuses moves
+    /// `legal` does not allow; records the others for transitions.jsonl.
+    /// Moving to the current status is a no-op and is not recorded.
+    pub fn transition(&mut self, change: Transition) -> Result<()> {
+        let Transition {
+            target,
+            to,
+            actor,
+            reason,
+        } = change;
+        let (level, stage_index, enabled) = match target {
+            Target::Run => (Level::Run, None, true),
+            Target::Stage(i) | Target::Attempt(i) => {
+                let stage = self
+                    .workflow
+                    .stages
+                    .get(i)
+                    .with_context(|| format!("No stage {}", i + 1))?;
+                let level = if matches!(target, Target::Stage(_)) {
+                    Level::Stage
+                } else {
+                    Level::Attempt
+                };
+                (level, Some(i), stage.enabled)
+            }
+        };
+        let (slot, attempt) = match target {
+            Target::Run => (&mut self.status, None),
+            Target::Stage(i) => (&mut self.stages[i].status, None),
+            Target::Attempt(i) => {
+                let attempt = self.stages[i]
+                    .attempts
+                    .last_mut()
+                    .with_context(|| format!("Stage {} has no attempt", i + 1))?;
+                (&mut attempt.status, Some(attempt.number))
+            }
+        };
+        let from = *slot;
+        if from == to {
+            return Ok(());
+        }
+        ensure!(
+            legal(level, from, to, enabled),
+            "Illegal {} transition{}: {} → {} ({reason})",
+            level.label(),
+            stage_index.map_or_else(String::new, |i| format!(" in stage {}", i + 1)),
+            from.as_str(),
+            to.as_str()
+        );
+        *slot = to;
+        self.journal.push(transitions::Record {
+            at: Utc::now(),
+            run_revision: self.revision,
+            level,
+            stage_index,
+            attempt,
+            from,
+            to,
+            reason,
+            actor,
+        });
+        Ok(())
+    }
+
+    fn set(
+        &mut self,
+        target: Target,
+        to: Status,
+        actor: Actor,
+        reason: impl Into<String>,
+    ) -> Result<()> {
+        self.transition(Transition::new(target, to, actor, reason))
+    }
+
+    /// Applies `cmd` here and saves it, under the run lock; see `command`.
+    /// On error this run is left as it was.
+    pub fn command(&mut self, cmd: Cmd) -> Result<()> {
+        *self = command(&self.project, &self.id, Some(self.revision), cmd)?;
+        Ok(())
     }
     pub fn current_name(&self) -> &str {
         self.workflow
@@ -334,47 +546,60 @@ impl Run {
     }
 
     /// Explicit retry may preserve filesystem effects of the previous attempt.
+    /// Changes this run in memory only; `command` applies it under the lock.
     pub fn retry(&mut self, interactive: bool, model: Option<String>) -> Result<()> {
         ensure!(
             self.cursor < self.stages.len(),
             "This run is already complete"
         );
-        if let Some(attempt) = self.stages[self.cursor].attempts.last_mut() {
-            if attempt.status == Status::Running {
-                attempt.status = Status::Failed;
-                attempt.finished_at = Some(Utc::now());
-                attempt.error = Some(
-                    "Previous execution was interrupted; retry was explicitly requested".into(),
-                );
-            }
+        let index = self.cursor;
+        if self.stages[index]
+            .attempts
+            .last()
+            .is_some_and(|a| a.status == Status::Running)
+        {
+            let message = "Previous execution was interrupted; retry was explicitly requested";
+            self.set(
+                Target::Attempt(index),
+                Status::Failed,
+                Actor::Recovery,
+                message,
+            )?;
+            let attempt = self.stages[index]
+                .attempts
+                .last_mut()
+                .context("No attempt")?;
+            attempt.finished_at = Some(Utc::now());
+            attempt.error = Some(message.into());
         }
         if interactive {
-            self.workflow.stages[self.cursor].mode = Mode::Interactive;
+            self.workflow.stages[index].mode = Mode::Interactive;
         }
+        let mut reason = String::from("Retry");
         if let Some(model) = model {
-            self.workflow.stages[self.cursor].model = model;
+            reason = format!("Retry with model {model}");
+            self.workflow.stages[index].model = model;
         }
-        self.reset(self.cursor);
-        self.status = Status::Pending;
+        if interactive {
+            reason.push_str(" interactively");
+        }
+        self.reset(index, Actor::User, &reason)?;
         self.error = None;
         self.resume = None;
-        Ok(())
+        self.set(Target::Run, Status::Pending, Actor::User, reason)
     }
 
     /// Reopens the current stage's last session in the harness's native
     /// interactive CLI: an unattended attempt, or an interactive one awaiting
     /// review. The stage must have stopped; filesystem changes are kept, as
-    /// with retry.
+    /// with retry. In memory only; `command` applies it under the lock.
     pub fn take_over(&mut self) -> Result<()> {
         ensure!(
             self.cursor < self.stages.len(),
             "This run is already complete"
         );
         ensure!(
-            matches!(
-                self.status,
-                Status::Failed | Status::Blocked | Status::Cancelled | Status::AwaitingConfirmation
-            ),
+            self.status.stopped() || self.status == Status::AwaitingConfirmation,
             "Stop the stage before taking it over"
         );
         let stage = &self.workflow.stages[self.cursor];
@@ -396,47 +621,35 @@ impl Run {
             })
             .context("The harness did not report a session for this attempt; retry interactively with [i] instead")?;
         set_aside_handoff(&attempt.handoff_file, &attempt.directory)?;
+        let reason = format!("Take over session {session}");
         self.resume = Some(Resume {
             session,
             handoff_file: attempt.handoff_file.clone(),
         });
         self.workflow.stages[self.cursor].mode = Mode::Interactive;
-        self.reset(self.cursor);
-        self.status = Status::Interactive;
+        self.reset(self.cursor, Actor::User, &reason)?;
         self.error = None;
-        Ok(())
+        self.set(Target::Run, Status::Interactive, Actor::User, reason)
     }
 
     /// Allows one more review repair pass after the workflow's limit stopped
     /// the run, then sends the review's findings to the implementation stage
     /// as an automatic repair would. `model-router resume <id> --allow-repair`.
+    /// In memory only; `command` applies it under the lock.
     pub fn allow_repair(&mut self) -> Result<()> {
         ensure!(
-            self.status == Status::Blocked && self.cursor < self.stages.len(),
-            "Only a run stopped by its repair limit can get another repair pass"
-        );
-        let stage = &self.workflow.stages[self.cursor];
-        let requests_repair = self.stages[self.cursor]
-            .handoff
-            .as_ref()
-            .is_some_and(Handoff::requires_repair);
-        ensure!(
-            stage.role == Role::Review
-                && requests_repair
-                && self.gate().is_none()
+            self.status == Status::Blocked
+                && self.cursor < self.stages.len()
+                && self.review_failures().is_some()
                 && self.repair_passes >= self.repair_limit(),
             "Only a run stopped by its repair limit can get another repair pass"
         );
         self.extra_repair_passes += 1;
-        self.stages[self.cursor].status = Status::Complete;
+        self.error = None;
         if let Some(attempt) = self.stages[self.cursor].attempts.last_mut() {
-            // The review itself completed; only the limit held it.
-            attempt.status = Status::Complete;
             attempt.error = None;
         }
-        self.error = None;
-        self.status = Status::Pending;
-        self.apply_handoff()
+        self.advance(Actor::User)
     }
 
     fn repair_limit(&self) -> u32 {
@@ -446,20 +659,23 @@ impl Run {
     }
 
     /// Return stages from `from` onward to pending, discarding handoffs and acceptances.
-    fn reset(&mut self, from: usize) {
+    fn reset(&mut self, from: usize, actor: Actor, reason: &str) -> Result<()> {
         for i in from..self.stages.len() {
-            let state = &mut self.stages[i];
-            state.status = if self.workflow.stages[i].enabled {
+            let to = if self.workflow.stages[i].enabled {
                 Status::Pending
             } else {
                 Status::Skipped
             };
+            self.set(Target::Stage(i), to, actor, reason)?;
+            let state = &mut self.stages[i];
             state.handoff = None;
             state.waiver = None;
         }
+        Ok(())
     }
 
-    /// Confirming a checkpoint also accepts its pending waiver; it never needs a second step.
+    /// Confirming a checkpoint also accepts its pending waiver; it never needs
+    /// a second step. In memory only; `command` applies it under the lock.
     pub fn confirm(&mut self) -> Result<()> {
         ensure!(
             self.status == Status::AwaitingConfirmation,
@@ -471,18 +687,37 @@ impl Run {
                 accepted_at: Utc::now(),
             });
         }
-        self.stages[self.cursor].status = Status::Complete;
-        if let Some(attempt) = self.stages[self.cursor].attempts.last_mut() {
-            attempt.status = Status::Complete;
+        self.advance(Actor::User)
+    }
+
+    /// Replaces the summary of the non-review handoff awaiting confirmation.
+    fn edit_summary(&mut self, summary: String) -> Result<()> {
+        ensure!(
+            self.status == Status::AwaitingConfirmation
+                && self.workflow.stages[self.cursor].role != Role::Review,
+            "Only an interactive non-review handoff summary can be edited"
+        );
+        ensure!(
+            !summary.trim().is_empty() && summary.len() <= 12000,
+            "Enter a summary of 1–12000 bytes"
+        );
+        let state = &mut self.stages[self.cursor];
+        let handoff = state.handoff.as_mut().context("No handoff")?;
+        handoff.summary = summary;
+        handoff
+            .decisions
+            .push("Handoff summary supplied or edited by the user".into());
+        if let Some(attempt) = state.attempts.last() {
+            storage::write_json(&attempt.directory.join("handoff.json"), handoff)?;
         }
-        self.apply_handoff()?;
         Ok(())
     }
 
     /// The not-applicable reason when this checkpoint awaits acceptance of a test
     /// stage without verification evidence.
     pub fn pending_waiver(&self) -> Option<&str> {
-        if self.status != Status::AwaitingConfirmation || !matches!(self.gate(), Some(Gate::Waiver))
+        if self.status != Status::AwaitingConfirmation
+            || !matches!(self.decide(), Ok(Decision::AwaitWaiver))
         {
             return None;
         }
@@ -514,162 +749,223 @@ impl Run {
         Ok((from, to))
     }
 
-    fn gate(&self) -> Option<Gate> {
+    /// The current stage's failed required router checks, described.
+    fn failed_checks(&self) -> Option<String> {
+        let checks = self.stages[self.cursor]
+            .attempts
+            .last()
+            .map_or(&[][..], |a| &a.checks);
+        let mut failed = checks
+            .iter()
+            .filter(|c| c.required && c.status != TestStatus::Passed);
+        let check = failed.next()?;
+        let more = failed.count();
+        Some(format!(
+            "Required check failed: {} ({}){}. Logs: {}",
+            shell_words::join(&check.command),
+            check.outcome(),
+            if more > 0 {
+                format!("; {more} more failed")
+            } else {
+                String::new()
+            },
+            check.directory.display()
+        ))
+    }
+
+    /// Why the current review stage requests a repair: its handoff, its failed
+    /// required router checks, or both. None for other stages, a review that
+    /// passed, or one that reports a block.
+    fn review_failures(&self) -> Option<Option<String>> {
         let stage = self.workflow.stages.get(self.cursor)?;
+        let handoff = self.stages[self.cursor].handoff.as_ref()?;
+        if stage.role != Role::Review || !stage.enabled || handoff.verdict == Verdict::Blocked {
+            return None;
+        }
+        let checks = self.failed_checks();
+        (handoff.requires_repair() || checks.is_some()).then_some(checks)
+    }
+
+    /// What the current stage's handoff and checks lead to.
+    fn decide(&self) -> Result<Decision> {
+        let stage = self
+            .workflow
+            .stages
+            .get(self.cursor)
+            .context("This run is already complete")?;
         let state = &self.stages[self.cursor];
-        let handoff = state.handoff.as_ref()?;
+        let handoff = state.handoff.as_ref().context("Missing handoff")?;
         if handoff.verdict == Verdict::Blocked {
-            return Some(Gate::Block(format!(
+            return Ok(Decision::Block(format!(
                 "Stage reports a block: {}",
                 handoff.summary
             )));
         }
-        let checks = state.attempts.last().map_or(&[][..], |a| &a.checks);
-        let mut failed = checks
-            .iter()
-            .filter(|c| c.required && c.status != TestStatus::Passed);
-        if let Some(check) = failed.next() {
-            let more = failed.count();
-            return Some(Gate::Block(format!(
-                "Required check failed: {} ({}){}. Logs: {}",
-                shell_words::join(&check.command),
-                check.outcome(),
-                if more > 0 {
-                    format!("; {more} more failed")
-                } else {
-                    String::new()
-                },
-                check.directory.display()
-            )));
-        }
-        if stage.role != Role::Test {
-            return None;
-        }
-        if handoff.requires_repair()
-            || handoff
-                .tests
-                .iter()
-                .any(|test| test.required && test.status == TestStatus::NotRun)
-        {
-            return Some(Gate::Block("Test stage reports incomplete verification; inspect its findings and required checks before retrying".into()));
-        }
-        if handoff.has_passing_required_check()
-            || checks
-                .iter()
-                .any(|c| c.required && c.status == TestStatus::Passed)
-            || state.waiver.is_some()
-        {
-            return None;
-        }
-        Some(match handoff.not_applicable_reason() {
-            Some(_) => Gate::Waiver,
-            None => Gate::Block("Test stage reported no passing required check. Retry it with evidence, or have it report not_applicable with a reason, which requires your explicit acceptance".into()),
-        })
-    }
-
-    fn apply_handoff(&mut self) -> Result<()> {
-        ensure!(
-            self.stages[self.cursor].handoff.is_some(),
-            "Missing handoff"
-        );
-        match self.gate() {
-            Some(Gate::Block(message)) => {
-                self.fail_attempt(Status::Blocked, message);
-                return Ok(());
-            }
-            Some(Gate::Waiver) => {
-                self.stages[self.cursor].status = Status::AwaitingConfirmation;
-                self.status = Status::AwaitingConfirmation;
-                return Ok(());
-            }
-            None => {}
-        }
-        let stage = &self.workflow.stages[self.cursor];
-        let handoff = self.stages[self.cursor]
-            .handoff
-            .as_ref()
-            .context("Missing handoff")?;
-        if stage.role == Role::Review && handoff.requires_repair() {
-            let feedback = format!(
+        // A failed required check in an enabled review requests a repair, as
+        // its blocking findings do; anywhere else it blocks the stage.
+        if let Some(checks) = self.review_failures() {
+            let mut feedback = format!(
                 "Review {} requested changes:\n{}",
                 stage.name,
                 serde_json::to_string_pretty(handoff)?
             );
+            if let Some(checks) = &checks {
+                feedback.push_str(&format!("\nRouter checks: {checks}"));
+            }
+            let note = checks.map_or_else(String::new, |c| format!(" {c}"));
             if self.repair_passes >= self.repair_limit() {
-                let message = format!(
-                    "Review still requests changes after {} repair passes. Inspect its findings, then allow another pass with: model-router -C {} resume {} --allow-repair",
+                return Ok(Decision::Block(format!(
+                    "Review still requests changes after {} repair passes.{note} Inspect its findings, then allow another pass with: model-router -C {} resume {} --allow-repair",
                     self.repair_passes,
                     self.project.display(),
                     self.id
-                );
-                self.fail_attempt(Status::Blocked, message);
-                return Ok(());
+                )));
             }
             let target = self.workflow.stages[..self.cursor].iter().rposition(|s| {
                 s.enabled
                     && s.role == Role::Implementation
                     && (stage.repair_target.is_empty() || s.id == stage.repair_target)
             });
-            let Some(target) = target else {
-                self.fail_attempt(
-                    Status::Blocked,
-                    "Review requested changes, but no enabled upstream implementation stage exists"
-                        .into(),
-                );
-                return Ok(());
-            };
-            self.repair_feedback = Some(feedback);
-            self.repair_review = Some(self.cursor);
-            self.repair_passes += 1;
-            // Invalidate all downstream handoffs, including previously passing reviews.
-            self.reset(target);
-            self.cursor = target;
-            self.status = Status::Pending;
-            return Ok(());
+            return Ok(match target {
+                Some(target) => Decision::Repair { target, feedback },
+                None => Decision::Block(format!(
+                    "Review requested changes, but no enabled upstream implementation stage exists.{note}"
+                )),
+            });
+        }
+        if let Some(checks) = self.failed_checks() {
+            return Ok(Decision::Block(checks));
+        }
+        if stage.role == Role::Test {
+            let checks = state.attempts.last().map_or(&[][..], |a| &a.checks);
+            if handoff.requires_repair()
+                || handoff
+                    .tests
+                    .iter()
+                    .any(|test| test.required && test.status == TestStatus::NotRun)
+            {
+                return Ok(Decision::Block("Test stage reports incomplete verification; inspect its findings and required checks before retrying".into()));
+            }
+            if handoff.has_passing_required_check()
+                || checks
+                    .iter()
+                    .any(|c| c.required && c.status == TestStatus::Passed)
+                || state.waiver.is_some()
+            {
+                return Ok(Decision::Advance);
+            }
+            return Ok(match handoff.not_applicable_reason() {
+                Some(_) => Decision::AwaitWaiver,
+                None => Decision::Block("Test stage reported no passing required check. Retry it with evidence, or have it report not_applicable with a reason, which requires your explicit acceptance".into()),
+            });
         }
         if handoff.verdict == Verdict::NeedsChanges {
-            self.fail_attempt(
-                Status::Blocked,
+            return Ok(Decision::Block(
                 "Stage reports incomplete work; inspect its handoff and retry".into(),
-            );
-            return Ok(());
+            ));
         }
-        self.stages[self.cursor].status = Status::Complete;
-        // The review that asked for the repair passed: later stages, and
-        // later retries, must not see its old request.
-        if self.repair_review == Some(self.cursor) {
-            self.repair_feedback = None;
-            self.repair_review = None;
-        }
-        self.cursor += 1;
-        self.status = Status::Pending;
-        Ok(())
+        Ok(Decision::Advance)
     }
 
-    /// Stops the run at the current stage without touching its attempts: the
-    /// error belongs to no attempt of this execution, e.g. a launch that
-    /// failed before its attempt was recorded, or a cancel between stages.
-    fn fail(&mut self, status: Status, message: String) {
-        self.status = status;
-        self.error = Some(message);
-        if let Some(stage) = self.stages.get_mut(self.cursor) {
-            stage.status = status;
+    /// Acts on the current stage's finished handoff: blocks, waits for the
+    /// user's acceptance, sends a review's request to a repair, or moves on.
+    fn advance(&mut self, actor: Actor) -> Result<()> {
+        let index = self.cursor;
+        let name = self.workflow.stages[index].name.clone();
+        match self.decide()? {
+            Decision::Block(message) => self.stop(Status::Blocked, message, actor, true),
+            Decision::AwaitWaiver => {
+                let reason = "Test stage reports not applicable; awaiting acceptance";
+                self.set(Target::Attempt(index), Status::Complete, actor, reason)?;
+                self.set(
+                    Target::Stage(index),
+                    Status::AwaitingConfirmation,
+                    actor,
+                    reason,
+                )?;
+                self.set(Target::Run, Status::AwaitingConfirmation, actor, reason)
+            }
+            Decision::Repair { target, feedback } => {
+                let reason = format!(
+                    "Review {name} requested a repair at {}",
+                    self.workflow.stages[target].name
+                );
+                self.set(Target::Attempt(index), Status::Complete, actor, &reason)?;
+                self.repair_feedback = Some(feedback);
+                self.repair_review = Some(index);
+                self.repair_passes += 1;
+                // Invalidate all downstream handoffs, including previously passing reviews.
+                self.reset(target, actor, &reason)?;
+                self.cursor = target;
+                self.set(Target::Run, Status::Pending, actor, reason)
+            }
+            Decision::Advance => {
+                let reason = format!("Stage {name} complete");
+                self.set(Target::Attempt(index), Status::Complete, actor, &reason)?;
+                self.set(Target::Stage(index), Status::Complete, actor, &reason)?;
+                // The review that asked for the repair passed: later stages, and
+                // later retries, must not see its old request.
+                if self.repair_review == Some(index) {
+                    self.repair_feedback = None;
+                    self.repair_review = None;
+                }
+                self.cursor += 1;
+                self.set(Target::Run, Status::Pending, actor, reason)
+            }
         }
     }
 
-    /// Stops the run and records the error on the current stage's attempt,
-    /// which this execution created or just finished.
-    fn fail_attempt(&mut self, status: Status, message: String) {
-        self.fail(status, message.clone());
-        if let Some(attempt) = self
-            .stages
-            .get_mut(self.cursor)
-            .and_then(|s| s.attempts.last_mut())
-        {
-            attempt.status = status;
-            attempt.error = Some(message);
+    /// An interactive stage's handoff waits for the user at the checkpoint.
+    fn checkpoint(&mut self) -> Result<()> {
+        let index = self.cursor;
+        let reason = "Interactive handoff awaits inspection";
+        self.set(
+            Target::Attempt(index),
+            Status::Complete,
+            Actor::Engine,
+            reason,
+        )?;
+        self.set(
+            Target::Stage(index),
+            Status::AwaitingConfirmation,
+            Actor::Engine,
+            reason,
+        )?;
+        self.set(
+            Target::Run,
+            Status::AwaitingConfirmation,
+            Actor::Engine,
+            reason,
+        )
+    }
+
+    /// Stops the run at the current stage. With `attempt`, also records the
+    /// error on the stage's latest attempt, which this execution created or
+    /// just finished; without, the error belongs to no attempt of this
+    /// execution, e.g. a launch that failed before its attempt was recorded,
+    /// or a cancel between stages.
+    fn stop(&mut self, status: Status, message: String, actor: Actor, attempt: bool) -> Result<()> {
+        let index = self.cursor;
+        let has_attempt = attempt
+            && self
+                .stages
+                .get(index)
+                .is_some_and(|s| !s.attempts.is_empty());
+        if has_attempt {
+            self.set(Target::Attempt(index), status, actor, &message)?;
+            let attempt = self.stages[index]
+                .attempts
+                .last_mut()
+                .context("No attempt")?;
+            attempt.error = Some(message.clone());
             attempt.finished_at.get_or_insert_with(Utc::now);
         }
+        if index < self.stages.len() {
+            self.set(Target::Stage(index), status, actor, &message)?;
+        }
+        self.set(Target::Run, status, actor, &message)?;
+        self.error = Some(message);
+        Ok(())
     }
 }
 
@@ -696,6 +992,31 @@ pub fn load(project: &Path, id: &str) -> Result<Run> {
             && run.cursor <= run.stages.len(),
         "Invalid or unsupported run record"
     );
+    Ok(run)
+}
+
+/// Applies a recovery or checkpoint command to the saved run and saves the
+/// result, holding the run lock throughout. With `revision`, refuses a run
+/// that another process changed since the caller loaded it. Returns the run
+/// as saved; callers replace their copy with it.
+pub fn command(project: &Path, id: &str, revision: Option<u64>, cmd: Cmd) -> Result<Run> {
+    let directory = storage::run_dir(project, id)?;
+    let _lock = storage::lock_wait(&directory.join("run.lock"), LOCK_WAIT)?;
+    let mut run = load(project, id)?;
+    if let Some(revision) = revision {
+        ensure!(
+            run.revision == revision,
+            "This run changed in another process; reload it before continuing"
+        );
+    }
+    match cmd {
+        Cmd::Retry { interactive, model } => run.retry(interactive, model)?,
+        Cmd::TakeOver => run.take_over()?,
+        Cmd::Confirm => run.confirm()?,
+        Cmd::AllowRepair => run.allow_repair()?,
+        Cmd::EditSummary(summary) => run.edit_summary(summary)?,
+    }
+    run.persist()?;
     Ok(run)
 }
 
@@ -908,7 +1229,7 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
         finished_at: None,
         model: stage.model.clone(),
         mode: stage.mode,
-        status: Status::Running,
+        status: Status::Pending,
         exit_code: None,
         directory: directory.clone(),
         handoff_file: handoff_file.clone(),
@@ -919,11 +1240,29 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
         usage: None,
         session,
         process_group: None,
+        handoff_source: None,
     });
+    let reason = format!(
+        "Attempt {number} started: {} {} ({})",
+        stage.harness,
+        stage.model,
+        stage.mode.label()
+    );
     run.resume = None;
-    run.stages[index].status = Status::Running;
-    run.status = Status::Running;
     run.error = None;
+    run.set(
+        Target::Attempt(index),
+        Status::Running,
+        Actor::Engine,
+        &reason,
+    )?;
+    run.set(
+        Target::Stage(index),
+        Status::Running,
+        Actor::Engine,
+        &reason,
+    )?;
+    run.set(Target::Run, Status::Running, Actor::Engine, reason)?;
     run.persist()?;
     Ok(Prepared {
         invocation,
@@ -939,13 +1278,21 @@ fn read_head(path: &Path, max: u64) -> Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn finish(
+/// How a harness process ended, before its handoff is read.
+enum Exit {
+    /// The harness succeeded; its output, normalized.
+    Succeeded(handoff::Normalized),
+    /// The stage stops with this status and message.
+    Stopped(Status, String),
+}
+
+/// Records the process's end on the attempt and classifies it: cancelled,
+/// timed out, failed, denied permissions, a protocol error, or success.
+fn classify_exit(
     run: &mut Run,
     prepared: &Prepared,
     result: Result<process::Outcome>,
-    cancel: &AtomicBool,
-    emit: &mut impl FnMut(Event),
-) -> Result<()> {
+) -> Result<Exit> {
     let index = run.cursor;
     let outcome = match result {
         Ok(outcome) => outcome,
@@ -954,10 +1301,10 @@ fn finish(
             if let Some(attempt) = run.stages[index].attempts.last_mut() {
                 attempt.process_group = None;
             }
-            run.fail_attempt(Status::Failed, format!("{error:#}"));
-            return Ok(());
+            return Ok(Exit::Stopped(Status::Failed, format!("{error:#}")));
         }
     };
+    let stdout = prepared.directory.join("stdout.log");
     if let Some(attempt) = run.stages[index].attempts.last_mut() {
         attempt.exit_code = outcome.code;
         attempt.finished_at = Some(Utc::now());
@@ -965,53 +1312,42 @@ fn finish(
         // spread through the log, so read far more than the final response needs.
         attempt.process_group = None;
         if attempt.mode == Mode::Unattended {
-            attempt.usage = handoff::usage_file(
-                &prepared.directory.join("stdout.log"),
-                prepared.invocation.kind,
-            );
+            attempt.usage = handoff::usage_file(&stdout, prepared.invocation.kind);
         }
     }
     if outcome.cancelled {
-        run.fail_attempt(
+        return Ok(Exit::Stopped(
             Status::Cancelled,
             "Stage cancelled. Filesystem changes are retained; retry explicitly".into(),
-        );
-        return Ok(());
+        ));
     }
     if outcome.timed_out {
-        run.fail_attempt(
+        return Ok(Exit::Stopped(
             Status::Failed,
             "Stage timed out. Inspect logs or reopen interactively; existing changes are retained"
                 .into(),
-        );
-        return Ok(());
+        ));
     }
+    let mode = run.workflow.stages[index].mode;
     if !outcome.success() {
         // A JSON error event names the cause; stderr often holds only warnings.
-        let reported = (run.workflow.stages[index].mode == Mode::Unattended)
-            .then(|| {
-                process::read_tail(&prepared.directory.join("stdout.log"), 4 * 1024 * 1024).ok()
-            })
+        let reported = (mode == Mode::Unattended)
+            .then(|| process::read_tail(&stdout, 4 * 1024 * 1024).ok())
             .flatten()
             .and_then(|raw| handoff::normalize(&raw, prepared.invocation.kind).error);
         let detail = match reported {
-            Some(error) => error,
+            Some(error) => error.to_string(),
             None => storage::clean_terminal(
                 &process::read_tail(&prepared.directory.join("stderr.log"), 3000)
                     .unwrap_or_default(),
             ),
         };
-        run.fail_attempt(
+        return Ok(Exit::Stopped(
             Status::Failed,
             format!("Harness exited with code {:?}. {detail}", outcome.code),
-        );
-        return Ok(());
+        ));
     }
-    let (mode, role) = (
-        run.workflow.stages[index].mode,
-        run.workflow.stages[index].role,
-    );
-    let raw = process::read_tail(&prepared.directory.join("stdout.log"), 4 * 1024 * 1024)?;
+    let raw = process::read_tail(&stdout, 4 * 1024 * 1024)?;
     let normalized = if mode == Mode::Interactive {
         handoff::Normalized {
             text: storage::clean_terminal(&raw),
@@ -1021,25 +1357,47 @@ fn finish(
         handoff::normalize(&raw, prepared.invocation.kind)
     };
     if normalized.permission_blocked {
-        run.fail_attempt(Status::Blocked, "Harness reported denied tool permissions. Reopen interactively or set explicit permission arguments and retry".into());
-        return Ok(());
+        return Ok(Exit::Stopped(Status::Blocked, "Harness reported denied tool permissions. Reopen interactively or set explicit permission arguments and retry".into()));
     }
     // A handoff file may replace a missing assistant text event, but not a real
     // protocol error (e.g. a tool/API failure after the file was written).
-    if let Some(error) = &normalized.error {
-        if !error.starts_with("No final assistant")
-            || (!prepared.handoff_file.is_file() && !prepared.invocation.final_file.is_file())
-        {
-            run.fail_attempt(Status::Failed, error.clone());
-            return Ok(());
-        }
+    match &normalized.error {
+        Some(ProtocolError::NoFinalResponse)
+            if prepared.handoff_file.is_file() || prepared.invocation.final_file.is_file() => {}
+        Some(error) => return Ok(Exit::Stopped(Status::Failed, error.to_string())),
+        None => {}
     }
+    Ok(Exit::Succeeded(normalized))
+}
+
+/// A successful attempt's handoff, or why the stage stops without one.
+enum Resolved {
+    Handoff(HandoffSource, Handoff),
+    Stopped(Status, String),
+}
+
+/// Reads the handoff from the first source present: the handoff file, the
+/// harness's final-message file, then the output stream. An interactive
+/// stage that wrote no file gets a placeholder, except reviews and tests,
+/// which must produce a structured verdict.
+fn resolve_handoff(
+    run: &Run,
+    prepared: &Prepared,
+    normalized: handoff::Normalized,
+) -> Result<Resolved> {
+    let stage = &run.workflow.stages[run.cursor];
+    let (mode, role) = (stage.mode, stage.role);
     // Interactive terminal transcripts can echo the original prompt (including
     // the example JSON). Never infer a structured verdict from an echoed prompt.
     if mode == Mode::Interactive && !prepared.handoff_file.is_file() {
         if matches!(role, Role::Review | Role::Test) {
-            run.fail_attempt(Status::Blocked, format!("Interactive {} did not write its handoff file. Reopen it to produce a structured verdict and evidence", role.label()));
-            return Ok(());
+            return Ok(Resolved::Stopped(
+                Status::Blocked,
+                format!(
+                    "Interactive {} did not write its handoff file. Reopen it to produce a structured verdict and evidence",
+                    role.label()
+                ),
+            ));
         }
         let handoff = Handoff {
             summary: format!(
@@ -1055,34 +1413,48 @@ fn finish(
             not_applicable: None,
             structured: false,
         };
-        storage::write_json(&prepared.directory.join("handoff.json"), &handoff)?;
-        run.stages[index].handoff = Some(handoff);
-        if !run_checks(run, prepared, cancel, emit)? {
-            return Ok(());
-        }
-        run.stages[index].status = Status::AwaitingConfirmation;
-        run.status = Status::AwaitingConfirmation;
-        if let Some(attempt) = run.stages[index].attempts.last_mut() {
-            attempt.status = Status::AwaitingConfirmation;
-        }
-        return Ok(());
+        return Ok(Resolved::Handoff(HandoffSource::Placeholder, handoff));
     }
-    let source = if prepared.handoff_file.is_file() {
-        process::read_tail(&prepared.handoff_file, 1024 * 1024)?
+    let (source, text) = if prepared.handoff_file.is_file() {
+        (
+            HandoffSource::File,
+            process::read_tail(&prepared.handoff_file, 1024 * 1024)?,
+        )
     } else if prepared.invocation.final_file.is_file() {
-        process::read_tail(&prepared.invocation.final_file, 1024 * 1024)?
+        (
+            HandoffSource::Final,
+            process::read_tail(&prepared.invocation.final_file, 1024 * 1024)?,
+        )
     } else {
-        normalized.text
+        (HandoffSource::Stream, normalized.text)
     };
-    let handoff = match handoff::parse(&source, role) {
-        Ok(handoff) => handoff,
-        Err(error) => {
-            run.fail_attempt(Status::Blocked, format!("{error:#}"));
-            return Ok(());
+    Ok(match handoff::parse(&text, role) {
+        Ok(handoff) => Resolved::Handoff(source, handoff),
+        Err(error) => Resolved::Stopped(Status::Blocked, format!("{error:#}")),
+    })
+}
+
+/// Completes the attempt's bookkeeping after its harness ended.
+fn finish(
+    run: &mut Run,
+    prepared: &Prepared,
+    result: Result<process::Outcome>,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(Event),
+) -> Result<()> {
+    let index = run.cursor;
+    let normalized = match classify_exit(run, prepared, result)? {
+        Exit::Succeeded(normalized) => normalized,
+        Exit::Stopped(status, message) => return run.stop(status, message, Actor::Engine, true),
+    };
+    let (source, handoff) = match resolve_handoff(run, prepared, normalized)? {
+        Resolved::Handoff(source, handoff) => (source, handoff),
+        Resolved::Stopped(status, message) => {
+            return run.stop(status, message, Actor::Engine, true);
         }
     };
     storage::write_json(&prepared.directory.join("handoff.json"), &handoff)?;
-    if role == Role::Summary {
+    if run.workflow.stages[index].role == Role::Summary && source != HandoffSource::Placeholder {
         // The brief is for a person: keep it readable outside the router.
         storage::atomic_write(
             &run.directory.join("review.md"),
@@ -1092,20 +1464,17 @@ fn finish(
     // A reported block stops the stage regardless of check results.
     let blocked = handoff.verdict == Verdict::Blocked;
     run.stages[index].handoff = Some(handoff);
+    if let Some(attempt) = run.stages[index].attempts.last_mut() {
+        attempt.handoff_source = Some(source);
+    }
     if !blocked && !run_checks(run, prepared, cancel, emit)? {
         return Ok(());
     }
-    run.stages[index].status = Status::Complete;
-    if let Some(attempt) = run.stages[index].attempts.last_mut() {
-        attempt.status = Status::Complete;
-    }
-    if mode == Mode::Interactive {
-        run.status = Status::AwaitingConfirmation;
-        run.stages[index].status = Status::AwaitingConfirmation;
+    if run.workflow.stages[index].mode == Mode::Interactive {
+        run.checkpoint()
     } else {
-        run.apply_handoff()?;
+        run.advance(Actor::Engine)
     }
-    Ok(())
 }
 
 /// Runs the current stage's router checks. False when cancellation stopped the run.
@@ -1131,11 +1500,13 @@ fn run_checks(
         attempt.checks = results;
     }
     if cancelled {
-        run.fail_attempt(
+        run.stop(
             Status::Cancelled,
             "Stage cancelled during checks. Filesystem changes are retained; retry explicitly"
                 .into(),
-        );
+            Actor::Engine,
+            true,
+        )?;
     }
     Ok(!cancelled)
 }
@@ -1153,11 +1524,8 @@ fn execute_stage(
         Err(e) => {
             // Errors before the attempt was recorded belong to the stage,
             // never to an earlier, finished attempt.
-            if run.stages[index].attempts.len() > attempts {
-                run.fail_attempt(Status::Failed, format!("{e:#}"));
-            } else {
-                run.fail(Status::Failed, format!("{e:#}"));
-            }
+            let recorded = run.stages[index].attempts.len() > attempts;
+            run.stop(Status::Failed, format!("{e:#}"), Actor::Engine, recorded)?;
             run.persist()?;
             emit(Event::State(Box::new(run.clone())));
             return Ok(());
@@ -1218,10 +1586,12 @@ fn execute_stage(
         result
     };
     if let Err(error) = finish(run, &prepared, result, cancel, emit) {
-        run.fail_attempt(
+        run.stop(
             Status::Failed,
             format!("Could not complete stage bookkeeping: {error:#}"),
-        );
+            Actor::Engine,
+            true,
+        )?;
     }
     // Finishing may move the cursor, so record the stage that ran.
     let tree = snapshot::tree(&run.workspace, &run.directory);
@@ -1297,22 +1667,40 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
                 return Ok(Action::Stopped);
             }
             Status::Running => {
-                run.fail_attempt(
+                // Only an attempt still marked running belongs to that execution.
+                let running = run
+                    .stages
+                    .get(run.cursor)
+                    .and_then(|s| s.attempts.last())
+                    .is_some_and(|a| a.status == Status::Running);
+                run.stop(
                     Status::Failed,
                     "A previous execution was interrupted. Inspect artifacts and retry explicitly"
                         .into(),
-                );
+                    Actor::Recovery,
+                    running,
+                )?;
                 run.persist()?;
                 return Ok(Action::Stopped);
             }
             _ => {}
         }
         while run.cursor < run.workflow.stages.len() && !run.workflow.stages[run.cursor].enabled {
-            run.stages[run.cursor].status = Status::Skipped;
+            run.set(
+                Target::Stage(run.cursor),
+                Status::Skipped,
+                Actor::Engine,
+                "Stage disabled",
+            )?;
             run.cursor += 1;
         }
         if run.cursor == run.stages.len() {
-            run.status = Status::Complete;
+            run.set(
+                Target::Run,
+                Status::Complete,
+                Actor::Engine,
+                "All enabled stages complete",
+            )?;
             run.error = None;
             run.persist()?;
             save_changes(run);
@@ -1320,16 +1708,22 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
             return Ok(Action::Complete);
         }
         if cancel.load(Ordering::Relaxed) {
-            run.fail(
+            run.stop(
                 Status::Cancelled,
                 "Run cancelled before the next stage".into(),
-            );
+                Actor::User,
+                false,
+            )?;
             run.persist()?;
             save_changes(run);
             return Ok(Action::Stopped);
         }
         if run.workflow.stages[run.cursor].mode == Mode::Interactive {
-            run.status = Status::Interactive;
+            let reason = format!(
+                "Stage {} waits for its terminal",
+                run.workflow.stages[run.cursor].name
+            );
+            run.set(Target::Run, Status::Interactive, Actor::Engine, reason)?;
             run.persist()?;
             emit(Event::State(Box::new(run.clone())));
             return Ok(Action::Interactive);
@@ -1369,28 +1763,10 @@ pub fn run_interactive(
     Ok(())
 }
 
+/// Replaces the summary of the handoff awaiting confirmation and saves it;
+/// `command` with `Cmd::EditSummary`.
 pub fn edit_handoff(run: &mut Run, summary: String) -> Result<()> {
-    ensure!(
-        run.status == Status::AwaitingConfirmation
-            && run.workflow.stages[run.cursor].role != Role::Review,
-        "Only an interactive non-review handoff summary can be edited"
-    );
-    ensure!(
-        !summary.trim().is_empty() && summary.len() <= 12000,
-        "Enter a summary of 1–12000 bytes"
-    );
-    let _lock = storage::lock_wait(&run.directory.join("run.lock"), LOCK_WAIT)?;
-    run.check_revision()?;
-    let state = &mut run.stages[run.cursor];
-    let handoff = state.handoff.as_mut().context("No handoff")?;
-    handoff.summary = summary;
-    handoff
-        .decisions
-        .push("Handoff summary supplied or edited by the user".into());
-    if let Some(attempt) = state.attempts.last() {
-        storage::write_json(&attempt.directory.join("handoff.json"), handoff)?;
-    }
-    run.persist()
+    run.command(Cmd::EditSummary(summary))
 }
 
 pub fn preview(
@@ -1532,6 +1908,54 @@ mod tests {
         let prompt = fs::read_to_string(prepared.directory.join("prompt.md")).unwrap();
         assert!(prompt.contains(&prepared.handoff_file.display().to_string()));
         assert!(!prepared.handoff_file.exists());
+    }
+
+    #[test]
+    fn illegal_transitions_are_refused_and_not_recorded() {
+        let mut run = crate::report::tests::sample();
+        let refused = |run: &mut Run, target, to| {
+            let before = (run.status, run.stages[0].status, run.journal.len());
+            let error = run
+                .transition(Transition::new(target, to, Actor::Engine, "test"))
+                .unwrap_err();
+            assert!(error.to_string().starts_with("Illegal"), "{error}");
+            assert_eq!(
+                before,
+                (run.status, run.stages[0].status, run.journal.len())
+            );
+        };
+        // Values that belong to another level.
+        refused(&mut run, Target::Run, Status::Skipped);
+        refused(&mut run, Target::Stage(0), Status::Interactive);
+        refused(&mut run, Target::Attempt(0), Status::AwaitingConfirmation);
+        refused(&mut run, Target::Attempt(0), Status::Pending);
+        // A complete run is final; an enabled stage is never skipped.
+        refused(&mut run, Target::Run, Status::Pending);
+        refused(&mut run, Target::Stage(0), Status::Skipped);
+        refused(&mut run, Target::Stage(2), Status::Pending);
+        // A finished attempt never runs again.
+        refused(&mut run, Target::Attempt(0), Status::Running);
+        assert!(
+            run.transition(Transition::new(
+                Target::Stage(9),
+                Status::Pending,
+                Actor::Engine,
+                "test"
+            ))
+            .is_err()
+        );
+        // Moving to the current status records nothing.
+        run.set(Target::Run, Status::Complete, Actor::Engine, "same")
+            .unwrap();
+        assert!(run.journal.is_empty());
+        run.status = Status::Failed;
+        run.set(Target::Stage(0), Status::Pending, Actor::User, "reset")
+            .unwrap();
+        let record = run.journal.last().unwrap();
+        assert_eq!(
+            (record.level, record.stage_index, record.from, record.to),
+            (Level::Stage, Some(0), Status::Complete, Status::Pending)
+        );
     }
 
     #[test]

@@ -6,7 +6,12 @@ use super::{
     theme::Palette,
     widgets::{elapsed, empty_state, short_path},
 };
-use crate::{adapters, config::Mode, engine::Status, storage};
+use crate::{
+    adapters,
+    config::Mode,
+    engine::{Cmd, Status},
+    storage,
+};
 use anyhow::{Context, Result, bail, ensure};
 use ratatui::{
     Frame,
@@ -57,7 +62,11 @@ impl App {
                         run: run.id.clone(),
                     })));
                 } else {
-                    self.focused.run.as_mut().context("No run")?.take_over()?;
+                    self.focused
+                        .run
+                        .as_mut()
+                        .context("No run")?
+                        .command(Cmd::TakeOver)?;
                     self.launch_interactive = true;
                 }
             }
@@ -124,7 +133,11 @@ impl App {
                 self.start_driver()?
             }
             ActionId::Advance => {
-                self.focused.run.as_mut().context("No run")?.confirm()?;
+                self.focused
+                    .run
+                    .as_mut()
+                    .context("No run")?
+                    .command(Cmd::Confirm)?;
                 self.start_driver()?;
             }
             ActionId::Retry => {
@@ -132,7 +145,10 @@ impl App {
                     .run
                     .as_mut()
                     .context("No run")?
-                    .retry(false, None)?;
+                    .command(Cmd::Retry {
+                        interactive: false,
+                        model: None,
+                    })?;
                 self.start_driver()?;
             }
             ActionId::RetryInteractive => {
@@ -141,7 +157,10 @@ impl App {
                 if run.status == Status::Interactive {
                     self.launch_interactive = true;
                 } else {
-                    run.retry(true, None)?;
+                    run.command(Cmd::Retry {
+                        interactive: true,
+                        model: None,
+                    })?;
                     self.start_driver()?;
                 }
             }
