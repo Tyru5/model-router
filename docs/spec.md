@@ -145,6 +145,9 @@ API clients, automatic task classification, and embedded IDE control are exclude
 - CLI equivalents for initialization, validation, previews, execution, discovery,
   history (filters, JSON, sizes), rerun, compare, clean, and resume; all share
   the same execution engine.
+- Notifications (terminal bell/OSC, desktop, ntfy-style webhook; terminal on by
+  default) when a run needs input, stops, or completes; the CLI opts in with
+  `--notify`. The TUI keeps a notice history and lists the session's runs.
 
 ## Acceptance checks
 

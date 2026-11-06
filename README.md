@@ -446,7 +446,28 @@ and starting more runs never touch active ones. The Monitor tab counts runs in
 progress (`2 Monitor ●2`). When there is more than one, the Monitor lists them
 under its title; `[` and `]` switch between them, and `x` closes a stopped run
 here (its files stay; Runs reopens it). The status line reports runs that stop,
-complete, or wait for you while you are elsewhere.
+complete, or wait for you while you are elsewhere; `!` lists earlier notices,
+newest first. The header shows `◆ 2 need input [N]` while runs wait for you,
+and `N` jumps to the next one. `L` lists this session's runs with status,
+stage, elapsed time, and a needs-input marker: `Enter` focuses one, `n` jumps
+to the next needing input, and `C` cancels a run's stage after confirming.
+
+### Notifications
+
+When a run needs input (interactive stage, handoff review, or verification
+waiver), stops blocked or failed, or completes, Model Router notifies you, even
+while another run's interactive session has the screen. Choose backends with
+**F9** or `:` → **Notifications…** (saved in `appearance.json`):
+
+- **Terminal** (on by default): bell plus OSC 9 and OSC 777 notifications,
+  written to the controlling terminal (wrapped for tmux passthrough).
+- **Desktop** (off): `notify-send` on Linux, `osascript` on macOS.
+- **Webhook** (off): ntfy-style POST (message body, `Title` header) to a URL
+  you enter, or to `MODEL_ROUTER_NOTIFY_URL`, which turns it on by itself.
+
+The same event is sent once per three minutes. The dialog has a test button.
+CLI `run`, `resume`, and `rerun` notify with `--notify` or
+`MODEL_ROUTER_NOTIFY=1`, using the same backends.
 
 A run that starts while another run of this session (or another router
 process) is using the checkout gets its own Git worktree from committed HEAD,
