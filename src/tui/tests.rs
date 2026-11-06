@@ -1452,3 +1452,238 @@ fn monitor_results_and_dialogs_fit_the_minimum_size() {
         );
     }
 }
+
+/// A session of four runs: done, awaiting review, running (focused), and
+/// waiting for its terminal.
+fn mixed_session(project: &std::path::Path) -> App {
+    let mut app = theme_app(project);
+    for (id, status) in [
+        ("done", Status::Complete),
+        ("review", Status::AwaitingConfirmation),
+        ("busy", Status::Running),
+        ("term", Status::Interactive),
+    ] {
+        let mut run = sample_run(id);
+        run.status = status;
+        app.adopt(run);
+        if status == Status::Running {
+            app.focused.worker = Some(Worker::stub());
+        }
+    }
+    app.focus_run("busy");
+    app.page = 1;
+    app
+}
+
+#[test]
+fn session_runs_dialog_lists_runs_focuses_cancels_and_jumps_to_input() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = mixed_session(project.path());
+    assert_eq!(session(&app), "done review busy* term");
+    assert_eq!(app.needing_input(), 2);
+    let text = rows(&mut app, 120, 30).join("\n");
+    assert!(text.contains("◆ 2 need input [N]"), "{text}");
+
+    app.key(shift('L')).unwrap();
+    assert!(matches!(
+        app.modal,
+        Some(Modal::SessionRuns { selected: 2 })
+    ));
+    let text = rows(&mut app, 120, 30).join("\n");
+    assert!(text.contains("Session runs · 2 need input"), "{text}");
+    for id in ["done", "review", "busy", "term"] {
+        assert!(text.contains(id), "{id}: {text}");
+    }
+    assert_eq!(text.matches("◆ needs input").count(), 2, "{text}");
+    assert!(text.contains("running"), "{text}");
+
+    // [C] on the running run asks, then cancels only that run.
+    app.key(shift('C')).unwrap();
+    assert!(matches!(app.modal.as_deref_ask(), Some(Ask::CancelRun { run }) if run == "busy"));
+    app.key(key(Key::Char('y'))).unwrap();
+    assert!(app.focused.cancel.load(Ordering::Relaxed));
+    assert!(
+        app.message.contains("Stopping the stage of busy"),
+        "{}",
+        app.message
+    );
+    app.focused.cancel.store(false, Ordering::Relaxed);
+
+    // [C] on a run that is not running cancels nothing.
+    app.key(shift('L')).unwrap();
+    app.key(key(Key::Up)).unwrap();
+    app.key(shift('C')).unwrap();
+    assert!(matches!(app.modal, Some(Modal::SessionRuns { .. })));
+    assert!(app.message.contains("nothing to cancel"), "{}", app.message);
+
+    // [Enter] focuses the selected run.
+    app.key(key(Key::Enter)).unwrap();
+    assert!(app.modal.is_none());
+    assert_eq!(session(&app), "done review* busy term");
+    assert!(app.message.contains("[a] advances"), "{}", app.message);
+
+    // [n] in the dialog and [N] anywhere jump to the next run needing input, wrapping.
+    app.key(shift('L')).unwrap();
+    app.key(key(Key::Char('n'))).unwrap();
+    assert_eq!(session(&app), "done review busy term*");
+    assert!(app.message.contains("[i] opens it"), "{}", app.message);
+    app.page = 0;
+    app.key(shift('N')).unwrap();
+    assert_eq!(session(&app), "done review* busy term");
+    assert_eq!(app.page, 1);
+    for slot in std::iter::once(&mut app.focused).chain(&mut app.parked) {
+        if let Some(run) = &mut slot.run {
+            run.status = Status::Complete;
+        }
+    }
+    app.key(shift('N')).unwrap();
+    assert!(app.message.contains("No run of this session needs input"));
+    assert!(!rows(&mut app, 120, 30).join("\n").contains("need input"));
+}
+
+trait AskModal {
+    fn as_deref_ask(&self) -> Option<&Ask>;
+}
+impl AskModal for Option<Modal> {
+    fn as_deref_ask(&self) -> Option<&Ask> {
+        match self {
+            Some(Modal::Ask(ask)) => Some(ask),
+            _ => None,
+        }
+    }
+}
+
+#[test]
+fn background_run_events_queue_notices_instead_of_clobbering() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    for id in ["first", "second", "third"] {
+        let mut run = sample_run(id);
+        run.status = Status::Running;
+        app.adopt(run);
+        app.focused.worker = Some(Worker::stub());
+    }
+    app.page = 0;
+    let finish = |app: &App, index: usize, status, result| {
+        let slot = &app.parked[index];
+        let mut run = slot.run.clone().unwrap();
+        run.status = status;
+        run.error = Some("tests failed".into());
+        slot.worker.as_ref().unwrap().finish(run, result);
+    };
+    finish(&app, 0, Status::Blocked, Ok(Action::Stopped));
+    finish(&app, 1, Status::AwaitingConfirmation, Ok(Action::Confirm));
+    app.poll().unwrap();
+    assert_eq!(app.notices.len(), 2);
+    let workflow = app.parked[0].run.as_ref().unwrap().workflow.name.clone();
+    assert!(app.notices[0].alert);
+    assert!(
+        app.notices[0]
+            .text
+            .starts_with(&format!("{workflow} (first) stopped: tests failed")),
+        "{}",
+        app.notices[0].text
+    );
+    // The newest shows; the status line counts the rest.
+    assert!(app.message.contains("(second)") && app.message.contains("[N] jumps"));
+    assert_eq!(app.more_notices(), 1);
+    let text = rows(&mut app, 120, 30).join("\n");
+    assert!(text.contains("(+1 more · [!] notices)"), "{text}");
+
+    // The focused run's stop is kept too, and [!] lists all, newest first.
+    let mut run = app.focused.run.clone().unwrap();
+    run.status = Status::Complete;
+    app.focused
+        .worker
+        .as_ref()
+        .unwrap()
+        .finish(run, Ok(Action::Complete));
+    app.poll().unwrap();
+    assert_eq!(app.more_notices(), 2);
+    app.key(shift('!')).unwrap();
+    let Some(Modal::Text { body, .. }) = &app.modal else {
+        panic!("Notice history did not open");
+    };
+    let lines: Vec<_> = body.lines().collect();
+    assert_eq!(lines.len(), 3, "{body}");
+    assert!(lines[0].contains("(third) complete"), "{body}");
+    assert!(
+        lines[2].contains("✗") && lines[2].contains("(first)"),
+        "{body}"
+    );
+    assert_eq!(app.more_notices(), 0);
+    app.key(key(Key::Esc)).unwrap();
+    for n in 0..60 {
+        app.push_notice(format!("notice {n}"), false);
+    }
+    assert_eq!(app.notices.len(), super::session::NOTICES);
+    assert_eq!(app.notices.back().unwrap().text, "notice 59");
+}
+
+#[test]
+fn notifications_dialog_saves_backends_with_older_preferences() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    std::fs::write(&app.theme_path, r#"{"theme":"nord","vim_motions":false}"#).unwrap();
+    let loaded = theme::load(&app.theme_path).unwrap();
+    app.theme = loaded.theme;
+    app.notifications = loaded.notifications;
+    assert!(app.notifications.terminal && !app.notifications.desktop);
+
+    // The command menu reaches the dialog, as F9 does.
+    app.key(key(Key::Char(':'))).unwrap();
+    app.paste("Notifications");
+    app.key(key(Key::Enter)).unwrap();
+    assert!(matches!(app.modal, Some(Modal::Notifications { .. })));
+    let text = rows(&mut app, 100, 30).join("\n");
+    assert!(
+        text.contains("[x] Terminal") && text.contains("[ ] Desktop"),
+        "{text}"
+    );
+
+    app.key(key(Key::Down)).unwrap();
+    app.key(key(Key::Char(' '))).unwrap();
+    let saved = theme::load(&app.theme_path).unwrap();
+    assert!(saved.notifications.desktop && saved.notifications.terminal);
+    assert_eq!(saved.theme, Theme::Nord);
+    assert!(app.notifications.desktop);
+
+    // Webhook URL: invalid ones are refused, a valid one turns the webhook on.
+    app.key(key(Key::Down)).unwrap();
+    app.key(key(Key::Down)).unwrap();
+    app.key(key(Key::Enter)).unwrap();
+    assert!(matches!(app.modal, Some(Modal::Input { .. })));
+    app.paste("ftp://nope");
+    assert!(app.key(ctrl('s')).is_err());
+    app.key(key(Key::Esc)).unwrap();
+    app.key(key(Key::F(9))).unwrap();
+    for _ in 0..3 {
+        app.key(key(Key::Down)).unwrap();
+    }
+    app.key(key(Key::Enter)).unwrap();
+    app.paste("https://ntfy.sh/mr-test");
+    app.key(ctrl('s')).unwrap();
+    assert!(matches!(
+        app.modal,
+        Some(Modal::Notifications { selected: 3, .. })
+    ));
+    let saved = theme::load(&app.theme_path).unwrap();
+    assert!(saved.notifications.webhook);
+    assert_eq!(saved.notifications.webhook_url, "https://ntfy.sh/mr-test");
+
+    // The test button reports what it sent.
+    app.key(key(Key::Down)).unwrap();
+    app.key(key(Key::Enter)).unwrap();
+    let Some(Modal::Notifications { status, .. }) = &app.modal else {
+        panic!("dialog closed");
+    };
+    assert!(status.starts_with("Sent"), "{status}");
+    app.key(key(Key::Esc)).unwrap();
+
+    // Other preference changes keep the backends.
+    app.key(key(Key::F(8))).unwrap();
+    app.pick(PickValue::Theme(Theme::Dracula)).unwrap();
+    let saved = theme::load(&app.theme_path).unwrap();
+    assert!(saved.vim_motions && saved.notifications.desktop && saved.notifications.webhook);
+    assert_eq!(saved.theme, Theme::Dracula);
+}

@@ -7,6 +7,7 @@ use super::{
     modal::{Ask, Choice, InputTarget, Modal, PickValue, draw_modal, matching_choices},
     monitor::draw_run,
     path_picker::PathPicker,
+    session::{Notice, draw_session_runs, notice_text},
     theme::{self, Palette, Theme},
     widgets::{dim, rows_for, short_path, textarea},
     workflow_page::{StageEditor, draw_workflow},
@@ -16,7 +17,7 @@ use crate::{
     config::{self, Settings, Stage},
     engine::{self, Action, Event as RunEvent, Placement, Run, Status},
     history::Entry,
-    process, storage,
+    notify, process, storage,
 };
 use anyhow::{Context, Result, bail, ensure};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
@@ -84,8 +85,12 @@ pub(super) struct Worker {
 }
 impl Worker {
     /// Runs `work` on a thread that reports through the returned worker.
+    /// When the work ends, the user is notified of results `notify` accepts.
+    /// Notifying from the worker thread reaches the user even while another
+    /// run's interactive session has the screen.
     fn spawn(
         terminal: Option<process::InteractiveSession>,
+        notify: fn(&std::result::Result<Action, String>) -> bool,
         work: impl FnOnce(&mut dyn FnMut(RunEvent)) -> (Run, std::result::Result<Action, String>)
         + Send
         + 'static,
@@ -94,6 +99,9 @@ impl Worker {
         let shared = inbox.clone();
         let thread = thread::spawn(move || {
             let (run, result) = work(&mut |event| lock(&shared).push(event));
+            if notify(&result) {
+                notify::notify_outcome(&run, &result);
+            }
             lock(&shared).done = Some((Box::new(run), result));
         });
         Self {
@@ -275,29 +283,18 @@ impl Drop for RunSlot {
     }
 }
 
-/// What the status line says when a run outside the Monitor stops driving.
-fn notice(run: &Run, result: &std::result::Result<Action, String>) -> String {
-    let stage = run.current_name();
-    let id = &run.id;
-    match result {
-        Ok(Action::Interactive) => format!(
-            "Run {id}: {stage} is ready in its native terminal. Monitor [2], [ ] to select the run, then [i]."
-        ),
-        Ok(Action::Confirm) => format!("Run {id}: {stage} awaits handoff review in Monitor [2]."),
-        Ok(Action::Complete) => format!("Run {id} ({}) complete.", run.workflow.name),
-        Ok(Action::Stopped) => format!(
-            "Run {id} stopped: {}",
-            run.error.as_deref().unwrap_or("no error recorded")
-        ),
-        Err(error) => format!("Run {id}: {error}"),
-    }
-}
 pub(super) struct App {
     pub(super) project: PathBuf,
     pub(super) config_path: PathBuf,
     pub(super) theme: Theme,
     pub(super) theme_path: PathBuf,
     pub(super) vim_motions: bool,
+    /// Notification backends, saved with the theme.
+    pub(super) notifications: notify::Backends,
+    /// What runs of this session reported, newest last; `!` lists them.
+    pub(super) notices: VecDeque<Notice>,
+    /// Notices since the list was last opened.
+    pub(super) unseen_notices: usize,
     pub(super) settings: Settings,
     pub(super) workflow: usize,
     pub(super) selected: usize,
@@ -440,6 +437,9 @@ impl App {
             theme: Theme::default(),
             theme_path: config::config_dir().join("appearance.json"),
             vim_motions: false,
+            notifications: notify::Backends::default(),
+            notices: VecDeque::new(),
+            unseen_notices: 0,
             workflow: 0,
             selected: 0,
             task: String::new(),
@@ -688,10 +688,14 @@ impl App {
         let mut run = self.focused.run.clone().context("No run selected")?;
         self.focused.cancel.store(false, Ordering::Relaxed);
         let cancel = self.focused.cancel.clone();
-        self.focused.worker = Some(Worker::spawn(None, move |emit| {
-            let action = engine::drive(&mut run, &cancel, emit).map_err(|e| format!("{e:#}"));
-            (run, action)
-        }));
+        self.focused.worker = Some(Worker::spawn(
+            None,
+            |_| true,
+            move |emit| {
+                let action = engine::drive(&mut run, &cancel, emit).map_err(|e| format!("{e:#}"));
+                (run, action)
+            },
+        ));
         Ok(())
     }
     /// Start the stage once; subsequent attachments reuse this worker's PTY.
@@ -710,18 +714,25 @@ impl App {
         let terminal = session.clone();
         self.focused.cancel.store(false, Ordering::Relaxed);
         let cancel = self.focused.cancel.clone();
-        self.focused.worker = Some(Worker::spawn(Some(session.clone()), move |emit| {
-            let result = engine::run_interactive(&mut run, &cancel, &terminal, emit)
-                .map(|()| {
-                    if run.status == Status::AwaitingConfirmation {
-                        Action::Confirm
-                    } else {
-                        Action::Stopped
-                    }
-                })
-                .map_err(|error| format!("{error:#}"));
-            (run, result)
-        }));
+        // The user ends an interactive stage themselves, so only failures notify.
+        let failures =
+            |result: &std::result::Result<Action, String>| !matches!(result, Ok(Action::Confirm));
+        self.focused.worker = Some(Worker::spawn(
+            Some(session.clone()),
+            failures,
+            move |emit| {
+                let result = engine::run_interactive(&mut run, &cancel, &terminal, emit)
+                    .map(|()| {
+                        if run.status == Status::AwaitingConfirmation {
+                            Action::Confirm
+                        } else {
+                            Action::Stopped
+                        }
+                    })
+                    .map_err(|error| format!("{error:#}"));
+                (run, result)
+            },
+        ));
         Ok(session)
     }
     pub(super) fn poll(&mut self) -> Result<bool> {
@@ -742,10 +753,8 @@ impl App {
             if let Some(result) = stopped {
                 self.run_stopped();
                 if let Some(run) = &self.parked[index].run {
-                    self.message = notice(run, &result);
-                    if result.is_err() || result == Ok(Action::Stopped) {
-                        self.alert = self.message.clone();
-                    }
+                    let alert = result.is_err() || result == Ok(Action::Stopped);
+                    self.push_notice(notice_text(run, &result), alert);
                 }
             }
         }
@@ -996,14 +1005,14 @@ impl App {
         Ok(())
     }
     fn focused_stopped(&mut self, result: std::result::Result<Action, String>) {
+        // Every stop is kept in the notice history; on the Monitor, the
+        // status line then says what to do next.
+        if let Some(run) = &self.focused.run {
+            let alert = result.is_err() || result == Ok(Action::Stopped);
+            self.push_notice(notice_text(run, &result), alert);
+        }
         // Away from the Monitor, a terminal never takes over the screen.
         if self.page != 1 {
-            if let Some(run) = &self.focused.run {
-                self.message = notice(run, &result);
-                if result.is_err() || result == Ok(Action::Stopped) {
-                    self.alert = self.message.clone();
-                }
-            }
             return;
         }
         match result {
@@ -1258,7 +1267,13 @@ impl App {
             ActionId::Themes => self.choose_theme(),
             ActionId::ToggleVim => {
                 let enabled = !self.vim_motions;
-                theme::save(&self.theme_path, self.theme, enabled)?;
+                theme::save(
+                    &self.theme_path,
+                    &theme::Preferences {
+                        vim_motions: enabled,
+                        ..self.preferences()
+                    },
+                )?;
                 self.vim_motions = enabled;
                 self.runs.set_vim(enabled);
                 if let Some(field) = self.modal.as_mut().and_then(Modal::active_input) {
@@ -1279,6 +1294,10 @@ impl App {
                 })
             }
             ActionId::Commands => self.command_menu(),
+            ActionId::SessionRuns => self.session_runs(),
+            ActionId::NextNeedsInput => self.jump_to_input(),
+            ActionId::Notices => self.show_notices(),
+            ActionId::Notifications => self.notifications(),
             ActionId::NextView => self.show((self.page + 1) % TABS.len())?,
             ActionId::ShowWorkflow => self.show(0)?,
             ActionId::ShowMonitor => self.show(1)?,
@@ -1458,6 +1477,13 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
             storage::clean_terminal(&app.message),
             Style::default().fg(if alert { palette.red } else { palette.fg }),
         ),
+        Span::styled(
+            match app.more_notices() {
+                0 => String::new(),
+                more => format!("  (+{more} more · [!] notices)"),
+            },
+            Style::default().fg(palette.muted),
+        ),
     ]);
     let body_width = area.width.saturating_sub(2);
     let mut headers = header_lines(app, palette, area.width);
@@ -1528,7 +1554,13 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         if !previewing_theme {
             dim(frame, palette);
         }
-        draw_modal(frame, modal, ask, palette);
+        if let Modal::SessionRuns { selected } = modal {
+            // This dialog reads the session's runs, so it draws from the app.
+            let selected = *selected;
+            draw_session_runs(frame, app, selected, palette);
+        } else {
+            draw_modal(frame, modal, ask, palette);
+        }
     }
 }
 
@@ -1561,6 +1593,15 @@ fn header_lines(app: &App, palette: Palette, width: u16) -> Vec<Line<'static>> {
             } else {
                 Style::default().fg(palette.muted)
             },
+        ));
+    }
+    let waiting = app.needing_input();
+    if waiting > 0 {
+        tabs.push(Span::styled(
+            format!("  ◆ {waiting} need input [N] "),
+            Style::default()
+                .fg(palette.warn)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     let tabs = Line::from(tabs);

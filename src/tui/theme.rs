@@ -1,5 +1,5 @@
 use super::input::InputField;
-use crate::{engine::Status, storage};
+use crate::{engine::Status, notify, storage};
 use anyhow::{Context, Result};
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -431,26 +431,30 @@ impl Palette {
     }
 }
 
-#[derive(Default, Deserialize, Serialize)]
+/// User preferences for every project, saved as `appearance.json` (its name
+/// from when it held only the theme). Older files lack newer keys, which
+/// then take their defaults.
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
-pub(super) struct Appearance {
+pub(super) struct Preferences {
     pub theme: Theme,
     pub vim_motions: bool,
+    pub notifications: notify::Backends,
 }
 
-pub(super) fn load(path: &Path) -> Result<Appearance> {
+pub(super) fn load(path: &Path) -> Result<Preferences> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Appearance::default()),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Preferences::default()),
         Err(error) => return Err(error).with_context(|| format!("Read {}", path.display())),
     };
-    let appearance: Appearance = serde_json::from_slice(&bytes)
+    let preferences: Preferences = serde_json::from_slice(&bytes)
         .with_context(|| format!("Read theme from {}", path.display()))?;
-    Ok(appearance)
+    Ok(preferences)
 }
 
-pub(super) fn save(path: &Path, theme: Theme, vim_motions: bool) -> Result<()> {
-    storage::write_json(path, &Appearance { theme, vim_motions })
+pub(super) fn save(path: &Path, preferences: &Preferences) -> Result<()> {
+    storage::write_json(path, preferences)
 }
 
 /// Bracket each ` / `-separated alternative: `J / K` -> `[J] / [K]`.
@@ -464,6 +468,33 @@ pub fn key_label(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn with_theme(theme: Theme) -> Preferences {
+        Preferences {
+            theme,
+            ..Preferences::default()
+        }
+    }
+
+    #[test]
+    fn preferences_keep_notifications_and_read_files_without_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("appearance.json");
+        fs::write(&path, r#"{"theme":"nord","vim_motions":true}"#).unwrap();
+        let mut old = load(&path).unwrap();
+        assert_eq!(old.theme, Theme::Nord);
+        assert!(old.vim_motions);
+        assert_eq!(old.notifications, notify::Backends::default());
+        old.notifications.desktop = true;
+        old.notifications.webhook_url = "https://ntfy.sh/x".into();
+        save(&path, &old).unwrap();
+        let again = load(&path).unwrap();
+        assert_eq!(again.theme, Theme::Nord);
+        assert!(again.vim_motions && again.notifications.desktop);
+        assert_eq!(again.notifications.webhook_url, "https://ntfy.sh/x");
+        // The CLI reads the same file.
+        assert!(notify::load_backends(&path).desktop);
+    }
 
     #[test]
     fn appearance_defaults_and_invalid_files_are_recoverable() {
@@ -480,7 +511,7 @@ mod tests {
             fs::write(&path, invalid).unwrap();
             assert!(load(&path).is_err());
         }
-        save(&path, Theme::CatppuccinLatte, false).unwrap();
+        save(&path, &with_theme(Theme::CatppuccinLatte)).unwrap();
         assert_eq!(load(&path).unwrap().theme, Theme::CatppuccinLatte);
         assert!(
             fs::read_to_string(path)
@@ -496,7 +527,7 @@ mod tests {
         let mut ids = std::collections::HashSet::new();
         for theme in Theme::ALL {
             assert!(ids.insert(serde_json::to_string(&theme).unwrap()));
-            save(&path, theme, false).unwrap();
+            save(&path, &with_theme(theme)).unwrap();
             assert_eq!(load(&path).unwrap().theme, theme);
         }
     }

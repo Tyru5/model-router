@@ -182,6 +182,9 @@ API clients, automatic task classification, and embedded IDE control are exclude
   API with the same engine. Server runs are unattended only; interactive
   stages are refused unless the caller forces them unattended. Projects are
   limited to allowed roots. See `docs/serve.md`.
+- Notifications (terminal bell/OSC, desktop, ntfy-style webhook; terminal on by
+  default) when a run needs input, stops, or completes; the CLI opts in with
+  `--notify`. The TUI keeps a notice history and lists the session's runs.
 
 ## Acceptance checks
 

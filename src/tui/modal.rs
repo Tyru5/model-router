@@ -5,6 +5,7 @@ use super::{
     harness_editor::HarnessEditor,
     history::{Compare, Confirm},
     path_picker::{PathPicker, PickerAction},
+    session::draw_notifications,
     task_importer::{ImportAction, TaskImporter},
     theme::{self, Palette, Theme},
     widgets::{content, menu_key, popup},
@@ -13,7 +14,7 @@ use super::{
 use crate::{
     catalog::{self, Model},
     config::{self, Stage},
-    engine, presets, storage,
+    engine, notify, presets, storage,
 };
 use anyhow::{Context, Result, ensure};
 use crossterm::event::{KeyCode as Key, KeyEvent, KeyModifiers as Mods};
@@ -37,6 +38,7 @@ pub(super) enum InputTarget {
     RetryModel,
     RepairLimit,
     Handoff,
+    NotifyUrl,
 }
 #[derive(Clone)]
 pub(super) enum PickValue {
@@ -126,6 +128,16 @@ pub(super) enum Modal {
     Confirm(Box<Confirm>),
     /// A yes/no question before something hard to take back.
     Ask(Box<Ask>),
+    /// The session's runs; drawn by the app, which holds them.
+    SessionRuns {
+        selected: usize,
+    },
+    /// Notification backends and a test button.
+    Notifications {
+        backends: notify::Backends,
+        selected: usize,
+        status: String,
+    },
 }
 
 /// Title, question, and key hints of an `Ask` dialog.
@@ -138,6 +150,10 @@ pub(super) type AskText = (
 pub(super) enum Ask {
     /// Cancel the running stage of this run.
     CancelStage {
+        run: String,
+    },
+    /// Cancel the running stage of any run of this session.
+    CancelRun {
         run: String,
     },
     /// Stop this run's unattended stage and open its session.
@@ -160,6 +176,13 @@ impl Ask {
                 "Cancel stage",
                 format!(
                     "Stop the running stage of {run}? Its artifacts are kept; [y] in Monitor retries it."
+                ),
+                YES_NO,
+            ),
+            Self::CancelRun { run } => (
+                "Cancel run's stage",
+                format!(
+                    "Stop the running stage of {run}? Its artifacts are kept; [y] in its Monitor retries it."
                 ),
                 YES_NO,
             ),
@@ -299,7 +322,13 @@ impl App {
                 }
             }
             PickValue::Theme(theme) => {
-                theme::save(&self.theme_path, theme, self.vim_motions)?;
+                theme::save(
+                    &self.theme_path,
+                    &theme::Preferences {
+                        theme,
+                        ..self.preferences()
+                    },
+                )?;
                 self.theme = theme;
                 self.message = format!("Theme saved: {}. T changes it anytime.", theme.name());
             }
@@ -353,6 +382,24 @@ impl App {
             InputTarget::Handoff => {
                 engine::edit_handoff(self.focused.run.as_mut().context("No run")?, value)?
             }
+            InputTarget::NotifyUrl => {
+                let url = value.trim().to_owned();
+                ensure!(
+                    url.is_empty() || url.starts_with("https://") || url.starts_with("http://"),
+                    "The webhook URL must start with https:// or http://"
+                );
+                let backends = notify::Backends {
+                    webhook: self.notifications.webhook || !url.is_empty(),
+                    webhook_url: url,
+                    ..self.notifications.clone()
+                };
+                self.set_notifications(backends.clone())?;
+                self.modal = Some(Modal::Notifications {
+                    backends,
+                    selected: 3,
+                    status: "Webhook URL saved.".into(),
+                });
+            }
         }
         Ok(())
     }
@@ -385,6 +432,13 @@ impl App {
                 } else {
                     self.message = format!("{run} is not running a stage; nothing was cancelled.");
                 }
+            }
+            Ask::CancelRun { run } => {
+                self.message = if self.cancel_run(&run) {
+                    format!("Stopping the stage of {run}…")
+                } else {
+                    format!("{run} is not running a stage; nothing was cancelled.")
+                };
             }
             Ask::TakeOver { run } => {
                 if self.running(&run) {
@@ -579,6 +633,12 @@ impl App {
                 }
                 Modal::Loading(_) | Modal::Ask(_) => {}
                 Modal::Confirm(dialog) => keep = !self.confirm_key(dialog, key),
+                Modal::SessionRuns { selected } => keep = self.session_runs_key(selected, key),
+                Modal::Notifications {
+                    backends,
+                    selected,
+                    status,
+                } => keep = self.notifications_key(backends, selected, status, key)?,
             }
             Ok(())
         })();
@@ -659,6 +719,13 @@ pub(super) fn draw_modal(
         Modal::Import(importer) => importer.draw(frame, rect, palette),
         Modal::Harness(editor) => editor.draw(frame, rect, palette),
         Modal::Confirm(dialog) => dialog.draw(frame, rect, palette),
+        Modal::Notifications {
+            backends,
+            selected,
+            status,
+        } => draw_notifications(frame, backends, *selected, status, palette),
+        // Drawn by the app, which holds the runs.
+        Modal::SessionRuns { .. } => {}
         Modal::Input { title, text, .. } => {
             palette.style_textarea(text);
             let block = palette.modal(title, &[]);
