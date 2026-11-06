@@ -141,8 +141,11 @@ to run them unattended.
 ## Adapters and model discovery
 
 Built-in targets: Codex, Claude Code, Pi, Cursor Agent, Gemini CLI, OpenCode,
-Aider, Goose, Amp, and GitHub Copilot CLI. Custom adapters declare executable,
-unattended and interactive arguments, and optionally a model-list command.
+Aider, Goose, Amp, and GitHub Copilot CLI, each one declarative spec entry
+(`src/harness/`). Custom adapters declare executable, unattended and
+interactive arguments, and optionally a model-list command, output parser,
+session assignment or reporting, resume arguments, model/effort flags, and
+prompt delivery. Fields that reach the executable are trusted sections.
 
 Router providers never put secrets in arguments or artifacts: `base_url`
 cannot hold credentials or a query, previews redact environment values, and

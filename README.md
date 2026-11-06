@@ -980,7 +980,22 @@ A project's own adapters run only after [trust](#project-trust).
 
 Set `prompt_stdin = true` for tools that read an unattended prompt from stdin.
 Omit `interactive_args` when the tool has no interactive interface. A catalog
-command returns one native model ID per line. Model-only tools can use the same
+command returns one native model ID per line. Optional fields give a custom adapter
+what built-ins declare in their spec:
+
+```toml
+output = "claude-stream"   # or codex-jsonl, pi, cursor-stream, gemini-json, opencode, amp-stream, text
+session = { assign = "--session-id" }   # or { reported = true }: read from output events
+resume_args = ["--resume", "{session}"] # enables takeover; needs session
+model_flag = "--model"                  # FLAG model, after args, when set
+effort_flag = "--effort"
+prompt = { flag = "-p" }                # or "arg", or "stdin" (= prompt_stdin)
+```
+
+Order: `args`, model flag, effort flag, extra arguments, prompt. These fields
+reach the executable, so they are part of the trusted section.
+`model-router harnesses` lists harnesses; `--spec [NAME]` prints the resolved
+spec as JSON. Model-only tools can use the same
 adapter mechanism, for example `ollama run {model} {prompt}`, with provider
 configuration kept in that tool.
 
