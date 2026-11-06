@@ -1,0 +1,253 @@
+{
+  "version": 1,
+  "revision": 23,
+  "id": "20261106-033224-640539ec",
+  "created_at": "2026-11-06T03:32:24.973256038Z",
+  "updated_at": "2026-11-06T03:32:25.324920147Z",
+  "project": "{{PROJECT}}",
+  "workspace": "{{PROJECT}}",
+  "directory": "{{PROJECT}}/.model-router/runs/20261106-033224-640539ec",
+  "worktree": false,
+  "task": "Original task: preserve 雪 and $(touch NEVER) literally",
+  "workflow": {
+    "name": "Test",
+    "max_repair_passes": 2,
+    "stages": [
+      {
+        "id": "research",
+        "name": "research",
+        "role": "research",
+        "enabled": true,
+        "harness": "mock",
+        "model": "test-model",
+        "provider": "research",
+        "effort": "",
+        "mode": "unattended",
+        "instructions": "",
+        "extra_args": [],
+        "timeout_seconds": 3600,
+        "repair_target": ""
+      },
+      {
+        "id": "implementation",
+        "name": "implementation",
+        "role": "implementation",
+        "enabled": true,
+        "harness": "mock",
+        "model": "test-model",
+        "provider": "implementation",
+        "effort": "",
+        "mode": "unattended",
+        "instructions": "",
+        "extra_args": [],
+        "timeout_seconds": 3600,
+        "repair_target": ""
+      },
+      {
+        "id": "review",
+        "name": "review",
+        "role": "review",
+        "enabled": true,
+        "harness": "mock",
+        "model": "test-model",
+        "provider": "review",
+        "effort": "",
+        "mode": "unattended",
+        "instructions": "",
+        "extra_args": [
+          "--review-fail-until",
+          "3"
+        ],
+        "timeout_seconds": 3600,
+        "repair_target": ""
+      },
+      {
+        "id": "docs",
+        "name": "docs",
+        "role": "custom",
+        "enabled": false,
+        "harness": "mock",
+        "model": "test-model",
+        "provider": "docs",
+        "effort": "",
+        "mode": "unattended",
+        "instructions": "",
+        "extra_args": [],
+        "timeout_seconds": 3600,
+        "repair_target": ""
+      }
+    ]
+  },
+  "adapters": {
+    "mock": {
+      "command": "python3",
+      "args": [
+        "/home/tiru5/.t3/worktrees/model.routing.personal/t3-79aba92f/examples/mock_harness.py",
+        "--role",
+        "{provider}",
+        "--model",
+        "{model}",
+        "--prompt-file",
+        "{prompt_file}",
+        "--handoff-file",
+        "{handoff_file}"
+      ],
+      "interactive_args": null,
+      "models_args": null,
+      "prompt_stdin": false
+    }
+  },
+  "stages": [
+    {
+      "status": "complete",
+      "attempts": [
+        {
+          "number": 1,
+          "started_at": "2026-11-06T03:32:24.983104662Z",
+          "finished_at": "2026-11-06T03:32:25.020363219Z",
+          "model": "test-model",
+          "mode": "unattended",
+          "status": "complete",
+          "exit_code": 0,
+          "directory": "{{PROJECT}}/.model-router/runs/20261106-033224-640539ec/01-research/attempt-001",
+          "handoff_file": "{{PROJECT}}/.model-router/handoffs/20261106-033224-640539ec/research-001.json",
+          "error": null
+        }
+      ],
+      "handoff": {
+        "summary": "research evidence from model test-model, attempt 1",
+        "verdict": "complete",
+        "findings": [],
+        "decisions": [
+          "Offline fixture only"
+        ],
+        "files_changed": [],
+        "tests": [],
+        "unresolved": [],
+        "structured": true
+      }
+    },
+    {
+      "status": "complete",
+      "attempts": [
+        {
+          "number": 1,
+          "started_at": "2026-11-06T03:32:25.033703997Z",
+          "finished_at": "2026-11-06T03:32:25.073190429Z",
+          "model": "test-model",
+          "mode": "unattended",
+          "status": "complete",
+          "exit_code": 0,
+          "directory": "{{PROJECT}}/.model-router/runs/20261106-033224-640539ec/02-implementation/attempt-001",
+          "handoff_file": "{{PROJECT}}/.model-router/handoffs/20261106-033224-640539ec/implementation-001.json",
+          "error": null
+        },
+        {
+          "number": 2,
+          "started_at": "2026-11-06T03:32:25.133641010Z",
+          "finished_at": "2026-11-06T03:32:25.170655049Z",
+          "model": "test-model",
+          "mode": "unattended",
+          "status": "complete",
+          "exit_code": 0,
+          "directory": "{{PROJECT}}/.model-router/runs/20261106-033224-640539ec/02-implementation/attempt-002",
+          "handoff_file": "{{PROJECT}}/.model-router/handoffs/20261106-033224-640539ec/implementation-002.json",
+          "error": null
+        },
+        {
+          "number": 3,
+          "started_at": "2026-11-06T03:32:25.232126791Z",
+          "finished_at": "2026-11-06T03:32:25.268895698Z",
+          "model": "test-model",
+          "mode": "unattended",
+          "status": "complete",
+          "exit_code": 0,
+          "directory": "{{PROJECT}}/.model-router/runs/20261106-033224-640539ec/02-implementation/attempt-003",
+          "handoff_file": "{{PROJECT}}/.model-router/handoffs/20261106-033224-640539ec/implementation-003.json",
+          "error": null
+        }
+      ],
+      "handoff": {
+        "summary": "implementation evidence from model test-model, attempt 3",
+        "verdict": "complete",
+        "findings": [],
+        "decisions": [
+          "Offline fixture only"
+        ],
+        "files_changed": [],
+        "tests": [],
+        "unresolved": [],
+        "structured": true
+      }
+    },
+    {
+      "status": "blocked",
+      "attempts": [
+        {
+          "number": 1,
+          "started_at": "2026-11-06T03:32:25.084561700Z",
+          "finished_at": "2026-11-06T03:32:25.121366880Z",
+          "model": "test-model",
+          "mode": "unattended",
+          "status": "complete",
+          "exit_code": 0,
+          "directory": "{{PROJECT}}/.model-router/runs/20261106-033224-640539ec/03-review/attempt-001",
+          "handoff_file": "{{PROJECT}}/.model-router/handoffs/20261106-033224-640539ec/review-001.json",
+          "error": null
+        },
+        {
+          "number": 2,
+          "started_at": "2026-11-06T03:32:25.182791821Z",
+          "finished_at": "2026-11-06T03:32:25.219802789Z",
+          "model": "test-model",
+          "mode": "unattended",
+          "status": "complete",
+          "exit_code": 0,
+          "directory": "{{PROJECT}}/.model-router/runs/20261106-033224-640539ec/03-review/attempt-002",
+          "handoff_file": "{{PROJECT}}/.model-router/handoffs/20261106-033224-640539ec/review-002.json",
+          "error": null
+        },
+        {
+          "number": 3,
+          "started_at": "2026-11-06T03:32:25.280660909Z",
+          "finished_at": "2026-11-06T03:32:25.317193570Z",
+          "model": "test-model",
+          "mode": "unattended",
+          "status": "blocked",
+          "exit_code": 0,
+          "directory": "{{PROJECT}}/.model-router/runs/20261106-033224-640539ec/03-review/attempt-003",
+          "handoff_file": "{{PROJECT}}/.model-router/handoffs/20261106-033224-640539ec/review-003.json",
+          "error": "Review still requests changes after 2 repair passes. Inspect its findings, then allow another pass with: model-router -C {{PROJECT}} resume 20261106-033224-640539ec --allow-repair"
+        }
+      ],
+      "handoff": {
+        "summary": "review evidence from model test-model, attempt 3",
+        "verdict": "needs_changes",
+        "findings": [
+          {
+            "severity": "blocking",
+            "description": "Mock required fix"
+          }
+        ],
+        "decisions": [
+          "Offline fixture only"
+        ],
+        "files_changed": [],
+        "tests": [],
+        "unresolved": [],
+        "structured": true
+      }
+    },
+    {
+      "status": "skipped",
+      "attempts": [],
+      "handoff": null
+    }
+  ],
+  "cursor": 2,
+  "repair_passes": 2,
+  "repair_feedback": "Review review requested changes:\n{\n  \"summary\": \"review evidence from model test-model, attempt 2\",\n  \"verdict\": \"needs_changes\",\n  \"findings\": [\n    {\n      \"severity\": \"blocking\",\n      \"description\": \"Mock required fix\"\n    }\n  ],\n  \"decisions\": [\n    \"Offline fixture only\"\n  ],\n  \"files_changed\": [],\n  \"tests\": [],\n  \"unresolved\": [],\n  \"structured\": true\n}",
+  "repair_review": 2,
+  "status": "blocked",
+  "error": "Review still requests changes after 2 repair passes. Inspect its findings, then allow another pass with: model-router -C {{PROJECT}} resume 20261106-033224-640539ec --allow-repair"
+}

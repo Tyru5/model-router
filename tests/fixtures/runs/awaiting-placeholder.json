@@ -1,0 +1,98 @@
+{
+  "version": 1,
+  "revision": 3,
+  "id": "20261106-033237-a89b6ec8",
+  "created_at": "2026-11-06T03:32:37.788897017Z",
+  "updated_at": "2026-11-06T03:32:37.807803890Z",
+  "project": "{{PROJECT}}",
+  "workspace": "{{PROJECT}}",
+  "directory": "{{PROJECT}}/.model-router/runs/20261106-033237-a89b6ec8",
+  "worktree": false,
+  "task": "Task",
+  "workflow": {
+    "name": "Interactive",
+    "max_repair_passes": 0,
+    "stages": [
+      {
+        "id": "implement",
+        "name": "New stage",
+        "role": "implementation",
+        "enabled": true,
+        "harness": "mock",
+        "model": "",
+        "provider": "",
+        "effort": "",
+        "mode": "interactive",
+        "instructions": "",
+        "extra_args": [],
+        "timeout_seconds": 3600,
+        "repair_target": ""
+      },
+      {
+        "id": "next",
+        "name": "New stage",
+        "role": "custom",
+        "enabled": true,
+        "harness": "mock",
+        "model": "",
+        "provider": "",
+        "effort": "",
+        "mode": "unattended",
+        "instructions": "",
+        "extra_args": [],
+        "timeout_seconds": 3600,
+        "repair_target": ""
+      }
+    ]
+  },
+  "adapters": {
+    "mock": {
+      "command": "python3",
+      "args": [],
+      "interactive_args": [],
+      "models_args": null,
+      "prompt_stdin": false
+    }
+  },
+  "stages": [
+    {
+      "status": "awaiting_confirmation",
+      "attempts": [
+        {
+          "number": 1,
+          "started_at": "2026-11-06T03:32:37.799461616Z",
+          "finished_at": "2026-11-06T03:32:37.805412734Z",
+          "model": "",
+          "mode": "interactive",
+          "status": "awaiting_confirmation",
+          "exit_code": 0,
+          "directory": "{{PROJECT}}/.model-router/runs/20261106-033237-a89b6ec8/01-implement/attempt-001",
+          "handoff_file": "{{PROJECT}}/.model-router/handoffs/20261106-033237-a89b6ec8/implement-001.json",
+          "error": null
+        }
+      ],
+      "handoff": {
+        "summary": "Interactive stage exited without a structured handoff. Inspect the terminal transcript at {{PROJECT}}/.model-router/runs/20261106-033237-a89b6ec8/01-implement/attempt-001/stdout.log. Reopen to produce a handoff, or supply a summary before advancing.",
+        "verdict": "complete",
+        "findings": [],
+        "decisions": [],
+        "files_changed": [],
+        "tests": [],
+        "unresolved": [
+          "No model-authored handoff was produced"
+        ],
+        "structured": false
+      }
+    },
+    {
+      "status": "pending",
+      "attempts": [],
+      "handoff": null
+    }
+  ],
+  "cursor": 0,
+  "repair_passes": 0,
+  "repair_feedback": null,
+  "status": "awaiting_confirmation",
+  "error": null
+}
