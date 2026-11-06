@@ -568,6 +568,7 @@ pub(super) fn draw_completion(
 
 #[cfg(test)]
 mod tests {
+    use super::super::app::Page;
     use super::*;
     use crate::{report::tests::sample, tui::app::draw};
     use ratatui::{Terminal, backend::TestBackend};
@@ -582,7 +583,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         );
         app.focused.run = Some(run);
-        app.page = 1;
+        app.page = Page::Monitor;
         app
     }
 

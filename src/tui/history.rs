@@ -1,7 +1,7 @@
 use super::input::InputField;
 use super::{
     actions::ActionId,
-    app::App,
+    app::{App, Page},
     modal::{Choice, Modal, PickValue},
     theme::Palette,
     widgets::{content, empty_state, kv, menu_key, textarea},
@@ -158,7 +158,7 @@ impl App {
                     .selected_run()
                     .is_some_and(|entry| self.focus_run(entry.id()));
                 if open {
-                    self.page = 1;
+                    self.page = Page::Monitor;
                     self.message = "Run already open in this session.".into();
                 } else if let Some(run) =
                     self.selected_run().and_then(|entry| self.load_run(&entry))
@@ -168,7 +168,7 @@ impl App {
                     for line in tail {
                         self.focused.push_log(line);
                     }
-                    self.page = 1;
+                    self.page = Page::Monitor;
                     self.message =
                         "Saved run loaded. c continues; y retries; t reopens its session; i retries interactively.".into();
                 }
@@ -254,14 +254,14 @@ impl App {
         Ok(false)
     }
     pub(super) fn paste_runs_filter(&mut self, text: &str) {
-        if self.page == 2 && self.runs.filtering {
+        if self.page == Page::Runs && self.runs.filtering {
             let selected = self.selected_run().map(|entry| entry.id().to_owned());
             self.runs.filter.insert_str(text.replace(['\r', '\n'], " "));
             self.reselect(selected);
         }
     }
     pub(super) fn runs_filtering(&self) -> bool {
-        self.page == 2 && self.runs.filtering
+        self.page == Page::Runs && self.runs.filtering
     }
     fn compare_picker(&mut self, run: &Run) {
         let mut items = vec![];
@@ -750,7 +750,7 @@ mod tests {
             app.poll().unwrap();
             let busy = app.runs_job.is_some()
                 || app.starting.is_some()
-                || (app.page == 2 && app.runs_stale);
+                || (app.page == Page::Runs && app.runs_stale);
             if !busy || Instant::now() > deadline {
                 break;
             }
@@ -857,7 +857,7 @@ mod tests {
         assert_eq!(app.visible_runs().len(), 1);
         assert_eq!(app.history_selected, 0);
         // Action keys type into the field while it has focus.
-        assert_eq!(app.page, 2);
+        assert_eq!(app.page, Page::Runs);
         assert!(shows(&mut app, "1 of 3 runs"));
         app.key(key(Key::Esc)).unwrap();
         assert!(!app.runs_filtering());
@@ -908,7 +908,7 @@ mod tests {
         app.key(key(Key::Enter)).unwrap();
         settle(&mut app);
         assert!(app.focused.run.is_none());
-        assert_eq!(app.page, 2);
+        assert_eq!(app.page, Page::Runs);
         match &app.modal {
             Some(Modal::Text { title, body, .. }) => {
                 assert_eq!(title, "Damaged run record");
@@ -947,7 +947,7 @@ mod tests {
         );
         settle(&mut app);
         assert!(app.focused.worker.is_some());
-        assert_eq!(app.page, 1);
+        assert_eq!(app.page, Page::Monitor);
         let deadline = Instant::now() + Duration::from_secs(20);
         while app.focused.worker.is_some() && Instant::now() < deadline {
             app.poll().unwrap();

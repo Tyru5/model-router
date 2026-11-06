@@ -1,6 +1,6 @@
 use super::{
     actions::ActionId,
-    app::{App, SETTLE},
+    app::{App, Page, SETTLE},
     completion::{checks_cell, draw_completion},
     handoff_view::HandoffView,
     modal::{Ask, InputTarget, Modal},
@@ -221,7 +221,7 @@ impl App {
                     &summary,
                 );
             }
-            ActionId::BackToWorkflow => self.page = 0,
+            ActionId::BackToWorkflow => self.page = Page::Workflow,
             other => bail!("{other:?} is not a monitor action"),
         }
         Ok(())

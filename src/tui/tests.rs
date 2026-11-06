@@ -1,6 +1,6 @@
 use super::{
     actions::ActionId,
-    app::{App, Job, Worker, draw},
+    app::{App, Job, Page, Worker, draw},
     modal::{Ask, Modal, PickValue},
     path_picker::PathPicker,
     theme::{self, Theme},
@@ -78,7 +78,7 @@ fn vim_toggle_sits_below_header_options_on_the_right() {
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
         for enabled in [false, true] {
             app.vim_motions = enabled;
-            for page in 0..4 {
+            for page in Page::ALL {
                 app.page = page;
                 terminal.draw(|frame| draw(frame, &mut app)).unwrap();
                 let buffer = terminal.backend().buffer();
@@ -111,7 +111,7 @@ fn vim_toggle_sits_below_header_options_on_the_right() {
             }
         }
     }
-    app.page = 0;
+    app.page = Page::Workflow;
     app.task = "Keep this draft".into();
     app.key(key(Key::Char('t'))).unwrap();
     app.key(key(Key::Esc)).unwrap();
@@ -259,7 +259,7 @@ fn vim_motions_reach_harness_path_import_and_filter_inputs() {
         );
     }
     app.modal = None;
-    app.page = 2;
+    app.page = Page::Runs;
     app.key(key(Key::Char('/'))).unwrap();
     app.paste("abc");
     app.key(key(Key::Esc)).unwrap();
@@ -861,7 +861,7 @@ fn command_menu_lists_only_actions_for_the_current_context() {
     assert!(workflow.contains(&ActionId::Run) && workflow.contains(&ActionId::Commands));
     assert!(!workflow.contains(&ActionId::CancelStage) && !workflow.contains(&ActionId::OpenRun));
 
-    app.page = 1;
+    app.page = Page::Monitor;
     let idle = menu(&mut app);
     assert!(idle.contains(&ActionId::Continue) && idle.contains(&ActionId::Handoff));
     assert!(!idle.contains(&ActionId::CancelStage) && !idle.contains(&ActionId::Run));
@@ -872,13 +872,13 @@ fn command_menu_lists_only_actions_for_the_current_context() {
     assert!(!running.contains(&ActionId::Continue) && !running.contains(&ActionId::Advance));
 
     // Runs snapshot their workflow, so editing and starting another continue.
-    app.page = 0;
+    app.page = Page::Workflow;
     let editing = menu(&mut app);
     assert!(editing.contains(&ActionId::Run) && editing.contains(&ActionId::EditTask));
     assert!(!editing.contains(&ActionId::CancelStage));
 
     // A menu opened during a run does nothing once the run has stopped.
-    app.page = 1;
+    app.page = Page::Monitor;
     app.key(key(Key::Char(':'))).unwrap();
     app.focused.worker = None;
     for c in "cancel stage".chars() {
@@ -887,9 +887,9 @@ fn command_menu_lists_only_actions_for_the_current_context() {
     app.key(key(Key::Enter)).unwrap();
     assert!(app.modal.is_none() && !app.focused.cancel.load(Ordering::Relaxed));
 
-    app.page = 2;
+    app.page = Page::Runs;
     assert!(menu(&mut app).contains(&ActionId::OpenRun));
-    app.page = 3;
+    app.page = Page::Harnesses;
     assert!(menu(&mut app).contains(&ActionId::HarnessDetails));
 }
 
@@ -1099,7 +1099,7 @@ fn running_app(project: &std::path::Path) -> App {
     run.cursor = 0;
     app.adopt(run);
     app.focused.worker = Some(Worker::stub());
-    app.page = 1;
+    app.page = Page::Monitor;
     app
 }
 
@@ -1471,7 +1471,7 @@ fn mixed_session(project: &std::path::Path) -> App {
         }
     }
     app.focus_run("busy");
-    app.page = 1;
+    app.page = Page::Monitor;
     app
 }
 
@@ -1527,10 +1527,10 @@ fn session_runs_dialog_lists_runs_focuses_cancels_and_jumps_to_input() {
     app.key(key(Key::Char('n'))).unwrap();
     assert_eq!(session(&app), "done review busy term*");
     assert!(app.message.contains("[i] opens it"), "{}", app.message);
-    app.page = 0;
+    app.page = Page::Workflow;
     app.key(shift('N')).unwrap();
     assert_eq!(session(&app), "done review* busy term");
-    assert_eq!(app.page, 1);
+    assert_eq!(app.page, Page::Monitor);
     for slot in std::iter::once(&mut app.focused).chain(&mut app.parked) {
         if let Some(run) = &mut slot.run {
             run.status = Status::Complete;
@@ -1563,7 +1563,7 @@ fn background_run_events_queue_notices_instead_of_clobbering() {
         app.adopt(run);
         app.focused.worker = Some(Worker::stub());
     }
-    app.page = 0;
+    app.page = Page::Workflow;
     let finish = |app: &App, index: usize, status, result| {
         let slot = &app.parked[index];
         let mut run = slot.run.clone().unwrap();
@@ -1740,7 +1740,7 @@ fn diff_app(project: &std::path::Path, theme: Theme) -> App {
     run.project = project.into();
     run.workspace = project.into();
     app.adopt(run);
-    app.page = 1;
+    app.page = Page::Monitor;
     app.modal = Some(Modal::Diff(Box::new(super::diff_view::DiffView::new(
         REVIEW_PATCH.into(),
     ))));
@@ -1817,7 +1817,7 @@ fn diff_dialog_keys_move_between_files_hunks_and_matches() {
     // Esc clears the search, then closes; the dialog's keys stay local.
     app.key(key(Key::Esc)).unwrap();
     assert!(matches!(app.modal, Some(Modal::Diff(_))));
-    assert_eq!(app.page, 1);
+    assert_eq!(app.page, Page::Monitor);
     app.key(key(Key::Esc)).unwrap();
     assert!(app.modal.is_none());
 }
@@ -1958,11 +1958,11 @@ fn output_search_highlights_matches_and_owns_n_while_shown() {
     // Idle, `n` returns to the workflow, except while a search is shown.
     app.focused.worker = None;
     app.key(key(Key::Char('n'))).unwrap();
-    assert_eq!(app.page, 1);
+    assert_eq!(app.page, Page::Monitor);
     app.key(key(Key::Esc)).unwrap();
     assert!(app.focused.log_search.is_none());
     app.key(key(Key::Char('n'))).unwrap();
-    assert_eq!(app.page, 0);
+    assert_eq!(app.page, Page::Workflow);
 }
 
 #[test]

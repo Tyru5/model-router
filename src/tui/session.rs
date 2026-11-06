@@ -2,7 +2,7 @@
 //! the session runs dialog (`L`), jumping to a run that needs input (`N`),
 //! and the notifications dialog (`F9`).
 use super::{
-    app::{App, RunSlot},
+    app::{App, Page, RunSlot},
     modal::{Ask, InputTarget, Modal},
     theme::{self, Palette},
     widgets::{elapsed, menu_key, popup},
@@ -145,7 +145,7 @@ impl App {
             return;
         };
         self.focus(index);
-        self.page = 1;
+        self.page = Page::Monitor;
         self.message = self.focus_message();
     }
     /// The status line after focusing a run from the list.
@@ -186,7 +186,7 @@ impl App {
             Key::Down | Key::Char('j') => *selected = (*selected + 1).min(total.saturating_sub(1)),
             Key::Enter if *selected < total => {
                 self.focus(*selected);
-                self.page = 1;
+                self.page = Page::Monitor;
                 self.message = self.focus_message();
                 return false;
             }

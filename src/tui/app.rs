@@ -307,7 +307,7 @@ pub(super) struct App {
     pub(super) task: String,
     pub(super) worktree: bool,
     pub(super) dirty: bool,
-    pub(super) page: usize,
+    pub(super) page: Page,
     pub(super) modal: Option<Modal>,
     pub(super) message: String,
     /// Last error shown; the status line turns red while it is current.
@@ -455,7 +455,7 @@ impl App {
             task: String::new(),
             worktree: false,
             dirty: false,
-            page: 0,
+            page: Page::Workflow,
             modal: None,
             message: "Define a task, choose your stages, then run. Review is optional.".into(),
             alert: String::new(),
@@ -899,7 +899,7 @@ impl App {
                 }
             }
         }
-        if self.page == 2 {
+        if self.page == Page::Runs {
             let due = self.runs_loaded.is_none_or(|at| at.elapsed() >= RUNS_EVERY);
             if due && self.slots().any(|(slot, _)| slot.in_progress()) {
                 self.runs_stale = true;
@@ -964,7 +964,7 @@ impl App {
                     " in a worktree ({h} is using the checkout)"
                 ))
             );
-            self.page = 1;
+            self.page = Page::Monitor;
             return Ok(());
         }
         // The run has its own snapshot; the editor is free for the next one.
@@ -979,7 +979,7 @@ impl App {
             None => format!("Started {id}. "),
         };
         if interactive {
-            self.page = 1;
+            self.page = Page::Monitor;
         } else {
             self.message
                 .push_str("Monitor [2] follows it. Define the next task here.");
@@ -1024,7 +1024,7 @@ impl App {
             self.push_notice(notice_text(run, &result), alert);
         }
         // Away from the Monitor, a terminal never takes over the screen.
-        if self.page != 1 {
+        if self.page != Page::Monitor {
             return;
         }
         match result {
@@ -1214,7 +1214,7 @@ impl App {
         self.prefetch = None;
         self.prefetch_queue.clear();
         self.undo.clear();
-        self.page = 0;
+        self.page = Page::Workflow;
         self.message = format!("Project: {}", self.project.display());
         if let Some(note) = super::trust_prompt::notice(&self.settings) {
             self.message.push_str(&format!(" · {note}"));
@@ -1238,7 +1238,7 @@ impl App {
         if self.runs_filtering() {
             return self.runs_filter_key(key);
         }
-        if self.page == 1 && self.output_search_key(key) {
+        if self.page == Page::Monitor && self.output_search_key(key) {
             return Ok(false);
         }
         if let Some(id) = actions::resolve(self.scope(), key) {
@@ -1314,11 +1314,11 @@ impl App {
             ActionId::Notices => self.show_notices(),
             ActionId::Notifications => self.notifications(),
             ActionId::Stats => self.show_stats(),
-            ActionId::NextView => self.show((self.page + 1) % TABS.len())?,
-            ActionId::ShowWorkflow => self.show(0)?,
-            ActionId::ShowMonitor => self.show(1)?,
-            ActionId::ShowRuns => self.show(2)?,
-            ActionId::ShowHarnesses => self.show(3)?,
+            ActionId::NextView => self.show(self.page.next()),
+            ActionId::ShowWorkflow => self.show(Page::Workflow),
+            ActionId::ShowMonitor => self.show(Page::Monitor),
+            ActionId::ShowRuns => self.show(Page::Runs),
+            ActionId::ShowHarnesses => self.show(Page::Harnesses),
             other => bail!("{other:?} is not a global action"),
         }
         Ok(false)
@@ -1340,15 +1340,14 @@ impl App {
         self.message = "Stopping active runs and saving their artifacts before exit…".into();
         false
     }
-    fn show(&mut self, page: usize) -> Result<()> {
+    fn show(&mut self, page: Page) {
         self.page = page;
         match page {
             // Read when shown, not while Tab passes through.
-            2 => self.runs_stale = true,
-            3 => self.harness_checks.start(&self.settings, &self.project),
-            _ => {}
+            Page::Runs => self.runs_stale = true,
+            Page::Harnesses => self.harness_checks.start(&self.settings, &self.project),
+            Page::Workflow | Page::Monitor => {}
         }
-        Ok(())
     }
     /// Whether something on screen animates, so frames come faster.
     pub(super) fn animating(&self) -> bool {
@@ -1405,7 +1404,7 @@ impl App {
             })
             .collect();
         self.modal = Some(Modal::Picker {
-            title: format!("Commands · {}", TABS[self.page]),
+            title: format!("Commands · {}", self.page.name()),
             items,
             selected: 0,
             filter: textarea(""),
@@ -1415,11 +1414,11 @@ impl App {
     /// The page's scope; Monitor depends on whether a run is active.
     fn page_scope(&self) -> Scope {
         match self.page {
-            0 => Scope::Workflow,
-            1 if self.focused.worker.is_some() => Scope::MonitorRunning,
-            1 => Scope::MonitorIdle,
-            2 => Scope::Runs,
-            _ => Scope::Harnesses,
+            Page::Workflow => Scope::Workflow,
+            Page::Monitor if self.focused.worker.is_some() => Scope::MonitorRunning,
+            Page::Monitor => Scope::MonitorIdle,
+            Page::Runs => Scope::Runs,
+            Page::Harnesses => Scope::Harnesses,
         }
     }
     /// Where actions apply. Runs snapshot their workflow, so editing and
@@ -1429,7 +1428,30 @@ impl App {
     }
 }
 
-const TABS: [&str; 4] = ["Workflow", "Monitor", "Runs", "Harnesses"];
+/// The views, in tab order; [1]–[4] and Tab switch between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Page {
+    Workflow,
+    Monitor,
+    Runs,
+    Harnesses,
+}
+impl Page {
+    pub(super) const ALL: [Page; 4] = [Self::Workflow, Self::Monitor, Self::Runs, Self::Harnesses];
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Workflow => "Workflow",
+            Self::Monitor => "Monitor",
+            Self::Runs => "Runs",
+            Self::Harnesses => "Harnesses",
+        }
+    }
+    /// The next tab, wrapping.
+    fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|page| *page == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+}
 
 /// The settings and Git facts of the project at `path`; slow on network drives.
 fn read_project(path: PathBuf) -> std::result::Result<Opened, String> {
@@ -1536,10 +1558,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     );
     let body = chunks[2].inner(Margin::new(1, 0));
     match app.page {
-        0 => draw_workflow(frame, app, body, palette),
-        1 => draw_run(frame, app, body, palette),
-        2 => draw_history(frame, app, body, palette),
-        _ => draw_harnesses(frame, app, body, palette),
+        Page::Workflow => draw_workflow(frame, app, body, palette),
+        Page::Monitor => draw_run(frame, app, body, palette),
+        Page::Runs => draw_history(frame, app, body, palette),
+        Page::Harnesses => draw_harnesses(frame, app, body, palette),
     }
     if !app.message.is_empty() {
         frame.render_widget(
@@ -1593,15 +1615,16 @@ fn header_lines(app: &App, palette: Palette, width: u16) -> Vec<Line<'static>> {
     // while the next workflow is being set up.
     let live = app.slots().filter(|(slot, _)| slot.in_progress()).count();
     let mut tabs = Vec::new();
-    for (index, name) in TABS.iter().enumerate() {
-        let count = if index == 1 && live > 0 {
+    for (index, page) in Page::ALL.into_iter().enumerate() {
+        let name = page.name();
+        let count = if page == Page::Monitor && live > 0 {
             format!(" ●{live}")
         } else {
             String::new()
         };
         tabs.push(Span::styled(
             format!(" {} {name}{count} ", index + 1),
-            if index == app.page {
+            if page == app.page {
                 Style::default()
                     .fg(palette.on_accent())
                     .bg(palette.accent)
