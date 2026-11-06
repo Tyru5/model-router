@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use std::{
     io::{BufRead, Write},
     sync::{Arc, Mutex},
+    thread::JoinHandle,
 };
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -22,13 +23,16 @@ a failed or blocked one with retry_stage.";
 
 /// Reads requests until EOF. Tool calls run on their own threads so a long
 /// `wait_run` never blocks `cancel_run`; responses may arrive out of order.
+/// Returns the tool calls still in flight, so shutdown can let them answer.
 pub fn serve<W: Write + Send + 'static>(
     server: Arc<Server>,
     input: impl BufRead,
     output: W,
-) -> Result<()> {
+) -> Result<Vec<JoinHandle<()>>> {
     let output = Arc::new(Mutex::new(output));
+    let mut calls: Vec<JoinHandle<()>> = vec![];
     for line in input.lines() {
+        calls.retain(|call| !call.is_finished());
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -43,11 +47,11 @@ pub fn serve<W: Write + Send + 'static>(
                 continue;
             }
         };
-        if let Some(response) = handle(&server, &output, message) {
+        if let Some(response) = handle(&server, &output, message, &mut calls) {
             send(&output, &response);
         }
     }
-    Ok(())
+    Ok(calls)
 }
 
 fn send<W: Write>(output: &Mutex<W>, message: &Value) {
@@ -75,6 +79,7 @@ fn handle<W: Write + Send + 'static>(
     server: &Arc<Server>,
     output: &Arc<Mutex<W>>,
     message: Value,
+    calls: &mut Vec<JoinHandle<()>>,
 ) -> Option<Value> {
     let Some(object) = message.as_object() else {
         return Some(error_response(
@@ -133,7 +138,10 @@ fn handle<W: Write + Send + 'static>(
                     }
                 });
             match spawned {
-                Ok(_) => return None,
+                Ok(call) => {
+                    calls.push(call);
+                    return None;
+                }
                 Err(error) => response(id, tool_result(Err(error.into()))),
             }
         }

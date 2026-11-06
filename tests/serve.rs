@@ -484,3 +484,26 @@ fn http_api_requires_its_token_and_streams_events() {
     let end: Value = serde_json::from_str(end).unwrap();
     assert_eq!(end["status"], "complete", "{end}");
 }
+
+#[test]
+fn mcp_answers_calls_in_flight_when_stdin_closes() {
+    let dir = project();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_model-router"))
+        .arg("-C")
+        .arg(dir.path())
+        .args(["serve", "--mcp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let call = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+        "params": {"name": "list_workflows", "arguments": {}}});
+    writeln!(child.stdin.take().unwrap(), "{call}").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let response: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(response["id"], 7);
+    assert_eq!(response["result"]["isError"], false, "{response}");
+}

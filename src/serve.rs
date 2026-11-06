@@ -180,8 +180,15 @@ pub fn run(
             mcp::PROTOCOL_VERSION
         ));
         let stdin = std::io::stdin();
-        mcp::serve(server.clone(), stdin.lock(), std::io::stdout())?;
+        let calls = mcp::serve(server.clone(), stdin.lock(), std::io::stdout())?;
         log("stdin closed: cancelling active runs");
+        // Cancelling first ends pending wait_run calls; then let every call
+        // in flight answer, and cancel any run one of them just started.
+        server.runs.shutdown(SHUTDOWN_GRACE);
+        let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
+        while calls.iter().any(|call| !call.is_finished()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
     } else {
         while !shutdown.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(200));
