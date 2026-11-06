@@ -168,6 +168,8 @@ enum Commands {
         /// Query this provider's OpenAI-compatible /models endpoint.
         name: Option<String>,
     },
+    /// Serve tools for other agents: MCP over stdio and/or a loopback HTTP API.
+    Serve(model_router::serve::Args),
     /// Check harness executables, versions, and flags without a model request.
     Doctor {
         /// Print machine-readable JSON.
@@ -241,6 +243,10 @@ fn main_result() -> Result<()> {
         );
         return Ok(());
     }
+    if let Some(Commands::Serve(args)) = cli.command {
+        // Loads each project's config per call; the signal flag stops it.
+        return model_router::serve::run(args, project, cli.config, cancel);
+    }
     let (settings, config_path) = config::load(&project, cli.config.as_deref())?;
     match cli.command {
         None => {
@@ -260,7 +266,7 @@ fn main_result() -> Result<()> {
                 detected_from,
             )?;
         }
-        Some(Commands::Init { .. } | Commands::Presets) => unreachable!(),
+        Some(Commands::Init { .. } | Commands::Presets | Commands::Serve(_)) => unreachable!(),
         Some(Commands::Validate) => println!(
             "Valid: {} workflow(s). Save path: {}",
             settings.workflows.len(),
