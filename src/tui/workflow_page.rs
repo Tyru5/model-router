@@ -11,7 +11,7 @@ use super::{
 };
 use crate::{
     adapters, catalog,
-    config::{Check, Mode, Role, Sandbox, Stage},
+    config::{Candidate, Check, FanOut, Mode, Role, Sandbox, Stage},
     engine::{self, Run},
     harness_settings, presets, storage,
 };
@@ -40,17 +40,21 @@ const FIELDS: &[&str] = &[
     "Timeout (seconds)",
     "Review repair target (stage ID; blank = nearest)",
     "Extra arguments (shell quoting; no shell execution)",
+    "Run after (stage IDs, comma separated; blank = list order)",
+    "Fan-out candidates (one per line: [id:] harness [model] [provider] [effort])",
     "Router checks (one per line; ? prefix = optional)",
     "Router sandbox (inherit = workflow default)",
     "Stage instructions",
     "Ship options (TOML; ship role only)",
 ];
+const AFTER: usize = 10;
 /// Multiline fields, where Enter inserts a newline.
-const CHECKS: usize = 10;
-const SANDBOX: usize = 11;
-const INSTRUCTIONS: usize = 12;
-const SHIP: usize = 13;
-const MULTILINE: [usize; 3] = [CHECKS, INSTRUCTIONS, SHIP];
+const FAN_OUT: usize = 11;
+const CHECKS: usize = 12;
+const SANDBOX: usize = 13;
+const INSTRUCTIONS: usize = 14;
+const SHIP: usize = 15;
+const MULTILINE: [usize; 4] = [CHECKS, INSTRUCTIONS, FAN_OUT, SHIP];
 const CHOICES: [usize; 4] = [1, 2, 6, SANDBOX];
 /// The sandbox choice that keeps the workflow's `sandbox_default`.
 const INHERIT: &str = "inherit";
@@ -108,6 +112,8 @@ impl StageEditor {
             .join("\n");
         let sandbox = stage.sandbox.map_or(INHERIT, Sandbox::label).to_owned();
         let ship = ship_text(&stage);
+        let after = stage.after.join(", ");
+        let fan_out = stage.fan_out.as_ref().map(fan_out_text).unwrap_or_default();
         let fields = [
             &stage.name,
             stage.role.label(),
@@ -119,6 +125,8 @@ impl StageEditor {
             &stage.timeout_seconds.to_string(),
             &stage.repair_target,
             &args,
+            &after,
+            &fan_out,
             &checks,
             &sandbox,
             &stage.instructions,
@@ -212,6 +220,13 @@ impl StageEditor {
         if self.stage.ship.is_none() && stage.ship == Some(crate::ship::Options::default()) {
             stage.ship = None;
         }
+        stage.after = content(&self.fields[AFTER])
+            .split([',', ' '])
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .collect();
+        stage.fan_out = parse_fan_out(&content(&self.fields[FAN_OUT]))?;
         Ok(stage)
     }
     fn focus(&mut self, index: usize) {
@@ -450,6 +465,10 @@ impl StageEditor {
                 "   ·  argv per line, no shell; edit timeout_seconds in TOML"
             } else if self.selected == SHIP {
                 "   ·  e.g. push = true, draft_pr = true; blank = defaults (commit only, confirm)"
+            } else if self.selected == AFTER {
+                "   ·  any stage with after makes the workflow a graph"
+            } else if self.selected == FAN_OUT {
+                "   ·  - leaves a value blank; a judge = auto|<review id> line picks the winner"
             } else if self.selected == MODEL {
                 "   ·  Enter lists the harness's models; blank inherits its default"
             } else if self.selected == EFFORT && self.catalog.is_none() {
@@ -524,6 +543,80 @@ fn parse_checks(text: &str, existing: &[Check]) -> Result<Vec<Check>> {
         });
     }
     Ok(checks)
+}
+
+/// The fan-out field: a `judge = …` line, then one candidate per line.
+fn fan_out_text(fan: &FanOut) -> String {
+    let mut lines = vec![format!("judge = {}", fan.judge)];
+    for candidate in &fan.candidates {
+        let mut words = vec![];
+        if !candidate.id.is_empty() {
+            words.push(format!("{}:", candidate.id));
+        }
+        words.push(shell_words::quote(&candidate.harness).into_owned());
+        let values = [&candidate.model, &candidate.provider, &candidate.effort];
+        let used = values
+            .iter()
+            .rposition(|v| !v.is_empty())
+            .map_or(0, |i| i + 1);
+        for value in &values[..used] {
+            words.push(if value.is_empty() {
+                "-".into()
+            } else {
+                shell_words::quote(value).into_owned()
+            });
+        }
+        lines.push(words.join(" "));
+    }
+    lines.join("\n")
+}
+
+/// Parses the fan-out field; blank means no fan-out.
+fn parse_fan_out(text: &str) -> Result<Option<FanOut>> {
+    let mut judge = crate::config::AUTO_JUDGE.to_owned();
+    let mut candidates = vec![];
+    for (number, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("judge") {
+            let value = rest.trim_start().trim_start_matches(['=', ':']).trim();
+            ensure!(
+                !value.is_empty(),
+                "Fan-out line {} needs a judge",
+                number + 1
+            );
+            judge = value.to_owned();
+            continue;
+        }
+        let mut words = shell_words::split(line)
+            .with_context(|| format!("Fan-out line {} has unmatched quotes", number + 1))?
+            .into_iter();
+        let mut candidate = Candidate::default();
+        let mut first = words.next().unwrap_or_default();
+        if let Some(id) = first.strip_suffix(':') {
+            candidate.id = id.to_owned();
+            first = words.next().unwrap_or_default();
+        }
+        ensure!(
+            !first.is_empty(),
+            "Fan-out line {} needs a harness",
+            number + 1
+        );
+        candidate.harness = first;
+        let value = |word: Option<String>| word.filter(|w| w != "-").unwrap_or_default();
+        candidate.model = value(words.next());
+        candidate.provider = value(words.next());
+        candidate.effort = value(words.next());
+        ensure!(
+            words.next().is_none(),
+            "Fan-out line {} has more than harness, model, provider, and effort",
+            number + 1
+        );
+        candidates.push(candidate);
+    }
+    Ok((!candidates.is_empty()).then_some(FanOut { candidates, judge }))
 }
 
 fn duration(seconds: u64) -> String {
@@ -847,8 +940,14 @@ pub(super) fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palett
             })),
             Cell::from(format!("{}", index + 1)).style(Style::default().fg(palette.muted)),
             Cell::from(stage.name.clone()),
-            Cell::from(stage.harness.clone()),
-            if stage.model.is_empty() {
+            Cell::from(if stage.fan_out.is_some() {
+                "fan-out".into()
+            } else {
+                stage.harness.clone()
+            }),
+            if let Some(fan) = &stage.fan_out {
+                Cell::from(format!("{} candidates", fan.candidates.len()))
+            } else if stage.model.is_empty() {
                 Cell::from("default").style(Style::default().fg(palette.muted))
             } else {
                 Cell::from(stage.model.clone())
@@ -1016,6 +1115,29 @@ fn draw_stage_detail(
             true,
         ),
         kv(palette, "ID", &stage.id, true),
+    ]);
+    if !stage.after.is_empty() {
+        lines.push(kv(palette, "After", &stage.after.join(", "), true));
+    }
+    if let Some(fan) = &stage.fan_out {
+        lines.push(kv(
+            palette,
+            "Fan-out",
+            &format!("{} candidates · judge {}", fan.candidates.len(), fan.judge),
+            true,
+        ));
+        for (id, candidate) in fan.ids().iter().zip(&fan.candidates) {
+            lines.push(Line::styled(
+                format!(
+                    "         {id}: {} {}",
+                    candidate.harness,
+                    or_default(&candidate.model, "default").0
+                ),
+                Style::default().fg(palette.fg),
+            ));
+        }
+    }
+    lines.extend([
         Line::raw(""),
         Line::styled("Instructions", palette.header_style()),
     ]);
@@ -1385,5 +1507,48 @@ mod tests {
             text.contains("npm run 'lint fix'  optional · 90s"),
             "{text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod fan_out_field {
+    use super::*;
+
+    #[test]
+    fn the_fan_out_field_roundtrips_and_explains_mistakes() {
+        let fan = FanOut {
+            candidates: vec![
+                Candidate {
+                    harness: "claude".into(),
+                    model: "sonnet".into(),
+                    ..Candidate::default()
+                },
+                Candidate {
+                    id: "fast".into(),
+                    harness: "codex".into(),
+                    effort: "high".into(),
+                    ..Candidate::default()
+                },
+            ],
+            judge: "judge".into(),
+        };
+        let text = fan_out_text(&fan);
+        assert_eq!(text, "judge = judge\nclaude sonnet\nfast: codex - - high");
+        assert_eq!(parse_fan_out(&text).unwrap(), Some(fan));
+        assert_eq!(parse_fan_out(" \n").unwrap(), None);
+        let auto = parse_fan_out("codex\nclaude opus").unwrap().unwrap();
+        assert!(auto.is_auto() && auto.candidates.len() == 2);
+        assert!(parse_fan_out("codex a b c d").is_err());
+        assert!(parse_fan_out("judge =").is_err());
+        let mut stage = Stage {
+            after: vec!["a".into(), "b".into()],
+            ..Stage::default()
+        };
+        stage.fan_out = parse_fan_out("codex\nclaude").unwrap();
+        let editor = StageEditor::new(stage.clone(), vec!["codex".into()]);
+        let saved = editor.finish().unwrap();
+        assert_eq!(saved.after, ["a", "b"]);
+        assert_eq!(saved.fan_out, stage.fan_out);
+        assert!(!editor.changed());
     }
 }

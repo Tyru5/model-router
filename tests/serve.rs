@@ -61,6 +61,7 @@ fn project() -> tempfile::TempDir {
         max_repair_passes: 2,
         sandbox_default: Default::default(),
         budget: Default::default(),
+        max_parallel: 2,
         stages: stages.into_iter().chain([summary.clone()]).collect(),
     };
     let settings = Settings {

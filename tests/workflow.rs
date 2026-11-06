@@ -54,6 +54,14 @@ fn all_workflow_presets_execute_in_order_with_optional_reviews_disabled() {
             if stage.role == Role::Test {
                 stage.extra_args = vec!["--test-status".into(), "passed".into()];
             }
+            for candidate in stage.fan_out.iter_mut().flat_map(|f| &mut f.candidates) {
+                candidate.harness = "mock".into();
+                candidate.provider = stage.id.clone();
+                candidate.model = "test-model".into();
+            }
+            if stage.id == "judge" {
+                stage.extra_args = vec!["--select".into(), "c1".into()];
+            }
             if stage.enabled {
                 if let Some(previous) = previous {
                     stage
@@ -63,7 +71,20 @@ fn all_workflow_presets_execute_in_order_with_optional_reviews_disabled() {
                 previous = Some(stage.id.clone());
             }
         }
-        let (dir, _, mut run) = fixture(stages);
+        // Fan-out candidates work in Git worktrees.
+        let fans = stages.iter().any(|s| s.fan_out.is_some());
+        let (dir, mut run) = if fans {
+            let dir = common::tempdir();
+            if common::repository(dir.path()).is_none() {
+                continue;
+            }
+            let workflow = common::workflow(stages);
+            let run = common::create(dir.path(), &common::settings(&workflow), &workflow);
+            (dir, run)
+        } else {
+            let (dir, _, run) = fixture(stages);
+            (dir, run)
+        };
         assert_eq!(
             drive(&mut run),
             Action::Complete,
@@ -80,6 +101,18 @@ fn all_workflow_presets_execute_in_order_with_optional_reviews_disabled() {
                     Status::Skipped
                 }
             );
+            if let Some(fan) = &state.fan_out {
+                // Each candidate ran once, in its own worktree, with the stage prompt.
+                assert_eq!(count(dir.path(), &stage.id), 0);
+                for candidate in &fan.candidates {
+                    let prompt =
+                        fs::read_to_string(candidate.attempts[0].directory.join("prompt.md"))
+                            .unwrap();
+                    assert!(prompt.contains(&run.task) && prompt.contains(&stage.instructions));
+                }
+                assert_eq!(fan.selection.as_ref().unwrap().candidate, "c1");
+                continue;
+            }
             assert_eq!(count(dir.path(), &stage.id), u32::from(stage.enabled));
             if stage.enabled {
                 let prompt = fs::read_to_string(

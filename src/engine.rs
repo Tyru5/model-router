@@ -2,8 +2,8 @@ use crate::providers::{self, Provider};
 use crate::{
     adapters::{self, ContextPaths, Invocation},
     checks::{self, CheckResult},
-    config::{CustomAdapter, Mode, Role, Settings, Workflow},
-    events,
+    config::{CustomAdapter, Mode, Role, Settings, Stage, Workflow},
+    events, fanout, graph,
     handoff::{self, Handoff, HandoffSource, ProtocolError, TestStatus, Verdict},
     process, snapshot, storage,
     transitions::{self, Actor, Level, Target},
@@ -15,7 +15,11 @@ use std::{
     collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
     time::Duration,
 };
 
@@ -106,6 +110,13 @@ fn legal(level: Level, from: Status, to: Status, enabled: bool) -> bool {
             (AwaitingConfirmation, Complete | Failed | Blocked) => true,
             _ => false,
         },
+        // A fan-out candidate runs, ends, and runs again only when retried.
+        Level::Candidate => matches!(
+            (from, to),
+            (Pending, Running | Failed | Cancelled)
+                | (Running, Complete | Failed | Blocked | Cancelled)
+                | (Failed | Blocked | Cancelled, Pending)
+        ),
     }
 }
 
@@ -144,6 +155,8 @@ pub enum Cmd {
     AllowRepair,
     /// Replace the summary of the handoff awaiting confirmation.
     EditSummary(String),
+    /// Rerun one stopped candidate of a stopped fan-out stage, keeping the others.
+    RetryCandidate { stage: String, candidate: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +196,9 @@ pub struct Attempt {
     /// runs saved before this was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_source: Option<HandoffSource>,
+    /// A fan-out candidate attempt's own Git worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<PathBuf>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageState {
@@ -193,6 +209,74 @@ pub struct StageState {
     /// or of a ship stage's plan (see `ship::confirm`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiver: Option<Waiver>,
+    /// A fan-out stage's candidates and choice; None for other stages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fan_out: Option<FanOutState>,
+}
+
+/// One round of a best-of-N stage: where candidates started, each
+/// candidate, and which one reached the workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FanOutState {
+    /// The workspace snapshot every candidate started from.
+    pub base: String,
+    /// The private commit of `base` their worktrees check out.
+    pub base_commit: String,
+    pub candidates: Vec<CandidateState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<Selection>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateState {
+    pub id: String,
+    pub harness: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub effort: String,
+    pub status: Status,
+    pub attempts: Vec<Attempt>,
+    pub handoff: Option<Handoff>,
+    /// What the latest attempt changed, from the base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes: Option<CandidateChanges>,
+    /// Why the latest attempt stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateChanges {
+    pub files: Vec<String>,
+    pub added: u64,
+    pub removed: u64,
+    /// The full patch from the base; what the router applies if chosen.
+    pub patch: PathBuf,
+}
+impl CandidateChanges {
+    pub fn lines(&self) -> u64 {
+        self.added + self.removed
+    }
+}
+impl CandidateState {
+    /// Whether every required router check of its latest attempt passed.
+    pub fn checks_pass(&self) -> bool {
+        self.attempts.last().is_none_or(|a| {
+            a.checks
+                .iter()
+                .all(|c| !c.required || c.status == TestStatus::Passed)
+        })
+    }
+}
+/// The judge's choice and whether its patch reached the workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Selection {
+    pub candidate: String,
+    /// `auto`, or the judge stage's ID.
+    pub by: String,
+    pub reason: String,
+    pub applied: bool,
+    pub at: DateTime<Utc>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Waiver {
@@ -242,6 +326,22 @@ pub struct Run {
     /// Status changes not yet saved; `persist` appends them to transitions.jsonl.
     #[serde(skip)]
     journal: Vec<transitions::Record>,
+    /// While stages run side by side, their stops and repair requests wait
+    /// here and the run's own status settles once they all end.
+    #[serde(skip)]
+    hold: Option<Hold>,
+    /// The fan-out candidate whose prompt `prompt` renders.
+    #[serde(skip)]
+    view: Option<usize>,
+}
+
+/// Run-level outcomes deferred while several stages run; see `Run::settle`.
+#[derive(Debug, Clone, Default)]
+struct Hold {
+    /// The first review repair requested: (review, target, feedback, reason).
+    repair: Option<(usize, usize, String, String)>,
+    /// Messages of stages that stopped, by stage.
+    stops: Vec<(usize, String)>,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -289,6 +389,11 @@ enum Decision {
         target: usize,
         feedback: String,
     },
+    /// A judge chose candidate `candidate` of fan-out stage `fan`.
+    Select {
+        fan: usize,
+        candidate: usize,
+    },
     Advance,
 }
 
@@ -326,11 +431,27 @@ impl Run {
             "Enable at least one stage"
         );
         // Catch every missing selected harness before any stage mutates the project.
-        // Ship stages run in the router, without a harness.
+        let candidates: Vec<Stage> = workflow
+            .stages
+            .iter()
+            .filter(|s| s.enabled)
+            .flat_map(|s| {
+                s.fan_out
+                    .iter()
+                    .flat_map(|f| &f.candidates)
+                    .map(|c| c.stage(s))
+            })
+            .collect();
+        ensure!(
+            candidates.is_empty() || snapshot::is_repository(project),
+            "Fan-out stages need a Git repository: candidates run in Git worktrees"
+        );
         for stage in workflow
             .stages
             .iter()
-            .filter(|s| s.enabled && s.role != Role::Ship)
+            // Ship stages run in the router, without a harness.
+            .filter(|s| s.enabled && s.fan_out.is_none() && s.role != Role::Ship)
+            .chain(&candidates)
         {
             let program = adapters::program(&stage.harness, &settings.adapters);
             ensure!(
@@ -406,6 +527,7 @@ impl Run {
                     attempts: vec![],
                     handoff: None,
                     waiver: None,
+                    fan_out: None,
                 })
                 .collect(),
             cursor: 0,
@@ -417,6 +539,8 @@ impl Run {
             error: None,
             resume: None,
             journal: vec![],
+            hold: None,
+            view: None,
         };
         run.persist()?;
         Ok(run)
@@ -454,29 +578,49 @@ impl Run {
         } = change;
         let (level, stage_index, enabled) = match target {
             Target::Run => (Level::Run, None, true),
-            Target::Stage(i) | Target::Attempt(i) => {
+            Target::Stage(i)
+            | Target::Attempt(i)
+            | Target::Candidate(i, _)
+            | Target::CandidateAttempt(i, _) => {
                 let stage = self
                     .workflow
                     .stages
                     .get(i)
                     .with_context(|| format!("No stage {}", i + 1))?;
-                let level = if matches!(target, Target::Stage(_)) {
-                    Level::Stage
-                } else {
-                    Level::Attempt
+                let level = match target {
+                    Target::Stage(_) => Level::Stage,
+                    Target::Candidate(..) => Level::Candidate,
+                    _ => Level::Attempt,
                 };
                 (level, Some(i), stage.enabled)
             }
         };
-        let (slot, attempt) = match target {
-            Target::Run => (&mut self.status, None),
-            Target::Stage(i) => (&mut self.stages[i].status, None),
+        let (slot, attempt, candidate) = match target {
+            Target::Run => (&mut self.status, None, None),
+            Target::Stage(i) => (&mut self.stages[i].status, None, None),
             Target::Attempt(i) => {
                 let attempt = self.stages[i]
                     .attempts
                     .last_mut()
                     .with_context(|| format!("Stage {} has no attempt", i + 1))?;
-                (&mut attempt.status, Some(attempt.number))
+                (&mut attempt.status, Some(attempt.number), None)
+            }
+            Target::Candidate(i, c) | Target::CandidateAttempt(i, c) => {
+                let candidate = self.stages[i]
+                    .fan_out
+                    .as_mut()
+                    .and_then(|f| f.candidates.get_mut(c))
+                    .with_context(|| format!("Stage {} has no candidate {}", i + 1, c + 1))?;
+                let id = Some(candidate.id.clone());
+                if matches!(target, Target::Candidate(..)) {
+                    (&mut candidate.status, None, id)
+                } else {
+                    let attempt = candidate
+                        .attempts
+                        .last_mut()
+                        .with_context(|| format!("Candidate {} has no attempt", candidate.id))?;
+                    (&mut attempt.status, Some(attempt.number), id)
+                }
             }
         };
         let from = *slot;
@@ -485,9 +629,12 @@ impl Run {
         }
         ensure!(
             legal(level, from, to, enabled),
-            "Illegal {} transition{}: {} → {} ({reason})",
+            "Illegal {} transition{}{}: {} → {} ({reason})",
             level.label(),
             stage_index.map_or_else(String::new, |i| format!(" in stage {}", i + 1)),
+            candidate
+                .as_ref()
+                .map_or_else(String::new, |c| format!(" candidate {c}")),
             from.as_str(),
             to.as_str()
         );
@@ -498,6 +645,7 @@ impl Run {
             level,
             stage_index,
             attempt,
+            candidate,
             from,
             to,
             reason,
@@ -546,6 +694,10 @@ impl Run {
             "This run is already complete"
         );
         let index = self.cursor;
+        ensure!(
+            !(interactive && self.workflow.stages[index].fan_out.is_some()),
+            "Fan-out candidates run unattended; retry without interactive, or retry one candidate"
+        );
         if self.stages[index]
             .attempts
             .last()
@@ -596,6 +748,10 @@ impl Run {
             "Stop the stage before taking it over"
         );
         let stage = &self.workflow.stages[self.cursor];
+        ensure!(
+            stage.fan_out.is_none(),
+            "Fan-out stages have no session to take over; open a candidate's worktree, or retry one candidate"
+        );
         ensure!(
             adapters::resumable(&stage.harness, &self.adapters),
             "{} sessions cannot be resumed; retry interactively with [i] instead",
@@ -651,9 +807,15 @@ impl Run {
             .saturating_add(self.extra_repair_passes)
     }
 
-    /// Return stages from `from` onward to pending, discarding handoffs and acceptances.
+    /// Return stage `from` and every stage after it (in a graph, those that
+    /// depend on it) to pending, discarding handoffs, acceptances, and fan-out
+    /// rounds.
     fn reset(&mut self, from: usize, actor: Actor, reason: &str) -> Result<()> {
+        let order = self.order();
         for i in from..self.stages.len() {
+            if i != from && self.graph() && !order.precedes(from, i) {
+                continue;
+            }
             let to = if self.workflow.stages[i].enabled {
                 Status::Pending
             } else {
@@ -663,8 +825,100 @@ impl Run {
             let state = &mut self.stages[i];
             state.handoff = None;
             state.waiver = None;
+            state.fan_out = None;
+        }
+        // A graph's dependents may come earlier in the list.
+        if self.graph() {
+            for i in (0..from).filter(|&i| order.precedes(from, i)) {
+                let to = if self.workflow.stages[i].enabled {
+                    Status::Pending
+                } else {
+                    Status::Skipped
+                };
+                self.set(Target::Stage(i), to, actor, reason)?;
+                let state = &mut self.stages[i];
+                state.handoff = None;
+                state.waiver = None;
+                state.fan_out = None;
+            }
         }
         Ok(())
+    }
+
+    /// Whether the workflow is a dependency graph; see `graph`.
+    pub fn graph(&self) -> bool {
+        graph::is_graph(&self.workflow)
+    }
+    /// Which stages run before which.
+    pub fn order(&self) -> graph::Ancestry {
+        graph::order(&self.workflow)
+    }
+    /// The first stage not yet complete or disabled; the stage commands act on.
+    fn focus(&self) -> usize {
+        self.stages
+            .iter()
+            .position(|s| !matches!(s.status, Status::Complete | Status::Skipped))
+            .unwrap_or(self.stages.len())
+    }
+    /// Sets the run's status, unless stages run side by side: then stops are
+    /// collected and `settle` decides once they all end.
+    fn set_run(&mut self, to: Status, actor: Actor, reason: impl Into<String>) -> Result<()> {
+        let reason = reason.into();
+        if let Some(hold) = &mut self.hold {
+            if to.stopped() {
+                hold.stops.push((self.cursor, reason));
+            }
+            return Ok(());
+        }
+        self.set(Target::Run, to, actor, reason)
+    }
+
+    /// Rerun one stopped candidate of the stopped fan-out stage `stage`; the
+    /// other candidates keep their results. In memory only; `command`
+    /// applies it under the lock.
+    pub fn retry_candidate(&mut self, stage: &str, candidate: &str) -> Result<()> {
+        let index = self
+            .workflow
+            .stages
+            .iter()
+            .position(|s| s.id == stage)
+            .with_context(|| format!("No stage {stage}"))?;
+        ensure!(
+            self.status.stopped() && self.stages[index].status.stopped(),
+            "Only a stopped fan-out stage of a stopped run can retry a candidate"
+        );
+        ensure!(
+            self.graph() || self.cursor == index,
+            "The run stopped at another stage"
+        );
+        let c = self.stages[index]
+            .fan_out
+            .as_ref()
+            .and_then(|f| f.candidates.iter().position(|c| c.id == candidate))
+            .with_context(|| format!("Stage {stage} has no candidate {candidate}"))?;
+        let state = &self.stages[index]
+            .fan_out
+            .as_ref()
+            .context("No fan-out")?
+            .candidates[c];
+        ensure!(
+            state.status.stopped(),
+            "Candidate {candidate} is {}; only a stopped candidate can be retried",
+            state.status.label()
+        );
+        let reason = format!("Retry candidate {candidate}");
+        self.set(
+            Target::Candidate(index, c),
+            Status::Pending,
+            Actor::User,
+            &reason,
+        )?;
+        self.set(Target::Stage(index), Status::Pending, Actor::User, &reason)?;
+        self.stages[index].handoff = None;
+        self.cursor = index;
+        self.error = None;
+        self.resume = None;
+        self.set(Target::Run, Status::Pending, Actor::User, reason)
     }
 
     /// Confirming a checkpoint also accepts its pending waiver; it never needs
@@ -730,11 +984,12 @@ impl Run {
             .baseline
             .as_deref()
             .ok_or("no baseline snapshot was recorded")?;
+        // The last to finish: stages side by side can end out of order.
         let latest = self
             .stages
             .iter()
             .flat_map(|s| &s.attempts)
-            .max_by_key(|a| a.started_at);
+            .max_by_key(|a| (a.finished_at.unwrap_or(a.started_at), a.started_at));
         let to = match latest {
             Some(attempt) => attempt
                 .tree_after
@@ -797,6 +1052,10 @@ impl Run {
                 handoff.summary
             )));
         }
+        // A judge chooses; it never requests repairs.
+        if let Some(fan) = graph::judged_by(&self.workflow, self.cursor) {
+            return Ok(self.judgement(fan, handoff));
+        }
         // A failed required check in an enabled review requests a repair, as
         // its blocking findings do; anywhere else it blocks the stage.
         if let Some(checks) = self.review_failures() {
@@ -817,8 +1076,11 @@ impl Run {
                     self.id
                 )));
             }
-            let target = self.workflow.stages[..self.cursor].iter().rposition(|s| {
-                s.enabled
+            let order = self.order();
+            let target = (0..self.stages.len()).rev().find(|&i| {
+                let s = &self.workflow.stages[i];
+                order.precedes(i, self.cursor)
+                    && s.enabled
                     && s.role == Role::Implementation
                     && (stage.repair_target.is_empty() || s.id == stage.repair_target)
             });
@@ -879,7 +1141,19 @@ impl Run {
                     actor,
                     reason,
                 )?;
-                self.set(Target::Run, Status::AwaitingConfirmation, actor, reason)
+                self.set_run(Status::AwaitingConfirmation, actor, reason)
+            }
+            Decision::Select { fan, candidate } => {
+                let by = self.workflow.stages[index].id.clone();
+                let summary = self.stages[index]
+                    .handoff
+                    .as_ref()
+                    .map(|h| h.summary.clone())
+                    .unwrap_or_default();
+                match self.select(fan, candidate, &by, &summary)? {
+                    Ok(()) => self.complete(index, actor),
+                    Err(message) => self.stop(Status::Blocked, message, actor, true),
+                }
             }
             Decision::Repair { target, feedback } => {
                 let reason = format!(
@@ -887,6 +1161,11 @@ impl Run {
                     self.workflow.stages[target].name
                 );
                 self.set(Target::Attempt(index), Status::Complete, actor, &reason)?;
+                // Stages still running see it once they end; see `settle`.
+                if let Some(hold) = &mut self.hold {
+                    hold.repair.get_or_insert((index, target, feedback, reason));
+                    return Ok(());
+                }
                 self.repair_feedback = Some(feedback);
                 self.repair_review = Some(index);
                 self.repair_passes += 1;
@@ -895,20 +1174,27 @@ impl Run {
                 self.cursor = target;
                 self.set(Target::Run, Status::Pending, actor, reason)
             }
-            Decision::Advance => {
-                let reason = format!("Stage {name} complete");
-                self.set(Target::Attempt(index), Status::Complete, actor, &reason)?;
-                self.set(Target::Stage(index), Status::Complete, actor, &reason)?;
-                // The review that asked for the repair passed: later stages, and
-                // later retries, must not see its old request.
-                if self.repair_review == Some(index) {
-                    self.repair_feedback = None;
-                    self.repair_review = None;
-                }
-                self.cursor += 1;
-                self.set(Target::Run, Status::Pending, actor, reason)
-            }
+            Decision::Advance => self.complete(index, actor),
         }
+    }
+
+    /// Completes stage `index` and moves on.
+    fn complete(&mut self, index: usize, actor: Actor) -> Result<()> {
+        let reason = format!("Stage {} complete", self.workflow.stages[index].name);
+        self.set(Target::Attempt(index), Status::Complete, actor, &reason)?;
+        self.set(Target::Stage(index), Status::Complete, actor, &reason)?;
+        // The review that asked for the repair passed: later stages, and
+        // later retries, must not see its old request.
+        if self.repair_review == Some(index) {
+            self.repair_feedback = None;
+            self.repair_review = None;
+        }
+        self.cursor = if self.graph() {
+            self.focus()
+        } else {
+            index + 1
+        };
+        self.set_run(Status::Pending, actor, reason)
     }
 
     /// An interactive stage's handoff waits for the user at the checkpoint.
@@ -965,7 +1251,7 @@ impl Run {
         if index < self.stages.len() {
             self.set(Target::Stage(index), status, actor, &message)?;
         }
-        self.set(Target::Run, status, actor, &message)?;
+        self.set_run(status, actor, message.clone())?;
         self.error = Some(message);
         Ok(())
     }
@@ -1017,6 +1303,7 @@ pub fn command(project: &Path, id: &str, revision: Option<u64>, cmd: Cmd) -> Res
         Cmd::Confirm => run.confirm()?,
         Cmd::AllowRepair => run.allow_repair()?,
         Cmd::EditSummary(summary) => run.edit_summary(summary)?,
+        Cmd::RetryCandidate { stage, candidate } => run.retry_candidate(&stage, &candidate)?,
     }
     run.persist()?;
     Ok(run)
@@ -1042,7 +1329,15 @@ pub fn prompt(run: &Run, handoff_path: &Path, schema_path: &Path) -> String {
         run.workspace.display()
     );
     let mut remaining = 14000;
-    for (index, state) in run.stages[..run.cursor].iter().enumerate().rev() {
+    // Stages this one runs after; in a list, every earlier stage.
+    let order = run.order();
+    for (index, state) in run
+        .stages
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(index, _)| order.precedes(*index, run.cursor))
+    {
         if state.status == Status::Complete {
             if let Some(handoff) = &state.handoff {
                 let directory = state
@@ -1066,10 +1361,10 @@ pub fn prompt(run: &Run, handoff_path: &Path, schema_path: &Path) -> String {
         }
     }
     // Only the repaired stages and the review that asked see its request.
-    let feedback = run
-        .repair_feedback
-        .as_ref()
-        .filter(|_| run.repair_review.is_none_or(|review| run.cursor <= review));
+    let feedback = run.repair_feedback.as_ref().filter(|_| {
+        run.repair_review
+            .is_none_or(|review| run.cursor == review || order.precedes(run.cursor, review))
+    });
     if let Some(feedback) = feedback {
         text.push_str(&format!(
             "\nREPAIR REQUEST\n{}\n",
@@ -1090,6 +1385,7 @@ pub fn prompt(run: &Run, handoff_path: &Path, schema_path: &Path) -> String {
             ));
         }
     }
+    text.push_str(&fan_out_context(run));
     text.push_str(&handoff::contract(stage.role, handoff_path, schema_path));
     text
 }
@@ -1259,6 +1555,7 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
         session,
         process_group: None,
         handoff_source: None,
+        worktree: None,
     });
     let reason = format!(
         "Attempt {number} started: {} {} ({})",
@@ -1308,23 +1605,24 @@ enum Exit {
 /// Records the process's end on the attempt and classifies it: cancelled,
 /// timed out, failed, denied permissions, a protocol error, or success.
 fn classify_exit(
-    run: &mut Run,
+    attempt: Option<&mut Attempt>,
+    mode: Mode,
+    (harness, workspace): (&str, &Path),
     prepared: &Prepared,
     result: Result<process::Outcome>,
 ) -> Result<Exit> {
-    let index = run.cursor;
     let outcome = match result {
         Ok(outcome) => outcome,
         Err(error) => {
             // The supervisor ended the group before returning its error.
-            if let Some(attempt) = run.stages[index].attempts.last_mut() {
+            if let Some(attempt) = attempt {
                 attempt.process_group = None;
             }
             return Ok(Exit::Stopped(Status::Failed, format!("{error:#}")));
         }
     };
     let stdout = prepared.directory.join("stdout.log");
-    if let Some(attempt) = run.stages[index].attempts.last_mut() {
+    if let Some(attempt) = attempt {
         attempt.exit_code = outcome.code;
         attempt.finished_at = Some(Utc::now());
         // Spend counts whether or not the stage succeeded. Usage events can be
@@ -1335,9 +1633,9 @@ fn classify_exit(
         } else {
             // Best effort, from the harness's own session log.
             attempt.usage = handoff::session_usage(
-                &run.workflow.stages[index].harness,
+                harness,
                 attempt.session.as_deref(),
-                &run.workspace,
+                workspace,
                 attempt.started_at,
                 Utc::now(),
             );
@@ -1356,7 +1654,6 @@ fn classify_exit(
                 .into(),
         ));
     }
-    let mode = run.workflow.stages[index].mode;
     if !outcome.success() {
         // A JSON error event names the cause; stderr often holds only warnings.
         let reported = (mode == Mode::Unattended)
@@ -1409,11 +1706,10 @@ enum Resolved {
 /// stage that wrote no file gets a placeholder, except reviews and tests,
 /// which must produce a structured verdict.
 fn resolve_handoff(
-    run: &Run,
+    stage: &Stage,
     prepared: &Prepared,
     normalized: handoff::Normalized,
 ) -> Result<Resolved> {
-    let stage = &run.workflow.stages[run.cursor];
     let (mode, role) = (stage.mode, stage.role);
     // Interactive terminal transcripts can echo the original prompt (including
     // the example JSON). Never infer a structured verdict from an echoed prompt.
@@ -1475,16 +1771,21 @@ fn finish(
     emit: &mut impl FnMut(Event),
 ) -> Result<()> {
     let index = run.cursor;
-    let normalized = match classify_exit(run, prepared, result)? {
+    let mode = run.workflow.stages[index].mode;
+    let harness = run.workflow.stages[index].harness.clone();
+    let workspace = run.workspace.clone();
+    let attempt = run.stages[index].attempts.last_mut();
+    let normalized = match classify_exit(attempt, mode, (&harness, &workspace), prepared, result)? {
         Exit::Succeeded(normalized) => normalized,
         Exit::Stopped(status, message) => return run.stop(status, message, Actor::Engine, true),
     };
-    let (source, handoff) = match resolve_handoff(run, prepared, normalized)? {
-        Resolved::Handoff(source, handoff) => (source, *handoff),
-        Resolved::Stopped(status, message) => {
-            return run.stop(status, message, Actor::Engine, true);
-        }
-    };
+    let (source, handoff) =
+        match resolve_handoff(&run.workflow.stages[index], prepared, normalized)? {
+            Resolved::Handoff(source, handoff) => (source, *handoff),
+            Resolved::Stopped(status, message) => {
+                return run.stop(status, message, Actor::Engine, true);
+            }
+        };
     if let Some(attempt) = run.stages[index].attempts.last_mut() {
         attempt.handoff_source = Some(source);
     }
@@ -1543,12 +1844,9 @@ fn run_checks(
     Ok(!cancelled)
 }
 
-fn execute_stage(
-    run: &mut Run,
-    cancel: &AtomicBool,
-    interactive: Option<&process::InteractiveSession>,
-    emit: &mut impl FnMut(Event),
-) -> Result<()> {
+/// Prepares the current stage's attempt and announces it; None when that
+/// failed and stopped the stage.
+fn start_stage(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<Option<Prepared>> {
     let index = run.cursor;
     let attempts = run.stages[index].attempts.len();
     let prepared = match prepare(run) {
@@ -1560,7 +1858,7 @@ fn execute_stage(
             run.stop(Status::Failed, format!("{e:#}"), Actor::Engine, recorded)?;
             run.persist()?;
             emit(Event::State(Box::new(run.clone())));
-            return Ok(());
+            return Ok(None);
         }
     };
     emit(Event::State(Box::new(run.clone())));
@@ -1573,6 +1871,47 @@ fn execute_stage(
         if stage.model.is_empty() { "" } else { " " },
         stage.model
     )));
+    Ok(Some(prepared))
+}
+
+/// Finishes the current stage's attempt after its harness ended, records
+/// the workspace snapshot, and saves.
+fn conclude(
+    run: &mut Run,
+    prepared: &Prepared,
+    result: Result<process::Outcome>,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(Event),
+) -> Result<()> {
+    let index = run.cursor;
+    if let Err(error) = finish(run, prepared, result, cancel, emit) {
+        run.stop(
+            Status::Failed,
+            format!("Could not complete stage bookkeeping: {error:#}"),
+            Actor::Engine,
+            true,
+        )?;
+    }
+    // Finishing may move the cursor, so record the stage that ran.
+    let tree = snapshot::tree(&run.workspace, &run.directory);
+    if let Some(attempt) = run.stages[index].attempts.last_mut() {
+        attempt.tree_after = tree;
+    }
+    run.persist()?;
+    emit(Event::State(Box::new(run.clone())));
+    Ok(())
+}
+
+fn execute_stage(
+    run: &mut Run,
+    cancel: &AtomicBool,
+    interactive: Option<&process::InteractiveSession>,
+    emit: &mut impl FnMut(Event),
+) -> Result<()> {
+    let index = run.cursor;
+    let Some(prepared) = start_stage(run, emit)? else {
+        return Ok(());
+    };
     let workspace = run.workspace.clone();
     // Recorded so a later drive can stop the group if mr dies meanwhile.
     let record = |run: &mut Run, pgid: u32| {
@@ -1619,22 +1958,1315 @@ fn execute_stage(
         }
         result
     };
-    if let Err(error) = finish(run, &prepared, result, cancel, emit) {
-        run.stop(
-            Status::Failed,
-            format!("Could not complete stage bookkeeping: {error:#}"),
-            Actor::Engine,
-            true,
-        )?;
+    conclude(run, &prepared, result, cancel, emit)
+}
+
+const INTERRUPTED: &str =
+    "A previous execution was interrupted. Inspect artifacts and retry explicitly";
+
+/// Best-of-N stages: rounds, candidates, judging, and applying the winner.
+impl Run {
+    /// Marks every running fan-out candidate failed: its process died with
+    /// an earlier router. Never retried silently.
+    fn interrupt_candidates(&mut self, message: &str) -> Result<()> {
+        for index in 0..self.stages.len() {
+            let count = self.stages[index]
+                .fan_out
+                .as_ref()
+                .map_or(0, |f| f.candidates.len());
+            for c in 0..count {
+                if self.candidate(index, c).status == Status::Running {
+                    self.stop_candidate(index, c, Status::Failed, message.into(), Actor::Recovery)?;
+                }
+            }
+        }
+        Ok(())
     }
-    // Finishing may move the cursor, so record the stage that ran.
-    let tree = snapshot::tree(&run.workspace, &run.directory);
-    if let Some(attempt) = run.stages[index].attempts.last_mut() {
-        attempt.tree_after = tree;
+
+    fn candidate(&self, index: usize, c: usize) -> &CandidateState {
+        &self.stages[index]
+            .fan_out
+            .as_ref()
+            .expect("A fan-out stage has candidates")
+            .candidates[c]
+    }
+    fn candidate_mut(&mut self, index: usize, c: usize) -> &mut CandidateState {
+        &mut self.stages[index]
+            .fan_out
+            .as_mut()
+            .expect("A fan-out stage has candidates")
+            .candidates[c]
+    }
+
+    /// Ends candidate `c` with `status`, and its running attempt.
+    fn stop_candidate(
+        &mut self,
+        index: usize,
+        c: usize,
+        status: Status,
+        message: String,
+        actor: Actor,
+    ) -> Result<()> {
+        if self
+            .candidate(index, c)
+            .attempts
+            .last()
+            .is_some_and(|a| a.status == Status::Running)
+        {
+            self.set(Target::CandidateAttempt(index, c), status, actor, &message)?;
+            let attempt = self
+                .candidate_mut(index, c)
+                .attempts
+                .last_mut()
+                .context("No attempt")?;
+            attempt.error = Some(message.clone());
+            attempt.finished_at.get_or_insert_with(Utc::now);
+            attempt.process_group = None;
+        }
+        self.set(Target::Candidate(index, c), status, actor, &message)?;
+        self.candidate_mut(index, c).error = Some(message);
+        Ok(())
+    }
+
+    /// Starts a round of fan-out stage `index`: a new attempt for the stage,
+    /// and, unless an earlier round left candidates to retry, a base commit
+    /// of the workspace and pending candidates.
+    fn start_fan_out(&mut self, index: usize) -> Result<()> {
+        let stage = self.workflow.stages[index].clone();
+        let fan = stage.fan_out.clone().context("Not a fan-out stage")?;
+        let number = self.stages[index].attempts.len() + 1;
+        let directory = self
+            .directory
+            .join(format!("{:02}-{}", index + 1, stage.id))
+            .join(format!("attempt-{number:03}"));
+        fs::create_dir_all(&directory)?;
+        if self.stages[index].fan_out.is_none() {
+            let base = snapshot::tree(&self.workspace, &self.directory)
+                .context("Fan-out needs a Git snapshot of the workspace")?;
+            let reference = snapshot::base_ref(&self.id, &format!("{}-{number:03}", stage.id));
+            let base_commit = fanout::base_commit(&self.workspace, &base, &reference)?;
+            let candidates = fan
+                .candidates
+                .iter()
+                .zip(fan.ids())
+                .map(|(c, id)| CandidateState {
+                    id,
+                    harness: c.harness.clone(),
+                    model: c.model.clone(),
+                    provider: c.provider.clone(),
+                    effort: c.effort.clone(),
+                    status: Status::Pending,
+                    attempts: vec![],
+                    handoff: None,
+                    changes: None,
+                    error: None,
+                })
+                .collect();
+            self.stages[index].fan_out = Some(FanOutState {
+                base,
+                base_commit,
+                candidates,
+                selection: None,
+            });
+        }
+        let state = self.stages[index].fan_out.as_ref().context("No fan-out")?;
+        let pending = state
+            .candidates
+            .iter()
+            .filter(|c| c.status == Status::Pending)
+            .count();
+        let base = state.base.clone();
+        self.stages[index].attempts.push(Attempt {
+            number,
+            started_at: Utc::now(),
+            finished_at: None,
+            model: format!("{} candidates", fan.candidates.len()),
+            mode: Mode::Unattended,
+            status: Status::Pending,
+            exit_code: None,
+            directory: directory.clone(),
+            handoff_file: directory.join("handoff.json"),
+            error: None,
+            checks: vec![],
+            tree_before: Some(base),
+            tree_after: None,
+            usage: None,
+            session: None,
+            process_group: None,
+            handoff_source: None,
+            worktree: None,
+        });
+        let reason = format!("Fan-out round {number} started: {pending} candidate(s)");
+        self.resume = None;
+        self.error = None;
+        self.set(
+            Target::Attempt(index),
+            Status::Running,
+            Actor::Engine,
+            &reason,
+        )?;
+        self.set(
+            Target::Stage(index),
+            Status::Running,
+            Actor::Engine,
+            &reason,
+        )?;
+        self.set(Target::Run, Status::Running, Actor::Engine, reason)?;
+        self.persist()
+    }
+
+    /// Prepares candidate `c` of fan-out stage `index` in a new worktree from
+    /// the round's base, with the stage's prompt as that candidate sees it.
+    fn launch_candidate(&mut self, index: usize, c: usize) -> Result<(Prepared, PathBuf)> {
+        let stage = self.workflow.stages[index].clone();
+        let config = stage
+            .fan_out
+            .as_ref()
+            .and_then(|f| f.candidates.get(c))
+            .context("No such candidate")?
+            .clone();
+        let candidate = config.stage(&stage);
+        let state = self.stages[index].fan_out.as_ref().context("No fan-out")?;
+        let (base, base_commit) = (state.base.clone(), state.base_commit.clone());
+        let id = state.candidates[c].id.clone();
+        let number = state.candidates[c].attempts.len() + 1;
+        let directory = self
+            .directory
+            .join(format!("{:02}-{}", index + 1, stage.id))
+            .join("candidates")
+            .join(&id)
+            .join(format!("attempt-{number:03}"));
+        fs::create_dir_all(&directory)?;
+        let worktree = fanout::candidates_dir(&self.project, &self.id)?
+            .join(&stage.id)
+            .join(format!("{id}-{number:03}"));
+        fanout::add_worktree(&self.workspace, &worktree, &base_commit)?;
+        // A project inside a larger repository works in the same subdirectory.
+        let cwd = worktree.join(fanout::prefix(&self.workspace));
+        let handoff_file = storage::metadata_dir(&cwd)?
+            .join("handoffs")
+            .join(&self.id)
+            .join(format!("{}-{id}-{number:03}.json", stage.id));
+        fs::create_dir_all(handoff_file.parent().context("No handoff directory")?)?;
+        let mut view = self.clone();
+        view.workspace = cwd.clone();
+        view.workflow.stages[index] = candidate.clone();
+        view.cursor = index;
+        view.view = Some(c);
+        // The prompt names this copy of the handoff schema.
+        let schema_file = directory.join(handoff::SCHEMA_FILE);
+        storage::atomic_write(&schema_file, handoff::SCHEMA.as_bytes())?;
+        let text = prompt(&view, &handoff_file, &schema_file);
+        let prompt_file = directory.join("prompt.md");
+        storage::atomic_write(&prompt_file, text.as_bytes())?;
+        let paths = ContextPaths {
+            workspace: &cwd,
+            attempt_dir: &directory,
+            prompt_file: &prompt_file,
+            handoff_file: &handoff_file,
+        };
+        let mut invocation =
+            adapters::build(&candidate, &self.adapters, &self.providers, &text, &paths)?;
+        let session = adapters::assign_session(&mut invocation, &candidate.harness);
+        let sandbox = crate::sandbox::plan(
+            &self.workflow,
+            &candidate,
+            &crate::sandbox::Paths {
+                workspace: &cwd,
+                attempt_dir: &directory,
+                handoff_dir: handoff_file.parent().context("No handoff directory")?,
+                program: &invocation.program,
+            },
+        )?;
+        storage::write_json(
+            &directory.join("command.json"),
+            &serde_json::json!({ "program": invocation.program, "args": invocation.args, "stdin_from": invocation.stdin.as_ref().map(|_| "prompt.md"), "env": invocation.env.iter().map(|(name, _)| name).collect::<Vec<_>>(), "workspace": cwd, "model": candidate.model, "provider": candidate.provider, "effort": candidate.effort, "mode": candidate.mode, "candidate": id, "sandbox": sandbox }),
+        )?;
+        let state = self.candidate_mut(index, c);
+        state.harness = config.harness.clone();
+        state.model = config.model.clone();
+        state.provider = config.provider.clone();
+        state.effort = config.effort.clone();
+        state.error = None;
+        state.handoff = None;
+        state.changes = None;
+        state.attempts.push(Attempt {
+            number,
+            started_at: Utc::now(),
+            finished_at: None,
+            model: candidate.model.clone(),
+            mode: Mode::Unattended,
+            status: Status::Pending,
+            exit_code: None,
+            directory: directory.clone(),
+            handoff_file: handoff_file.clone(),
+            error: None,
+            checks: vec![],
+            tree_before: Some(base),
+            tree_after: None,
+            usage: None,
+            session,
+            process_group: None,
+            handoff_source: None,
+            worktree: Some(worktree),
+        });
+        let reason = format!(
+            "Candidate {id} attempt {number} started: {} {}",
+            candidate.harness, candidate.model
+        );
+        self.set(
+            Target::CandidateAttempt(index, c),
+            Status::Running,
+            Actor::Engine,
+            &reason,
+        )?;
+        self.set(
+            Target::Candidate(index, c),
+            Status::Running,
+            Actor::Engine,
+            reason,
+        )?;
+        self.persist()?;
+        Ok((
+            Prepared {
+                invocation,
+                sandbox,
+                directory,
+                handoff_file,
+            },
+            cwd,
+        ))
+    }
+
+    /// Records how candidate `c`'s harness ended: its handoff, its router
+    /// checks (run in its worktree), and its changes from the base.
+    fn finish_candidate(
+        &mut self,
+        (index, c): (usize, usize),
+        prepared: &Prepared,
+        cwd: &Path,
+        result: Result<process::Outcome>,
+        cancel: &AtomicBool,
+        emit: &mut impl FnMut(Event),
+    ) -> Result<()> {
+        let candidate = {
+            let stage = &self.workflow.stages[index];
+            let config = &stage.fan_out.as_ref().context("No fan-out")?.candidates[c];
+            config.stage(stage)
+        };
+        let attempt = self.candidate_mut(index, c).attempts.last_mut();
+        let normalized = match classify_exit(
+            attempt,
+            Mode::Unattended,
+            (&candidate.harness, cwd),
+            prepared,
+            result,
+        )? {
+            Exit::Succeeded(normalized) => normalized,
+            Exit::Stopped(status, message) => {
+                return self.stop_candidate(index, c, status, message, Actor::Engine);
+            }
+        };
+        let (source, handoff) = match resolve_handoff(&candidate, prepared, normalized)? {
+            Resolved::Handoff(source, handoff) => (source, *handoff),
+            Resolved::Stopped(status, message) => {
+                return self.stop_candidate(index, c, status, message, Actor::Engine);
+            }
+        };
+        storage::write_json(&prepared.directory.join("handoff.json"), &handoff)?;
+        let verdict = handoff.verdict;
+        let summary = handoff.summary.clone();
+        let state = self.candidate_mut(index, c);
+        state.handoff = Some(handoff);
+        let attempt = state.attempts.last_mut().context("No attempt")?;
+        attempt.handoff_source = Some(source);
+        let worktree = attempt.worktree.clone().context("No worktree")?;
+        if matches!(verdict, Verdict::Blocked | Verdict::NeedsChanges) {
+            return self.stop_candidate(
+                index,
+                c,
+                Status::Blocked,
+                format!(
+                    "Candidate reports incomplete work: {}",
+                    storage::truncate(&summary, 500)
+                ),
+                Actor::Engine,
+            );
+        }
+        if !candidate.checks.is_empty() {
+            let (results, cancelled) = checks::run(
+                &candidate.checks,
+                cwd,
+                &prepared.directory,
+                cancel,
+                |text| emit(Event::Output(text)),
+            )?;
+            if let Some(attempt) = self.candidate_mut(index, c).attempts.last_mut() {
+                attempt.checks = results;
+            }
+            if cancelled {
+                return self.stop_candidate(
+                    index,
+                    c,
+                    Status::Cancelled,
+                    "Candidate cancelled during checks; its worktree is retained".into(),
+                    Actor::Engine,
+                );
+            }
+        }
+        let base = self.stages[index]
+            .fan_out
+            .as_ref()
+            .context("No fan-out")?
+            .base
+            .clone();
+        let tree = snapshot::tree_with(
+            &worktree,
+            &prepared.directory.join("snapshot.index"),
+            &self.id,
+        )
+        .context("Snapshot the candidate's worktree")?;
+        let patch = prepared.directory.join("changes.diff");
+        fanout::write_patch(&worktree, &base, &tree, &patch)?;
+        let (files, added, removed) = fanout::stat(&worktree, &base, &tree)?;
+        let state = self.candidate_mut(index, c);
+        state.changes = Some(CandidateChanges {
+            files,
+            added,
+            removed,
+            patch,
+        });
+        if let Some(attempt) = state.attempts.last_mut() {
+            attempt.tree_after = Some(tree);
+        }
+        let reason = format!("Candidate {} complete", state.id);
+        self.set(
+            Target::CandidateAttempt(index, c),
+            Status::Complete,
+            Actor::Engine,
+            &reason,
+        )?;
+        self.set(
+            Target::Candidate(index, c),
+            Status::Complete,
+            Actor::Engine,
+            reason,
+        )
+    }
+
+    /// Whether no candidate of stage `index` waits or runs.
+    fn fan_out_done(&self, index: usize) -> bool {
+        self.stages[index].fan_out.as_ref().is_some_and(|f| {
+            f.candidates
+                .iter()
+                .all(|c| !matches!(c.status, Status::Pending | Status::Running))
+        })
+    }
+
+    /// Ends the round of fan-out stage `index` once its candidates have:
+    /// stops when none succeeded or the run was cancelled, waits for the
+    /// judge stage, or picks and applies a winner automatically.
+    fn settle_fan_out(&mut self, index: usize, cancelled: bool) -> Result<()> {
+        self.cursor = index;
+        let stage = self.workflow.stages[index].clone();
+        let state = self.stages[index].fan_out.as_ref().context("No fan-out")?;
+        let complete = state
+            .candidates
+            .iter()
+            .filter(|c| c.status == Status::Complete)
+            .count();
+        let total = state.candidates.len();
+        let failures: Vec<String> = state
+            .candidates
+            .iter()
+            .filter(|c| c.status != Status::Complete)
+            .map(|c| {
+                format!(
+                    "{} {}{}",
+                    c.id,
+                    c.status.label(),
+                    c.error
+                        .as_deref()
+                        .map(|e| format!(" ({})", e.lines().next().unwrap_or("")))
+                        .unwrap_or_default()
+                )
+            })
+            .collect();
+        let auto = state.selection.is_none() && graph::judge_of(&self.workflow, index).is_none();
+        let finish = |run: &mut Run| {
+            let tree = snapshot::tree(&run.workspace, &run.directory);
+            if let Some(attempt) = run.stages[index].attempts.last_mut() {
+                attempt.finished_at.get_or_insert_with(Utc::now);
+                attempt.tree_after = tree;
+            }
+        };
+        if cancelled
+            || state
+                .candidates
+                .iter()
+                .any(|c| c.status == Status::Cancelled)
+                && complete == 0
+        {
+            let message = format!(
+                "Fan-out stopped before every candidate finished ({}). Worktrees are retained; retry a candidate (resume --retry-candidate {}/<id>) or the stage",
+                failures.join("; "),
+                stage.id
+            );
+            self.stop(Status::Cancelled, message, Actor::Engine, true)?;
+            finish(self);
+            return Ok(());
+        }
+        if complete == 0 {
+            let message = format!(
+                "No fan-out candidate succeeded: {}. Retry a candidate (resume --retry-candidate {}/<id>) or the stage",
+                failures.join("; "),
+                stage.id
+            );
+            self.stop(Status::Blocked, message, Actor::Engine, true)?;
+            finish(self);
+            return Ok(());
+        }
+        if !auto {
+            let judge = graph::judge_of(&self.workflow, index)
+                .map_or_else(String::new, |j| self.workflow.stages[j].name.clone());
+            let handoff: Handoff = serde_json::from_value(serde_json::json!({
+                "summary": format!("{complete} of {total} fan-out candidates finished; the judge stage {judge:?} chooses one, then the router applies its changes to the workspace."),
+                "verdict": "complete",
+                "unresolved": failures,
+            }))?;
+            if let Some(attempt) = self.stages[index].attempts.last() {
+                storage::write_json(&attempt.directory.join("handoff.json"), &handoff)?;
+            }
+            self.stages[index].handoff = Some(handoff);
+            finish(self);
+            return self.advance(Actor::Engine);
+        }
+        let state = self.stages[index].fan_out.as_ref().context("No fan-out")?;
+        let winner = auto_pick(state).context("No complete candidate")?;
+        let chosen = &state.candidates[winner];
+        let reason = format!(
+            "auto: {} required checks, {} changed lines, among {complete} complete candidates",
+            if chosen.checks_pass() {
+                "passing"
+            } else {
+                "failing"
+            },
+            chosen.changes.as_ref().map_or(0, CandidateChanges::lines)
+        );
+        let outcome = self.select(index, winner, crate::config::AUTO_JUDGE, &reason)?;
+        finish(self);
+        match outcome {
+            Ok(()) => self.advance(Actor::Engine),
+            Err(message) => self.stop(Status::Blocked, message, Actor::Engine, true),
+        }
+    }
+
+    /// Why a judge's handoff chooses, or fails to choose, a candidate of
+    /// fan-out stage `fan`.
+    fn judgement(&self, fan: usize, handoff: &Handoff) -> Decision {
+        let Some(state) = self.stages[fan].fan_out.as_ref() else {
+            return Decision::Block(format!(
+                "Fan-out stage {} has no candidates to judge",
+                self.workflow.stages[fan].name
+            ));
+        };
+        let ids = state
+            .candidates
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let Some(selected) = handoff
+            .selected
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Decision::Block(format!(
+                "The judge chose no candidate: its handoff needs \"selected\" set to one of {ids}. Retry it"
+            ));
+        };
+        match state.candidates.iter().position(|c| c.id == selected) {
+            Some(c) if state.candidates[c].status == Status::Complete => {
+                Decision::Select { fan, candidate: c }
+            }
+            Some(c) => Decision::Block(format!(
+                "The judge chose candidate {selected}, which is {}. Retry the judge",
+                state.candidates[c].status.label()
+            )),
+            None => Decision::Block(format!(
+                "The judge chose unknown candidate {selected}; candidates: {ids}. Retry it"
+            )),
+        }
+    }
+
+    /// Applies candidate `c` of fan-out stage `fan` to the workspace and
+    /// records the choice; the inner error explains a conflict, which leaves
+    /// the workspace unchanged.
+    fn select(
+        &mut self,
+        fan: usize,
+        c: usize,
+        by: &str,
+        reason: &str,
+    ) -> Result<std::result::Result<(), String>> {
+        let state = self.stages[fan].fan_out.as_ref().context("No fan-out")?;
+        if let Some(done) = state.selection.as_ref().filter(|s| s.applied) {
+            return Ok(Err(format!(
+                "Candidate {} was already applied; retry the fan-out stage to choose again",
+                done.candidate
+            )));
+        }
+        let candidate = &state.candidates[c];
+        let id = candidate.id.clone();
+        let changes = candidate
+            .changes
+            .clone()
+            .context("The candidate's changes were not recorded")?;
+        let worktree = candidate
+            .attempts
+            .last()
+            .and_then(|a| a.worktree.clone())
+            .unwrap_or_default();
+        let ids = state
+            .candidates
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut handoff = candidate
+            .handoff
+            .clone()
+            .context("The candidate has no handoff")?;
+        let current = snapshot::tree(&self.workspace, &self.directory)
+            .context("Snapshot the workspace before applying the candidate")?;
+        let scratch = self.stages[fan]
+            .attempts
+            .last()
+            .map_or_else(|| self.directory.clone(), |a| a.directory.clone());
+        let applied = fanout::apply(
+            &self.workspace,
+            &self.directory.join("snapshot.index"),
+            &current,
+            &changes.files,
+            &changes.patch,
+            &scratch,
+        )?;
+        let outcome = match &applied {
+            fanout::Applied::Clean | fanout::Applied::Merged => Ok(()),
+            fanout::Applied::Conflict(files) => Err(format!(
+                "Candidate {id}'s changes conflict with workspace changes made since the candidates started ({}). The workspace is unchanged. The candidate's worktree stays at {} and its patch at {}: apply it yourself (git apply --3way <patch>), or undo the conflicting changes and retry this stage",
+                files.join(", "),
+                worktree.display(),
+                changes.patch.display()
+            )),
+        };
+        if outcome.is_ok() {
+            handoff.decisions.push(format!(
+                "Chosen by {by} from fan-out candidates {ids}{}",
+                if applied == fanout::Applied::Merged {
+                    "; merged with workspace changes"
+                } else {
+                    ""
+                }
+            ));
+            if let Some(attempt) = self.stages[fan].attempts.last() {
+                storage::write_json(&attempt.directory.join("handoff.json"), &handoff)?;
+            }
+            self.stages[fan].handoff = Some(handoff);
+        }
+        if let Some(state) = self.stages[fan].fan_out.as_mut() {
+            state.selection = Some(Selection {
+                candidate: id,
+                by: by.into(),
+                reason: storage::truncate(reason, 2000),
+                applied: outcome.is_ok(),
+                at: Utc::now(),
+            });
+        }
+        Ok(outcome)
+    }
+
+    /// After stages ran side by side: applies a held repair request, then
+    /// stops the run at the first stopped stage, waits at a checkpoint, or
+    /// returns it to pending.
+    fn settle(&mut self) -> Result<()> {
+        let hold = self.hold.take().unwrap_or_default();
+        if let Some((review, target, feedback, reason)) = hold.repair {
+            self.repair_feedback = Some(feedback);
+            self.repair_review = Some(review);
+            self.repair_passes += 1;
+            // Invalidate all downstream handoffs, including previously passing reviews.
+            self.reset(target, Actor::Engine, &reason)?;
+            self.cursor = target;
+        }
+        if let Some(index) = (0..self.stages.len()).find(|&i| self.stages[i].status.stopped()) {
+            let status = self.stages[index].status;
+            let message = hold
+                .stops
+                .iter()
+                .find(|(i, _)| *i == index)
+                .map(|(_, m)| m.clone())
+                .or_else(|| {
+                    self.stages[index]
+                        .attempts
+                        .last()
+                        .and_then(|a| a.error.clone())
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "Stage {} {}",
+                        self.workflow.stages[index].name,
+                        status.label()
+                    )
+                });
+            self.cursor = index;
+            self.error = Some(message.clone());
+            return self.set(Target::Run, status, Actor::Engine, message);
+        }
+        if let Some(index) = self
+            .stages
+            .iter()
+            .position(|s| s.status == Status::AwaitingConfirmation)
+        {
+            self.cursor = index;
+            return self.set(
+                Target::Run,
+                Status::AwaitingConfirmation,
+                Actor::Engine,
+                "Stage awaits acceptance",
+            );
+        }
+        self.cursor = self.focus();
+        self.error = None;
+        self.set(
+            Target::Run,
+            Status::Pending,
+            Actor::Engine,
+            "Side-by-side stages ended",
+        )
+    }
+
+    /// Recovers a graph run whose router died: every running candidate,
+    /// attempt, and stage failed.
+    fn recover(&mut self) -> Result<()> {
+        self.interrupt_candidates(INTERRUPTED)?;
+        let running: Vec<usize> = (0..self.stages.len())
+            .filter(|&i| self.stages[i].status == Status::Running)
+            .collect();
+        let stopped = if running.is_empty() {
+            vec![self.focus()]
+        } else {
+            running
+        };
+        let count = self.stages.len();
+        for index in stopped.iter().copied().filter(|&i| i < count) {
+            if self.stages[index]
+                .attempts
+                .last()
+                .is_some_and(|a| a.status == Status::Running)
+            {
+                self.set(
+                    Target::Attempt(index),
+                    Status::Failed,
+                    Actor::Recovery,
+                    INTERRUPTED,
+                )?;
+                let attempt = self.stages[index]
+                    .attempts
+                    .last_mut()
+                    .context("No attempt")?;
+                attempt.error = Some(INTERRUPTED.into());
+                attempt.finished_at.get_or_insert_with(Utc::now);
+            }
+            self.set(
+                Target::Stage(index),
+                Status::Failed,
+                Actor::Recovery,
+                INTERRUPTED,
+            )?;
+        }
+        self.cursor = stopped[0].min(self.stages.len());
+        self.set(Target::Run, Status::Failed, Actor::Recovery, INTERRUPTED)?;
+        self.error = Some(INTERRUPTED.into());
+        Ok(())
+    }
+}
+
+/// Auto judge: a complete candidate whose required checks passed, then the
+/// fewest changed lines, then the first listed.
+fn auto_pick(state: &FanOutState) -> Option<usize> {
+    state
+        .candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.status == Status::Complete)
+        .min_by_key(|(index, c)| {
+            (
+                !c.checks_pass(),
+                c.changes.as_ref().map_or(u64::MAX, CandidateChanges::lines),
+                *index,
+            )
+        })
+        .map(|(index, _)| index)
+}
+
+/// What the judge, or a candidate, needs to know beyond the stage prompt.
+fn fan_out_context(run: &Run) -> String {
+    let index = run.cursor;
+    if let Some(c) = run.view {
+        let Some(state) = run.stages.get(index).and_then(|s| s.fan_out.as_ref()) else {
+            return String::new();
+        };
+        return format!(
+            "\nFAN-OUT CANDIDATE\nYou are candidate {}, one of {} candidates for this stage, each working in its own Git worktree started from the same workspace state. The working directory above is your worktree: change files only there, and do not commit. A judge compares the candidates, and the router applies only the chosen candidate's changes to the main workspace.\n",
+            state.candidates[c].id,
+            state.candidates.len()
+        );
+    }
+    let Some(fan) = graph::judged_by(&run.workflow, index) else {
+        return String::new();
+    };
+    let Some(state) = run.stages[fan].fan_out.as_ref() else {
+        return String::new();
+    };
+    let mut text = format!(
+        "\nFAN-OUT CANDIDATES\nStage {:?} ran {} candidates, each in its own Git worktree from the same starting point. Compare them against the original task and choose one; the router then applies only the chosen candidate's changes to the working directory. Inspect worktrees and patches read-only; do not modify them or the working directory.\n",
+        run.workflow.stages[fan].name,
+        state.candidates.len()
+    );
+    for candidate in &state.candidates {
+        text.push_str(&format!(
+            "\n- {} ({}{}{}): {}",
+            candidate.id,
+            candidate.harness,
+            if candidate.model.is_empty() { "" } else { " " },
+            candidate.model,
+            candidate.status.label()
+        ));
+        if let Some(error) = &candidate.error {
+            text.push_str(&format!(
+                " — {}",
+                storage::truncate(error.lines().next().unwrap_or(""), 300)
+            ));
+        }
+        if let Some(attempt) = candidate.attempts.last() {
+            if let Some(worktree) = &attempt.worktree {
+                text.push_str(&format!("\n  worktree: {}", worktree.display()));
+            }
+            let required: Vec<_> = attempt.checks.iter().filter(|c| c.required).collect();
+            if !required.is_empty() {
+                text.push_str(&format!(
+                    "\n  router checks: {}/{} required passed",
+                    required
+                        .iter()
+                        .filter(|c| c.status == TestStatus::Passed)
+                        .count(),
+                    required.len()
+                ));
+            }
+        }
+        if let Some(changes) = &candidate.changes {
+            text.push_str(&format!(
+                "\n  changes: {} files, +{} −{}; patch: {}",
+                changes.files.len(),
+                changes.added,
+                changes.removed,
+                changes.patch.display()
+            ));
+        }
+        if let Some(handoff) = &candidate.handoff {
+            text.push_str(&format!(
+                "\n  handoff: {}",
+                storage::truncate(handoff.summary.trim(), 800).replace('\n', "\n    ")
+            ));
+        }
+    }
+    text.push_str("\n\nSet \"selected\" in your handoff to the chosen candidate's ID, for example \"selected\":\"c1\", with verdict pass, and explain the choice in summary. Choose only a complete candidate. Use verdict blocked if none is acceptable.\n");
+    text
+}
+
+/// A harness process the scheduler runs: a stage attempt or a candidate's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Job {
+    Stage(usize),
+    Candidate(usize, usize),
+}
+enum Message {
+    Spawned(Job, u32),
+    Output(Job, bool, String),
+    Done(Job, Result<process::Outcome>),
+}
+/// What the scheduler starts next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Launch {
+    Stage(usize),
+    FanOut(usize),
+    Candidate(usize, usize),
+    Interactive(usize),
+}
+
+/// The next thing to start, in list order, and a writer stage waiting to
+/// run alone. Stages start only when every stage they run after is done;
+/// parallel-safe ones run together up to `max_parallel` processes, others
+/// alone, and interactive ones alone with the run handed to their terminal.
+/// `only` limits it to that fan-out stage's candidates.
+fn next_launch(run: &Run, only: Option<usize>) -> (Option<Launch>, Option<usize>) {
+    let stages = &run.workflow.stages;
+    let max = run.workflow.max_parallel.max(1) as usize;
+    let mut flight = 0;
+    let mut writer = false;
+    for (stage, state) in stages.iter().zip(&run.stages) {
+        if let Some(fan) = &state.fan_out {
+            flight += fan
+                .candidates
+                .iter()
+                .filter(|c| c.status == Status::Running)
+                .count();
+        }
+        if state.status == Status::Running && stage.fan_out.is_none() {
+            flight += 1;
+            writer |= !graph::parallel_safe(stage);
+        }
+    }
+    let pending = |index: usize| {
+        run.stages[index].fan_out.as_ref().and_then(|f| {
+            f.candidates
+                .iter()
+                .position(|c| c.status == Status::Pending)
+        })
+    };
+    if let Some(index) = only {
+        return (
+            pending(index)
+                .filter(|_| flight < max)
+                .map(|c| Launch::Candidate(index, c)),
+            None,
+        );
+    }
+    if writer {
+        return (None, None);
+    }
+    let order = run.order();
+    for (index, stage) in stages.iter().enumerate() {
+        let status = run.stages[index].status;
+        if !stage.enabled {
+            continue;
+        }
+        if stage.fan_out.is_some() && status == Status::Running {
+            if let Some(c) = pending(index).filter(|_| flight < max) {
+                return (Some(Launch::Candidate(index, c)), None);
+            }
+            continue;
+        }
+        let ready = status == Status::Pending
+            && (0..stages.len()).all(|before| {
+                !order.precedes(before, index)
+                    || matches!(
+                        run.stages[before].status,
+                        Status::Complete | Status::Skipped
+                    )
+            });
+        if !ready {
+            continue;
+        }
+        if stage.mode == Mode::Interactive {
+            return ((flight == 0).then_some(Launch::Interactive(index)), None);
+        }
+        if graph::parallel_safe(stage) {
+            if flight >= max {
+                return (None, None);
+            }
+            return (
+                Some(if stage.fan_out.is_some() {
+                    Launch::FanOut(index)
+                } else {
+                    Launch::Stage(index)
+                }),
+                None,
+            );
+        }
+        return if flight == 0 {
+            (Some(Launch::Stage(index)), None)
+        } else {
+            (None, Some(index))
+        };
+    }
+    (None, None)
+}
+
+/// Runs stages and candidates side by side until none can start and none
+/// runs, then settles the run. Each process has its own process group and
+/// logs; workers only supervise processes and report over a channel, so
+/// only this thread changes or saves the run. Returns an interactive stage
+/// that should run next, and how many processes or rounds started.
+fn schedule(
+    run: &mut Run,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(Event),
+    only: Option<usize>,
+) -> Result<(Option<usize>, usize)> {
+    let mut interactive = None;
+    let mut started = 0;
+    let mut noted = vec![];
+    let halted = |run: &Run| {
+        cancel.load(Ordering::Relaxed)
+            || run
+                .hold
+                .as_ref()
+                .is_some_and(|h| h.repair.is_some() || !h.stops.is_empty())
+            || run
+                .stages
+                .iter()
+                .any(|s| s.status == Status::AwaitingConfirmation)
+    };
+    let result = thread::scope(|scope| -> Result<()> {
+        let result = (|| -> Result<()> {
+            let (tx, rx) = mpsc::channel::<Message>();
+            let mut flight: Vec<(Job, Prepared, PathBuf)> = vec![];
+            let mut formatters = std::collections::HashMap::new();
+            let mut speaking = None;
+            loop {
+                while !halted(run) {
+                    let (launch, waiting) = next_launch(run, only);
+                    if let Some(index) = waiting.filter(|i| !noted.contains(i)) {
+                        noted.push(index);
+                        emit(Event::Output(format!(
+                            "Stage {} changes the shared workspace: it waits for the running stages, then runs alone\n",
+                            run.workflow.stages[index].name
+                        )));
+                    }
+                    let Some(launch) = launch else {
+                        break;
+                    };
+                    started += 1;
+                    let (job, prepared, cwd) = match launch {
+                        Launch::Interactive(index) => {
+                            interactive = Some(index);
+                            break;
+                        }
+                        Launch::FanOut(index) => {
+                            run.cursor = index;
+                            let attempts = run.stages[index].attempts.len();
+                            if let Err(error) = run.start_fan_out(index) {
+                                let recorded = run.stages[index].attempts.len() > attempts;
+                                run.stop(
+                                    Status::Failed,
+                                    format!("{error:#}"),
+                                    Actor::Engine,
+                                    recorded,
+                                )?;
+                                run.persist()?;
+                            }
+                            emit(Event::State(Box::new(run.clone())));
+                            continue;
+                        }
+                        Launch::Stage(index) => {
+                            run.cursor = index;
+                            match start_stage(run, emit)? {
+                                Some(prepared) => {
+                                    (Job::Stage(index), prepared, run.workspace.clone())
+                                }
+                                None => continue,
+                            }
+                        }
+                        Launch::Candidate(index, c) => match run.launch_candidate(index, c) {
+                            Ok((prepared, cwd)) => {
+                                emit(Event::State(Box::new(run.clone())));
+                                (Job::Candidate(index, c), prepared, cwd)
+                            }
+                            Err(error) => {
+                                run.stop_candidate(
+                                    index,
+                                    c,
+                                    Status::Failed,
+                                    format!("{error:#}"),
+                                    Actor::Engine,
+                                )?;
+                                if run.fan_out_done(index) {
+                                    run.settle_fan_out(index, false)?;
+                                }
+                                run.persist()?;
+                                emit(Event::State(Box::new(run.clone())));
+                                continue;
+                            }
+                        },
+                    };
+                    let (index, label) = match job {
+                        Job::Stage(index) => (index, run.workflow.stages[index].name.clone()),
+                        Job::Candidate(index, c) => (
+                            index,
+                            format!(
+                                "{} · candidate {}",
+                                run.workflow.stages[index].name,
+                                run.candidate(index, c).id
+                            ),
+                        ),
+                    };
+                    if let Job::Candidate(..) = job {
+                        let state = match job {
+                            Job::Candidate(i, c) => run.candidate(i, c),
+                            Job::Stage(_) => unreachable!(),
+                        };
+                        emit(Event::Output(format!(
+                            "── {label} · attempt {} · {}{}{} ──\n",
+                            state.attempts.len(),
+                            state.harness,
+                            if state.model.is_empty() { "" } else { " " },
+                            state.model
+                        )));
+                    }
+                    speaking = Some(job);
+                    formatters.insert(
+                        job,
+                        (label, events::Formatter::new(prepared.invocation.kind)),
+                    );
+                    let timeout = Duration::from_secs(run.workflow.stages[index].timeout_seconds);
+                    let invocation = prepared.invocation.clone();
+                    let sandbox = prepared.sandbox.clone();
+                    let directory = prepared.directory.clone();
+                    let worker_cwd = cwd.clone();
+                    let tx = tx.clone();
+                    scope.spawn(move || {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            process::capture_with(
+                                &invocation,
+                                &worker_cwd,
+                                &directory,
+                                timeout,
+                                cancel,
+                                sandbox.as_ref(),
+                                |pgid| {
+                                    let _ = tx.send(Message::Spawned(job, pgid));
+                                },
+                                |err, text| {
+                                    let _ = tx.send(Message::Output(job, err, text.to_owned()));
+                                },
+                            )
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(anyhow::anyhow!("The harness supervisor panicked"))
+                        });
+                        let _ = tx.send(Message::Done(job, result));
+                    });
+                    flight.push((job, prepared, cwd));
+                }
+                if flight.is_empty() {
+                    break;
+                }
+                let message = rx.recv().context("Harness workers stopped")?;
+                match message {
+                    Message::Spawned(job, pgid) => {
+                        // Recorded so a later drive can stop the group if mr dies meanwhile.
+                        let attempt = match job {
+                            Job::Stage(i) => run.stages[i].attempts.last_mut(),
+                            Job::Candidate(i, c) => run.candidate_mut(i, c).attempts.last_mut(),
+                        };
+                        if let Some(attempt) = attempt {
+                            attempt.process_group = Some(pgid);
+                        }
+                        let _ = run.persist();
+                    }
+                    Message::Output(job, err, text) => {
+                        let Some((label, formatter)) = formatters.get_mut(&job) else {
+                            continue;
+                        };
+                        let lines = if err {
+                            Some(format!("[stderr] {}", storage::clean_terminal(&text)))
+                        } else {
+                            formatter.push(&text)
+                        };
+                        if let Some(lines) = lines {
+                            if speaking != Some(job) {
+                                speaking = Some(job);
+                                emit(Event::Output(format!("── {label} ──\n")));
+                            }
+                            emit(Event::Output(lines));
+                        }
+                    }
+                    Message::Done(job, result) => {
+                        let Some(position) = flight.iter().position(|(j, ..)| *j == job) else {
+                            continue;
+                        };
+                        let (_, prepared, cwd) = flight.swap_remove(position);
+                        if let Some((label, mut formatter)) = formatters.remove(&job) {
+                            if let Some(rest) = formatter.finish() {
+                                if speaking != Some(job) {
+                                    emit(Event::Output(format!("── {label} ──\n")));
+                                }
+                                emit(Event::Output(rest));
+                            }
+                            speaking = None;
+                        }
+                        match job {
+                            Job::Stage(index) => {
+                                run.cursor = index;
+                                conclude(run, &prepared, result, cancel, emit)?;
+                            }
+                            Job::Candidate(index, c) => {
+                                run.cursor = index;
+                                if let Err(error) = run.finish_candidate(
+                                    (index, c),
+                                    &prepared,
+                                    &cwd,
+                                    result,
+                                    cancel,
+                                    emit,
+                                ) {
+                                    run.stop_candidate(
+                                        index,
+                                        c,
+                                        Status::Failed,
+                                        format!(
+                                            "Could not complete candidate bookkeeping: {error:#}"
+                                        ),
+                                        Actor::Engine,
+                                    )?;
+                                }
+                                if run.fan_out_done(index) {
+                                    run.settle_fan_out(index, cancel.load(Ordering::Relaxed))?;
+                                }
+                                run.persist()?;
+                                emit(Event::State(Box::new(run.clone())));
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            // Running harnesses end promptly; the scope waits for them.
+            cancel.store(true, Ordering::Relaxed);
+        }
+        result
+    });
+    result?;
+    // Rounds the run stopped before every candidate started.
+    for index in 0..run.stages.len() {
+        if only.is_some_and(|only| only != index)
+            || run.stages[index].status != Status::Running
+            || run.stages[index].fan_out.is_none()
+        {
+            continue;
+        }
+        let count = run.stages[index]
+            .fan_out
+            .as_ref()
+            .map_or(0, |f| f.candidates.len());
+        for c in 0..count {
+            if run.candidate(index, c).status == Status::Pending {
+                run.stop_candidate(
+                    index,
+                    c,
+                    Status::Cancelled,
+                    "Not started: the run stopped first".into(),
+                    Actor::Engine,
+                )?;
+            }
+        }
+        run.settle_fan_out(index, true)?;
+    }
+    if only.is_none() {
+        run.settle()?;
     }
     run.persist()?;
     emit(Event::State(Box::new(run.clone())));
+    Ok((interactive, started))
+}
+
+/// Runs the current fan-out stage of a list workflow: its candidates side
+/// by side, then its judgement.
+fn execute_fan_out(run: &mut Run, cancel: &AtomicBool, emit: &mut impl FnMut(Event)) -> Result<()> {
+    let index = run.cursor;
+    let attempts = run.stages[index].attempts.len();
+    if let Err(error) = run.start_fan_out(index) {
+        let recorded = run.stages[index].attempts.len() > attempts;
+        run.stop(
+            Status::Failed,
+            format!("{error:#}"),
+            Actor::Engine,
+            recorded,
+        )?;
+        run.persist()?;
+        emit(Event::State(Box::new(run.clone())));
+        return Ok(());
+    }
+    emit(Event::State(Box::new(run.clone())));
+    schedule(run, cancel, emit, Some(index))?;
     Ok(())
+}
+
+/// `drive` for a dependency graph: ready stages side by side where safe.
+fn drive_graph(run: &mut Run, cancel: &AtomicBool, emit: &mut impl FnMut(Event)) -> Result<Action> {
+    loop {
+        match run.status {
+            Status::AwaitingConfirmation => return Ok(Action::Confirm),
+            Status::Interactive => return Ok(Action::Interactive),
+            Status::Failed | Status::Blocked | Status::Cancelled => {
+                save_changes(run);
+                run.persist()?;
+                return Ok(Action::Stopped);
+            }
+            Status::Running => {
+                run.recover()?;
+                run.persist()?;
+                return Ok(Action::Stopped);
+            }
+            _ => {}
+        }
+        if run
+            .stages
+            .iter()
+            .all(|s| matches!(s.status, Status::Complete | Status::Skipped))
+        {
+            run.cursor = run.stages.len();
+            run.set(
+                Target::Run,
+                Status::Complete,
+                Actor::Engine,
+                "All enabled stages complete",
+            )?;
+            run.error = None;
+            run.persist()?;
+            save_changes(run);
+            emit(Event::State(Box::new(run.clone())));
+            return Ok(Action::Complete);
+        }
+        if cancel.load(Ordering::Relaxed) {
+            run.cursor = run.focus();
+            run.stop(
+                Status::Cancelled,
+                "Run cancelled before the next stage".into(),
+                Actor::User,
+                false,
+            )?;
+            run.persist()?;
+            save_changes(run);
+            return Ok(Action::Stopped);
+        }
+        run.hold = Some(Hold::default());
+        let scheduled = schedule(run, cancel, emit, None);
+        run.hold = None;
+        let (interactive, started) = scheduled?;
+        if run.status == Status::Pending {
+            if let Some(index) = interactive {
+                run.cursor = index;
+                let reason = format!(
+                    "Stage {} waits for its terminal",
+                    run.workflow.stages[index].name
+                );
+                run.set(Target::Run, Status::Interactive, Actor::Engine, reason)?;
+                run.persist()?;
+                emit(Event::State(Box::new(run.clone())));
+                return Ok(Action::Interactive);
+            }
+            ensure!(
+                started > 0,
+                "No stage can start; inspect the run's stage states"
+            );
+        }
+    }
 }
 
 /// Saves the patch of this run's changes to changes.diff; best effort, like
@@ -1668,7 +3300,12 @@ fn lock_run(run: &Run) -> Result<(storage::FileLock, storage::FileLock)> {
 fn stop_orphans(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
     let mut changed = false;
     for state in &mut run.stages {
-        for attempt in &mut state.attempts {
+        let candidates = state
+            .fan_out
+            .iter_mut()
+            .flat_map(|f| &mut f.candidates)
+            .flat_map(|c| &mut c.attempts);
+        for attempt in state.attempts.iter_mut().chain(candidates) {
             let Some(pgid) = attempt.process_group.take() else {
                 continue;
             };
@@ -1692,6 +3329,9 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
     let (_lock, _workspace_lock) = lock_run(run)?;
     run.check_revision()?;
     stop_orphans(run, &mut emit)?;
+    if run.graph() {
+        return drive_graph(run, cancel, &mut emit);
+    }
     loop {
         match run.status {
             Status::AwaitingConfirmation => return Ok(Action::Confirm),
@@ -1707,6 +3347,7 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
                     .get(run.cursor)
                     .and_then(|s| s.attempts.last())
                     .is_some_and(|a| a.status == Status::Running);
+                run.interrupt_candidates(INTERRUPTED)?;
                 run.stop(
                     Status::Failed,
                     "A previous execution was interrupted. Inspect artifacts and retry explicitly"
@@ -1772,7 +3413,11 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
             emit(Event::State(Box::new(run.clone())));
             return Ok(Action::Interactive);
         }
-        execute_stage(run, cancel, None, &mut emit)?;
+        if run.workflow.stages[run.cursor].fan_out.is_some() {
+            execute_fan_out(run, cancel, &mut emit)?;
+        } else {
+            execute_stage(run, cancel, None, &mut emit)?;
+        }
     }
 }
 
@@ -2056,6 +3701,7 @@ mod tests {
                 max_repair_passes: 0,
                 sandbox_default: Default::default(),
                 budget: Default::default(),
+                max_parallel: 2,
                 stages: vec![
                     Stage {
                         harness: "mock".into(),

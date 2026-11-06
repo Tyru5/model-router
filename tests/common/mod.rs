@@ -7,10 +7,30 @@ use model_router::{
 use std::{collections::BTreeMap, fs, path::Path, sync::atomic::AtomicBool};
 
 pub fn fixture(stages: Vec<Stage>) -> (tempfile::TempDir, Settings, Run) {
-    let dir = tempfile::Builder::new()
+    let dir = tempdir();
+    let workflow = workflow(stages);
+    let settings = settings(&workflow);
+    let run = create(dir.path(), &settings, &workflow);
+    (dir, settings, run)
+}
+pub fn tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
         .prefix("router test 雪 ")
         .tempdir()
-        .unwrap();
+        .unwrap()
+}
+pub fn workflow(stages: Vec<Stage>) -> Workflow {
+    Workflow {
+        name: "Test".into(),
+        max_repair_passes: 2,
+        max_parallel: 2,
+        sandbox_default: Default::default(),
+        budget: Default::default(),
+        stages,
+    }
+}
+/// Settings with the offline mock adapter and `workflow` saved.
+pub fn settings(workflow: &Workflow) -> Settings {
     let adapter = CustomAdapter {
         command: "python3".into(),
         args: vec![
@@ -26,13 +46,6 @@ pub fn fixture(stages: Vec<Stage>) -> (tempfile::TempDir, Settings, Run) {
         ],
         ..CustomAdapter::default()
     };
-    let workflow = Workflow {
-        name: "Test".into(),
-        max_repair_passes: 2,
-        sandbox_default: Default::default(),
-        budget: Default::default(),
-        stages,
-    };
     // Saved configs gain an enabled Codex summary on load; opt out to stay offline.
     let mut saved = workflow.clone();
     if !saved.stages.iter().any(|s| s.role == Role::Summary) {
@@ -41,20 +54,21 @@ pub fn fixture(stages: Vec<Stage>) -> (tempfile::TempDir, Settings, Run) {
             ..stage("summary", Role::Summary)
         });
     }
-    let settings = Settings {
+    Settings {
         workflows: vec![saved],
         adapters: BTreeMap::from([("mock".into(), adapter)]),
         ..Settings::default()
-    };
-    let run = Run::create(
-        dir.path(),
-        &settings,
-        &workflow,
+    }
+}
+pub fn create(dir: &Path, settings: &Settings, workflow: &Workflow) -> Run {
+    Run::create(
+        dir,
+        settings,
+        workflow,
         "Original task: preserve 雪 and $(touch NEVER) literally".into(),
         false,
     )
-    .unwrap();
-    (dir, settings, run)
+    .unwrap()
 }
 pub fn stage(id: &str, role: Role) -> Stage {
     Stage {
@@ -75,4 +89,57 @@ pub fn count(path: &Path, role: &str) -> u32 {
         .unwrap_or_else(|_| "0".into())
         .parse()
         .unwrap()
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// A repository with one commit by the host's human identity, plus an
+/// uncommitted draft; None when that identity is unset, as tests never
+/// invent commit authorship.
+pub fn repository(dir: &Path) -> Option<()> {
+    let identity = |key| {
+        let output = std::process::Command::new("git")
+            .args(["config", "--get", key])
+            .output()
+            .unwrap();
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let (Some(name), Some(email)) = (identity("user.name"), identity("user.email")) else {
+        eprintln!("Skipping Git fixture: configure the human git identity first");
+        return None;
+    };
+    git(dir, &["init", "-q"]);
+    git(dir, &["config", "user.name", &name]);
+    git(dir, &["config", "user.email", &email]);
+    fs::write(dir.join("tracked.txt"), "original\n").unwrap();
+    git(dir, &["add", "tracked.txt"]);
+    git(
+        dir,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "Test fixture",
+        ],
+    );
+    fs::write(dir.join("draft.txt"), "uncommitted draft\n").unwrap();
+    Some(())
 }

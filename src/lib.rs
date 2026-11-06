@@ -7,6 +7,8 @@ pub mod cost;
 pub mod doctor;
 pub mod engine;
 pub mod events;
+pub mod fanout;
+pub mod graph;
 pub mod handoff;
 pub mod harness;
 pub mod harness_settings;

@@ -119,8 +119,9 @@ pub fn samples(run: &Run) -> Vec<Sample> {
         let Some(last) = state.attempts.last() else {
             continue;
         };
-        // The router ships; no harness or model to rate.
-        if stage.role == Role::Ship {
+        // The router ships; no harness or model to rate. A fan-out round is
+        // several assignments at once, not one.
+        if stage.role == Role::Ship || state.fan_out.is_some() {
             continue;
         }
         if matches!(state.status, Status::Running | Status::Interactive)

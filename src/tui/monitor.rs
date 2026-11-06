@@ -11,7 +11,7 @@ use super::{
 use crate::{
     adapters,
     config::Mode,
-    engine::{Cmd, Status},
+    engine::{self, Cmd, Status},
     storage,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -372,6 +372,17 @@ fn running_cost(app: &App, run: &crate::engine::Run) -> String {
     text
 }
 
+/// Stage rows plus fan-out candidate rows in the progress table.
+fn progress_rows(run: &engine::Run) -> usize {
+    run.stages.len()
+        + run
+            .stages
+            .iter()
+            .filter_map(|s| s.fan_out.as_ref())
+            .map(|f| f.candidates.len())
+            .sum::<usize>()
+}
+
 pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
     let Some(run) = &app.focused.run else {
         empty_state(
@@ -387,7 +398,7 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length((run.stages.len() as u16 + 3).min(10)),
+        Constraint::Length((progress_rows(run) as u16 + 3).min(10)),
         Constraint::Min(3),
     ])
     .split(area);
@@ -436,36 +447,91 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
         .stages
         .iter()
         .map(|s| s.name.chars().count() as u16)
+        .chain(
+            run.stages
+                .iter()
+                .filter_map(|s| s.fan_out.as_ref())
+                .flat_map(|f| &f.candidates)
+                .map(|c| (c.id.len() + c.harness.len() + c.model.len() + 8) as u16),
+        )
         .max()
         .unwrap_or(0)
         .clamp(16, 40);
-    let rows = run
-        .stages
-        .iter()
-        .zip(&run.workflow.stages)
-        .map(|(state, stage)| {
-            let seconds = state.attempts.last().map(|a| {
-                (a.finished_at.unwrap_or_else(chrono::Utc::now) - a.started_at)
-                    .num_seconds()
-                    .max(0)
-            });
-            Row::new([
-                Cell::from(stage.name.clone()),
-                Cell::from(palette.status_span(state.status)),
-                Cell::from(state.attempts.len().to_string())
+    let seconds = |attempt: Option<&engine::Attempt>| {
+        attempt.map(|a| {
+            (a.finished_at.unwrap_or_else(chrono::Utc::now) - a.started_at)
+                .num_seconds()
+                .max(0)
+        })
+    };
+    let mut rows = vec![];
+    // The cursor's row, counting the candidate rows above it.
+    let mut selected = 0;
+    for (index, (state, stage)) in run.stages.iter().zip(&run.workflow.stages).enumerate() {
+        if index == run.cursor.min(run.stages.len().saturating_sub(1)) {
+            selected = rows.len();
+        }
+        rows.push(Row::new([
+            Cell::from(stage.name.clone()),
+            Cell::from(palette.status_span(state.status)),
+            Cell::from(state.attempts.len().to_string()).style(Style::default().fg(palette.muted)),
+            Cell::from(checks_cell(
+                state
+                    .attempts
+                    .last()
+                    .into_iter()
+                    .flat_map(|a| a.checks.iter().map(|c| c.status)),
+            ))
+            .style(Style::default().fg(palette.muted)),
+            Cell::from(
+                seconds(state.attempts.last())
+                    .map(elapsed)
+                    .unwrap_or_else(|| "–".into()),
+            )
+            .style(Style::default().fg(palette.muted)),
+        ]));
+        // Fan-out candidates, indented under their stage; ★ marks the choice.
+        let Some(fan) = &state.fan_out else {
+            continue;
+        };
+        let chosen = fan.selection.as_ref().map(|s| s.candidate.as_str());
+        for candidate in &fan.candidates {
+            rows.push(Row::new([
+                Cell::from(format!(
+                    "  {} {} · {}",
+                    if chosen == Some(candidate.id.as_str()) {
+                        "★"
+                    } else {
+                        "↳"
+                    },
+                    candidate.id,
+                    if candidate.model.is_empty() {
+                        candidate.harness.clone()
+                    } else {
+                        format!("{} {}", candidate.harness, candidate.model)
+                    }
+                ))
+                .style(Style::default().fg(palette.muted)),
+                Cell::from(palette.status_span(candidate.status)),
+                Cell::from(candidate.attempts.len().to_string())
                     .style(Style::default().fg(palette.muted)),
                 Cell::from(checks_cell(
-                    state
+                    candidate
                         .attempts
                         .last()
                         .into_iter()
                         .flat_map(|a| a.checks.iter().map(|c| c.status)),
                 ))
                 .style(Style::default().fg(palette.muted)),
-                Cell::from(seconds.map(elapsed).unwrap_or_else(|| "–".into()))
-                    .style(Style::default().fg(palette.muted)),
-            ])
-        });
+                Cell::from(
+                    seconds(candidate.attempts.last())
+                        .map(elapsed)
+                        .unwrap_or_else(|| "–".into()),
+                )
+                .style(Style::default().fg(palette.muted)),
+            ]));
+        }
+    }
     frame.render_stateful_widget(
         Table::new(
             rows,
@@ -487,8 +553,7 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
         .highlight_spacing(HighlightSpacing::Always)
         .row_highlight_style(palette.selected_style()),
         chunks[2],
-        &mut TableState::default()
-            .with_selected(Some(run.cursor.min(run.stages.len().saturating_sub(1)))),
+        &mut TableState::default().with_selected(Some(selected)),
     );
     let cols = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(chunks[3]);

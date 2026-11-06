@@ -60,6 +60,7 @@ fn run_probe(mode: Sandbox) -> (tempfile::TempDir, Run) {
         ..CustomAdapter::default()
     };
     let workflow = Workflow {
+        max_parallel: 2,
         name: "Sandbox".into(),
         max_repair_passes: 0,
         budget: Default::default(),
@@ -137,6 +138,7 @@ fn interactive_harnesses_keep_their_terminal_inside_the_sandbox() {
     let attempt = dir.path().join("attempt");
     fs::create_dir(&attempt).unwrap();
     let workflow = Workflow {
+        max_parallel: 2,
         name: "w".into(),
         max_repair_passes: 0,
         budget: Default::default(),

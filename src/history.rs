@@ -576,7 +576,8 @@ pub fn size(path: &Path) -> u64 {
     }
 }
 
-/// A run's directory, then its handoff directories in the project or its worktree.
+/// A run's directory, then its handoff directories in the project or its
+/// worktree, then its fan-out candidates' worktrees.
 fn artifacts(project: &Path, entry: &Entry) -> Vec<PathBuf> {
     let id = entry.id();
     let root = project.join(".model-router");
@@ -586,6 +587,7 @@ fn artifacts(project: &Path, entry: &Entry) -> Vec<PathBuf> {
             .join(id)
             .join(".model-router/handoffs")
             .join(id),
+        root.join("candidates").join(id),
     ];
     std::iter::once(entry.dir(project))
         .chain(
@@ -596,7 +598,8 @@ fn artifacts(project: &Path, entry: &Entry) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Bytes in a run's directory and handoff files. Worktrees are not counted.
+/// Bytes in a run's directory, handoff files, and candidate worktrees. The
+/// run's own worktree is not counted.
 pub fn run_size(project: &Path, entry: &Entry) -> u64 {
     artifacts(project, entry)
         .iter()
@@ -788,6 +791,11 @@ fn remove(project: &Path, item: &Item) -> Result<Item> {
             done.note = Some(format!("Worktree kept: {error:#}"));
         }
     }
+    // Candidate worktrees are the router's own, kept for inspection only.
+    crate::fanout::remove_worktrees(
+        project,
+        &project.join(".model-router/candidates").join(&item.id),
+    )?;
     for (path, _) in item.paths.iter().rev() {
         remove_path(path).with_context(|| format!("Remove {}", path.display()))?;
     }

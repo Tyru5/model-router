@@ -915,6 +915,7 @@ pub fn execute(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
         session: None,
         process_group: None,
         handoff_source: None,
+        worktree: None,
     });
     let reason = format!(
         "Ship attempt {number} started{}",

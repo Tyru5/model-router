@@ -100,6 +100,10 @@
     "next_steps": {
       "type": "array",
       "items": { "type": "string" }
+    },
+    "selected": {
+      "type": "string",
+      "description": "Fan-out judge stages only: the id of the chosen candidate."
     }
   },
   "required": ["summary", "verdict"],

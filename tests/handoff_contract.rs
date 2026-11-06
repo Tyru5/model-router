@@ -104,6 +104,7 @@ fn preview(versions: Option<&str>) -> String {
     };
     let settings = Settings {
         workflows: vec![Workflow {
+            max_parallel: 2,
             name: "Native".into(),
             max_repair_passes: 0,
             budget: Default::default(),

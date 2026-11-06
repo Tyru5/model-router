@@ -782,6 +782,7 @@ mod tests {
                 max_repair_passes: 0,
                 sandbox_default: Default::default(),
                 budget: Default::default(),
+                max_parallel: 2,
                 stages: vec![Stage {
                     id: "research".into(),
                     name: "research".into(),

@@ -1,5 +1,5 @@
 //! Editable starting points; presets never change saved workflows automatically.
-use crate::config::{Mode, Role, Stage, Workflow};
+use crate::config::{Candidate, FanOut, Mode, Role, Stage, Workflow};
 
 pub struct StagePreset {
     pub key: &'static str,
@@ -123,6 +123,13 @@ pub const STAGES: &[StagePreset] = &[
         instructions: "Review the implementation and verification evidence against the original task. Inspect changed code and affected callers for correctness, regressions, maintainability, and missing coverage. Do not modify project files. Separate blocking findings from advisory suggestions, cite concrete evidence, and return an explicit pass or needs_changes verdict. Blocking findings and failed required checks request implementation repairs.",
     },
     StagePreset {
+        key: "judge",
+        name: "Judge candidates",
+        role: Role::Review,
+        purpose: "Compare a fan-out stage's candidates and choose the one to apply.",
+        instructions: "Compare the fan-out candidates listed below against the original task. Read each candidate's handoff, router check results, and patch, and inspect its worktree with read-only commands. Weigh correctness, completeness, test evidence, and the size and risk of each change. Do not modify any files. Choose exactly one complete candidate in selected with verdict pass, and explain in summary why it beats the others; return blocked if no candidate is acceptable.",
+    },
+    StagePreset {
         key: "security",
         name: "Security review",
         role: Role::Review,
@@ -171,6 +178,9 @@ pub struct WorkflowPreset {
     pub name: &'static str,
     pub purpose: &'static str,
     pub stages: &'static [&'static str],
+    /// Candidates `(harness, model)` for a best-of-N implement stage, judged
+    /// by the judge stage.
+    pub candidates: &'static [(&'static str, &'static str)],
 }
 
 impl WorkflowPreset {
@@ -180,14 +190,37 @@ impl WorkflowPreset {
             max_repair_passes: 2,
             sandbox_default: Default::default(),
             budget: Default::default(),
+            max_parallel: if self.candidates.is_empty() {
+                2
+            } else {
+                self.candidates.len() as u32
+            },
             stages: self
                 .stages
                 .iter()
                 .map(|key| {
                     let mut stage = stage(key).build();
                     // Selecting a workflow must never implicitly opt into a
-                    // review, or into the router committing.
-                    stage.enabled = !matches!(stage.role, Role::Review | Role::Ship);
+                    // review, or into the router committing; a judge chooses a
+                    // candidate rather than gating.
+                    let judge = *key == "judge" && !self.candidates.is_empty();
+                    stage.enabled = !matches!(stage.role, Role::Review | Role::Ship) || judge;
+                    if *key == "implement" && !self.candidates.is_empty() {
+                        // Candidates run side by side, so unattended.
+                        stage.mode = Mode::Unattended;
+                        stage.fan_out = Some(FanOut {
+                            candidates: self
+                                .candidates
+                                .iter()
+                                .map(|(harness, model)| Candidate {
+                                    harness: (*harness).into(),
+                                    model: (*model).into(),
+                                    ..Candidate::default()
+                                })
+                                .collect(),
+                            judge: "judge".into(),
+                        });
+                    }
                     stage
                 })
                 .collect(),
@@ -201,6 +234,7 @@ pub const WORKFLOWS: &[WorkflowPreset] = &[
         name: "Quick task",
         purpose: "Implement a clear task, verify it, optionally review, and summarize for you.",
         stages: &["implement", "verify", "review", "summary", "ship"],
+        candidates: &[],
     },
     WorkflowPreset {
         key: "full-feature",
@@ -219,6 +253,7 @@ pub const WORKFLOWS: &[WorkflowPreset] = &[
             "summary",
             "ship",
         ],
+        candidates: &[],
     },
     WorkflowPreset {
         key: "bug-fix",
@@ -232,12 +267,25 @@ pub const WORKFLOWS: &[WorkflowPreset] = &[
             "summary",
             "ship",
         ],
+        candidates: &[],
     },
     WorkflowPreset {
         key: "investigation",
         name: "Investigation",
         purpose: "Research a question and summarize findings without implementation.",
         stages: &["research", "summary"],
+        candidates: &[],
+    },
+    WorkflowPreset {
+        key: "best-of-3",
+        name: "Best-of-3 implement",
+        purpose: "Research, implement with three harnesses side by side, let a judge pick one, verify, and summarize.",
+        stages: &["research", "implement", "judge", "verify", "summary"],
+        candidates: &[
+            ("claude", "sonnet"),
+            ("codex", "gpt-6-astra"),
+            ("opencode", ""),
+        ],
     },
 ];
 
@@ -252,7 +300,9 @@ pub fn listing() -> String {
             preset.purpose
         ));
     }
-    text.push_str("\nWORKFLOW PRESETS (reviews start disabled, as does ship)\n");
+    text.push_str(
+        "\nWORKFLOW PRESETS (reviews start disabled, as does ship; fan-out judges start enabled)\n",
+    );
     for preset in WORKFLOWS {
         text.push_str(&format!(
             "  {} — {}\n    {}\n",
@@ -280,6 +330,7 @@ mod tests {
                     max_repair_passes: 0,
                     sandbox_default: Default::default(),
                     budget: Default::default(),
+                    max_parallel: 2,
                     stages: vec![preset.build()],
                 }],
                 ..Settings::default()
@@ -297,15 +348,60 @@ mod tests {
             let loaded: Settings =
                 toml::from_str(&toml::to_string_pretty(&settings).unwrap()).unwrap();
             loaded.validate().unwrap();
+            let judges: Vec<&str> = loaded.workflows[0]
+                .stages
+                .iter()
+                .filter_map(|s| s.fan_out.as_ref().map(|f| f.judge.as_str()))
+                .collect();
             assert!(
                 loaded.workflows[0]
                     .stages
                     .iter()
-                    .filter(|s| matches!(s.role, Role::Review | Role::Ship))
+                    .filter(|s| {
+                        matches!(s.role, Role::Review | Role::Ship)
+                            && !judges.contains(&s.id.as_str())
+                    })
                     .all(|s| !s.enabled)
+            );
+            assert!(
+                loaded.workflows[0]
+                    .stages
+                    .iter()
+                    .filter(|s| judges.contains(&s.id.as_str()))
+                    .all(|s| s.enabled)
             );
             assert_eq!(loaded.workflows[0].stages.len(), preset.stages.len());
         }
+    }
+
+    #[test]
+    fn best_of_three_fans_out_implementation_to_a_judge() {
+        let workflow = WORKFLOWS
+            .iter()
+            .find(|p| p.key == "best-of-3")
+            .unwrap()
+            .build();
+        let ids: Vec<&str> = workflow.stages.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["research", "implement", "judge", "verify", "summary"]);
+        let implement = &workflow.stages[1];
+        assert_eq!(implement.mode, Mode::Unattended);
+        let fan = implement.fan_out.as_ref().unwrap();
+        assert_eq!(fan.judge, "judge");
+        let harnesses: Vec<(&str, &str)> = fan
+            .candidates
+            .iter()
+            .map(|c| (c.harness.as_str(), c.model.as_str()))
+            .collect();
+        assert_eq!(
+            harnesses,
+            [
+                ("claude", "sonnet"),
+                ("codex", "gpt-6-astra"),
+                ("opencode", "")
+            ]
+        );
+        assert!(workflow.stages[2].enabled && workflow.stages[2].role == Role::Review);
+        assert_eq!(crate::graph::judge_of(&workflow, 1), Some(2));
     }
 
     #[test]

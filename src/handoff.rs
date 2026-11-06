@@ -99,6 +99,9 @@ pub struct Handoff {
     pub next_steps: Vec<String>,
     #[serde(default = "yes")]
     pub structured: bool,
+    /// The fan-out candidate a judge stage chose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<String>,
 }
 fn yes() -> bool {
     true
@@ -119,6 +122,7 @@ impl Handoff {
             artifacts: vec![],
             confidence: None,
             next_steps: vec![],
+            selected: None,
             structured: false,
         }
     }
@@ -1851,6 +1855,7 @@ mod tests {
             }],
             confidence: Some(Confidence::Low),
             next_steps: vec!["n".into()],
+            selected: Some("c1".into()),
             ..Handoff::unstructured("s".into())
         };
         let mut value = serde_json::to_value(&full).unwrap();
@@ -1974,7 +1979,7 @@ mod tests {
             "boolean"
         );
         // What Codex returns under it: every field, nulls for unset scalars.
-        let native = r#"{"schema_version":2,"summary":"Reviewed","verdict":"needs_changes","findings":[{"severity":"blocking","description":"bug"}],"decisions":[],"files_changed":[],"tests":[],"unresolved":[],"not_applicable":null,"artifacts":[{"kind":"file","path_or_url":"a.rs","description":null}],"confidence":null,"next_steps":[]}"#;
+        let native = r#"{"schema_version":2,"summary":"Reviewed","verdict":"needs_changes","findings":[{"severity":"blocking","description":"bug"}],"decisions":[],"files_changed":[],"tests":[],"unresolved":[],"not_applicable":null,"artifacts":[{"kind":"file","path_or_url":"a.rs","description":null}],"confidence":null,"next_steps":[],"selected":null}"#;
         let mut errors = vec![];
         validate(
             &serde_json::from_str(native).unwrap(),

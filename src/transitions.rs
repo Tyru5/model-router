@@ -35,12 +35,16 @@ impl Actor {
     }
 }
 
-/// Whose status changes. `Attempt(stage)` is that stage's latest attempt.
+/// Whose status changes. `Attempt(stage)` is that stage's latest attempt;
+/// `Candidate(stage, n)` is fan-out candidate `n` of that stage, and
+/// `CandidateAttempt(stage, n)` its latest attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     Run,
     Stage(usize),
     Attempt(usize),
+    Candidate(usize, usize),
+    CandidateAttempt(usize, usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +53,8 @@ pub enum Level {
     Run,
     Stage,
     Attempt,
+    /// A fan-out candidate of a stage.
+    Candidate,
 }
 impl Level {
     pub fn label(self) -> &'static str {
@@ -56,6 +62,7 @@ impl Level {
             Self::Run => "run",
             Self::Stage => "stage",
             Self::Attempt => "attempt",
+            Self::Candidate => "candidate",
         }
     }
 }
@@ -71,6 +78,9 @@ pub struct Record {
     /// The attempt's number, for attempt records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt: Option<usize>,
+    /// The fan-out candidate's ID, for candidate records and their attempts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<String>,
     pub from: Status,
     pub to: Status,
     pub reason: String,
@@ -147,6 +157,7 @@ mod tests {
             level: Level::Run,
             stage_index: None,
             attempt: None,
+            candidate: None,
             from: Status::Pending,
             to,
             reason: "test".into(),
