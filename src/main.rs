@@ -116,6 +116,20 @@ enum Commands {
         #[arg(long)]
         notify: bool,
     },
+    /// Commit a completed run's changes on a new branch, after a preview.
+    /// Uses the run's ship stage options, else the defaults.
+    Ship {
+        id: String,
+        /// Push the branch with --set-upstream.
+        #[arg(long)]
+        push: bool,
+        /// Open a draft pull request with gh; implies --push.
+        #[arg(long)]
+        draft_pr: bool,
+        /// Ship without asking after the preview.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Start a new run from a saved run's task and workflow snapshot.
     Rerun {
         id: String,
@@ -632,6 +646,12 @@ fn main_result() -> Result<()> {
             }
             cli_drive(&mut run, &cancel, notify::cli_enabled(notify))?;
         }
+        Some(Commands::Ship {
+            id,
+            push,
+            draft_pr,
+            yes,
+        }) => ship_command(&project, &id, push, draft_pr, yes)?,
         Some(Commands::Rerun {
             id,
             worktree,
@@ -722,6 +742,51 @@ fn main_result() -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn ship_command(project: &Path, id: &str, push: bool, draft_pr: bool, yes: bool) -> Result<()> {
+    use model_router::{ship, storage};
+    use std::time::Duration;
+    let wait = Duration::from_secs(2);
+    let run = engine::load(project, id)?;
+    let _run_lock = storage::lock_wait(&run.directory.join("run.lock"), wait)?;
+    let _workspace_lock = if run.workspace.is_dir() {
+        Some(storage::lock_wait(
+            &storage::metadata_dir(&run.workspace)?.join("workspace.lock"),
+            wait,
+        )?)
+    } else {
+        None
+    };
+    let run = engine::load(project, id)?;
+    let mut options = ship::run_options(&run);
+    options.push |= push || draft_pr;
+    options.draft_pr |= draft_pr;
+    let (plan, dir) = ship::plan_completed(&run, &options)?;
+    print!("{}", plan.preview());
+    println!("Plan saved in {}", dir.display());
+    if !yes {
+        ensure!(
+            io::stdin().is_terminal(),
+            "Nothing shipped. Add --yes to ship this plan without asking"
+        );
+        print!("Ship it? [y/N] ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            println!("Nothing shipped.");
+            return Ok(());
+        }
+    }
+    let outcome = ship::apply(&plan, &dir, |line| print!("{line}"));
+    for line in outcome.lines() {
+        println!("{line}");
+    }
+    if let Some(error) = &outcome.error {
+        bail!("Ship stopped: {error}");
     }
     Ok(())
 }
@@ -930,6 +995,33 @@ fn cli_drive(run: &mut Run, cancel: &AtomicBool, notify: bool) -> Result<()> {
                     );
                 }
                 cli_interactive(run, cancel)?;
+            }
+            Action::Confirm if run.workflow.stages[run.cursor].role == Role::Ship => {
+                // The preview was printed as stage output.
+                ensure!(
+                    io::stdin().is_terminal(),
+                    "The ship plan awaits confirmation. Use resume {} --advance to ship it",
+                    run.id
+                );
+                print!("[a] Ship as previewed  [r] Plan again  [q] Save and stop: ");
+                io::stdout().flush()?;
+                let mut answer = String::new();
+                io::stdin().read_line(&mut answer)?;
+                match answer.trim() {
+                    "a" => run.command(Cmd::Confirm)?,
+                    "r" => run.command(Cmd::Retry {
+                        interactive: false,
+                        model: None,
+                    })?,
+                    _ => {
+                        println!(
+                            "Saved. Ship with: model-router -C {} resume {} --advance",
+                            shell_words::quote(&run.project.display().to_string()),
+                            run.id
+                        );
+                        return Ok(());
+                    }
+                }
             }
             Action::Confirm => {
                 if let Some(handoff) = &run.stages[run.cursor].handoff {
