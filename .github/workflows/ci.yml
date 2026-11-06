@@ -91,6 +91,8 @@ jobs:
         run: $SMOKE scripts/smoke_startup.py
       - name: Native terminal detach and reattach
         run: $SMOKE scripts/smoke_detach.py
+      - name: Diff review and external tools
+        run: $SMOKE scripts/smoke_review.py
       # Plain python3: the raw-PTY harness must not need pyte.
       - name: Terminal disconnect and shutdown
         run: python3 scripts/smoke_shutdown.py
