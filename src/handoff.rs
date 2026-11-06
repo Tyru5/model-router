@@ -161,8 +161,37 @@ pub fn parse(text: &str, role: Role) -> Result<Handoff> {
 #[derive(Debug, Default)]
 pub struct Normalized {
     pub text: String,
-    pub error: Option<String>,
+    pub error: Option<ProtocolError>,
     pub permission_blocked: bool,
+}
+
+/// Why a harness's structured output is unusable. Reads as its message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtocolError {
+    /// The harness reported an error event or result.
+    Reported(String),
+    /// A native structured stream with no assistant message. A handoff file
+    /// written by the harness may still stand in for it.
+    NoFinalResponse,
+}
+impl std::ops::Deref for ProtocolError {
+    type Target = str;
+    fn deref(&self) -> &str {
+        match self {
+            Self::Reported(message) => message,
+            Self::NoFinalResponse => "No final assistant response found in harness output",
+        }
+    }
+}
+impl std::fmt::Display for ProtocolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self)
+    }
+}
+impl From<&str> for ProtocolError {
+    fn from(message: &str) -> Self {
+        Self::Reported(message.into())
+    }
 }
 
 /// The harness session an unattended log reports: Codex's `thread.started`
@@ -216,14 +245,14 @@ pub fn normalize(raw: &str, kind: OutputKind) -> Normalized {
                 .flatten()
                 .filter_map(Value::as_str)
                 .collect();
-            result.error = Some(
+            result.error = Some(ProtocolError::Reported(
                 event
                     .get("result")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
                     .or_else(|| (!errors.is_empty()).then(|| errors.join("\n")))
                     .unwrap_or_else(|| "Harness reported an error".into()),
-            );
+            ));
         }
         if event
             .get("permission_denials")
@@ -237,7 +266,10 @@ pub fn normalize(raw: &str, kind: OutputKind) -> Normalized {
             || kind_name == "turn.failed"
             || event.get("error").is_some_and(|v| !v.is_null())
         {
-            result.error = Some(storage::truncate(&event.to_string(), 1500));
+            result.error = Some(ProtocolError::Reported(storage::truncate(
+                &event.to_string(),
+                1500,
+            )));
         }
         match kind {
             OutputKind::Claude | OutputKind::Cursor | OutputKind::Amp => {
@@ -327,7 +359,7 @@ pub fn normalize(raw: &str, kind: OutputKind) -> Normalized {
     }
     // A native structured stream with no assistant message isn't a usable result.
     if !recognized && result.error.is_none() {
-        result.error = Some("No final assistant response found in harness output".into());
+        result.error = Some(ProtocolError::NoFinalResponse);
     }
     result
 }

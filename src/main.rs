@@ -4,7 +4,7 @@ use model_router::{
     catalog,
     config::{self, Mode, Role, Settings},
     doctor,
-    engine::{self, Action, Event, Run, Status},
+    engine::{self, Action, Cmd, Event, Run, Status},
     history::{self, Criteria, Entry, StatusFilter},
     presets, process, providers, task_import, tui,
 };
@@ -61,6 +61,9 @@ enum Commands {
         /// Print the patch of changes made during the run.
         #[arg(long, conflicts_with = "json")]
         diff: bool,
+        /// Include the run's status timeline (transitions.jsonl).
+        #[arg(long, conflicts_with = "diff")]
+        transitions: bool,
     },
     /// Show the exact argument structure without launching a model.
     Preview {
@@ -266,15 +269,26 @@ fn main_result() -> Result<()> {
             settings.workflows.len(),
             config_path.display()
         ),
-        Some(Commands::Report { id, json, diff }) => {
+        Some(Commands::Report {
+            id,
+            json,
+            diff,
+            transitions,
+        }) => {
             use model_router::report;
             let run = engine::load(&project, &id)?;
+            let timeline = transitions.then(|| report::transitions(&run)).transpose()?;
             if diff {
                 print!("{}", report::diff(&run)?);
             } else if json {
                 let mut value = serde_json::to_value(report::build(&run))?;
                 value["changes"] = serde_json::to_value(report::changes(&run))?;
+                if let Some(timeline) = &timeline {
+                    value["transitions"] = serde_json::to_value(timeline)?;
+                }
                 println!("{}", serde_json::to_string_pretty(&value)?);
+            } else if let Some(timeline) = &timeline {
+                print!("{}", report::render_transitions(&run, timeline));
             } else {
                 println!(
                     "Run {} · {}\nArtifacts: {}\n",
@@ -466,13 +480,13 @@ fn main_result() -> Result<()> {
         }) => {
             let mut run = engine::load(&project, &id)?;
             if advance {
-                run.confirm()?;
+                run.command(Cmd::Confirm)?;
             }
             if allow_repair {
-                run.allow_repair()?;
+                run.command(Cmd::AllowRepair)?;
             }
             if retry || interactive || model.is_some() {
-                run.retry(interactive, model)?;
+                run.command(Cmd::Retry { interactive, model })?;
             }
             cli_drive(&mut run, &cancel)?;
         }
@@ -690,8 +704,11 @@ fn cli_drive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
                 let mut answer = String::new();
                 io::stdin().read_line(&mut answer)?;
                 match answer.trim() {
-                    "a" => run.confirm()?,
-                    "r" => run.retry(true, None)?,
+                    "a" => run.command(Cmd::Confirm)?,
+                    "r" => run.command(Cmd::Retry {
+                        interactive: true,
+                        model: None,
+                    })?,
                     _ => {
                         println!(
                             "Saved. Resume with: model-router -C {} resume {}",

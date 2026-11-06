@@ -5,6 +5,7 @@ use crate::{
     engine::{Attempt, Run, Status},
     handoff::{Severity, TestStatus, Usage},
     snapshot::{self, FileChange},
+    transitions::{Level, Record},
 };
 use anyhow::{Result, anyhow};
 use chrono::Utc;
@@ -333,6 +334,53 @@ pub fn diff(run: &Run) -> Result<String> {
         Err(reason) => Err(anyhow!("Changes are unavailable: {reason}")),
     };
     live.or_else(|error| fs::read_to_string(run.directory.join("changes.diff")).map_err(|_| error))
+}
+
+/// The run's saved status changes, oldest first.
+pub fn transitions(run: &Run) -> Result<Vec<Record>> {
+    crate::transitions::read(&run.directory)
+}
+
+/// The status timeline, one change per line: time, run revision, what
+/// changed, from → to, who, and why.
+pub fn render_transitions(run: &Run, records: &[Record]) -> String {
+    let mut text = String::from("Transitions\n");
+    if records.is_empty() {
+        text.push_str("  none recorded\n");
+        return text;
+    }
+    for record in records {
+        let stage = record
+            .stage_index
+            .and_then(|i| run.workflow.stages.get(i))
+            .map_or_else(String::new, |s| s.name.clone());
+        let subject = match (record.level, record.attempt) {
+            (Level::Run, _) => "run".to_owned(),
+            (Level::Stage, _) => stage,
+            (Level::Attempt, Some(number)) => format!("{stage} #{number}"),
+            (Level::Attempt, None) => format!("{stage} #?"),
+        };
+        let _ = writeln!(
+            text,
+            "  {}  r{:<3} {:<20} {} → {}  [{}] {}",
+            record.at.format("%Y-%m-%d %H:%M:%S"),
+            record.run_revision,
+            clip(&subject, 20),
+            record.from.as_str(),
+            record.to.as_str(),
+            record.actor.label(),
+            record.reason.lines().next().unwrap_or("")
+        );
+    }
+    text
+}
+
+fn clip(text: &str, chars: usize) -> String {
+    if text.chars().count() <= chars {
+        text.to_owned()
+    } else {
+        format!("{}…", text.chars().take(chars - 1).collect::<String>())
+    }
 }
 
 pub fn duration(seconds: i64) -> String {

@@ -337,7 +337,10 @@ impl App {
                     .run
                     .as_mut()
                     .context("No run")?
-                    .retry(false, Some(value.trim().into()))?;
+                    .command(engine::Cmd::Retry {
+                        interactive: false,
+                        model: Some(value.trim().into()),
+                    })?;
                 self.start_driver()?;
             }
             InputTarget::RepairLimit => {
