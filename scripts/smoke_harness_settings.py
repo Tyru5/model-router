@@ -78,6 +78,11 @@ mode = "interactive"
             )
             replace(terminal, "cancel-this")
             terminal.send(ESC)
+            terminal.wait(
+                lambda: "Discard changes?" in terminal.text(),
+                "Esc did not ask before discarding the draft",
+            )
+            terminal.send("y")
             assert save(terminal, config) == original, "Cancel changed stage settings"
 
             terminal.send("c")

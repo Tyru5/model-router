@@ -71,7 +71,10 @@ Opening the router does not start a model. Press `p` to choose a repository,
 or disables a stage. `T` chooses a theme. `1`–`4` or `Tab` switch views.
 `?` opens the full keyboard guide. `:` opens a command menu: type to search
 the current view's actions, then press `Enter` to run one. Use `Ctrl+S` to apply
-text/form edits; `Esc` cancels them. `q` saves workflow edits and exits.
+text/form edits; `Esc` cancels them, asking first if an editor has changes.
+`q` and `Ctrl+C` exit; with unsaved workflow edits they ask first (`y` saves,
+`n` discards, `Esc` stays). Page keys need their exact modifiers: `Ctrl+R` is
+not `r`.
 
 In selection menus, including repository and file browsers, `Ctrl+N` moves to
 the next option and `Ctrl+P` to the previous option, just like `↓` and `↑`.
@@ -394,6 +397,9 @@ template set. Global configuration uses your platform's config directory
 `s` saves project templates; `S` saves global templates. `w` chooses, clones,
 or adds a workflow preset; `R` renames and `X` deletes the current workflow.
 `a` adds a stage preset, `d` duplicates it, `J`/`K` move it, and `x` removes it.
+`X` asks before deleting; `u` undoes stage removals and workflow deletions
+(until you switch projects). In the stage editor, `↑`/`↓` move within
+multiline fields and leave them from the first or last line.
 `h` picks the stage's harness and `v` toggles execution mode. `g` toggles an
 isolated Git worktree for the next run. `l` sets the repair limit.
 All fields, including instructions and permission arguments, are editable with `e`.
@@ -445,7 +451,8 @@ the first run's edits, are not part of it. Outside Git, the second run is
 refused instead. `g` still chooses a worktree explicitly.
 
 A new interactive stage takes over the screen only while its run is shown in
-the Monitor. Otherwise it waits, and `i` opens it when you are ready. A workflow
+the Monitor and no dialog is open. Otherwise it waits, and `t` or `i` opens it
+when you are ready. A workflow
 whose first enabled stage is interactive opens the Monitor right away.
 
 ### Detach and reattach an interactive session
@@ -460,13 +467,16 @@ require the harness to support saved-session resume.
 The harness still waits when it needs input or approval. `/exit` (or the
 harness's own quit command) **quits the harness**, rather than detaching.
 After it exits, the router performs the usual checks and handoff inspection.
-`Ctrl+]` stops the attached stage; `c` stops it from the Monitor.
+`Ctrl+]` stops the attached stage; `C` stops it from the Monitor (`y` confirms).
 
 CLI runs use the same **Ctrl+B** shortcut. Their detached waiting view accepts
 `t` to reattach and `c` or `q` to stop, and notices completion without a keypress.
 Detached sessions live only for the current `mr` process: quitting the router
 or losing its terminal still cancels its active runs. In the TUI, `q` quits
-after stopping all active runs; `Ctrl+C` stops them without quitting.
+after stopping all active runs; `Ctrl+C` stops them without quitting. In the
+Monitor, `C` cancels the running stage after a confirmation, and `c` continues
+an idle run (not in the moment a stage stops, so a late `c` cannot start the
+next stage).
 
 ### Take over an unattended stage
 
@@ -475,8 +485,8 @@ assistant text (`●`), tool calls and shell commands (`⚙`, `$`) with a one-li
 result (`↳`), file edits (`✎`), reasoning (`∴`), and errors (`✗`). Hook, delta,
 and bookkeeping events are hidden. `stdout.log` keeps the raw events.
 
-To work in the session yourself, press `t` in the Monitor: the router stops the
-unattended process and reopens the same session in the harness's native
+To work in the session yourself, press `t` in the Monitor and confirm with `y`:
+the router stops the unattended process and reopens the same session in the harness's native
 terminal, with its history, including the stage prompt and handoff path:
 
 | Harness | Session | Reopened with |
@@ -551,8 +561,10 @@ retried most recently; `--source` compares a rerun with its source run.
 
 On the Runs page (`3`), `/` filters as you type (`Enter` keeps, `Esc` clears),
 `f` cycles the status filter, `n` reruns after a confirmation, `c` compares
-attempts, and `D` previews removing the selected run. Sizes load in the
-background. `Enter` on a damaged row shows its error and path.
+attempts, and `D` previews removing the selected run. The list, sizes, and
+new runs load in the background and refresh while runs are active. `Enter`
+opens a run with the tail of its latest output; on a damaged row it shows the
+error and path.
 
 Interactive review and verification stages must write their handoff files;
 terminal echoes are not accepted as verdicts. Other interactive stages without
