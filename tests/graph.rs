@@ -398,6 +398,16 @@ fn a_crashed_candidate_fails_and_retries_alone() {
             && r.level == Level::Candidate
             && r.candidate.as_deref() == Some("c2")
     }));
+    // Candidates run unattended, and a round has no session to take over.
+    for cmd in [
+        Cmd::Retry {
+            interactive: true,
+            model: None,
+        },
+        Cmd::TakeOver,
+    ] {
+        assert!(engine::command(dir.path(), &run.id, Some(run.revision), cmd).is_err());
+    }
     // Only a stopped candidate can be retried.
     assert!(
         engine::command(

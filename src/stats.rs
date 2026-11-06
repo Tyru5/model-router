@@ -119,6 +119,10 @@ pub fn samples(run: &Run) -> Vec<Sample> {
         let Some(last) = state.attempts.last() else {
             continue;
         };
+        // A fan-out round is several assignments at once, not one.
+        if state.fan_out.is_some() {
+            continue;
+        }
         if matches!(state.status, Status::Running | Status::Interactive)
             || state.attempts.iter().any(|a| a.status == Status::Running)
         {

@@ -705,6 +705,10 @@ impl Run {
             "This run is already complete"
         );
         let index = self.cursor;
+        ensure!(
+            !(interactive && self.workflow.stages[index].fan_out.is_some()),
+            "Fan-out candidates run unattended; retry without interactive, or retry one candidate"
+        );
         if self.stages[index]
             .attempts
             .last()
@@ -755,6 +759,10 @@ impl Run {
             "Stop the stage before taking it over"
         );
         let stage = &self.workflow.stages[self.cursor];
+        ensure!(
+            stage.fan_out.is_none(),
+            "Fan-out stages have no session to take over; open a candidate's worktree, or retry one candidate"
+        );
         ensure!(
             adapters::resumable(&stage.harness, &self.adapters),
             "{} sessions cannot be resumed; retry interactively with [i] instead",

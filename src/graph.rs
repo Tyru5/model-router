@@ -152,7 +152,7 @@ impl Ancestry {
 
 /// Checks `after` and fan-out fields; `Settings::validate` also checks harnesses.
 pub fn validate(workflow: &Workflow) -> Result<()> {
-    let ancestry = Ancestry(ancestors(workflow)?);
+    ancestors(workflow)?;
     let graph = is_graph(workflow);
     let stages = &workflow.stages;
     for (index, stage) in stages.iter().enumerate() {
@@ -225,7 +225,6 @@ pub fn validate(workflow: &Workflow) -> Result<()> {
                 judging.id
             );
         }
-        debug_assert!(!graph || ancestry.precedes(index, judge));
     }
     Ok(())
 }
