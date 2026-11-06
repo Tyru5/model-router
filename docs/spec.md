@@ -115,6 +115,14 @@ Cleanup previews selected runs and sizes before removing anything, skips runs
 whose lock is held or that are open, and removes worktrees only when Git can
 without force; branches stay.
 
+Stats aggregate saved runs per role, harness, and model, cached by run revision
+in `.model-router/stats-cache.json`; damaged records are counted and skipped.
+They may suggest an assignment with at least five samples that clearly did
+better, but never change a stage: routing stays the user's explicit choice.
+Benchmarks run each task under each listed assignment, unattended, each in its
+own worktree, and save the results; they refuse interactive stages unless told
+to run them unattended.
+
 ## Adapters and model discovery
 
 Built-in targets: Codex, Claude Code, Pi, Cursor Agent, Gemini CLI, OpenCode,

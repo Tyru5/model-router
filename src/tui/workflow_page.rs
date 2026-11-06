@@ -854,7 +854,8 @@ pub(super) fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palett
             .get(&stage.harness)
             .and_then(|c| c.efforts_for(&stage.model, &stage.provider))
             .map(|efforts| effort_note(stage, &efforts));
-        draw_stage_detail(frame, stage, warning, effort, cols[1], palette);
+        let hint = app.stats_hint(stage);
+        draw_stage_detail(frame, stage, warning, effort, hint, cols[1], palette);
     }
 }
 
@@ -888,6 +889,7 @@ fn draw_stage_detail(
     stage: &Stage,
     warning: Option<String>,
     effort_note: Option<(String, bool)>,
+    hint: Option<String>,
     area: Rect,
     palette: Palette,
 ) {
@@ -976,6 +978,15 @@ fn draw_stage_detail(
             .map(|line| Line::styled(line.to_string(), Style::default().fg(palette.fg))),
     );
     lines.push(Line::raw(""));
+    if let Some(hint) = hint {
+        // Advice from saved runs; the router never applies it.
+        lines.push(Line::styled(
+            hint,
+            Style::default()
+                .fg(palette.muted)
+                .add_modifier(Modifier::DIM),
+        ));
+    }
     lines.push(Line::styled(
         if stage.role == Role::Review {
             "Optional. [Space] toggles it; blocking findings request repairs."
@@ -1220,7 +1231,7 @@ mod tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 50)).unwrap();
         terminal
-            .draw(|frame| draw_stage_detail(frame, stage, None, None, frame.area(), palette))
+            .draw(|frame| draw_stage_detail(frame, stage, None, None, None, frame.area(), palette))
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)

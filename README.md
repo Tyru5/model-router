@@ -113,6 +113,7 @@ the next option and `Ctrl+P` to the previous option, just like `↓` and `↑`.
 - Interactive repository browser, recent projects, and optional Git worktrees.
 - Editable task/spec imports from local files, text URLs, and GitHub issues/files.
 - CLI execution and previews using the same engine as the TUI.
+- Per-model outcome stats from saved runs, with cautious suggestions, and benchmark matrices.
 
 ## Choose a theme
 
@@ -871,6 +872,35 @@ also deletes the run's snapshot refs (`refs/model-router/runs/RUN_ID/`).
 Read-only stage instructions are intent; effective tool access comes from the
 harness. Credentials stay in native configuration/environment variables. Extra
 arguments and task text are part of saved run artifacts.
+
+## Stats and suggestions
+
+`model-router stats [--role R] [--json] [--all-projects]` ranks each
+(role, harness, model) seen in saved runs: samples, success (completed with no
+failed, blocked, or cancelled attempt), mean retries, repairs caused
+(implementation) or requested (review), review first-try pass rate, failures,
+blocks, median duration, reported tokens and cost, and router check pass rate.
+Rows with fewer than five samples are marked `*`. `--all-projects` adds recent
+projects. Damaged records are counted and skipped. Results are cached in
+`.model-router/stats-cache.json` by run revision.
+
+In the TUI, `I` opens the same table. When a stage's role has an assignment
+with at least five samples, a success rate 15 points higher, and no more
+repairs or retries, the selected stage panel shows a dim hint such as
+`History: claude/opus succeeded 9/10 here vs 4/8`. It is advice only; nothing
+changes a stage for you.
+
+## Benchmarks
+
+`model-router bench BENCH.toml [--jobs N] [--dry-run] [--allow-interactive]`
+runs every task under every combination of the stage assignments it lists
+(see [examples/bench.toml](examples/bench.toml)). Each run gets its own Git
+worktree from committed `HEAD` and runs unattended through the normal engine,
+so it appears in history and stats. Interactive stages are refused unless
+`--allow-interactive` runs them unattended. `--dry-run` prints the matrix.
+Results go to `.model-router/bench/bench-TIMESTAMP.json` and `.md`: success,
+checks, repairs, duration, and usage per variant and per run. `Ctrl+C` stops
+running stages and skips the rest.
 
 ## Custom adapters and model-only tools
 

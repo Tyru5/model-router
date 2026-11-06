@@ -29,6 +29,7 @@ mod monitor;
 mod path_picker;
 mod session;
 mod startup;
+mod stats_page;
 mod task_importer;
 #[cfg(test)]
 mod tests;
