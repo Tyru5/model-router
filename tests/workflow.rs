@@ -619,6 +619,7 @@ fn background_children_end_with_a_harness_that_exits_normally() {
         dir.path(),
         Duration::from_secs(10),
         &AtomicBool::new(false),
+        None,
         |pgid| group = Some(pgid),
         |_, _| {},
     )

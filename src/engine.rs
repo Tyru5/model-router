@@ -834,6 +834,7 @@ fn shorten(value: &mut serde_json::Value, chars: usize, items: usize) {
 
 struct Prepared {
     invocation: Invocation,
+    sandbox: Option<crate::sandbox::Plan>,
     directory: PathBuf,
     handoff_file: PathBuf,
 }
@@ -898,9 +899,19 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
             (invocation, session)
         }
     };
+    let sandbox = crate::sandbox::plan(
+        &run.workflow,
+        stage,
+        &crate::sandbox::Paths {
+            workspace: &run.workspace,
+            attempt_dir: &directory,
+            handoff_dir: &handoff_dir,
+            program: &invocation.program,
+        },
+    )?;
     storage::write_json(
         &directory.join("command.json"),
-        &serde_json::json!({ "program": invocation.program, "args": invocation.args, "stdin_from": invocation.stdin.as_ref().map(|_| "prompt.md"), "env": invocation.env.iter().map(|(name, _)| name).collect::<Vec<_>>(), "workspace": run.workspace, "model": stage.model, "provider": stage.provider, "effort": stage.effort, "mode": stage.mode }),
+        &serde_json::json!({ "program": invocation.program, "args": invocation.args, "stdin_from": invocation.stdin.as_ref().map(|_| "prompt.md"), "env": invocation.env.iter().map(|(name, _)| name).collect::<Vec<_>>(), "workspace": run.workspace, "model": stage.model, "provider": stage.provider, "effort": stage.effort, "mode": stage.mode, "sandbox": sandbox }),
     )?;
     run.stages[index].attempts.push(Attempt {
         number,
@@ -927,6 +938,7 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
     run.persist()?;
     Ok(Prepared {
         invocation,
+        sandbox,
         directory,
         handoff_file,
     })
@@ -1188,6 +1200,7 @@ fn execute_stage(
             &prepared.directory,
             cancel,
             session,
+            prepared.sandbox.as_ref(),
             |pgid| record(run, pgid),
         )
     } else {
@@ -1200,6 +1213,7 @@ fn execute_stage(
             &prepared.directory,
             timeout,
             cancel,
+            prepared.sandbox.as_ref(),
             |pgid| record(run, pgid),
             |err, text| {
                 if err {
@@ -1438,6 +1452,9 @@ pub fn preview(
                 ""
             }
         ));
+        if let Some(sandbox) = crate::sandbox::preview(workflow, stage) {
+            text.push_str(&format!("   {sandbox}\n"));
+        }
         for check in &stage.checks {
             text.push_str(&format!(
                 "   check: {} ({}, {}s)\n",
@@ -1573,6 +1590,7 @@ mod tests {
             workflows: vec![Workflow {
                 name: "Interactive".into(),
                 max_repair_passes: 0,
+                sandbox_default: Default::default(),
                 stages: vec![
                     Stage {
                         harness: "mock".into(),

@@ -28,6 +28,59 @@ impl Mode {
     }
 }
 
+/// OS-level filesystem sandbox around a stage's harness; see `sandbox`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub enum Sandbox {
+    /// No router sandbox; the harness's own permissions still apply.
+    #[default]
+    Off,
+    /// The workspace and its Git directory are writable too.
+    WorkspaceWrite,
+    /// Only the attempt, handoff, temporary, and harness state directories are writable.
+    ReadOnly,
+    /// Read-only for research, planning, review, and summary stages;
+    /// workspace-write for the rest.
+    ByRole,
+}
+impl Sandbox {
+    pub const ALL: [Self; 4] = [
+        Self::Off,
+        Self::ReadOnly,
+        Self::WorkspaceWrite,
+        Self::ByRole,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::ReadOnly => "read-only",
+            Self::ByRole => "by-role",
+        }
+    }
+    /// The concrete mode for a stage of `role`.
+    pub fn resolve(self, role: Role) -> Self {
+        match (self, role) {
+            (Self::ByRole, Role::Research | Role::Planning | Role::Review | Role::Summary) => {
+                Self::ReadOnly
+            }
+            (Self::ByRole, _) => Self::WorkspaceWrite,
+            (mode, _) => mode,
+        }
+    }
+}
+
+/// What a stage does when its sandbox cannot be set up.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxFallback {
+    /// Fail the stage; never run it unsandboxed.
+    #[default]
+    Refuse,
+    /// Run unsandboxed and record a warning.
+    Warn,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -88,6 +141,34 @@ pub struct Stage {
     /// Commands the router runs after the harness succeeds, independent of its handoff.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<Check>,
+    /// Router sandbox for this stage; unset inherits the workflow's `sandbox_default`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<Sandbox>,
+    /// Extra paths the sandbox leaves writable (`~/` expands to the home directory).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sandbox_writable: Vec<String>,
+    /// False cuts the sandboxed harness off the network.
+    #[serde(skip_serializing_if = "is_true")]
+    pub sandbox_network: bool,
+    #[serde(skip_serializing_if = "is_refuse")]
+    pub sandbox_fallback: SandboxFallback,
+}
+fn is_true(value: &bool) -> bool {
+    *value
+}
+fn is_refuse(value: &SandboxFallback) -> bool {
+    *value == SandboxFallback::Refuse
+}
+fn is_off(value: &Sandbox) -> bool {
+    *value == Sandbox::Off
+}
+impl Stage {
+    /// The concrete sandbox mode within `workflow`: never `ByRole`.
+    pub fn effective_sandbox(&self, workflow: &Workflow) -> Sandbox {
+        self.sandbox
+            .unwrap_or(workflow.sandbox_default)
+            .resolve(self.role)
+    }
 }
 impl Default for Stage {
     fn default() -> Self {
@@ -107,6 +188,10 @@ impl Default for Stage {
             timeout_seconds: 3600,
             repair_target: String::new(),
             checks: vec![],
+            sandbox: None,
+            sandbox_writable: vec![],
+            sandbox_network: true,
+            sandbox_fallback: SandboxFallback::Refuse,
         }
     }
 }
@@ -136,6 +221,9 @@ pub struct Workflow {
     pub name: String,
     #[serde(default = "two")]
     pub max_repair_passes: u32,
+    /// Sandbox for stages that do not set their own; see `Sandbox`.
+    #[serde(default, skip_serializing_if = "is_off")]
+    pub sandbox_default: Sandbox,
     pub stages: Vec<Stage>,
 }
 fn two() -> u32 {
@@ -172,7 +260,7 @@ impl Workflow {
 }
 impl Default for Workflow {
     fn default() -> Self {
-        Self { name: "Feature development".into(), max_repair_passes: 2, stages: vec![
+        Self { name: "Feature development".into(), max_repair_passes: 2, sandbox_default: Sandbox::Off, stages: vec![
         Stage { id: "research".into(), name: "Investigate".into(), role: Role::Research, model: "gpt-6-astra".into(),
             instructions: "Investigate the task and relevant project files. Explain the root cause or requirements, cite evidence, and propose a concrete implementation plan. Do not change project code.".into(), ..Stage::default() },
         Stage { id: "implement".into(), name: "Implement".into(), role: Role::Implementation, harness: "claude".into(), model: "sonnet".into(), mode: Mode::Interactive,
@@ -302,7 +390,10 @@ pub fn unknown_fields(value: &toml::Value) -> Vec<String> {
     };
     let mut out = vec![];
     extra(value, &keys(&sample), "", &mut out);
-    let workflow = keys(&Workflow::default());
+    let workflow = keys(&Workflow {
+        sandbox_default: Sandbox::ByRole,
+        ..Workflow::default()
+    });
     for (index, item) in value
         .get("workflows")
         .and_then(toml::Value::as_array)
@@ -415,6 +506,14 @@ impl Settings {
                 ensure!(
                     stage.checks.len() <= 16,
                     "Stage {} can have at most 16 checks",
+                    stage.name
+                );
+                ensure!(
+                    stage.sandbox_writable.len() <= 32
+                        && stage.sandbox_writable.iter().all(|p| {
+                            !p.contains('\0') && (p.starts_with('/') || p.starts_with("~/"))
+                        }),
+                    "Stage {} sandbox_writable paths must be absolute or start with ~/ (at most 32)",
                     stage.name
                 );
                 for check in &stage.checks {
@@ -668,6 +767,47 @@ checks = [
     }
 
     #[test]
+    fn sandbox_fields_parse_validate_and_stay_out_of_default_files() {
+        let text = CHECKS
+            .replace(
+                "name = \"Verify\"",
+                "name = \"Verify\"\nsandbox_default = \"by-role\"",
+            )
+            .replace(
+                "role = \"test\"",
+                "role = \"test\"\nsandbox = \"read-only\"\nsandbox_writable = [\"~/.npm\", \"/opt/cache dir\"]\nsandbox_network = false\nsandbox_fallback = \"warn\"",
+            );
+        let settings = parse(&text).unwrap();
+        settings.validate().unwrap();
+        assert!(settings.warnings.is_empty(), "{:?}", settings.warnings);
+        let workflow = &settings.workflows[0];
+        let stage = &workflow.stages[0];
+        assert_eq!(workflow.sandbox_default, Sandbox::ByRole);
+        assert_eq!(stage.sandbox, Some(Sandbox::ReadOnly));
+        assert_eq!(stage.sandbox_writable, ["~/.npm", "/opt/cache dir"]);
+        assert!(!stage.sandbox_network && stage.sandbox_fallback == SandboxFallback::Warn);
+        let saved = toml::to_string_pretty(&settings).unwrap();
+        assert_eq!(
+            parse(&saved).unwrap().workflows[0].stages[0]
+                .sandbox_writable
+                .len(),
+            2
+        );
+        let plain = toml::to_string_pretty(&Settings::default()).unwrap();
+        assert!(!plain.contains("sandbox_"), "{plain}");
+        assert!(parse(&text.replace("\"read-only\"", "\"strict\"")).is_err());
+        let mut relative = settings.clone();
+        relative.workflows[0].stages[0].sandbox_writable = vec!["cache".into()];
+        assert!(
+            relative
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("absolute")
+        );
+    }
+
+    #[test]
     fn invalid_checks_are_rejected() {
         let error = |edit: fn(&mut Vec<Check>)| {
             let mut settings = parse(CHECKS).unwrap();
@@ -735,6 +875,7 @@ checks = [
         let mut workflow = Workflow {
             name: "w".into(),
             max_repair_passes: 0,
+            sandbox_default: Sandbox::Off,
             stages: vec![Stage {
                 id: "a".into(),
                 harness: "claude".into(),

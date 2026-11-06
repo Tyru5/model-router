@@ -59,6 +59,7 @@ fn project() -> tempfile::TempDir {
     let workflow = |name: &str, stages: Vec<Stage>| Workflow {
         name: name.into(),
         max_repair_passes: 2,
+        sandbox_default: Default::default(),
         stages: stages.into_iter().chain([summary.clone()]).collect(),
     };
     let settings = Settings {
