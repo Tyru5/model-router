@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify the real startup animation, skip controls, resizing, and terminal cleanup.
 
-Run: uv run --with pyte --with pillow python scripts/smoke_startup.py
+Run: uv run --with-requirements scripts/requirements-smoke.txt python scripts/smoke_startup.py
 """
 
 import os
@@ -13,7 +13,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-from smoke_tui import ARTIFACTS, BINARY, ROOT, Terminal, records
+from smoke_common import ARTIFACTS, BINARY, ROOT, Terminal, records
 
 BACKGROUND = (13, 20, 33)
 FOREGROUND = (222, 231, 242)
@@ -43,7 +43,7 @@ def render(screen):
 
 
 def wait_for_intro(terminal):
-    terminal.wait(
+    terminal.wait_for(
         lambda: "Any key to skip" in terminal.text(),
         "Animation did not appear",
         timeout=3,
@@ -58,7 +58,7 @@ def main():
         )
         animation_env = {"MODEL_ROUTER_NO_ANIMATION": "0", "NO_COLOR": ""}
 
-        terminal = Terminal(project, extra_env=animation_env, size=(80, 24))
+        terminal = Terminal(project, env=animation_env, size=(80, 24))
         try:
             started = time.monotonic()
             wait_for_intro(terminal)
@@ -92,12 +92,12 @@ def main():
             terminal.cleanup()
 
         # The skip key is consumed, so 'e' must not also open the stage editor.
-        terminal = Terminal(project, extra_env=animation_env)
+        terminal = Terminal(project, env=animation_env)
         try:
             wait_for_intro(terminal)
             started = time.monotonic()
             terminal.send("e")
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "1 Workflow" in terminal.text(),
                 "Key did not skip animation",
                 timeout=1,
@@ -115,9 +115,9 @@ def main():
             (["--no-animation"], animation_env),
             ([], {"MODEL_ROUTER_NO_ANIMATION": "1"}),
         ]:
-            terminal = Terminal(project, extra, extra_env=env)
+            terminal = Terminal(project, extra, env=env)
             try:
-                terminal.wait(
+                terminal.wait_for(
                     lambda: "1 Workflow" in terminal.text(),
                     "Bypass did not open the TUI",
                     timeout=1,
@@ -130,20 +130,20 @@ def main():
             finally:
                 terminal.cleanup()
 
-        terminal = Terminal(project, extra_env=animation_env)
+        terminal = Terminal(project, env=animation_env)
         try:
             wait_for_intro(terminal)
-            terminal.resize(40, 10)
-            terminal.wait(
+            terminal.resize(40, 10, settle="clear")
+            terminal.wait_for(
                 lambda: (
                     "MODEL ROUTER" in terminal.text()
                     and "Any key to skip" in terminal.text()
                 ),
                 "Compact animation did not render",
             )
-            terminal.resize(80, 24)
+            terminal.resize(80, 24, settle="clear")
             terminal.send("\x1b[200~pasted text\x1b[201~")
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "1 Workflow" in terminal.text(),
                 "Paste/resize failed to return to the TUI",
             )
@@ -153,7 +153,7 @@ def main():
             terminal.cleanup()
 
         for interrupt in ("key", "signal"):
-            terminal = Terminal(project, extra_env=animation_env)
+            terminal = Terminal(project, env=animation_env)
             try:
                 wait_for_intro(terminal)
                 if interrupt == "key":

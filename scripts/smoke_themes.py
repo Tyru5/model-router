@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Exercise theme previews, persistence, and picker colours in actual terminals.
 
-Run: uv run --with pyte python scripts/smoke_themes.py
+Run: uv run --with-requirements scripts/requirements-smoke.txt python scripts/smoke_themes.py
 """
 
 import json
 from pathlib import Path
 import tempfile
 
-from smoke_tui import ARTIFACTS, ROOT, Terminal, records
+from smoke_common import ARTIFACTS, ROOT, Terminal, records
 
 
 THEMES = [
@@ -36,7 +36,7 @@ def background(terminal):
 
 def choose(terminal, name):
     terminal.send("T")
-    terminal.wait(
+    terminal.wait_for(
         lambda: "Choose theme" in terminal.text(), "Theme picker did not open"
     )
     terminal.send(name)
@@ -58,9 +58,11 @@ def main():
             "NO_COLOR": "",
             "MODEL_ROUTER_NO_ANIMATION": "0",
         }
-        terminal = Terminal(project, ["--no-animation"], extra_env=env, size=(80, 24))
+        terminal = Terminal(project, ["--no-animation"], env=env, size=(80, 24))
         try:
-            terminal.wait(lambda: "1 Workflow" in terminal.text(), "App did not start")
+            terminal.wait_for(
+                lambda: "1 Workflow" in terminal.text(), "App did not start"
+            )
             assert background(terminal) == "0d1421"
             assert "[T] themes" in terminal.text()
             terminal.send("tKeep my task")
@@ -90,7 +92,11 @@ def main():
                 )
                 terminal.send("\r")
                 assert "Choose theme" not in terminal.text()
-                assert json.loads(prefs.read_text())["theme"] == theme_id
+                terminal.wait_for_json(
+                    prefs,
+                    lambda value: value["theme"] == theme_id,
+                    f"{label} was not saved",
+                )
                 assert background(terminal) == bg and "Keep my task" in terminal.text()
                 terminal.snapshot(f"theme-{theme_id}-80x24.txt")
                 terminal.send("f")
@@ -117,7 +123,7 @@ def main():
             terminal.send(b"\x0c")
             terminal.send(f"\x1b[200~{other}\x1b[201~\r")
             terminal.send("\r")
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "Choose repository" not in terminal.text(),
                 "Repository switch failed",
             )
@@ -128,14 +134,14 @@ def main():
             terminal.cleanup()
 
         # A new process loads the global choice before drawing its startup animation.
-        terminal = Terminal(other, extra_env=env, size=(120, 36))
+        terminal = Terminal(other, env=env, size=(120, 36))
         try:
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "Any key to skip" in terminal.text(), "Intro did not appear"
             )
             assert background(terminal) == "1b1e28", "Startup ignored the saved theme"
             terminal.send(" ")
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "1 Workflow" in terminal.text(), "Intro did not finish"
             )
             terminal.send("T")
@@ -149,9 +155,9 @@ def main():
 
         # Corrupt preferences must not prevent starting or choosing a replacement.
         prefs.write_text('{"theme":"removed-theme"}')
-        terminal = Terminal(project, ["--no-animation"], extra_env=env)
+        terminal = Terminal(project, ["--no-animation"], env=env)
         try:
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "1 Workflow" in terminal.text(),
                 "Bad preferences blocked startup",
             )
@@ -159,7 +165,11 @@ def main():
             assert "Read theme" in terminal.text()
             choose(terminal, "Catppuccin Latte")
             terminal.send("\r")
-            assert json.loads(prefs.read_text())["theme"] == "catppuccin-latte"
+            terminal.wait_for_json(
+                prefs,
+                lambda value: value["theme"] == "catppuccin-latte",
+                "Replacement theme was not saved",
+            )
             terminal.send("q")
             terminal.exit()
         finally:

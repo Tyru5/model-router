@@ -1,164 +1,38 @@
 #!/usr/bin/env python3
 """Exercise the real TUI and nested terminal with an offline mock harness.
 
-Run: uv run --with pyte python scripts/smoke_tui.py
+Run: uv run --with-requirements scripts/requirements-smoke.txt python scripts/smoke_tui.py
 """
 
-import fcntl
-import codecs
 import json
-import os
 from pathlib import Path
-import pty
-import select
-import signal
-import struct
-import sys
 import tempfile
-import termios
-import time
-import tomllib
 
-import pyte
-
-ROOT = Path(__file__).resolve().parents[1]
-BINARY = ROOT / "target/debug/model-router"
-ARTIFACTS = ROOT / ".model-router/qa"
-ARTIFACTS.mkdir(parents=True, exist_ok=True)
-
-
-class Terminal:
-    def __init__(self, project, extra=(), extra_env=None, size=(120, 36)):
-        self.project = project
-        self.pid, self.fd = pty.fork()
-        if not self.pid:
-            env = dict(
-                os.environ,
-                TERM="xterm-256color",
-                XDG_CONFIG_HOME=str(project / "config-home"),
-            )
-            env.update(extra_env or {})
-            argv = [
-                str(BINARY),
-                "-C",
-                str(project),
-                "--config",
-                str(project / ".model-router.toml"),
-                *extra,
-            ]
-            os.execve(str(BINARY), argv, env)
-        self.screen = pyte.Screen(*size)
-        self.stream = pyte.Stream(self.screen)
-        self.raw = bytearray()
-        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
-        self.resize(*size, wait=False)
-        self.exited = False
-
-    def resize(self, cols, rows, wait=True):
-        start = len(self.raw)
-        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-        self.screen.resize(lines=rows, columns=cols)
-        os.kill(self.pid, signal.SIGWINCH)
-        if wait:
-            # Keys sent before the full-screen redraw can race the resize on slow machines.
-            self.wait(
-                lambda: b"\x1b[2J" in self.raw[start:],
-                "No redraw after resize",
-                timeout=5,
-            )
-
-    def pump(self, duration=0.15):
-        end = time.monotonic() + duration
-        while time.monotonic() < end:
-            readable, _, _ = select.select([self.fd], [], [], 0.025)
-            if readable:
-                try:
-                    data = os.read(self.fd, 65536)
-                except OSError:
-                    return
-                if not data:
-                    return
-                self.raw.extend(data)
-                self.stream.feed(self.decoder.decode(data))
-                if b"\x1b[6n" in data:
-                    os.write(self.fd, b"\x1b[1;1R")
-
-    def text(self):
-        return "\n".join(self.screen.display)
-
-    def wait(self, predicate, message, timeout=10):
-        end = time.monotonic() + timeout
-        while time.monotonic() < end:
-            self.pump()
-            if predicate():
-                return
-        raise AssertionError(message + "\n" + self.text())
-
-    def send(self, data):
-        os.write(self.fd, data.encode() if isinstance(data, str) else data)
-        self.pump()
-
-    def snapshot(self, name):
-        (ARTIFACTS / name).write_text(self.text())
-
-    def exit(self, expected=0):
-        end = time.monotonic() + 10
-        while time.monotonic() < end:
-            self.pump()
-            pid, status = os.waitpid(self.pid, os.WNOHANG)
-            if pid:
-                self.exited = True
-                assert os.waitstatus_to_exitcode(status) == expected, (
-                    status,
-                    self.text(),
-                )
-                attributes = termios.tcgetattr(self.fd)
-                assert attributes[3] & termios.ICANON, "Terminal left in raw mode"
-                (ARTIFACTS / "terminal-transcript.ansi").write_bytes(self.raw)
-                os.close(self.fd)
-                return
-        raise AssertionError("Router did not exit")
-
-    def cleanup(self):
-        if not self.exited:
-            try:
-                os.kill(self.pid, signal.SIGKILL)
-                os.waitpid(self.pid, 0)
-            except ProcessLookupError:
-                pass
-            os.close(self.fd)
-
-
-def records(project):
-    return sorted(
-        (
-            json.loads(p.read_text())
-            for p in project.glob(".model-router/runs/*/run.json")
-        ),
-        key=lambda r: r["created_at"],
-    )
+from smoke_common import (
+    ARTIFACTS,
+    ROOT,
+    Terminal,
+    demo_config,
+    records,
+    require_binary,
+)
 
 
 def main():
-    assert BINARY.exists(), "Run cargo build first"
+    require_binary()
     with tempfile.TemporaryDirectory(prefix="router terminal test ") as name:
         project = Path(name)
-        config = (
-            (ROOT / "examples/demo.toml")
-            .read_text()
-            .replace("examples/mock_harness.py", str(ROOT / "examples/mock_harness.py"))
-        )
         path = project / ".model-router.toml"
-        path.write_text(config)
+        path.write_text(demo_config())
         terminal = Terminal(project)
         try:
-            terminal.wait(lambda: "1 Workflow" in terminal.text(), "TUI did not render")
+            terminal.wait_for_text("1 Workflow", message="TUI did not render")
             assert not records(project), "Opening the router started a run"
             terminal.snapshot("workflow-120x36.txt")
             terminal.resize(80, 24)
-            terminal.wait(
-                lambda: "Review" in terminal.text(),
-                "Optional review is hidden at 80x24",
+            terminal.wait_for_line(
+                r"\b3\s+Review \(optional\)",
+                message="Optional review stage row is hidden at 80x24",
             )
             terminal.snapshot("workflow-80x24.txt")
             terminal.resize(120, 36)
@@ -173,8 +47,7 @@ def main():
             terminal.send(b"\x01\x0b")  # beginning/end-of-line deletion in text editor
             terminal.send("Interactive implementation")
             terminal.send(b"\x13")
-            terminal.send("s")
-            saved = tomllib.loads(path.read_text())
+            saved = terminal.save_config(path)
             assert saved["workflows"][0]["stages"][1]["mode"] == "interactive"
             assert (
                 saved["workflows"][0]["stages"][1]["name"]
@@ -184,37 +57,39 @@ def main():
             terminal.send("r")
             # The editor stays open for the next workflow; the run announces
             # its interactive stage instead of taking over the screen.
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "ready in its native terminal" in terminal.text(),
                 "Interactive stage was not announced",
             )
             assert "1 Workflow" in terminal.text() and "Monitor ●1" in terminal.text()
-            terminal.send("2i")
-            terminal.wait(
+            terminal.send("2")
+            terminal.send("i", settle="quiet")
+            terminal.wait_for(
                 lambda: "MOCK INTERACTIVE READY" in terminal.text(),
                 "Interactive stage did not receive a terminal",
             )
-            terminal.send("done 雪\n")
-            terminal.wait(
+            terminal.send("done 雪\n", settle=None)
+            terminal.wait_for(
                 lambda: (
                     records(project)
                     and records(project)[-1]["status"] == "awaiting_confirmation"
                 ),
                 "No interactive checkpoint",
             )
-            terminal.wait(
-                lambda: "MODEL ROUTER" in terminal.text(), "TUI was not restored"
+            # The run file updates before the TUI receives the checkpoint.
+            terminal.wait_for_text(
+                "Inspect the handoff: [h]", message="TUI did not show the checkpoint"
             )
             terminal.snapshot("interactive-checkpoint.txt")
             terminal.send("h")
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "implementation evidence" in terminal.text(),
                 "Handoff inspector missing",
             )
             terminal.snapshot("handoff.txt")
             terminal.send(b"\x1b")
             terminal.send("a")
-            terminal.wait(
+            terminal.wait_for(
                 lambda: records(project)[-1]["status"] == "complete",
                 "Run did not complete",
             )
@@ -231,7 +106,7 @@ def main():
             terminal.snapshot("completed.txt")
             terminal.send("3\r")
             # The run is still in this session, so Runs focuses it.
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "Run already open in this session" in terminal.text(),
                 "History did not focus the session's run",
             )
@@ -258,11 +133,11 @@ mode = "interactive"
         path.write_text(review)
         terminal = Terminal(project, ["run", "--task", "Review without a handoff file"])
         try:
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "MOCK INTERACTIVE READY" in terminal.text(),
                 "Review did not open",
             )
-            terminal.send("done\n")
+            terminal.send("done\n", settle=None)
             terminal.exit(expected=1)
             assert records(project)[-1]["status"] == "blocked"
         finally:

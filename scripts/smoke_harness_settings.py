@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check stage-scoped harness settings in a real PTY, without inference.
 
-Run: uv run --with pyte python scripts/smoke_harness_settings.py
+Run: uv run --with-requirements scripts/requirements-smoke.txt python scripts/smoke_harness_settings.py
 """
 
 import json
@@ -9,7 +9,7 @@ from pathlib import Path
 import tempfile
 import tomllib
 
-from smoke_tui import ARTIFACTS, Terminal, records
+from smoke_common import ARTIFACTS, Terminal, records
 
 NEXT, PREVIOUS, APPLY, ESC = b"\x0e", b"\x10", b"\x13", b"\x1b"
 RIGHT, F7 = b"\x1b[C", b"\x1b[18~"
@@ -21,8 +21,7 @@ def replace(terminal, text):
 
 
 def save(terminal, path):
-    terminal.send("s")
-    return tomllib.loads(path.read_text())["workflows"][0]["stages"]
+    return terminal.save_config(path)["workflows"][0]["stages"]
 
 
 def main():
@@ -67,12 +66,14 @@ mode = "interactive"
             )
         )
         env = {"CODEX_HOME": str(codex_home), "NO_COLOR": ""}
-        terminal = Terminal(project, ["--no-animation"], extra_env=env)
+        terminal = Terminal(project, ["--no-animation"], env=env)
         try:
-            terminal.wait(lambda: "1 Workflow" in terminal.text(), "App did not start")
+            terminal.wait_for(
+                lambda: "1 Workflow" in terminal.text(), "App did not start"
+            )
             original = save(terminal, config)
             terminal.send("c")
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "Harness settings" in terminal.text(),
                 "Settings shortcut missing",
             )
@@ -83,29 +84,29 @@ mode = "interactive"
             terminal.send("c")
             replace(terminal, "draft-model")
             terminal.send(F7)
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "codex selections" in terminal.text(), "Model picker missing"
             )
             terminal.send(ESC)
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "Harness settings" in terminal.text(), "Esc lost the draft"
             )
             assert "draft-model" in terminal.text()
             terminal.send(F7)
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "codex selections" in terminal.text(), "Model picker missing"
             )
             terminal.send(NEXT)
             terminal.send(PREVIOUS)
             terminal.send(NEXT)
             terminal.send("\r")
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "Harness settings" in terminal.text(),
                 "Model selection did not return to settings",
             )
             assert "fixture-model" in terminal.text()
             terminal.send(NEXT * 2)  # effort
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "Levels from Codex local cache" in terminal.text(),
                 "Catalog effort choices did not load",
             )
@@ -113,7 +114,7 @@ mode = "interactive"
             terminal.send(NEXT * 2)  # timeout
             replace(terminal, "0")
             terminal.send(APPLY)
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "Timeout must be greater than zero" in terminal.text(),
                 "Validation error not visible",
             )
@@ -129,13 +130,13 @@ mode = "interactive"
             terminal.send(NEXT)  # extra args
             replace(terminal, "--sandbox read-only")
             terminal.send(APPLY)
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "also set in Extra arguments" in terminal.text(),
                 "Conflicting permission arguments accepted",
             )
             replace(terminal, "--config 'example=\"value with spaces\"'")
             terminal.send(APPLY)
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "Harness settings applied" in terminal.text(),
                 "Settings did not apply",
             )
@@ -156,9 +157,8 @@ mode = "interactive"
             assert changed[1] == original[1], "Editing Codex changed the Claude stage"
 
             terminal.resize(80, 24)
-            terminal.pump()
             terminal.send("jc")
-            terminal.wait(
+            terminal.wait_for(
                 lambda: (
                     "Harness settings" in terminal.text()
                     and "claude" in terminal.text()
@@ -187,13 +187,13 @@ mode = "interactive"
         finally:
             terminal.cleanup()
 
-        terminal = Terminal(project, ["--no-animation"], extra_env=env, size=(65, 20))
+        terminal = Terminal(project, ["--no-animation"], env=env, size=(65, 20))
         try:
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "1 Workflow" in terminal.text(), "App did not restart"
             )
             terminal.send("c")
-            terminal.wait(
+            terminal.wait_for(
                 lambda: "Harness settings" in terminal.text(),
                 "Saved settings did not reopen",
             )
