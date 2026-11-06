@@ -166,6 +166,16 @@ API clients, automatic task classification, and embedded IDE control are exclude
   unresolved findings, per-stage time, retries, and harness-reported usage, with
   unavailable values labelled; the full diff opens in a dialog. `report` prints
   the same summary from the CLI.
+- Cost per attempt, labelled by source: harness-reported, else tokens priced
+  from user overrides, router-provider `/models` prices (cached at most daily;
+  failures non-fatal), or a dated built-in estimate table, else unknown.
+  Interactive Claude Code and Codex stages read tokens from their native
+  session logs, best effort. The Monitor header shows the running total;
+  `cost` aggregates history by harness and model.
+- Optional workflow and stage budgets (`max_usd`, `max_tokens`). After each
+  attempt, known cost or counted tokens over a cap block the run before its
+  next stage; unknown costs count only toward tokens. Running stages are never
+  killed. `resume --budget-usd/--budget-tokens` raises the cap to continue.
 - Run history with live text and status filters, damaged-record rows,
   background-computed sizes, confirmed reruns, attempt comparison, and cleanup
   previews; harness availability/catalog view.

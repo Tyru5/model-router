@@ -497,6 +497,8 @@ model-router resume RUN_ID --allow-repair
 model-router report RUN_ID
 model-router report RUN_ID --json
 model-router report RUN_ID --diff
+model-router resume RUN_ID --budget-usd 10
+model-router cost --since 7d
 ```
 
 `--unattended` overrides execution mode for this run. `--with-review` enables
@@ -628,9 +630,45 @@ it for any saved run, including stopped ones; `--json` gives the data and
 `--diff` the patch. Changes come from Git snapshots taken by the router
 (baseline at run start, then before and after each attempt), so edits made
 before the run are excluded. Outside Git they are labelled unavailable and the
-model-reported `files_changed` list is shown instead. Token counts and cost
-appear only when a harness reports them; nothing is estimated, and totals say
-how many attempts reported.
+model-reported `files_changed` list is shown instead. Token counts appear only
+when a harness reports them, and totals say how many attempts reported. Cost
+is labelled by source; see [Cost and budgets](#cost-and-budgets).
+
+### Cost and budgets
+
+Each attempt's cost is the harness's own reported cost (Claude Code, Amp, Pi,
+OpenCode), else its tokens priced from your overrides (`config`), a router
+provider's `/models` prices (`provider`, cached daily in
+`.model-router/pricing-cache.json`), or the built-in table (`table`); otherwise
+it is `unknown`. Table prices are estimates with an `as of` date: verify them
+with your provider. Interactive Claude Code and Codex stages read their tokens
+from the harness's session logs (`~/.claude/projects`, `~/.codex/sessions`),
+best effort. `report`, the results view, and the Monitor header show the
+amounts with their sources; `model-router cost [--since 7d] [--json]` sums
+history by harness and model.
+
+```toml
+[pricing."my-model"]          # USD per 1M tokens; also ~/.config/model-router/pricing.toml as [models."id"]
+input = 1.5
+output = 6.0
+cache_read = 0.15             # optional: default 0.1 x input; cache_write 1.25 x input
+
+[[workflows]]
+name = "Feature development"
+[workflows.budget]
+max_usd = 5.0
+max_tokens = 2_000_000        # input + output + cache writes; cache reads excluded
+
+[[workflows.stages]]
+id = "implement"
+budget = { max_usd = 2.0 }
+```
+
+After each attempt, a run whose known cost or tokens exceed a cap stops,
+blocked, before its next stage starts; a running stage is never killed
+(a live cap on streamed usage is future work). Unknown costs count only toward
+`max_tokens`. Continue with `model-router resume RUN_ID --budget-usd N` (or
+`--budget-tokens N`), which sets the run's cap and any exceeded stage cap.
 
 `history` lists runs newest first from their summaries, including damaged
 records (`DAMAGED RUN_ID  error`). Filter with `--status` (`active`, a status
