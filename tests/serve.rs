@@ -56,13 +56,8 @@ fn project() -> tempfile::TempDir {
         enabled: false,
         ..stage("summary", Role::Summary, "mock", Mode::Unattended)
     };
-    let workflow = |name: &str, stages: Vec<Stage>| Workflow {
-        name: name.into(),
-        max_repair_passes: 2,
-        sandbox_default: Default::default(),
-        budget: Default::default(),
-        max_parallel: 2,
-        stages: stages.into_iter().chain([summary.clone()]).collect(),
+    let workflow = |name: &str, stages: Vec<Stage>| {
+        Workflow::new(name, stages.into_iter().chain([summary.clone()]).collect())
     };
     let settings = Settings {
         workflows: vec![

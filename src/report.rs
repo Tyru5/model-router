@@ -973,13 +973,9 @@ pub(crate) mod tests {
             ("verify", "Verify"),
             ("review", "Review"),
         ];
-        let workflow = Workflow {
-            name: "Feature".into(),
-            max_repair_passes: 2,
-            sandbox_default: Default::default(),
-            budget: Default::default(),
-            max_parallel: 2,
-            stages: names
+        let workflow = Workflow::new(
+            "Feature",
+            names
                 .iter()
                 .map(|(id, name)| Stage {
                     id: (*id).into(),
@@ -989,7 +985,7 @@ pub(crate) mod tests {
                     ..Stage::default()
                 })
                 .collect(),
-        };
+        );
         let paid = Usage {
             input_tokens: Some(1_200),
             output_tokens: Some(300),

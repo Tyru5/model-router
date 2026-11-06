@@ -479,12 +479,9 @@ mod tests {
 
     fn workflow(default: Sandbox) -> Workflow {
         Workflow {
-            max_parallel: 2,
-            name: "w".into(),
             max_repair_passes: 0,
             sandbox_default: default,
-            budget: Default::default(),
-            stages: vec![],
+            ..Workflow::new("w", vec![])
         }
     }
 

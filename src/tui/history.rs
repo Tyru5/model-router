@@ -778,20 +778,19 @@ mod tests {
         };
         Settings {
             workflows: vec![Workflow {
-                name: "Test".into(),
                 max_repair_passes: 0,
-                sandbox_default: Default::default(),
-                budget: Default::default(),
-                max_parallel: 2,
-                stages: vec![Stage {
-                    id: "research".into(),
-                    name: "research".into(),
-                    role: Role::Research,
-                    harness: "mock".into(),
-                    provider: "research".into(),
-                    model: model.into(),
-                    ..Stage::default()
-                }],
+                ..Workflow::new(
+                    "Test",
+                    vec![Stage {
+                        id: "research".into(),
+                        name: "research".into(),
+                        role: Role::Research,
+                        harness: "mock".into(),
+                        provider: "research".into(),
+                        model: model.into(),
+                        ..Stage::default()
+                    }],
+                )
             }],
             adapters: BTreeMap::from([("mock".into(), adapter)]),
             ..Settings::default()

@@ -82,12 +82,9 @@ fn create(stages: Vec<Stage>, budget: Budget) -> (tempfile::TempDir, Run) {
     setup();
     let dir = tempfile::tempdir().unwrap();
     let workflow = Workflow {
-        max_parallel: 2,
-        name: "Budget".into(),
         max_repair_passes: 0,
-        sandbox_default: Default::default(),
-        stages,
         budget,
+        ..Workflow::new("Budget", stages)
     };
     let settings = Settings {
         workflows: vec![workflow.clone()],

@@ -3697,19 +3697,18 @@ mod tests {
         };
         let settings = Settings {
             workflows: vec![Workflow {
-                name: "Interactive".into(),
                 max_repair_passes: 0,
-                sandbox_default: Default::default(),
-                budget: Default::default(),
-                max_parallel: 2,
-                stages: vec![
-                    Stage {
-                        harness: "mock".into(),
-                        mode: Mode::Interactive,
-                        ..stage
-                    },
-                    next,
-                ],
+                ..Workflow::new(
+                    "Interactive",
+                    vec![
+                        Stage {
+                            harness: "mock".into(),
+                            mode: Mode::Interactive,
+                            ..stage
+                        },
+                        next,
+                    ],
+                )
             }],
             adapters: BTreeMap::from([(
                 "mock".into(),
