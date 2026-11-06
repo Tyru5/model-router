@@ -540,11 +540,19 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
         summary(report)
     );
     let _ = writeln!(text, "Usage: {}", usage_text(&report.usage));
-    let _ = writeln!(
+    let _ = write!(
         text,
         "Cost: {}",
         cost_text(&report.usage.cost, &report.budget)
     );
+    if report.usage.cost.table.attempts > 0 {
+        let _ = write!(
+            text,
+            " · table prices are estimates as of {}",
+            report.prices_as_of
+        );
+    }
+    text.push('\n');
     if let Some(error) = &report.error {
         let _ = writeln!(text, "Error: {error}");
     }
@@ -605,11 +613,7 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
             let _ = writeln!(text, "  {} {}", item_glyph(item.kind), item_text(item));
         }
     }
-    let _ = writeln!(
-        text,
-        "\nStages (costs not reported by the harness are estimates; table prices as of {}):",
-        report.prices_as_of
-    );
+    let _ = writeln!(text, "\nStages:");
     let width = report
         .stages
         .iter()
@@ -817,7 +821,7 @@ pub(crate) mod tests {
             "{text}"
         );
         assert!(text.contains("cost ~$0.18 (config)"), "{text}");
-        assert!(text.contains(cost::table_as_of()), "{text}");
+        assert!(!text.contains("table prices"), "{text}");
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["usage"]["cost"]["config"]["attempts"], 1);
         assert_eq!(json["budget"]["max_usd"], 5.0);

@@ -196,6 +196,13 @@ fn stage_caps_and_table_prices_gate_too() {
     cost::raise_budget(&mut run, Some(1.0), None).unwrap();
     assert_eq!(run.workflow.stages[0].budget.max_usd, Some(1.0));
     assert_eq!(drive(&mut run), Action::Complete);
+    let text = report::render(&report::build(&run), None);
+    assert!(
+        text.contains(
+            "(reported $1.00 + table $0.15) · budget $1.00 · table prices are estimates as of"
+        ),
+        "{text}"
+    );
     let summary = cost::aggregate([&run], None, &cost::Pricing::load(dir.path()));
     assert_eq!(summary.rows.len(), 2);
     assert_eq!(

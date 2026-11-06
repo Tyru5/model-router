@@ -32,6 +32,20 @@ pub(super) struct Loaded {
     patch: std::result::Result<String, String>,
 }
 
+/// The run's report, rebuilt only when the run changes, not every frame.
+pub(super) fn cached_report(app: &App, run: &Run) -> std::rc::Rc<RunReport> {
+    let stamp = format!("{} {}", key(run), run.revision);
+    let mut cache = app.focused.cache.borrow_mut();
+    match &cache.report {
+        Some((cached, report)) if *cached == stamp => report.clone(),
+        _ => {
+            let report = std::rc::Rc::new(report::build(run));
+            cache.report = Some((stamp, report.clone()));
+            report
+        }
+    }
+}
+
 pub(super) fn finished(run: &Run) -> bool {
     matches!(
         run.status,
@@ -181,8 +195,9 @@ pub(super) fn checks_cell(statuses: impl IntoIterator<Item = TestStatus>) -> Str
     }
 }
 
-/// Cost and tokens in table width, e.g. "$0.25 · 2.0k/400"; "partial" when
-/// some attempts reported nothing.
+/// Cost and tokens in table width, e.g. "~$0.25 · 2.0k/400 tok": the known
+/// cost, "~" when any part is estimated; "partial" when some attempts
+/// reported nothing. The header names the sources.
 fn usage_cell(total: &UsageTotal) -> String {
     if total.attempts == 0 {
         return "–".into();
@@ -192,8 +207,8 @@ fn usage_cell(total: &UsageTotal) -> String {
     }
     let sum = &total.sum;
     let mut parts = vec![];
-    if let Some(cost) = sum.cost_usd {
-        parts.push(report::dollars(cost));
+    if total.cost.known() {
+        parts.push(total.cost.amount());
     }
     if sum.input_tokens.is_some() || sum.output_tokens.is_some() {
         let side = |n: Option<u64>| n.map_or_else(|| "?".into(), report::tokens);
@@ -363,19 +378,7 @@ pub(super) fn draw_completion(
     area: Rect,
     palette: Palette,
 ) {
-    // The report is rebuilt only when the run changes, not every frame.
-    let stamp = format!("{} {}", key(run), run.revision);
-    let report = {
-        let mut cache = app.focused.cache.borrow_mut();
-        match &cache.report {
-            Some((cached, report)) if *cached == stamp => report.clone(),
-            _ => {
-                let report = std::rc::Rc::new(report::build(run));
-                cache.report = Some((stamp, report.clone()));
-                report
-            }
-        }
-    };
+    let report = cached_report(app, run);
     let summary = Line::styled(report::summary(&report), Style::default().fg(palette.fg));
     let usage = Line::from(vec![
         Span::styled("Usage ", palette.header_style()),
@@ -388,8 +391,19 @@ pub(super) fn draw_completion(
             }),
         ),
     ]);
+    let cost = Line::from(vec![
+        Span::styled("Cost ", palette.header_style()),
+        Span::styled(
+            report::cost_text(&report.usage.cost, &report.budget),
+            Style::default().fg(if report.usage.cost.known() {
+                palette.fg
+            } else {
+                palette.muted
+            }),
+        ),
+    ]);
     let width = area.width.max(1);
-    let mut header = vec![summary, usage];
+    let mut header = vec![summary, usage, cost];
     if let Some(error) = &report.error {
         header.push(Line::styled(
             format!("Error: {}", storage::clean_terminal(error)),
@@ -571,6 +585,7 @@ mod tests {
             for expected in [
                 "wall 2m 10s · active 1m 40s · 3 attempts · 1 retry",
                 "usage reported by 2 of 3",
+                "Cost $0.25 (reported) · cost unknown for 2 of 3 attempts",
                 "Changed during this run",
                 "1 file, +40 -5",
                 "M src/lib.rs  +40 -5",
@@ -591,6 +606,8 @@ mod tests {
                     "Unresolved",
                     "! Implement: blocking finding: Data loss",
                     "1/3 ✗",
+                    // The Monitor header's running total.
+                    "repairs 1/2  ·  cost $0.25+? reported",
                 ] {
                     assert!(
                         text.contains(expected),

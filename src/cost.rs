@@ -425,7 +425,8 @@ impl CostTotal {
         }
     }
 
-    fn amount(&self) -> String {
+    /// "$0.25" when every known amount was reported, else "~$0.31".
+    pub fn amount(&self) -> String {
         format!(
             "{}{}",
             if self.exact() { "" } else { "~" },
