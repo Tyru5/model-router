@@ -57,7 +57,9 @@ impl HarnessEditor {
     pub fn new(stage: Stage, providers: BTreeMap<String, Provider>) -> Self {
         let mut fields = vec![Field {
             kind: FieldKind::Model,
-            label: if stage.harness == "amp" {
+            label: if crate::harness::get(&stage.harness)
+                .is_some_and(|spec| matches!(spec.model, crate::harness::ModelPass::Mode(_)))
+            {
                 "Model / mode"
             } else {
                 "Model / alias"
@@ -77,13 +79,10 @@ impl HarnessEditor {
             fields.push(Field {
                 kind: FieldKind::Effort,
                 label: "Reasoning effort",
-                help: match stage.harness.as_str() {
-                    "codex" => "Native reasoning effort, e.g. low, medium, high, xhigh. Availability depends on the model. Blank inherits the harness default.",
-                    "claude" => "Native effort: low, medium, high, xhigh, max. Availability depends on the model. Blank inherits the harness default.",
-                    "pi" => "Native thinking level: off, minimal, low, medium, high, xhigh. Availability depends on the model. Blank inherits the default.",
-                    "omp" => "Native thinking level: off, minimal, low, medium, high, xhigh, max, auto. Availability depends on the model. Blank inherits the default.",
-                    _ => "Native effort or model variant. Blank inherits the harness default. Accepted values depend on the model and harness.",
-                },
+                help: crate::harness::get(&stage.harness)
+                    .map(|spec| spec.effort_help)
+                    .filter(|help| !help.is_empty())
+                    .unwrap_or("Native effort or model variant. Blank inherits the harness default. Accepted values depend on the model and harness."),
                 text: textarea(&stage.effort),
             });
         }
@@ -219,6 +218,12 @@ impl HarnessEditor {
         }
     }
 
+    /// Whether the draft differs from the stage it opened with, or cannot be applied.
+    pub fn changed(&self) -> bool {
+        self.finish().map_or(true, |stage| {
+            serde_json::to_value(&stage).ok() != serde_json::to_value(&self.stage).ok()
+        })
+    }
     pub fn finish(&self) -> Result<Stage> {
         let mut stage = self.stage.clone();
         for field in &self.fields {

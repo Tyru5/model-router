@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"00000000-0000-0000-0000-000000000000"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"schema_version\":1,\"summary\":\"The claim 2+2=4 is correct.\",\"verdict\":\"pass\",\"findings\":[{\"severity\":\"advisory\",\"description\":\"The equality holds under standard arithmetic.\"}],\"decisions\":[],\"files_changed\":[],\"tests\":[],\"unresolved\":[],\"not_applicable\":null,\"artifacts\":[],\"confidence\":\"high\",\"next_steps\":[]}"}}
+{"type":"turn.completed","usage":{"input_tokens":27733,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":153,"reasoning_output_tokens":63}}

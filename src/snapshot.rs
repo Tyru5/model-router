@@ -2,6 +2,10 @@
 //! (`<run dir>/snapshot.index`) records the working tree, so the user's index,
 //! HEAD, refs, and files never change. Untracked files are included and ignored
 //! ones are not, which keeps the self-ignored `.model-router/` out.
+//!
+//! Trees are not reachable from any commit, so each is kept by a ref,
+//! `refs/model-router/runs/<run id>/<tree>`, or `git gc` would prune it and
+//! old runs would lose their diffs. Cleaning a run deletes its refs.
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -70,8 +74,65 @@ pub fn is_repository(dir: &Path) -> bool {
 /// The working tree as a Git tree ID. None outside Git or when Git fails; a
 /// snapshot never fails a run.
 pub fn tree(workspace: &Path, run_dir: &Path) -> Option<String> {
-    let index = std::path::absolute(run_dir.join("snapshot.index")).ok()?;
-    capture(workspace, &index).ok().flatten()
+    let run = run_dir.file_name().and_then(|name| name.to_str())?;
+    tree_with(workspace, &run_dir.join("snapshot.index"), run)
+}
+
+/// `tree` with its own private index, e.g. for a fan-out candidate's
+/// worktree; kept under run `run`'s refs.
+pub fn tree_with(workspace: &Path, index: &Path, run: &str) -> Option<String> {
+    let index = std::path::absolute(index).ok()?;
+    let tree = capture(workspace, &index).ok().flatten()?;
+    // Best effort: an unkept tree still serves until the next gc.
+    let _ = git(
+        workspace,
+        None,
+        &["update-ref", &format!("{}/{tree}", namespace(run)), &tree],
+    );
+    Some(tree)
+}
+
+/// The ref keeping fan-out base commit `name` of run `run`.
+pub fn base_ref(run: &str, name: &str) -> String {
+    format!("{}/base/{name}", namespace(run))
+}
+
+fn namespace(run: &str) -> String {
+    format!("refs/model-router/runs/{run}")
+}
+
+/// Deletes the refs keeping run `run`'s snapshots. Best effort; nothing to do
+/// outside Git.
+pub fn forget(project: &Path, run: &str) {
+    let prefix = format!("{}/", namespace(run));
+    let Ok(refs) = git(
+        project,
+        None,
+        &["for-each-ref", "--format=%(refname)", &prefix],
+    ) else {
+        return;
+    };
+    let commands: String = String::from_utf8_lossy(&refs)
+        .lines()
+        .filter(|name| name.starts_with(&prefix))
+        .map(|name| format!("delete {name}\n"))
+        .collect();
+    if commands.is_empty() {
+        return;
+    }
+    let child = Command::new("git")
+        .args(["update-ref", "--stdin"])
+        .current_dir(project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Ok(mut child) = child {
+        if let Some(mut input) = child.stdin.take() {
+            let _ = std::io::Write::write_all(&mut input, commands.as_bytes());
+        }
+        let _ = child.wait();
+    }
 }
 
 fn capture(workspace: &Path, index: &Path) -> Result<Option<String>> {
@@ -350,6 +411,25 @@ mod tests {
         );
         assert!(!dir.path().join(".git/index").exists());
         assert_eq!(status(dir.path()), ["?? first.txt", "?? second.txt"]);
+    }
+
+    #[test]
+    fn refs_keep_snapshots_through_gc_until_the_run_is_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), None, &["init", "-q"]).unwrap();
+        let run_dir = run_dir(dir.path());
+        fs::write(dir.path().join("kept.txt"), "kept\n").unwrap();
+        let kept = tree(dir.path(), &run_dir).unwrap();
+        let exists = |object: &str| git(dir.path(), None, &["cat-file", "-e", object]).is_ok();
+        git(dir.path(), None, &["gc", "-q", "--prune=now"]).unwrap();
+        assert!(exists(&kept), "gc pruned a kept snapshot");
+        let refs = git(dir.path(), None, &["for-each-ref", "refs/model-router/"]).unwrap();
+        assert!(String::from_utf8_lossy(&refs).contains("refs/model-router/runs/fixture/"));
+        forget(dir.path(), "fixture");
+        let refs = git(dir.path(), None, &["for-each-ref", "refs/model-router/"]).unwrap();
+        assert!(refs.is_empty());
+        git(dir.path(), None, &["gc", "-q", "--prune=now"]).unwrap();
+        assert!(!exists(&kept));
     }
 
     #[test]

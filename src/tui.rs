@@ -13,24 +13,37 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 mod actions;
 mod app;
 mod completion;
+mod diff_view;
+mod editor;
+mod external;
+mod frame_marker;
+mod handoff_view;
 mod harness_editor;
 mod harnesses;
 mod history;
 mod input;
 mod modal;
+mod models;
 mod monitor;
+mod output_search;
 mod path_picker;
+mod run_slot;
+mod session;
 mod startup;
+mod stats_page;
 mod task_importer;
+mod tasks;
 #[cfg(test)]
 mod tests;
 mod theme;
+pub mod trust_prompt;
+mod ui;
 mod widgets;
 mod workflow_page;
 use app::{App, draw};
@@ -130,60 +143,100 @@ pub fn run(
     }));
     let mut app = App::new(project, settings, config_path, cancel);
     if let Some(cwd) = detected_from {
-        app.message = format!(
+        app.ui.message = format!(
             "Project: {} (detected above {}). p changes it.",
             app.project.display(),
             cwd.display()
         );
     }
-    match theme::load(&app.theme_path) {
+    if let Some(note) = trust_prompt::notice(&app.editor.settings) {
+        app.ui.message = if app.ui.message.is_empty() {
+            note
+        } else {
+            format!("{} · {note}", app.ui.message)
+        };
+    }
+    match theme::load(&app.ui.theme_path) {
         Ok(preferences) => {
-            app.theme = preferences.theme;
-            app.vim_motions = preferences.vim_motions;
+            app.ui.theme = preferences.theme;
+            app.ui.vim_motions = preferences.vim_motions;
+            crate::notify::global().set_backends(preferences.notifications.clone());
+            app.ui.notifications = preferences.notifications;
         }
         Err(error) => {
-            app.message = format!("{error:#}. Using Model Router colours; T chooses a theme.");
+            app.ui.message = format!("{error:#}. Using Model Router colours; T chooses a theme.");
         }
     }
     let mut screen = Screen::new()?;
-    if animate && !startup::play(&mut screen.terminal, &app.signal, app.palette())? {
+    if animate && !startup::play(&mut screen.terminal, &app.signal, app.ui.palette())? {
         return Ok(());
     }
     let _ = storage::remember_project(&app.project);
+    let mut drawn = Instant::now();
     'run: loop {
         if app.signal.load(Ordering::Relaxed) {
-            app.cancel_all();
-            app.quit_after_stop = true;
+            app.session.cancel_all();
+            app.session.quit_after_stop = true;
         }
         if app.poll()? {
             break;
         }
-        if app.launch_interactive {
-            app.launch_interactive = false;
+        if app.take_launch() {
             let result = match app.interactive_terminal() {
                 Ok(session) => {
+                    let cancel = app.session.focused().map(|slot| slot.cancel.clone());
+                    let cancel = cancel.unwrap_or_default();
                     screen.restore();
-                    let result = session.attach(&app.focused.cancel, &app.signal);
+                    let result = session.attach(&cancel, &app.signal);
                     screen.resume()?;
                     result
                 }
                 Err(error) => Err(error),
             };
-            app.message = match result {
+            app.ui.message = match result {
                 Ok(AttachOutcome::Detached) => {
-                    "Interactive session detached and still running. [t] reattaches; [c] stops it. /exit quits the harness.".into()
+                    "Interactive session detached and still running. [t] reattaches; [C] stops it. /exit quits the harness.".into()
                 }
                 Ok(AttachOutcome::Finished) => "Harness returned. Finishing stage…".into(),
                 Err(error) => {
-                    app.alert = format!("{error:#}");
-                    app.alert.clone()
+                    app.ui.alert = format!("{error:#}");
+                    app.ui.alert.clone()
                 }
             };
             // Apply completion or shutdown before accepting another action.
+            app.ui.redraw = true;
             continue;
         }
-        screen.terminal.draw(|frame| draw(frame, &mut app))?;
+        if let Some(launch) = app.ui.external.take() {
+            // The pager or editor owns the terminal, so Ctrl+C there is its
+            // own and must not stop the router.
+            let signalled = app.signal.load(Ordering::Relaxed);
+            screen.restore();
+            let result = launch.run();
+            screen.resume()?;
+            if !signalled {
+                app.signal.store(false, Ordering::Relaxed);
+            }
+            app.finish_external(result);
+            continue;
+        }
+        // Frames are drawn when something changed, and once a second for
+        // elapsed times; spinners animate faster.
+        let tick = if app.animating() {
+            Duration::from_millis(80)
+        } else {
+            Duration::from_secs(1)
+        };
+        if app.ui.redraw || drawn.elapsed() >= tick {
+            // Notifications from worker threads wait for the frame.
+            let _terminal = crate::notify::terminal_lock();
+            screen.terminal.draw(|frame| draw(frame, &mut app))?;
+            frame_marker::frame_drawn();
+            app.ui.redraw = false;
+            drawn = Instant::now();
+        }
         if event::poll(Duration::from_millis(70))? {
+            app.ui.redraw = true;
             // Handle all queued input before drawing again, so slow frames do
             // not make typing lag one event per frame.
             for _ in 0..64 {
@@ -192,8 +245,7 @@ pub fn run(
                         Ok(true) => break 'run,
                         Ok(false) => {}
                         Err(error) => {
-                            app.message = format!("{error:#}");
-                            app.alert = app.message.clone();
+                            app.ui.error(format!("{error:#}"));
                         }
                     },
                     Event::Paste(text) => app.paste(&text),

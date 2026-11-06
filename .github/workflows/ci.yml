@@ -41,7 +41,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked
+      - run: cargo test --locked --no-fail-fast
 
   msrv:
     name: MSRV (1.85)
@@ -53,9 +53,18 @@ jobs:
       - run: cargo check --all-targets --locked
 
   smoke:
-    name: Terminal smoke tests
-    runs-on: ubuntu-latest
+    name: Terminal smoke tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    # All scripts are portable (PTY/termios only, /proc checks gated to Linux).
+    # macOS stays advisory until it has a record of green runs.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
+    env:
+      SMOKE: uv run --with-requirements scripts/requirements-smoke.txt python
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -63,27 +72,49 @@ jobs:
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: scripts/requirements-smoke.txt
       - run: cargo build --locked
       - name: Workflow
-        run: uv run --with pyte python scripts/smoke_tui.py
+        run: $SMOKE scripts/smoke_tui.py
       - name: Repository browser
-        run: uv run --with pyte python scripts/smoke_repos.py
+        run: $SMOKE scripts/smoke_repos.py
       - name: Task imports
-        run: uv run --with pyte python scripts/smoke_imports.py
+        run: $SMOKE scripts/smoke_imports.py
       - name: Stage presets
-        run: uv run --with pyte python scripts/smoke_stages.py
+        run: $SMOKE scripts/smoke_stages.py
       - name: Themes
-        run: uv run --with pyte python scripts/smoke_themes.py
+        run: $SMOKE scripts/smoke_themes.py
       - name: Harness settings
-        run: uv run --with pyte python scripts/smoke_harness_settings.py
+        run: $SMOKE scripts/smoke_harness_settings.py
       - name: Startup animation
-        run: uv run --with pyte --with pillow python scripts/smoke_startup.py
+        run: $SMOKE scripts/smoke_startup.py
+      - name: Native terminal detach and reattach
+        run: $SMOKE scripts/smoke_detach.py
+      - name: Diff review and external tools
+        run: $SMOKE scripts/smoke_review.py
+      # Plain python3: the raw-PTY harness must not need pyte.
       - name: Terminal disconnect and shutdown
         run: python3 scripts/smoke_shutdown.py
       - name: Upload screen captures
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: smoke-captures
+          name: smoke-captures-${{ matrix.os }}
           path: .model-router/qa/
           if-no-files-found: ignore
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    # Advisories appear without code changes; report them, don't block merges.
+    continue-on-error: true
+    permissions:
+      contents: read
+      checks: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

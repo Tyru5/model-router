@@ -1,5 +1,5 @@
 use super::input::InputField;
-use crate::{engine::Status, storage};
+use crate::{engine::Status, notify, storage};
 use anyhow::{Context, Result};
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -398,6 +398,46 @@ impl Palette {
         }
     }
 
+    /// Added diff lines; ANSI green in the Terminal theme.
+    pub fn diff_add(self) -> Style {
+        Style::default().fg(self.success)
+    }
+
+    /// Removed diff lines; ANSI red in the Terminal theme.
+    pub fn diff_del(self) -> Style {
+        Style::default().fg(self.red)
+    }
+
+    /// `@@` hunk headers.
+    pub fn diff_hunk(self) -> Style {
+        Style::default().fg(self.blue)
+    }
+
+    /// `diff --git` lines that start each file.
+    pub fn diff_file(self) -> Style {
+        Style::default()
+            .fg(self.accent)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// index, mode, rename, `---`, and `+++` lines.
+    pub fn diff_meta(self) -> Style {
+        Style::default().fg(self.violet)
+    }
+
+    /// A search match.
+    pub fn search_match(self) -> Style {
+        Style::default().fg(self.on_accent()).bg(self.warn)
+    }
+
+    /// The match search moved to.
+    pub fn search_current(self) -> Style {
+        Style::default()
+            .fg(self.on_accent())
+            .bg(self.accent)
+            .add_modifier(Modifier::BOLD)
+    }
+
     pub fn status_color(self, status: Status) -> Color {
         match status {
             Status::Complete => self.success,
@@ -431,26 +471,30 @@ impl Palette {
     }
 }
 
-#[derive(Default, Deserialize, Serialize)]
+/// User preferences for every project, saved as `appearance.json` (its name
+/// from when it held only the theme). Older files lack newer keys, which
+/// then take their defaults.
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
-pub(super) struct Appearance {
+pub(super) struct Preferences {
     pub theme: Theme,
     pub vim_motions: bool,
+    pub notifications: notify::Backends,
 }
 
-pub(super) fn load(path: &Path) -> Result<Appearance> {
+pub(super) fn load(path: &Path) -> Result<Preferences> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Appearance::default()),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Preferences::default()),
         Err(error) => return Err(error).with_context(|| format!("Read {}", path.display())),
     };
-    let appearance: Appearance = serde_json::from_slice(&bytes)
+    let preferences: Preferences = serde_json::from_slice(&bytes)
         .with_context(|| format!("Read theme from {}", path.display()))?;
-    Ok(appearance)
+    Ok(preferences)
 }
 
-pub(super) fn save(path: &Path, theme: Theme, vim_motions: bool) -> Result<()> {
-    storage::write_json(path, &Appearance { theme, vim_motions })
+pub(super) fn save(path: &Path, preferences: &Preferences) -> Result<()> {
+    storage::write_json(path, preferences)
 }
 
 /// Bracket each ` / `-separated alternative: `J / K` -> `[J] / [K]`.
@@ -464,6 +508,33 @@ pub fn key_label(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn with_theme(theme: Theme) -> Preferences {
+        Preferences {
+            theme,
+            ..Preferences::default()
+        }
+    }
+
+    #[test]
+    fn preferences_keep_notifications_and_read_files_without_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("appearance.json");
+        fs::write(&path, r#"{"theme":"nord","vim_motions":true}"#).unwrap();
+        let mut old = load(&path).unwrap();
+        assert_eq!(old.theme, Theme::Nord);
+        assert!(old.vim_motions);
+        assert_eq!(old.notifications, notify::Backends::default());
+        old.notifications.desktop = true;
+        old.notifications.webhook_url = "https://ntfy.sh/x".into();
+        save(&path, &old).unwrap();
+        let again = load(&path).unwrap();
+        assert_eq!(again.theme, Theme::Nord);
+        assert!(again.vim_motions && again.notifications.desktop);
+        assert_eq!(again.notifications.webhook_url, "https://ntfy.sh/x");
+        // The CLI reads the same file.
+        assert!(notify::load_backends(&path).desktop);
+    }
 
     #[test]
     fn appearance_defaults_and_invalid_files_are_recoverable() {
@@ -480,7 +551,7 @@ mod tests {
             fs::write(&path, invalid).unwrap();
             assert!(load(&path).is_err());
         }
-        save(&path, Theme::CatppuccinLatte, false).unwrap();
+        save(&path, &with_theme(Theme::CatppuccinLatte)).unwrap();
         assert_eq!(load(&path).unwrap().theme, Theme::CatppuccinLatte);
         assert!(
             fs::read_to_string(path)
@@ -496,7 +567,7 @@ mod tests {
         let mut ids = std::collections::HashSet::new();
         for theme in Theme::ALL {
             assert!(ids.insert(serde_json::to_string(&theme).unwrap()));
-            save(&path, theme, false).unwrap();
+            save(&path, &with_theme(theme)).unwrap();
             assert_eq!(load(&path).unwrap().theme, theme);
         }
     }
@@ -537,6 +608,24 @@ mod tests {
                 contrast(p.selection_fg, p.selection_bg) >= 4.5,
                 "{theme:?}: selection"
             );
+            for (name, style) in [
+                ("added", p.diff_add()),
+                ("removed", p.diff_del()),
+                ("hunk", p.diff_hunk()),
+            ] {
+                // The theme's own status colours (Nord's red is the lowest);
+                // the +/− prefix tells the lines apart too.
+                assert!(
+                    contrast(style.fg.unwrap(), p.panel) >= 2.4,
+                    "{theme:?}: {name} diff lines"
+                );
+            }
+            for style in [p.search_match(), p.search_current()] {
+                assert!(
+                    contrast(style.fg.unwrap(), style.bg.unwrap()) >= 3.0,
+                    "{theme:?}: search match"
+                );
+            }
         }
     }
 
@@ -549,6 +638,26 @@ mod tests {
             p.violet,
         ];
         assert!(fields.iter().all(|c| !matches!(c, Color::Rgb(..))));
+        // Diff and search colours are ANSI too, so they follow the terminal's scheme.
+        for style in [
+            p.diff_add(),
+            p.diff_del(),
+            p.diff_hunk(),
+            p.diff_file(),
+            p.diff_meta(),
+            p.search_match(),
+            p.search_current(),
+        ] {
+            assert!(
+                [style.fg, style.bg]
+                    .iter()
+                    .flatten()
+                    .all(|c| !matches!(c, Color::Rgb(..))),
+                "{style:?}"
+            );
+        }
+        assert_eq!(p.diff_add().fg, Some(Color::Green));
+        assert_eq!(p.diff_del().fg, Some(Color::Red));
         assert!(p.selected_style().add_modifier.contains(Modifier::REVERSED));
         assert_eq!(p.on_accent(), Color::Black);
         let model_router = Theme::ModelRouter.palette();

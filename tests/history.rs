@@ -46,7 +46,14 @@ fn listing_reads_summaries_without_run_json() {
     assert_eq!(drive(&mut run), Action::Complete);
     let saved: history::RunSummary =
         storage::read_json(&run.directory.join("summary.json")).unwrap();
-    assert_eq!(saved, history::RunSummary::from(&run));
+    let run_bytes = fs::metadata(run.directory.join("run.json")).unwrap().len();
+    assert_eq!(saved.run_bytes, Some(run_bytes));
+    assert_eq!(saved.revision, run.revision);
+    let listed = history::RunSummary {
+        run_bytes: None,
+        ..saved.clone()
+    };
+    assert_eq!(listed, history::RunSummary::from(&run));
     assert_eq!(saved.status, Status::Complete);
     assert_eq!((saved.enabled_stages, saved.complete_stages), (1, 1));
     assert_eq!(saved.attempts, 1);
@@ -54,16 +61,19 @@ fn listing_reads_summaries_without_run_json() {
     // Old runs without summary.json still list from run.json.
     fs::remove_file(run.directory.join("summary.json")).unwrap();
     let entries = history::list(dir.path()).unwrap();
-    assert_eq!(summary(&entries[0]), &saved);
+    assert_eq!(summary(&entries[0]), &listed);
     assert!(
         !run.directory.join("summary.json").exists(),
         "listing wrote"
     );
-    // With a summary, run.json is not read.
+    // With a summary, run.json is only checked for the size it recorded.
     run.persist().unwrap();
+    let entries = history::list(dir.path()).unwrap();
+    assert_eq!(summary(&entries[0]).revision, run.revision);
+    // A run.json that broke after its summary was saved lists as damaged.
     fs::write(run.directory.join("run.json"), "{").unwrap();
     let entries = history::list(dir.path()).unwrap();
-    assert_eq!(summary(&entries[0]).id, run.id);
+    assert!(matches!(&entries[0], Entry::Damaged { id, .. } if *id == run.id));
     // Loading on demand reports the broken record.
     assert!(engine::load(dir.path(), &run.id).is_err());
     assert!(engine::history(dir.path()).unwrap().is_empty());

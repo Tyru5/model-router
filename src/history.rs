@@ -34,6 +34,14 @@ pub struct RunSummary {
     pub worktree: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerun_of: Option<String>,
+    /// run.json's revision when this summary was saved.
+    #[serde(default)]
+    pub revision: u64,
+    /// run.json's size when this summary was saved, so listing can notice a
+    /// run.json that changed or broke without parsing it. None in summaries
+    /// saved before this was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_bytes: Option<u64>,
 }
 impl From<&Run> for RunSummary {
     fn from(run: &Run) -> Self {
@@ -54,6 +62,8 @@ impl From<&Run> for RunSummary {
             error: run.error.as_deref().map(excerpt),
             worktree: run.worktree,
             rerun_of: run.rerun_of.clone(),
+            revision: run.revision,
+            run_bytes: None,
         }
     }
 }
@@ -158,13 +168,23 @@ pub fn list(project: &Path) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
+/// The summary when run.json still has the size it recorded; otherwise the
+/// full record decides, so a broken run.json lists as damaged and one saved
+/// without its summary (a crash between the two writes) lists current.
 fn read_summary(project: &Path, id: &str, dir: &Path) -> Result<RunSummary> {
     if let Ok(summary) = storage::read_json::<RunSummary>(&dir.join("summary.json")) {
-        if summary.id == id {
+        let run_bytes = fs::metadata(dir.join("run.json")).map(|meta| meta.len());
+        let consistent = match (summary.run_bytes, run_bytes) {
+            (Some(expected), Ok(actual)) => expected == actual,
+            (None, Ok(actual)) => actual > 0,
+            (_, Err(_)) => false,
+        };
+        if summary.id == id && consistent {
             return Ok(summary);
         }
     }
-    Ok(RunSummary::from(&engine::load(project, id)?))
+    let run = engine::load(project, id)?;
+    Ok(RunSummary::from(&run))
 }
 
 /// Selects entries by run status, by every active status, or damaged records.
@@ -556,7 +576,8 @@ pub fn size(path: &Path) -> u64 {
     }
 }
 
-/// A run's directory, then its handoff directories in the project or its worktree.
+/// A run's directory, then its handoff directories in the project or its
+/// worktree, then its fan-out candidates' worktrees.
 fn artifacts(project: &Path, entry: &Entry) -> Vec<PathBuf> {
     let id = entry.id();
     let root = project.join(".model-router");
@@ -566,6 +587,7 @@ fn artifacts(project: &Path, entry: &Entry) -> Vec<PathBuf> {
             .join(id)
             .join(".model-router/handoffs")
             .join(id),
+        root.join("candidates").join(id),
     ];
     std::iter::once(entry.dir(project))
         .chain(
@@ -576,7 +598,8 @@ fn artifacts(project: &Path, entry: &Entry) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Bytes in a run's directory and handoff files. Worktrees are not counted.
+/// Bytes in a run's directory, handoff files, and candidate worktrees. The
+/// run's own worktree is not counted.
 pub fn run_size(project: &Path, entry: &Entry) -> u64 {
     artifacts(project, entry)
         .iter()
@@ -685,7 +708,7 @@ pub fn cleanup_plan(project: &Path, criteria: &Criteria) -> Result<Plan> {
         }
         // A missing lock file is free; checking must not create one.
         let lock = entry.dir(project).join("run.lock");
-        if lock.exists() && storage::lock(&lock).is_err() {
+        if storage::is_locked(&lock) {
             plan.skipped.push((id.into(), IN_USE.into()));
             continue;
         }
@@ -768,9 +791,16 @@ fn remove(project: &Path, item: &Item) -> Result<Item> {
             done.note = Some(format!("Worktree kept: {error:#}"));
         }
     }
+    // Candidate worktrees are the router's own, kept for inspection only.
+    crate::fanout::remove_worktrees(
+        project,
+        &project.join(".model-router/candidates").join(&item.id),
+    )?;
     for (path, _) in item.paths.iter().rev() {
         remove_path(path).with_context(|| format!("Remove {}", path.display()))?;
     }
+    // Its snapshots become unreachable, so `git gc` may prune them.
+    crate::snapshot::forget(project, &item.id);
     Ok(done)
 }
 

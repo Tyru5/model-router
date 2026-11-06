@@ -1,0 +1,1582 @@
+{
+  "unattended/default": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/model": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/model+provider": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--provider",
+        "openrouter"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--provider",
+        "openrouter"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/model+local-provider": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--provider",
+        "ollama"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--provider",
+        "ollama"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/model+lmstudio": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--provider",
+        "lmstudio"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--provider",
+        "lmstudio"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/model+effort": {
+    "build": {
+      "error": "goose has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/effort-only": {
+    "build": {
+      "error": "goose has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/model+provider+effort": {
+    "build": {
+      "error": "goose has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/routed": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--provider",
+        "openai"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "OPENAI_HOST",
+          {
+            "literal": "http://localhost:4000"
+          }
+        ],
+        [
+          "OPENAI_BASE_PATH",
+          {
+            "literal": "v1/chat/completions"
+          }
+        ],
+        [
+          "OPENAI_API_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--provider",
+        "openai"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/routed-keyless": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--provider",
+        "openai"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "OPENAI_HOST",
+          {
+            "literal": "http://localhost:8000"
+          }
+        ],
+        [
+          "OPENAI_BASE_PATH",
+          {
+            "literal": "chat/completions"
+          }
+        ],
+        [
+          "OPENAI_API_KEY",
+          {
+            "literal": "none"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--provider",
+        "openai"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/routed-preset": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--provider",
+        "openai"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GROQ_API_KEY",
+          {
+            "var": "GROQ_API_KEY"
+          }
+        ],
+        [
+          "OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "OPENAI_HOST",
+          {
+            "literal": "https://api.groq.com"
+          }
+        ],
+        [
+          "OPENAI_BASE_PATH",
+          {
+            "literal": "openai/v1/chat/completions"
+          }
+        ],
+        [
+          "OPENAI_API_KEY",
+          {
+            "var": "GROQ_API_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--provider",
+        "openai"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/routed+effort": {
+    "build": {
+      "error": "goose has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/provider-without-model": {
+    "build": {
+      "error": "A provider override requires a model"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/structured-off-old-version": {
+    "build": {
+      "error": "goose has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/old-version-routed": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--provider",
+        "openai"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "OPENAI_HOST",
+          {
+            "literal": "http://localhost:4000"
+          }
+        ],
+        [
+          "OPENAI_BASE_PATH",
+          {
+            "literal": "v1/chat/completions"
+          }
+        ],
+        [
+          "OPENAI_API_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--provider",
+        "openai"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/old-version-default": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/extra-args": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/user-output-schema": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/user-json-schema": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--json-schema={}"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1",
+        "--json-schema={}"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/unknown-setting": {
+    "build": {
+      "error": "goose has no stage setting nope"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/setting:mode=approve": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GOOSE_MODE",
+          {
+            "literal": "approve"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/setting:mode=smart_approve": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GOOSE_MODE",
+          {
+            "literal": "smart_approve"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/setting:mode=chat": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GOOSE_MODE",
+          {
+            "literal": "chat"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/setting:mode=auto": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GOOSE_MODE",
+          {
+            "literal": "auto"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/setting:mode=": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--model",
+        "m-1"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/setting:mode+invalid": {
+    "build": {
+      "error": "Invalid Permission mode for goose: not-a-choice"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/default": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/model": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/model+provider": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--provider",
+        "openrouter"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--provider",
+        "openrouter"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/model+local-provider": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--provider",
+        "ollama"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--provider",
+        "ollama"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/model+lmstudio": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--provider",
+        "lmstudio"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--provider",
+        "lmstudio"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/model+effort": {
+    "build": {
+      "error": "goose has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/effort-only": {
+    "build": {
+      "error": "goose has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/model+provider+effort": {
+    "build": {
+      "error": "goose has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/routed": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--provider",
+        "openai"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "OPENAI_HOST",
+          {
+            "literal": "http://localhost:4000"
+          }
+        ],
+        [
+          "OPENAI_BASE_PATH",
+          {
+            "literal": "v1/chat/completions"
+          }
+        ],
+        [
+          "OPENAI_API_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--provider",
+        "openai"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/routed-keyless": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--provider",
+        "openai"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "OPENAI_HOST",
+          {
+            "literal": "http://localhost:8000"
+          }
+        ],
+        [
+          "OPENAI_BASE_PATH",
+          {
+            "literal": "chat/completions"
+          }
+        ],
+        [
+          "OPENAI_API_KEY",
+          {
+            "literal": "none"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--provider",
+        "openai"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/routed-preset": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--provider",
+        "openai"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GROQ_API_KEY",
+          {
+            "var": "GROQ_API_KEY"
+          }
+        ],
+        [
+          "OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "OPENAI_HOST",
+          {
+            "literal": "https://api.groq.com"
+          }
+        ],
+        [
+          "OPENAI_BASE_PATH",
+          {
+            "literal": "openai/v1/chat/completions"
+          }
+        ],
+        [
+          "OPENAI_API_KEY",
+          {
+            "var": "GROQ_API_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--provider",
+        "openai"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/routed+effort": {
+    "build": {
+      "error": "goose has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/provider-without-model": {
+    "build": {
+      "error": "A provider override requires a model"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/structured-off-old-version": {
+    "build": {
+      "error": "goose has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/old-version-routed": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--provider",
+        "openai"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "OPENAI_HOST",
+          {
+            "literal": "http://localhost:4000"
+          }
+        ],
+        [
+          "OPENAI_BASE_PATH",
+          {
+            "literal": "v1/chat/completions"
+          }
+        ],
+        [
+          "OPENAI_API_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--provider",
+        "openai"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/old-version-default": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/extra-args": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/user-output-schema": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/user-json-schema": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--json-schema={}"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--json-schema={}"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/unknown-setting": {
+    "build": {
+      "error": "goose has no stage setting nope"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/setting:mode=approve": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GOOSE_MODE",
+          {
+            "literal": "approve"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/setting:mode=smart_approve": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GOOSE_MODE",
+          {
+            "literal": "smart_approve"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/setting:mode=chat": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GOOSE_MODE",
+          {
+            "literal": "chat"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/setting:mode=auto": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GOOSE_MODE",
+          {
+            "literal": "auto"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/setting:mode=": {
+    "build": {
+      "program": "goose",
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--text",
+        "Do the task.\nLine two {model} $(x)",
+        "--interactive",
+        "--model",
+        "m-1"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/setting:mode+invalid": {
+    "build": {
+      "error": "Invalid Permission mode for goose: not-a-choice"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  }
+}

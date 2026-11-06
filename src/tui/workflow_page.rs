@@ -3,15 +3,15 @@ use super::{
     actions::ActionId,
     app::App,
     harness_editor::HarnessEditor,
-    modal::{Choice, InputTarget, Modal, PickValue},
+    modal::{Ask, Choice, InputTarget, Modal, PickValue},
     path_picker::PathPicker,
     task_importer::TaskImporter,
     theme::Palette,
-    widgets::{content, focus_textarea, kv, or_default, short_path, textarea, wrapped_textarea},
+    widgets::{content, focus_textarea, kv, or_default, textarea, wrapped_textarea},
 };
 use crate::{
     adapters, catalog,
-    config::{Check, Mode, Role, Stage},
+    config::{Candidate, Check, FanOut, Mode, Role, Sandbox, Stage},
     engine::{self, Run},
     harness_settings, presets, storage,
 };
@@ -27,6 +27,7 @@ use ratatui::{
         TableState, Wrap,
     },
 };
+use tui_textarea::CursorMove;
 
 const FIELDS: &[&str] = &[
     "Name",
@@ -39,13 +40,24 @@ const FIELDS: &[&str] = &[
     "Timeout (seconds)",
     "Review repair target (stage ID; blank = nearest)",
     "Extra arguments (shell quoting; no shell execution)",
+    "Run after (stage IDs, comma separated; blank = list order)",
+    "Fan-out candidates (one per line: [id:] harness [model] [provider] [effort])",
     "Router checks (one per line; ? prefix = optional)",
+    "Router sandbox (inherit = workflow default)",
     "Stage instructions",
+    "Ship options (TOML; ship role only)",
 ];
+const AFTER: usize = 10;
 /// Multiline fields, where Enter inserts a newline.
-const CHECKS: usize = 10;
-const INSTRUCTIONS: usize = 11;
-const CHOICES: [usize; 3] = [1, 2, 6];
+const FAN_OUT: usize = 11;
+const CHECKS: usize = 12;
+const SANDBOX: usize = 13;
+const INSTRUCTIONS: usize = 14;
+const SHIP: usize = 15;
+const MULTILINE: [usize; 4] = [CHECKS, INSTRUCTIONS, FAN_OUT, SHIP];
+const CHOICES: [usize; 4] = [1, 2, 6, SANDBOX];
+/// The sandbox choice that keeps the workflow's `sandbox_default`.
+const INHERIT: &str = "inherit";
 /// The model field: chosen from the harness catalog, typed only on request.
 pub(super) const MODEL: usize = 3;
 const PROVIDER: usize = 4;
@@ -98,6 +110,10 @@ impl StageEditor {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        let sandbox = stage.sandbox.map_or(INHERIT, Sandbox::label).to_owned();
+        let ship = ship_text(&stage);
+        let after = stage.after.join(", ");
+        let fan_out = stage.fan_out.as_ref().map(fan_out_text).unwrap_or_default();
         let fields = [
             &stage.name,
             stage.role.label(),
@@ -109,8 +125,12 @@ impl StageEditor {
             &stage.timeout_seconds.to_string(),
             &stage.repair_target,
             &args,
+            &after,
+            &fan_out,
             &checks,
+            &sandbox,
             &stage.instructions,
+            &ship,
         ]
         .into_iter()
         .map(textarea)
@@ -158,6 +178,10 @@ impl StageEditor {
                 levels.insert(0, String::new());
                 levels
             }
+            SANDBOX => std::iter::once(INHERIT)
+                .chain(Sandbox::ALL.map(Sandbox::label))
+                .map(String::from)
+                .collect(),
             _ => vec!["unattended".into(), "interactive".into()],
         }
     }
@@ -189,6 +213,20 @@ impl StageEditor {
             .context("Extra arguments have unmatched quotes")?;
         stage.checks = parse_checks(&content(&self.fields[CHECKS]), &self.stage.checks)?;
         stage.instructions = content(&self.fields[INSTRUCTIONS]);
+        let sandbox = content(&self.fields[SANDBOX]);
+        stage.sandbox = Sandbox::ALL.into_iter().find(|s| s.label() == sandbox);
+        stage.ship = parse_ship(stage.role, &content(&self.fields[SHIP]))?;
+        // A ship stage without options already means the defaults.
+        if self.stage.ship.is_none() && stage.ship == Some(crate::ship::Options::default()) {
+            stage.ship = None;
+        }
+        stage.after = content(&self.fields[AFTER])
+            .split([',', ' '])
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .collect();
+        stage.fan_out = parse_fan_out(&content(&self.fields[FAN_OUT]))?;
         Ok(stage)
     }
     fn focus(&mut self, index: usize) {
@@ -196,8 +234,35 @@ impl StageEditor {
         self.typing_model = false;
         focus_textarea(&mut self.fields[index]);
     }
+    /// Whether the draft differs from the stage it opened with, or cannot be applied.
+    pub(super) fn changed(&self) -> bool {
+        self.finish().map_or(true, |stage| {
+            serde_json::to_value(&stage).ok() != serde_json::to_value(&self.stage).ok()
+        })
+    }
+    /// Whether Up/Down move the cursor inside a multiline field instead of
+    /// leaving it: only on its first or last line do they switch fields.
+    fn moves_within(&self, key: &KeyEvent) -> bool {
+        if !MULTILINE.contains(&self.selected) || !key.modifiers.is_empty() {
+            return false;
+        }
+        let field = &self.fields[self.selected];
+        let row = field.cursor().0;
+        match key.code {
+            Key::Up => row > 0,
+            Key::Down => row + 1 < field.lines().len(),
+            _ => false,
+        }
+    }
     pub(super) fn key(&mut self, key: KeyEvent) -> StageRequest {
-        if matches!(key.code, Key::Tab | Key::Down)
+        if self.moves_within(&key) {
+            // Moved directly, so Vim's Normal mode moves too.
+            self.fields[self.selected].move_cursor(if key.code == Key::Up {
+                CursorMove::Up
+            } else {
+                CursorMove::Down
+            });
+        } else if matches!(key.code, Key::Tab | Key::Down)
             || (key.code == Key::Char('n') && key.modifiers.contains(Mods::CONTROL))
         {
             self.focus((self.selected + 1) % self.fields.len());
@@ -225,6 +290,9 @@ impl StageEditor {
                 Key::Left | Key::Right | Key::Char(' ') | Key::Enter
             ) {
                 let values = self.choices(self.selected);
+                if values.is_empty() {
+                    return StageRequest::None;
+                }
                 let current = values
                     .iter()
                     .position(|v| *v == content(&self.fields[self.selected]))
@@ -243,7 +311,7 @@ impl StageEditor {
                     return StageRequest::Catalog;
                 }
             }
-        } else if key.code == Key::Enter && ![CHECKS, INSTRUCTIONS].contains(&self.selected) {
+        } else if key.code == Key::Enter && !MULTILINE.contains(&self.selected) {
             self.focus((self.selected + 1) % self.fields.len());
         } else {
             self.fields[self.selected].input(key);
@@ -395,6 +463,12 @@ impl StageEditor {
         keys.spans.push(Span::styled(
             if self.selected == CHECKS {
                 "   ·  argv per line, no shell; edit timeout_seconds in TOML"
+            } else if self.selected == SHIP {
+                "   ·  e.g. push = true, draft_pr = true; blank = defaults (commit only, confirm)"
+            } else if self.selected == AFTER {
+                "   ·  any stage with after makes the workflow a graph"
+            } else if self.selected == FAN_OUT {
+                "   ·  - leaves a value blank; a judge = auto|<review id> line picks the winner"
             } else if self.selected == MODEL {
                 "   ·  Enter lists the harness's models; blank inherits its default"
             } else if self.selected == EFFORT && self.catalog.is_none() {
@@ -409,6 +483,33 @@ impl StageEditor {
             chunks[1],
         );
     }
+}
+
+/// A ship stage's options as TOML lines; empty for other stages.
+fn ship_text(stage: &Stage) -> String {
+    if stage.role != Role::Ship && stage.ship.is_none() {
+        return String::new();
+    }
+    toml::to_string(&stage.ship.clone().unwrap_or_default())
+        .unwrap_or_default()
+        .trim_end()
+        .to_owned()
+}
+
+/// Parses the ship options field. Blank means the defaults for a ship stage
+/// and none for other roles.
+fn parse_ship(role: Role, text: &str) -> Result<Option<crate::ship::Options>> {
+    if text.trim().is_empty() {
+        return Ok((role == Role::Ship).then(crate::ship::Options::default));
+    }
+    ensure!(
+        role == Role::Ship,
+        "Ship options apply to ship stages only; clear the field or choose the ship role"
+    );
+    let options: crate::ship::Options =
+        toml::from_str(text).map_err(|e| anyhow::anyhow!("Ship options: {}", e.message()))?;
+    options.validate()?;
+    Ok(Some(options))
 }
 
 /// Parses the router checks field: one shell-quoted argv per nonempty line, a
@@ -444,6 +545,80 @@ fn parse_checks(text: &str, existing: &[Check]) -> Result<Vec<Check>> {
     Ok(checks)
 }
 
+/// The fan-out field: a `judge = …` line, then one candidate per line.
+fn fan_out_text(fan: &FanOut) -> String {
+    let mut lines = vec![format!("judge = {}", fan.judge)];
+    for candidate in &fan.candidates {
+        let mut words = vec![];
+        if !candidate.id.is_empty() {
+            words.push(format!("{}:", candidate.id));
+        }
+        words.push(shell_words::quote(&candidate.harness).into_owned());
+        let values = [&candidate.model, &candidate.provider, &candidate.effort];
+        let used = values
+            .iter()
+            .rposition(|v| !v.is_empty())
+            .map_or(0, |i| i + 1);
+        for value in &values[..used] {
+            words.push(if value.is_empty() {
+                "-".into()
+            } else {
+                shell_words::quote(value).into_owned()
+            });
+        }
+        lines.push(words.join(" "));
+    }
+    lines.join("\n")
+}
+
+/// Parses the fan-out field; blank means no fan-out.
+fn parse_fan_out(text: &str) -> Result<Option<FanOut>> {
+    let mut judge = crate::config::AUTO_JUDGE.to_owned();
+    let mut candidates = vec![];
+    for (number, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("judge") {
+            let value = rest.trim_start().trim_start_matches(['=', ':']).trim();
+            ensure!(
+                !value.is_empty(),
+                "Fan-out line {} needs a judge",
+                number + 1
+            );
+            judge = value.to_owned();
+            continue;
+        }
+        let mut words = shell_words::split(line)
+            .with_context(|| format!("Fan-out line {} has unmatched quotes", number + 1))?
+            .into_iter();
+        let mut candidate = Candidate::default();
+        let mut first = words.next().unwrap_or_default();
+        if let Some(id) = first.strip_suffix(':') {
+            candidate.id = id.to_owned();
+            first = words.next().unwrap_or_default();
+        }
+        ensure!(
+            !first.is_empty(),
+            "Fan-out line {} needs a harness",
+            number + 1
+        );
+        candidate.harness = first;
+        let value = |word: Option<String>| word.filter(|w| w != "-").unwrap_or_default();
+        candidate.model = value(words.next());
+        candidate.provider = value(words.next());
+        candidate.effort = value(words.next());
+        ensure!(
+            words.next().is_none(),
+            "Fan-out line {} has more than harness, model, provider, and effort",
+            number + 1
+        );
+        candidates.push(candidate);
+    }
+    Ok((!candidates.is_empty()).then_some(FanOut { candidates, judge }))
+}
+
 fn duration(seconds: u64) -> String {
     if seconds % 60 == 0 {
         format!("{} min", seconds / 60)
@@ -454,43 +629,52 @@ fn duration(seconds: u64) -> String {
 
 impl App {
     pub(super) fn perform_workflow(&mut self, id: ActionId) -> Result<()> {
-        let count = self.settings.workflows[self.workflow].stages.len();
+        let count = self.editor.settings.workflows[self.editor.workflow]
+            .stages
+            .len();
         match id {
-            ActionId::NextStage => self.selected = (self.selected + 1).min(count - 1),
-            ActionId::PreviousStage => self.selected = self.selected.saturating_sub(1),
+            ActionId::NextStage => {
+                self.editor.selected = (self.editor.selected + 1).min(count.saturating_sub(1))
+            }
+            ActionId::PreviousStage => {
+                self.editor.selected = self.editor.selected.saturating_sub(1)
+            }
             ActionId::ToggleStage => {
-                let stage = self.stage_mut();
+                let stage = self.editor.stage_mut();
                 stage.enabled = !stage.enabled;
-                self.dirty = true;
+                self.editor.dirty = true;
             }
             ActionId::ToggleMode => {
-                let stage = self.stage_mut();
+                let stage = self.editor.stage_mut();
                 stage.mode = if stage.mode == Mode::Interactive {
                     Mode::Unattended
                 } else {
                     Mode::Interactive
                 };
-                self.dirty = true;
+                self.editor.dirty = true;
             }
             ActionId::EditTask => self.input(
                 "Task · [Ctrl+S] applies · [Enter] adds a line",
                 InputTarget::Task,
-                &self.task.clone(),
+                &self.editor.task.clone(),
             ),
             ActionId::Repositories => {
-                self.modal = Some(Modal::Repositories(Box::new(PathPicker::new(
+                self.ui.open(Modal::Repositories(Box::new(PathPicker::new(
                     &self.project,
                     storage::recent_projects(),
+                    self.tasks.spawner(),
                 )?)));
             }
             ActionId::ImportTask => {
-                self.modal = Some(Modal::Import(Box::new(TaskImporter::new(
+                self.ui.open(Modal::Import(Box::new(TaskImporter::new(
                     &self.project,
-                    &self.task,
+                    &self.editor.task,
+                    self.tasks.spawner(),
                 )?)));
             }
             ActionId::ChooseWorkflow => {
                 let mut items: Vec<_> = self
+                    .editor
                     .settings
                     .workflows
                     .iter()
@@ -513,29 +697,31 @@ impl App {
                             value: PickValue::WorkflowPreset(index),
                         }),
                 );
-                self.modal = Some(Modal::Picker {
+                self.ui.open(Modal::Picker {
                     title: "Choose workflow".into(),
                     items,
-                    selected: self.workflow,
+                    selected: self.editor.workflow,
                     filter: textarea(""),
-                    note: "Presets add an editable workflow. Reviews start disabled; existing workflows are kept."
+                    note: "Presets add an editable workflow. Reviews start disabled, as does ship; existing workflows are kept."
                         .into(),
                 });
             }
             ActionId::RenameWorkflow => self.input(
                 "Rename workflow",
                 InputTarget::RenameWorkflow,
-                &self.settings.workflows[self.workflow].name.clone(),
+                &self.editor.settings.workflows[self.editor.workflow]
+                    .name
+                    .clone(),
             ),
             ActionId::RepairLimit => self.input(
                 "Maximum automatic repair passes (0 disables repairs)",
                 InputTarget::RepairLimit,
-                &self.settings.workflows[self.workflow]
+                &self.editor.settings.workflows[self.editor.workflow]
                     .max_repair_passes
                     .to_string(),
             ),
             ActionId::PickHarness => {
-                let items = catalog::known_harnesses(&self.settings)
+                let items = catalog::known_harnesses(&self.editor.settings)
                     .into_iter()
                     .map(|name| Choice {
                         label: format!(
@@ -543,7 +729,7 @@ impl App {
                             name,
                             if adapters::executable(&adapters::program(
                                 &name,
-                                &self.settings.adapters
+                                &self.editor.settings.adapters
                             ))
                             .is_some()
                             {
@@ -555,7 +741,7 @@ impl App {
                         value: PickValue::Harness(name),
                     })
                     .collect();
-                self.modal = Some(Modal::Picker {
+                self.ui.open(Modal::Picker {
                     title: "Harness for selected stage".into(),
                     items,
                     selected: 0,
@@ -565,26 +751,26 @@ impl App {
                 });
             }
             ActionId::EditStage => {
-                self.modal = Some(Modal::Stage {
+                self.ui.open(Modal::Stage {
                     editor: Box::new(StageEditor::new(
-                        self.stage().clone(),
-                        catalog::known_harnesses(&self.settings),
+                        self.editor.stage().clone(),
+                        catalog::known_harnesses(&self.editor.settings),
                     )),
                     insert_at: None,
                 });
-                self.request_catalog(self.stage().harness.clone());
+                self.request_catalog(self.editor.stage().harness.clone());
             }
             ActionId::HarnessSettings => {
-                self.modal = Some(Modal::Harness(Box::new(HarnessEditor::new(
-                    self.stage().clone(),
-                    self.settings.providers.clone(),
+                self.ui.open(Modal::Harness(Box::new(HarnessEditor::new(
+                    self.editor.stage().clone(),
+                    self.editor.settings.providers.clone(),
                 ))));
-                self.request_catalog(self.stage().harness.clone());
+                self.request_catalog(self.editor.stage().harness.clone());
             }
-            ActionId::Models => self.model_picker(),
+            ActionId::Models => self.model_picker_for(self.editor.stage().harness.clone()),
             ActionId::AddStage => {
                 ensure!(count < 64, "A workflow can contain at most 64 stages");
-                self.modal = Some(Modal::Picker {
+                self.ui.open(Modal::Picker {
                     title: "Add stage from preset".into(),
                     items: presets::STAGES
                         .iter()
@@ -603,97 +789,84 @@ impl App {
             }
             ActionId::DuplicateStage => {
                 ensure!(count < 64, "A workflow can contain at most 64 stages");
-                let mut copy = self.stage().clone();
+                let mut copy = self.editor.stage().clone();
                 copy.id = Stage::default().id;
                 copy.name.push_str(" copy");
-                self.settings.workflows[self.workflow]
+                self.editor.settings.workflows[self.editor.workflow]
                     .stages
-                    .insert(self.selected + 1, copy);
-                self.selected += 1;
-                self.dirty = true;
+                    .insert(self.editor.selected + 1, copy);
+                self.editor.selected += 1;
+                self.editor.dirty = true;
             }
             ActionId::RemoveStage => {
                 ensure!(count > 1, "Keep at least one stage");
-                self.settings.workflows[self.workflow]
+                let name = self.editor.stage().name.clone();
+                self.editor.remember(format!("stage “{name}”"));
+                self.editor.settings.workflows[self.editor.workflow]
                     .stages
-                    .remove(self.selected);
-                self.selected = self.selected.min(count - 2);
-                self.dirty = true;
+                    .remove(self.editor.selected);
+                self.editor.selected = self.editor.selected.min(count - 2);
+                self.editor.dirty = true;
+                self.ui.message = format!("Removed stage “{name}” — [u] to undo.");
             }
             ActionId::DeleteWorkflow => {
                 ensure!(
-                    self.settings.workflows.len() > 1,
+                    self.editor.settings.workflows.len() > 1,
                     "Keep at least one workflow"
                 );
-                self.settings.workflows.remove(self.workflow);
-                self.workflow = 0;
-                self.selected = 0;
-                self.dirty = true;
+                self.ui.open(Modal::Ask(Box::new(Ask::DeleteWorkflow {
+                    index: self.editor.workflow,
+                })));
             }
+            ActionId::Undo => self.ui.message = self.editor.restore(),
             ActionId::MoveStageUp => {
-                if self.selected > 0 {
-                    self.settings.workflows[self.workflow]
+                if self.editor.selected > 0 {
+                    self.editor.settings.workflows[self.editor.workflow]
                         .stages
-                        .swap(self.selected, self.selected - 1);
-                    self.selected -= 1;
-                    self.dirty = true;
+                        .swap(self.editor.selected, self.editor.selected - 1);
+                    self.editor.selected -= 1;
+                    self.editor.dirty = true;
                 }
             }
             ActionId::MoveStageDown => {
-                if self.selected + 1 < count {
-                    self.settings.workflows[self.workflow]
+                if self.editor.selected + 1 < count {
+                    self.editor.settings.workflows[self.editor.workflow]
                         .stages
-                        .swap(self.selected, self.selected + 1);
-                    self.selected += 1;
-                    self.dirty = true;
+                        .swap(self.editor.selected, self.editor.selected + 1);
+                    self.editor.selected += 1;
+                    self.editor.dirty = true;
                 }
             }
-            ActionId::ToggleWorktree => self.worktree = !self.worktree,
+            ActionId::ToggleWorktree => self.editor.worktree = !self.editor.worktree,
             ActionId::Save => self.save(false)?,
             ActionId::SaveGlobal => self.save(true)?,
             ActionId::Preview => self.text(
                 "Launch preview · no model is started",
                 engine::preview(
-                    &self.settings,
-                    &self.settings.workflows[self.workflow],
+                    &self.editor.settings,
+                    &self.editor.settings.workflows[self.editor.workflow],
                     &self.project,
-                    &self.task,
+                    &self.editor.task,
                 )?,
             ),
             ActionId::Run => {
-                let (placement, holder) = self.placement(self.worktree)?;
-                let run = Run::create_at(
-                    &self.project,
-                    &self.settings,
-                    &self.settings.workflows[self.workflow],
-                    self.task.clone(),
-                    placement,
+                // Creating a worktree and snapshot can take a while, so the
+                // run starts in the background; the editor stays usable.
+                let (project, settings, task) = (
+                    self.project.clone(),
+                    self.editor.settings.clone(),
+                    self.editor.task.clone(),
+                );
+                let workflow = settings.workflows[self.editor.workflow].clone();
+                crate::config::validate_task(&task)?;
+                self.start_run(
+                    move |placement| {
+                        Run::create_at(&project, &settings, &workflow, task, placement)
+                    },
+                    self.editor.worktree,
+                    Some(self.editor.task.clone()),
+                    None,
                 )?;
-                // An interactive first stage needs the terminal right away.
-                let interactive = run
-                    .workflow
-                    .stages
-                    .iter()
-                    .find(|s| s.enabled)
-                    .is_some_and(|s| s.mode == Mode::Interactive);
-                let (id, workspace) = (run.id.clone(), run.workspace.clone());
-                self.adopt(run);
-                self.start_driver()?;
-                // The run has its own snapshot; the editor is free for the next one.
-                self.task.clear();
-                self.message = match holder {
-                    Some(holder) => format!(
-                        "Started {id} in worktree {}: {holder} is using the checkout, whose uncommitted changes are not included. ",
-                        short_path(&workspace, 60)
-                    ),
-                    None => format!("Started {id}. "),
-                };
-                if interactive {
-                    self.page = 1;
-                } else {
-                    self.message
-                        .push_str("Monitor [2] follows it. Define the next task here.");
-                }
             }
             other => bail!("{other:?} is not a workflow action"),
         }
@@ -709,13 +882,13 @@ pub(super) fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palett
         Constraint::Min(5),
     ])
     .split(area);
-    let workflow = &app.settings.workflows[app.workflow];
+    let workflow = &app.editor.settings.workflows[app.editor.workflow];
     let enabled = workflow.stages.iter().filter(|s| s.enabled).count();
     let mut heading = vec![Span::styled(
         workflow.name.clone(),
         Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
     )];
-    if app.dirty {
+    if app.editor.dirty {
         heading.push(Span::styled(
             "  ● unsaved",
             Style::default().fg(palette.warn),
@@ -725,7 +898,7 @@ pub(super) fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palett
         format!(
             "   {enabled}/{} stages  ·  {}  ·  repairs ≤ {}",
             workflow.stages.len(),
-            if app.worktree {
+            if app.editor.worktree {
                 "isolated worktree"
             } else {
                 "current directory"
@@ -746,7 +919,7 @@ pub(super) fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palett
         frame.render_widget(Paragraph::new(actions).right_aligned(), chunks[0]);
     }
     frame.render_widget(Paragraph::new(heading), chunks[0]);
-    let task = if app.task.is_empty() {
+    let task = if app.editor.task.is_empty() {
         Paragraph::new(Line::styled(
             "No task yet. Press [t] to write one, or [f] to import a file, URL, or GitHub issue.",
             Style::default()
@@ -754,7 +927,8 @@ pub(super) fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palett
                 .add_modifier(Modifier::ITALIC),
         ))
     } else {
-        Paragraph::new(storage::clean_terminal(&app.task)).style(Style::default().fg(palette.fg))
+        Paragraph::new(storage::clean_terminal(&app.editor.task))
+            .style(Style::default().fg(palette.fg))
     };
     frame.render_widget(
         task.wrap(Wrap { trim: false })
@@ -778,8 +952,14 @@ pub(super) fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palett
             })),
             Cell::from(format!("{}", index + 1)).style(Style::default().fg(palette.muted)),
             Cell::from(stage.name.clone()),
-            Cell::from(stage.harness.clone()),
-            if stage.model.is_empty() {
+            Cell::from(if stage.fan_out.is_some() {
+                "fan-out".into()
+            } else {
+                stage.harness.clone()
+            }),
+            if let Some(fan) = &stage.fan_out {
+                Cell::from(format!("{} candidates", fan.candidates.len()))
+            } else if stage.model.is_empty() {
                 Cell::from("default").style(Style::default().fg(palette.muted))
             } else {
                 Cell::from(stage.model.clone())
@@ -826,17 +1006,26 @@ pub(super) fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palett
     frame.render_stateful_widget(
         table,
         cols[0],
-        &mut TableState::default().with_selected(Some(app.selected)),
+        &mut TableState::default().with_selected(Some(app.editor.selected)),
     );
     if cols[1].width > 0 {
-        let stage = app.stage();
-        let warning = app.harness_checks.warning(&stage.harness);
+        let stage = app.editor.stage();
+        let warning = app.harnesses.checks.warning(&stage.harness);
         let effort = app
             .catalogs
+            .cached
             .get(&stage.harness)
             .and_then(|c| c.efforts_for(&stage.model, &stage.provider))
             .map(|efforts| effort_note(stage, &efforts));
-        draw_stage_detail(frame, stage, warning, effort, cols[1], palette);
+        let hint = app.stats_hint(stage);
+        let sandbox = stage.effective_sandbox(&app.editor.settings.workflows[app.editor.workflow]);
+        let notes = StageNotes {
+            sandbox,
+            warning,
+            effort_note: effort,
+            hint,
+        };
+        draw_stage_detail(frame, stage, notes, cols[1], palette);
     }
 }
 
@@ -863,16 +1052,31 @@ fn effort_note(stage: &Stage, efforts: &catalog::Efforts) -> (String, bool) {
     }
 }
 
-/// `warning` flags missing harness flags from cached doctor results;
-/// `effort` says whether the catalog lists the stage's effort level.
+/// Derived facts shown beside a stage's own settings.
+struct StageNotes {
+    /// The stage's effective router sandbox.
+    sandbox: Sandbox,
+    /// Missing harness flags from cached doctor results.
+    warning: Option<String>,
+    /// Whether the catalog lists the stage's effort level.
+    effort_note: Option<(String, bool)>,
+    /// A routing suggestion from run history.
+    hint: Option<String>,
+}
+
 fn draw_stage_detail(
     frame: &mut Frame<'_>,
     stage: &Stage,
-    warning: Option<String>,
-    effort_note: Option<(String, bool)>,
+    notes: StageNotes,
     area: Rect,
     palette: Palette,
 ) {
+    let StageNotes {
+        sandbox,
+        warning,
+        effort_note,
+        hint,
+    } = notes;
     let model = or_default(&stage.model, "harness default");
     let provider = or_default(&stage.provider, "harness default");
     let effort = or_default(&stage.effort, "harness default");
@@ -901,6 +1105,12 @@ fn draw_stage_detail(
     lines.extend([
         kv(palette, "Model", model.0, model.1),
         kv(palette, "Execution", stage.mode.label(), true),
+        kv(
+            palette,
+            "Sandbox",
+            sandbox.label(),
+            stage.sandbox.is_some() || sandbox != Sandbox::Off,
+        ),
         kv(palette, "Provider", provider.0, provider.1),
         kv(palette, "Effort", effort.0, effort.1),
     ]);
@@ -918,6 +1128,29 @@ fn draw_stage_detail(
             true,
         ),
         kv(palette, "ID", &stage.id, true),
+    ]);
+    if !stage.after.is_empty() {
+        lines.push(kv(palette, "After", &stage.after.join(", "), true));
+    }
+    if let Some(fan) = &stage.fan_out {
+        lines.push(kv(
+            palette,
+            "Fan-out",
+            &format!("{} candidates · judge {}", fan.candidates.len(), fan.judge),
+            true,
+        ));
+        for (id, candidate) in fan.ids().iter().zip(&fan.candidates) {
+            lines.push(Line::styled(
+                format!(
+                    "         {id}: {} {}",
+                    candidate.harness,
+                    or_default(&candidate.model, "default").0
+                ),
+                Style::default().fg(palette.fg),
+            ));
+        }
+    }
+    lines.extend([
         Line::raw(""),
         Line::styled("Instructions", palette.header_style()),
     ]);
@@ -958,6 +1191,15 @@ fn draw_stage_detail(
             .map(|line| Line::styled(line.to_string(), Style::default().fg(palette.fg))),
     );
     lines.push(Line::raw(""));
+    if let Some(hint) = hint {
+        // Advice from saved runs; the router never applies it.
+        lines.push(Line::styled(
+            hint,
+            Style::default()
+                .fg(palette.muted)
+                .add_modifier(Modifier::DIM),
+        ));
+    }
     lines.push(Line::styled(
         if stage.role == Role::Review {
             "Optional. [Space] toggles it; blocking findings request repairs."
@@ -1041,10 +1283,35 @@ mod tests {
             assert_eq!(editor.fields[0].cursor(), (0, 8));
         }
         editor.key(KeyEvent::new(Key::Up, Mods::NONE));
+        assert_eq!(editor.selected, SHIP);
+        editor.key(KeyEvent::new(Key::Up, Mods::NONE));
         assert_eq!(editor.selected, INSTRUCTIONS);
         assert_eq!(editor.fields[INSTRUCTIONS].cursor(), (1, 4));
         editor.key(KeyEvent::new(Key::Char('!'), Mods::NONE));
         assert_eq!(editor.finish().unwrap().instructions, "first\nlast!");
+    }
+
+    #[test]
+    fn ship_options_edit_as_toml_for_ship_stages_only() {
+        let ship = crate::presets::stage("ship").build();
+        let mut editor = StageEditor::new(ship, vec!["codex".into()]);
+        assert!(content(&editor.fields[SHIP]).contains("draft_pr = true"));
+        assert!(!editor.changed());
+        editor.fields[SHIP] = textarea("push = false\nbranch = \"ship/{slug}\"");
+        let options = editor.finish().unwrap().ship.unwrap();
+        assert!(!options.push && !options.draft_pr && options.confirm);
+        assert_eq!(options.branch, "ship/{slug}");
+        editor.fields[SHIP] = textarea("draft_pr = true");
+        assert!(format!("{:#}", editor.finish().unwrap_err()).contains("requires push"));
+        editor.fields[SHIP] = textarea("pushh = true");
+        assert!(format!("{:#}", editor.finish().unwrap_err()).contains("unknown field"));
+
+        let plain = StageEditor::new(Stage::default(), vec!["codex".into()]);
+        assert_eq!(content(&plain.fields[SHIP]), "");
+        assert!(plain.finish().unwrap().ship.is_none());
+        let mut plain = plain;
+        plain.fields[SHIP] = textarea("push = true");
+        assert!(plain.finish().is_err());
     }
 
     #[test]
@@ -1202,7 +1469,15 @@ mod tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 50)).unwrap();
         terminal
-            .draw(|frame| draw_stage_detail(frame, stage, None, None, frame.area(), palette))
+            .draw(|frame| {
+                let notes = StageNotes {
+                    sandbox: Sandbox::Off,
+                    warning: None,
+                    effort_note: None,
+                    hint: None,
+                };
+                draw_stage_detail(frame, stage, notes, frame.area(), palette)
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
@@ -1213,6 +1488,21 @@ mod tests {
                     + "\n"
             })
             .collect()
+    }
+
+    #[test]
+    fn sandbox_choice_cycles_and_inherits_by_default() {
+        let mut editor = StageEditor::new(Stage::default(), vec!["codex".into()]);
+        assert_eq!(editor.finish().unwrap().sandbox, None);
+        editor.focus(SANDBOX);
+        editor.key(KeyEvent::from(Key::Right));
+        editor.key(KeyEvent::from(Key::Right));
+        assert_eq!(editor.finish().unwrap().sandbox, Some(Sandbox::ReadOnly));
+        assert!(editor.changed());
+        editor.key(KeyEvent::from(Key::Left));
+        editor.key(KeyEvent::from(Key::Left));
+        assert_eq!(editor.finish().unwrap().sandbox, None);
+        assert!(!editor.changed());
     }
 
     #[test]
@@ -1230,5 +1520,48 @@ mod tests {
             text.contains("npm run 'lint fix'  optional · 90s"),
             "{text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod fan_out_field {
+    use super::*;
+
+    #[test]
+    fn the_fan_out_field_roundtrips_and_explains_mistakes() {
+        let fan = FanOut {
+            candidates: vec![
+                Candidate {
+                    harness: "claude".into(),
+                    model: "sonnet".into(),
+                    ..Candidate::default()
+                },
+                Candidate {
+                    id: "fast".into(),
+                    harness: "codex".into(),
+                    effort: "high".into(),
+                    ..Candidate::default()
+                },
+            ],
+            judge: "judge".into(),
+        };
+        let text = fan_out_text(&fan);
+        assert_eq!(text, "judge = judge\nclaude sonnet\nfast: codex - - high");
+        assert_eq!(parse_fan_out(&text).unwrap(), Some(fan));
+        assert_eq!(parse_fan_out(" \n").unwrap(), None);
+        let auto = parse_fan_out("codex\nclaude opus").unwrap().unwrap();
+        assert!(auto.is_auto() && auto.candidates.len() == 2);
+        assert!(parse_fan_out("codex a b c d").is_err());
+        assert!(parse_fan_out("judge =").is_err());
+        let mut stage = Stage {
+            after: vec!["a".into(), "b".into()],
+            ..Stage::default()
+        };
+        stage.fan_out = parse_fan_out("codex\nclaude").unwrap();
+        let editor = StageEditor::new(stage.clone(), vec!["codex".into()]);
+        let saved = editor.finish().unwrap();
+        assert_eq!(saved.after, ["a", "b"]);
+        assert_eq!(saved.fan_out, stage.fan_out);
+        assert!(!editor.changed());
     }
 }

@@ -1,20 +1,23 @@
 use super::{
     actions::{self, ActionId, Scope},
-    completion,
-    harness_editor::HarnessEditor,
-    harnesses::{HarnessChecks, draw_harnesses},
-    history::{RunsView, draw_history},
-    modal::{Choice, InputTarget, Modal, PickValue, draw_modal, matching_choices},
+    editor::Editor,
+    harnesses::{HarnessesPage, draw_harnesses},
+    history::{RunsPage, draw_history},
+    modal::{Ask, Choice, InputTarget, Loading, Modal, PickValue, draw_modal},
+    models::Catalogs,
     monitor::draw_run,
+    run_slot::{RunSlot, Worker},
+    session::{Session, draw_session_runs, notice_text},
+    tasks::{Msg, Tasks},
     theme::{self, Palette, Theme},
+    ui::Ui,
     widgets::{dim, rows_for, short_path, textarea},
-    workflow_page::{StageEditor, draw_workflow},
+    workflow_page::draw_workflow,
 };
 use crate::{
-    catalog::{self, Catalog},
-    config::{self, Settings, Stage},
-    engine::{self, Action, Event as RunEvent, Placement, Run, Status},
-    history::Entry,
+    catalog,
+    config::{self, Settings},
+    engine::{self, Action, Placement, Run, Status},
     process, storage,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -27,212 +30,84 @@ use ratatui::{
     widgets::{Block, Paragraph, Wrap},
 };
 use std::{
-    collections::{BTreeMap, VecDeque},
     path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver},
     },
-    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
-enum WorkerMessage {
-    Event(RunEvent),
-    Done(Box<Run>, std::result::Result<Action, String>),
-}
-pub(super) struct Worker {
-    receiver: Receiver<WorkerMessage>,
-    thread: Option<JoinHandle<()>>,
-    terminal: Option<process::InteractiveSession>,
-}
-#[cfg(test)]
-impl Worker {
-    /// A worker without a thread, so tests can put the app in its running state.
-    pub(super) fn stub() -> Self {
-        Self {
-            receiver: mpsc::sync_channel(1).1,
-            thread: None,
-            terminal: None,
-        }
-    }
-}
-
-/// A run started or opened in this session, with its Monitor view state.
-pub(super) struct RunSlot {
-    pub(super) run: Option<Run>,
-    pub(super) worker: Option<Worker>,
-    pub(super) cancel: Arc<AtomicBool>,
-    pub(super) logs: VecDeque<String>,
-    pub(super) log_scroll: usize,
-    /// A finished run shows results unless the output log was chosen.
-    pub(super) show_output: bool,
-    pub(super) results_scroll: u16,
-    pub(super) changes: Option<completion::Loaded>,
-    pub(super) changes_job: Option<(String, Receiver<completion::Loaded>)>,
-    /// The run checkpoint whose waiver the status line last announced.
-    pub(super) waiver_shown: String,
-    /// Reopen the stage's session interactively once its worker stops.
-    pub(super) takeover: bool,
-}
-impl Default for RunSlot {
-    fn default() -> Self {
-        Self {
-            run: None,
-            worker: None,
-            cancel: Arc::new(AtomicBool::new(false)),
-            logs: VecDeque::new(),
-            log_scroll: 0,
-            show_output: false,
-            results_scroll: 0,
-            changes: None,
-            changes_job: None,
-            waiver_shown: String::new(),
-            takeover: false,
-        }
-    }
-}
-impl RunSlot {
-    pub(super) fn terminal(&self) -> Option<&process::InteractiveSession> {
-        self.worker.as_ref()?.terminal.as_ref()
-    }
-    /// Whether the run still needs the router: driving, or waiting on the user.
-    pub(super) fn in_progress(&self) -> bool {
-        self.worker.is_some()
-            || self.run.as_ref().is_some_and(|run| {
-                matches!(
-                    run.status,
-                    Status::Pending
-                        | Status::Running
-                        | Status::Interactive
-                        | Status::AwaitingConfirmation
-                )
-            })
-    }
-    /// Applies worker messages; returns the driver's result once it stops.
-    fn poll(&mut self) -> Option<std::result::Result<Action, String>> {
-        let messages: Vec<_> = self
-            .worker
-            .as_ref()
-            .map(|w| w.receiver.try_iter().collect())
-            .unwrap_or_default();
-        let mut stopped = None;
-        for message in messages {
-            match message {
-                WorkerMessage::Event(RunEvent::State(run)) => self.run = Some(*run),
-                WorkerMessage::Event(RunEvent::Output(text)) => {
-                    for line in text.lines() {
-                        self.logs.push_back(storage::truncate(line, 1500));
-                    }
-                    while self.logs.len() > 400 {
-                        self.logs.pop_front();
-                    }
-                }
-                WorkerMessage::Done(run, result) => {
-                    self.run = Some(*run);
-                    if let Some(mut worker) = self.worker.take() {
-                        if let Some(handle) = worker.thread.take() {
-                            let _ = handle.join();
-                        }
-                    }
-                    stopped = Some(self.settle(result));
-                }
-            }
-        }
-        if self.worker.is_none() {
-            self.cancel.store(false, Ordering::Relaxed);
-        }
-        stopped
-    }
-    /// A takeover turns the cancelled stage into one waiting for the terminal.
-    fn settle(
-        &mut self,
-        result: std::result::Result<Action, String>,
-    ) -> std::result::Result<Action, String> {
-        if !std::mem::take(&mut self.takeover) || result != Ok(Action::Stopped) {
-            return result;
-        }
-        let run = self.run.as_mut().ok_or("No run to take over")?;
-        run.take_over()
-            .map(|()| Action::Interactive)
-            .map_err(|e| format!("{e:#}"))
-    }
-}
-impl Drop for RunSlot {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
-        if let Some(mut worker) = self.worker.take() {
-            drop(worker.receiver);
-            if let Some(thread) = worker.thread.take() {
-                let _ = thread.join();
-            }
-        }
-    }
-}
-
-/// What the status line says when a run outside the Monitor stops driving.
-fn notice(run: &Run, result: &std::result::Result<Action, String>) -> String {
-    let stage = run.current_name();
-    let id = &run.id;
-    match result {
-        Ok(Action::Interactive) => format!(
-            "Run {id}: {stage} is ready in its native terminal. Monitor [2], [ ] to select the run, then [i]."
-        ),
-        Ok(Action::Confirm) => format!("Run {id}: {stage} awaits handoff review in Monitor [2]."),
-        Ok(Action::Complete) => format!("Run {id} ({}) complete.", run.workflow.name),
-        Ok(Action::Stopped) => format!(
-            "Run {id} stopped: {}",
-            run.error.as_deref().unwrap_or("no error recorded")
-        ),
-        Err(error) => format!("Run {id}: {error}"),
-    }
-}
 pub(super) struct App {
     pub(super) project: PathBuf,
-    pub(super) config_path: PathBuf,
-    pub(super) theme: Theme,
-    pub(super) theme_path: PathBuf,
-    pub(super) vim_motions: bool,
-    pub(super) settings: Settings,
-    pub(super) workflow: usize,
-    pub(super) selected: usize,
-    pub(super) task: String,
-    pub(super) worktree: bool,
-    pub(super) dirty: bool,
-    pub(super) page: usize,
-    pub(super) modal: Option<Modal>,
-    pub(super) message: String,
-    /// Last error shown; the status line turns red while it is current.
-    pub(super) alert: String,
-    /// The run the Monitor shows. Other runs of this session keep going in
-    /// `parked`; switching focus swaps a parked slot in.
-    pub(super) focused: RunSlot,
-    pub(super) parked: Vec<RunSlot>,
-    /// Position of `focused` among the session's runs, in start order.
-    pub(super) focus_index: usize,
+    /// The Workflow page's workflow, task, and undo stack.
+    pub(super) editor: Editor,
+    /// This session's runs; the Monitor shows the focused one.
+    pub(super) session: Session,
+    pub(super) runs: RunsPage,
+    pub(super) harnesses: HarnessesPage,
+    /// Preferences, status line, dialog stack, and redraw flag.
+    pub(super) ui: Ui,
+    /// Ctrl+C from the terminal, shared with the signal handler.
     pub(super) signal: Arc<AtomicBool>,
-    /// The focused run's interactive stage gets the terminal on the next frame.
-    pub(super) launch_interactive: bool,
-    pub(super) history: Vec<Entry>,
-    pub(super) history_selected: usize,
-    pub(super) runs: RunsView,
-    pub(super) harness_selected: usize,
-    pub(super) harness_checks: HarnessChecks,
-    pub(super) catalog: Option<Receiver<std::result::Result<Catalog, String>>>,
-    pub(super) model_editor: Option<Box<HarnessEditor>>,
-    /// Stage editor parked while its model picker is open.
-    pub(super) stage_editor: Option<(Box<StageEditor>, Option<usize>)>,
-    /// Harness whose catalog is being read.
-    pub(super) catalog_harness: String,
-    /// Catalogs read so far, by harness; they supply effort levels to editors.
-    pub(super) catalogs: BTreeMap<String, Catalog>,
-    /// A catalog being read for an editor, without a picker.
-    prefetch: Option<(String, Receiver<std::result::Result<Catalog, String>>)>,
-    prefetch_queue: VecDeque<String>,
-    /// Git facts for the project, refreshed on start and project switch.
-    pub(super) repo: Option<storage::RepoInfo>,
-    pub(super) quit_after_stop: bool,
+    /// Saved-run stats behind the stage hint and the Stats dialog.
+    pub(super) route_stats: super::stats_page::StatsCache,
+    /// Harness model catalogs, for pickers and editors.
+    pub(super) catalogs: Catalogs,
+    /// Git facts for the header.
+    pub(super) repo: Repo,
+    /// A run is being created (worktree, snapshot) before it starts.
+    pub(super) starting: bool,
+    /// Background work and the channel its results arrive on.
+    pub(super) tasks: Tasks,
 }
+
+/// Git facts for the project, refreshed in the background.
+pub(super) struct Repo {
+    pub(super) info: Option<storage::RepoInfo>,
+    /// When the facts were last read; None reads them on the next poll.
+    pub(super) checked: Option<Instant>,
+    pub(super) reading: bool,
+}
+impl Repo {
+    fn new(info: Option<storage::RepoInfo>) -> Self {
+        Self {
+            info,
+            checked: Some(Instant::now()),
+            reading: false,
+        }
+    }
+}
+
+/// A created run, ready for its driver.
+pub(super) struct Started {
+    run: Run,
+    /// What was using the checkout, when the run got a worktree instead.
+    holder: Option<String>,
+    /// The task as submitted; the editor clears only if it still holds it.
+    task: Option<String>,
+    rerun_of: Option<String>,
+}
+/// A project read in the background.
+pub(super) struct Opened {
+    project: PathBuf,
+    settings: Settings,
+    config_path: PathBuf,
+    repo: Option<storage::RepoInfo>,
+}
+#[cfg(test)]
+impl App {
+    /// The focused run's slot, which the test has set up.
+    pub(super) fn slot(&self) -> &RunSlot {
+        self.session.focused().expect("a focused run")
+    }
+    pub(super) fn slot_mut(&mut self) -> &mut RunSlot {
+        self.session.focused_mut().expect("a focused run")
+    }
+}
+/// How often the header re-reads Git status, and Runs re-reads active runs.
+const REPO_EVERY: Duration = Duration::from_secs(5);
+const RUNS_EVERY: Duration = Duration::from_secs(3);
 impl App {
     pub(super) fn new(
         project: PathBuf,
@@ -243,63 +118,21 @@ impl App {
         let repo = storage::repo_info(&project);
         Self {
             project,
-            settings,
-            config_path,
-            theme: Theme::default(),
-            theme_path: config::config_dir().join("appearance.json"),
-            vim_motions: false,
-            workflow: 0,
-            selected: 0,
-            task: String::new(),
-            worktree: false,
-            dirty: false,
-            page: 0,
-            modal: None,
-            message: "Define a task, choose your stages, then run. Review is optional.".into(),
-            alert: String::new(),
-            focused: RunSlot::default(),
-            parked: vec![],
-            focus_index: 0,
+            editor: Editor::new(settings, config_path),
+            session: Session::default(),
+            runs: RunsPage::default(),
+            harnesses: HarnessesPage::default(),
+            ui: Ui::default(),
             signal: cancel,
-            launch_interactive: false,
-            history: vec![],
-            history_selected: 0,
-            runs: RunsView::default(),
-            harness_selected: 0,
-            harness_checks: HarnessChecks::new(),
-            catalog: None,
-            model_editor: None,
-            stage_editor: None,
-            catalog_harness: String::new(),
-            catalogs: BTreeMap::new(),
-            prefetch: None,
-            prefetch_queue: VecDeque::new(),
-            repo,
-            quit_after_stop: false,
+            route_stats: Default::default(),
+            catalogs: Catalogs::default(),
+            repo: Repo::new(repo),
+            starting: false,
+            tasks: Tasks::default(),
         }
-    }
-    pub(super) fn displayed_theme(&self) -> Theme {
-        if let Some(Modal::Picker {
-            items,
-            selected,
-            filter,
-            ..
-        }) = &self.modal
-        {
-            let choices = matching_choices(items, filter);
-            if let Some(choice) = choices.get((*selected).min(choices.len().saturating_sub(1))) {
-                if let PickValue::Theme(theme) = choice.value {
-                    return theme;
-                }
-            }
-        }
-        self.theme
-    }
-    pub(super) fn palette(&self) -> Palette {
-        self.displayed_theme().palette()
     }
     pub(super) fn choose_theme(&mut self) {
-        self.modal = Some(Modal::Picker {
+        self.ui.open(Modal::Picker {
             title: "Choose theme · live preview".into(),
             items: Theme::ALL
                 .into_iter()
@@ -308,7 +141,7 @@ impl App {
                         "{} · {}{}",
                         theme.name(),
                         theme.appearance(),
-                        if theme == self.theme {
+                        if theme == self.ui.theme {
                             " (current)"
                         } else {
                             ""
@@ -319,139 +152,29 @@ impl App {
                 .collect(),
             selected: Theme::ALL
                 .iter()
-                .position(|theme| *theme == self.theme)
+                .position(|theme| *theme == self.ui.theme)
                 .unwrap_or(0),
             filter: textarea(""),
             note: format!(
                 "Preview as you move. [Enter] saves for every project. [Esc] restores {}.",
-                self.theme.name()
+                self.ui.theme.name()
             ),
         });
     }
-    pub(super) fn stage(&self) -> &Stage {
-        &self.settings.workflows[self.workflow].stages[self.selected]
-    }
-    pub(super) fn stage_mut(&mut self) -> &mut Stage {
-        &mut self.settings.workflows[self.workflow].stages[self.selected]
-    }
     pub(super) fn input(&mut self, title: &str, target: InputTarget, value: &str) {
-        self.modal = Some(Modal::Input {
-            title: title.into(),
-            target,
-            text: textarea(value),
-        });
+        self.ui.open(Modal::input(title, target, value));
     }
     pub(super) fn text(&mut self, title: &str, body: String) {
-        self.modal = Some(Modal::Text {
+        self.ui.open(Modal::Text {
             title: title.into(),
-            body,
+            body: storage::clean_terminal(&body),
             scroll: 0,
             guide: false,
         });
     }
     pub(super) fn save(&mut self, global: bool) -> Result<()> {
-        let path = if global {
-            config::config_dir().join("config.toml")
-        } else {
-            self.config_path.clone()
-        };
-        self.settings.save(&path)?;
-        self.dirty = false;
-        self.message = format!("Saved {}", path.display());
-        Ok(())
-    }
-    /// Every run of this session, in start order, with whether it is focused.
-    pub(super) fn slots(&self) -> impl Iterator<Item = (&RunSlot, bool)> {
-        let focused = self.focused.run.is_some().then_some(&self.focused);
-        let at = self.focus_index.min(self.parked.len());
-        self.parked[..at]
-            .iter()
-            .map(|slot| (slot, false))
-            .chain(focused.map(|slot| (slot, true)))
-            .chain(self.parked[at..].iter().map(|slot| (slot, false)))
-    }
-    pub(super) fn any_active(&self) -> bool {
-        self.focused.worker.is_some() || self.parked.iter().any(|slot| slot.worker.is_some())
-    }
-    pub(super) fn cancel_all(&mut self) {
-        for slot in std::iter::once(&self.focused).chain(&self.parked) {
-            if slot.worker.is_some() {
-                slot.cancel.store(true, Ordering::Relaxed);
-            }
-        }
-    }
-    /// Focuses `run` in a fresh slot. A focused run keeps going, parked.
-    pub(super) fn adopt(&mut self, run: Run) {
-        let mut slot = RunSlot::default();
-        std::mem::swap(&mut self.focused, &mut slot);
-        if slot.run.is_some() {
-            self.parked
-                .insert(self.focus_index.min(self.parked.len()), slot);
-        }
-        self.focus_index = self.parked.len();
-        self.focused.run = Some(run);
-    }
-    /// Focuses the session's run at `index` (start order).
-    pub(super) fn focus(&mut self, index: usize) {
-        let has_focus = self.focused.run.is_some();
-        let total = self.parked.len() + usize::from(has_focus);
-        if index >= total || (has_focus && index == self.focus_index) {
-            return;
-        }
-        let at = if has_focus && index > self.focus_index {
-            index - 1
-        } else {
-            index
-        };
-        let mut slot = self.parked.remove(at);
-        std::mem::swap(&mut self.focused, &mut slot);
-        if slot.run.is_some() {
-            // The old focus keeps its place in start order.
-            let back = if self.focus_index < index {
-                self.focus_index
-            } else {
-                self.focus_index - 1
-            };
-            self.parked.insert(back.min(self.parked.len()), slot);
-        }
-        self.focus_index = index;
-    }
-    /// Focuses the next or previous run of the session, wrapping.
-    pub(super) fn cycle_focus(&mut self, forward: bool) {
-        let total = self.parked.len() + usize::from(self.focused.run.is_some());
-        if total < 2 {
-            return;
-        }
-        self.focus(if forward {
-            (self.focus_index + 1) % total
-        } else {
-            (self.focus_index + total - 1) % total
-        });
-    }
-    /// Focuses the session's slot holding run `id`; false when none does.
-    pub(super) fn focus_run(&mut self, id: &str) -> bool {
-        let index = self
-            .slots()
-            .position(|(slot, _)| slot.run.as_ref().is_some_and(|run| run.id == id));
-        if let Some(index) = index {
-            self.focus(index);
-        }
-        index.is_some()
-    }
-    /// Removes the focused run from this session; its files stay on disk.
-    pub(super) fn dismiss(&mut self) -> Result<()> {
-        ensure!(
-            self.focused.worker.is_none(),
-            "Cancel the stage before closing its run"
-        );
-        self.focused = RunSlot::default();
-        if self.parked.is_empty() {
-            self.focus_index = 0;
-        } else {
-            let at = self.focus_index.min(self.parked.len() - 1);
-            self.focused = self.parked.remove(at);
-            self.focus_index = at;
-        }
+        let path = self.editor.save(global)?;
+        self.ui.message = format!("Saved {}", path.display());
         Ok(())
     }
     /// Where a new run in the project works. A checkout another run is using
@@ -463,52 +186,50 @@ impl App {
         }
         let project = std::fs::canonicalize(&self.project).unwrap_or_else(|_| self.project.clone());
         let holder = self
-            .slots()
-            .filter(|(slot, _)| slot.in_progress())
-            .filter_map(|(slot, _)| slot.run.as_ref())
+            .session
+            .runs
+            .iter()
+            .filter(|slot| slot.in_progress())
+            .map(|slot| &slot.run)
             .find(|run| run.workspace == project)
             .map(|run| format!("run {}", run.id))
             .or_else(|| {
                 let lock = storage::metadata_dir(&project).ok()?.join("workspace.lock");
-                (lock.is_file() && storage::lock(&lock).is_err())
-                    .then(|| "another router process".to_owned())
+                storage::is_locked(&lock).then(|| "another router process".to_owned())
             });
         let Some(holder) = holder else {
             return Ok((Placement::Project, None));
         };
         ensure!(
-            self.repo.is_some(),
+            self.repo.info.is_some(),
             "{holder} is using this folder. It is not a Git repository, so a second run cannot get its own worktree; wait for the first to finish"
         );
         Ok((Placement::WorktreeFromHead, Some(holder)))
     }
     pub(super) fn start_driver(&mut self) -> Result<()> {
-        ensure!(self.focused.worker.is_none(), "A stage is still running");
-        let mut run = self.focused.run.clone().context("No run selected")?;
-        self.focused.cancel.store(false, Ordering::Relaxed);
-        let cancel = self.focused.cancel.clone();
-        let (sender, receiver) = mpsc::sync_channel(128);
-        let handle = thread::spawn(move || {
-            let action = engine::drive(&mut run, &cancel, |event| {
-                let _ = sender.try_send(WorkerMessage::Event(event));
-            })
-            .map_err(|e| format!("{e:#}"));
-            let _ = sender.send(WorkerMessage::Done(Box::new(run), action));
-        });
-        self.focused.worker = Some(Worker {
-            receiver,
-            thread: Some(handle),
-            terminal: None,
-        });
+        let slot = self.session.focused_mut().context("No run selected")?;
+        ensure!(slot.worker.is_none(), "A stage is still running");
+        let mut run = slot.run.clone();
+        slot.cancel.store(false, Ordering::Relaxed);
+        let cancel = slot.cancel.clone();
+        slot.worker = Some(Worker::spawn(
+            None,
+            |_| true,
+            move |emit| {
+                let action = engine::drive(&mut run, &cancel, emit).map_err(|e| format!("{e:#}"));
+                (run, action)
+            },
+        ));
         Ok(())
     }
     /// Start the stage once; subsequent attachments reuse this worker's PTY.
     pub(super) fn interactive_terminal(&mut self) -> Result<process::InteractiveSession> {
-        if let Some(session) = self.focused.terminal() {
+        let slot = self.session.focused_mut().context("No run selected")?;
+        if let Some(session) = slot.terminal() {
             return Ok(session.clone());
         }
-        ensure!(self.focused.worker.is_none(), "A stage is still running");
-        let mut run = self.focused.run.clone().context("No run selected")?;
+        ensure!(slot.worker.is_none(), "A stage is still running");
+        let mut run = slot.run.clone();
         ensure!(
             run.status == Status::Interactive,
             "No interactive stage is ready"
@@ -516,264 +237,297 @@ impl App {
         let (cols, rows) = crossterm::terminal::size()?;
         let session = process::InteractiveSession::new(cols, rows);
         let terminal = session.clone();
-        self.focused.cancel.store(false, Ordering::Relaxed);
-        let cancel = self.focused.cancel.clone();
-        let (sender, receiver) = mpsc::sync_channel(128);
-        let handle = thread::spawn(move || {
-            let result = engine::run_interactive(&mut run, &cancel, &terminal, |event| {
-                let _ = sender.try_send(WorkerMessage::Event(event));
-            })
-            .map(|()| {
-                if run.status == Status::AwaitingConfirmation {
-                    Action::Confirm
-                } else {
-                    Action::Stopped
-                }
-            })
-            .map_err(|error| format!("{error:#}"));
-            let _ = sender.send(WorkerMessage::Done(Box::new(run), result));
-        });
-        self.focused.worker = Some(Worker {
-            receiver,
-            thread: Some(handle),
-            terminal: Some(session.clone()),
-        });
+        slot.cancel.store(false, Ordering::Relaxed);
+        let cancel = slot.cancel.clone();
+        // The user ends an interactive stage themselves, so only failures notify.
+        let failures =
+            |result: &std::result::Result<Action, String>| !matches!(result, Ok(Action::Confirm));
+        slot.worker = Some(Worker::spawn(
+            Some(session.clone()),
+            failures,
+            move |emit| {
+                let result = engine::run_interactive(&mut run, &cancel, &terminal, emit)
+                    .map(|()| {
+                        if run.status == Status::AwaitingConfirmation {
+                            Action::Confirm
+                        } else {
+                            Action::Stopped
+                        }
+                    })
+                    .map_err(|error| format!("{error:#}"));
+                (run, result)
+            },
+        ));
         Ok(session)
     }
+    /// Applies background results and run progress, and starts timed
+    /// refreshes; true means exit now.
     pub(super) fn poll(&mut self) -> Result<bool> {
-        if let Some(Modal::Import(importer)) = &mut self.modal {
-            importer.poll();
+        while let Some((generation, msg)) = self.tasks.try_recv() {
+            self.update(generation, msg);
         }
-        if let Some(result) = self.focused.poll() {
-            self.focused_stopped(result);
-        }
-        for index in 0..self.parked.len() {
-            if let Some(result) = self.parked[index].poll() {
-                if let Some(run) = &self.parked[index].run {
-                    self.message = notice(run, &result);
-                    if result.is_err() || result == Ok(Action::Stopped) {
-                        self.alert = self.message.clone();
-                    }
-                }
+        // The focused run first, then the others in start order.
+        let focus = self.session.focus;
+        let others = (0..self.session.runs.len()).filter(|index| *index != focus);
+        for index in std::iter::once(focus).chain(others) {
+            let Some(slot) = self.session.runs.get_mut(index) else {
+                continue;
+            };
+            let (changed, stopped) = slot.poll();
+            self.ui.redraw |= changed;
+            let Some(result) = stopped else { continue };
+            self.run_stopped();
+            if index == focus {
+                self.focused_stopped(result);
+            } else {
+                let run = &self.session.runs[index].run;
+                let alert = result.is_err() || result == Ok(Action::Stopped);
+                self.push_notice(notice_text(run, &result), alert);
             }
         }
-        if let Some((harness, receiver)) = &self.prefetch {
-            if let Ok(result) = receiver.try_recv() {
-                let harness = harness.clone();
-                self.prefetch = None;
-                if let Ok(catalog) = result {
-                    self.catalogs.insert(harness.clone(), catalog);
-                    self.push_catalog(&harness);
-                }
-                if let Some(next) = self.prefetch_queue.pop_front() {
-                    self.request_catalog(next);
-                }
-            }
-        }
-        if let Some(receiver) = &self.catalog {
-            if let Ok(result) = receiver.try_recv() {
-                self.catalog = None;
-                match result {
-                    Ok(catalog) => {
-                        let harness = self.catalog_harness.clone();
-                        self.catalogs.insert(harness.clone(), catalog.clone());
-                        self.push_catalog(&harness);
-                        self.show_catalog(catalog);
-                    }
-                    Err(error) => {
-                        self.message =
-                            format!("{error}. Enter a model ID manually in harness settings [c].");
-                        self.alert = self.message.clone();
-                        self.modal = self.model_editor.take().map(|mut editor| {
-                            editor.error = self.message.clone();
-                            Modal::Harness(editor)
-                        });
-                        if let Some((editor, insert_at)) = self.stage_editor.take() {
-                            self.message = format!("{error}. Type a model ID with [i] instead.");
-                            self.alert = self.message.clone();
-                            self.modal = Some(Modal::Stage { editor, insert_at });
-                        }
-                    }
-                }
-            }
-        }
-        match self.harness_checks.poll() {
-            Some(true) => {
-                self.harness_selected = self
-                    .harness_selected
-                    .min(self.harness_checks.reports.len().saturating_sub(1))
-            }
-            Some(false) => {
-                self.message = "Harness check failed. Press [r] to retry.".into();
-                self.alert = self.message.clone();
-            }
-            None => {}
-        }
+        self.refresh();
         self.poll_completion();
-        Ok(self.quit_after_stop && !self.any_active())
+        Ok(self.session.quit_after_stop && !self.session.any_active())
+    }
+    /// A run stopped: Git status and the saved runs list may have changed.
+    fn run_stopped(&mut self) {
+        self.ui.redraw = true;
+        self.repo.checked = None;
+        self.runs.stale = true;
+    }
+    /// Starts reads that are due: saved runs on the Runs page, Git status,
+    /// and stats for the Workflow page's hint.
+    fn refresh(&mut self) {
+        if self.ui.page == Page::Runs {
+            let due = self
+                .runs
+                .loaded_at
+                .is_none_or(|at| at.elapsed() >= RUNS_EVERY);
+            if due && self.session.runs.iter().any(RunSlot::in_progress) {
+                self.runs.stale = true;
+            }
+            if self.runs.stale && !self.runs.loading {
+                self.load_runs();
+            }
+        }
+        let due = self
+            .repo
+            .checked
+            .is_none_or(|at| at.elapsed() >= REPO_EVERY);
+        if due && !self.repo.reading {
+            self.repo.reading = true;
+            let project = self.project.clone();
+            self.tasks.spawn(
+                "Reading Git status stopped unexpectedly",
+                move || Ok(storage::repo_info(&project)),
+                Msg::Repo,
+            );
+        }
+        if self.ui.page == Page::Workflow {
+            self.refresh_stats();
+        }
+    }
+    /// Reads saved runs in the background; the page shows them when they arrive.
+    pub(super) fn load_runs(&mut self) {
+        self.runs.stale = false;
+        self.runs.loading = true;
+        let project = self.project.clone();
+        self.tasks.spawn(
+            "Reading saved runs stopped unexpectedly; [r] retries.",
+            move || crate::history::list(&project).map_err(|e| format!("{e:#}")),
+            Msg::Runs,
+        );
+    }
+    /// Adopts a created run and starts its driver.
+    pub(super) fn begin(&mut self, started: Started) -> Result<()> {
+        let Started {
+            run,
+            holder,
+            task,
+            rerun_of,
+        } = started;
+        // An interactive first stage needs the terminal right away.
+        let interactive = run
+            .workflow
+            .stages
+            .iter()
+            .find(|s| s.enabled)
+            .is_some_and(|s| s.mode == config::Mode::Interactive);
+        let (id, workspace) = (run.id.clone(), run.workspace.clone());
+        self.session.adopt(run);
+        self.start_driver()?;
+        self.runs.stale = true;
+        if let Some(source) = rerun_of {
+            self.ui.message = format!(
+                "Rerunning {source} as {id}{}…",
+                holder.map_or_else(String::new, |h| format!(
+                    " in a worktree ({h} is using the checkout)"
+                ))
+            );
+            self.ui.page = Page::Monitor;
+            return Ok(());
+        }
+        // The run has its own snapshot; the editor is free for the next one.
+        if task.is_some_and(|task| task == self.editor.task) {
+            self.editor.task.clear();
+        }
+        self.ui.message = match holder {
+            Some(holder) => format!(
+                "Started {id} in worktree {}: {holder} is using the checkout, whose uncommitted changes are not included. ",
+                short_path(&workspace, 60)
+            ),
+            None => format!("Started {id}. "),
+        };
+        if interactive {
+            self.ui.page = Page::Monitor;
+        } else {
+            self.ui
+                .message
+                .push_str("Monitor [2] follows it. Define the next task here.");
+        }
+        Ok(())
+    }
+    /// Creates a run in the background (worktree and snapshot can be slow);
+    /// it starts once ready.
+    pub(super) fn start_run(
+        &mut self,
+        create: impl FnOnce(Placement) -> Result<Run> + Send + 'static,
+        worktree: bool,
+        task: Option<String>,
+        rerun_of: Option<String>,
+    ) -> Result<()> {
+        ensure!(
+            !self.starting,
+            "A run is still starting; wait for it to begin"
+        );
+        let (placement, holder) = self.placement(worktree)?;
+        self.ui.message = match &rerun_of {
+            Some(id) => format!("Starting a rerun of {id}…"),
+            None => "Starting run…".into(),
+        };
+        self.starting = true;
+        self.tasks.spawn(
+            "Starting the run stopped unexpectedly; try again.",
+            move || {
+                create(placement)
+                    .map(|run| {
+                        Box::new(Started {
+                            run,
+                            holder,
+                            task,
+                            rerun_of,
+                        })
+                    })
+                    .map_err(|e| format!("{e:#}"))
+            },
+            Msg::Started,
+        );
+        Ok(())
     }
     fn focused_stopped(&mut self, result: std::result::Result<Action, String>) {
+        // Every stop is kept in the notice history; on the Monitor, the
+        // status line then says what to do next.
+        if let Some(run) = self.session.run() {
+            let alert = result.is_err() || result == Ok(Action::Stopped);
+            self.push_notice(notice_text(run, &result), alert);
+        }
         // Away from the Monitor, a terminal never takes over the screen.
-        if self.page != 1 {
-            if let Some(run) = &self.focused.run {
-                self.message = notice(run, &result);
-                if result.is_err() || result == Ok(Action::Stopped) {
-                    self.alert = self.message.clone();
-                }
-            }
+        if self.ui.page != Page::Monitor {
             return;
         }
         match result {
-            Ok(Action::Interactive) => self.launch_interactive = !self.quit_after_stop,
+            Ok(Action::Interactive) => self.session.launch_interactive = !self.session.quit_after_stop,
             Ok(Action::Confirm) => {
-                self.message =
+                self.ui.message =
                     "Inspect the handoff: [h]. Advance: [a]. Reopen session: [t]. Restart: [i]. Save and exit: [q]."
                         .into()
             }
             Ok(Action::Complete) => {
-                self.message = "Workflow complete. Artifacts and handoffs are saved.".into()
+                self.ui.message = "Workflow complete. Artifacts and handoffs are saved.".into()
             }
             Ok(Action::Stopped) => {
-                self.message = self
-                    .focused
-                    .run
-                    .as_ref()
+                self.ui.message = self
+                    .session
+                    .run()
                     .and_then(|r| r.error.clone())
                     .unwrap_or_else(|| "Run stopped".into())
             }
             Err(error) => {
-                self.alert = error.clone();
-                self.message = error;
+                self.ui.alert = error.clone();
+                self.ui.message = error;
             }
         }
     }
-    fn show_catalog(&mut self, catalog: Catalog) {
-        let items = catalog
-            .models
-            .into_iter()
-            .map(|model| Choice {
-                label: format!(
-                    "{}{}{}  ·  {}{}",
-                    if model.provider.is_empty() {
-                        ""
-                    } else {
-                        &model.provider
-                    },
-                    if model.provider.is_empty() { "" } else { "/" },
-                    model.label,
-                    model.availability,
-                    if model.efforts.is_empty() {
-                        String::new()
-                    } else {
-                        format!("  ·  {}", model.efforts.join("/"))
-                    }
-                ),
-                value: PickValue::Model(model),
-            })
-            .collect();
-        self.modal = Some(Modal::Picker {
-            title: format!("{} selections · type to filter", self.catalog_harness),
-            items,
-            selected: 0,
-            filter: textarea(""),
-            note: catalog.note,
-        });
-    }
-    /// Hands a cached catalog to the open or parked editors for `harness`.
-    fn push_catalog(&mut self, harness: &str) {
-        let Some(catalog) = self.catalogs.get(harness).cloned() else {
-            return;
-        };
-        match &mut self.modal {
-            Some(Modal::Harness(editor)) if editor.harness() == harness => {
-                editor.set_catalog(catalog.clone());
-            }
-            Some(Modal::Stage { editor, .. }) if editor.harness() == harness => {
-                editor.set_catalog(catalog.clone());
-            }
-            _ => {}
-        }
-        if let Some(editor) = &mut self.model_editor {
-            if editor.harness() == harness {
-                editor.set_catalog(catalog.clone());
-            }
-        }
-        if let Some((editor, _)) = &mut self.stage_editor {
-            if editor.harness() == harness {
-                editor.set_catalog(catalog);
-            }
-        }
-    }
-    /// Makes `harness`'s catalog available to editors: from the cache now, or
-    /// read in the background without opening a picker.
-    pub(super) fn request_catalog(&mut self, harness: String) {
-        if self.catalogs.contains_key(&harness) {
-            self.push_catalog(&harness);
-            return;
-        }
-        if self.prefetch_queue.contains(&harness)
-            || self.prefetch.as_ref().is_some_and(|(h, _)| *h == harness)
-        {
-            return;
-        }
-        if self.prefetch.is_some() {
-            self.prefetch_queue.push_back(harness);
-            return;
-        }
-        let settings = self.settings.clone();
-        let project = self.project.clone();
-        let (sender, receiver) = mpsc::channel();
-        self.prefetch = Some((harness.clone(), receiver));
-        thread::spawn(move || {
-            let _ = sender.send(
-                catalog::discover(&harness, &settings, &project).map_err(|e| format!("{e:#}")),
-            );
-        });
-    }
-    pub(super) fn model_picker(&mut self) {
-        self.model_picker_for(self.stage().harness.clone());
-    }
-    pub(super) fn model_picker_for(&mut self, harness: String) {
-        self.catalog_harness = harness.clone();
-        if let Some(catalog) = self.catalogs.get(&harness).cloned() {
-            self.show_catalog(catalog);
-            return;
-        }
-        let settings = self.settings.clone();
-        let project = self.project.clone();
-        let (sender, receiver) = mpsc::channel();
-        self.catalog = Some(receiver);
-        self.modal = Some(Modal::Loading(format!(
-            "Reading {harness} model selections…"
-        )));
-        thread::spawn(move || {
-            let _ = sender.send(
-                catalog::discover(&harness, &settings, &project).map_err(|e| format!("{e:#}")),
-            );
-        });
-    }
-    /// Runs of this session keep going in their own projects.
+    /// Reads `path` as a project now; `begin_switch` does it in the background.
+    #[cfg(test)]
     pub(super) fn switch_project(&mut self, path: PathBuf) -> Result<()> {
-        let project = catalog::check_project(&path)?;
-        if self.dirty {
+        let opened = read_project(path).map_err(anyhow::Error::msg)?;
+        self.open_project(opened)
+    }
+    /// Opens `path` in the background, above the repository browser.
+    pub(super) fn begin_switch(&mut self, path: PathBuf) {
+        let loading = Loading::new("Opening project…");
+        let ticket = loading.ticket;
+        self.tasks.spawn(
+            "Opening the project stopped unexpectedly",
+            move || read_project(path),
+            move |result| Msg::Opened { ticket, result },
+        );
+        self.ui.open(Modal::Loading(loading));
+    }
+    /// Shows the project read in the background and closes the browser, or
+    /// returns to the browser, which shows why it could not open.
+    pub(super) fn project_opened(&mut self, opened: Result<Opened>) {
+        match opened.and_then(|opened| self.open_project(opened)) {
+            Ok(()) => {
+                if matches!(self.ui.dialog(), Some(Modal::Repositories(_))) {
+                    self.ui.dialogs.pop();
+                }
+            }
+            Err(error) => match self.ui.dialog_mut() {
+                Some(Modal::Repositories(picker)) => picker.error = format!("{error:#}"),
+                _ => self.ui.error(format!("{error:#}")),
+            },
+        }
+    }
+    /// Shows `opened`. Runs of this session keep going in their own projects;
+    /// everything read for the previous project is dropped.
+    fn open_project(&mut self, opened: Opened) -> Result<()> {
+        if self.editor.dirty {
             self.save(false)?;
         }
-        let (settings, config_path) = config::load(&project, None)?;
-        self.repo = storage::repo_info(&project);
+        let Opened {
+            project,
+            settings,
+            config_path,
+            repo,
+        } = opened;
+        // What is still being read for the old project is dropped on arrival.
+        self.tasks.next_generation();
+        self.repo = Repo::new(repo);
         self.project = project;
-        self.settings = settings;
-        self.config_path = config_path;
-        self.workflow = 0;
-        self.selected = 0;
-        self.task.clear();
-        self.history.clear();
-        self.history_selected = 0;
-        self.harness_selected = 0;
-        self.harness_checks.clear();
-        self.page = 0;
-        self.message = format!("Project: {}", self.project.display());
+        self.editor.settings = settings;
+        self.editor.config_path = config_path;
+        self.editor.workflow = 0;
+        self.editor.selected = 0;
+        self.editor.task.clear();
+        self.runs.entries.clear();
+        self.runs.selected = 0;
+        self.runs.loading = false;
+        self.runs.stale = true;
+        self.runs.loaded_at = None;
+        self.harnesses.selected = 0;
+        self.harnesses.checks.clear();
+        self.catalogs = Catalogs::default();
+        self.editor.undo.clear();
+        self.ui.page = Page::Workflow;
+        self.ui.message = format!("Project: {}", self.project.display());
+        if let Some(note) = super::trust_prompt::notice(&self.editor.settings) {
+            self.ui.message.push_str(&format!(" · {note}"));
+        }
         if let Err(error) = storage::remember_project(&self.project) {
-            self.message
+            self.ui
+                .message
                 .push_str(&format!(" · Could not save recent projects: {error:#}"));
         }
         Ok(())
@@ -785,11 +539,14 @@ impl App {
         if key.code == KeyCode::F(8) && key.modifiers.is_empty() {
             return self.perform_global(ActionId::ToggleVim);
         }
-        if self.modal.is_some() {
+        if !self.ui.dialogs.is_empty() {
             return self.modal_key(key);
         }
         if self.runs_filtering() {
             return self.runs_filter_key(key);
+        }
+        if self.ui.page == Page::Monitor && self.output_search_key(key) {
+            return Ok(false);
         }
         if let Some(id) = actions::resolve(self.scope(), key) {
             return self.perform(id);
@@ -817,64 +574,108 @@ impl App {
     fn perform_global(&mut self, id: ActionId) -> Result<bool> {
         match id {
             ActionId::Interrupt => {
-                if !self.any_active() {
-                    return Ok(true);
+                if !self.session.any_active() {
+                    return Ok(self.ask_to_save().is_none());
                 }
-                self.cancel_all();
-                self.message = "Stopping active stages and saving their artifacts…".into();
+                self.session.cancel_all();
+                self.ui.message = "Stopping active stages and saving their artifacts…".into();
             }
             ActionId::Quit => {
-                if self.dirty {
-                    self.save(false)?;
+                if self.ask_to_save().is_some() {
+                    return Ok(false);
                 }
-                if !self.any_active() {
-                    return Ok(true);
-                }
-                self.cancel_all();
-                self.quit_after_stop = true;
-                self.message = "Stopping active runs and saving before exit…".into();
+                return Ok(self.quit());
             }
             ActionId::Themes => self.choose_theme(),
             ActionId::ToggleVim => {
-                let enabled = !self.vim_motions;
-                theme::save(&self.theme_path, self.theme, enabled)?;
-                self.vim_motions = enabled;
+                let enabled = !self.ui.vim_motions;
+                theme::save(
+                    &self.ui.theme_path,
+                    &theme::Preferences {
+                        vim_motions: enabled,
+                        ..self.ui.preferences()
+                    },
+                )?;
+                self.ui.vim_motions = enabled;
                 self.runs.set_vim(enabled);
-                if let Some(field) = self.modal.as_mut().and_then(Modal::active_input) {
+                if let Some(field) = self.ui.dialog_mut().and_then(Modal::active_input) {
                     field.set_vim(enabled);
                 }
-                self.message = if enabled {
+                self.ui.message = if enabled {
                     "Vim motions enabled for all projects. Inputs start in Insert mode; Esc enters Normal mode. F8 disables."
                 } else {
                     "Vim motions disabled for all projects. F8 enables."
                 }.into();
             }
-            ActionId::Help => {
-                self.modal = Some(Modal::Text {
-                    title: "Keyboard guide".into(),
-                    body: actions::guide(),
-                    scroll: 0,
-                    guide: true,
-                })
-            }
+            ActionId::Help => self.ui.open(Modal::Text {
+                title: "Keyboard guide".into(),
+                body: actions::guide(),
+                scroll: 0,
+                guide: true,
+            }),
             ActionId::Commands => self.command_menu(),
-            ActionId::NextView => self.show((self.page + 1) % TABS.len())?,
-            ActionId::ShowWorkflow => self.show(0)?,
-            ActionId::ShowMonitor => self.show(1)?,
-            ActionId::ShowRuns => self.show(2)?,
-            ActionId::ShowHarnesses => self.show(3)?,
+            ActionId::SessionRuns => self.session_runs(),
+            ActionId::NextNeedsInput => self.jump_to_input(),
+            ActionId::Notices => self.show_notices(),
+            ActionId::Notifications => self.notifications(),
+            ActionId::Stats => self.show_stats(),
+            ActionId::NextView => self.show(self.ui.page.next()),
+            ActionId::ShowWorkflow => self.show(Page::Workflow),
+            ActionId::ShowMonitor => self.show(Page::Monitor),
+            ActionId::ShowRuns => self.show(Page::Runs),
+            ActionId::ShowHarnesses => self.show(Page::Harnesses),
             other => bail!("{other:?} is not a global action"),
         }
         Ok(false)
     }
-    fn show(&mut self, page: usize) -> Result<()> {
-        self.page = page;
-        match page {
-            2 => self.refresh_runs()?,
-            3 => self.harness_checks.start(&self.settings, &self.project),
-            _ => {}
+    /// Asks whether to save unsaved workflow edits before exiting; None when
+    /// there are none.
+    fn ask_to_save(&mut self) -> Option<()> {
+        self.editor.dirty.then(|| {
+            self.ui.open(Modal::Ask(Box::new(Ask::SaveAndExit)));
+        })
+    }
+    /// Exits now, or once active runs have stopped; true means exit now.
+    pub(super) fn quit(&mut self) -> bool {
+        if !self.session.any_active() {
+            return true;
         }
-        Ok(())
+        self.session.cancel_all();
+        self.session.quit_after_stop = true;
+        self.ui.message = "Stopping active runs and saving their artifacts before exit…".into();
+        false
+    }
+    fn show(&mut self, page: Page) {
+        self.ui.page = page;
+        match page {
+            // Read when shown, not while Tab passes through.
+            Page::Runs => self.runs.stale = true,
+            Page::Harnesses => {
+                self.harnesses
+                    .checks
+                    .start(&self.editor.settings, &self.project, &self.tasks)
+            }
+            Page::Workflow | Page::Monitor => {}
+        }
+    }
+    /// Whether something on screen animates, so frames come faster.
+    pub(super) fn animating(&self) -> bool {
+        matches!(self.ui.dialog(), Some(Modal::Loading(_)))
+            || self.starting
+            || matches!(self.ui.dialog(), Some(Modal::Import(importer)) if importer.busy())
+    }
+    /// Whether the focused interactive stage may take the terminal now. An
+    /// open dialog keeps it waiting, and the status line says how to open it.
+    pub(super) fn take_launch(&mut self) -> bool {
+        if !std::mem::take(&mut self.session.launch_interactive) {
+            return false;
+        }
+        if !self.ui.dialogs.is_empty() {
+            self.ui.message =
+                "Interactive stage ready — press [t] on the Monitor to open it.".into();
+            return false;
+        }
+        true
     }
     fn command_menu(&mut self) {
         let items = actions::available(self.scope())
@@ -888,8 +689,8 @@ impl App {
                 value: PickValue::Action(entry.id),
             })
             .collect();
-        self.modal = Some(Modal::Picker {
-            title: format!("Commands · {}", TABS[self.page]),
+        self.ui.open(Modal::Picker {
+            title: format!("Commands · {}", self.ui.page.name()),
             items,
             selected: 0,
             filter: textarea(""),
@@ -898,12 +699,12 @@ impl App {
     }
     /// The page's scope; Monitor depends on whether a run is active.
     fn page_scope(&self) -> Scope {
-        match self.page {
-            0 => Scope::Workflow,
-            1 if self.focused.worker.is_some() => Scope::MonitorRunning,
-            1 => Scope::MonitorIdle,
-            2 => Scope::Runs,
-            _ => Scope::Harnesses,
+        match self.ui.page {
+            Page::Workflow => Scope::Workflow,
+            Page::Monitor if self.session.running() => Scope::MonitorRunning,
+            Page::Monitor => Scope::MonitorIdle,
+            Page::Runs => Scope::Runs,
+            Page::Harnesses => Scope::Harnesses,
         }
     }
     /// Where actions apply. Runs snapshot their workflow, so editing and
@@ -913,10 +714,49 @@ impl App {
     }
 }
 
-const TABS: [&str; 4] = ["Workflow", "Monitor", "Runs", "Harnesses"];
+/// The views, in tab order; [1]–[4] and Tab switch between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Page {
+    Workflow,
+    Monitor,
+    Runs,
+    Harnesses,
+}
+impl Page {
+    pub(super) const ALL: [Page; 4] = [Self::Workflow, Self::Monitor, Self::Runs, Self::Harnesses];
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Workflow => "Workflow",
+            Self::Monitor => "Monitor",
+            Self::Runs => "Runs",
+            Self::Harnesses => "Harnesses",
+        }
+    }
+    /// The next tab, wrapping.
+    fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|page| *page == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+}
+
+/// The settings and Git facts of the project at `path`; slow on network drives.
+fn read_project(path: PathBuf) -> std::result::Result<Opened, String> {
+    let read = || -> Result<Opened> {
+        let project = catalog::check_project(&path)?;
+        let (settings, config_path) = config::load(&project, None)?;
+        let repo = storage::repo_info(&project);
+        Ok(Opened {
+            project,
+            settings,
+            config_path,
+            repo,
+        })
+    };
+    read().map_err(|e| format!("{e:#}"))
+}
 
 pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
-    let palette = app.palette();
+    let palette = app.ui.palette();
     let area = frame.area();
     frame.render_widget(
         Block::default().style(Style::default().bg(palette.bg).fg(palette.fg)),
@@ -951,15 +791,22 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .collect();
     let mut footer = palette.hints(&keys);
     footer.spans.insert(0, Span::raw(" "));
-    let alert = !app.message.is_empty() && app.message == app.alert;
+    let alert = !app.ui.message.is_empty() && app.ui.message == app.ui.alert;
     let status = Line::from(vec![
         Span::styled(
             if alert { "✗ " } else { "› " },
             Style::default().fg(if alert { palette.red } else { palette.accent }),
         ),
         Span::styled(
-            storage::clean_terminal(&app.message),
+            storage::clean_terminal(&app.ui.message),
             Style::default().fg(if alert { palette.red } else { palette.fg }),
+        ),
+        Span::styled(
+            match app.more_notices() {
+                0 => String::new(),
+                more => format!("  (+{more} more · [!] notices)"),
+            },
+            Style::default().fg(palette.muted),
         ),
     ]);
     let body_width = area.width.saturating_sub(2);
@@ -992,17 +839,17 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
     draw_repository(frame, app, repo, repo_area, used, palette);
     frame.render_widget(
-        Paragraph::new(vim_toggle(app.vim_motions, palette)).right_aligned(),
+        Paragraph::new(vim_toggle(app.ui.vim_motions, palette)).right_aligned(),
         chunks[1].inner(Margin::new(1, 0)),
     );
     let body = chunks[2].inner(Margin::new(1, 0));
-    match app.page {
-        0 => draw_workflow(frame, app, body, palette),
-        1 => draw_run(frame, app, body, palette),
-        2 => draw_history(frame, app, body, palette),
-        _ => draw_harnesses(frame, app, body, palette),
+    match app.ui.page {
+        Page::Workflow => draw_workflow(frame, app, body, palette),
+        Page::Monitor => draw_run(frame, app, body, palette),
+        Page::Runs => draw_history(frame, app, body, palette),
+        Page::Harnesses => draw_harnesses(frame, app, body, palette),
     }
-    if !app.message.is_empty() {
+    if !app.ui.message.is_empty() {
         frame.render_widget(
             Paragraph::new(status).wrap(Wrap { trim: false }),
             chunks[3].inner(Margin::new(1, 0)),
@@ -1014,9 +861,15 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
             .wrap(Wrap { trim: false }),
         chunks[4],
     );
-    if let Some(modal) = &mut app.modal {
+    // Only the top dialog shows; those below come back as it closes.
+    let ask = match app.ui.dialog() {
+        Some(Modal::Ask(ask)) => Some(ask.text(app)),
+        _ => None,
+    };
+    let vim = app.ui.vim_motions;
+    if let Some(modal) = app.ui.dialog_mut() {
         if let Some(field) = modal.active_input() {
-            field.set_vim(app.vim_motions);
+            field.set_vim(vim);
         }
         // The theme picker previews live, so keep the page behind it legible.
         let previewing_theme = matches!(
@@ -1027,7 +880,13 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         if !previewing_theme {
             dim(frame, palette);
         }
-        draw_modal(frame, modal, palette);
+        if let Modal::SessionRuns { selected } = modal {
+            // This dialog reads the session's runs, so it draws from the app.
+            let selected = *selected;
+            draw_session_runs(frame, app, selected, palette);
+        } else {
+            draw_modal(frame, modal, ask, palette);
+        }
     }
 }
 
@@ -1042,17 +901,23 @@ fn header_lines(app: &App, palette: Palette, width: u16) -> Vec<Line<'static>> {
     ];
     // The Monitor tab counts runs still in progress, so they stay visible
     // while the next workflow is being set up.
-    let live = app.slots().filter(|(slot, _)| slot.in_progress()).count();
+    let live = app
+        .session
+        .runs
+        .iter()
+        .filter(|slot| slot.in_progress())
+        .count();
     let mut tabs = Vec::new();
-    for (index, name) in TABS.iter().enumerate() {
-        let count = if index == 1 && live > 0 {
+    for (index, page) in Page::ALL.into_iter().enumerate() {
+        let name = page.name();
+        let count = if page == Page::Monitor && live > 0 {
             format!(" ●{live}")
         } else {
             String::new()
         };
         tabs.push(Span::styled(
             format!(" {} {name}{count} ", index + 1),
-            if index == app.page {
+            if page == app.ui.page {
                 Style::default()
                     .fg(palette.on_accent())
                     .bg(palette.accent)
@@ -1060,6 +925,15 @@ fn header_lines(app: &App, palette: Palette, width: u16) -> Vec<Line<'static>> {
             } else {
                 Style::default().fg(palette.muted)
             },
+        ));
+    }
+    let waiting = app.session.needing_input();
+    if waiting > 0 {
+        tabs.push(Span::styled(
+            format!("  ◆ {waiting} need input [N] "),
+            Style::default()
+                .fg(palette.warn)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     let tabs = Line::from(tabs);
@@ -1093,7 +967,7 @@ fn vim_toggle(enabled: bool, palette: Palette) -> Line<'static> {
 
 /// Repository name and branch, or the project directory when not a Git repository.
 fn repository_line(app: &App, palette: Palette) -> Line<'static> {
-    let spans = match &app.repo {
+    let spans = match &app.repo.info {
         Some(repo) => {
             let mut spans = vec![
                 Span::styled(" ⎇ ", Style::default().fg(palette.accent)),

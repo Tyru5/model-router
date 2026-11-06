@@ -11,6 +11,7 @@ use ratatui::{
 };
 use tui_textarea::CursorMove;
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub(super) fn textarea(value: &str) -> InputField<'static> {
     let mut field = InputField::from(value.split('\n').map(str::to_owned).collect::<Vec<_>>());
@@ -112,7 +113,8 @@ pub(super) fn elapsed(seconds: i64) -> String {
         s => format!("{}h {:02}m", s / 3600, s % 3600 / 60),
     }
 }
-/// Home-relative path, trimmed from the left to fit `width` columns.
+/// Home-relative path, trimmed from the left to fit `width` display
+/// columns; wide characters (CJK, emoji) take two.
 pub(super) fn short_path(path: &std::path::Path, width: usize) -> String {
     let mut text = path.display().to_string();
     if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
@@ -121,12 +123,21 @@ pub(super) fn short_path(path: &std::path::Path, width: usize) -> String {
         }
     }
     let text = storage::clean_terminal(&text);
-    let count = text.chars().count();
-    if count <= width {
+    if text.width() <= width {
         return text;
     }
-    let keep = width.saturating_sub(1);
-    format!("…{}", text.chars().skip(count - keep).collect::<String>())
+    // Keep the end, which names the folder, behind an ellipsis.
+    let mut room = width.saturating_sub(1);
+    let mut tail = vec![];
+    for c in text.chars().rev() {
+        let size = c.width().unwrap_or(0);
+        if size > room {
+            break;
+        }
+        room -= size;
+        tail.push(c);
+    }
+    std::iter::once('…').chain(tail.into_iter().rev()).collect()
 }
 pub(super) fn kv(palette: Palette, label: &str, value: &str, set: bool) -> Line<'static> {
     Line::from(vec![
@@ -251,6 +262,19 @@ mod tests {
         assert_eq!(buffer[(0, 1)].bg, Color::Blue);
         assert_eq!(buffer[(3, 1)].bg, Color::Red);
         assert_eq!(content(&field), "界界e\u{301}xy");
+    }
+
+    #[test]
+    fn short_path_fits_display_width_with_wide_characters() {
+        let path = std::path::Path::new("/srv/项目/雪の日/😀app");
+        for width in [4, 8, 12, 40] {
+            let short = short_path(path, width);
+            assert!(short.width() <= width, "{short:?} is wider than {width}");
+        }
+        assert_eq!(short_path(path, 40), "/srv/项目/雪の日/😀app");
+        assert_eq!(short_path(path, 7), "…/😀app");
+        // A wide character that does not fit is left out whole.
+        assert_eq!(short_path(path, 5), "…app");
     }
 
     #[test]

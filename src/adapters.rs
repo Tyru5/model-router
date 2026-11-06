@@ -1,12 +1,20 @@
-use crate::config::{CustomAdapter, Mode, Stage};
-use crate::harness_settings;
+use crate::config::{CustomAdapter, CustomPrompt, Mode, PromptMode, Stage};
+use crate::harness::{
+    self, BaseEnv, EffortPass, HarnessSpec, ModelPass, Part, Prompt, ProviderPass, Routing,
+    SchemaDelivery, Session,
+};
 use crate::providers::{self, Provider};
+use crate::{handoff, harness_settings};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
-    env, fs,
+    collections::{BTreeMap, HashMap},
+    env,
+    ffi::OsString,
+    fs,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::Duration,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +27,21 @@ pub enum OutputKind {
     Gemini,
     OpenCode,
     Amp,
+}
+impl OutputKind {
+    /// The parser name custom adapters use for `output`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Codex => "codex-jsonl",
+            Self::Claude => "claude-stream",
+            Self::Pi => "pi",
+            Self::Cursor => "cursor-stream",
+            Self::Gemini => "gemini-json",
+            Self::OpenCode => "opencode",
+            Self::Amp => "amp-stream",
+        }
+    }
 }
 
 /// An environment value for the harness. `Var` copies another variable at
@@ -34,6 +57,10 @@ pub enum EnvValue {
         path: Vec<String>,
         value: String,
     },
+    /// Removes every inherited variable whose name starts with this entry's
+    /// name, except those the invocation sets: `OPENAI_` keeps an OpenAI
+    /// organization, project, or headers from reaching a routed endpoint.
+    UnsetPrefix,
 }
 
 #[derive(Debug, Clone)]
@@ -44,19 +71,23 @@ pub struct Invocation {
     pub kind: OutputKind,
     pub final_file: PathBuf,
     pub env: Vec<(String, EnvValue)>,
+    /// Files the harness reads, written just before launch (never by `build`,
+    /// so previews and doctor have no side effects).
+    pub files: Vec<(PathBuf, String)>,
+    /// A session ID `assign_session` may add (`Session::Assign`).
+    pub assign: Option<AssignSession>,
 }
 impl Invocation {
+    /// The command line with environment values redacted: values can hold
+    /// endpoints or inline config, and previews are shared.
     pub fn display(&self) -> String {
         let env = self.env.iter().map(|(name, value)| match value {
-            EnvValue::Literal(v) => format!("{name}={}", shell_words::quote(v)),
+            EnvValue::Literal(_) => format!("{name}=<redacted>"),
             EnvValue::Var(var) => format!("{name}=${var}"),
-            EnvValue::JsonInsert { path, value } => {
-                format!(
-                    "{name}=${name}+{}={}",
-                    path.join("."),
-                    shell_words::quote(value)
-                )
+            EnvValue::JsonInsert { path, .. } => {
+                format!("{name}=${name}+{}=<redacted>", path.join("."))
             }
+            EnvValue::UnsetPrefix => format!("-u {name}*"),
         });
         env.chain(
             std::iter::once(self.program.as_str())
@@ -67,26 +98,64 @@ impl Invocation {
         .join(" ")
     }
     /// Resolves `env` for launch; fails when a referenced variable is unset.
+    /// Several JSON inserts into one variable apply in order.
     pub fn environment(&self) -> Result<Vec<(String, String)>> {
-        self.env
+        let mut resolved: Vec<(String, String)> = vec![];
+        for (name, value) in &self.env {
+            let text = match value {
+                EnvValue::Literal(v) => v.clone(),
+                EnvValue::Var(var) => env::var(var)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .with_context(|| format!("Set {var} to use this provider"))?,
+                EnvValue::JsonInsert { path, value } => {
+                    let base = match resolved.iter().find(|(n, _)| n == name) {
+                        Some((_, text)) => Some(text.clone()),
+                        None => env::var(name).ok(),
+                    };
+                    json_insert(base.as_deref(), path, value)
+                        .with_context(|| format!("Add router config to {name}"))?
+                }
+                EnvValue::UnsetPrefix => continue,
+            };
+            match resolved.iter_mut().find(|(n, _)| n == name) {
+                Some(entry) => entry.1 = text,
+                None => resolved.push((name.clone(), text)),
+            }
+        }
+        Ok(resolved)
+    }
+    /// Inherited variables to remove at launch (see `EnvValue::UnsetPrefix`).
+    pub fn removed(&self) -> Vec<OsString> {
+        self.removed_from(env::vars_os().map(|(name, _)| name))
+    }
+    fn removed_from(&self, inherited: impl Iterator<Item = OsString>) -> Vec<OsString> {
+        let prefixes: Vec<&str> = self
+            .env
             .iter()
-            .map(|(name, value)| {
-                Ok((
-                    name.clone(),
-                    match value {
-                        EnvValue::Literal(v) => v.clone(),
-                        EnvValue::Var(var) => env::var(var)
-                            .ok()
-                            .filter(|v| !v.is_empty())
-                            .with_context(|| format!("Set {var} to use this provider"))?,
-                        EnvValue::JsonInsert { path, value } => {
-                            json_insert(env::var(name).ok().as_deref(), path, value)
-                                .with_context(|| format!("Add provider config to {name}"))?
-                        }
-                    },
-                ))
+            .filter(|(_, v)| *v == EnvValue::UnsetPrefix)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if prefixes.is_empty() {
+            return vec![];
+        }
+        inherited
+            .filter(|name| {
+                let text = name.to_string_lossy();
+                prefixes.iter().any(|p| text.starts_with(p))
+                    && !self
+                        .env
+                        .iter()
+                        .any(|(set, v)| *v != EnvValue::UnsetPrefix && *set == text)
             })
             .collect()
+    }
+    /// Writes `files`; the process launcher calls this right before spawning.
+    pub fn write_files(&self) -> Result<()> {
+        for (path, text) in &self.files {
+            fs::write(path, text).with_context(|| format!("Write {}", path.display()))?;
+        }
+        Ok(())
     }
 }
 
@@ -127,28 +196,214 @@ pub fn program(harness: &str, custom: &BTreeMap<String, CustomAdapter>) -> Strin
     if let Some(adapter) = custom.get(harness) {
         return adapter.command.clone();
     }
-    match harness {
-        "cursor" if executable("cursor-agent").is_some() => "cursor-agent".into(),
-        "cursor" => "agent".into(),
-        other => other.into(),
+    match harness::get(harness) {
+        Some(spec) => resolve_program(spec).into(),
+        None => harness.into(),
     }
 }
 
-/// Harnesses that cannot be pointed at a router-defined provider.
-const UNROUTABLE: &[&str] = &["claude", "cursor", "gemini", "amp", "copilot"];
+/// The first installed program candidate, skipping a shared name (Cursor's
+/// `agent`) that is not the harness's; the first candidate otherwise.
+fn resolve_program(spec: &HarnessSpec) -> &'static str {
+    for &candidate in spec.programs {
+        let Some(path) = executable(candidate) else {
+            continue;
+        };
+        match spec.identity {
+            Some(identity) if identity.program == candidate => {
+                if is_identified(&path, identity.path_contains, identity.help_contains) {
+                    return candidate;
+                }
+            }
+            _ => return candidate,
+        }
+    }
+    spec.programs[0]
+}
+
+/// Whether `path` resolves into a directory named `path_contains` (Cursor
+/// installs `agent` as a link into its `cursor-agent` directory), or else
+/// its help contains `help_contains`. Cached per path.
+fn is_identified(path: &Path, path_contains: &str, help_contains: &str) -> bool {
+    static SEEN: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    if let Some(known) = seen.lock().ok().and_then(|s| s.get(path).copied()) {
+        return known;
+    }
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let found = resolved.to_string_lossy().contains(path_contains)
+        || probe(&path.to_string_lossy(), "--help")
+            .is_some_and(|help| help.contains(help_contains));
+    if let Ok(mut seen) = seen.lock() {
+        seen.insert(path.to_path_buf(), found);
+    }
+    found
+}
+
+#[cfg(test)]
+fn is_cursor_agent(path: &Path) -> bool {
+    let identity = harness::get("cursor")
+        .and_then(|spec| spec.identity)
+        .expect("cursor identity");
+    is_identified(path, identity.path_contains, identity.help_contains)
+}
+
+/// The output parser for a harness's unattended runs.
+pub fn output_kind(harness: &str, custom: &BTreeMap<String, CustomAdapter>) -> OutputKind {
+    match custom.get(harness) {
+        Some(adapter) => adapter.output.map_or(OutputKind::Text, |o| o.kind()),
+        None => harness::get(harness).map_or(OutputKind::Text, |spec| spec.output),
+    }
+}
+
+/// Output of `<program> <flag>`, or None when it fails or takes over 5 s.
+fn probe(program: &str, flag: &str) -> Option<String> {
+    let temp = tempfile::tempdir().ok()?;
+    let invocation = Invocation {
+        program: program.into(),
+        args: vec![flag.into()],
+        stdin: None,
+        kind: OutputKind::Text,
+        final_file: temp.path().join("unused"),
+        env: vec![],
+        files: vec![],
+        assign: None,
+    };
+    let outcome = crate::process::capture(
+        &invocation,
+        temp.path(),
+        temp.path(),
+        Duration::from_secs(5),
+        &std::sync::atomic::AtomicBool::new(false),
+        |_, _| {},
+    )
+    .ok()?;
+    if !outcome.success() || outcome.timed_out {
+        return None;
+    }
+    let text = crate::process::read_tail(&temp.path().join("stdout.log"), 64 * 1024).ok()?;
+    Some(crate::storage::clean_terminal(&text))
+}
+
+fn versions() -> &'static Mutex<HashMap<String, Option<String>>> {
+    static VERSIONS: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+    VERSIONS.get_or_init(Default::default)
+}
+
+/// Records a detected `--version` line (doctor does), so builds reuse it.
+pub fn remember_version(program: &str, line: Option<&str>) {
+    if let Ok(mut versions) = versions().lock() {
+        versions.insert(program.into(), line.map(str::to_owned));
+    }
+}
+
+/// The harness's version: `MODEL_ROUTER_HARNESS_VERSIONS` (`opencode=1.4.0,…`)
+/// overrides detection; otherwise the first line of `<program> --version`,
+/// detected once per process.
+pub fn harness_version(harness: &str, program: &str) -> Option<String> {
+    if let Ok(overrides) = env::var("MODEL_ROUTER_HARNESS_VERSIONS") {
+        if let Some(version) = overrides.split(',').find_map(|pair| {
+            let (name, version) = pair.split_once('=')?;
+            (name.trim() == harness).then(|| version.trim().to_owned())
+        }) {
+            return Some(version);
+        }
+    }
+    if let Some(known) = versions().lock().ok().and_then(|v| v.get(program).cloned()) {
+        return known;
+    }
+    let line = executable(program)
+        .and_then(|_| probe(program, "--version"))
+        .and_then(|text| {
+            text.lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(str::to_owned)
+        });
+    remember_version(program, line.as_deref());
+    line
+}
+
+/// The major version in a `--version` line, e.g. 2 in `opencode v2.0.22`.
+pub fn major_version(line: &str) -> Option<u64> {
+    line.split(|c: char| c.is_whitespace() || matches!(c, '/' | '(' | ')' | ','))
+        .map(|token| token.strip_prefix('v').unwrap_or(token))
+        .find(|token| token.starts_with(|c: char| c.is_ascii_digit()))
+        .and_then(|token| token.split('.').next()?.parse().ok())
+}
+
+/// The `[major, minor, patch]` version in a `--version` line, e.g.
+/// `[0, 41, 0]` in `codex-cli 0.41.0`; missing parts are 0.
+pub fn version_numbers(line: &str) -> Option<[u64; 3]> {
+    let token = line
+        .split(|c: char| c.is_whitespace() || matches!(c, '/' | '(' | ')' | ','))
+        .map(|token| token.strip_prefix('v').unwrap_or(token))
+        .find(|token| token.starts_with(|c: char| c.is_ascii_digit()))?;
+    let mut numbers = [0; 3];
+    for (slot, part) in numbers.iter_mut().zip(token.split('.')) {
+        let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+        *slot = digits.parse().ok()?;
+    }
+    Some(numbers)
+}
+
+/// Whether `version` (a `--version` line) takes the harness's native output
+/// schema flag (`HarnessSpec::structured`). Unknown versions count as current.
+pub fn output_schema_supported(harness: &str, version: Option<&str>) -> bool {
+    let Some(structured) = harness::get(harness).and_then(|spec| spec.structured) else {
+        return false;
+    };
+    version
+        .and_then(version_numbers)
+        .is_none_or(|found| found >= structured.since)
+}
+
+/// The Codex attempt file holding the strict handoff schema.
+pub const OUTPUT_SCHEMA_FILE: &str = "output-schema.json";
+
+/// Whether the invocation asks its harness for schema-constrained output.
+pub fn uses_output_schema(invocation: &Invocation) -> bool {
+    let flags: Vec<&str> = harness::SPECS
+        .iter()
+        .filter_map(|spec| spec.structured.map(|s| s.flag))
+        .collect();
+    invocation.args.iter().any(|a| flags.contains(&a.as_str()))
+}
+
+/// Whether the harness is older than `major`. Unknown versions count as
+/// current, so the newest flags are the default.
+fn older_than(harness: &str, program: &str, major: u64) -> bool {
+    harness_version(harness, program)
+        .as_deref()
+        .and_then(major_version)
+        .is_some_and(|found| found < major)
+}
 
 pub fn validate_options(stage: &Stage, configured: &BTreeMap<String, Provider>) -> Result<()> {
-    if providers::route(&stage.harness, &stage.provider, configured).is_some() {
-        ensure!(
-            !UNROUTABLE.contains(&stage.harness.as_str()),
-            "{} cannot use router provider {}; it only uses its own account",
-            stage.harness,
-            stage.provider
-        );
-    } else if !stage.provider.is_empty() && !harness_settings::supports_provider(&stage.harness) {
+    let spec = harness::get(&stage.harness);
+    if !stage.provider.is_empty() && !harness_settings::supports_provider(&stage.harness) {
+        if configured.contains_key(&stage.provider) {
+            bail!(
+                "{} cannot use router provider {}; it only uses its own account",
+                stage.harness,
+                stage.provider
+            );
+        }
         bail!(
             "{} uses its existing provider/auth configuration; leave the provider field empty",
             stage.harness
+        );
+    }
+    // Registry harnesses (Pi, omp) resolve providers themselves; a provider
+    // only the router defines would fail inside the harness.
+    if spec.is_some_and(|s| s.routing == Routing::Registry)
+        && configured.contains_key(&stage.provider)
+        && !providers::builtins().contains_key(&stage.provider)
+    {
+        bail!(
+            "{harness} cannot use provider {provider}: it is defined only in model-router's [providers.{provider}], and {harness} uses its own provider registry. Define it in {harness}'s models.json, or choose a provider listed by `model-router models {harness}`",
+            harness = stage.harness,
+            provider = stage.provider
         );
     }
     if !stage.provider.is_empty() {
@@ -168,46 +423,39 @@ pub fn validate_options(stage: &Stage, configured: &BTreeMap<String, Provider>) 
 
 /// Whether `harness` can reopen a stage's session in its interactive CLI.
 pub fn resumable(harness: &str, custom: &BTreeMap<String, CustomAdapter>) -> bool {
-    !custom.contains_key(harness)
-        && matches!(
-            harness,
-            "claude" | "codex" | "pi" | "omp" | "cursor" | "opencode" | "amp"
-        )
+    match custom.get(harness) {
+        Some(adapter) => adapter.resume_args.is_some() && adapter.session.is_some(),
+        None => harness::get(harness).is_some_and(|spec| spec.resume.is_some()),
+    }
 }
 
-/// Gives a Claude Code or Pi launch a known session ID, which it returns, so
-/// the stage can be taken over or reopened later. The others report their own
-/// session in their JSON events.
-pub fn assign_session(invocation: &mut Invocation, harness: &str) -> Option<String> {
+/// A session ID the router may choose for a launch (`Session::Assign`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignSession {
+    pub flag: String,
+    pub prepend: bool,
+    /// Flags that already pick, continue, or disable a session.
+    pub conflicts: Vec<String>,
+}
+
+/// Gives a launch whose harness accepts one (Claude Code, Pi, custom
+/// adapters with `session.assign`) a known session ID, which it returns, so
+/// the stage can be taken over or reopened later. The others report their
+/// own session in their JSON events. The plan comes from `build`.
+pub fn assign_session(invocation: &mut Invocation, _harness: &str) -> Option<String> {
+    let plan = invocation.assign.take()?;
     let chosen = |flag: &str| {
         invocation
             .args
             .iter()
             .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
     };
-    // Flags that already pick, continue, or disable a session.
-    let session_flags: &[&str] = match harness {
-        "claude" => &["--session-id", "--resume", "-r", "--continue", "-c"],
-        // omp shares Pi's output but has no --session-id; it reports its own.
-        "pi" => &[
-            "--session-id",
-            "--session",
-            "--resume",
-            "-r",
-            "--continue",
-            "-c",
-            "--fork",
-            "--no-session",
-        ],
-        _ => return None,
-    };
-    if session_flags.iter().any(|flag| chosen(flag)) {
+    if plan.conflicts.iter().any(|flag| chosen(flag)) {
         return None;
     }
     let id = uuid::Uuid::new_v4().to_string();
-    let flag = ["--session-id".to_owned(), id.clone()];
-    if harness == "claude" {
-        // Interactive Claude Code takes its prompt last.
+    let flag = [plan.flag, id.clone()];
+    if plan.prepend {
         invocation.args.splice(0..0, flag);
     } else {
         invocation.args.extend(flag);
@@ -229,34 +477,41 @@ pub fn resume(
         "{} sessions cannot be resumed",
         stage.harness
     );
+    if custom.contains_key(&stage.harness) {
+        let stage = Stage {
+            mode: Mode::Interactive,
+            ..stage.clone()
+        };
+        return build_inner(&stage, custom, configured, "", paths, Some(session));
+    }
+    let spec = harness::get(&stage.harness).context("Unknown adapter")?;
+    let plan = spec.resume.context("Not resumable")?;
     let stage = Stage {
         mode: Mode::Interactive,
+        effort: if plan.keep_effort {
+            stage.effort.clone()
+        } else {
+            String::new()
+        },
         ..stage.clone()
     };
     let mut invocation = build(&stage, custom, configured, "", paths)?;
+    invocation.assign = None;
+    let fill = |items: &[&str]| -> Vec<String> {
+        items
+            .iter()
+            .map(|item| expand(item, &[("{session}", session.to_owned())]))
+            .collect()
+    };
     let args = &mut invocation.args;
     // Interactive builds end with the prompt (Pi, omp: its @file); the session replaces it.
     args.pop();
-    match stage.harness.as_str() {
-        "claude" => {
-            args.splice(0..0, ["--resume".to_owned(), session.to_owned()]);
+    match plan.replace {
+        Some(items) => *args = fill(items),
+        None => {
+            args.splice(0..0, fill(plan.prepend));
+            args.extend(fill(plan.append));
         }
-        "codex" => {
-            args.insert(0, "resume".into());
-            args.push(session.into());
-        }
-        "pi" => args.extend(["--session-id".to_owned(), session.to_owned()]),
-        "omp" => {
-            args.splice(0..0, ["--resume".to_owned(), session.to_owned()]);
-        }
-        "cursor" => args.extend(["--resume".to_owned(), session.to_owned()]),
-        "amp" => {
-            args.splice(0..0, ["threads".to_owned(), "continue".to_owned()]);
-            args.push(session.into());
-        }
-        // The OpenCode TUI keeps the session's model; `run` options do not apply.
-        "opencode" => *args = vec!["--session".into(), session.into()],
-        other => bail!("{other} sessions cannot be resumed"),
     }
     Ok(invocation)
 }
@@ -275,11 +530,22 @@ pub fn build(
     prompt: &str,
     paths: &ContextPaths<'_>,
 ) -> Result<Invocation> {
+    build_inner(stage, custom, configured, prompt, paths, None)
+}
+
+/// `build`, or for a custom adapter with `resume`, its resume command.
+fn build_inner(
+    stage: &Stage,
+    custom: &BTreeMap<String, CustomAdapter>,
+    configured: &BTreeMap<String, Provider>,
+    prompt: &str,
+    paths: &ContextPaths<'_>,
+    resume: Option<&str>,
+) -> Result<Invocation> {
     validate_options(stage, configured)?;
     let routed = providers::route(&stage.harness, &stage.provider, configured);
     let mut extra_args = harness_settings::arguments(stage)?;
     extra_args.extend(stage.extra_args.clone());
-    let interactive = stage.mode == Mode::Interactive;
     let mut invocation = Invocation {
         program: program(&stage.harness, custom),
         args: vec![],
@@ -287,305 +553,382 @@ pub fn build(
         kind: OutputKind::Text,
         final_file: paths.attempt_dir.join("final.txt"),
         env: vec![],
+        files: vec![],
+        assign: None,
     };
     if let Some(provider) = &routed {
         invocation.env = route_env(stage, provider)?;
     }
-    let a = &mut invocation.args;
-    let mut append = |items: &[&str]| {
-        a.extend(items.iter().map(|s| (*s).to_owned()));
+    for (name, value) in harness_settings::environment(stage) {
+        invocation.env.push((name, EnvValue::Literal(value)));
+    }
+    let routed = routed.as_deref();
+    if let Some(adapter) = custom.get(&stage.harness) {
+        build_custom(
+            &mut invocation,
+            &stage.harness,
+            adapter,
+            stage,
+            routed,
+            &extra_args,
+            prompt,
+            paths,
+            resume,
+        )?;
+        return Ok(invocation);
+    }
+    let spec = harness::get(&stage.harness)
+        .with_context(|| format!("Unknown adapter {}", stage.harness))?;
+    let legacy = spec
+        .version_override
+        .is_some_and(|o| older_than(spec.name, &invocation.program, o.below_major));
+    build_spec(
+        spec,
+        &mut invocation,
+        stage,
+        routed,
+        &extra_args,
+        prompt,
+        paths,
+        legacy,
+    )?;
+    Ok(invocation)
+}
+
+/// Builds a built-in harness's invocation from its spec; `legacy` selects
+/// its version override.
+#[allow(clippy::too_many_arguments)]
+fn build_spec(
+    spec: &HarnessSpec,
+    invocation: &mut Invocation,
+    stage: &Stage,
+    routed: Option<&Provider>,
+    extra_args: &[String],
+    prompt: &str,
+    paths: &ContextPaths<'_>,
+    legacy: bool,
+) -> Result<()> {
+    let interactive = stage.mode == Mode::Interactive;
+    invocation.kind = spec.output;
+    let (parts, prompt_pass, effort_pass) = spec.template(interactive, legacy);
+    let model = &stage.model;
+    let effort = &stage.effort;
+    if let EffortPass::ModelSuffix(_) = effort_pass {
+        ensure!(
+            effort.is_empty() || !model.is_empty(),
+            "{} selects a {} (effort) as part of the model; choose a model",
+            spec.display,
+            spec.effort_name
+        );
+    }
+    let takes_effort = match effort_pass {
+        EffortPass::None => false,
+        EffortPass::ModelSuffix(_) => parts.contains(&Part::Model),
+        _ => parts.contains(&Part::Effort),
     };
+    ensure!(
+        effort.is_empty() || takes_effort,
+        "{} {} has no {} option; leave effort empty or run {}",
+        if interactive {
+            "Interactive"
+        } else {
+            "Unattended"
+        },
+        spec.display,
+        spec.effort_name,
+        if interactive {
+            "unattended"
+        } else {
+            "interactively"
+        }
+    );
     let qualified = if stage.provider.is_empty() {
-        stage.model.clone()
-    } else if routed.is_some() && stage.harness == "opencode" {
-        format!("{}/{}", router_provider_id(&stage.provider), stage.model)
+        model.clone()
+    } else if routed.is_some() && spec.routing.router_id_in_model() {
+        format!("{}/{}", router_provider_id(&stage.provider), model)
     } else {
-        format!("{}/{}", stage.provider, stage.model)
+        format!("{}/{}", stage.provider, model)
     };
-    match stage.harness.as_str() {
-        "codex" => {
-            invocation.kind = OutputKind::Codex;
-            if !interactive {
-                append(&[
-                    "exec",
-                    "--json",
-                    "--color",
-                    "never",
-                    "--skip-git-repo-check",
-                    "--output-last-message",
-                    invocation
-                        .final_file
-                        .to_str()
-                        .context("Output path must be UTF-8")?,
-                ]);
+    let selector = |value: &str| match effort_pass {
+        EffortPass::ModelSuffix(c) if !effort.is_empty() => format!("{value}{c}{effort}"),
+        _ => value.to_owned(),
+    };
+    let openai = match spec.routing {
+        Routing::OpenAiEnv(env) => Some(env),
+        _ => None,
+    };
+    // Native structured output, unless the user passed their own schema or
+    // the detected harness predates the flag.
+    let schema = spec.structured.filter(|s| {
+        !interactive
+            && !extra_args
+                .iter()
+                .any(|a| a == s.flag || a.starts_with(&format!("{}=", s.flag)))
+            && output_schema_supported(
+                spec.name,
+                harness_version(spec.name, &invocation.program).as_deref(),
+            )
+    });
+    if let Session::Assign {
+        flag,
+        prepend,
+        conflicts,
+    } = spec.session
+    {
+        invocation.assign = Some(AssignSession {
+            flag: flag.into(),
+            prepend,
+            conflicts: conflicts.iter().map(|c| (*c).to_owned()).collect(),
+        });
+    }
+    let utf8 = |path: &Path, what: &str| -> Result<String> {
+        Ok(path
+            .to_str()
+            .with_context(|| format!("{what} path must be UTF-8"))?
+            .to_owned())
+    };
+    let mut args: Vec<String> = vec![];
+    for part in parts {
+        match *part {
+            Part::Args(items) => {
+                for item in items {
+                    args.push(if item.contains("{final_file}") {
+                        let file = utf8(&invocation.final_file, "Output")?;
+                        expand(item, &[("{final_file}", file)])
+                    } else {
+                        (*item).to_owned()
+                    });
+                }
             }
-            if !stage.model.is_empty() {
-                append(&["--model", &stage.model]);
-            }
-            if let Some(provider) = &routed {
-                // Isolated from native/reserved IDs (openai, ollama, …); dotted
-                // names stay one TOML key.
-                let id = router_provider_id(&stage.provider);
-                let key = format!("model_providers.{id}");
-                for (field, value) in [
-                    ("name", &stage.provider),
-                    ("base_url", &provider.base_url),
-                    ("env_key", &provider.api_key_env),
-                ] {
-                    if value.is_empty() {
-                        continue;
+            Part::Schema => match schema.map(|s| (s.flag, s.delivery)) {
+                Some((flag, SchemaDelivery::File(name))) => {
+                    let path = paths.attempt_dir.join(name);
+                    args.extend([flag.to_owned(), utf8(&path, "Schema")?]);
+                    invocation.files.push((path, handoff::strict_schema()));
+                }
+                Some((flag, SchemaDelivery::Inline)) => {
+                    args.extend([flag.to_owned(), handoff::compact_schema()]);
+                }
+                None => {}
+            },
+            Part::Model => match spec.model {
+                ModelPass::Flag(flag) | ModelPass::Mode(flag) => {
+                    if !model.is_empty() {
+                        args.extend([flag.to_owned(), selector(model)]);
                     }
-                    append(&[
-                        "--config",
-                        &format!("{key}.{field}={}", serde_json::to_string(value)?),
+                }
+                ModelPass::Qualified(flag) => {
+                    let prefix = openai.and_then(|o| o.model_prefix);
+                    match (routed, prefix) {
+                        (Some(provider), Some(prefix)) => {
+                            args.extend([flag.to_owned(), format!("{prefix}{model}")]);
+                            if let Some(base) = openai.and_then(|o| o.base_url_flag) {
+                                args.extend([base.to_owned(), provider.base_url.clone()]);
+                            }
+                        }
+                        _ if !qualified.is_empty() => {
+                            args.extend([flag.to_owned(), selector(&qualified)]);
+                        }
+                        _ => {}
+                    }
+                }
+            },
+            Part::Provider => match spec.provider {
+                ProviderPass::None | ProviderPass::InModel => {}
+                ProviderPass::Flag(flag) => match (routed, openai.and_then(|o| o.provider_value)) {
+                    (Some(_), Some(value)) => args.extend([flag.to_owned(), value.to_owned()]),
+                    _ if !stage.provider.is_empty() => {
+                        args.extend([flag.to_owned(), stage.provider.clone()]);
+                    }
+                    _ => {}
+                },
+                ProviderPass::CodexConfig => codex_provider_args(&mut args, stage, routed)?,
+            },
+            Part::Effort => {
+                if !effort.is_empty() {
+                    match effort_pass {
+                        EffortPass::None | EffortPass::ModelSuffix(_) => {}
+                        EffortPass::Flag(flag) => args.extend([flag.to_owned(), effort.clone()]),
+                        EffortPass::ConfigKv { flag, key } => args.extend([
+                            flag.to_owned(),
+                            format!("{key}={}", serde_json::to_string(effort)?),
+                        ]),
+                    }
+                }
+            }
+            Part::Extra => args.extend(extra_args.iter().cloned()),
+            Part::Prompt => match prompt_pass {
+                Prompt::Stdin => invocation.stdin = Some(prompt.into()),
+                Prompt::StdinArg(arg) => {
+                    args.push(arg.into());
+                    invocation.stdin = Some(prompt.into());
+                }
+                Prompt::Arg => args.push(prompt.into()),
+                Prompt::Flag(flag) => args.extend([flag.to_owned(), prompt.to_owned()]),
+                Prompt::AtFile => args.push(format!("@{}", paths.prompt_file.display())),
+                Prompt::MessageFile(flag) => {
+                    args.extend([flag.to_owned(), utf8(paths.prompt_file, "Prompt")?]);
+                }
+                Prompt::ReadAndLoad {
+                    read,
+                    load,
+                    file,
+                    commands,
+                } => {
+                    let path = paths.attempt_dir.join(file);
+                    invocation.files.push((path.clone(), commands.into()));
+                    args.extend([
+                        read.to_owned(),
+                        utf8(paths.prompt_file, "Prompt")?,
+                        load.to_owned(),
+                        utf8(&path, "Command")?,
                     ]);
                 }
-                append(&[
-                    "--config",
-                    &format!("model_provider={}", serde_json::to_string(&id)?),
-                ]);
-            } else if !stage.provider.is_empty() {
-                if matches!(stage.provider.as_str(), "ollama" | "lmstudio") {
-                    append(&["--oss", "--local-provider", &stage.provider]);
-                } else {
-                    append(&[
-                        "--config",
-                        &format!("model_provider={}", serde_json::to_string(&stage.provider)?),
-                    ]);
+            },
+            Part::ModelEnv { var, path } => {
+                if !qualified.is_empty() {
+                    invocation.env.push((
+                        var.to_owned(),
+                        EnvValue::JsonInsert {
+                            path: vec![path.into()],
+                            value: serde_json::to_string(&qualified)?,
+                        },
+                    ));
                 }
             }
-            if !stage.effort.is_empty() {
-                append(&[
-                    "--config",
-                    &format!(
-                        "model_reasoning_effort={}",
-                        serde_json::to_string(&stage.effort)?
-                    ),
-                ]);
-            }
-            a.extend(extra_args.clone());
-            if interactive {
-                a.push(prompt.into());
-            } else {
-                a.push("-".into());
-                invocation.stdin = Some(prompt.into());
-            }
         }
-        "claude" => {
-            invocation.kind = OutputKind::Claude;
-            if !interactive {
-                // Stream events so the monitor shows progress; print mode
-                // requires --verbose for stream-json.
-                append(&["--print", "--output-format", "stream-json", "--verbose"]);
-            }
-            if !stage.model.is_empty() {
-                append(&["--model", &stage.model]);
-            }
-            if !stage.effort.is_empty() {
-                append(&["--effort", &stage.effort]);
-            }
-            a.extend(extra_args.clone());
-            if interactive {
-                a.push(prompt.into());
-            } else {
-                invocation.stdin = Some(prompt.into());
-            }
-        }
-        "pi" => {
-            invocation.kind = OutputKind::Pi;
-            if !interactive {
-                append(&["--print", "--mode", "json"]);
-            }
-            if !stage.model.is_empty() {
-                append(&["--model", &stage.model]);
-            }
-            if !stage.provider.is_empty() {
-                append(&["--provider", &stage.provider]);
-            }
-            if !stage.effort.is_empty() {
-                append(&["--thinking", &stage.effort]);
-            }
-            a.extend(extra_args.clone());
-            a.push(format!("@{}", paths.prompt_file.display()));
-        }
-        // oh-my-pi prints Pi's JSON events. Its provider is part of the model
-        // selector; it reads the prompt file and needs no stdin.
-        "omp" => {
-            invocation.kind = OutputKind::Pi;
-            if !interactive {
-                append(&["--print", "--mode", "json"]);
-            }
-            if !qualified.is_empty() {
-                append(&["--model", &qualified]);
-            }
-            if !stage.effort.is_empty() {
-                append(&["--thinking", &stage.effort]);
-            }
-            a.extend(extra_args.clone());
-            a.push(format!("@{}", paths.prompt_file.display()));
-        }
-        "cursor" => {
-            invocation.kind = OutputKind::Cursor;
-            if !interactive {
-                append(&["--print", "--output-format", "stream-json"]);
-            }
-            if !stage.model.is_empty() {
-                append(&["--model", &stage.model]);
-            }
-            a.extend(extra_args.clone());
-            a.push(prompt.into());
-        }
-        "gemini" => {
-            invocation.kind = OutputKind::Gemini;
-            if !stage.model.is_empty() {
-                append(&["--model", &stage.model]);
-            }
-            if interactive {
-                append(&["--prompt-interactive", prompt]);
-            } else {
-                append(&["--prompt", prompt, "--output-format", "json"]);
-            }
-            a.extend(extra_args.clone());
-        }
-        "opencode" => {
-            invocation.kind = OutputKind::OpenCode;
-            if interactive {
-                append(&["run", "--interactive"]);
-            } else {
-                append(&["run", "--format", "json"]);
-            }
-            if !qualified.is_empty() {
-                append(&["--model", &qualified]);
-            }
-            if !stage.effort.is_empty() {
-                append(&["--variant", &stage.effort]);
-            }
-            a.extend(extra_args.clone());
-            a.push(prompt.into());
-        }
-        "aider" => {
-            if routed.is_some() {
-                // LiteLLM's openai/ prefix targets OPENAI_API_BASE.
-                append(&["--model", &format!("openai/{}", stage.model)]);
-            } else if !qualified.is_empty() {
-                append(&["--model", &qualified]);
-            }
-            append(&["--no-auto-commits", "--no-dirty-commits"]);
-            if interactive {
-                let commands = paths.attempt_dir.join("aider.commands");
-                fs::write(
-                    &commands,
-                    "/code Complete the stage described in the attached model-router prompt file.\n",
-                )?;
-                append(&[
-                    "--read",
-                    paths
-                        .prompt_file
-                        .to_str()
-                        .context("Prompt path must be UTF-8")?,
-                    "--load",
-                    commands.to_str().context("Command path must be UTF-8")?,
-                ]);
-            } else {
-                append(&[
-                    "--message-file",
-                    paths
-                        .prompt_file
-                        .to_str()
-                        .context("Prompt path must be UTF-8")?,
-                ]);
-            }
-            a.extend(extra_args.clone());
-        }
-        "goose" => {
-            append(&["run", "--text", prompt]);
-            if interactive {
-                append(&["--interactive"]);
-            }
-            if !stage.model.is_empty() {
-                append(&["--model", &stage.model]);
-            }
-            if routed.is_some() {
-                append(&["--provider", "openai"]);
-            } else if !stage.provider.is_empty() {
-                append(&["--provider", &stage.provider]);
-            }
-            a.extend(extra_args.clone());
-        }
-        "amp" => {
-            invocation.kind = OutputKind::Amp;
-            if !stage.model.is_empty() {
-                append(&["--mode", &stage.model]);
-            }
-            if !interactive {
-                append(&["--execute", "--stream-json"]);
-            }
-            a.extend(extra_args.clone());
-            if interactive {
-                a.push(prompt.into());
-            } else {
-                invocation.stdin = Some(prompt.into());
-            }
-        }
-        "copilot" => {
-            if !stage.model.is_empty() {
-                append(&["--model", &stage.model]);
+    }
+    invocation.args = args;
+    Ok(())
+}
+
+/// Codex provider arguments (escape hatch): a routed provider becomes an
+/// isolated `model_providers` entry, local providers use `--oss`, and other
+/// names select Codex's own provider.
+fn codex_provider_args(
+    args: &mut Vec<String>,
+    stage: &Stage,
+    routed: Option<&Provider>,
+) -> Result<()> {
+    let mut append = |items: &[&str]| args.extend(items.iter().map(|s| (*s).to_owned()));
+    if let Some(provider) = routed {
+        // Isolated from native/reserved IDs (openai, ollama, …); dotted
+        // names stay one TOML key.
+        let id = router_provider_id(&stage.provider);
+        let key = format!("model_providers.{id}");
+        for (field, value) in [
+            ("name", &stage.provider),
+            ("base_url", &provider.base_url),
+            ("env_key", &provider.api_key_env),
+        ] {
+            if value.is_empty() {
+                continue;
             }
             append(&[
-                if interactive {
-                    "--interactive"
-                } else {
-                    "--prompt"
-                },
-                prompt,
+                "--config",
+                &format!("{key}.{field}={}", serde_json::to_string(value)?),
             ]);
-            a.extend(extra_args.clone());
         }
-        name => {
-            let adapter = custom
-                .get(name)
-                .with_context(|| format!("Unknown adapter {name}"))?;
-            let args = if interactive {
-                adapter
-                    .interactive_args
-                    .as_ref()
-                    .with_context(|| format!("{name} does not define interactive_args"))?
-            } else {
-                &adapter.args
-            };
-            let values = [
-                ("{prompt}", prompt.to_owned()),
-                ("{model}", stage.model.clone()),
-                ("{provider}", stage.provider.clone()),
-                ("{effort}", stage.effort.clone()),
-                ("{prompt_file}", paths.prompt_file.display().to_string()),
-                ("{handoff_file}", paths.handoff_file.display().to_string()),
-                ("{workspace}", paths.workspace.display().to_string()),
-                ("{run_dir}", paths.attempt_dir.display().to_string()),
-                (
-                    "{base_url}",
-                    routed
-                        .as_ref()
-                        .map(|p| p.base_url.clone())
-                        .unwrap_or_default(),
-                ),
-                (
-                    "{api_key_env}",
-                    routed
-                        .as_ref()
-                        .map(|p| p.api_key_env.clone())
-                        .unwrap_or_default(),
-                ),
-            ];
-            a.extend(args.iter().map(|arg| expand(arg, &values)));
-            a.extend(extra_args.clone());
-            if adapter.prompt_stdin && !interactive {
+        append(&[
+            "--config",
+            &format!("model_provider={}", serde_json::to_string(&id)?),
+        ]);
+    } else if !stage.provider.is_empty() {
+        if matches!(stage.provider.as_str(), "ollama" | "lmstudio") {
+            append(&["--oss", "--local-provider", &stage.provider]);
+        } else {
+            append(&[
+                "--config",
+                &format!("model_provider={}", serde_json::to_string(&stage.provider)?),
+            ]);
+        }
+    }
+    Ok(())
+}
+
+/// A custom adapter's template arguments, then `model_flag`, `effort_flag`,
+/// extra arguments, and the prompt. With `resume`, `resume_args` replace the
+/// template and no prompt is passed.
+#[allow(clippy::too_many_arguments)]
+fn build_custom(
+    invocation: &mut Invocation,
+    name: &str,
+    adapter: &CustomAdapter,
+    stage: &Stage,
+    routed: Option<&Provider>,
+    extra_args: &[String],
+    prompt: &str,
+    paths: &ContextPaths<'_>,
+    resume: Option<&str>,
+) -> Result<()> {
+    let interactive = stage.mode == Mode::Interactive;
+    invocation.kind = adapter.output.map_or(OutputKind::Text, |o| o.kind());
+    // An untrusted adapter keeps its name but runs BLOCKED_COMMAND, which no
+    // PATH provides: previews show it and launches fail.
+    let template = match resume {
+        Some(_) => adapter
+            .resume_args
+            .as_ref()
+            .with_context(|| format!("{name} does not define resume_args"))?,
+        None if interactive => adapter
+            .interactive_args
+            .as_ref()
+            .with_context(|| format!("{name} does not define interactive_args"))?,
+        None => &adapter.args,
+    };
+    let values = [
+        ("{prompt}", prompt.to_owned()),
+        ("{model}", stage.model.clone()),
+        ("{provider}", stage.provider.clone()),
+        ("{effort}", stage.effort.clone()),
+        ("{prompt_file}", paths.prompt_file.display().to_string()),
+        ("{handoff_file}", paths.handoff_file.display().to_string()),
+        ("{workspace}", paths.workspace.display().to_string()),
+        ("{run_dir}", paths.attempt_dir.display().to_string()),
+        (
+            "{base_url}",
+            routed.map(|p| p.base_url.clone()).unwrap_or_default(),
+        ),
+        (
+            "{api_key_env}",
+            routed.map(|p| p.api_key_env.clone()).unwrap_or_default(),
+        ),
+        ("{session}", resume.unwrap_or_default().to_owned()),
+    ];
+    let a = &mut invocation.args;
+    a.extend(template.iter().map(|arg| expand(arg, &values)));
+    for (flag, value) in [
+        (&adapter.model_flag, &stage.model),
+        (&adapter.effort_flag, &stage.effort),
+    ] {
+        if let (Some(flag), false) = (flag, value.is_empty()) {
+            a.extend([flag.clone(), value.clone()]);
+        }
+    }
+    a.extend(extra_args.iter().cloned());
+    if resume.is_some() {
+        return Ok(());
+    }
+    match &adapter.prompt {
+        Some(CustomPrompt::Mode(PromptMode::Arg)) => a.push(prompt.into()),
+        Some(CustomPrompt::Flag { flag }) => a.extend([flag.clone(), prompt.into()]),
+        _ => {
+            if adapter.stdin_prompt() && !interactive {
                 invocation.stdin = Some(prompt.into());
             }
         }
     }
-    Ok(invocation)
+    if let Some(flag) = adapter.session.as_ref().and_then(|s| s.assign.as_ref()) {
+        invocation.assign = Some(AssignSession {
+            flag: flag.clone(),
+            prepend: false,
+            conflicts: vec![flag.clone()],
+        });
+    }
+    Ok(())
 }
+
+type Env = Vec<(String, EnvValue)>;
 
 /// Sets `path` in `base` (an inherited JSON object, if any) to `value`,
 /// replacing whatever was there. Key order elsewhere is preserved.
@@ -628,9 +971,10 @@ fn router_provider_id(name: &str) -> String {
     format!("model-router-{safe}")
 }
 
-/// Environment that points a harness at a router-defined provider. The key
-/// variable is always listed so a missing key fails before launch.
-fn route_env(stage: &Stage, provider: &Provider) -> Result<Vec<(String, EnvValue)>> {
+/// Environment that points a harness at a router-defined provider, per its
+/// `Routing`. The key variable is always listed so a missing key fails
+/// before launch.
+fn route_env(stage: &Stage, provider: &Provider) -> Result<Env> {
     let keyless = provider.api_key_env.is_empty();
     // Local servers ignore the key, but clients refuse to send an empty one.
     let key = || {
@@ -645,56 +989,62 @@ fn route_env(stage: &Stage, provider: &Provider) -> Result<Vec<(String, EnvValue
     if !keyless {
         env.push((provider.api_key_env.clone(), key()));
     }
-    match stage.harness.as_str() {
-        "opencode" => {
-            let mut options = serde_json::json!({ "baseURL": &provider.base_url });
-            if !keyless {
-                options["apiKey"] = format!("{{env:{}}}", provider.api_key_env).into();
+    let routing = harness::get(&stage.harness).map(|spec| spec.routing);
+    match routing {
+        Some(Routing::OpencodeJson) => env.push(opencode_provider_env(stage, provider)),
+        Some(Routing::OpenAiEnv(openai)) => {
+            for prefix in openai.strip_prefixes {
+                env.push(((*prefix).into(), EnvValue::UnsetPrefix));
             }
-            // A fresh ID shares no inherited options, headers, or stored auth.
-            let (context, output) = provider.limits();
-            let entry = serde_json::json!({
-                "npm": "@ai-sdk/openai-compatible",
-                "name": &stage.provider,
-                "options": options,
-                // The isolated ID has no catalog entry; without limits OpenCode
-                // treats the context as 0 and never compacts.
-                "models": { &stage.model: { "limit": {
-                    "context": context,
-                    "output": output,
-                }}},
-            });
-            env.push((
-                "OPENCODE_CONFIG_CONTENT".into(),
-                EnvValue::JsonInsert {
-                    path: vec!["provider".into(), router_provider_id(&stage.provider)],
-                    value: entry.to_string(),
-                },
-            ));
-        }
-        "aider" => env.extend([
-            ("OPENAI_API_BASE".into(), literal(&provider.base_url)),
-            ("OPENAI_API_KEY".into(), key()),
-        ]),
-        // Goose's OpenAI provider splits the URL into host and path.
-        "goose" => {
-            let url = reqwest::Url::parse(&provider.base_url)?;
-            let host = url.origin().ascii_serialization();
-            let path = url.path().trim_matches('/');
-            let path = if path.is_empty() {
-                "chat/completions".into()
-            } else {
-                format!("{path}/chat/completions")
-            };
-            env.extend([
-                ("OPENAI_HOST".into(), literal(&host)),
-                ("OPENAI_BASE_PATH".into(), literal(&path)),
-                ("OPENAI_API_KEY".into(), key()),
-            ]);
+            match openai.base {
+                BaseEnv::Url(var) => env.push((var.into(), literal(&provider.base_url))),
+                BaseEnv::HostPath { host, path, suffix } => {
+                    let url = reqwest::Url::parse(&provider.base_url)?;
+                    let origin = url.origin().ascii_serialization();
+                    let trimmed = url.path().trim_matches('/');
+                    let full = if trimmed.is_empty() {
+                        suffix.to_owned()
+                    } else {
+                        format!("{trimmed}/{suffix}")
+                    };
+                    env.push((host.into(), literal(&origin)));
+                    env.push((path.into(), literal(&full)));
+                }
+            }
+            env.push((openai.key_var.into(), key()));
         }
         _ => {}
     }
     Ok(env)
+}
+
+/// OpenCode provider entry (escape hatch): an isolated ID merged into the
+/// inherited `OPENCODE_CONFIG_CONTENT`.
+fn opencode_provider_env(stage: &Stage, provider: &Provider) -> (String, EnvValue) {
+    let mut options = serde_json::json!({ "baseURL": &provider.base_url });
+    if !provider.api_key_env.is_empty() {
+        options["apiKey"] = format!("{{env:{}}}", provider.api_key_env).into();
+    }
+    // A fresh ID shares no inherited options, headers, or stored auth.
+    let (context, output) = provider.limits();
+    let entry = serde_json::json!({
+        "npm": "@ai-sdk/openai-compatible",
+        "name": &stage.provider,
+        "options": options,
+        // The isolated ID has no catalog entry; without limits OpenCode
+        // treats the context as 0 and never compacts.
+        "models": { &stage.model: { "limit": {
+            "context": context,
+            "output": output,
+        }}},
+    });
+    (
+        "OPENCODE_CONFIG_CONTENT".into(),
+        EnvValue::JsonInsert {
+            path: vec!["provider".into(), router_provider_id(&stage.provider)],
+            value: entry.to_string(),
+        },
+    )
 }
 
 /// Expand only tokens present in the template, never tokens introduced by user input.
@@ -823,6 +1173,8 @@ mod tests {
                 "--output-format",
                 "stream-json",
                 "--verbose",
+                "--json-schema",
+                &handoff::compact_schema(),
                 "--model",
                 "m",
                 "--effort",
@@ -1017,9 +1369,7 @@ mod tests {
                     "--base={base_url}".into(),
                     "--key={api_key_env}".into(),
                 ],
-                interactive_args: None,
-                models_args: None,
-                prompt_stdin: false,
+                ..CustomAdapter::default()
             },
         )]);
         let configured = BTreeMap::from([(
@@ -1157,5 +1507,352 @@ mod tests {
             panic!()
         };
         assert!(!value.contains("apiKey"), "{value}");
+    }
+
+    fn paths_in(dir: &Path) -> ContextPaths<'_> {
+        ContextPaths {
+            workspace: dir,
+            attempt_dir: dir,
+            prompt_file: dir,
+            handoff_file: dir,
+        }
+    }
+
+    #[test]
+    fn routed_aider_and_goose_drop_inherited_openai_settings() {
+        let configured = BTreeMap::from([(
+            "proxy".to_string(),
+            Provider {
+                base_url: "http://localhost:4000/v1".into(),
+                api_key_env: "PROXY_KEY".into(),
+                ..Provider::default()
+            },
+        )]);
+        let inherited = || {
+            [
+                "OPENAI_ORGANIZATION",
+                "OPENAI_PROJECT",
+                "OPENAI_CUSTOM_HEADERS",
+                "OPENAI_API_KEY",
+                "AIDER_OPENAI_API_KEY",
+                "PATH",
+            ]
+            .into_iter()
+            .map(OsString::from)
+        };
+        for harness in ["aider", "goose"] {
+            let i = routed_with(harness, "proxy", Mode::Unattended, &configured).unwrap();
+            let removed: Vec<_> = i
+                .removed_from(inherited())
+                .into_iter()
+                .map(|n| n.into_string().unwrap())
+                .collect();
+            assert!(removed.contains(&"OPENAI_ORGANIZATION".into()), "{harness}");
+            assert!(
+                removed.contains(&"OPENAI_CUSTOM_HEADERS".into()),
+                "{harness}"
+            );
+            // The key the router sets is replaced, not removed; PATH stays.
+            assert!(!removed.contains(&"OPENAI_API_KEY".into()), "{harness}");
+            assert!(!removed.contains(&"PATH".into()), "{harness}");
+            assert_eq!(
+                removed.contains(&"AIDER_OPENAI_API_KEY".into()),
+                harness == "aider"
+            );
+            assert!(
+                !i.environment()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|(n, _)| n.ends_with('_'))
+            );
+        }
+        // The CLI flag outranks an OPENAI_API_BASE in a project .env.
+        let aider = routed_with("aider", "proxy", Mode::Unattended, &configured).unwrap();
+        assert!(
+            aider
+                .args
+                .windows(2)
+                .any(|a| a == ["--openai-api-base", "http://localhost:4000/v1"])
+        );
+        // Unrouted invocations remove nothing.
+        let plain = routed("aider", "", Mode::Unattended).unwrap();
+        assert!(plain.removed_from(inherited()).is_empty());
+    }
+
+    #[test]
+    fn display_redacts_environment_values() {
+        let i = Invocation {
+            program: "goose".into(),
+            args: vec!["run".into()],
+            stdin: None,
+            kind: OutputKind::Text,
+            final_file: PathBuf::from("unused"),
+            env: vec![
+                ("OPENAI_".into(), EnvValue::UnsetPrefix),
+                (
+                    "OPENAI_HOST".into(),
+                    EnvValue::Literal("https://h.example".into()),
+                ),
+                ("OPENAI_API_KEY".into(), EnvValue::Var("PROXY_KEY".into())),
+                (
+                    "OPENCODE_CONFIG_CONTENT".into(),
+                    EnvValue::JsonInsert {
+                        path: vec!["model".into()],
+                        value: "\"secret-ish\"".into(),
+                    },
+                ),
+            ],
+            files: vec![],
+            assign: None,
+        };
+        let shown = i.display();
+        assert_eq!(
+            shown,
+            "-u OPENAI_* OPENAI_HOST=<redacted> OPENAI_API_KEY=$PROXY_KEY OPENCODE_CONFIG_CONTENT=$OPENCODE_CONFIG_CONTENT+model=<redacted> goose run"
+        );
+    }
+
+    #[test]
+    fn json_inserts_into_one_variable_accumulate() {
+        let i = Invocation {
+            program: "opencode".into(),
+            args: vec![],
+            stdin: None,
+            kind: OutputKind::OpenCode,
+            final_file: PathBuf::from("unused"),
+            env: vec![
+                (
+                    "MODEL_ROUTER_TEST_UNSET_CONFIG".into(),
+                    EnvValue::JsonInsert {
+                        path: vec!["provider".into(), "p".into()],
+                        value: "{}".into(),
+                    },
+                ),
+                (
+                    "MODEL_ROUTER_TEST_UNSET_CONFIG".into(),
+                    EnvValue::JsonInsert {
+                        path: vec!["model".into()],
+                        value: "\"p/m\"".into(),
+                    },
+                ),
+            ],
+            files: vec![],
+            assign: None,
+        };
+        let env = i.environment().unwrap();
+        assert_eq!(env.len(), 1);
+        let merged: serde_json::Value = serde_json::from_str(&env[0].1).unwrap();
+        assert_eq!(merged["model"], "p/m");
+        assert!(merged["provider"]["p"].is_object());
+    }
+
+    #[test]
+    fn opencode_uses_2x_flags_unless_an_older_version_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let spec = harness::get("opencode").unwrap();
+        let run = |interactive: bool, model: &str, effort: &str, legacy: bool| {
+            let stage = Stage {
+                harness: "opencode".into(),
+                model: model.into(),
+                effort: effort.into(),
+                mode: if interactive {
+                    Mode::Interactive
+                } else {
+                    Mode::Unattended
+                },
+                ..Stage::default()
+            };
+            let mut invocation = Invocation {
+                program: "opencode".into(),
+                args: vec![],
+                stdin: None,
+                kind: OutputKind::Text,
+                final_file: PathBuf::from("unused"),
+                env: vec![],
+                files: vec![],
+                assign: None,
+            };
+            build_spec(
+                spec,
+                &mut invocation,
+                &stage,
+                None,
+                &[],
+                "task",
+                &paths,
+                legacy,
+            )
+            .map(|()| invocation)
+        };
+        let i = run(false, "p/m", "high", false).unwrap();
+        assert_eq!(
+            i.args,
+            ["run", "--format", "json", "--model", "p/m#high", "task"]
+        );
+        assert!(i.env.is_empty());
+        let i = run(true, "p/m", "", false).unwrap();
+        assert_eq!(i.args, ["--prompt", "task"]);
+        assert_eq!(
+            i.env,
+            [(
+                "OPENCODE_CONFIG_CONTENT".to_owned(),
+                EnvValue::JsonInsert {
+                    path: vec!["model".into()],
+                    value: "\"p/m\"".into()
+                }
+            )]
+        );
+        assert!(run(true, "p/m", "high", false).is_err());
+        assert!(run(false, "", "high", false).is_err());
+        let i = run(true, "p/m", "high", true).unwrap();
+        assert_eq!(
+            i.args,
+            [
+                "run",
+                "--interactive",
+                "--model",
+                "p/m",
+                "--variant",
+                "high",
+                "task"
+            ]
+        );
+        assert_eq!(major_version("opencode v2.0.22"), Some(2));
+        assert_eq!(major_version("1.4.3"), Some(1));
+        assert_eq!(major_version("omp/18.6.3"), Some(18));
+        assert_eq!(major_version("unknown"), None);
+    }
+
+    #[test]
+    fn pi_rejects_providers_only_the_router_defines() {
+        let configured = BTreeMap::from([
+            (
+                "litellm".to_string(),
+                Provider {
+                    base_url: "http://localhost:4000/v1".into(),
+                    ..Provider::default()
+                },
+            ),
+            ("openrouter".to_string(), Provider::default()),
+        ]);
+        for harness in ["pi", "omp"] {
+            let error = routed_with(harness, "litellm", Mode::Unattended, &configured)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("own provider registry"), "{error}");
+            // Built-in names and Pi's own providers pass through.
+            routed_with(harness, "openrouter", Mode::Unattended, &configured).unwrap();
+            routed_with(harness, "anthropic", Mode::Unattended, &configured).unwrap();
+        }
+    }
+
+    #[test]
+    fn permission_settings_reach_aider_goose_and_copilot() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let with = |harness: &str, key: &str, value: &str| {
+            let stage = Stage {
+                harness: harness.into(),
+                model: "m".into(),
+                harness_settings: BTreeMap::from([(key.into(), value.into())]),
+                ..Stage::default()
+            };
+            build(&stage, &BTreeMap::new(), &BTreeMap::new(), "t", &paths).unwrap()
+        };
+        assert!(
+            with("aider", "confirmations", "yes-always")
+                .args
+                .contains(&"--yes-always".into())
+        );
+        let goose = with("goose", "mode", "smart_approve");
+        assert_eq!(
+            env(&goose, "GOOSE_MODE"),
+            Some(&EnvValue::Literal("smart_approve".into()))
+        );
+        assert!(!goose.args.iter().any(|a| a.contains("GOOSE")));
+        assert!(
+            with("copilot", "tool_permissions", "allow-all-tools")
+                .args
+                .contains(&"--allow-all-tools".into())
+        );
+        let claude = with("claude", "permission_mode", "manual");
+        assert!(
+            claude
+                .args
+                .windows(2)
+                .any(|a| a == ["--permission-mode", "manual"])
+        );
+        // Nothing is emitted for the harness default.
+        assert!(
+            !with("aider", "confirmations", "")
+                .args
+                .contains(&"--yes-always".into())
+        );
+    }
+
+    #[test]
+    fn build_is_pure_and_aider_commands_are_written_at_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let stage = Stage {
+            harness: "aider".into(),
+            model: "m".into(),
+            mode: Mode::Interactive,
+            ..Stage::default()
+        };
+        let i = build(&stage, &BTreeMap::new(), &BTreeMap::new(), "t", &paths).unwrap();
+        let commands = dir.path().join("aider.commands");
+        assert!(!commands.exists(), "build must not write files");
+        assert_eq!(i.files.len(), 1);
+        i.write_files().unwrap();
+        assert!(fs::read_to_string(&commands).unwrap().starts_with("/code "));
+    }
+
+    #[test]
+    fn untrusted_custom_adapters_cannot_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let custom = BTreeMap::from([(
+            "mine".to_string(),
+            CustomAdapter {
+                command: crate::trust::BLOCKED_COMMAND.into(),
+                ..CustomAdapter::default()
+            },
+        )]);
+        let stage = Stage {
+            harness: "mine".into(),
+            ..Stage::default()
+        };
+        let i = build(&stage, &custom, &BTreeMap::new(), "t", &paths).unwrap();
+        assert_eq!(i.program, crate::trust::BLOCKED_COMMAND);
+        assert!(executable(&i.program).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_accepts_agent_only_when_it_is_cursor() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let other = script("other-agent", "#!/bin/sh\necho 'Usage: agent [deploy]'\n");
+        let cursor = script(
+            "cursor-help",
+            "#!/bin/sh\necho 'Usage: agent [options]'\necho 'Start the Cursor Agent'\n",
+        );
+        assert!(!is_cursor_agent(&other));
+        assert!(is_cursor_agent(&cursor));
+        let linked = dir.path().join("cursor-agent/versions/1/cursor-agent");
+        fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        fs::write(&linked, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&linked, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = dir.path().join("agent");
+        std::os::unix::fs::symlink(&linked, &link).unwrap();
+        assert!(is_cursor_agent(&link), "Cursor's own link needs no probe");
     }
 }

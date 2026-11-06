@@ -54,6 +54,14 @@ fn all_workflow_presets_execute_in_order_with_optional_reviews_disabled() {
             if stage.role == Role::Test {
                 stage.extra_args = vec!["--test-status".into(), "passed".into()];
             }
+            for candidate in stage.fan_out.iter_mut().flat_map(|f| &mut f.candidates) {
+                candidate.harness = "mock".into();
+                candidate.provider = stage.id.clone();
+                candidate.model = "test-model".into();
+            }
+            if stage.id == "judge" {
+                stage.extra_args = vec!["--select".into(), "c1".into()];
+            }
             if stage.enabled {
                 if let Some(previous) = previous {
                     stage
@@ -63,7 +71,20 @@ fn all_workflow_presets_execute_in_order_with_optional_reviews_disabled() {
                 previous = Some(stage.id.clone());
             }
         }
-        let (dir, _, mut run) = fixture(stages);
+        // Fan-out candidates work in Git worktrees.
+        let fans = stages.iter().any(|s| s.fan_out.is_some());
+        let (dir, mut run) = if fans {
+            let dir = common::tempdir();
+            if common::repository(dir.path()).is_none() {
+                continue;
+            }
+            let workflow = common::workflow(stages);
+            let run = common::create(dir.path(), &common::settings(&workflow), &workflow);
+            (dir, run)
+        } else {
+            let (dir, _, run) = fixture(stages);
+            (dir, run)
+        };
         assert_eq!(
             drive(&mut run),
             Action::Complete,
@@ -80,6 +101,18 @@ fn all_workflow_presets_execute_in_order_with_optional_reviews_disabled() {
                     Status::Skipped
                 }
             );
+            if let Some(fan) = &state.fan_out {
+                // Each candidate ran once, in its own worktree, with the stage prompt.
+                assert_eq!(count(dir.path(), &stage.id), 0);
+                for candidate in &fan.candidates {
+                    let prompt =
+                        fs::read_to_string(candidate.attempts[0].directory.join("prompt.md"))
+                            .unwrap();
+                    assert!(prompt.contains(&run.task) && prompt.contains(&stage.instructions));
+                }
+                assert_eq!(fan.selection.as_ref().unwrap().candidate, "c1");
+                continue;
+            }
             assert_eq!(count(dir.path(), &stage.id), u32::from(stage.enabled));
             if stage.enabled {
                 let prompt = fs::read_to_string(
@@ -305,7 +338,12 @@ fn adapter_contracts_keep_prompt_and_models_literal() {
                 &paths,
             )
             .unwrap();
-            assert!(invocation.args.iter().any(|a| a == &stage.model));
+            // Interactive OpenCode 2.x takes its model from inline config.
+            let in_config = invocation.env.iter().any(|(_, value)| {
+                matches!(value, adapters::EnvValue::JsonInsert { value, .. }
+                    if serde_json::from_str::<String>(value).is_ok_and(|m| m == stage.model))
+            });
+            assert!(invocation.args.iter().any(|a| a == &stage.model) || in_config);
             assert!(
                 !invocation
                     .args
@@ -345,7 +383,7 @@ fn structured_native_errors_override_success_exit_and_tool_echoes_are_ignored() 
 #[test]
 fn capture_drains_both_streams_without_deadlock_and_handles_early_closed_stdin() {
     let dir = tempfile::tempdir().unwrap();
-    let inv = adapters::Invocation { program: "python3".into(), args: vec!["-c".into(), "import sys; sys.stdin.close(); sys.stdout.write('x'*200000); sys.stderr.write('y'*200000)".into()], stdin: Some("z".repeat(100000)), kind: OutputKind::Text, final_file: dir.path().join("unused"), env: vec![] };
+    let inv = adapters::Invocation { program: "python3".into(), args: vec!["-c".into(), "import sys; sys.stdin.close(); sys.stdout.write('x'*200000); sys.stderr.write('y'*200000)".into()], stdin: Some("z".repeat(100000)), kind: OutputKind::Text, final_file: dir.path().join("unused"), env: vec![], files: vec![], assign: None };
     let result = process::capture(
         &inv,
         dir.path(),
@@ -376,6 +414,8 @@ fn cancelling_lets_a_harness_save_before_it_is_killed() {
         kind: OutputKind::Text,
         final_file: dir.path().join("unused"),
         env: vec![],
+        files: vec![],
+        assign: None,
     };
     // Cancel once the script's trap is installed.
     let cancel = AtomicBool::new(false);
@@ -541,11 +581,22 @@ fn capture_applies_environment_variables() {
     let dir = tempfile::tempdir().unwrap();
     let inv = adapters::Invocation {
         program: "python3".into(),
-        args: vec!["-c".into(), "import os; print(os.environ['ROUTED'])".into()],
+        args: vec![
+            "-c".into(),
+            "import os; print(os.environ['ROUTED'], open('aider.commands').read().strip(), 'HOME' in os.environ)".into(),
+        ],
         stdin: None,
         kind: OutputKind::Text,
         final_file: dir.path().join("unused"),
-        env: vec![("ROUTED".into(), adapters::EnvValue::Literal("yes".into()))],
+        env: vec![
+            ("ROUTED".into(), adapters::EnvValue::Literal("yes".into())),
+            // Removes inherited HOME* variables, but never one the invocation sets.
+            ("HOME".into(), adapters::EnvValue::UnsetPrefix),
+            ("ROUTED".into(), adapters::EnvValue::UnsetPrefix),
+        ],
+        // Written at launch, not when the invocation is built.
+        files: vec![(dir.path().join("aider.commands"), "/code go\n".into())],
+        assign: None,
     };
     let result = process::capture(
         &inv,
@@ -559,6 +610,187 @@ fn capture_applies_environment_variables() {
     assert!(result.success());
     assert_eq!(
         fs::read_to_string(dir.path().join("stdout.log")).unwrap(),
-        "yes\n"
+        "yes /code go False\n"
     );
+}
+
+#[cfg(target_os = "linux")]
+fn running(pid: i32) -> bool {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    !stat.is_empty() && stat.split_whitespace().nth(2) != Some("Z")
+}
+#[cfg(all(unix, not(target_os = "linux")))]
+fn running(pid: i32) -> bool {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let stat = String::from_utf8_lossy(&output.stdout);
+    let stat = stat.trim();
+    !stat.is_empty() && !stat.starts_with('Z')
+}
+
+#[test]
+fn background_children_end_with_a_harness_that_exits_normally() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("server.pid");
+    let inv = adapters::Invocation {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            "sleep 30 & echo $! > server.pid; echo done".into(),
+        ],
+        stdin: None,
+        kind: OutputKind::Text,
+        final_file: dir.path().join("unused"),
+        env: vec![],
+        files: vec![],
+        assign: None,
+    };
+    let mut group = None;
+    let started = Instant::now();
+    let result = process::capture_with(
+        &inv,
+        dir.path(),
+        dir.path(),
+        Duration::from_secs(10),
+        &AtomicBool::new(false),
+        None,
+        |pgid| group = Some(pgid),
+        |_, _| {},
+    )
+    .unwrap();
+    assert!(result.success());
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let pid: i32 = fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert!(!running(pid), "background child outlived its harness");
+    assert!(!process::group_alive(group.unwrap()));
+}
+
+#[test]
+fn drive_stops_a_harness_group_left_by_a_dead_router() {
+    let (dir, _, mut run) = fixture(vec![stage("implementation", Role::Implementation)]);
+    assert_eq!(drive(&mut run), Action::Complete);
+    // A crash mid-stage leaves the attempt running with its group recorded.
+    let mut leader = {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & echo $! > orphan.pid"])
+            .current_dir(dir.path())
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    };
+    let pgid = leader.id();
+    leader.wait().unwrap();
+    let pid: i32 = fs::read_to_string(dir.path().join("orphan.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(process::group_alive(pgid));
+    run.cursor = 0;
+    run.status = Status::Running;
+    run.stages[0].status = Status::Running;
+    let attempt = run.stages[0].attempts.last_mut().unwrap();
+    attempt.status = Status::Running;
+    attempt.process_group = Some(pgid);
+    run.persist().unwrap();
+    assert_eq!(drive(&mut run), Action::Stopped);
+    assert!(run.error.as_deref().unwrap().contains("interrupted"));
+    assert!(run.stages[0].attempts[0].process_group.is_none());
+    thread::sleep(Duration::from_millis(100));
+    assert!(!running(pid), "orphaned harness child still running");
+}
+
+#[test]
+fn repair_request_reaches_only_the_repair_and_its_review() {
+    let mut review = stage("review", Role::Review);
+    review.extra_args = vec!["--review-fail-until".into(), "1".into()];
+    let (dir, _, mut run) = fixture(vec![
+        stage("implementation", Role::Implementation),
+        review,
+        stage("docs", Role::Custom),
+    ]);
+    assert_eq!(drive(&mut run), Action::Complete);
+    let prompt = |role: &str| {
+        fs::read_to_string(dir.path().join(format!(".model-router/mock/{role}.prompt"))).unwrap()
+    };
+    assert!(prompt("implementation").contains("REPAIR REQUEST"));
+    assert!(prompt("review").contains("REPAIR REQUEST"));
+    assert!(
+        !prompt("docs").contains("REPAIR REQUEST"),
+        "a stage after the passing review saw a stale repair request"
+    );
+    assert!(run.repair_feedback.is_none() && run.repair_review.is_none());
+}
+
+#[test]
+fn errors_outside_an_attempt_leave_finished_attempts_alone() {
+    // A launch that fails before its attempt exists.
+    let mut implement = stage("implementation", Role::Implementation);
+    implement.model = "fail".into();
+    let (_dir, _, mut run) = fixture(vec![implement]);
+    assert_eq!(drive(&mut run), Action::Stopped);
+    let first = run.stages[0].attempts[0].clone();
+    run.retry(false, Some("test-model".into())).unwrap();
+    let taken = first.handoff_file.with_file_name("implementation-002.json");
+    fs::write(&taken, "{}").unwrap();
+    assert_eq!(drive(&mut run), Action::Stopped);
+    assert!(run.error.as_deref().unwrap().contains("already exists"));
+    assert_eq!(run.stages[0].attempts.len(), 1);
+    let kept = &run.stages[0].attempts[0];
+    assert_eq!((kept.status, &kept.error), (first.status, &first.error));
+
+    // A cancel after a repair moved the cursor back to a finished stage.
+    let mut review = stage("review", Role::Review);
+    review.extra_args = vec!["--review-fail-until".into(), "1".into()];
+    let (_dir, _, mut run) = fixture(vec![stage("implementation", Role::Implementation), review]);
+    let cancel = AtomicBool::new(false);
+    let action = engine::drive(&mut run, &cancel, |event| {
+        if let engine::Event::State(state) = event {
+            if state.repair_passes == 1 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
+    })
+    .unwrap();
+    assert_eq!(
+        (action, run.status, run.cursor),
+        (Action::Stopped, Status::Cancelled, 0)
+    );
+    assert_eq!(run.stages[0].attempts.len(), 1);
+    assert_eq!(run.stages[0].attempts[0].status, Status::Complete);
+    assert!(run.stages[0].attempts[0].error.is_none());
+}
+
+#[test]
+fn repair_limit_can_be_extended_explicitly() {
+    let mut review = stage("review", Role::Review);
+    review.extra_args = vec!["--review-fail-until".into(), "3".into()];
+    let (dir, _, mut run) = fixture(vec![stage("implementation", Role::Implementation), review]);
+    assert!(run.allow_repair().is_err(), "nothing is blocked yet");
+    assert_eq!(drive(&mut run), Action::Stopped);
+    assert_eq!((run.status, run.repair_passes), (Status::Blocked, 2));
+    let error = run.error.clone().unwrap();
+    assert!(
+        error.contains(&format!("resume {} --allow-repair", run.id)),
+        "{error}"
+    );
+    let mut resumed = engine::load(dir.path(), &run.id).unwrap();
+    resumed.allow_repair().unwrap();
+    assert_eq!((resumed.cursor, resumed.status), (0, Status::Pending));
+    assert_eq!(
+        resumed.stages[1].attempts.last().unwrap().status,
+        Status::Complete
+    );
+    assert_eq!(drive(&mut resumed), Action::Complete);
+    assert_eq!(resumed.repair_passes, 3);
+    assert_eq!(count(dir.path(), "implementation"), 4);
+    assert!(resumed.allow_repair().is_err());
 }

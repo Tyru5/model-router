@@ -2,112 +2,37 @@
 use crate::config::Stage;
 use anyhow::{Context, Result, ensure};
 
-pub struct Setting {
-    pub key: &'static str,
-    pub label: &'static str,
-    pub choices: &'static [&'static str],
-    pub help: &'static str,
-    flag: &'static str,
-    config_key: Option<&'static str>,
-    conflicts: &'static [&'static str],
-}
+use crate::harness::Emit;
+pub use crate::harness::Setting;
 
-const CODEX: &[Setting] = &[
-    Setting {
-        key: "sandbox",
-        label: "Sandbox",
-        choices: &["read-only", "workspace-write", "danger-full-access"],
-        help: "read-only: inspect files. workspace-write: allow changes in the workspace. danger-full-access: run without sandbox restrictions.",
-        flag: "--sandbox",
-        config_key: Some("sandbox_mode"),
-        conflicts: &[
-            "-s",
-            "--full-auto",
-            "--approve-for-me",
-            "--dangerously-bypass-approvals-and-sandbox",
-        ],
-    },
-    Setting {
-        key: "approval_policy",
-        label: "Approval policy",
-        choices: &["on-request", "never"],
-        help: "on-request: the harness can request approval. never: no approval prompts; commands blocked by the sandbox stay blocked. Unattended runs cannot answer prompts.",
-        flag: "--config",
-        config_key: Some("approval_policy"),
-        conflicts: &[
-            "-a",
-            "--ask-for-approval",
-            "--full-auto",
-            "--approve-for-me",
-            "--dangerously-bypass-approvals-and-sandbox",
-        ],
-    },
-];
-const CLAUDE: &[Setting] = &[Setting {
-    key: "permission_mode",
-    label: "Permission mode",
-    choices: &[
-        "manual",
-        "acceptEdits",
-        "plan",
-        "dontAsk",
-        "auto",
-        "bypassPermissions",
-    ],
-    help: "manual: ask for permissions. acceptEdits: approve file edits. plan: planning only. dontAsk: deny unapproved tools. auto: native automatic review. bypassPermissions: skip checks. Modes depend on your Claude version and account.",
-    flag: "--permission-mode",
-    config_key: None,
-    conflicts: &["--dangerously-skip-permissions"],
-}];
-const CURSOR: &[Setting] = &[Setting {
-    key: "sandbox",
-    label: "Sandbox",
-    choices: &["enabled", "disabled"],
-    help: "Explicitly enable or disable Cursor's sandbox for this stage. Additional tool permissions can be supplied in Extra arguments.",
-    flag: "--sandbox",
-    config_key: None,
-    conflicts: &[],
-}];
-const GEMINI: &[Setting] = &[Setting {
-    key: "approval_mode",
-    label: "Approval mode",
-    choices: &["default", "auto_edit", "plan", "yolo"],
-    help: "default: prompt for tool approval. auto_edit: approve edits. plan: planning mode. yolo: approve all actions. Unattended runs cannot answer prompts.",
-    flag: "--approval-mode",
-    config_key: None,
-    conflicts: &["--yolo", "-y"],
-}];
-
-const OMP: &[Setting] = &[Setting {
-    key: "approval_mode",
-    label: "Approval mode",
-    choices: &["always-ask", "write", "yolo"],
-    help: "always-ask: prompt before tools run. write: approve edits automatically. yolo: approve all tool calls. Unattended runs cannot answer prompts.",
-    flag: "--approval-mode",
-    config_key: None,
-    conflicts: &["--auto-approve"],
-}];
-
+/// The harness's native settings, from its spec; none for custom adapters.
 pub fn settings(harness: &str) -> &'static [Setting] {
-    match harness {
-        "codex" => CODEX,
-        "omp" => OMP,
-        "claude" => CLAUDE,
-        "cursor" => CURSOR,
-        "gemini" => GEMINI,
-        _ => &[],
-    }
+    crate::harness::get(harness).map_or(&[], |spec| spec.settings)
 }
 
+/// Whether a stage can set a provider: not for harnesses that only use their
+/// own account. Custom adapters can.
 pub fn supports_provider(harness: &str) -> bool {
-    !matches!(harness, "claude" | "cursor" | "gemini" | "amp" | "copilot")
+    crate::harness::get(harness).is_none_or(|spec| spec.supports_provider())
 }
 
+/// `(key, value)` settings of `stage` that loosen the harness's own checks.
+pub fn escalations(stage: &Stage) -> Vec<(&str, &str)> {
+    settings(&stage.harness)
+        .iter()
+        .filter_map(|setting| {
+            let value = stage.harness_settings.get(setting.key)?;
+            setting
+                .escalating
+                .contains(&value.as_str())
+                .then_some((setting.key, value.as_str()))
+        })
+        .collect()
+}
+
+/// Whether the harness has a portable effort option. Custom adapters do.
 pub fn supports_effort(harness: &str) -> bool {
-    !matches!(
-        harness,
-        "cursor" | "gemini" | "aider" | "goose" | "amp" | "copilot"
-    )
+    crate::harness::get(harness).is_none_or(|spec| spec.supports_effort())
 }
 
 fn matches_flag(argument: &str, flag: &str) -> bool {
@@ -121,7 +46,7 @@ impl Setting {
     fn conflicts_with(&self, arguments: &[String]) -> bool {
         arguments.iter().enumerate().any(|(index, argument)| {
             // --config is repeatable; only the matching key conflicts.
-            (self.flag != "--config" && matches_flag(argument, self.flag))
+            (self.flag != "--config" && self.emit != Emit::Env && matches_flag(argument, self.flag))
                 || self
                     .conflicts
                     .iter()
@@ -177,15 +102,33 @@ pub fn arguments(stage: &Stage) -> Result<Vec<String>> {
             .get(setting.key)
             .filter(|v| !v.is_empty())
         {
-            args.push(setting.flag.into());
-            args.push(if setting.flag == "--config" {
-                format!("{}={}", setting.key, serde_json::to_string(value)?)
-            } else {
-                value.clone()
-            });
+            match setting.emit {
+                Emit::Env => {}
+                Emit::Switch => args.push(setting.flag.into()),
+                Emit::Value => {
+                    args.push(setting.flag.into());
+                    args.push(if setting.flag == "--config" {
+                        format!("{}={}", setting.key, serde_json::to_string(value)?)
+                    } else {
+                        value.clone()
+                    });
+                }
+            }
         }
     }
     Ok(args)
+}
+
+/// Environment variables the stage's settings set, e.g. Goose's GOOSE_MODE.
+pub fn environment(stage: &Stage) -> Vec<(String, String)> {
+    settings(&stage.harness)
+        .iter()
+        .filter(|setting| setting.emit == Emit::Env)
+        .filter_map(|setting| {
+            let value = stage.harness_settings.get(setting.key)?;
+            (!value.is_empty()).then(|| (setting.flag.to_owned(), value.clone()))
+        })
+        .collect()
 }
 
 pub fn summary(stage: &Stage) -> String {

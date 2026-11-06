@@ -3,8 +3,12 @@ use anyhow::{Context, Result, ensure};
 use std::{
     fs::OpenOptions,
     io::Read,
-    path::Path,
-    sync::atomic::{AtomicBool, Ordering},
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -58,11 +62,15 @@ fn decode(bytes: Vec<u8>) -> Result<String> {
 
 #[derive(Debug, PartialEq)]
 enum Remote {
+    /// An issue or pull request: its title and body.
     Issue {
+        /// GitHub host for `gh api --hostname`: github.com or an Enterprise host.
+        host: String,
         endpoint: String,
         source: String,
     },
     GitHubFile {
+        host: String,
         repository: String,
         location: String,
         revision: String,
@@ -71,7 +79,38 @@ enum Remote {
     Text(reqwest::Url),
 }
 
+/// GitHub Enterprise hosts `gh` is logged in to (its hosts.yml, and GH_HOST).
+fn enterprise_hosts() -> Vec<String> {
+    let dir = std::env::var_os("GH_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(|d| PathBuf::from(d).join("gh")))
+        .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".config/gh")));
+    let mut hosts: Vec<String> = dir
+        .and_then(|dir| std::fs::read_to_string(dir.join("hosts.yml")).ok())
+        .map(|text| hosts_from_yaml(&text))
+        .unwrap_or_default();
+    if let Ok(host) = std::env::var("GH_HOST") {
+        hosts.push(host.trim().to_ascii_lowercase());
+    }
+    hosts.retain(|h| !h.is_empty() && h != "github.com");
+    hosts
+}
+
+/// Top-level keys of gh's hosts.yml, which are host names.
+fn hosts_from_yaml(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|line| !line.starts_with([' ', '\t', '#', '-']))
+        .filter_map(|line| line.trim_end().strip_suffix(':'))
+        .map(|host| host.trim_matches(['"', '\'']).to_ascii_lowercase())
+        .filter(|host| !host.is_empty() && !host.contains(char::is_whitespace))
+        .collect()
+}
+
 fn remote(input: &str) -> Result<Remote> {
+    remote_with(input, &enterprise_hosts())
+}
+
+fn remote_with(input: &str, enterprise: &[String]) -> Result<Remote> {
     let mut url =
         reqwest::Url::parse(input.trim()).context("Enter a complete http:// or https:// URL")?;
     ensure!(
@@ -84,18 +123,22 @@ fn remote(input: &str) -> Result<Remote> {
     );
     url.set_fragment(None);
     let parts: Vec<_> = url.path_segments().context("URL has no path")?.collect();
-    let host = url.host_str().unwrap_or("");
-    if matches!(
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    let host = host.as_str();
+    let public = matches!(
         host,
         "github.com" | "www.github.com" | "raw.githubusercontent.com"
-    ) {
+    );
+    let enterprise = !public && url.scheme() == "https" && enterprise.iter().any(|h| h == host);
+    if public || enterprise {
+        let api_host = if public { "github.com" } else { host }.to_owned();
         ensure!(
             url.port_or_known_default() == Some(if url.scheme() == "https" { 443 } else { 80 }),
             "Use a standard GitHub URL"
         );
         ensure!(
             parts.len() >= 4 && parts.iter().all(|part| !part.is_empty()),
-            "Paste a GitHub issue or file URL"
+            "Paste a GitHub issue, pull request, or file URL"
         );
         let owner = parts[0];
         let repo = parts[1];
@@ -107,14 +150,28 @@ fn remote(input: &str) -> Result<Remote> {
             valid_name(owner) && valid_name(repo),
             "Invalid GitHub repository URL"
         );
+        let web = if public { "github.com" } else { host };
         if host != "raw.githubusercontent.com" && parts[2] == "issues" {
             ensure!(
                 parts.len() == 4 && parts[3].parse::<u64>().is_ok_and(|n| n > 0),
                 "Paste an issue URL ending in /issues/NUMBER"
             );
             return Ok(Remote::Issue {
+                host: api_host,
                 endpoint: format!("repos/{owner}/{repo}/issues/{}", parts[3]),
-                source: format!("https://github.com/{owner}/{repo}/issues/{}", parts[3]),
+                source: format!("https://{web}/{owner}/{repo}/issues/{}", parts[3]),
+            });
+        }
+        // Pull requests, including their /files or /commits tabs.
+        if host != "raw.githubusercontent.com" && parts[2] == "pull" {
+            ensure!(
+                parts[3].parse::<u64>().is_ok_and(|n| n > 0),
+                "Paste a pull request URL with /pull/NUMBER"
+            );
+            return Ok(Remote::Issue {
+                host: api_host,
+                endpoint: format!("repos/{owner}/{repo}/pulls/{}", parts[3]),
+                source: format!("https://{web}/{owner}/{repo}/pull/{}", parts[3]),
             });
         }
         let mut tail = if host == "raw.githubusercontent.com" {
@@ -139,6 +196,7 @@ fn remote(input: &str) -> Result<Remote> {
             .decode_utf8()
             .context("Invalid GitHub revision")?;
         return Ok(Remote::GitHubFile {
+            host: api_host,
             repository: format!("{owner}/{repo}"),
             location: percent_encoding::percent_decode_str(&tail.join("/"))
                 .decode_utf8()
@@ -155,26 +213,37 @@ fn remote(input: &str) -> Result<Remote> {
 pub fn read_url(input: &str, cancel: &AtomicBool) -> Result<String> {
     ensure!(!cancel.load(Ordering::Relaxed), "Import cancelled");
     match remote(input)? {
-        Remote::Issue { endpoint, source } => {
-            let json = github(&endpoint, "{title,body}", cancel)?;
+        Remote::Issue {
+            host,
+            endpoint,
+            source,
+        } => {
+            let json = github(&host, &endpoint, "{title,body}", cancel)?;
             let value: serde_json::Value =
                 serde_json::from_slice(&json).context("Read GitHub issue response")?;
             let title = value["title"]
                 .as_str()
-                .context("GitHub response is missing an issue title")?;
+                .context("GitHub response is missing a title")?;
             let body = value["body"].as_str().unwrap_or("");
             decode(format!("# {title}\n\nSource: {source}\n\n{body}").into_bytes())
         }
         Remote::GitHubFile {
+            host,
             repository,
             location,
             revision,
             kind,
         } => {
             use base64::Engine;
-            let endpoint =
-                file_endpoint(&repository, &location, &revision, kind.as_deref(), cancel)?;
-            let json = github(&endpoint, "{type,size,encoding,content}", cancel)?;
+            let endpoint = file_endpoint(
+                &host,
+                &repository,
+                &location,
+                &revision,
+                kind.as_deref(),
+                cancel,
+            )?;
+            let json = github(&host, &endpoint, "{type,size,encoding,content}", cancel)?;
             let value: serde_json::Value =
                 serde_json::from_slice(&json).context("Read GitHub file response")?;
             ensure!(
@@ -202,10 +271,24 @@ pub fn read_url(input: &str, cancel: &AtomicBool) -> Result<String> {
             decode(bytes)
         }
         Remote::Text(url) => {
+            // Private addresses are reachable only when the URL itself names
+            // one; redirects and DNS answers cannot lead there otherwise.
+            let allow_private = targets_private(&url);
             let client = reqwest::blocking::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
                 .timeout(Duration::from_secs(20))
-                .redirect(reqwest::redirect::Policy::limited(5))
+                .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                    let previous = attempt.previous().last().cloned();
+                    if attempt.previous().len() > 5 {
+                        return attempt.error("Too many redirects");
+                    }
+                    match previous.map(|from| redirect_allowed(&from, attempt.url(), allow_private))
+                    {
+                        Some(Err(error)) => attempt.error(error),
+                        _ => attempt.follow(),
+                    }
+                }))
+                .dns_resolver(Arc::new(PublicResolver { allow_private }))
                 .user_agent(concat!("model-router/", env!("CARGO_PKG_VERSION")))
                 .build()?;
             let response = client
@@ -247,6 +330,113 @@ pub fn read_url(input: &str, cancel: &AtomicBool) -> Result<String> {
     }
 }
 
+/// Loopback, link-local, private (RFC 1918, IPv6 ULA), and unspecified
+/// addresses: cloud metadata and local services live there.
+fn private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_loopback() || ip.is_link_local() || ip.is_private() || ip.is_unspecified()
+        }
+        IpAddr::V6(ip) => {
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return private(IpAddr::V4(v4));
+            }
+            let first = ip.segments()[0];
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || first & 0xffc0 == 0xfe80
+                || first & 0xfe00 == 0xfc00
+        }
+    }
+}
+
+/// The URL's host when it is an IP address literal.
+fn host_ip(url: &reqwest::Url) -> Option<IpAddr> {
+    url.host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .ok()
+}
+
+/// Whether the URL's host is, or resolves to, a private address.
+fn targets_private(url: &reqwest::Url) -> bool {
+    let Some(name) = url.host_str() else {
+        return false;
+    };
+    match host_ip(url) {
+        Some(ip) => private(ip),
+        None => {
+            name.eq_ignore_ascii_case("localhost")
+                || (name, url.port_or_known_default().unwrap_or(443))
+                    .to_socket_addrs()
+                    .is_ok_and(|mut addrs| addrs.any(|a| private(a.ip())))
+        }
+    }
+}
+
+/// A redirect may not downgrade HTTPS to HTTP, leave HTTP(S), or reach a
+/// private address literal unless the original URL was private.
+fn redirect_allowed(
+    from: &reqwest::Url,
+    to: &reqwest::Url,
+    allow_private: bool,
+) -> std::result::Result<(), String> {
+    if !matches!(to.scheme(), "http" | "https") {
+        return Err(format!("Refusing redirect to {} URL", to.scheme()));
+    }
+    if from.scheme() == "https" && to.scheme() == "http" {
+        return Err("Refusing redirect from HTTPS to HTTP".into());
+    }
+    let literal = match (host_ip(to), to.host_str()) {
+        (Some(ip), _) => private(ip),
+        (None, Some(name)) => name.eq_ignore_ascii_case("localhost"),
+        (None, None) => true,
+    };
+    if literal && !allow_private {
+        return Err(format!(
+            "Refusing redirect to private address {}",
+            to.host_str().unwrap_or("")
+        ));
+    }
+    Ok(())
+}
+
+/// Public addresses of `addrs`, or all of them when private ones are allowed.
+fn public_addrs(
+    name: &str,
+    addrs: Vec<SocketAddr>,
+    allow_private: bool,
+) -> std::result::Result<Vec<SocketAddr>, String> {
+    let kept: Vec<SocketAddr> = addrs
+        .into_iter()
+        .filter(|a| allow_private || !private(a.ip()))
+        .collect();
+    if kept.is_empty() {
+        return Err(format!(
+            "Refusing to connect to {name}: it has no public address"
+        ));
+    }
+    Ok(kept)
+}
+
+/// Resolves with the system resolver and drops private addresses, so a
+/// public name (or a redirect to one) cannot reach internal services.
+struct PublicResolver {
+    allow_private: bool,
+}
+impl reqwest::dns::Resolve for PublicResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let allow_private = self.allow_private;
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> = (host.as_str(), 0).to_socket_addrs()?.collect();
+            let kept = public_addrs(&host, addrs, allow_private)?;
+            Ok(Box::new(kept.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 fn contents_endpoint(repository: &str, revision: &str, path: &str) -> Result<String> {
     let mut url = reqwest::Url::parse(&format!(
         "https://api.github.com/repos/{repository}/contents/"
@@ -264,6 +454,7 @@ fn contents_endpoint(repository: &str, revision: &str, path: &str) -> Result<Str
 }
 
 fn file_endpoint(
+    host: &str,
     repository: &str,
     location: &str,
     revision: &str,
@@ -281,6 +472,7 @@ fn file_endpoint(
             let prefix =
                 percent_encoding::utf8_percent_encode(revision, percent_encoding::NON_ALPHANUMERIC);
             let json = github(
+                host,
                 &format!("repos/{repository}/git/matching-refs/{candidate}/{prefix}"),
                 "map(.ref)",
                 cancel,
@@ -313,7 +505,7 @@ fn matching_revision<'a>(location: &str, refs: &'a [String], kind: &str) -> Opti
         .max_by_key(|reference| reference.len())
 }
 
-fn github(endpoint: &str, query: &str, cancel: &AtomicBool) -> Result<Vec<u8>> {
+fn github(host: &str, endpoint: &str, query: &str, cancel: &AtomicBool) -> Result<Vec<u8>> {
     use crate::{
         adapters::{Invocation, OutputKind},
         process,
@@ -324,7 +516,7 @@ fn github(endpoint: &str, query: &str, cancel: &AtomicBool) -> Result<Vec<u8>> {
         args: vec![
             "api".into(),
             "--hostname".into(),
-            "github.com".into(),
+            host.into(),
             "--method".into(),
             "GET".into(),
             endpoint.into(),
@@ -335,6 +527,8 @@ fn github(endpoint: &str, query: &str, cancel: &AtomicBool) -> Result<Vec<u8>> {
         kind: OutputKind::Text,
         final_file: temp.path().join("unused"),
         env: vec![],
+        files: vec![],
+        assign: None,
     };
     let mut received = 0;
     let mut oversized = false;
@@ -375,10 +569,25 @@ mod tests {
         assert_eq!(
             remote("https://github.com/acme/project/issues/7#issuecomment-1").unwrap(),
             Remote::Issue {
+                host: "github.com".into(),
                 endpoint: "repos/acme/project/issues/7".into(),
                 source: "https://github.com/acme/project/issues/7".into(),
             }
         );
+        for url in [
+            "https://github.com/acme/project/pull/12",
+            "https://github.com/acme/project/pull/12/files",
+        ] {
+            assert_eq!(
+                remote(url).unwrap(),
+                Remote::Issue {
+                    host: "github.com".into(),
+                    endpoint: "repos/acme/project/pulls/12".into(),
+                    source: "https://github.com/acme/project/pull/12".into(),
+                }
+            );
+        }
+        assert!(remote("https://github.com/acme/project/pull/new").is_err());
         for url in [
             "https://github.com/acme/project/blob/feature%2Fnew/docs/spec%20one.md#L2",
             "https://raw.githubusercontent.com/acme/project/feature%2Fnew/docs/spec%20one.md",
@@ -387,6 +596,7 @@ mod tests {
             assert_eq!(
                 remote(url).unwrap(),
                 Remote::GitHubFile {
+                    host: "github.com".into(),
                     repository: "acme/project".into(),
                     location: "feature/new/docs/spec one.md".into(),
                     revision: "feature/new".into(),
@@ -423,6 +633,137 @@ mod tests {
         ] {
             assert!(remote(url).is_err(), "{url}");
         }
+    }
+
+    #[test]
+    fn enterprise_hosts_use_gh_with_their_hostname() {
+        let hosts = hosts_from_yaml(
+            "github.com:\n    user: me\nghe.corp.example:\n    git_protocol: https\n    users:\n        me:\n\"Git.Other.Example\":\n",
+        );
+        assert_eq!(
+            hosts,
+            ["github.com", "ghe.corp.example", "git.other.example"]
+        );
+        let enterprise = ["ghe.corp.example".to_owned()];
+        assert_eq!(
+            remote_with("https://ghe.corp.example/team/app/issues/3", &enterprise).unwrap(),
+            Remote::Issue {
+                host: "ghe.corp.example".into(),
+                endpoint: "repos/team/app/issues/3".into(),
+                source: "https://ghe.corp.example/team/app/issues/3".into(),
+            }
+        );
+        assert!(matches!(
+            remote_with("https://ghe.corp.example/team/app/blob/main/spec.md", &enterprise)
+                .unwrap(),
+            Remote::GitHubFile { host, .. } if host == "ghe.corp.example"
+        ));
+        // Unknown hosts and plain HTTP stay direct text downloads.
+        for url in [
+            "https://other.example/team/app/issues/3",
+            "http://ghe.corp.example/team/app/issues/3",
+        ] {
+            assert!(
+                matches!(remote_with(url, &enterprise).unwrap(), Remote::Text(_)),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirects_and_dns_cannot_reach_private_addresses() {
+        let url = |text: &str| reqwest::Url::parse(text).unwrap();
+        for ip in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "::1",
+            "fe80::1",
+            "fd00::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(private(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["8.8.8.8", "172.32.0.1", "2606:4700::1"] {
+            assert!(!private(ip.parse().unwrap()), "{ip}");
+        }
+        let public = url("https://docs.example/spec.md");
+        assert!(redirect_allowed(&public, &url("https://cdn.example/spec.md"), false).is_ok());
+        assert!(redirect_allowed(&public, &url("http://cdn.example/spec.md"), false).is_err());
+        assert!(redirect_allowed(&public, &url("ftp://cdn.example/spec.md"), false).is_err());
+        for target in [
+            "https://169.254.169.254/latest/meta-data",
+            "https://127.0.0.1:8080/",
+            "https://[::1]/",
+            "https://localhost/",
+        ] {
+            assert!(
+                redirect_allowed(&public, &url(target), false).is_err(),
+                "{target}"
+            );
+            assert!(
+                redirect_allowed(&public, &url(target), true).is_ok(),
+                "{target}"
+            );
+        }
+        assert!(
+            redirect_allowed(&url("http://a.example/"), &url("http://b.example/"), false).is_ok()
+        );
+        let addrs = |list: &[&str]| -> Vec<SocketAddr> {
+            list.iter().map(|a| a.parse().unwrap()).collect()
+        };
+        assert_eq!(
+            public_addrs("x", addrs(&["10.0.0.1:0", "93.184.216.34:0"]), false).unwrap(),
+            addrs(&["93.184.216.34:0"])
+        );
+        assert!(public_addrs("x", addrs(&["169.254.169.254:0"]), false).is_err());
+        assert_eq!(
+            public_addrs("x", addrs(&["10.0.0.1:0"]), true)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(targets_private(&url("http://127.0.0.1:9/spec.md")));
+        assert!(targets_private(&url("http://localhost/spec.md")));
+        assert!(!targets_private(&url("http://93.184.216.34/spec.md")));
+    }
+
+    #[test]
+    fn local_servers_may_redirect_within_private_addresses() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+        // A user-given loopback URL may redirect to another loopback port.
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let next = format!("http://{}/spec.md", target.local_addr().unwrap());
+        let url = format!("http://{}/start", first.local_addr().unwrap());
+        let serve = |listener: TcpListener, reply: String| {
+            thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut bytes = [0; 4096];
+                let _ = socket.read(&mut bytes).unwrap();
+                let _ = socket.write_all(reply.as_bytes());
+            })
+        };
+        let a = serve(
+            first,
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: {next}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        let b = serve(
+            target,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nConnection: close\r\n\r\n# Task".into(),
+        );
+        assert_eq!(read_url(&url, &AtomicBool::new(false)).unwrap(), "# Task");
+        a.join().unwrap();
+        b.join().unwrap();
     }
 
     #[test]

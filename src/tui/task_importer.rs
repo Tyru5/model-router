@@ -1,5 +1,6 @@
 use super::input::InputField;
 use super::path_picker::{PathPicker, PickerAction};
+use super::tasks::{Msg, Spawner, ticket};
 use super::theme::Palette;
 use super::widgets::{content, focus_textarea, textarea};
 use crate::{config, storage, task_import};
@@ -17,9 +18,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver},
     },
-    thread,
 };
 
 pub(super) enum ImportAction {
@@ -50,7 +49,8 @@ impl Draft {
 
 struct ImportJob {
     source: String,
-    receiver: Receiver<std::result::Result<String, String>>,
+    /// Identifies the download's result.
+    ticket: u64,
     cancel: Arc<AtomicBool>,
 }
 impl Drop for ImportJob {
@@ -66,6 +66,7 @@ pub(super) struct TaskImporter {
     url: Option<InputField<'static>>,
     job: Option<ImportJob>,
     error: String,
+    spawner: Spawner,
 }
 
 impl TaskImporter {
@@ -80,37 +81,54 @@ impl TaskImporter {
             Some(self.picker.active_input())
         }
     }
-    pub fn new(project: &Path, existing: &str) -> Result<Self> {
+    pub fn new(project: &Path, existing: &str, spawner: Spawner) -> Result<Self> {
         Ok(Self {
-            picker: PathPicker::files(project)?,
+            picker: PathPicker::files(project, spawner.clone())?,
             existing: existing.into(),
             draft: None,
             url: None,
             job: None,
             error: String::new(),
+            spawner,
         })
     }
 
-    pub fn poll(&mut self) {
-        let result = self
-            .job
-            .as_ref()
-            .and_then(|job| match job.receiver.try_recv() {
-                Ok(result) => Some(result),
-                Err(mpsc::TryRecvError::Empty) => None,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    Some(Err("Import stopped unexpectedly; retry the URL.".into()))
-                }
-            });
-        if let Some(result) = result {
-            let job = self.job.take().expect("Import result has a job");
-            match result {
-                Ok(text) => {
-                    self.draft = Some(Draft::new(job.source.clone(), &text, &self.existing))
-                }
-                Err(error) => self.error = error,
-            }
+    /// Whether a URL import is running.
+    pub fn busy(&self) -> bool {
+        self.job.is_some()
+    }
+    /// Whether its picker's folder read reports with `ticket`.
+    pub(super) fn waits_for(&self, ticket: u64) -> bool {
+        self.picker.waits_for(ticket)
+    }
+    /// Whether the download reports with `ticket`.
+    pub(super) fn import_waits_for(&self, ticket: u64) -> bool {
+        self.job.as_ref().is_some_and(|job| job.ticket == ticket)
+    }
+    /// Shows a folder its picker read; false when it is not the picker's.
+    pub(super) fn folder_read(
+        &mut self,
+        ticket: u64,
+        result: std::result::Result<Vec<super::path_picker::FolderEntry>, String>,
+    ) -> bool {
+        self.picker.folder_read(ticket, result)
+    }
+    /// Shows a downloaded task; false when `ticket` is not the download
+    /// waited for, e.g. after Esc.
+    pub(super) fn imported(
+        &mut self,
+        ticket: u64,
+        result: std::result::Result<String, String>,
+    ) -> bool {
+        if !self.import_waits_for(ticket) {
+            return false;
         }
+        let job = self.job.take().expect("Import result has a job");
+        match result {
+            Ok(text) => self.draft = Some(Draft::new(job.source.clone(), &text, &self.existing)),
+            Err(error) => self.error = error,
+        }
+        true
     }
 
     pub fn paste(&mut self, text: &str) {
@@ -180,16 +198,18 @@ impl TaskImporter {
                     );
                     let cancel = Arc::new(AtomicBool::new(false));
                     let worker_cancel = cancel.clone();
-                    let input = source.clone();
-                    let (sender, receiver) = mpsc::channel();
-                    thread::spawn(move || {
-                        let result = task_import::read_url(&input, &worker_cancel)
-                            .map_err(|e| format!("{e:#}"));
-                        let _ = sender.send(result);
-                    });
+                    let (input, ticket) = (source.clone(), ticket());
+                    self.spawner.spawn(
+                        "Import stopped unexpectedly; retry the URL.",
+                        move || {
+                            task_import::read_url(&input, &worker_cancel)
+                                .map_err(|e| format!("{e:#}"))
+                        },
+                        move |result| Msg::Imported { ticket, result },
+                    );
                     self.job = Some(ImportJob {
                         source,
-                        receiver,
+                        ticket,
                         cancel,
                     });
                 }
@@ -338,7 +358,10 @@ mod tests {
         let source = dir.path().join("spec.md");
         let text = "# Spec 雪\n\n- Do this\n";
         std::fs::write(&source, text).unwrap();
-        let mut importer = TaskImporter::new(dir.path(), "Keep existing instructions").unwrap();
+        let (spawner, inbox) = Spawner::detached();
+        let mut importer =
+            TaskImporter::new(dir.path(), "Keep existing instructions", spawner).unwrap();
+        importer.picker.wait(&inbox);
         importer.paste("spec.md");
         assert!(matches!(
             press(&mut importer, Key::Enter),
@@ -366,7 +389,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("spec.md"), "# Additional work").unwrap();
         let existing = "x".repeat(config::MAX_TASK_BYTES);
-        let mut importer = TaskImporter::new(dir.path(), &existing).unwrap();
+        let (spawner, inbox) = Spawner::detached();
+        let mut importer = TaskImporter::new(dir.path(), &existing, spawner).unwrap();
+        importer.picker.wait(&inbox);
         importer.paste("spec.md");
         press(&mut importer, Key::Enter);
         assert!(matches!(

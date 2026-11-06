@@ -1,7 +1,12 @@
 //! The Monitor's results view for a finished run: what changed, which checks
 //! ran, what is unresolved, and what each stage took and spent. Git work runs
 //! on a background thread; the view shows "Computing changes…" until it lands.
-use super::{app::App, theme::Palette};
+use super::{
+    app::App,
+    run_slot::RunSlot,
+    tasks::{Msg, Tasks},
+    theme::Palette,
+};
 use crate::{
     engine::{Run, Status},
     handoff::TestStatus,
@@ -9,7 +14,7 @@ use crate::{
     snapshot::ChangeKind,
     storage,
 };
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, bail};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -17,19 +22,27 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Cell, HighlightSpacing, Paragraph, Row, Table, Wrap},
 };
-use std::{
-    sync::mpsc::{self, TryRecvError},
-    thread,
-};
-
-/// Diff text the dialog renders; the full patch stays in changes.diff.
-const DIFF_VIEW_LIMIT: usize = 256 * 1024;
 
 /// Changes and patch computed for one finished run state.
 pub(super) struct Loaded {
     key: String,
     changes: Changes,
     patch: std::result::Result<String, String>,
+}
+
+/// The run's report, rebuilt only when the run changes, not every frame.
+pub(super) fn cached_report(slot: &RunSlot) -> std::rc::Rc<RunReport> {
+    let run = &slot.run;
+    let stamp = format!("{} {}", key(run), run.revision);
+    let mut cache = slot.cache.borrow_mut();
+    match &cache.report {
+        Some((cached, report)) if *cached == stamp => report.clone(),
+        _ => {
+            let report = std::rc::Rc::new(report::build(run));
+            cache.report = Some((stamp, report.clone()));
+            report
+        }
+    }
 }
 
 pub(super) fn finished(run: &Run) -> bool {
@@ -44,24 +57,38 @@ fn key(run: &Run) -> String {
     format!("{} {:?} {:?}", run.id, run.status, run.change_range())
 }
 
+/// The directory Git ran in for this run: its workspace, else the project.
+pub(super) fn run_dir(run: &Run) -> std::path::PathBuf {
+    if run.workspace.is_dir() {
+        run.workspace.clone()
+    } else {
+        run.project.clone()
+    }
+}
+
+/// The top of the repository holding `dir`, which Git paths start from.
+pub(super) fn repo_root(dir: &std::path::Path) -> std::path::PathBuf {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim_end_matches(['\n', '\r'])
+                .to_owned()
+        })
+        .filter(|root| !root.is_empty())
+        .map_or_else(|| dir.to_path_buf(), std::path::PathBuf::from)
+}
+
+/// The patch is kept whole (Git caps it); the diff view lays out only what
+/// shows and bounds each file's rows.
 fn load(run: &Run) -> Loaded {
-    let patch = report::diff(run)
-        .map_err(|e| format!("{e:#}"))
-        .map(|mut text| {
-            if text.len() > DIFF_VIEW_LIMIT {
-                let mut end = DIFF_VIEW_LIMIT;
-                while !text.is_char_boundary(end) {
-                    end -= 1;
-                }
-                text.truncate(end);
-                text.push_str(&format!(
-                    "\n[Shown up to {} KiB. Full patch: {}]\n",
-                    DIFF_VIEW_LIMIT / 1024,
-                    run.directory.join("changes.diff").display()
-                ));
-            }
-            text
-        });
+    let patch = report::diff(run).map_err(|e| format!("{e:#}"));
     Loaded {
         key: key(run),
         changes: report::changes(run),
@@ -69,95 +96,124 @@ fn load(run: &Run) -> Loaded {
     }
 }
 
-impl App {
+impl RunSlot {
     /// Whether the Monitor shows results rather than the output log.
     pub(super) fn results_shown(&self) -> bool {
-        self.focused.worker.is_none()
-            && !self.focused.show_output
-            && self.focused.run.as_ref().is_some_and(finished)
+        self.worker.is_none() && !self.show_output && finished(&self.run)
     }
 
     fn loaded(&self) -> Option<&Loaded> {
-        let run = self.focused.run.as_ref()?;
-        self.focused.changes.as_ref().filter(|l| l.key == key(run))
+        self.changes.as_ref().filter(|l| l.key == key(&self.run))
     }
 
-    /// Collects finished Git work, starts it for a newly finished run, and
-    /// announces a pending waiver once per checkpoint.
-    pub(super) fn poll_completion(&mut self) {
-        if let Some((_, receiver)) = &self.focused.changes_job {
-            match receiver.try_recv() {
-                Ok(loaded) => {
-                    self.focused.changes = Some(loaded);
-                    self.focused.changes_job = None;
-                }
-                Err(TryRecvError::Disconnected) => self.focused.changes_job = None,
-                Err(TryRecvError::Empty) => {}
-            }
+    /// Computed changes for `key`; kept when still the ones waited for.
+    pub(super) fn changes_read(&mut self, key: &str, result: Result<Loaded, String>) {
+        if self.changes_pending.as_deref() != Some(key) {
+            return;
         }
-        let Some(run) = &self.focused.run else { return };
+        self.changes_pending = None;
+        if let Ok(loaded) = result {
+            self.changes = Some(loaded);
+        }
+    }
+
+    /// Starts Git work for a newly finished run. Returns the status line for
+    /// a pending waiver, once per checkpoint.
+    fn poll_completion(&mut self, tasks: &Tasks) -> Option<String> {
+        let run = &self.run;
+        let mut message = None;
         if let Some(reason) = run.pending_waiver() {
             let shown = format!("{} {}", run.id, run.revision);
-            if self.focused.waiver_shown != shown {
-                self.message = format!(
+            if self.waiver_shown != shown {
+                message = Some(format!(
                     "The test stage reported verification is not applicable: {}. [a] accepts without checks; [y] retries.",
                     storage::clean_terminal(reason)
-                );
-                self.focused.waiver_shown = shown;
+                ));
+                self.waiver_shown = shown;
             }
         }
-        if self.focused.worker.is_some() || !finished(run) {
-            return;
+        if self.worker.is_some() || !finished(run) {
+            return message;
         }
         let key = key(run);
-        let current = self.focused.changes.as_ref().is_some_and(|l| l.key == key)
-            || self
-                .focused
-                .changes_job
-                .as_ref()
-                .is_some_and(|(k, _)| *k == key);
+        let current = self.changes.as_ref().is_some_and(|l| l.key == key)
+            || self.changes_pending.as_ref() == Some(&key);
         if current {
-            return;
+            return message;
         }
         // A newly finished run opens on its results.
-        self.focused.show_output = false;
-        self.focused.results_scroll = 0;
+        self.show_output = false;
+        self.results_scroll = [0; 2];
+        self.changes_pending = Some(key.clone());
         let run = run.clone();
-        let (sender, receiver) = mpsc::channel();
-        self.focused.changes_job = Some((key, receiver));
-        thread::spawn(move || {
-            let _ = sender.send(load(&run));
-        });
+        let id = run.id.clone();
+        tasks.spawn(
+            "Computing changes stopped unexpectedly",
+            move || Ok(load(&run)),
+            move |result| Msg::Changes {
+                run: id,
+                key,
+                result,
+            },
+        );
+        message
+    }
+}
+
+impl App {
+    /// Whether the Monitor shows the focused run's results.
+    pub(super) fn results_shown(&self) -> bool {
+        self.session.focused().is_some_and(RunSlot::results_shown)
+    }
+
+    /// See `RunSlot::poll_completion`; only the focused run is followed.
+    pub(super) fn poll_completion(&mut self) {
+        let tasks = &self.tasks;
+        let message = self
+            .session
+            .focused_mut()
+            .and_then(|slot| slot.poll_completion(tasks));
+        if let Some(message) = message {
+            self.ui.message = message;
+        }
+    }
+
+    /// Where the focused run's files are.
+    pub(super) fn run_dir(&self) -> Result<std::path::PathBuf> {
+        Ok(run_dir(
+            self.session
+                .run()
+                .ok_or_else(|| anyhow::anyhow!("No run selected"))?,
+        ))
+    }
+
+    /// The focused run once it has finished.
+    fn finished_slot(&mut self, reason: &str) -> Result<&mut RunSlot> {
+        match self.session.focused_mut() {
+            Some(slot) if slot.worker.is_none() && finished(&slot.run) => Ok(slot),
+            _ => bail!("{reason}"),
+        }
     }
 
     pub(super) fn toggle_results(&mut self) -> Result<()> {
-        ensure!(
-            self.focused.worker.is_none() && self.focused.run.as_ref().is_some_and(finished),
-            "Results appear when the run finishes"
-        );
-        self.focused.show_output = !self.focused.show_output;
+        let slot = self.finished_slot("Results appear when the run finishes")?;
+        slot.show_output = !slot.show_output;
         Ok(())
     }
 
     pub(super) fn show_diff(&mut self) -> Result<()> {
-        ensure!(
-            self.focused.worker.is_none() && self.focused.run.as_ref().is_some_and(finished),
-            "The diff is available when the run finishes"
-        );
-        let Some(loaded) = self.loaded() else {
-            self.message = "Computing changes…".into();
+        let slot = self.finished_slot("The diff is available when the run finishes")?;
+        let Some(patch) = slot.loaded().map(|loaded| loaded.patch.clone()) else {
+            self.ui.message = "Computing changes…".into();
             return Ok(());
         };
-        match &loaded.patch {
+        match &patch {
             Ok(patch) if patch.trim().is_empty() => {
-                self.message = "No files changed during this run.".into()
+                self.ui.message = "No files changed during this run.".into()
             }
             Ok(patch) => {
-                let patch = patch.clone();
-                self.text(
-                    "Changes during this run · [↑↓] scroll · [Esc] closes",
-                    patch,
-                );
+                let view = super::diff_view::DiffView::new(patch.clone());
+                self.ui.open(super::modal::Modal::Diff(Box::new(view)));
             }
             Err(error) => bail!("{error}"),
         }
@@ -181,8 +237,9 @@ pub(super) fn checks_cell(statuses: impl IntoIterator<Item = TestStatus>) -> Str
     }
 }
 
-/// Cost and tokens in table width, e.g. "$0.25 · 2.0k/400"; "partial" when
-/// some attempts reported nothing.
+/// Cost and tokens in table width, e.g. "~$0.25 · 2.0k/400 tok": the known
+/// cost, "~" when any part is estimated; "partial" when some attempts
+/// reported nothing. The header names the sources.
 fn usage_cell(total: &UsageTotal) -> String {
     if total.attempts == 0 {
         return "–".into();
@@ -192,8 +249,8 @@ fn usage_cell(total: &UsageTotal) -> String {
     }
     let sum = &total.sum;
     let mut parts = vec![];
-    if let Some(cost) = sum.cost_usd {
-        parts.push(report::dollars(cost));
+    if total.cost.known() {
+        parts.push(total.cost.amount());
     }
     if sum.input_tokens.is_some() || sum.output_tokens.is_some() {
         let side = |n: Option<u64>| n.map_or_else(|| "?".into(), report::tokens);
@@ -293,6 +350,30 @@ fn review_lines(report: &RunReport, palette: Palette) -> Vec<Line<'static>> {
 
 fn findings_lines(report: &RunReport, palette: Palette) -> Vec<Line<'static>> {
     let mut lines = vec![];
+    // Best-of-N stages: the judge's choice first, then each candidate.
+    for stage in &report.stages {
+        let Some(fan) = &stage.fan_out else {
+            continue;
+        };
+        lines.push(Line::styled(
+            format!("Fan-out · {}", stage.name),
+            palette.header_style(),
+        ));
+        for (index, line) in report::fan_out_text(fan).into_iter().enumerate() {
+            let color = if index == 0 && !fan.applied {
+                palette.warn
+            } else if line.starts_with('★') {
+                palette.success
+            } else {
+                palette.fg
+            };
+            lines.push(Line::styled(
+                storage::clean_terminal(&line),
+                Style::default().fg(color),
+            ));
+        }
+        lines.push(Line::raw(""));
+    }
     let checks: Vec<_> = report
         .stages
         .iter()
@@ -356,14 +437,8 @@ fn findings_lines(report: &RunReport, palette: Palette) -> Vec<Line<'static>> {
 
 /// Header lines, stage table, then changes beside (or above) checks and
 /// unresolved items. `area` excludes the title row the Monitor draws.
-pub(super) fn draw_completion(
-    frame: &mut Frame<'_>,
-    app: &App,
-    run: &Run,
-    area: Rect,
-    palette: Palette,
-) {
-    let report = report::build(run);
+pub(super) fn draw_completion(frame: &mut Frame<'_>, slot: &RunSlot, area: Rect, palette: Palette) {
+    let report = cached_report(slot);
     let summary = Line::styled(report::summary(&report), Style::default().fg(palette.fg));
     let usage = Line::from(vec![
         Span::styled("Usage ", palette.header_style()),
@@ -376,8 +451,19 @@ pub(super) fn draw_completion(
             }),
         ),
     ]);
+    let cost = Line::from(vec![
+        Span::styled("Cost ", palette.header_style()),
+        Span::styled(
+            report::cost_text(&report.usage.cost, &report.budget),
+            Style::default().fg(if report.usage.cost.known() {
+                palette.fg
+            } else {
+                palette.muted
+            }),
+        ),
+    ]);
     let width = area.width.max(1);
-    let mut header = vec![summary, usage];
+    let mut header = vec![summary, usage, cost];
     if let Some(error) = &report.error {
         header.push(Line::styled(
             format!("Error: {}", storage::clean_terminal(error)),
@@ -440,7 +526,7 @@ pub(super) fn draw_completion(
         .highlight_spacing(HighlightSpacing::Never),
         chunks[1],
     );
-    let loaded = app.loaded();
+    let loaded = slot.loaded();
     // The review brief leads: it is what the person reads first.
     let mut changes = review_lines(&report, palette);
     changes.extend(changes_lines(loaded, &report, palette));
@@ -450,11 +536,20 @@ pub(super) fn draw_completion(
         "Changes"
     };
     let findings = findings_lines(&report, palette);
-    let mut panel = |title: &str, lines: Vec<Line<'static>>, keys: &[(&str, &str)], rect: Rect| {
-        let scroll = app
-            .focused
-            .results_scroll
-            .min(lines.len().saturating_sub(1) as u16);
+    let mut limits = [0; 2];
+    let mut panel = |index: usize,
+                     title: &str,
+                     lines: Vec<Line<'static>>,
+                     keys: &[(&str, &str)],
+                     rect: Rect| {
+        // Rows the wrapped text takes, less what fits: how far it can scroll.
+        let inner = rect.width.saturating_sub(2);
+        let rows: u16 = lines
+            .iter()
+            .map(|line| super::widgets::rows_for(line, inner, u16::MAX))
+            .fold(0, u16::saturating_add);
+        limits[index] = rows.saturating_sub(rect.height.saturating_sub(2));
+        let scroll = slot.results_scroll[index].min(limits[index]);
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
@@ -466,8 +561,9 @@ pub(super) fn draw_completion(
     if chunks[2].width >= 110 {
         let cols = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
             .split(chunks[2]);
-        panel(left, changes, &[("d", "diff"), ("o", "output")], cols[0]);
+        panel(0, left, changes, &[("d", "diff"), ("o", "output")], cols[0]);
         panel(
+            1,
             "Checks · Unresolved",
             findings,
             &[("PgUp/PgDn", "scroll")],
@@ -478,16 +574,19 @@ pub(super) fn draw_completion(
         lines.push(Line::raw(""));
         lines.extend(findings);
         panel(
+            0,
             "Results",
             lines,
             &[("d", "diff"), ("o", "output"), ("PgUp/PgDn", "scroll")],
             chunks[2],
         );
     }
+    slot.results_limit.set(limits);
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::app::Page;
     use super::*;
     use crate::{report::tests::sample, tui::app::draw};
     use ratatui::{Terminal, backend::TestBackend};
@@ -501,8 +600,8 @@ mod tests {
             dir.join("model-router-test-config.toml"),
             Arc::new(AtomicBool::new(false)),
         );
-        app.focused.run = Some(run);
-        app.page = 1;
+        app.session.adopt(run);
+        app.ui.page = Page::Monitor;
         app
     }
 
@@ -541,12 +640,13 @@ mod tests {
         assert!(app.results_shown());
         let text = screen(&mut app, 80, 24);
         assert!(text.contains("Computing changes…"), "{text}");
-        app.focused.changes = Some(tracked());
+        app.slot_mut().changes = Some(tracked());
         for (width, height) in [(80, 24), (120, 36)] {
             let text = screen(&mut app, width, height);
             for expected in [
                 "wall 2m 10s · active 1m 40s · 3 attempts · 1 retry",
                 "usage reported by 2 of 3",
+                "Cost $0.25 (reported) · cost unknown for 2 of 3 attempts",
                 "Changed during this run",
                 "1 file, +40 -5",
                 "M src/lib.rs  +40 -5",
@@ -567,6 +667,8 @@ mod tests {
                     "Unresolved",
                     "! Implement: blocking finding: Data loss",
                     "1/3 ✗",
+                    // The Monitor header's running total.
+                    "repairs 1/2  ·  cost $0.25+? reported",
                 ] {
                     assert!(
                         text.contains(expected),
@@ -578,13 +680,51 @@ mod tests {
     }
 
     #[test]
+    fn fan_out_candidates_show_in_progress_and_results() {
+        let mut run = sample();
+        run.stages[0].fan_out = Some(
+            serde_json::from_value(serde_json::json!({
+                "base": "tree",
+                "base_commit": "commit",
+                "candidates": [
+                    {"id": "c1", "harness": "claude", "model": "sonnet", "status": "complete",
+                     "attempts": [], "handoff": null,
+                     "changes": {"files": ["a.rs"], "added": 5, "removed": 1, "patch": "/p1.diff"}},
+                    {"id": "c2", "harness": "codex", "model": "", "status": "failed",
+                     "attempts": [], "handoff": null, "error": "Harness exited"}
+                ],
+                "selection": {"candidate": "c1", "by": "auto", "reason": "auto: passing",
+                              "applied": true, "at": "2026-01-01T00:00:00Z"}
+            }))
+            .unwrap(),
+        );
+        let mut results = app(run.clone());
+        results.slot_mut().changes = Some(tracked());
+        let text = screen(&mut results, 120, 40);
+        for expected in [
+            "Fan-out · Implement",
+            "judge auto: c1 applied (auto: passing)",
+            "★ c1 claude sonnet complete · 1 file +5 −1",
+            "· c2 codex default failed · Harness exited",
+        ] {
+            assert!(text.contains(expected), "lacks {expected:?}\n{text}");
+        }
+        // While it runs, the monitor lists candidates under their stage.
+        run.status = Status::Running;
+        let mut monitor = app(run);
+        let text = screen(&mut monitor, 120, 40);
+        assert!(text.contains("★ c1 · claude sonnet"), "{text}");
+        assert!(text.contains("↳ c2 · codex"), "{text}");
+    }
+
+    #[test]
     fn stopped_runs_highlight_the_error_and_label_missing_changes() {
         let mut run = sample();
         run.status = Status::Failed;
         run.error = Some("Required check failed".into());
         let mut app = app(run);
-        app.focused.changes = Some(Loaded {
-            key: key(app.focused.run.as_ref().unwrap()),
+        app.slot_mut().changes = Some(Loaded {
+            key: key(app.session.run().unwrap()),
             changes: Changes::NotGit,
             patch: Err("Changes are unavailable (not a Git repository)".into()),
         });
@@ -604,14 +744,14 @@ mod tests {
     fn diff_and_output_toggle_use_the_loaded_changes() {
         let mut app = app(sample());
         app.show_diff().unwrap();
-        assert_eq!(app.message, "Computing changes…");
-        assert!(app.modal.is_none());
-        app.focused.changes = Some(tracked());
+        assert_eq!(app.ui.message, "Computing changes…");
+        assert!(app.ui.dialog().is_none());
+        app.slot_mut().changes = Some(tracked());
         app.show_diff().unwrap();
         assert!(
-            matches!(&app.modal, Some(super::super::modal::Modal::Text { body, .. }) if body.contains("+fresh line"))
+            matches!(app.ui.dialog(), Some(super::super::modal::Modal::Diff(view)) if view.patch.contains("+fresh line"))
         );
-        app.modal = None;
+        app.ui.dialogs.clear();
         app.toggle_results().unwrap();
         assert!(!app.results_shown());
         assert!(screen(&mut app, 80, 24).contains("Output"));
@@ -619,7 +759,7 @@ mod tests {
         assert!(app.results_shown());
         let mut running = sample();
         running.status = Status::AwaitingConfirmation;
-        app.focused.run = Some(running);
+        app.session.adopt(running);
         assert!(app.toggle_results().is_err());
         assert!(app.show_diff().is_err());
     }
@@ -632,25 +772,30 @@ mod tests {
         run.workspace = dir.path().into();
         run.directory = dir.path().join("run");
         let mut app = app(run);
-        app.focused.show_output = true;
+        app.slot_mut().show_output = true;
         app.poll_completion();
-        assert!(app.focused.changes_job.is_some());
+        assert!(app.slot().changes_pending.is_some());
         assert!(
-            !app.focused.show_output,
+            !app.slot().show_output,
             "A newly finished run opens on its results"
         );
         for _ in 0..500 {
-            app.poll_completion();
-            if app.focused.changes_job.is_none() {
+            app.poll().unwrap();
+            if app.slot().changes_pending.is_none() {
                 break;
             }
-            thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let loaded = app.loaded().expect("changes loaded");
+        let loaded = app
+            .session
+            .focused()
+            .unwrap()
+            .loaded()
+            .expect("changes loaded");
         assert!(matches!(loaded.changes, Changes::NotGit));
         // The same state does not start another job.
         app.poll_completion();
-        assert!(app.focused.changes_job.is_none());
+        assert!(app.slot().changes_pending.is_none());
     }
 
     #[test]
@@ -668,17 +813,17 @@ mod tests {
         let mut app = app(run);
         app.poll_completion();
         assert_eq!(
-            app.message,
+            app.ui.message,
             "The test stage reported verification is not applicable: Docs only. [a] accepts without checks; [y] retries."
         );
         assert!(
-            app.focused.changes_job.is_none(),
+            app.slot().changes_pending.is_none(),
             "Unfinished runs compute no changes"
         );
         // Announced once per checkpoint, so later messages stay visible.
-        app.message = "Other".into();
+        app.ui.message = "Other".into();
         app.poll_completion();
-        assert_eq!(app.message, "Other");
+        assert_eq!(app.ui.message, "Other");
         assert!(!app.results_shown());
         for (width, height) in [(80, 24), (120, 36)] {
             let text = screen(&mut app, width, height);

@@ -69,6 +69,36 @@ pub fn lock(path: &Path) -> Result<FileLock> {
     Ok(FileLock(file))
 }
 
+/// `lock`, retrying for up to `wait` while another holder (often a brief
+/// probe such as `is_locked`) has it.
+pub fn lock_wait(path: &Path, wait: std::time::Duration) -> Result<FileLock> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match lock(path) {
+            Ok(lock) => return Ok(lock),
+            Err(error) if std::time::Instant::now() >= deadline => return Err(error),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+}
+
+/// Whether a router process holds the lock at `path`. Never creates the
+/// file. The probe takes a shared lock on its own descriptor for an instant,
+/// so it never blocks other probes; owners acquire with `lock_wait`, which
+/// rides out the instant.
+pub fn is_locked(path: &Path) -> bool {
+    let Ok(file) = OpenOptions::new().read(true).open(path) else {
+        return false;
+    };
+    match FileExt::try_lock_shared(&file) {
+        Ok(()) => {
+            let _ = FileExt::unlock(&file);
+            false
+        }
+        Err(_) => true,
+    }
+}
+
 pub fn run_dir(project: &Path, id: &str) -> Result<PathBuf> {
     ensure!(
         !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
@@ -210,5 +240,27 @@ mod tests {
         assert!(lock(&path).is_err(), "The next owner still has exclusivity");
         drop(next);
         drop(inherited);
+    }
+
+    #[test]
+    fn probing_a_lock_neither_creates_nor_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.lock");
+        assert!(!is_locked(&path));
+        assert!(!path.exists(), "probing must not create the lock file");
+        let guard = lock(&path).unwrap();
+        assert!(is_locked(&path));
+        drop(guard);
+        assert!(!is_locked(&path));
+        // An owner waiting briefly gets the lock once its holder lets go.
+        let held = lock(&path).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(held);
+        });
+        assert!(lock_wait(&path, std::time::Duration::from_secs(5)).is_ok());
+        release.join().unwrap();
+        let _held = lock(&path).unwrap();
+        assert!(lock_wait(&path, std::time::Duration::from_millis(100)).is_err());
     }
 }

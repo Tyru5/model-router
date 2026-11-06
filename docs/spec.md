@@ -14,9 +14,12 @@ remain visible, including Amp's mode selection and provider-specific identifiers
 
 Provide editable stage presets for requirements, research, diagnosis, design,
 planning, implementation, verification, code/security review, documentation,
-handoff, and a blank custom stage. Provide Quick task, Full feature, Bug fix,
-and Investigation workflow presets. Adding a preset never overwrites an existing
-workflow or changes a saved run; reviews start disabled in workflow presets.
+handoff, judging fan-out candidates, ship, and a blank custom stage. Provide
+Quick task, Full feature, Bug fix, Investigation, and Best-of-3 implement
+workflow presets. Adding a preset never overwrites an existing workflow or
+changes a saved run; optional reviews and ship stages start disabled in
+workflow presets, while a fan-out's judge starts enabled because it chooses
+rather than gates.
 
 ## Execution and handoff
 
@@ -28,6 +31,14 @@ workflow or changes a saved run; reviews start disabled in workflow presets.
   changed files, tests, and unresolved issues. Retain complete attempt logs on disk.
 - Use a small structured handoff in subsequent prompts, with artifact paths for
   details. Never treat a missing review verdict as a passing review.
+- The handoff contract is versioned (`schema_version`, absent = 1; current 2,
+  published as `schema/handoff.schema.json`). Version 2 adds optional
+  `artifacts`, `confidence`, and `next_steps`; older handoffs and saved runs
+  stay readable. Read the handoff from the harness's native structured output
+  where supported and version-gated, then the handoff file, then the final
+  response's last marker block, fenced JSON, or bare JSON. Never accept the
+  prompt's example as an answer. Record the channel on the attempt and show it
+  in reports.
 - Verification (`test`) stages require structured handoffs and evidence: at
   least one passing required check, reported by the model or run by the router.
   Required failed or unrun checks, blocking findings, and missing evidence stop
@@ -39,29 +50,122 @@ workflow or changes a saved run; reviews start disabled in workflow presets.
 - Any stage may declare router checks: argument vectors run in the workspace
   after the harness succeeds, each with a timeout. Results and logs are saved
   with the attempt, independent of the handoff. A required check that fails,
-  times out, or cannot start blocks the stage; optional failures are recorded.
-- Read-only stage intent is expressed in instructions. Effective execution
-  permissions are supplied by the harness and the user's explicit overrides;
-  the router is not a universal sandbox.
+  times out, or cannot start blocks the stage, except in an enabled review,
+  where it requests a repair (see Optional reviews); optional failures are
+  recorded.
+- Read-only stage intent is expressed in instructions; harness permissions come
+  from the harness and the user's explicit overrides. An optional router
+  sandbox (stage `sandbox`, workflow `sandbox_default`; off by default) enforces
+  it independently of the harness: `read-only` leaves writable only the attempt
+  and handoff directories, a private `/tmp`, harness state directories, and
+  `sandbox_writable` paths; `workspace-write` adds the workspace and its Git
+  directory. Linux uses bubblewrap, macOS `sandbox-exec`. A stage whose sandbox
+  cannot be set up fails before launch unless `sandbox_fallback = "warn"`.
+  `command.json` records the effective sandbox.
 - Surface reported permission denials and errors. Unattended processes have no
   interactive stdin. A harness that does not report approval requirements clearly
   can be cancelled or timed out and reopened interactively.
 
+## Graphs and fan-out
+
+- A workflow without `after` on any stage runs in list order, exactly as
+  before. Once any stage sets `after = [ids]`, the workflow is a dependency
+  graph: a stage starts when every stage it transitively runs after is
+  complete or disabled (disabled stages are transparent); a stage without
+  `after` is a root. Unknown IDs, self-dependencies, and cycles fail
+  validation. "Upstream" (prompts' prior handoffs, repair targets, the
+  feedback's reach) means "runs before" in the graph and "earlier" in a list.
+- Ready stages run side by side only when they cannot conflict in the shared
+  workspace: unattended research, planning, review, and summary stages, and
+  fan-out stages (their candidates have worktrees). Other stages wait for
+  running ones and run alone, in list order, with a note in the output.
+  Interactive stages always run alone. A workflow's `max_parallel` (default 2,
+  1–16) caps concurrent harness processes, candidates included.
+- Each concurrent process has its own process group, logs, and artifacts.
+  Worker threads only supervise processes; the driver thread, holding the run
+  lock, applies every status change through the run's transition validation,
+  logs it, and saves. While stages run side by side, a stop or a review's
+  repair request stops new launches; the run's own status settles once the
+  running ones end (a held repair first, then the first stopped stage, then a
+  waiting checkpoint).
+- A `fan_out` stage (unattended; implementation or custom role; 2–8
+  candidates, each a harness, model, provider, and effort, with an optional
+  `id`, default `c1`…) runs a round: it snapshots the workspace (HEAD plus
+  uncommitted, non-ignored changes) as a private commit kept by
+  `refs/model-router/runs/<run>/base/<stage>-<round>`, and checks it out once
+  per candidate attempt as a detached worktree under
+  `.model-router/candidates/<run>/`. User branches, HEAD, and the user's index
+  never change. Each round is a stage attempt; candidates are child records
+  with their own attempts and statuses (`candidate` transitions in
+  transitions.jsonl). A candidate succeeds with a complete handoff; its router
+  checks run in its worktree and its patch from the base is saved.
+- The judge is `auto` (required router checks passing, then fewest changed
+  lines, then list order) or an enabled review stage that runs after the
+  fan-out (in a list, the next enabled stage; in a graph, it lists the fan-out
+  in `after`, and the fan-out's other dependents also wait for it). It sees
+  every candidate's handoff, checks, diff stat, and patch and worktree paths,
+  and must return `"selected": "<id>"` naming a complete candidate; anything
+  else blocks it. A judge never requests repairs. A disabled judge means auto.
+- The router applies the chosen patch to the workspace (plain apply, then a
+  three-way merge in a private index). On conflict it restores the patch's
+  files, leaving the workspace unchanged, and blocks with the patch and
+  worktree paths. A round with no successful candidate blocks; cancellation
+  cancels it. Unchosen candidates stay on disk, listed in the report, until
+  `clean` removes the run (candidate worktrees with force: they are the
+  router's own).
+- A crash marks running candidates failed, never retried silently.
+  `resume --retry-candidate STAGE/ID` or Monitor `Y` (`Cmd::RetryCandidate`) reruns one
+  stopped candidate of a stopped fan-out stage in a new round with the same
+  base; the others keep their results. Retrying the stage reruns all.
+
 ## Optional reviews
 
-Any number of review stages may be enabled. A structured blocking finding or a
-failed required test requests a repair at the selected upstream implementation
+Any number of review stages may be enabled. A structured blocking finding, a
+failed required test, or a failed required router check requests a repair at the selected upstream implementation
 stage (nearest implementation by default). Invalidate and rerun subsequent stages
 so stale reviews cannot approve changed code. Allow two repair passes per run by
 default. Suggestions alone do not trigger repair. Disabled reviews never gate a
-run, and a run with no review ends after its last enabled stage.
+run, and a run with no review ends after its last enabled stage. The repair
+request reaches only the repaired stages up to the review that made it, and is
+cleared once that review passes. Reaching the limit blocks the run; the user
+may explicitly allow one more pass at a time (`resume --allow-repair`).
+
+## Configuration and trust
+
+Config files carry a `version` (currently 2). Older versions migrate in order
+when loaded (v1→v2 adds the review summary stage once) and save as the current
+version; a newer version fails with an upgrade message. Unknown fields outside
+stages and checks are warnings shown by `validate` and the TUI, so newer
+releases can add fields; stage and check fields stay strict.
+
+A project's `.model-router.toml` is untrusted until the user approves its
+dangerous sections: custom adapters, checks, extra arguments, permission
+settings that loosen a harness's checks, router sandbox loosening (a stage mode
+weaker than its workflow default, `sandbox_writable`, `sandbox_fallback =
+"warn"`), ship stages without confirmation, and providers with their own
+endpoint or key variable. Approval stores a SHA-256 digest of those sections per
+canonical project path in the user's `trust.json`; any change asks again.
+`run` refuses an untrusted config and lists the sections; the TUI asks once
+(trust, continue with them ignored, or quit); read-only commands ignore them.
+Ignored sections are kept when the config is saved. The global config and an
+explicit `--config` file are trusted. `model-router trust [--yes]` approves and
+`--revoke` forgets.
 
 ## Persistence and recovery
 
 Save reusable workflows as TOML and snapshot them into each run. Save every
-attempt, handoff, status transition, and explicit model override. Use atomic
-writes and locks to protect run state and active workspaces. A crash, failure,
+attempt, handoff, status transition, and explicit model override: each run,
+stage, or attempt status change is validated and appended, with its time, run
+revision, cause, and reason, to the run's `transitions.jsonl`. Recovery and
+checkpoint commands (retry, take over, confirm, allow repair) apply and save
+under the run lock. Use atomic writes and locks to protect run state and active
+workspaces. A crash, failure,
 timeout, or cancellation never silently retries a possibly mutating stage.
+A harness's whole process group ends with its stage (SIGTERM, a grace period,
+then SIGKILL), including after a normal exit, and on Linux when mr dies. Each
+attempt records its process group while running; the next drive stops a group
+left behind by a crashed router before continuing. Git snapshot trees stay
+reachable through `refs/model-router/runs/<run>/` until the run is cleaned.
 
 The user can retry, switch model, reopen interactively, or resume a saved run.
 Resuming preserves prior completed stages; it does not roll back filesystem
@@ -69,6 +173,20 @@ changes. Default timeout: 60 minutes per unattended stage.
 
 Use the selected working directory by default. Optional Git worktrees start from
 committed HEAD, remain on disk, and are never merged or committed automatically.
+
+The router commits only in a ship stage the user explicitly added and enabled
+(disabled in workflow presets), or with `model-router ship`; agents are still
+told not to commit. No harness runs: the router commits exactly the files
+changed during the run on a new branch from HEAD, optionally pushes it (never
+forced), and optionally opens a draft PR with `gh`. By default it first waits
+at the human checkpoint with a preview of branch, files, commit message, push,
+and PR, and ships only that confirmed plan; a changed plan is previewed again.
+Server clients cannot confirm it, and skipping the preview requires project
+trust. Files changed before the run, and the user's index, stay out; a file
+changed both before and during the run blocks unless explicitly included. It
+commits as the user's Git identity only, refusing without one, and adds no
+trailers or attribution. It never amends or moves an existing branch; failures
+block with Git's or `gh`'s error.
 Store generated artifacts in a self-ignored `.model-router` directory. Retain
 history until the user removes it. Aider's automatic commits are disabled.
 
@@ -82,11 +200,26 @@ Cleanup previews selected runs and sizes before removing anything, skips runs
 whose lock is held or that are open, and removes worktrees only when Git can
 without force; branches stay.
 
+Stats aggregate saved runs per role, harness, and model, cached by run revision
+in `.model-router/stats-cache.json`; damaged records are counted and skipped.
+They may suggest an assignment with at least five samples that clearly did
+better, but never change a stage: routing stays the user's explicit choice.
+Benchmarks run each task under each listed assignment, unattended, each in its
+own worktree, and save the results; they refuse interactive stages unless told
+to run them unattended.
+
 ## Adapters and model discovery
 
 Built-in targets: Codex, Claude Code, Pi, Cursor Agent, Gemini CLI, OpenCode,
-Aider, Goose, Amp, and GitHub Copilot CLI. Custom adapters declare executable,
-unattended and interactive arguments, and optionally a model-list command.
+Aider, Goose, Amp, and GitHub Copilot CLI, each one declarative spec entry
+(`src/harness/`). Custom adapters declare executable, unattended and
+interactive arguments, and optionally a model-list command, output parser,
+session assignment or reporting, resume arguments, model/effort flags, and
+prompt delivery. Fields that reach the executable are trusted sections.
+
+Router providers never put secrets in arguments or artifacts: `base_url`
+cannot hold credentials or a query, previews redact environment values, and
+routed launches drop inherited variables meant for the native provider.
 
 Reuse native authentication and provider configurations. No credential store,
 no automatic installation of harnesses, and no model inference during discovery.
@@ -100,12 +233,19 @@ API clients, automatic task classification, and embedded IDE control are exclude
   and flag/environment bypass. No model calls or simulated loading operations.
 - Workflow editor with task, project, stage order, enable toggle, execution mode,
   model selector, provider, reasoning effort, instructions, and extra arguments.
+- Stage editor fields for `after` (comma-separated IDs) and fan-out
+  candidates (one per line, `[id:] harness [model] [provider] [effort]`, and a
+  `judge = auto|ID` line).
 - Workflow picker with built-in presets and local/global template saving.
 - Searchable stage catalog with purpose and default routing. Selecting a preset
   opens an editor; saving inserts after the current stage. Cancelling the picker
   or editor leaves the workflow unchanged. Preserve freely editable custom stages.
 - Task/spec import from local Markdown/UTF-8 files, direct HTTP(S) text URLs,
-  and GitHub issue/file links. Reuse `gh` authentication for GitHub access.
+  and GitHub issue, pull request, and file links, including GitHub Enterprise
+  hosts `gh` is logged in to. Reuse `gh` authentication for GitHub access.
+  Direct URLs cannot redirect from HTTPS to HTTP, and redirects or DNS cannot
+  reach loopback, link-local, or private addresses unless the entered URL
+  names one.
   Browse files or enter a path/URL, then edit an append/replace preview.
   Default to append when a task exists. Apply explicitly; importing never starts
   execution. Cancellation and errors preserve the current task. Limit the final
@@ -125,18 +265,39 @@ API clients, automatic task classification, and embedded IDE control are exclude
   and persistent recent projects. Recognizes Git directories and `.git` files
   for linked worktrees/submodules; non-Git folders can also be selected.
   Saves workflow edits and loads the selected project's configuration.
-- Run monitor with stage state, elapsed time, check results, logs, cancellation,
-  handoff view, and explicit recovery actions. Finished runs show a results view:
+- Run monitor with stage state (fan-out candidates indented under their
+  stage), elapsed time, check results, logs, cancellation, handoff view, and
+  explicit recovery actions. Finished runs show a results view:
   files changed during the run (from private Git snapshots), checks by source,
   unresolved findings, per-stage time, retries, and harness-reported usage, with
-  unavailable values labelled; the full diff opens in a dialog. `report` prints
-  the same summary from the CLI.
+  unavailable values labelled, plus each fan-out's candidates, judge decision,
+  and whether its patch was applied; the diff opens in a dialog with a file list,
+  coloured hunks, search, and hand-offs to `$PAGER`, `$VISUAL`/`$EDITOR`, and
+  `git difftool` (argv only, never a shell). The output log can be paused,
+  searched, and opened in `$PAGER`. `report` prints the same summary from the CLI.
+- Cost per attempt, labelled by source: harness-reported, else tokens priced
+  from user overrides, router-provider `/models` prices (cached at most daily;
+  failures non-fatal), or a dated built-in estimate table, else unknown.
+  Interactive Claude Code and Codex stages read tokens from their native
+  session logs, best effort. The Monitor header shows the running total;
+  `cost` aggregates history by harness and model.
+- Optional workflow and stage budgets (`max_usd`, `max_tokens`). After each
+  attempt, known cost or counted tokens over a cap block the run before its
+  next stage; unknown costs count only toward tokens. Running stages are never
+  killed. `resume --budget-usd/--budget-tokens` raises the cap to continue.
 - Run history with live text and status filters, damaged-record rows,
   background-computed sizes, confirmed reruns, attempt comparison, and cleanup
   previews; harness availability/catalog view.
 - CLI equivalents for initialization, validation, previews, execution, discovery,
-  history (filters, JSON, sizes), rerun, compare, clean, and resume; all share
+  history (filters, JSON, sizes), rerun, compare, clean, resume, and ship; all share
   the same execution engine.
+- Headless `serve`: MCP over stdio and a loopback, token-protected HTTP/SSE
+  API with the same engine. Server runs are unattended only; interactive
+  stages are refused unless the caller forces them unattended. Projects are
+  limited to allowed roots. See `docs/serve.md`.
+- Notifications (terminal bell/OSC, desktop, ntfy-style webhook; terminal on by
+  default) when a run needs input, stops, or completes; the CLI opts in with
+  `--notify`. The TUI keeps a notice history and lists the session's runs.
 
 ## Acceptance checks
 
@@ -162,3 +323,8 @@ API clients, automatic task classification, and embedded IDE control are exclude
 12. Add, edit, reorder, and persist stage/workflow presets through the real TUI.
     All built-in workflows execute in order with mocked harnesses, keep reviews
     optional, and stop when verification reports required failures or missing checks.
+13. List workflows run exactly as before. Graph workflows run ready read-only
+    stages side by side and writers alone; fan-out candidates run in their own
+    worktrees from the uncommitted workspace, the auto or stage judge's choice
+    is applied, a conflicting choice blocks without changing the workspace, a
+    crash fails running candidates, and one candidate can be retried alone.

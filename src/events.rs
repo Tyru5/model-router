@@ -9,12 +9,20 @@ const EXCERPT: usize = 160;
 /// Longest assistant or reasoning text shown for one event.
 const MESSAGE: usize = 4000;
 
+/// Longest partial line held while waiting for its end. Longer lines (e.g.
+/// a huge event) are dropped from display with a note; stdout.log keeps them.
+const PENDING_LIMIT: usize = 4 << 20;
+
 /// Splits streamed output into whole lines and formats each one. Partial
-/// lines wait for the rest of their chunk.
+/// lines wait for the rest of their chunk. A carriage return also ends a
+/// line, so progress bars that redraw with \r do not pile up; JSON events
+/// never contain a raw one.
 #[derive(Debug)]
 pub struct Formatter {
     kind: OutputKind,
     pending: String,
+    /// Inside a line longer than `PENDING_LIMIT`, until its end.
+    skipping: bool,
 }
 
 impl Formatter {
@@ -22,21 +30,52 @@ impl Formatter {
         Self {
             kind,
             pending: String::new(),
+            skipping: false,
         }
     }
 
     /// Formatted text for the complete lines in `chunk`, or None when they
-    /// carried nothing worth showing.
+    /// carried nothing worth showing. Each chunk is scanned once.
     pub fn push(&mut self, chunk: &str) -> Option<String> {
-        self.pending.push_str(chunk);
-        let end = self.pending.rfind('\n')?;
-        let complete: String = self.pending.drain(..=end).collect();
-        join(complete.lines().flat_map(|line| describe(line, self.kind)))
+        let Some(end) = chunk.rfind(['\n', '\r']) else {
+            self.hold(chunk);
+            return None;
+        };
+        let mut complete = std::mem::take(&mut self.pending);
+        let skipped = std::mem::take(&mut self.skipping);
+        complete.push_str(&chunk[..end]);
+        self.hold(&chunk[end + 1..]);
+        let mut lines = complete.split(['\n', '\r']);
+        // An overlong line's tail ends at the chunk's first line break.
+        let first = lines.next().unwrap_or("");
+        let note = skipped.then(|| format!("… line longer than {PENDING_LIMIT} bytes omitted"));
+        let first = (!skipped).then_some(first);
+        join(
+            note.into_iter().chain(
+                first
+                    .into_iter()
+                    .chain(lines)
+                    .flat_map(|line| describe(line, self.kind)),
+            ),
+        )
+    }
+
+    fn hold(&mut self, text: &str) {
+        if self.skipping {
+            return;
+        }
+        if self.pending.len() + text.len() > PENDING_LIMIT {
+            self.pending.clear();
+            self.skipping = true;
+        } else {
+            self.pending.push_str(text);
+        }
     }
 
     /// Formats whatever the harness left without a final newline.
     pub fn finish(&mut self) -> Option<String> {
         let rest = std::mem::take(&mut self.pending);
+        self.skipping = false;
         join(rest.lines().flat_map(|line| describe(line, self.kind)))
     }
 }
@@ -548,5 +587,21 @@ mod tests {
         );
         assert_eq!(formatter.finish(), Some("plain\n".into()));
         assert_eq!(describe("not json", OutputKind::Claude), ["not json"]);
+    }
+
+    #[test]
+    fn carriage_returns_end_lines_and_overlong_lines_stay_bounded() {
+        let mut formatter = Formatter::new(OutputKind::Text);
+        assert_eq!(formatter.push("10%\r50%\r"), Some("10%\n50%\n".into()));
+        assert!(formatter.pending.is_empty());
+        let chunk = "x".repeat(64 * 1024);
+        for _ in 0..(PENDING_LIMIT / chunk.len() + 8) {
+            assert_eq!(formatter.push(&chunk), None);
+            assert!(formatter.pending.len() <= PENDING_LIMIT);
+        }
+        let shown = formatter.push("tail\nnext\n").unwrap();
+        assert!(shown.starts_with("… line longer than"), "{shown}");
+        assert!(shown.ends_with("next\n") && !shown.contains("tail"));
+        assert_eq!(formatter.push("after\n"), Some("after\n".into()));
     }
 }

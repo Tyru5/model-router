@@ -66,6 +66,8 @@ pub fn run(
             kind: OutputKind::Text,
             final_file: PathBuf::new(),
             env: vec![],
+            files: vec![],
+            assign: None,
         };
         let started_at = Utc::now();
         let mut line_start = true;

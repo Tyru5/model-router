@@ -1,12 +1,20 @@
 use super::{
     actions::ActionId,
-    app::App,
+    app::{App, Page},
     completion::{checks_cell, draw_completion},
-    modal::InputTarget,
+    handoff_view::HandoffView,
+    modal::{Ask, Choice, InputTarget, Modal, PickValue},
+    output_search::{Wrapped, visible_lines},
+    run_slot::{RunSlot, SETTLE},
     theme::Palette,
-    widgets::{elapsed, empty_state, short_path},
+    widgets::{elapsed, empty_state, short_path, textarea},
 };
-use crate::{adapters, config::Mode, engine::Status, storage};
+use crate::{
+    adapters,
+    config::Mode,
+    engine::{self, Cmd, Status},
+    storage,
+};
 use anyhow::{Context, Result, bail, ensure};
 use ratatui::{
     Frame,
@@ -15,21 +23,30 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Cell, HighlightSpacing, Paragraph, Row, Table, TableState, Wrap},
 };
-use std::{collections::VecDeque, sync::atomic::Ordering};
+use std::{collections::VecDeque, rc::Rc};
+use unicode_width::UnicodeWidthChar;
 
 impl App {
     pub(super) fn perform_monitor(&mut self, id: ActionId) -> Result<()> {
         match id {
             ActionId::CancelStage => {
-                self.focused.cancel.store(true, Ordering::Relaxed);
-                self.message = "Stopping stage…".into();
+                let run = self.session.run().context("No run selected")?;
+                self.ui.open(Modal::Ask(Box::new(Ask::CancelStage {
+                    run: run.id.clone(),
+                })));
             }
             ActionId::TakeOver => {
-                if self.focused.terminal().is_some() {
-                    self.launch_interactive = true;
+                let slot = self.session.focused().context("No run selected")?;
+                if slot.terminal().is_some() {
+                    self.session.launch_interactive = true;
                     return Ok(());
                 }
-                let run = self.focused.run.as_ref().context("No run selected")?;
+                let run = &slot.run;
+                // A stage waiting for its terminal opens as it is.
+                if slot.worker.is_none() && run.status == Status::Interactive {
+                    self.session.launch_interactive = true;
+                    return Ok(());
+                }
                 let stage = run
                     .workflow
                     .stages
@@ -40,88 +57,182 @@ impl App {
                     "{} sessions cannot be resumed; [i] retries the stage interactively",
                     stage.harness
                 );
-                if self.focused.worker.is_some() {
+                if slot.worker.is_some() {
                     ensure!(
                         stage.mode == Mode::Unattended,
                         "This stage is already interactive"
                     );
-                    self.focused.takeover = true;
-                    self.focused.cancel.store(true, Ordering::Relaxed);
-                    self.message = "Stopping the unattended stage to open its session…".into();
+                    self.ui.open(Modal::Ask(Box::new(Ask::TakeOver {
+                        run: run.id.clone(),
+                    })));
                 } else {
-                    self.focused.run.as_mut().context("No run")?.take_over()?;
-                    self.launch_interactive = true;
+                    self.session
+                        .run_mut()
+                        .context("No run")?
+                        .command(Cmd::TakeOver)?;
+                    self.session.launch_interactive = true;
                 }
             }
-            ActionId::PreviousSessionRun => self.cycle_focus(false),
-            ActionId::NextSessionRun => self.cycle_focus(true),
+            ActionId::PreviousSessionRun => self.session.cycle_focus(false),
+            ActionId::NextSessionRun => self.session.cycle_focus(true),
             ActionId::CloseRun => {
-                self.dismiss()?;
-                self.message = "Run closed here; Runs [3] reopens it.".into();
+                self.session.dismiss()?;
+                self.ui.message = "Run closed here; Runs [3] reopens it.".into();
             }
-            ActionId::ScrollUp if self.results_shown() => {
-                self.focused.results_scroll = self.focused.results_scroll.saturating_sub(5)
+            ActionId::ScrollUp if self.results_shown() => self.view(|slot| {
+                for scroll in &mut slot.results_scroll {
+                    *scroll = scroll.saturating_sub(5);
+                }
+            }),
+            // Each panel stops at its own end, so scrolling back moves both at once.
+            ActionId::ScrollDown if self.results_shown() => self.view(|slot| {
+                let limit = slot.results_limit.get();
+                for (scroll, limit) in slot.results_scroll.iter_mut().zip(limit) {
+                    *scroll = scroll.saturating_add(5).min(limit);
+                }
+            }),
+            // Scrolling up pauses the output; reaching the end follows again.
+            ActionId::ScrollUp => self.view(|slot| slot.scroll_output(-10)),
+            ActionId::ScrollDown => self.view(|slot| slot.scroll_output(10)),
+            ActionId::OutputTop if self.results_shown() => {
+                self.view(|slot| slot.results_scroll = [0; 2])
             }
-            ActionId::ScrollDown if self.results_shown() => {
-                self.focused.results_scroll = self.focused.results_scroll.saturating_add(5)
+            ActionId::OutputBottom if self.results_shown() => {
+                self.view(|slot| slot.results_scroll = slot.results_limit.get())
             }
-            // Wrapped lines can outnumber log entries; drawing clamps the offset.
-            ActionId::ScrollUp => {
-                self.focused.log_scroll = self
-                    .focused
-                    .log_scroll
-                    .saturating_add(10)
-                    .min(self.focused.logs.len() * 4)
+            ActionId::OutputTop => self.view(RunSlot::output_home),
+            ActionId::OutputBottom => self.view(RunSlot::output_end),
+            ActionId::FollowOutput if self.results_shown() => self.view(|slot| {
+                slot.show_output = true;
+                slot.output_end();
+            }),
+            ActionId::FollowOutput => {
+                let message = self.session.focused_mut().and_then(RunSlot::toggle_follow);
+                if let Some(message) = message {
+                    self.ui.message = message;
+                }
             }
-            ActionId::ScrollDown => {
-                self.focused.log_scroll = self.focused.log_scroll.saturating_sub(10)
+            ActionId::FindOutput => self.view(RunSlot::start_output_search),
+            ActionId::OpenLog => {
+                let path = self.focused_log().context("No attempt has output yet")?;
+                self.ui.external = Some(super::external::page_file(&path)?);
             }
             ActionId::Diff => self.show_diff()?,
             ActionId::ToggleResults => self.toggle_results()?,
             ActionId::Handoff => {
-                let run = self.focused.run.as_ref().context("No run selected")?;
+                let run = self.session.run().context("No run selected")?;
                 let index = run.cursor.min(run.stages.len().saturating_sub(1));
-                let handoff = run.stages[index]
-                    .handoff
-                    .as_ref()
-                    .or_else(|| run.stages.iter().rev().find_map(|s| s.handoff.as_ref()));
-                let body = handoff
-                    .map(serde_json::to_string_pretty)
-                    .transpose()?
-                    .unwrap_or_else(|| {
-                        format!(
+                let found = run
+                    .stages
+                    .get(index)
+                    .and_then(|s| s.handoff.as_ref().map(|h| (index, h)))
+                    .or_else(|| {
+                        run.stages
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            .find_map(|(i, s)| s.handoff.as_ref().map(|h| (i, h)))
+                    });
+                match found {
+                    Some((index, handoff)) => {
+                        let stage = run
+                            .workflow
+                            .stages
+                            .get(index)
+                            .map_or_else(String::new, |s| s.name.clone());
+                        self.ui.open(Modal::Handoff(Box::new(HandoffView::new(
+                            handoff.clone(),
+                            stage,
+                        ))));
+                    }
+                    None => {
+                        let body = format!(
                             "No completed handoff yet.\n\n{}\n\nArtifacts: {}",
                             run.error.as_deref().unwrap_or(""),
                             run.directory.display()
-                        )
-                    });
-                self.text("Handoff · [↑↓] scroll · [Esc] closes", body);
+                        );
+                        self.text("Handoff · [↑↓] scroll · [Esc] closes", body);
+                    }
+                }
             }
-            ActionId::Continue => self.start_driver()?,
+            ActionId::Continue => {
+                // `c` pressed as a stage stops was likely meant for the
+                // running stage, so it must not start the next one.
+                ensure!(
+                    self.session
+                        .focused()
+                        .and_then(|slot| slot.stopped_at)
+                        .is_none_or(|at| at.elapsed() >= SETTLE),
+                    "The stage just stopped; press [c] again to continue"
+                );
+                self.start_driver()?
+            }
             ActionId::Advance => {
-                self.focused.run.as_mut().context("No run")?.confirm()?;
+                self.session
+                    .run_mut()
+                    .context("No run")?
+                    .command(Cmd::Confirm)?;
                 self.start_driver()?;
             }
             ActionId::Retry => {
-                self.focused
-                    .run
-                    .as_mut()
+                self.session
+                    .run_mut()
                     .context("No run")?
-                    .retry(false, None)?;
+                    .command(Cmd::Retry {
+                        interactive: false,
+                        model: None,
+                    })?;
                 self.start_driver()?;
             }
             ActionId::RetryInteractive => {
-                let run = self.focused.run.as_mut().context("No run")?;
+                let run = self.session.run_mut().context("No run")?;
                 // A stage already waiting for the terminal opens as it is.
                 if run.status == Status::Interactive {
-                    self.launch_interactive = true;
+                    self.session.launch_interactive = true;
                 } else {
-                    run.retry(true, None)?;
+                    run.command(Cmd::Retry {
+                        interactive: true,
+                        model: None,
+                    })?;
                     self.start_driver()?;
                 }
             }
+            ActionId::RetryCandidate => {
+                let run = self.session.run().context("No run selected")?;
+                let items: Vec<Choice> = retryable_candidates(run)
+                    .into_iter()
+                    .map(|(index, candidate)| Choice {
+                        label: format!(
+                            "{} · {} · {} · {}",
+                            run.workflow.stages[index].name,
+                            candidate.id,
+                            if candidate.model.is_empty() {
+                                candidate.harness.clone()
+                            } else {
+                                format!("{} {}", candidate.harness, candidate.model)
+                            },
+                            candidate.status.label()
+                        ),
+                        value: PickValue::Candidate {
+                            stage: run.workflow.stages[index].id.clone(),
+                            candidate: candidate.id.clone(),
+                        },
+                    })
+                    .collect();
+                ensure!(
+                    !items.is_empty(),
+                    "No failed fan-out candidate to retry; [y] retries the whole stage"
+                );
+                self.ui.open(Modal::Picker {
+                    title: "Retry a fan-out candidate".into(),
+                    items,
+                    selected: 0,
+                    filter: textarea(""),
+                    note: "Reruns the candidate from the fan-out base; the others keep their results and the judge chooses again.".into(),
+                });
+            }
             ActionId::ReplaceModel => {
-                let run = self.focused.run.as_ref().context("No run")?;
+                let run = self.session.run().context("No run")?;
                 let stage = run
                     .workflow
                     .stages
@@ -134,14 +245,15 @@ impl App {
                 );
             }
             ActionId::EditSummary => {
-                let run = self.focused.run.as_ref().context("No run")?;
+                let run = self.session.run().context("No run")?;
                 ensure!(
                     run.status == Status::AwaitingConfirmation,
                     "Only interactive handoffs can be edited"
                 );
-                let summary = run.stages[run.cursor]
-                    .handoff
-                    .as_ref()
+                let summary = run
+                    .stages
+                    .get(run.cursor)
+                    .and_then(|s| s.handoff.as_ref())
                     .map(|h| h.summary.clone())
                     .unwrap_or_default();
                 self.input(
@@ -150,22 +262,82 @@ impl App {
                     &summary,
                 );
             }
-            ActionId::BackToWorkflow => self.page = 0,
+            ActionId::BackToWorkflow => self.ui.page = Page::Workflow,
             other => bail!("{other:?} is not a monitor action"),
         }
         Ok(())
     }
 }
 
+impl App {
+    /// Changes the focused run's view; nothing without a run.
+    fn view(&mut self, change: impl FnOnce(&mut RunSlot)) {
+        if let Some(slot) = self.session.focused_mut() {
+            change(slot);
+        }
+    }
+
+    /// Keys for a search in the focused run's output; false passes the key on.
+    pub(super) fn output_search_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        let handled = self
+            .session
+            .focused_mut()
+            .and_then(|slot| slot.output_search_key(key));
+        if let Some(Some(message)) = &handled {
+            self.ui.message = message.clone();
+        }
+        handled.is_some()
+    }
+
+    /// stdout.log of the focused attempt: the current stage's latest, else
+    /// the latest of any stage.
+    pub(super) fn focused_log(&self) -> Option<std::path::PathBuf> {
+        let run = self.session.run()?;
+        let index = run.cursor.min(run.stages.len().saturating_sub(1));
+        let attempt = run
+            .stages
+            .get(index)
+            .and_then(|s| s.attempts.last())
+            .or_else(|| {
+                run.stages
+                    .iter()
+                    .flat_map(|s| &s.attempts)
+                    .max_by_key(|a| a.started_at)
+            })?;
+        Some(attempt.directory.join("stdout.log"))
+    }
+}
+
+/// Stopped candidates the run can retry, with their stage's index: those of
+/// its stopped fan-out stage, or of any stopped fan-out stage of a graph run.
+fn retryable_candidates(run: &engine::Run) -> Vec<(usize, &engine::CandidateState)> {
+    let stopped = |status| matches!(status, Status::Failed | Status::Blocked | Status::Cancelled);
+    if !stopped(run.status) {
+        return vec![];
+    }
+    run.stages
+        .iter()
+        .enumerate()
+        .filter(|(index, state)| (run.graph() || *index == run.cursor) && stopped(state.status))
+        .filter_map(|(index, state)| Some((index, state.fan_out.as_ref()?)))
+        .flat_map(|(index, fan)| {
+            fan.candidates
+                .iter()
+                .filter(|candidate| stopped(candidate.status))
+                .map(move |candidate| (index, candidate))
+        })
+        .collect()
+}
+
 /// One line listing this session's runs when there is more than one;
 /// false when there is nothing to list.
 fn draw_session(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) -> bool {
-    if app.slots().nth(1).is_none() {
+    if app.session.runs.len() < 2 {
         return false;
     }
     let mut spans = vec![Span::styled("[ ] ", Style::default().fg(palette.accent))];
-    for (index, (slot, focused)) in app.slots().enumerate() {
-        let Some(run) = &slot.run else { continue };
+    for (index, (slot, focused)) in app.session.slots().enumerate() {
+        let run = &slot.run;
         let label = format!(
             " {} {} · {} ",
             index + 1,
@@ -185,10 +357,17 @@ fn draw_session(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) 
 }
 
 /// Output lines wrapped to `width` columns and coloured by what they show:
-/// stage headers, assistant text, tool calls, results, and errors.
-fn output_lines(logs: &VecDeque<String>, width: usize, palette: Palette) -> Vec<Line<'static>> {
+/// stage headers, assistant text, tool calls, results, and errors. `first`
+/// is the absolute number of the first log line.
+pub(super) fn output_lines(
+    logs: &VecDeque<String>,
+    first: u64,
+    width: usize,
+    palette: Palette,
+) -> Wrapped {
     let width = width.max(10);
     let mut lines = Vec::new();
+    let mut starts = Vec::with_capacity(logs.len());
     let mut style = Style::default().fg(palette.muted);
     for log in logs {
         style = if log.starts_with("── ") {
@@ -216,19 +395,77 @@ fn output_lines(logs: &VecDeque<String>, width: usize, palette: Palette) -> Vec<
         } else {
             Style::default().fg(palette.muted)
         };
-        let chars: Vec<char> = log.chars().collect();
-        if chars.is_empty() {
-            lines.push(Line::raw(""));
-        }
-        for row in chars.chunks(width) {
-            lines.push(Line::styled(row.iter().collect::<String>(), style));
+        starts.push(lines.len());
+        for row in wrap(log, width) {
+            lines.push(Line::styled(row, style));
         }
     }
-    lines
+    Wrapped {
+        lines,
+        starts,
+        first,
+    }
+}
+
+/// `text` in rows of at most `width` display columns; wide characters
+/// (CJK, emoji) take two. An empty line is one empty row.
+pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut rows = vec![];
+    let mut row = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let size = c.width().unwrap_or(0);
+        if used + size > width && !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+        row.push(c);
+        used += size;
+    }
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
+/// "  ·  ~$0.42 table of $5.00": spend so far, updated as each attempt
+/// records its usage; empty before any attempt without a budget.
+fn running_cost(slot: &RunSlot) -> String {
+    let report = super::completion::cached_report(slot);
+    let (cost, budget) = (report.usage.cost, report.budget);
+    if cost.attempts == 0 && budget.is_empty() {
+        return String::new();
+    }
+    let mut text = format!("  ·  cost {}", cost.short());
+    if cost.known() {
+        text.push_str(&format!(" {}", cost.sources()));
+    }
+    if let Some(cap) = budget.max_usd {
+        text.push_str(&format!(" of {}", crate::report::dollars(cap)));
+    }
+    if let Some(cap) = budget.max_tokens {
+        text.push_str(&format!(
+            " · {} of {} tokens",
+            crate::report::tokens(cost.tokens),
+            crate::report::tokens(cap)
+        ));
+    }
+    text
+}
+
+/// Stage rows plus fan-out candidate rows in the progress table.
+fn progress_rows(run: &engine::Run) -> usize {
+    run.stages.len()
+        + run
+            .stages
+            .iter()
+            .filter_map(|s| s.fan_out.as_ref())
+            .map(|f| f.candidates.len())
+            .sum::<usize>()
 }
 
 pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
-    let Some(run) = &app.focused.run else {
+    let Some(slot) = app.session.focused() else {
         empty_state(
             frame,
             palette,
@@ -239,10 +476,11 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
         );
         return;
     };
+    let run = &slot.run;
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length((run.stages.len() as u16 + 3).min(10)),
+        Constraint::Length((progress_rows(run) as u16 + 3).min(10)),
         Constraint::Min(3),
     ])
     .split(area);
@@ -256,13 +494,16 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
             palette.status_span(run.status),
             Span::styled(
                 format!(
-                    "   {}  ·  repairs {}/{}",
-                    run.id, run.repair_passes, run.workflow.max_repair_passes
+                    "   {}  ·  repairs {}/{}{}",
+                    run.id,
+                    run.repair_passes,
+                    run.workflow.max_repair_passes,
+                    running_cost(slot)
                 ),
                 Style::default().fg(palette.muted),
             ),
             Span::styled(
-                if app.focused.terminal().is_some() {
+                if slot.terminal().is_some() {
                     "   detached · [t] attach"
                 } else {
                     ""
@@ -280,7 +521,7 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
             height: area.height.saturating_sub(top - area.y),
             ..area
         };
-        draw_completion(frame, app, run, rest, palette);
+        draw_completion(frame, slot, rest, palette);
         return;
     }
     let name_width = run
@@ -288,17 +529,32 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
         .stages
         .iter()
         .map(|s| s.name.chars().count() as u16)
+        .chain(
+            run.stages
+                .iter()
+                .filter_map(|s| s.fan_out.as_ref())
+                .flat_map(|f| &f.candidates)
+                .map(|c| (c.id.len() + c.harness.len() + c.model.len() + 8) as u16),
+        )
         .max()
         .unwrap_or(0)
         .clamp(16, 40);
-    let rows = run.stages.iter().enumerate().map(|(i, state)| {
-        let seconds = state.attempts.last().map(|a| {
+    let seconds = |attempt: Option<&engine::Attempt>| {
+        attempt.map(|a| {
             (a.finished_at.unwrap_or_else(chrono::Utc::now) - a.started_at)
                 .num_seconds()
                 .max(0)
-        });
-        Row::new([
-            Cell::from(run.workflow.stages[i].name.clone()),
+        })
+    };
+    let mut rows = vec![];
+    // The cursor's row, counting the candidate rows above it.
+    let mut selected = 0;
+    for (index, (state, stage)) in run.stages.iter().zip(&run.workflow.stages).enumerate() {
+        if index == run.cursor.min(run.stages.len().saturating_sub(1)) {
+            selected = rows.len();
+        }
+        rows.push(Row::new([
+            Cell::from(stage.name.clone()),
             Cell::from(palette.status_span(state.status)),
             Cell::from(state.attempts.len().to_string()).style(Style::default().fg(palette.muted)),
             Cell::from(checks_cell(
@@ -309,10 +565,55 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
                     .flat_map(|a| a.checks.iter().map(|c| c.status)),
             ))
             .style(Style::default().fg(palette.muted)),
-            Cell::from(seconds.map(elapsed).unwrap_or_else(|| "–".into()))
+            Cell::from(
+                seconds(state.attempts.last())
+                    .map(elapsed)
+                    .unwrap_or_else(|| "–".into()),
+            )
+            .style(Style::default().fg(palette.muted)),
+        ]));
+        // Fan-out candidates, indented under their stage; ★ marks the choice.
+        let Some(fan) = &state.fan_out else {
+            continue;
+        };
+        let chosen = fan.selection.as_ref().map(|s| s.candidate.as_str());
+        for candidate in &fan.candidates {
+            rows.push(Row::new([
+                Cell::from(format!(
+                    "  {} {} · {}",
+                    if chosen == Some(candidate.id.as_str()) {
+                        "★"
+                    } else {
+                        "↳"
+                    },
+                    candidate.id,
+                    if candidate.model.is_empty() {
+                        candidate.harness.clone()
+                    } else {
+                        format!("{} {}", candidate.harness, candidate.model)
+                    }
+                ))
                 .style(Style::default().fg(palette.muted)),
-        ])
-    });
+                Cell::from(palette.status_span(candidate.status)),
+                Cell::from(candidate.attempts.len().to_string())
+                    .style(Style::default().fg(palette.muted)),
+                Cell::from(checks_cell(
+                    candidate
+                        .attempts
+                        .last()
+                        .into_iter()
+                        .flat_map(|a| a.checks.iter().map(|c| c.status)),
+                ))
+                .style(Style::default().fg(palette.muted)),
+                Cell::from(
+                    seconds(candidate.attempts.last())
+                        .map(elapsed)
+                        .unwrap_or_else(|| "–".into()),
+                )
+                .style(Style::default().fg(palette.muted)),
+            ]));
+        }
+    }
     frame.render_stateful_widget(
         Table::new(
             rows,
@@ -334,13 +635,33 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
         .highlight_spacing(HighlightSpacing::Always)
         .row_highlight_style(palette.selected_style()),
         chunks[2],
-        &mut TableState::default().with_selected(Some(run.cursor.min(run.stages.len() - 1))),
+        &mut TableState::default().with_selected(Some(selected)),
     );
     let cols = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(chunks[3]);
-    let visible = cols[0].height.saturating_sub(2) as usize;
-    let output_block = palette.panel_with("Output", &[("PgUp/PgDn", "scroll")]);
-    if app.focused.logs.is_empty() {
+    let paused = !slot.log_view.follow;
+    let mut output_block = palette.panel_with(
+        if paused {
+            "Output · ▲ paused — End to follow"
+        } else {
+            "Output"
+        },
+        // The paused notice needs the room at narrow widths.
+        if paused {
+            &[]
+        } else {
+            &[("PgUp/PgDn", "scroll"), ("/", "search")]
+        },
+    );
+    if let Some(status) = slot.output_search_status() {
+        output_block = output_block.title_bottom(Line::styled(
+            format!(" {status} "),
+            Style::default().fg(palette.accent),
+        ));
+    }
+    let visible = output_block.inner(cols[0]).height as usize;
+    slot.log_visible.set(visible);
+    if slot.logs.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::styled(
                 "Harness output appears here. Some harnesses emit their final response only when the stage finishes. Full logs are saved on disk.",
@@ -351,25 +672,38 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
             cols[0],
         );
     } else {
-        let lines = output_lines(
-            &app.focused.logs,
-            cols[0].width.saturating_sub(2) as usize,
-            palette,
-        );
-        let scroll = app
-            .focused
-            .log_scroll
-            .min(lines.len().saturating_sub(visible));
-        let end = lines.len() - scroll;
-        let start = end.saturating_sub(visible);
+        // The panel's own inner width: borders and padding included.
+        let width = output_block.inner(cols[0]).width as usize;
+        // Wrapped lines are kept until the log, width, or theme changes.
+        let key = (width, slot.log_version, app.ui.displayed_theme());
+        let mut cache = slot.cache.borrow_mut();
+        let lines = match &cache.output {
+            Some((cached, lines)) if *cached == key => lines.clone(),
+            _ => {
+                let first = slot.log_version.saturating_sub(slot.logs.len() as u64);
+                let lines = Rc::new(output_lines(&slot.logs, first, width, palette));
+                cache.output = Some((key, lines.clone()));
+                lines
+            }
+        };
+        drop(cache);
+        // Paused output keeps its top line as new output arrives.
+        let top = lines.top(slot.log_view, visible);
         frame.render_widget(
-            Paragraph::new(lines[start..end].to_vec()).block(output_block),
+            Paragraph::new(visible_lines(
+                &lines,
+                top,
+                visible,
+                slot.log_search.as_ref(),
+                palette,
+            ))
+            .block(output_block),
             cols[0],
         );
     }
     let handoff = run
         .stages
-        .get(run.cursor.min(run.stages.len() - 1))
+        .get(run.cursor.min(run.stages.len().saturating_sub(1)))
         .and_then(|s| s.handoff.as_ref());
     let summary: Vec<Line> = if let Some(error) = &run.error {
         vec![

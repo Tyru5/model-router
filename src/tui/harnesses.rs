@@ -1,3 +1,4 @@
+use super::tasks::{Msg, Tasks};
 use super::{actions::ActionId, app::App, theme::Palette, widgets::short_path};
 use crate::{
     catalog,
@@ -12,11 +13,7 @@ use ratatui::{
     text::Line,
     widgets::{Cell, HighlightSpacing, Row, Table, TableState},
 };
-use std::{
-    path::Path,
-    sync::mpsc::{self, Receiver, TryRecvError},
-    thread,
-};
+use std::path::Path;
 
 pub(super) type Probe = fn(&Settings, &Path) -> Vec<Report>;
 
@@ -25,49 +22,47 @@ pub(super) type Probe = fn(&Settings, &Path) -> Vec<Report>;
 /// thread when the page opens.
 pub(super) struct HarnessChecks {
     pub(super) reports: Vec<Report>,
-    receiver: Option<Receiver<Vec<Report>>>,
+    /// A check is running.
+    pub(super) checking: bool,
     /// Tests swap in a stub so no harness runs.
     pub(super) probe: Probe,
+}
+/// The Harnesses page: doctor results and the selected row.
+#[derive(Default)]
+pub(super) struct HarnessesPage {
+    pub(super) selected: usize,
+    pub(super) checks: HarnessChecks,
+}
+
+impl Default for HarnessChecks {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl HarnessChecks {
     pub(super) fn new() -> Self {
         Self {
             reports: vec![],
-            receiver: None,
+            checking: false,
             probe: doctor::inspect_all,
         }
     }
     /// Starts a check unless one is running. Old results stay until new ones arrive.
-    pub(super) fn start(&mut self, settings: &Settings, project: &Path) {
-        if self.checking() {
+    pub(super) fn start(&mut self, settings: &Settings, project: &Path, tasks: &Tasks) {
+        if self.checking {
             return;
         }
-        let (sender, receiver) = mpsc::channel();
+        self.checking = true;
         let (settings, project, probe) = (settings.clone(), project.to_path_buf(), self.probe);
-        thread::spawn(move || {
-            let _ = sender.send(probe(&settings, &project));
-        });
-        self.receiver = Some(receiver);
-    }
-    pub(super) fn checking(&self) -> bool {
-        self.receiver.is_some()
-    }
-    /// Some(true) when results arrived, Some(false) when the check died.
-    pub(super) fn poll(&mut self) -> Option<bool> {
-        let arrived = match self.receiver.as_ref()?.try_recv() {
-            Ok(reports) => {
-                self.reports = reports;
-                true
-            }
-            Err(TryRecvError::Empty) => return None,
-            Err(TryRecvError::Disconnected) => false,
-        };
-        self.receiver = None;
-        Some(arrived)
+        tasks.spawn(
+            "Harness check failed",
+            move || Ok(probe(&settings, &project)),
+            Msg::Checks,
+        );
     }
     pub(super) fn clear(&mut self) {
         self.reports.clear();
-        self.receiver = None;
+        self.checking = false;
     }
     pub(super) fn report(&self, harness: &str) -> Option<&Report> {
         self.reports.iter().find(|r| r.harness == harness)
@@ -95,37 +90,53 @@ fn missing(report: &Report) -> Vec<&str> {
     flags
 }
 
-impl App {
+impl HarnessesPage {
     /// Harness names in display order: the last results, or the configured
     /// harnesses until the first check finishes.
-    fn harness_names(&self) -> Vec<String> {
-        if self.harness_checks.reports.is_empty() {
-            catalog::known_harnesses(&self.settings)
+    pub(super) fn names(&self, settings: &Settings) -> Vec<String> {
+        if self.checks.reports.is_empty() {
+            catalog::known_harnesses(settings)
         } else {
-            self.harness_checks
+            self.checks
                 .reports
                 .iter()
                 .map(|r| r.harness.clone())
                 .collect()
         }
     }
+}
+
+impl App {
     pub(super) fn perform_harnesses(&mut self, id: ActionId) -> Result<()> {
         match id {
             ActionId::NextHarness => {
-                self.harness_selected =
-                    (self.harness_selected + 1).min(self.harness_names().len().saturating_sub(1))
+                self.harnesses.selected = (self.harnesses.selected + 1).min(
+                    self.harnesses
+                        .names(&self.editor.settings)
+                        .len()
+                        .saturating_sub(1),
+                )
             }
             ActionId::PreviousHarness => {
-                self.harness_selected = self.harness_selected.saturating_sub(1)
+                self.harnesses.selected = self.harnesses.selected.saturating_sub(1)
             }
             ActionId::HarnessDetails => {
-                let Some(harness) = self.harness_names().get(self.harness_selected).cloned() else {
+                let Some(harness) = self
+                    .harnesses
+                    .names(&self.editor.settings)
+                    .get(self.harnesses.selected)
+                    .cloned()
+                else {
                     return Ok(());
                 };
-                let body = details(&harness, self.harness_checks.report(&harness));
+                let body = details(&harness, self.harnesses.checks.report(&harness));
                 self.text(&harness, body);
             }
-            ActionId::RefreshHarnesses => self.harness_checks.start(&self.settings, &self.project),
+            ActionId::RefreshHarnesses => {
+                self.harnesses
+                    .checks
+                    .start(&self.editor.settings, &self.project, &self.tasks)
+            }
             other => bail!("{other:?} is not a Harnesses action"),
         }
         Ok(())
@@ -180,12 +191,20 @@ fn details(harness: &str, report: Option<&Report>) -> String {
     text.push_str(&format!(
         "\n{}\n\nSelect this harness with [h] on the workflow page, then press [m] to load model selections. Use [c] on Workflow to configure the selected stage, including permissions and extra arguments.\n\nPermissions inherit the harness configuration unless overridden for a stage.\n\n{}\n\nCustom adapters are defined in TOML. See README.md for the template contract.",
         doctor::AUTH_NOTE,
-        if harness == "amp" {
-            "Amp uses mode keys. A mode determines its model and tools."
-        } else {
-            "A model must be supported by the selected harness/provider."
+        match crate::harness::get(harness) {
+            Some(spec) if matches!(spec.model, crate::harness::ModelPass::Mode(_)) => format!(
+                "{} uses mode keys. A mode determines its model and tools.",
+                spec.display
+            ),
+            _ => "A model must be supported by the selected harness/provider.".into(),
         }
     ));
+    if let Some(spec) = crate::harness::get(harness) {
+        text.push_str(&format!(
+            "\n{}: {} `model-router harnesses --spec {harness}` prints its full spec.\n",
+            spec.display, spec.notes
+        ));
+    }
     text
 }
 
@@ -199,9 +218,9 @@ fn clip(text: &str, width: usize) -> String {
 }
 
 pub(super) fn draw_harnesses(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
-    let checks = &app.harness_checks;
+    let checks = &app.harnesses.checks;
     let wide = area.width >= 110;
-    let names = app.harness_names();
+    let names = app.harnesses.names(&app.editor.settings);
     let name_width = names.iter().map(|n| n.chars().count()).max().unwrap_or(7);
     let name_width = name_width.clamp(7, 14);
     let version_width = if area.width >= 140 { 22 } else { 10 };
@@ -220,7 +239,7 @@ pub(super) fn draw_harnesses(frame: &mut Frame<'_>, app: &App, area: Rect, palet
             return Row::new([
                 Cell::from(clip(name, name_width)),
                 styled(
-                    if checks.checking() {
+                    if checks.checking {
                         "checking…"
                     } else {
                         "not checked"
@@ -281,7 +300,7 @@ pub(super) fn draw_harnesses(frame: &mut Frame<'_>, app: &App, area: Rect, palet
             palette.muted
         }))
     });
-    let note = if checks.checking() {
+    let note = if checks.checking {
         " checking… "
     } else {
         " uses existing logins and provider settings "
@@ -313,7 +332,7 @@ pub(super) fn draw_harnesses(frame: &mut Frame<'_>, app: &App, area: Rect, palet
             .highlight_spacing(HighlightSpacing::Always)
             .row_highlight_style(palette.selected_style()),
         area,
-        &mut TableState::default().with_selected(Some(app.harness_selected)),
+        &mut TableState::default().with_selected(Some(app.harnesses.selected)),
     );
 }
 
@@ -349,6 +368,7 @@ mod tests {
             version: None,
             tested_versions: vec![],
             version_tested: None,
+            version_captured: false,
             capabilities: None,
             summary: "not checked".into(),
             notes: vec![AUTH_NOTE.into()],
@@ -386,7 +406,7 @@ mod tests {
             PathBuf::from("/tmp/config"),
             Arc::new(AtomicBool::new(false)),
         );
-        app.harness_checks.probe = stub;
+        app.harnesses.checks.probe = stub;
         app
     }
 
@@ -396,13 +416,13 @@ mod tests {
 
     fn wait(app: &mut App) {
         let start = Instant::now();
-        while app.harness_checks.checking() {
+        while app.harnesses.checks.checking {
             assert!(
                 start.elapsed() < Duration::from_secs(5),
                 "check never finished"
             );
             app.poll().unwrap();
-            thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -432,16 +452,16 @@ mod tests {
     #[test]
     fn page_checks_in_background_and_shows_doctor_columns() {
         let mut app = app();
-        let palette = app.palette();
+        let palette = app.ui.palette();
         press(&mut app, KeyCode::Char('4'));
-        assert!(app.harness_checks.checking());
+        assert!(app.harnesses.checks.checking);
         let (text, _) = render(&mut app, 80, "checking…");
         assert!(
             text.contains("codex") && text.contains("checking…"),
             "{text}"
         );
         wait(&mut app);
-        assert_eq!(app.harness_checks.reports.len(), 3);
+        assert_eq!(app.harnesses.checks.reports.len(), 3);
 
         let (text, color) = render(&mut app, 80, "missing: --variant");
         assert_eq!(color, Some(palette.warn), "{text}");
@@ -464,12 +484,12 @@ mod tests {
         );
 
         // Refresh keeps old rows until fresh results arrive.
-        app.harness_checks.reports.truncate(1);
+        app.harnesses.checks.reports.truncate(1);
         press(&mut app, KeyCode::Char('r'));
-        assert!(app.harness_checks.checking());
-        assert_eq!(app.harness_checks.reports.len(), 1);
+        assert!(app.harnesses.checks.checking);
+        assert_eq!(app.harnesses.checks.reports.len(), 1);
         wait(&mut app);
-        assert_eq!(app.harness_checks.reports.len(), 3);
+        assert_eq!(app.harnesses.checks.reports.len(), 3);
     }
 
     #[test]
@@ -477,15 +497,15 @@ mod tests {
         let mut app = app();
         press(&mut app, KeyCode::Char('4'));
         press(&mut app, KeyCode::Enter);
-        let Some(super::super::modal::Modal::Text { body, .. }) = &app.modal else {
+        let Some(super::super::modal::Modal::Text { body, .. }) = app.ui.dialog() else {
             panic!("details did not open");
         };
         assert!(body.contains("Still checking"), "{body}");
-        app.modal = None;
+        app.ui.dialogs.clear();
         wait(&mut app);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
-        let Some(super::super::modal::Modal::Text { title, body, .. }) = &app.modal else {
+        let Some(super::super::modal::Modal::Text { title, body, .. }) = app.ui.dialog() else {
             panic!("details did not open");
         };
         assert_eq!(title, "opencode");
@@ -507,7 +527,7 @@ mod tests {
     #[test]
     fn workflow_warns_only_from_cached_results() {
         let mut app = app();
-        app.stage_mut().harness = "opencode".into();
+        app.editor.stage_mut().harness = "opencode".into();
         let warning = "⚠ opencode 2.0.22 lacks --variant, --interactive; see Harnesses [4]";
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(260, 40)).unwrap();
@@ -525,12 +545,12 @@ mod tests {
         };
         assert!(!draw(&mut app).contains("lacks"));
         assert!(
-            !app.harness_checks.checking(),
+            !app.harnesses.checks.checking,
             "Workflow must not run doctor"
         );
-        app.harness_checks.reports = stub(&app.settings, &app.project);
+        app.harnesses.checks.reports = stub(&app.editor.settings, &app.project);
         assert!(draw(&mut app).contains(warning));
-        app.stage_mut().harness = "codex".into();
+        app.editor.stage_mut().harness = "codex".into();
         assert!(!draw(&mut app).contains("lacks"));
     }
 }

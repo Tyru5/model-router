@@ -36,3 +36,12 @@ harness = "demo"
 provider = "review"
 model = "demo-reviewer"
 instructions = "Request one repair, then pass."
+
+[[workflows.stages]]
+id = "summary"
+name = "Review summary"
+role = "summary"
+harness = "demo"
+provider = "summary"
+model = "demo-summarizer"
+instructions = "Brief the reviewer. This mock makes no model calls."

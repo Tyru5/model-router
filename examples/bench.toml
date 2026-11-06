@@ -1,0 +1,34 @@
+# model-router bench examples/bench.toml --dry-run
+#
+# Every task runs under every combination of the matrix's assignments, each
+# run unattended in its own Git worktree from committed HEAD.
+
+# Base workflow (default: the first configured). The built-in "Feature
+# development" implements interactively, so this bench needs
+# --allow-interactive, or a workflow whose stages are unattended.
+workflow = "Feature development"
+# Runs of each task under each variant.
+repeat = 1
+
+tasks = [
+  { name = "greeting", text = "Add a --greeting flag that prints a configurable greeting, with a test." },
+  # Markdown or text file, relative to this bench file (up to 32 KiB):
+  # { name = "spec", file = "tasks/spec.md" },
+]
+
+# Vary the implement stage: 2 variants × 1 task = 2 runs.
+[[matrix]]
+stage = "implement"
+assignments = [
+  { harness = "claude", model = "opus" },
+  { harness = "codex", model = "gpt-6-astra" },
+]
+
+# A second axis multiplies the variants (2 × 2 = 4):
+# [[matrix]]
+# stage = "research"
+# assignments = [{ model = "gpt-6-astra" }, { harness = "claude", model = "sonnet" }]
+#
+# Assignment fields: harness, model, provider, effort, extra_args. Changing the
+# harness clears the stage's provider, effort, harness settings, and extra
+# arguments unless given here.

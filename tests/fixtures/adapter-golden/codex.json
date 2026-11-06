@@ -1,0 +1,3135 @@
+{
+  "unattended/default": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+provider": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_provider=\"openrouter\"",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_provider=\"openrouter\"",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "model_provider=\"openrouter\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+local-provider": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--oss",
+        "--local-provider",
+        "ollama",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--oss",
+        "--local-provider",
+        "ollama",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--oss",
+        "--local-provider",
+        "ollama",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+lmstudio": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--oss",
+        "--local-provider",
+        "lmstudio",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--oss",
+        "--local-provider",
+        "lmstudio",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--oss",
+        "--local-provider",
+        "lmstudio",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+effort": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/effort-only": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+provider+effort": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_provider=\"openrouter\"",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_provider=\"openrouter\"",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "model_provider=\"openrouter\"",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/routed": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/routed-keyless": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-local.name=\"local\"",
+        "--config",
+        "model_providers.model-router-local.base_url=\"http://localhost:8000\"",
+        "--config",
+        "model_provider=\"model-router-local\"",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-local.name=\"local\"",
+        "--config",
+        "model_providers.model-router-local.base_url=\"http://localhost:8000\"",
+        "--config",
+        "model_provider=\"model-router-local\"",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-local.name=\"local\"",
+        "--config",
+        "model_providers.model-router-local.base_url=\"http://localhost:8000\"",
+        "--config",
+        "model_provider=\"model-router-local\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/routed-preset": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-groq.name=\"groq\"",
+        "--config",
+        "model_providers.model-router-groq.base_url=\"https://api.groq.com/openai/v1\"",
+        "--config",
+        "model_providers.model-router-groq.env_key=\"GROQ_API_KEY\"",
+        "--config",
+        "model_provider=\"model-router-groq\"",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GROQ_API_KEY",
+          {
+            "var": "GROQ_API_KEY"
+          }
+        ]
+      ],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-groq.name=\"groq\"",
+        "--config",
+        "model_providers.model-router-groq.base_url=\"https://api.groq.com/openai/v1\"",
+        "--config",
+        "model_providers.model-router-groq.env_key=\"GROQ_API_KEY\"",
+        "--config",
+        "model_provider=\"model-router-groq\"",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-groq.name=\"groq\"",
+        "--config",
+        "model_providers.model-router-groq.base_url=\"https://api.groq.com/openai/v1\"",
+        "--config",
+        "model_providers.model-router-groq.env_key=\"GROQ_API_KEY\"",
+        "--config",
+        "model_provider=\"model-router-groq\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GROQ_API_KEY",
+          {
+            "var": "GROQ_API_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/routed+effort": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/provider-without-model": {
+    "build": {
+      "error": "A provider override requires a model"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "A provider override requires a model"
+    }
+  },
+  "unattended/structured-off-old-version": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--model",
+        "m-1",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--model",
+        "m-1",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/old-version-routed": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/old-version-default": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/extra-args": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/user-output-schema": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    }
+  },
+  "unattended/user-json-schema": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/unknown-setting": {
+    "build": {
+      "error": "codex has no stage setting nope"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "codex has no stage setting nope"
+    }
+  },
+  "unattended/setting:sandbox=read-only": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--sandbox",
+        "read-only",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--sandbox",
+        "read-only",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--sandbox",
+        "read-only",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/setting:sandbox=workspace-write": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--sandbox",
+        "workspace-write",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--sandbox",
+        "workspace-write",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--sandbox",
+        "workspace-write",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/setting:sandbox=danger-full-access": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--sandbox",
+        "danger-full-access",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--sandbox",
+        "danger-full-access",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--sandbox",
+        "danger-full-access",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/setting:sandbox=": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/setting:sandbox+invalid": {
+    "build": {
+      "error": "Invalid Sandbox for codex: not-a-choice"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "Invalid Sandbox for codex: not-a-choice"
+    }
+  },
+  "unattended/setting:approval_policy=on-request": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "approval_policy=\"on-request\"",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "approval_policy=\"on-request\"",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "approval_policy=\"on-request\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/setting:approval_policy=never": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "approval_policy=\"never\"",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "approval_policy=\"never\"",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "approval_policy=\"never\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/setting:approval_policy=": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/setting:approval_policy+invalid": {
+    "build": {
+      "error": "Invalid Approval policy for codex: not-a-choice"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "Invalid Approval policy for codex: not-a-choice"
+    }
+  },
+  "interactive/default": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+provider": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "model_provider=\"openrouter\"",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "model_provider=\"openrouter\"",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "model_provider=\"openrouter\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+local-provider": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "--oss",
+        "--local-provider",
+        "ollama",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--oss",
+        "--local-provider",
+        "ollama",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--oss",
+        "--local-provider",
+        "ollama",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+lmstudio": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "--oss",
+        "--local-provider",
+        "lmstudio",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--oss",
+        "--local-provider",
+        "lmstudio",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--oss",
+        "--local-provider",
+        "lmstudio",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+effort": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/effort-only": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+provider+effort": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "model_provider=\"openrouter\"",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "model_provider=\"openrouter\"",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "model_provider=\"openrouter\"",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/routed": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/routed-keyless": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-local.name=\"local\"",
+        "--config",
+        "model_providers.model-router-local.base_url=\"http://localhost:8000\"",
+        "--config",
+        "model_provider=\"model-router-local\"",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-local.name=\"local\"",
+        "--config",
+        "model_providers.model-router-local.base_url=\"http://localhost:8000\"",
+        "--config",
+        "model_provider=\"model-router-local\"",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-local.name=\"local\"",
+        "--config",
+        "model_providers.model-router-local.base_url=\"http://localhost:8000\"",
+        "--config",
+        "model_provider=\"model-router-local\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/routed-preset": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-groq.name=\"groq\"",
+        "--config",
+        "model_providers.model-router-groq.base_url=\"https://api.groq.com/openai/v1\"",
+        "--config",
+        "model_providers.model-router-groq.env_key=\"GROQ_API_KEY\"",
+        "--config",
+        "model_provider=\"model-router-groq\"",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GROQ_API_KEY",
+          {
+            "var": "GROQ_API_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-groq.name=\"groq\"",
+        "--config",
+        "model_providers.model-router-groq.base_url=\"https://api.groq.com/openai/v1\"",
+        "--config",
+        "model_providers.model-router-groq.env_key=\"GROQ_API_KEY\"",
+        "--config",
+        "model_provider=\"model-router-groq\"",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-groq.name=\"groq\"",
+        "--config",
+        "model_providers.model-router-groq.base_url=\"https://api.groq.com/openai/v1\"",
+        "--config",
+        "model_providers.model-router-groq.env_key=\"GROQ_API_KEY\"",
+        "--config",
+        "model_provider=\"model-router-groq\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GROQ_API_KEY",
+          {
+            "var": "GROQ_API_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/routed+effort": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/provider-without-model": {
+    "build": {
+      "error": "A provider override requires a model"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "A provider override requires a model"
+    }
+  },
+  "interactive/structured-off-old-version": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/old-version-routed": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/old-version-default": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/extra-args": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/user-output-schema": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    }
+  },
+  "interactive/user-json-schema": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/unknown-setting": {
+    "build": {
+      "error": "codex has no stage setting nope"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "codex has no stage setting nope"
+    }
+  },
+  "interactive/setting:sandbox=read-only": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "--sandbox",
+        "read-only",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--sandbox",
+        "read-only",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--sandbox",
+        "read-only",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/setting:sandbox=workspace-write": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "--sandbox",
+        "workspace-write",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--sandbox",
+        "workspace-write",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--sandbox",
+        "workspace-write",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/setting:sandbox=danger-full-access": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "--sandbox",
+        "danger-full-access",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--sandbox",
+        "danger-full-access",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--sandbox",
+        "danger-full-access",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/setting:sandbox=": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/setting:sandbox+invalid": {
+    "build": {
+      "error": "Invalid Sandbox for codex: not-a-choice"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "Invalid Sandbox for codex: not-a-choice"
+    }
+  },
+  "interactive/setting:approval_policy=on-request": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "approval_policy=\"on-request\"",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "approval_policy=\"on-request\"",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "approval_policy=\"on-request\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/setting:approval_policy=never": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "approval_policy=\"never\"",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--config",
+        "approval_policy=\"never\"",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "--config",
+        "approval_policy=\"never\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/setting:approval_policy=": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/setting:approval_policy+invalid": {
+    "build": {
+      "error": "Invalid Approval policy for codex: not-a-choice"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "Invalid Approval policy for codex: not-a-choice"
+    }
+  }
+}

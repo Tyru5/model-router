@@ -1,4 +1,5 @@
 use super::input::InputField;
+use super::tasks::{Msg, Spawner, ticket};
 use super::theme::Palette;
 use super::widgets::{content, menu_key, textarea};
 use crate::{catalog, storage};
@@ -17,13 +18,14 @@ use std::{
 };
 use tui_textarea::CursorMove;
 
-struct Entry {
+/// A folder or file in a listing.
+pub(super) struct FolderEntry {
     path: PathBuf,
     repository: bool,
     directory: bool,
 }
 
-impl Entry {
+impl FolderEntry {
     fn new(path: PathBuf) -> Self {
         // Linked worktrees and submodules use a .git file instead of a directory.
         let git = path.join(".git");
@@ -48,30 +50,69 @@ pub(super) enum PickerAction {
     Close,
 }
 
+/// A folder being read on a background thread; network drives (such as
+/// /mnt/c under WSL) can take seconds.
+struct Reading {
+    directory: PathBuf,
+    /// The entry to select once read.
+    select: Option<PathBuf>,
+    /// Identifies the read's result.
+    ticket: u64,
+}
+
 pub(super) struct PathPicker {
     directory: PathBuf,
-    entries: Vec<Entry>,
-    recent: Vec<Entry>,
+    reading: Option<Reading>,
+    entries: Vec<FolderEntry>,
+    recent: Vec<FolderEntry>,
     show_recent: bool,
     selected: usize,
     filter: InputField<'static>,
     path_input: Option<InputField<'static>>,
     pub error: String,
     files: bool,
+    spawner: Spawner,
+}
+
+/// The folders (and with `files`, files) in `directory`, repositories or
+/// folders first.
+fn read_entries(directory: &Path, files: bool) -> std::result::Result<Vec<FolderEntry>, String> {
+    let mut entries: Vec<_> = fs::read_dir(directory)
+        .map_err(|e| format!("Cannot browse {}: {e}", directory.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry.file_name() != ".git"
+                && (entry.path().is_dir() || (files && entry.path().is_file()))
+        })
+        .map(|entry| FolderEntry::new(entry.path()))
+        .collect();
+    entries.sort_by_cached_key(|entry| {
+        (
+            if files {
+                !entry.directory
+            } else {
+                !entry.repository
+            },
+            entry.name().to_lowercase(),
+            entry.path.clone(),
+        )
+    });
+    Ok(entries)
 }
 
 impl PathPicker {
     pub(super) fn active_input(&mut self) -> &mut InputField<'static> {
         self.path_input.as_mut().unwrap_or(&mut self.filter)
     }
-    pub fn new(project: &Path, recent: Vec<PathBuf>) -> Result<Self> {
+    pub fn new(project: &Path, recent: Vec<PathBuf>, spawner: Spawner) -> Result<Self> {
         let mut picker = Self {
             directory: project.into(),
+            reading: None,
             entries: vec![],
             recent: recent
                 .into_iter()
                 .filter(|p| p.is_dir())
-                .map(Entry::new)
+                .map(FolderEntry::new)
                 .collect(),
             show_recent: false,
             selected: 0,
@@ -79,16 +120,19 @@ impl PathPicker {
             path_input: None,
             error: String::new(),
             files: false,
+            spawner,
         };
         let parent = project.parent().unwrap_or(project);
-        picker.visit(parent).or_else(|_| picker.visit(project))?;
-        picker.select_path(project);
+        picker
+            .visit_selecting(parent, Some(project.into()))
+            .or_else(|_| picker.visit(project))?;
         Ok(picker)
     }
 
-    pub fn files(project: &Path) -> Result<Self> {
+    pub fn files(project: &Path, spawner: Spawner) -> Result<Self> {
         let mut picker = Self {
             directory: project.into(),
+            reading: None,
             entries: vec![],
             recent: vec![],
             show_recent: false,
@@ -97,44 +141,82 @@ impl PathPicker {
             path_input: None,
             error: String::new(),
             files: true,
+            spawner,
         };
         picker.visit(project)?;
         Ok(picker)
     }
 
     fn visit(&mut self, path: &Path) -> Result<()> {
+        self.visit_selecting(path, None)
+    }
+
+    /// Starts reading `path`; the view changes when it arrives. A path that is
+    /// not a directory fails now, keeping the current view.
+    fn visit_selecting(&mut self, path: &Path, select: Option<PathBuf>) -> Result<()> {
         let directory = catalog::check_project(path)?;
-        let mut entries: Vec<_> = fs::read_dir(&directory)
-            .with_context(|| format!("Cannot browse {}", directory.display()))?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry.file_name() != ".git"
-                    && (entry.path().is_dir() || (self.files && entry.path().is_file()))
-            })
-            .map(|entry| Entry::new(entry.path()))
-            .collect();
-        entries.sort_by_cached_key(|entry| {
-            (
-                if self.files {
-                    !entry.directory
-                } else {
-                    !entry.repository
-                },
-                entry.name().to_lowercase(),
-                entry.path.clone(),
-            )
+        let (target, files, ticket) = (directory.clone(), self.files, ticket());
+        self.spawner.spawn(
+            "Reading the folder stopped",
+            move || read_entries(&target, files),
+            move |result| Msg::Folder { ticket, result },
+        );
+        self.reading = Some(Reading {
+            directory,
+            select,
+            ticket,
         });
-        // Only replace the view after a successful read, so failed navigation is recoverable.
-        self.directory = directory;
-        self.entries = entries;
-        self.show_recent = false;
-        self.selected = 0;
         self.filter = textarea("");
+        self.show_recent = false;
         self.error.clear();
         Ok(())
     }
 
-    fn entries(&self) -> &[Entry] {
+    /// Whether the folder being read reports with `ticket`.
+    pub(super) fn waits_for(&self, ticket: u64) -> bool {
+        self.reading.as_ref().is_some_and(|r| r.ticket == ticket)
+    }
+
+    /// Shows a folder that finished reading; false when `ticket` is not
+    /// the read this picker waits for.
+    pub(super) fn folder_read(
+        &mut self,
+        ticket: u64,
+        result: std::result::Result<Vec<FolderEntry>, String>,
+    ) -> bool {
+        if !self.waits_for(ticket) {
+            return false;
+        }
+        let reading = self.reading.take().expect("a folder was being read");
+        match result {
+            // Only replace the view after a successful read, so failed navigation is recoverable.
+            Ok(entries) => {
+                self.directory = reading.directory;
+                self.entries = entries;
+                // Recent projects may have been chosen while the folder was read.
+                if !self.show_recent {
+                    self.selected = 0;
+                    if let Some(path) = reading.select {
+                        self.select_path(&path);
+                    }
+                }
+            }
+            Err(error) => self.error = error,
+        }
+        true
+    }
+
+    /// Waits for the folder being read, as tests need.
+    #[cfg(test)]
+    pub(super) fn wait(&mut self, inbox: &std::sync::mpsc::Receiver<(u64, Msg)>) {
+        while self.reading.is_some() {
+            if let (_, Msg::Folder { ticket, result }) = inbox.recv().expect("a folder read") {
+                self.folder_read(ticket, result);
+            }
+        }
+    }
+
+    fn entries(&self) -> &[FolderEntry] {
         if self.show_recent {
             &self.recent
         } else {
@@ -265,8 +347,7 @@ impl PathPicker {
             Key::Left => {
                 let previous = self.directory.clone();
                 let parent = previous.parent().unwrap_or(&previous);
-                self.visit(parent)?;
-                self.select_path(&previous);
+                self.visit_selecting(parent, Some(previous.clone()))?;
             }
             Key::Enter | Key::Right => {
                 if let Some((path, selectable)) = self.highlighted() {
@@ -321,12 +402,14 @@ impl PathPicker {
                 chunks[0],
             );
         }
+        let shown = self
+            .reading
+            .as_ref()
+            .map_or(&self.directory, |r| &r.directory);
         frame.render_widget(
-            Paragraph::new(storage::clean_terminal(
-                &self.directory.display().to_string(),
-            ))
-            .style(Style::default().fg(palette.fg))
-            .wrap(Wrap { trim: false }),
+            Paragraph::new(storage::clean_terminal(&shown.display().to_string()))
+                .style(Style::default().fg(palette.fg))
+                .wrap(Wrap { trim: false }),
             chunks[1],
         );
         if let Some(input) = &mut self.path_input {
@@ -345,7 +428,16 @@ impl PathPicker {
         }
         let matches = self.matches();
         self.selected = self.selected.min(matches.len().saturating_sub(1));
-        if matches.is_empty() {
+        if self.reading.is_some() {
+            frame.render_widget(
+                Paragraph::new("Reading folder…").style(
+                    Style::default()
+                        .fg(palette.muted)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+                chunks[3],
+            );
+        } else if matches.is_empty() {
             let message = if self.show_recent && content(&self.filter).is_empty() {
                 "No recent projects. Press [Tab] to browse folders."
             } else if self.files {
@@ -477,7 +569,7 @@ mod tests {
         fs::create_dir(&docs).unwrap();
         let spec = docs.join("Feature 雪.md");
         fs::write(&spec, "# A task").unwrap();
-        let mut picker = PathPicker::files(&dir).unwrap();
+        let mut picker = files(&dir);
         picker.paste("docs");
         assert!(matches!(
             key(&mut picker, Key::Enter).unwrap(),
@@ -501,8 +593,24 @@ mod tests {
         );
     }
 
+    thread_local! {
+        /// Where this test's folder reads report.
+        static INBOX: std::cell::RefCell<Option<std::sync::mpsc::Receiver<(u64, Msg)>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    fn spawner() -> Spawner {
+        let (spawner, inbox) = Spawner::detached();
+        INBOX.with(|cell| *cell.borrow_mut() = Some(inbox));
+        spawner
+    }
+    fn wait(picker: &mut PathPicker) {
+        INBOX.with(|cell| picker.wait(cell.borrow().as_ref().expect("a spawner")));
+    }
+
     fn key(picker: &mut PathPicker, code: Key) -> Result<PickerAction> {
-        picker.key(KeyEvent::new(code, Mods::NONE))
+        let action = picker.key(KeyEvent::new(code, Mods::NONE));
+        wait(picker);
+        action
     }
 
     fn open_path(picker: &mut PathPicker, path: &str) -> Result<PickerAction> {
@@ -511,13 +619,25 @@ mod tests {
         key(picker, Key::Enter)
     }
 
+    fn browse(project: &Path, recent: Vec<PathBuf>) -> PathPicker {
+        let mut picker = PathPicker::new(project, recent, spawner()).unwrap();
+        wait(&mut picker);
+        picker
+    }
+
+    fn files(project: &Path) -> PathPicker {
+        let mut picker = PathPicker::files(project, spawner()).unwrap();
+        wait(&mut picker);
+        picker
+    }
+
     #[test]
     fn slash_or_tilde_opens_path_entry_when_filter_is_empty() {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
         let target = root.join("target");
         fs::create_dir(&target).unwrap();
-        let mut picker = PathPicker::new(&root, vec![]).unwrap();
+        let mut picker = browse(&root, vec![]);
         key(&mut picker, Key::Char('/')).unwrap();
         picker.paste(&target.display().to_string()[1..]);
         key(&mut picker, Key::Enter).unwrap();
@@ -544,7 +664,7 @@ mod tests {
         fs::create_dir_all(repo.join(".git")).unwrap();
         fs::create_dir(&linked).unwrap();
         fs::write(linked.join(".git"), "gitdir: /elsewhere/worktrees/linked\n").unwrap();
-        let mut picker = PathPicker::new(&project, vec![]).unwrap();
+        let mut picker = browse(&project, vec![]);
         picker.paste("projects");
         assert!(matches!(
             key(&mut picker, Key::Enter).unwrap(),
@@ -578,7 +698,7 @@ mod tests {
         let root = fs::canonicalize(temp.path()).unwrap();
         let project = root.join("current");
         fs::create_dir(&project).unwrap();
-        let mut picker = PathPicker::new(&project, vec![]).unwrap();
+        let mut picker = browse(&project, vec![]);
         picker.paste("no such repo");
         assert!(matches!(
             key(&mut picker, Key::Enter).unwrap(),
@@ -607,7 +727,7 @@ mod tests {
         let other = root.join("empty folder 雪");
         fs::create_dir(&project).unwrap();
         fs::create_dir(&other).unwrap();
-        let mut picker = PathPicker::new(&project, vec![]).unwrap();
+        let mut picker = browse(&project, vec![]);
         open_path(&mut picker, "./empty folder 雪").unwrap();
         assert!(
             matches!(key(&mut picker, Key::Enter).unwrap(), PickerAction::Select(path) if path == other)
@@ -636,11 +756,10 @@ mod tests {
         let second = root.join("second");
         fs::create_dir(&project).unwrap();
         fs::create_dir(&second).unwrap();
-        let mut picker = PathPicker::new(
+        let mut picker = browse(
             &project,
             vec![project.clone(), root.join("deleted"), second.clone()],
-        )
-        .unwrap();
+        );
         key(&mut picker, Key::Tab).unwrap();
         assert_eq!(picker.recent.len(), 2);
         picker.paste("second");
@@ -663,7 +782,7 @@ mod tests {
         symlink(&project, root.join("repo-alias")).unwrap();
         symlink(&root, root.join("loop")).unwrap();
         symlink(root.join("missing"), root.join("broken")).unwrap();
-        let mut picker = PathPicker::new(&project, vec![]).unwrap();
+        let mut picker = browse(&project, vec![]);
         picker.paste("repo-alias");
         assert!(
             matches!(key(&mut picker, Key::Enter).unwrap(), PickerAction::Select(path) if path == root.join("repo-alias"))

@@ -3,10 +3,12 @@ use clap::{Parser, Subcommand};
 use model_router::{
     catalog,
     config::{self, Mode, Role, Settings},
-    doctor,
-    engine::{self, Action, Event, Run, Status},
+    cost, doctor,
+    engine::{self, Action, Cmd, Event, Run, Status},
     history::{self, Criteria, Entry, StatusFilter},
-    presets, process, providers, task_import, tui,
+    notify, presets, process, providers, task_import,
+    trust::{self, Trust},
+    tui,
 };
 use std::{
     io::{self, IsTerminal, Write},
@@ -61,6 +63,9 @@ enum Commands {
         /// Print the patch of changes made during the run.
         #[arg(long, conflicts_with = "json")]
         diff: bool,
+        /// Include the run's status timeline (transitions.jsonl).
+        #[arg(long, conflicts_with = "diff")]
+        transitions: bool,
     },
     /// Show the exact argument structure without launching a model.
     Preview {
@@ -87,6 +92,10 @@ enum Commands {
         unattended: bool,
         #[arg(long)]
         with_review: bool,
+        /// Notify (bell/OSC, desktop, webhook per saved preferences) when the
+        /// run needs input, stops, or completes. Also MODEL_ROUTER_NOTIFY=1.
+        #[arg(long)]
+        notify: bool,
     },
     /// Resume a run. Retry and model changes are explicit.
     Resume {
@@ -99,6 +108,44 @@ enum Commands {
         model: Option<String>,
         #[arg(long, conflicts_with_all = ["retry", "interactive", "model"])]
         advance: bool,
+        /// Allow one more review repair pass after the repair limit stopped the run.
+        #[arg(long, conflicts_with_all = ["retry", "interactive", "model", "advance"])]
+        allow_repair: bool,
+        /// Rerun one stopped fan-out candidate, keeping the others: STAGE/CANDIDATE.
+        #[arg(long, value_name = "STAGE/CANDIDATE", conflicts_with_all = ["retry", "interactive", "model", "advance", "allow_repair"])]
+        retry_candidate: Option<String>,
+        /// Notify (bell/OSC, desktop, webhook per saved preferences) when the
+        /// run needs input, stops, or completes. Also MODEL_ROUTER_NOTIFY=1.
+        #[arg(long)]
+        notify: bool,
+        /// Set the run's USD budget (and any exceeded stage cap) to N and continue.
+        #[arg(long, value_name = "N")]
+        budget_usd: Option<f64>,
+        /// Set the run's token budget (and any exceeded stage cap) to N and continue.
+        #[arg(long, value_name = "N")]
+        budget_tokens: Option<u64>,
+    },
+    /// Estimated spend over saved runs, by harness and model.
+    Cost {
+        /// Only attempts started within this long ago, e.g. 7d, 12h, 2w.
+        #[arg(long, value_name = "AGE")]
+        since: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Commit a completed run's changes on a new branch, after a preview.
+    /// Uses the run's ship stage options, else the defaults.
+    Ship {
+        id: String,
+        /// Push the branch with --set-upstream.
+        #[arg(long)]
+        push: bool,
+        /// Open a draft pull request with gh; implies --push.
+        #[arg(long)]
+        draft_pr: bool,
+        /// Ship without asking after the preview.
+        #[arg(long)]
+        yes: bool,
     },
     /// Start a new run from a saved run's task and workflow snapshot.
     Rerun {
@@ -108,6 +155,10 @@ enum Commands {
         worktree: bool,
         #[arg(long)]
         unattended: bool,
+        /// Notify (bell/OSC, desktop, webhook per saved preferences) when the
+        /// run needs input, stops, or completes. Also MODEL_ROUTER_NOTIFY=1.
+        #[arg(long)]
+        notify: bool,
     },
     /// Compare two attempts of a stage, or a rerun's stage with its source's.
     Compare {
@@ -158,12 +209,57 @@ enum Commands {
         #[arg(long)]
         sizes: bool,
     },
+    /// Outcomes per role, harness, and model across saved runs, ranked.
+    /// Suggestions only; never changes a workflow.
+    Stats {
+        /// Only this role: research, planning, implementation, review, test, summary, custom.
+        #[arg(long, value_parser = parse_role)]
+        role: Option<Role>,
+        #[arg(long)]
+        json: bool,
+        /// Include every recent project, not only this one.
+        #[arg(long)]
+        all_projects: bool,
+    },
+    /// Run tasks under a matrix of stage assignments, each unattended in its
+    /// own Git worktree, and summarize the outcomes.
+    Bench {
+        /// Bench file (TOML); see examples/bench.toml.
+        file: PathBuf,
+        /// Runs at a time.
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        jobs: usize,
+        /// Show the matrix without running anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Run the workflow's interactive stages unattended instead of refusing.
+        #[arg(long)]
+        allow_interactive: bool,
+    },
     /// List model/mode selections without sending an inference request.
     Models { harness: String },
+    /// List built-in and custom harnesses, or print resolved specs as JSON.
+    Harnesses {
+        /// Print the resolved spec of NAME, or of every harness, as JSON.
+        #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
+        spec: Option<String>,
+    },
     /// List router providers, or a provider's model IDs (one listing request).
     Providers {
         /// Query this provider's OpenAI-compatible /models endpoint.
         name: Option<String>,
+    },
+    /// Serve tools for other agents: MCP over stdio and/or a loopback HTTP API.
+    Serve(model_router::serve::Args),
+    /// Trust this project's .model-router.toml: its custom adapters, checks,
+    /// extra arguments, escalated permissions, and custom providers.
+    Trust {
+        /// Trust without asking.
+        #[arg(long)]
+        yes: bool,
+        /// Forget this project's trust; its dangerous sections are ignored again.
+        #[arg(long, conflicts_with = "yes")]
+        revoke: bool,
     },
     /// Check harness executables, versions, and flags without a model request.
     Doctor {
@@ -238,7 +334,44 @@ fn main_result() -> Result<()> {
         );
         return Ok(());
     }
-    let (settings, config_path) = config::load(&project, cli.config.as_deref())?;
+    if let Some(Commands::Serve(args)) = cli.command {
+        // Loads each project's config per call; the signal flag stops it.
+        return model_router::serve::run(args, project, cli.config, cancel);
+    }
+    if let Some(Commands::Trust { yes, revoke }) = &cli.command {
+        return trust_command(&project, cli.config.as_deref(), *yes, *revoke);
+    }
+    let loaded = config::load_config(&project, cli.config.as_deref())?;
+    let config_path = loaded.save_path.clone();
+    let review = loaded.review().cloned();
+    // Commands that execute a project's dangerous sections refuse until it is
+    // trusted; the TUI asks; read-only commands ignore those sections.
+    let settings = match (&cli.command, &review) {
+        (_, None) => loaded.settings,
+        (Some(Commands::Run { .. }), Some(review)) => bail!("{}", review.text().trim_end()),
+        (None, Some(review)) => {
+            ensure!(
+                io::stdin().is_terminal() && io::stdout().is_terminal(),
+                "The TUI requires a terminal. Try model-router --help for CLI commands"
+            );
+            match tui::trust_prompt::ask(review)? {
+                tui::trust_prompt::Choice::Trust => {
+                    trust::approve(review)?;
+                    loaded.settings
+                }
+                tui::trust_prompt::Choice::Ignore => loaded.safe(),
+                tui::trust_prompt::Choice::Quit => return Ok(()),
+            }
+        }
+        (Some(Commands::Validate), Some(_)) => loaded.safe(),
+        (Some(_), Some(review)) => {
+            eprintln!(
+                "Ignoring untrusted sections of {}; run `model-router trust` to use them.",
+                review.project.join(".model-router.toml").display()
+            );
+            loaded.safe()
+        }
+    };
     match cli.command {
         None => {
             ensure!(
@@ -257,21 +390,49 @@ fn main_result() -> Result<()> {
                 detected_from,
             )?;
         }
-        Some(Commands::Init { .. } | Commands::Presets) => unreachable!(),
-        Some(Commands::Validate) => println!(
-            "Valid: {} workflow(s). Save path: {}",
-            settings.workflows.len(),
-            config_path.display()
-        ),
-        Some(Commands::Report { id, json, diff }) => {
+        Some(
+            Commands::Init { .. } | Commands::Presets | Commands::Trust { .. } | Commands::Serve(_),
+        ) => {
+            unreachable!()
+        }
+        Some(Commands::Validate) => {
+            println!(
+                "Valid: {} workflow(s). Save path: {}",
+                settings.workflows.len(),
+                config_path.display()
+            );
+            for warning in settings
+                .warnings
+                .iter()
+                .filter(|w| review.is_none() || !w.contains("untrusted"))
+            {
+                println!("Warning: {warning}");
+            }
+            if let Some(review) = &review {
+                print!("{}", review.text());
+            }
+        }
+        Some(Commands::Report {
+            id,
+            json,
+            diff,
+            transitions,
+        }) => {
             use model_router::report;
             let run = engine::load(&project, &id)?;
+            cost::refresh_provider_prices(&project, &cost::routed_providers(&run));
+            let timeline = transitions.then(|| report::transitions(&run)).transpose()?;
             if diff {
                 print!("{}", report::diff(&run)?);
             } else if json {
                 let mut value = serde_json::to_value(report::build(&run))?;
                 value["changes"] = serde_json::to_value(report::changes(&run))?;
+                if let Some(timeline) = &timeline {
+                    value["transitions"] = serde_json::to_value(timeline)?;
+                }
                 println!("{}", serde_json::to_string_pretty(&value)?);
+            } else if let Some(timeline) = &timeline {
+                print!("{}", report::render_transitions(&run, timeline));
             } else {
                 println!(
                     "Run {} · {}\nArtifacts: {}\n",
@@ -300,6 +461,7 @@ fn main_result() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&reports)?);
             } else {
                 print!("{}", doctor::table(&reports));
+                println!("\n{}", doctor::sandbox_line());
                 println!("\n{}", doctor::AUTH_NOTE);
             }
             ensure!(
@@ -307,6 +469,28 @@ fn main_result() -> Result<()> {
                 "An installed harness lacks a flag the router passes"
             );
         }
+        Some(Commands::Stats {
+            role,
+            json,
+            all_projects,
+        }) => stats_command(&project, role, json, all_projects)?,
+        Some(Commands::Bench {
+            file,
+            jobs,
+            dry_run,
+            allow_interactive,
+        }) => bench_command(
+            &project,
+            &settings,
+            &file,
+            &model_router::bench::Options {
+                jobs,
+                allow_interactive,
+            },
+            dry_run,
+            &cancel,
+        )?,
+        Some(Commands::Harnesses { spec }) => harnesses_command(&settings, spec.as_deref())?,
         Some(Commands::Models { harness }) => {
             let catalog = catalog::discover(&harness, &settings, &project)?;
             for model in catalog.models {
@@ -341,8 +525,21 @@ fn main_result() -> Result<()> {
             let provider = providers::resolve(&name, &settings.providers).with_context(|| {
                 format!("Unknown provider {name}; see `model-router providers`")
             })?;
-            for id in providers::models(&provider)? {
-                println!("{id}");
+            for model in providers::models(&provider)? {
+                let mut line = model.id.clone();
+                if let Some(context) = model.context_length {
+                    line.push_str(&format!("\tcontext {context}"));
+                }
+                if let (Some(prompt), Some(completion)) =
+                    (model.prompt_price, model.completion_price)
+                {
+                    line.push_str(&format!(
+                        "\t${:.2}/${:.2} per M tokens",
+                        prompt * 1e6,
+                        completion * 1e6
+                    ));
+                }
+                println!("{line}");
             }
         }
         Some(Commands::Providers { name: None }) => {
@@ -369,7 +566,7 @@ fn main_result() -> Result<()> {
                     provider.base_url
                 );
             }
-            println!("\n{}", providers::NOTE);
+            println!("\n{}", providers::note());
         }
         Some(Commands::History {
             status,
@@ -433,6 +630,7 @@ fn main_result() -> Result<()> {
             worktree,
             unattended,
             with_review,
+            notify,
         }) => {
             let task = match (task, task_file, task_url) {
                 (Some(task), _, _) => task,
@@ -451,7 +649,14 @@ fn main_result() -> Result<()> {
             }
             let mut run = Run::create(&project, &settings, &workflow, task, worktree)?;
             println!("Run: {}\nArtifacts: {}", run.id, run.directory.display());
-            cli_drive(&mut run, &cancel)?;
+            // Provider prices for estimates; never delays the run, and an
+            // offline lookup just keeps the cache.
+            let routed = cost::routed_providers(&run);
+            if !routed.is_empty() {
+                let project = project.clone();
+                std::thread::spawn(move || cost::refresh_provider_prices(&project, &routed));
+            }
+            cli_drive(&mut run, &cancel, notify::cli_enabled(notify))?;
         }
         Some(Commands::Resume {
             id,
@@ -459,20 +664,66 @@ fn main_result() -> Result<()> {
             interactive,
             model,
             advance,
+            allow_repair,
+            retry_candidate,
+            notify,
+            budget_usd,
+            budget_tokens,
         }) => {
             let mut run = engine::load(&project, &id)?;
+            if let Some(target) = retry_candidate {
+                let (stage, candidate) = target
+                    .split_once('/')
+                    .context("Use --retry-candidate STAGE/CANDIDATE, e.g. implement/c2")?;
+                run.command(Cmd::RetryCandidate {
+                    stage: stage.into(),
+                    candidate: candidate.into(),
+                })?;
+            }
+            if budget_usd.is_some() || budget_tokens.is_some() {
+                cost::raise_budget(&mut run, budget_usd, budget_tokens)?;
+            }
             if advance {
-                run.confirm()?;
+                run.command(Cmd::Confirm)?;
+            }
+            if allow_repair {
+                run.command(Cmd::AllowRepair)?;
             }
             if retry || interactive || model.is_some() {
-                run.retry(interactive, model)?;
+                run.command(Cmd::Retry { interactive, model })?;
             }
-            cli_drive(&mut run, &cancel)?;
+            cli_drive(&mut run, &cancel, notify::cli_enabled(notify))?;
         }
+        Some(Commands::Cost { since, json }) => {
+            let since = since
+                .as_deref()
+                .map(cost::parse_since)
+                .transpose()?
+                .map(|age| chrono::Utc::now() - age);
+            let runs = engine::history(&project)?;
+            let mut routed = std::collections::BTreeMap::new();
+            for run in &runs {
+                routed.extend(cost::routed_providers(run));
+            }
+            cost::refresh_provider_prices(&project, &routed);
+            let summary = cost::aggregate(&runs, since, &cost::Pricing::load(&project));
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                print!("{}", cost::render_summary(&summary));
+            }
+        }
+        Some(Commands::Ship {
+            id,
+            push,
+            draft_pr,
+            yes,
+        }) => ship_command(&project, &id, push, draft_pr, yes)?,
         Some(Commands::Rerun {
             id,
             worktree,
             unattended,
+            notify,
         }) => {
             let mut run = history::rerun(&project, &settings, &id, worktree.then_some(true))?;
             if unattended {
@@ -486,7 +737,7 @@ fn main_result() -> Result<()> {
                 run.id,
                 run.directory.display()
             );
-            cli_drive(&mut run, &cancel)?;
+            cli_drive(&mut run, &cancel, notify::cli_enabled(notify))?;
         }
         Some(Commands::Compare {
             id,
@@ -562,15 +813,228 @@ fn main_result() -> Result<()> {
     Ok(())
 }
 
-fn cli_drive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
-    loop {
-        let action = engine::drive(run, cancel, |event| match event {
-            Event::State(run) => eprintln!("[{}] {}", run.status.label(), run.current_name()),
-            Event::Output(text) => {
-                print!("{text}");
-                let _ = io::stdout().flush();
+fn ship_command(project: &Path, id: &str, push: bool, draft_pr: bool, yes: bool) -> Result<()> {
+    use model_router::{ship, storage};
+    use std::time::Duration;
+    let wait = Duration::from_secs(2);
+    let run = engine::load(project, id)?;
+    let _run_lock = storage::lock_wait(&run.directory.join("run.lock"), wait)?;
+    let _workspace_lock = if run.workspace.is_dir() {
+        Some(storage::lock_wait(
+            &storage::metadata_dir(&run.workspace)?.join("workspace.lock"),
+            wait,
+        )?)
+    } else {
+        None
+    };
+    let run = engine::load(project, id)?;
+    let mut options = ship::run_options(&run);
+    options.push |= push || draft_pr;
+    options.draft_pr |= draft_pr;
+    let (plan, dir) = ship::plan_completed(&run, &options)?;
+    print!("{}", plan.preview());
+    println!("Plan saved in {}", dir.display());
+    if !yes {
+        ensure!(
+            io::stdin().is_terminal(),
+            "Nothing shipped. Add --yes to ship this plan without asking"
+        );
+        print!("Ship it? [y/N] ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            println!("Nothing shipped.");
+            return Ok(());
+        }
+    }
+    let outcome = ship::apply(&plan, &dir, |line| print!("{line}"));
+    for line in outcome.lines() {
+        println!("{line}");
+    }
+    if let Some(error) = &outcome.error {
+        bail!("Ship stopped: {error}");
+    }
+    Ok(())
+}
+
+fn parse_role(text: &str) -> std::result::Result<Role, String> {
+    Role::ALL
+        .into_iter()
+        .find(|role| role.label() == text)
+        .ok_or_else(|| {
+            let names: Vec<_> = Role::ALL.iter().map(|r| r.label()).collect();
+            format!("expected one of {}", names.join(", "))
+        })
+}
+
+fn stats_command(project: &Path, role: Option<Role>, json: bool, all: bool) -> Result<()> {
+    use model_router::stats::{self, Stats};
+    let stats = Stats::collect(&stats::projects(project, all));
+    if json {
+        let mut value = serde_json::to_value(&stats)?;
+        if let Some(role) = role {
+            value["metrics"] = serde_json::to_value(
+                stats
+                    .metrics
+                    .iter()
+                    .filter(|m| m.role == role)
+                    .collect::<Vec<_>>(),
+            )?;
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        print!("{}", stats.table(role));
+    }
+    Ok(())
+}
+
+fn bench_command(
+    project: &Path,
+    settings: &Settings,
+    file: &Path,
+    options: &model_router::bench::Options,
+    dry_run: bool,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    use model_router::bench;
+    let plan = bench::Plan::new(file, &bench::load(file)?, settings, options)?;
+    print!("{}", plan.preview());
+    if dry_run {
+        println!("\nDry run: nothing started.");
+        return Ok(());
+    }
+    println!();
+    let results = bench::run(project, settings, &plan, options, cancel, &|line| {
+        eprintln!("{line}")
+    })?;
+    let (json, markdown) = bench::save(project, &results)?;
+    println!("{}", bench::markdown(&results));
+    println!("Saved {}\nSaved {}", json.display(), markdown.display());
+    ensure!(
+        !cancel.load(Ordering::Relaxed),
+        "Bench cancelled; unfinished cells are marked skipped"
+    );
+    Ok(())
+}
+
+/// Lines queued for printing while the engine runs. A stalled stdout (a
+/// paused pager or pipe) fills it, and further lines are dropped and
+/// counted, so the engine's timeouts and cancellation keep working.
+const PRINT_QUEUE: usize = 1024;
+
+enum Line {
+    Out(String),
+    Err(String),
+}
+
+/// `engine::drive`, printing its events from another thread.
+fn drive_printing(run: &mut Run, cancel: &AtomicBool) -> Result<Action> {
+    let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (tx, rx) = mpsc::sync_channel::<Line>(PRINT_QUEUE);
+    let counter = dropped.clone();
+    let printer = std::thread::spawn(move || {
+        let note = |count: usize| {
+            println!(
+                "[{count} output updates dropped while output was blocked; see the attempt's stdout.log]"
+            );
+        };
+        for line in rx {
+            let missed = counter.swap(0, Ordering::Relaxed);
+            if missed > 0 {
+                note(missed);
             }
-        })?;
+            match line {
+                Line::Out(text) => {
+                    print!("{text}");
+                    let _ = io::stdout().flush();
+                }
+                Line::Err(text) => eprintln!("{text}"),
+            }
+        }
+        let missed = counter.swap(0, Ordering::Relaxed);
+        if missed > 0 {
+            note(missed);
+        }
+    });
+    let action = engine::drive(run, cancel, |event| {
+        let line = match event {
+            Event::State(run) => {
+                Line::Err(format!("[{}] {}", run.status.label(), run.current_name()))
+            }
+            Event::Output(text) => Line::Out(text),
+        };
+        if tx.try_send(line).is_err() {
+            dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    drop(tx);
+    let _ = printer.join();
+    action
+}
+
+/// `model-router trust`: approve the project config's dangerous sections as
+/// they are now, or revoke the approval.
+fn trust_command(project: &Path, explicit: Option<&Path>, yes: bool, revoke: bool) -> Result<()> {
+    if revoke {
+        if trust::revoke(project)? {
+            println!("Revoked trust for {}", project.display());
+        } else {
+            println!("{} was not trusted", project.display());
+        }
+        return Ok(());
+    }
+    let loaded = config::load_config(project, explicit)?;
+    if loaded.origin != config::Origin::Project {
+        println!(
+            "Nothing to trust: only a project's own .model-router.toml needs trust. Global and --config files are yours."
+        );
+        return Ok(());
+    }
+    let review = match loaded.trust {
+        Trust::Trusted if trust::dangerous(&loaded.settings).is_empty() => {
+            println!(
+                "Nothing to trust: the project config runs no commands and sends no credentials."
+            );
+            return Ok(());
+        }
+        Trust::Trusted => {
+            println!("Already trusted: {}", project.display());
+            return Ok(());
+        }
+        Trust::Untrusted(review) => review,
+    };
+    print!("{}", review.text());
+    if !yes {
+        ensure!(
+            io::stdin().is_terminal(),
+            "Confirm from a terminal, or pass --yes"
+        );
+        print!("Trust these sections? [y/N] ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            println!("Not trusted.");
+            return Ok(());
+        }
+    }
+    trust::approve(&review)?;
+    println!(
+        "Trusted {}. A change to these sections asks again.",
+        project.display()
+    );
+    Ok(())
+}
+
+fn cli_drive(run: &mut Run, cancel: &AtomicBool, notify: bool) -> Result<()> {
+    loop {
+        let action = drive_printing(run, cancel);
+        if notify {
+            let outcome = action.as_ref().map(|a| *a).map_err(|e| format!("{e:#}"));
+            notify::notify_outcome(run, &outcome);
+        }
+        let action = action?;
         match action {
             Action::Complete => {
                 use model_router::report;
@@ -598,6 +1062,33 @@ fn cli_drive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
                     );
                 }
                 cli_interactive(run, cancel)?;
+            }
+            Action::Confirm if run.workflow.stages[run.cursor].role == Role::Ship => {
+                // The preview was printed as stage output.
+                ensure!(
+                    io::stdin().is_terminal(),
+                    "The ship plan awaits confirmation. Use resume {} --advance to ship it",
+                    run.id
+                );
+                print!("[a] Ship as previewed  [r] Plan again  [q] Save and stop: ");
+                io::stdout().flush()?;
+                let mut answer = String::new();
+                io::stdin().read_line(&mut answer)?;
+                match answer.trim() {
+                    "a" => run.command(Cmd::Confirm)?,
+                    "r" => run.command(Cmd::Retry {
+                        interactive: false,
+                        model: None,
+                    })?,
+                    _ => {
+                        println!(
+                            "Saved. Ship with: model-router -C {} resume {} --advance",
+                            shell_words::quote(&run.project.display().to_string()),
+                            run.id
+                        );
+                        return Ok(());
+                    }
+                }
             }
             Action::Confirm => {
                 if let Some(handoff) = &run.stages[run.cursor].handoff {
@@ -634,8 +1125,11 @@ fn cli_drive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
                 let mut answer = String::new();
                 io::stdin().read_line(&mut answer)?;
                 match answer.trim() {
-                    "a" => run.confirm()?,
-                    "r" => run.retry(true, None)?,
+                    "a" => run.command(Cmd::Confirm)?,
+                    "r" => run.command(Cmd::Retry {
+                        interactive: true,
+                        model: None,
+                    })?,
                     _ => {
                         println!(
                             "Saved. Resume with: model-router -C {} resume {}",
@@ -786,5 +1280,62 @@ fn cli_interactive_events(events: &mpsc::Receiver<Event>) -> Result<()> {
         }
     }
     stdout.flush()?;
+    Ok(())
+}
+
+/// `harnesses`: a table, or with `--spec` the resolved specs as JSON.
+fn harnesses_command(settings: &Settings, spec: Option<&str>) -> Result<()> {
+    use model_router::{adapters, harness};
+    let names = catalog::known_harnesses(settings);
+    let resolved = |name: &str| -> Result<serde_json::Value> {
+        if let Some(spec) = harness::get(name) {
+            let mut value = serde_json::to_value(spec)?;
+            value["builtin"] = true.into();
+            value["program"] = adapters::program(name, &settings.adapters).into();
+            return Ok(value);
+        }
+        let adapter = settings
+            .adapters
+            .get(name)
+            .with_context(|| format!("Unknown harness {name}; see `model-router harnesses`"))?;
+        let mut value = serde_json::to_value(adapter)?;
+        value["name"] = name.into();
+        value["builtin"] = false.into();
+        value["output"] = adapters::output_kind(name, &settings.adapters)
+            .name()
+            .into();
+        value["resumable"] = adapters::resumable(name, &settings.adapters).into();
+        Ok(value)
+    };
+    match spec {
+        Some("") => {
+            let all = names
+                .iter()
+                .map(|name| resolved(name))
+                .collect::<Result<Vec<_>>>()?;
+            println!("{}", serde_json::to_string_pretty(&all)?);
+        }
+        Some(name) => println!("{}", serde_json::to_string_pretty(&resolved(name)?)?),
+        None => {
+            println!("HARNESS\tKIND\tPROGRAM\tOUTPUT\tRESUME");
+            for name in &names {
+                println!(
+                    "{name}\t{}\t{}\t{}\t{}",
+                    if harness::get(name).is_some() {
+                        "built-in"
+                    } else {
+                        "custom"
+                    },
+                    adapters::program(name, &settings.adapters),
+                    adapters::output_kind(name, &settings.adapters).name(),
+                    if adapters::resumable(name, &settings.adapters) {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                );
+            }
+        }
+    }
     Ok(())
 }

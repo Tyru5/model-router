@@ -25,6 +25,9 @@ parser.add_argument("--not-applicable", metavar="REASON")
 parser.add_argument(
     "--write-file", metavar="PATH", help="Write a line to PATH in the workspace"
 )
+parser.add_argument(
+    "--select", metavar="CANDIDATE", help="Judge a fan-out: choose CANDIDATE"
+)
 args = parser.parse_args()
 
 root = Path(".model-router/mock")
@@ -54,17 +57,21 @@ if args.interactive:
 if args.write_file:
     target = Path(args.write_file)
     target.parent.mkdir(parents=True, exist_ok=True)
+    # Model lines-N writes N lines, so fan-out candidates differ in size.
+    lines = int(args.model[6:]) if args.model.startswith("lines-") else 1
     with target.open("a") as file:
-        file.write(f"written by {args.role} attempt {number}\n")
+        for line in range(lines):
+            file.write(f"written by {args.role} attempt {number} line {line + 1}\n")
 if args.model == "malformed":
     print("Looks fine, probably!")
     sys.exit(0)
-blocking = args.role.startswith("review") and number <= args.review_fail_until
+review = args.role.startswith("review") or args.select is not None
+blocking = review and number <= args.review_fail_until
 handoff = {
     "summary": f"{args.role} evidence from model {args.model}, attempt {number}",
     "verdict": "needs_changes"
     if blocking
-    else ("pass" if args.role.startswith("review") else "complete"),
+    else ("pass" if review else "complete"),
     "findings": [{"severity": "blocking", "description": "Mock required fix"}]
     if blocking
     else [],
@@ -83,6 +90,8 @@ handoff = {
 }
 if args.not_applicable:
     handoff["not_applicable"] = args.not_applicable
+if args.select:
+    handoff["selected"] = args.select
 if not args.no_handoff:
     Path(args.handoff_file).write_text(json.dumps(handoff))
 print("<router-handoff>" + json.dumps(handoff) + "</router-handoff>", flush=True)

@@ -1,10 +1,13 @@
 //! Completion summaries: what a run changed, checked, left unresolved, and
-//! spent. `build` and `render` are pure; `changes` and `diff` run Git.
+//! spent. `build_with` and `render` are pure; `build` also reads pricing
+//! files and saved ship results (never the network); `changes` and `diff` run Git.
 use crate::{
-    config::Role,
+    config::{Budget, Role},
+    cost::{self, CostTotal, Pricing},
     engine::{Attempt, Run, Status},
-    handoff::{Severity, TestStatus, Usage},
+    handoff::{HandoffSource, Severity, TestStatus, Usage},
     snapshot::{self, FileChange},
+    transitions::{Level, Record},
 };
 use anyhow::{Result, anyhow};
 use chrono::Utc;
@@ -26,6 +29,10 @@ pub struct RunReport {
     pub repair_passes: u32,
     pub max_repair_passes: u32,
     pub usage: UsageTotal,
+    /// The run's spend caps.
+    pub budget: Budget,
+    /// When the built-in price table was last checked.
+    pub prices_as_of: String,
     pub stages: Vec<StageReport>,
     /// Most severe first.
     pub unresolved: Vec<Item>,
@@ -33,6 +40,9 @@ pub struct RunReport {
     pub reported_files: Vec<String>,
     /// The latest review summary stage's brief, Markdown; also review.md.
     pub review: Option<String>,
+    /// Ships of this run: by ship stages, then `model-router ship`. Read
+    /// from each ship's ship.json.
+    pub shipped: Vec<crate::ship::Outcome>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -47,14 +57,51 @@ pub struct StageReport {
     pub retries: usize,
     pub active_seconds: i64,
     pub usage: UsageTotal,
+    pub budget: Budget,
     /// Router checks from the latest attempt, then model-reported tests.
     pub checks: Vec<CheckLine>,
     /// Accepted not-applicable reason.
     pub waiver: Option<String>,
+    /// Where the latest attempt's handoff came from; None when unrecorded.
+    pub handoff_source: Option<HandoffSource>,
+    /// A best-of-N stage's candidates and choice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fan_out: Option<FanOutReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FanOutReport {
+    /// `auto`, or the judge stage's name.
+    pub judge: String,
+    pub candidates: Vec<CandidateReport>,
+    /// The chosen candidate, why, and whether its patch reached the workspace.
+    pub selected: Option<String>,
+    pub reason: Option<String>,
+    pub applied: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CandidateReport {
+    pub id: String,
+    pub harness: String,
+    pub model: String,
+    pub status: Status,
+    pub attempts: usize,
+    pub usage: UsageTotal,
+    /// Changed files and lines from the round's base.
+    pub files: Option<usize>,
+    pub added: Option<u64>,
+    pub removed: Option<u64>,
+    /// Whether every required router check passed in its worktree.
+    pub checks_pass: bool,
+    pub error: Option<String>,
+    pub worktree: Option<std::path::PathBuf>,
+    pub patch: Option<std::path::PathBuf>,
 }
 
 /// Sums of what attempts reported. A field stays None when no attempt
-/// reported it; unreported attempts are counted, never estimated.
+/// reported it; unreported attempts are counted, never estimated. `cost`
+/// adds estimates, each labelled with its source.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct UsageTotal {
     pub sum: Usage,
@@ -62,6 +109,7 @@ pub struct UsageTotal {
     /// Attempts that reported any usage, and any cost.
     pub reported: usize,
     pub cost_reported: usize,
+    pub cost: CostTotal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -124,7 +172,39 @@ pub enum Changes {
     },
 }
 
+/// `build_with` the project's pricing.
 pub fn build(run: &Run) -> RunReport {
+    build_with(run, &Pricing::load(&run.project))
+}
+
+pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
+    let estimates: Vec<Vec<cost::Estimate>> = run
+        .stages
+        .iter()
+        .enumerate()
+        .map(|(index, state)| {
+            state
+                .attempts
+                .iter()
+                .map(|a| cost::attempt_estimate(run, index, a, pricing))
+                .collect()
+        })
+        .collect();
+    // Candidate attempts in stage order, flattened per stage.
+    let candidate_estimates: Vec<Vec<cost::Estimate>> = run
+        .stages
+        .iter()
+        .enumerate()
+        .map(|(index, state)| {
+            state
+                .fan_out
+                .iter()
+                .flat_map(|f| &f.candidates)
+                .flat_map(|c| &c.attempts)
+                .map(|a| cost::attempt_estimate(run, index, a, pricing))
+                .collect()
+        })
+        .collect();
     // Only an unfinished attempt reads the clock.
     let now = Utc::now();
     let seconds = |a: &Attempt| {
@@ -142,7 +222,14 @@ pub fn build(run: &Run) -> RunReport {
     }
     let mut reported_files: Vec<String> = vec![];
     let mut stages = vec![];
-    for (stage, state) in run.workflow.stages.iter().zip(&run.stages) {
+    for (((stage, state), estimates), candidate_estimates) in run
+        .workflow
+        .stages
+        .iter()
+        .zip(&run.stages)
+        .zip(&estimates)
+        .zip(&candidate_estimates)
+    {
         let last = state.attempts.last();
         let mut checks: Vec<_> = last
             .map_or(&[][..], |a| &a.checks)
@@ -227,12 +314,67 @@ pub fn build(run: &Run) -> RunReport {
                 ),
             );
         }
-        if let Some(waiver) = &state.waiver {
+        // A ship stage's acceptance is its plan's confirmation.
+        let waiver = state.waiver.as_ref().filter(|_| stage.role != Role::Ship);
+        if let Some(waiver) = waiver {
             item(
                 ItemKind::Waiver,
                 format!("verification not applicable: {}", waiver.reason),
             );
         }
+        let fan_out = state.fan_out.as_ref().map(|fan| {
+            let judge = stage.fan_out.as_ref().map_or_else(
+                || crate::config::AUTO_JUDGE.to_owned(),
+                |f| {
+                    run.workflow
+                        .stages
+                        .iter()
+                        .find(|s| s.id == f.judge && s.enabled)
+                        .map_or_else(|| crate::config::AUTO_JUDGE.to_owned(), |s| s.name.clone())
+                },
+            );
+            if let Some(selection) = fan.selection.as_ref().filter(|s| !s.applied) {
+                item(
+                    ItemKind::Error,
+                    format!("chosen candidate {} was not applied", selection.candidate),
+                );
+            }
+            FanOutReport {
+                judge,
+                candidates: fan
+                    .candidates
+                    .iter()
+                    .scan(0, |offset, c| {
+                        let start = *offset;
+                        *offset += c.attempts.len();
+                        Some((c, &candidate_estimates[start..*offset]))
+                    })
+                    .map(|(c, estimates)| CandidateReport {
+                        id: c.id.clone(),
+                        harness: c.harness.clone(),
+                        model: c.model.clone(),
+                        status: c.status,
+                        attempts: c.attempts.len(),
+                        usage: total(c.attempts.iter().zip(estimates)),
+                        files: c.changes.as_ref().map(|x| x.files.len()),
+                        added: c.changes.as_ref().map(|x| x.added),
+                        removed: c.changes.as_ref().map(|x| x.removed),
+                        checks_pass: c.checks_pass(),
+                        error: c.error.clone(),
+                        worktree: c.attempts.last().and_then(|a| a.worktree.clone()),
+                        patch: c.changes.as_ref().map(|x| x.patch.clone()),
+                    })
+                    .collect(),
+                selected: fan.selection.as_ref().map(|s| s.candidate.clone()),
+                reason: fan.selection.as_ref().map(|s| s.reason.clone()),
+                applied: fan.selection.as_ref().is_some_and(|s| s.applied),
+            }
+        });
+        let candidate_attempts = state
+            .fan_out
+            .iter()
+            .flat_map(|f| &f.candidates)
+            .flat_map(|c| &c.attempts);
         stages.push(StageReport {
             name: stage.name.clone(),
             role: stage.role,
@@ -242,9 +384,19 @@ pub fn build(run: &Run) -> RunReport {
             attempts: state.attempts.len(),
             retries: state.attempts.len().saturating_sub(1),
             active_seconds: state.attempts.iter().map(seconds).sum(),
-            usage: total(&state.attempts),
+            // Spend counts every candidate's.
+            usage: total(
+                state
+                    .attempts
+                    .iter()
+                    .zip(estimates)
+                    .chain(candidate_attempts.zip(candidate_estimates)),
+            ),
+            budget: stage.budget,
             checks,
-            waiver: state.waiver.as_ref().map(|w| w.reason.clone()),
+            waiver: waiver.map(|w| w.reason.clone()),
+            handoff_source: last.and_then(|a| a.handoff_source),
+            fan_out,
         });
     }
     // Stable, so each kind keeps stage order.
@@ -265,7 +417,26 @@ pub fn build(run: &Run) -> RunReport {
         retries: stages.iter().map(|s| s.retries).sum(),
         repair_passes: run.repair_passes,
         max_repair_passes: run.workflow.max_repair_passes,
-        usage: total(attempts()),
+        usage: total(
+            run.stages
+                .iter()
+                .zip(&estimates)
+                .flat_map(|(s, e)| s.attempts.iter().zip(e))
+                .chain(
+                    run.stages
+                        .iter()
+                        .zip(&candidate_estimates)
+                        .flat_map(|(s, e)| {
+                            s.fan_out
+                                .iter()
+                                .flat_map(|f| &f.candidates)
+                                .flat_map(|c| &c.attempts)
+                                .zip(e)
+                        }),
+                ),
+        ),
+        budget: run.workflow.budget,
+        prices_as_of: cost::table_as_of().into(),
         stages,
         unresolved,
         reported_files,
@@ -278,13 +449,15 @@ pub fn build(run: &Run) -> RunReport {
             .filter(|(stage, _)| stage.role == Role::Summary)
             .find_map(|(_, state)| state.handoff.as_ref())
             .map(|handoff| handoff.summary.trim().to_owned()),
+        shipped: crate::ship::outcomes(run),
     }
 }
 
-fn total<'a>(attempts: impl IntoIterator<Item = &'a Attempt>) -> UsageTotal {
+fn total<'a>(attempts: impl IntoIterator<Item = (&'a Attempt, &'a cost::Estimate)>) -> UsageTotal {
     let mut total = UsageTotal::default();
-    for attempt in attempts {
+    for (attempt, estimate) in attempts {
         total.attempts += 1;
+        total.cost.add(estimate);
         if let Some(usage) = attempt.usage {
             total.reported += 1;
             total.cost_reported += usize::from(usage.cost_usd.is_some());
@@ -333,6 +506,57 @@ pub fn diff(run: &Run) -> Result<String> {
         Err(reason) => Err(anyhow!("Changes are unavailable: {reason}")),
     };
     live.or_else(|error| fs::read_to_string(run.directory.join("changes.diff")).map_err(|_| error))
+}
+
+/// The run's saved status changes, oldest first.
+pub fn transitions(run: &Run) -> Result<Vec<Record>> {
+    crate::transitions::read(&run.directory)
+}
+
+/// The status timeline, one change per line: time, run revision, what
+/// changed, from → to, who, and why.
+pub fn render_transitions(run: &Run, records: &[Record]) -> String {
+    let mut text = String::from("Transitions\n");
+    if records.is_empty() {
+        text.push_str("  none recorded\n");
+        return text;
+    }
+    for record in records {
+        let stage = record
+            .stage_index
+            .and_then(|i| run.workflow.stages.get(i))
+            .map_or_else(String::new, |s| s.name.clone());
+        let stage = match &record.candidate {
+            Some(candidate) => format!("{stage}/{candidate}"),
+            None => stage,
+        };
+        let subject = match (record.level, record.attempt) {
+            (Level::Run, _) => "run".to_owned(),
+            (Level::Stage | Level::Candidate, _) => stage,
+            (Level::Attempt, Some(number)) => format!("{stage} #{number}"),
+            (Level::Attempt, None) => format!("{stage} #?"),
+        };
+        let _ = writeln!(
+            text,
+            "  {}  r{:<3} {:<20} {} → {}  [{}] {}",
+            record.at.format("%Y-%m-%d %H:%M:%S"),
+            record.run_revision,
+            clip(&subject, 20),
+            record.from.as_str(),
+            record.to.as_str(),
+            record.actor.label(),
+            record.reason.lines().next().unwrap_or("")
+        );
+    }
+    text
+}
+
+fn clip(text: &str, chars: usize) -> String {
+    if text.chars().count() <= chars {
+        text.to_owned()
+    } else {
+        format!("{}…", text.chars().take(chars - 1).collect::<String>())
+    }
 }
 
 pub fn duration(seconds: i64) -> String {
@@ -402,6 +626,21 @@ pub fn usage_text(total: &UsageTotal) -> String {
         parts.push(format!("cost reported by {} of {of}", total.cost_reported));
     }
     parts.join(" · ")
+}
+
+/// E.g. "~$0.31 (reported $0.25 + table $0.06) · budget $5.00 / 2.0M tokens".
+pub fn cost_text(cost: &CostTotal, budget: &Budget) -> String {
+    let mut text = cost.text();
+    let caps: Vec<String> = budget
+        .max_usd
+        .map(dollars)
+        .into_iter()
+        .chain(budget.max_tokens.map(|n| format!("{} tokens", tokens(n))))
+        .collect();
+    if !caps.is_empty() {
+        text.push_str(&format!(" · budget {}", caps.join(" / ")));
+    }
+    text
 }
 
 /// "+40 -5", or "binary" without line counts.
@@ -490,11 +729,30 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
         summary(report)
     );
     let _ = writeln!(text, "Usage: {}", usage_text(&report.usage));
+    let _ = write!(
+        text,
+        "Cost: {}",
+        cost_text(&report.usage.cost, &report.budget)
+    );
+    if report.usage.cost.table.attempts > 0 {
+        let _ = write!(
+            text,
+            " · table prices are estimates as of {}",
+            report.prices_as_of
+        );
+    }
+    text.push('\n');
     if let Some(error) = &report.error {
         let _ = writeln!(text, "Error: {error}");
     }
     if let Some(review) = &report.review {
         let _ = writeln!(text, "\nReview summary:\n{review}");
+    }
+    for ship in &report.shipped {
+        let _ = writeln!(text, "\nShipped:");
+        for line in ship.lines() {
+            let _ = writeln!(text, "  {line}");
+        }
     }
     if let Some(changes) = changes {
         let _ = writeln!(text, "\n{}", changes_heading(changes));
@@ -562,7 +820,7 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
         if stage.attempts > 0 {
             let _ = write!(
                 text,
-                " · {} · {} · {} {} · {}",
+                " · {} · {} · {} {} · {} · cost {}",
                 count(stage.attempts, "attempt", "attempts"),
                 duration(stage.active_seconds),
                 stage.harness,
@@ -571,12 +829,80 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
                 } else {
                     &stage.model
                 },
-                usage_text(&stage.usage)
+                usage_text(&stage.usage),
+                cost_text(&stage.usage.cost, &stage.budget)
             );
+            if let Some(source) = stage.handoff_source {
+                let _ = write!(text, " · handoff: {}", source.label());
+            }
         }
         text.push('\n');
+        if let Some(fan) = &stage.fan_out {
+            for line in fan_out_text(fan) {
+                let _ = writeln!(text, "    {line}");
+            }
+        }
     }
     text
+}
+
+/// A best-of-N stage's judge, choice, and candidates, one line each.
+pub fn fan_out_text(fan: &FanOutReport) -> Vec<String> {
+    let mut lines = vec![match &fan.selected {
+        Some(id) => format!(
+            "judge {}: {id} {}{}",
+            fan.judge,
+            if fan.applied {
+                "applied"
+            } else {
+                "not applied"
+            },
+            fan.reason
+                .as_deref()
+                .filter(|r| !r.is_empty())
+                .map(|r| format!(" ({})", r.lines().next().unwrap_or("")))
+                .unwrap_or_default()
+        ),
+        None => format!("judge {}: no choice yet", fan.judge),
+    }];
+    for candidate in &fan.candidates {
+        let mut line = format!(
+            "{} {} {} {} {}",
+            if fan.selected.as_ref() == Some(&candidate.id) {
+                "★"
+            } else {
+                "·"
+            },
+            candidate.id,
+            candidate.harness,
+            if candidate.model.is_empty() {
+                "default"
+            } else {
+                &candidate.model
+            },
+            candidate.status.label()
+        );
+        if let (Some(files), Some(added), Some(removed)) =
+            (candidate.files, candidate.added, candidate.removed)
+        {
+            let _ = write!(
+                line,
+                " · {} +{added} −{removed}",
+                count(files, "file", "files")
+            );
+            if !candidate.checks_pass {
+                line.push_str(" · checks failed");
+            }
+        }
+        if let Some(error) = &candidate.error {
+            let _ = write!(line, " · {}", clip(error.lines().next().unwrap_or(""), 80));
+        }
+        if let Some(tree) = &candidate.worktree {
+            let _ = write!(line, " · {}", tree.display());
+        }
+        lines.push(line);
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -647,10 +973,9 @@ pub(crate) mod tests {
             ("verify", "Verify"),
             ("review", "Review"),
         ];
-        let workflow = Workflow {
-            name: "Feature".into(),
-            max_repair_passes: 2,
-            stages: names
+        let workflow = Workflow::new(
+            "Feature",
+            names
                 .iter()
                 .map(|(id, name)| Stage {
                     id: (*id).into(),
@@ -660,7 +985,7 @@ pub(crate) mod tests {
                     ..Stage::default()
                 })
                 .collect(),
-        };
+        );
         let paid = Usage {
             input_tokens: Some(1_200),
             output_tokens: Some(300),
@@ -725,6 +1050,41 @@ pub(crate) mod tests {
         .unwrap();
         run.stages = vec![implement, verify, stage(Status::Skipped, vec![])];
         run
+    }
+
+    #[test]
+    fn report_labels_cost_sources_per_stage_and_in_total() {
+        let mut run = sample();
+        run.workflow.budget.max_usd = Some(5.0);
+        // model-a is not in the table: only the reported cost is known.
+        let report = build_with(&run, &Pricing::default());
+        assert_eq!(
+            report.usage.cost.text(),
+            "$0.25 (reported) · cost unknown for 2 of 3 attempts"
+        );
+        let price = cost::Price {
+            input: 100.0,
+            output: 1000.0,
+            cache_read: None,
+            cache_write: None,
+        };
+        let report = build_with(&run, &Pricing::default().with_override("model-a", price));
+        // Verify: 800 in at $100/M + 100 out at $1000/M = $0.18.
+        assert_eq!(report.stages[1].usage.cost.text(), "~$0.18 (config)");
+        assert_eq!(
+            cost_text(&report.usage.cost, &report.budget),
+            "~$0.43 (reported $0.25 + config $0.18) · cost unknown for 1 of 3 attempts · budget $5.00"
+        );
+        let text = render(&report, None);
+        assert!(
+            text.contains("\nCost: ~$0.43 (reported $0.25 + config $0.18)"),
+            "{text}"
+        );
+        assert!(text.contains("cost ~$0.18 (config)"), "{text}");
+        assert!(!text.contains("table prices"), "{text}");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["usage"]["cost"]["config"]["attempts"], 1);
+        assert_eq!(json["budget"]["max_usd"], 5.0);
     }
 
     #[test]
