@@ -11,7 +11,7 @@ import sys
 import tempfile
 
 import smoke_common
-from smoke_common import alive, kill_all, require_binary, wait_until
+from smoke_common import alive, kill_all, require_binary, trust, wait_until
 
 TASK = "Offline native terminal detach regression"
 
@@ -119,6 +119,7 @@ role = "research"
 harness = "mock"
 mode = "interactive"
 """)
+    trust(project)
 
 
 def state(project):

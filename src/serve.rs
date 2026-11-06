@@ -97,7 +97,10 @@ impl Server {
                 path
             }
         };
-        ensure_trusted(&project)?;
+        let explicit = (project == self.project)
+            .then_some(self.config.as_deref())
+            .flatten();
+        ensure_trusted(&project, explicit)?;
         Ok(project)
     }
 
@@ -113,9 +116,18 @@ impl Server {
 
 /// Hook for the project trust model. Every tool resolves its project
 /// through here before reading config or starting a harness.
-// TODO(trust): call into src/trust.rs once it exists; until then every
-// project under the allowed roots is trusted.
-pub fn ensure_trusted(_project: &Path) -> Result<()> {
+/// Refuses a project whose `.model-router.toml` has untrusted dangerous
+/// sections (custom commands, checks, custom providers), like `run` does.
+/// Global and `--config` files are the user's own and always trusted.
+pub fn ensure_trusted(project: &Path, explicit: Option<&Path>) -> Result<()> {
+    let loaded = config::load_config(project, explicit)?;
+    if let Some(review) = loaded.review() {
+        anyhow::bail!(
+            "{}\nRun `model-router -C {} trust` first.",
+            review.text().trim_end(),
+            project.display()
+        );
+    }
     Ok(())
 }
 

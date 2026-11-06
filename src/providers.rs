@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::{borrow::Cow, collections::BTreeMap, time::Duration};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Provider {
     /// OpenAI-compatible API root, e.g. `https://openrouter.ai/api/v1`.
     pub base_url: String,
@@ -219,6 +219,16 @@ pub fn validate(name: &str, provider: &Provider) -> Result<()> {
             matches!(parsed.scheme(), "http" | "https") && parsed.host().is_some(),
             "Provider {name} base_url must be http:// or https://"
         );
+        // base_url reaches Codex arguments, saved commands, and previews, so
+        // it must carry no secret: keys belong in api_key_env.
+        ensure!(
+            parsed.username().is_empty() && parsed.password().is_none(),
+            "Provider {name} base_url cannot embed credentials; name the key's variable in api_key_env"
+        );
+        ensure!(
+            parsed.query().is_none() && parsed.fragment().is_none(),
+            "Provider {name} base_url cannot have a query or fragment; name the key's variable in api_key_env"
+        );
     }
     ensure!(
         provider.api_key_env.is_empty()
@@ -234,11 +244,61 @@ pub fn validate(name: &str, provider: &Provider) -> Result<()> {
     Ok(())
 }
 
-/// Lists model IDs from the provider's OpenAI-compatible `GET /models`.
+/// One entry of a provider's `/models` listing. Context length and prices are
+/// kept when the provider reports them (OpenRouter and similar gateways).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
+    /// USD per prompt token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_price: Option<f64>,
+    /// USD per completion token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_price: Option<f64>,
+}
+
+fn model_info(entry: &Value) -> Option<ModelInfo> {
+    // Prices arrive as decimal strings ("0.000003") or numbers.
+    let number = |value: Option<&Value>| match value? {
+        Value::String(text) => text.parse::<f64>().ok(),
+        value => value.as_f64(),
+    };
+    Some(ModelInfo {
+        id: entry.get("id")?.as_str()?.to_owned(),
+        context_length: entry
+            .get("context_length")
+            .or_else(|| entry.get("context_window"))
+            .and_then(Value::as_u64),
+        prompt_price: number(entry.pointer("/pricing/prompt")),
+        completion_price: number(entry.pointer("/pricing/completion")),
+    })
+}
+
+/// Parses an OpenAI-compatible `/models` body, sorted by ID.
+pub fn parse_models(body: &str) -> Result<Vec<ModelInfo>> {
+    let body: Value = serde_json::from_str(body).context("Provider model list is not JSON")?;
+    let mut models: Vec<ModelInfo> = body
+        .get("data")
+        .and_then(Value::as_array)
+        .context("Provider model list has no data array")?
+        .iter()
+        .filter_map(model_info)
+        .collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(models)
+}
+
+/// Lists models from the provider's OpenAI-compatible `GET /models`.
 /// Sends the key when set; OpenRouter's listing is public. No model request.
-pub fn models(provider: &Provider) -> Result<Vec<String>> {
+pub fn models(provider: &Provider) -> Result<Vec<ModelInfo>> {
+    models_within(provider, Duration::from_secs(15))
+}
+
+pub fn models_within(provider: &Provider, timeout: Duration) -> Result<Vec<ModelInfo>> {
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
+        .timeout(timeout)
         .build()?;
     let mut request = client.get(format!(
         "{}/models",
@@ -251,17 +311,7 @@ pub fn models(provider: &Provider) -> Result<Vec<String>> {
         request = request.bearer_auth(key);
     }
     let response = request.send()?.error_for_status()?;
-    let body: Value =
-        serde_json::from_str(&response.text()?).context("Provider model list is not JSON")?;
-    let mut ids: Vec<String> = body
-        .get("data")
-        .and_then(Value::as_array)
-        .context("Provider model list has no data array")?
-        .iter()
-        .filter_map(|m| m.get("id").and_then(Value::as_str).map(String::from))
-        .collect();
-    ids.sort();
-    Ok(ids)
+    parse_models(&response.text()?)
 }
 
 #[cfg(test)]
@@ -301,10 +351,52 @@ mod tests {
                 api_key_env: "KEY; rm".into(),
                 ..good.clone()
             },
+            Provider {
+                base_url: "https://user:secret@gateway.example/v1".into(),
+                ..good.clone()
+            },
+            Provider {
+                base_url: "https://token@gateway.example/v1".into(),
+                ..good.clone()
+            },
+            Provider {
+                base_url: "https://gateway.example/v1?key=secret".into(),
+                ..good.clone()
+            },
+            Provider {
+                base_url: "https://gateway.example/v1#secret".into(),
+                ..good.clone()
+            },
         ] {
             assert!(validate("x", &bad).is_err());
         }
         assert!(validate("a/b", &good).is_err());
+    }
+    #[test]
+    fn model_listings_keep_context_and_prices() {
+        let body = r#"{"data":[
+            {"id":"z/model","context_length":200000,"pricing":{"prompt":"0.000003","completion":"0.000015"}},
+            {"id":"a/plain"},
+            {"id":"m/numeric","context_window":8192,"pricing":{"prompt":0.5,"completion":1}},
+            {"name":"no id"}
+        ]}"#;
+        let models = parse_models(body).unwrap();
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["a/plain", "m/numeric", "z/model"]
+        );
+        assert_eq!(
+            models[0],
+            ModelInfo {
+                id: "a/plain".into(),
+                ..ModelInfo::default()
+            }
+        );
+        assert_eq!(models[1].context_length, Some(8192));
+        assert_eq!(models[1].completion_price, Some(1.0));
+        assert_eq!(models[2].context_length, Some(200_000));
+        assert_eq!(models[2].prompt_price, Some(0.000003));
+        assert!(parse_models("[]").is_err() && parse_models("nope").is_err());
     }
     #[test]
     fn builtins_route_only_when_opted_in() {

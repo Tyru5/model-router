@@ -4,9 +4,13 @@ use crate::providers::{self, Provider};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
-    env, fs,
+    collections::{BTreeMap, HashMap},
+    env,
+    ffi::OsString,
+    fs,
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    time::Duration,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +38,10 @@ pub enum EnvValue {
         path: Vec<String>,
         value: String,
     },
+    /// Removes every inherited variable whose name starts with this entry's
+    /// name, except those the invocation sets: `OPENAI_` keeps an OpenAI
+    /// organization, project, or headers from reaching a routed endpoint.
+    UnsetPrefix,
 }
 
 #[derive(Debug, Clone)]
@@ -44,19 +52,21 @@ pub struct Invocation {
     pub kind: OutputKind,
     pub final_file: PathBuf,
     pub env: Vec<(String, EnvValue)>,
+    /// Files the harness reads, written just before launch (never by `build`,
+    /// so previews and doctor have no side effects).
+    pub files: Vec<(PathBuf, String)>,
 }
 impl Invocation {
+    /// The command line with environment values redacted: values can hold
+    /// endpoints or inline config, and previews are shared.
     pub fn display(&self) -> String {
         let env = self.env.iter().map(|(name, value)| match value {
-            EnvValue::Literal(v) => format!("{name}={}", shell_words::quote(v)),
+            EnvValue::Literal(_) => format!("{name}=<redacted>"),
             EnvValue::Var(var) => format!("{name}=${var}"),
-            EnvValue::JsonInsert { path, value } => {
-                format!(
-                    "{name}=${name}+{}={}",
-                    path.join("."),
-                    shell_words::quote(value)
-                )
+            EnvValue::JsonInsert { path, .. } => {
+                format!("{name}=${name}+{}=<redacted>", path.join("."))
             }
+            EnvValue::UnsetPrefix => format!("-u {name}*"),
         });
         env.chain(
             std::iter::once(self.program.as_str())
@@ -67,26 +77,64 @@ impl Invocation {
         .join(" ")
     }
     /// Resolves `env` for launch; fails when a referenced variable is unset.
+    /// Several JSON inserts into one variable apply in order.
     pub fn environment(&self) -> Result<Vec<(String, String)>> {
-        self.env
+        let mut resolved: Vec<(String, String)> = vec![];
+        for (name, value) in &self.env {
+            let text = match value {
+                EnvValue::Literal(v) => v.clone(),
+                EnvValue::Var(var) => env::var(var)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .with_context(|| format!("Set {var} to use this provider"))?,
+                EnvValue::JsonInsert { path, value } => {
+                    let base = match resolved.iter().find(|(n, _)| n == name) {
+                        Some((_, text)) => Some(text.clone()),
+                        None => env::var(name).ok(),
+                    };
+                    json_insert(base.as_deref(), path, value)
+                        .with_context(|| format!("Add router config to {name}"))?
+                }
+                EnvValue::UnsetPrefix => continue,
+            };
+            match resolved.iter_mut().find(|(n, _)| n == name) {
+                Some(entry) => entry.1 = text,
+                None => resolved.push((name.clone(), text)),
+            }
+        }
+        Ok(resolved)
+    }
+    /// Inherited variables to remove at launch (see `EnvValue::UnsetPrefix`).
+    pub fn removed(&self) -> Vec<OsString> {
+        self.removed_from(env::vars_os().map(|(name, _)| name))
+    }
+    fn removed_from(&self, inherited: impl Iterator<Item = OsString>) -> Vec<OsString> {
+        let prefixes: Vec<&str> = self
+            .env
             .iter()
-            .map(|(name, value)| {
-                Ok((
-                    name.clone(),
-                    match value {
-                        EnvValue::Literal(v) => v.clone(),
-                        EnvValue::Var(var) => env::var(var)
-                            .ok()
-                            .filter(|v| !v.is_empty())
-                            .with_context(|| format!("Set {var} to use this provider"))?,
-                        EnvValue::JsonInsert { path, value } => {
-                            json_insert(env::var(name).ok().as_deref(), path, value)
-                                .with_context(|| format!("Add provider config to {name}"))?
-                        }
-                    },
-                ))
+            .filter(|(_, v)| *v == EnvValue::UnsetPrefix)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if prefixes.is_empty() {
+            return vec![];
+        }
+        inherited
+            .filter(|name| {
+                let text = name.to_string_lossy();
+                prefixes.iter().any(|p| text.starts_with(p))
+                    && !self
+                        .env
+                        .iter()
+                        .any(|(set, v)| *v != EnvValue::UnsetPrefix && *set == text)
             })
             .collect()
+    }
+    /// Writes `files`; the process launcher calls this right before spawning.
+    pub fn write_files(&self) -> Result<()> {
+        for (path, text) in &self.files {
+            fs::write(path, text).with_context(|| format!("Write {}", path.display()))?;
+        }
+        Ok(())
     }
 }
 
@@ -128,27 +176,149 @@ pub fn program(harness: &str, custom: &BTreeMap<String, CustomAdapter>) -> Strin
         return adapter.command.clone();
     }
     match harness {
-        "cursor" if executable("cursor-agent").is_some() => "cursor-agent".into(),
-        "cursor" => "agent".into(),
+        "cursor" => cursor_program().into(),
         other => other.into(),
     }
 }
 
-/// Harnesses that cannot be pointed at a router-defined provider.
-const UNROUTABLE: &[&str] = &["claude", "cursor", "gemini", "amp", "copilot"];
+/// `cursor-agent`, or Cursor's newer `agent` name when only that is
+/// installed and it is Cursor's: `agent` is a common name for other tools.
+fn cursor_program() -> &'static str {
+    if executable("cursor-agent").is_some() {
+        return "cursor-agent";
+    }
+    match executable("agent") {
+        Some(path) if is_cursor_agent(&path) => "agent",
+        _ => "cursor-agent",
+    }
+}
+
+/// Cursor installs `agent` as a link into its `cursor-agent` directory;
+/// otherwise its help names the Cursor Agent. Cached per path.
+fn is_cursor_agent(path: &Path) -> bool {
+    static SEEN: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    if let Some(known) = seen.lock().ok().and_then(|s| s.get(path).copied()) {
+        return known;
+    }
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let cursor = resolved.to_string_lossy().contains("cursor-agent")
+        || probe(&path.to_string_lossy(), "--help")
+            .is_some_and(|help| help.contains("Cursor Agent"));
+    if let Ok(mut seen) = seen.lock() {
+        seen.insert(path.to_path_buf(), cursor);
+    }
+    cursor
+}
+
+/// Output of `<program> <flag>`, or None when it fails or takes over 5 s.
+fn probe(program: &str, flag: &str) -> Option<String> {
+    let temp = tempfile::tempdir().ok()?;
+    let invocation = Invocation {
+        program: program.into(),
+        args: vec![flag.into()],
+        stdin: None,
+        kind: OutputKind::Text,
+        final_file: temp.path().join("unused"),
+        env: vec![],
+        files: vec![],
+    };
+    let outcome = crate::process::capture(
+        &invocation,
+        temp.path(),
+        temp.path(),
+        Duration::from_secs(5),
+        &std::sync::atomic::AtomicBool::new(false),
+        |_, _| {},
+    )
+    .ok()?;
+    if !outcome.success() || outcome.timed_out {
+        return None;
+    }
+    let text = crate::process::read_tail(&temp.path().join("stdout.log"), 64 * 1024).ok()?;
+    Some(crate::storage::clean_terminal(&text))
+}
+
+fn versions() -> &'static Mutex<HashMap<String, Option<String>>> {
+    static VERSIONS: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+    VERSIONS.get_or_init(Default::default)
+}
+
+/// Records a detected `--version` line (doctor does), so builds reuse it.
+pub fn remember_version(program: &str, line: Option<&str>) {
+    if let Ok(mut versions) = versions().lock() {
+        versions.insert(program.into(), line.map(str::to_owned));
+    }
+}
+
+/// The harness's version: `MODEL_ROUTER_HARNESS_VERSIONS` (`opencode=1.4.0,…`)
+/// overrides detection; otherwise the first line of `<program> --version`,
+/// detected once per process.
+pub fn harness_version(harness: &str, program: &str) -> Option<String> {
+    if let Ok(overrides) = env::var("MODEL_ROUTER_HARNESS_VERSIONS") {
+        if let Some(version) = overrides.split(',').find_map(|pair| {
+            let (name, version) = pair.split_once('=')?;
+            (name.trim() == harness).then(|| version.trim().to_owned())
+        }) {
+            return Some(version);
+        }
+    }
+    if let Some(known) = versions().lock().ok().and_then(|v| v.get(program).cloned()) {
+        return known;
+    }
+    let line = executable(program)
+        .and_then(|_| probe(program, "--version"))
+        .and_then(|text| {
+            text.lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(str::to_owned)
+        });
+    remember_version(program, line.as_deref());
+    line
+}
+
+/// The major version in a `--version` line, e.g. 2 in `opencode v2.0.22`.
+pub fn major_version(line: &str) -> Option<u64> {
+    line.split(|c: char| c.is_whitespace() || matches!(c, '/' | '(' | ')' | ','))
+        .map(|token| token.strip_prefix('v').unwrap_or(token))
+        .find(|token| token.starts_with(|c: char| c.is_ascii_digit()))
+        .and_then(|token| token.split('.').next()?.parse().ok())
+}
+
+/// Whether the harness is older than `major`. Unknown versions count as
+/// current, so the newest flags are the default.
+fn older_than(harness: &str, program: &str, major: u64) -> bool {
+    harness_version(harness, program)
+        .as_deref()
+        .and_then(major_version)
+        .is_some_and(|found| found < major)
+}
 
 pub fn validate_options(stage: &Stage, configured: &BTreeMap<String, Provider>) -> Result<()> {
-    if providers::route(&stage.harness, &stage.provider, configured).is_some() {
-        ensure!(
-            !UNROUTABLE.contains(&stage.harness.as_str()),
-            "{} cannot use router provider {}; it only uses its own account",
-            stage.harness,
-            stage.provider
-        );
-    } else if !stage.provider.is_empty() && !harness_settings::supports_provider(&stage.harness) {
+    if !stage.provider.is_empty() && !harness_settings::supports_provider(&stage.harness) {
+        if configured.contains_key(&stage.provider) {
+            bail!(
+                "{} cannot use router provider {}; it only uses its own account",
+                stage.harness,
+                stage.provider
+            );
+        }
         bail!(
             "{} uses its existing provider/auth configuration; leave the provider field empty",
             stage.harness
+        );
+    }
+    // Pi and omp resolve providers in their own registry; a provider only the
+    // router defines would fail inside the harness.
+    if matches!(stage.harness.as_str(), "pi" | "omp")
+        && configured.contains_key(&stage.provider)
+        && !providers::builtins().contains_key(&stage.provider)
+    {
+        bail!(
+            "{harness} cannot use provider {provider}: it is defined only in model-router's [providers.{provider}], and {harness} uses its own provider registry. Define it in {harness}'s models.json, or choose a provider listed by `model-router models {harness}`",
+            harness = stage.harness,
+            provider = stage.provider
         );
     }
     if !stage.provider.is_empty() {
@@ -231,6 +401,12 @@ pub fn resume(
     );
     let stage = Stage {
         mode: Mode::Interactive,
+        // The OpenCode TUI keeps the session's model and variant.
+        effort: if stage.harness == "opencode" {
+            String::new()
+        } else {
+            stage.effort.clone()
+        },
         ..stage.clone()
     };
     let mut invocation = build(&stage, custom, configured, "", paths)?;
@@ -287,9 +463,13 @@ pub fn build(
         kind: OutputKind::Text,
         final_file: paths.attempt_dir.join("final.txt"),
         env: vec![],
+        files: vec![],
     };
     if let Some(provider) = &routed {
         invocation.env = route_env(stage, provider)?;
+    }
+    for (name, value) in harness_settings::environment(stage) {
+        invocation.env.push((name, EnvValue::Literal(value)));
     }
     let a = &mut invocation.args;
     let mut append = |items: &[&str]| {
@@ -449,34 +629,35 @@ pub fn build(
         }
         "opencode" => {
             invocation.kind = OutputKind::OpenCode;
-            if interactive {
-                append(&["run", "--interactive"]);
-            } else {
-                append(&["run", "--format", "json"]);
-            }
-            if !qualified.is_empty() {
-                append(&["--model", &qualified]);
-            }
-            if !stage.effort.is_empty() {
-                append(&["--variant", &stage.effort]);
-            }
-            a.extend(extra_args.clone());
-            a.push(prompt.into());
+            let legacy = older_than("opencode", &invocation.program, 2);
+            let (args, env) = opencode_args(
+                legacy,
+                interactive,
+                &qualified,
+                &stage.effort,
+                &extra_args,
+                prompt,
+            )?;
+            a.extend(args);
+            invocation.env.extend(env);
         }
         "aider" => {
-            if routed.is_some() {
-                // LiteLLM's openai/ prefix targets OPENAI_API_BASE.
+            if let Some(provider) = &routed {
+                // LiteLLM's openai/ prefix targets OPENAI_API_BASE. The flag
+                // also outranks an OPENAI_API_BASE in a project .env file.
                 append(&["--model", &format!("openai/{}", stage.model)]);
+                append(&["--openai-api-base", &provider.base_url]);
             } else if !qualified.is_empty() {
                 append(&["--model", &qualified]);
             }
             append(&["--no-auto-commits", "--no-dirty-commits"]);
             if interactive {
                 let commands = paths.attempt_dir.join("aider.commands");
-                fs::write(
-                    &commands,
-                    "/code Complete the stage described in the attached model-router prompt file.\n",
-                )?;
+                invocation.files.push((
+                    commands.clone(),
+                    "/code Complete the stage described in the attached model-router prompt file.\n"
+                        .into(),
+                ));
                 append(&[
                     "--read",
                     paths
@@ -545,6 +726,8 @@ pub fn build(
             let adapter = custom
                 .get(name)
                 .with_context(|| format!("Unknown adapter {name}"))?;
+            // An untrusted adapter keeps its name but runs BLOCKED_COMMAND,
+            // which no PATH provides: previews show it and launches fail.
             let args = if interactive {
                 adapter
                     .interactive_args
@@ -585,6 +768,75 @@ pub fn build(
         }
     }
     Ok(invocation)
+}
+
+type Env = Vec<(String, EnvValue)>;
+
+/// OpenCode arguments and inline config. OpenCode 2.x selects a variant with
+/// `--model provider/model#variant`, and its interactive TUI is the root
+/// command with `--prompt`, which takes the model from config; 1.x used
+/// `run --interactive` and `--variant`.
+fn opencode_args(
+    legacy: bool,
+    interactive: bool,
+    model: &str,
+    effort: &str,
+    extra_args: &[String],
+    prompt: &str,
+) -> Result<(Vec<String>, Env)> {
+    let mut args: Vec<String> = vec![];
+    let mut env = vec![];
+    let owned = |items: &[&str]| items.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    if legacy {
+        args.extend(owned(if interactive {
+            &["run", "--interactive"]
+        } else {
+            &["run", "--format", "json"]
+        }));
+        if !model.is_empty() {
+            args.extend(owned(&["--model", model]));
+        }
+        if !effort.is_empty() {
+            args.extend(owned(&["--variant", effort]));
+        }
+        args.extend(extra_args.iter().cloned());
+        args.push(prompt.into());
+        return Ok((args, env));
+    }
+    ensure!(
+        effort.is_empty() || !model.is_empty(),
+        "OpenCode selects a variant (effort) as part of the model; choose a model"
+    );
+    if interactive {
+        ensure!(
+            effort.is_empty(),
+            "Interactive OpenCode has no variant option; leave effort empty or run unattended"
+        );
+        if !model.is_empty() {
+            env.push((
+                "OPENCODE_CONFIG_CONTENT".to_owned(),
+                EnvValue::JsonInsert {
+                    path: vec!["model".into()],
+                    value: serde_json::to_string(model)?,
+                },
+            ));
+        }
+        args.extend(extra_args.iter().cloned());
+        args.extend(owned(&["--prompt", prompt]));
+    } else {
+        args.extend(owned(&["run", "--format", "json"]));
+        if !model.is_empty() {
+            let selector = if effort.is_empty() {
+                model.to_owned()
+            } else {
+                format!("{model}#{effort}")
+            };
+            args.extend(["--model".to_owned(), selector]);
+        }
+        args.extend(extra_args.iter().cloned());
+        args.push(prompt.into());
+    }
+    Ok((args, env))
 }
 
 /// Sets `path` in `base` (an inherited JSON object, if any) to `value`,
@@ -672,7 +924,12 @@ fn route_env(stage: &Stage, provider: &Provider) -> Result<Vec<(String, EnvValue
                 },
             ));
         }
+        // LiteLLM and Aider read OPENAI_* (organization, project, API type
+        // and version, headers) and AIDER_OPENAI_*; inherited ones are meant
+        // for OpenAI, so none reach the routed endpoint.
         "aider" => env.extend([
+            ("OPENAI_".into(), EnvValue::UnsetPrefix),
+            ("AIDER_OPENAI_".into(), EnvValue::UnsetPrefix),
             ("OPENAI_API_BASE".into(), literal(&provider.base_url)),
             ("OPENAI_API_KEY".into(), key()),
         ]),
@@ -686,7 +943,10 @@ fn route_env(stage: &Stage, provider: &Provider) -> Result<Vec<(String, EnvValue
             } else {
                 format!("{path}/chat/completions")
             };
+            // Goose's OpenAI provider also reads OPENAI_ORGANIZATION,
+            // OPENAI_PROJECT, and OPENAI_CUSTOM_HEADERS.
             env.extend([
+                ("OPENAI_".into(), EnvValue::UnsetPrefix),
                 ("OPENAI_HOST".into(), literal(&host)),
                 ("OPENAI_BASE_PATH".into(), literal(&path)),
                 ("OPENAI_API_KEY".into(), key()),
@@ -1157,5 +1417,314 @@ mod tests {
             panic!()
         };
         assert!(!value.contains("apiKey"), "{value}");
+    }
+
+    fn paths_in(dir: &Path) -> ContextPaths<'_> {
+        ContextPaths {
+            workspace: dir,
+            attempt_dir: dir,
+            prompt_file: dir,
+            handoff_file: dir,
+        }
+    }
+
+    #[test]
+    fn routed_aider_and_goose_drop_inherited_openai_settings() {
+        let configured = BTreeMap::from([(
+            "proxy".to_string(),
+            Provider {
+                base_url: "http://localhost:4000/v1".into(),
+                api_key_env: "PROXY_KEY".into(),
+                ..Provider::default()
+            },
+        )]);
+        let inherited = || {
+            [
+                "OPENAI_ORGANIZATION",
+                "OPENAI_PROJECT",
+                "OPENAI_CUSTOM_HEADERS",
+                "OPENAI_API_KEY",
+                "AIDER_OPENAI_API_KEY",
+                "PATH",
+            ]
+            .into_iter()
+            .map(OsString::from)
+        };
+        for harness in ["aider", "goose"] {
+            let i = routed_with(harness, "proxy", Mode::Unattended, &configured).unwrap();
+            let removed: Vec<_> = i
+                .removed_from(inherited())
+                .into_iter()
+                .map(|n| n.into_string().unwrap())
+                .collect();
+            assert!(removed.contains(&"OPENAI_ORGANIZATION".into()), "{harness}");
+            assert!(
+                removed.contains(&"OPENAI_CUSTOM_HEADERS".into()),
+                "{harness}"
+            );
+            // The key the router sets is replaced, not removed; PATH stays.
+            assert!(!removed.contains(&"OPENAI_API_KEY".into()), "{harness}");
+            assert!(!removed.contains(&"PATH".into()), "{harness}");
+            assert_eq!(
+                removed.contains(&"AIDER_OPENAI_API_KEY".into()),
+                harness == "aider"
+            );
+            assert!(
+                !i.environment()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|(n, _)| n.ends_with('_'))
+            );
+        }
+        // The CLI flag outranks an OPENAI_API_BASE in a project .env.
+        let aider = routed_with("aider", "proxy", Mode::Unattended, &configured).unwrap();
+        assert!(
+            aider
+                .args
+                .windows(2)
+                .any(|a| a == ["--openai-api-base", "http://localhost:4000/v1"])
+        );
+        // Unrouted invocations remove nothing.
+        let plain = routed("aider", "", Mode::Unattended).unwrap();
+        assert!(plain.removed_from(inherited()).is_empty());
+    }
+
+    #[test]
+    fn display_redacts_environment_values() {
+        let i = Invocation {
+            program: "goose".into(),
+            args: vec!["run".into()],
+            stdin: None,
+            kind: OutputKind::Text,
+            final_file: PathBuf::from("unused"),
+            env: vec![
+                ("OPENAI_".into(), EnvValue::UnsetPrefix),
+                (
+                    "OPENAI_HOST".into(),
+                    EnvValue::Literal("https://h.example".into()),
+                ),
+                ("OPENAI_API_KEY".into(), EnvValue::Var("PROXY_KEY".into())),
+                (
+                    "OPENCODE_CONFIG_CONTENT".into(),
+                    EnvValue::JsonInsert {
+                        path: vec!["model".into()],
+                        value: "\"secret-ish\"".into(),
+                    },
+                ),
+            ],
+            files: vec![],
+        };
+        let shown = i.display();
+        assert_eq!(
+            shown,
+            "-u OPENAI_* OPENAI_HOST=<redacted> OPENAI_API_KEY=$PROXY_KEY OPENCODE_CONFIG_CONTENT=$OPENCODE_CONFIG_CONTENT+model=<redacted> goose run"
+        );
+    }
+
+    #[test]
+    fn json_inserts_into_one_variable_accumulate() {
+        let i = Invocation {
+            program: "opencode".into(),
+            args: vec![],
+            stdin: None,
+            kind: OutputKind::OpenCode,
+            final_file: PathBuf::from("unused"),
+            env: vec![
+                (
+                    "MODEL_ROUTER_TEST_UNSET_CONFIG".into(),
+                    EnvValue::JsonInsert {
+                        path: vec!["provider".into(), "p".into()],
+                        value: "{}".into(),
+                    },
+                ),
+                (
+                    "MODEL_ROUTER_TEST_UNSET_CONFIG".into(),
+                    EnvValue::JsonInsert {
+                        path: vec!["model".into()],
+                        value: "\"p/m\"".into(),
+                    },
+                ),
+            ],
+            files: vec![],
+        };
+        let env = i.environment().unwrap();
+        assert_eq!(env.len(), 1);
+        let merged: serde_json::Value = serde_json::from_str(&env[0].1).unwrap();
+        assert_eq!(merged["model"], "p/m");
+        assert!(merged["provider"]["p"].is_object());
+    }
+
+    #[test]
+    fn opencode_uses_2x_flags_unless_an_older_version_is_detected() {
+        let none: Vec<String> = vec![];
+        let (args, env) = opencode_args(false, false, "p/m", "high", &none, "task").unwrap();
+        assert_eq!(
+            args,
+            ["run", "--format", "json", "--model", "p/m#high", "task"]
+        );
+        assert!(env.is_empty());
+        let (args, env) = opencode_args(false, true, "p/m", "", &none, "task").unwrap();
+        assert_eq!(args, ["--prompt", "task"]);
+        assert_eq!(
+            env,
+            [(
+                "OPENCODE_CONFIG_CONTENT".to_owned(),
+                EnvValue::JsonInsert {
+                    path: vec!["model".into()],
+                    value: "\"p/m\"".into()
+                }
+            )]
+        );
+        assert!(opencode_args(false, true, "p/m", "high", &none, "t").is_err());
+        assert!(opencode_args(false, false, "", "high", &none, "t").is_err());
+        let (args, _) = opencode_args(true, true, "p/m", "high", &none, "task").unwrap();
+        assert_eq!(
+            args,
+            [
+                "run",
+                "--interactive",
+                "--model",
+                "p/m",
+                "--variant",
+                "high",
+                "task"
+            ]
+        );
+        assert_eq!(major_version("opencode v2.0.22"), Some(2));
+        assert_eq!(major_version("1.4.3"), Some(1));
+        assert_eq!(major_version("omp/18.6.3"), Some(18));
+        assert_eq!(major_version("unknown"), None);
+    }
+
+    #[test]
+    fn pi_rejects_providers_only_the_router_defines() {
+        let configured = BTreeMap::from([
+            (
+                "litellm".to_string(),
+                Provider {
+                    base_url: "http://localhost:4000/v1".into(),
+                    ..Provider::default()
+                },
+            ),
+            ("openrouter".to_string(), Provider::default()),
+        ]);
+        for harness in ["pi", "omp"] {
+            let error = routed_with(harness, "litellm", Mode::Unattended, &configured)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("own provider registry"), "{error}");
+            // Built-in names and Pi's own providers pass through.
+            routed_with(harness, "openrouter", Mode::Unattended, &configured).unwrap();
+            routed_with(harness, "anthropic", Mode::Unattended, &configured).unwrap();
+        }
+    }
+
+    #[test]
+    fn permission_settings_reach_aider_goose_and_copilot() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let with = |harness: &str, key: &str, value: &str| {
+            let stage = Stage {
+                harness: harness.into(),
+                model: "m".into(),
+                harness_settings: BTreeMap::from([(key.into(), value.into())]),
+                ..Stage::default()
+            };
+            build(&stage, &BTreeMap::new(), &BTreeMap::new(), "t", &paths).unwrap()
+        };
+        assert!(
+            with("aider", "confirmations", "yes-always")
+                .args
+                .contains(&"--yes-always".into())
+        );
+        let goose = with("goose", "mode", "smart_approve");
+        assert_eq!(
+            env(&goose, "GOOSE_MODE"),
+            Some(&EnvValue::Literal("smart_approve".into()))
+        );
+        assert!(!goose.args.iter().any(|a| a.contains("GOOSE")));
+        assert!(
+            with("copilot", "tool_permissions", "allow-all-tools")
+                .args
+                .contains(&"--allow-all-tools".into())
+        );
+        let claude = with("claude", "permission_mode", "manual");
+        assert!(
+            claude
+                .args
+                .windows(2)
+                .any(|a| a == ["--permission-mode", "manual"])
+        );
+        // Nothing is emitted for the harness default.
+        assert!(
+            !with("aider", "confirmations", "")
+                .args
+                .contains(&"--yes-always".into())
+        );
+    }
+
+    #[test]
+    fn build_is_pure_and_aider_commands_are_written_at_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let stage = Stage {
+            harness: "aider".into(),
+            model: "m".into(),
+            mode: Mode::Interactive,
+            ..Stage::default()
+        };
+        let i = build(&stage, &BTreeMap::new(), &BTreeMap::new(), "t", &paths).unwrap();
+        let commands = dir.path().join("aider.commands");
+        assert!(!commands.exists(), "build must not write files");
+        assert_eq!(i.files.len(), 1);
+        i.write_files().unwrap();
+        assert!(fs::read_to_string(&commands).unwrap().starts_with("/code "));
+    }
+
+    #[test]
+    fn untrusted_custom_adapters_cannot_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let custom = BTreeMap::from([(
+            "mine".to_string(),
+            CustomAdapter {
+                command: crate::trust::BLOCKED_COMMAND.into(),
+                ..CustomAdapter::default()
+            },
+        )]);
+        let stage = Stage {
+            harness: "mine".into(),
+            ..Stage::default()
+        };
+        let i = build(&stage, &custom, &BTreeMap::new(), "t", &paths).unwrap();
+        assert_eq!(i.program, crate::trust::BLOCKED_COMMAND);
+        assert!(executable(&i.program).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_accepts_agent_only_when_it_is_cursor() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let other = script("other-agent", "#!/bin/sh\necho 'Usage: agent [deploy]'\n");
+        let cursor = script(
+            "cursor-help",
+            "#!/bin/sh\necho 'Usage: agent [options]'\necho 'Start the Cursor Agent'\n",
+        );
+        assert!(!is_cursor_agent(&other));
+        assert!(is_cursor_agent(&cursor));
+        let linked = dir.path().join("cursor-agent/versions/1/cursor-agent");
+        fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        fs::write(&linked, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&linked, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = dir.path().join("agent");
+        std::os::unix::fs::symlink(&linked, &link).unwrap();
+        assert!(is_cursor_agent(&link), "Cursor's own link needs no probe");
     }
 }

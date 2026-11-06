@@ -239,7 +239,11 @@ pub fn capture_with(
             Stdio::null()
         })
         .process_group(0);
+    for name in inv.removed() {
+        command.env_remove(name);
+    }
     command.envs(inv.environment()?);
+    inv.write_files()?;
     die_with_parent(&mut command);
     let mut child = ProcessGroup {
         child: command
@@ -1177,9 +1181,13 @@ pub fn interactive(
     })?;
     let mut cmd = CommandBuilder::new(&inv.program);
     cmd.args(&inv.args);
+    for name in inv.removed() {
+        cmd.env_remove(name);
+    }
     for (name, value) in inv.environment()? {
         cmd.env(name, value);
     }
+    inv.write_files()?;
     cmd.cwd(cwd);
     let mut transcript = File::create(dir.join("stdout.log"))?;
     File::create(dir.join("stderr.log"))?;
@@ -1443,6 +1451,7 @@ mod tests {
             kind: crate::adapters::OutputKind::Text,
             final_file: dir.path().join("unused"),
             env: vec![],
+            files: vec![],
         };
         let session = InteractiveSession::new(80, 24);
         let cancel = AtomicBool::new(false);

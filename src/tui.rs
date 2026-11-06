@@ -32,6 +32,7 @@ mod task_importer;
 #[cfg(test)]
 mod tests;
 mod theme;
+pub mod trust_prompt;
 mod widgets;
 mod workflow_page;
 use app::{App, draw};
@@ -136,6 +137,13 @@ pub fn run(
             app.project.display(),
             cwd.display()
         );
+    }
+    if let Some(note) = trust_prompt::notice(&app.settings) {
+        app.message = if app.message.is_empty() {
+            note
+        } else {
+            format!("{} · {note}", app.message)
+        };
     }
     match theme::load(&app.theme_path) {
         Ok(preferences) => {

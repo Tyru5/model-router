@@ -8,32 +8,43 @@ model entitlement database.
 | --- | --- | --- |
 | Codex | Installed `codex exec --help` and model-cache metadata | `--model`, `--config model_reasoning_effort`, JSON events, `--output-last-message`; interactive prompt is positional. Takeover runs `codex resume THREAD_ID`. |
 | Claude Code | Installed `claude --help`; [model configuration](https://code.claude.com/docs/en/model-config) | `--print --output-format stream-json --verbose`, stdin prompt, `--model`, `--effort`, `--session-id` (unattended and interactive) for takeover with `--resume`; explicit permission denials are handled. |
-| Pi | Installed `pi --help`; [CLI source/documentation](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) | `--print --mode json`, `@prompt-file`, `--provider`, `--model`, `--thinking`. Provider catalogs include extension-defined models. Takeover: router-chosen `--session-id`. |
+| Pi | Installed `pi --help`; [CLI source/documentation](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) | `--print --mode json`, `@prompt-file`, `--provider`, `--model`, `--thinking`. Provider catalogs include extension-defined models. A provider defined only in the router's `[providers]` is rejected before launch. Takeover: router-chosen `--session-id`. |
 | omp (oh-my-pi) | Installed `omp --help` and `omp models --json` | `--print --mode json` (Pi's event format), `@prompt-file`, `--model provider/model`, `--thinking`, `--approval-mode`. Catalog from `omp models --json`, with per-model thinking levels. Takeover: `omp --resume ID` from its `session` event. |
-| Cursor Agent | Installed `cursor-agent --help`; [CLI documentation](https://cursor.com/docs/cli/overview) | Print-mode JSON and account model listing. Uses `cursor-agent` when installed, otherwise `agent`. Unattended uses `--output-format stream-json`; takeover `--resume ID`. |
+| Cursor Agent | Installed `cursor-agent --help` (2026.10.22); [CLI documentation](https://cursor.com/docs/cli/overview) | Print-mode stream JSON and account model listing. Uses `cursor-agent`; `agent` only when it links into Cursor's `cursor-agent` directory or its `--help` names the Cursor Agent, since other tools use that name. Unattended uses `--output-format stream-json`, whose retries emit `{type: retry}` events; takeover `--resume ID`. |
 | Gemini CLI | [Headless reference](https://geminicli.com/docs/cli/headless/) and [CLI reference](https://geminicli.com/docs/cli/cli-reference/) | `--prompt`, JSON `response`, native `--model`; interactive uses `--prompt-interactive`. |
-| OpenCode | Installed `opencode run --help`; [CLI reference](https://opencode.ai/docs/cli/) | `run --format json`; `run --interactive` for terminal mode. `--model provider/model` and `--variant`. OpenCode 2.x removed `run --interactive` and `--variant`; `doctor` reports both. Takeover: `opencode --session ID`. |
-| Aider | [Scripting](https://aider.chat/docs/scripting.html) and [options](https://aider.chat/docs/config/options.html) | `--message-file` unattended; interactive `--read` plus `--load` command file. Disable auto/dirty commits. |
-| Goose | [CLI command reference](https://github.com/aaif-goose/goose/blob/main/documentation/docs/guides/goose-cli-commands.md) | `run --text`, `--provider`, `--model`; `--interactive` continues the conversation. |
+| OpenCode | Installed `opencode run --help` and `opencode --help` (2.2.5, 2026-11-05); [CLI reference](https://opencode.ai/docs/cli/) | 2.x: `run --format json --model provider/model#variant`; interactive is the root TUI with `--prompt`, its model set through `OPENCODE_CONFIG_CONTENT` (`model`), and no variant option, so interactive effort is rejected. Before 2.x (detected `--version` major below 2): `run --interactive`, `--model`, `--variant`. `MODEL_ROUTER_HARNESS_VERSIONS=opencode=1.4.0` overrides detection. Takeover: `opencode --session ID`. |
+| Aider | [Scripting](https://aider.chat/docs/scripting.html) and [options](https://aider.chat/docs/config/options.html) | `--message-file` unattended; interactive `--read` plus `--load` command file, written at launch (never by previews). Disable auto/dirty commits. `--yes-always` is the Confirmations setting. Aider has no flag to skip its `.env` files (home, Git root, working directory); routed providers pass `--openai-api-base` so a `.env` cannot redirect the endpoint. |
+| Goose | [CLI command reference](https://github.com/aaif-goose/goose/blob/main/documentation/docs/guides/goose-cli-commands.md) | `run --text`, `--provider`, `--model`; `--interactive` continues the conversation. Permission mode via `GOOSE_MODE` (`run` has no flag). |
 | Amp | Installed `amp --help`; [modes](https://ampcode.com/docs/models-and-subagents) | `--execute --stream-json` reads stdin. `--mode` selects a mode, which can change its underlying model. Takeover: `amp threads continue ID`. |
-| Copilot CLI | [Command reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference) | `--prompt` or `--interactive`, plus `--model`. Programmatic tool permissions must be explicitly configured by the user. |
+| Copilot CLI | [Command reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference) | `--prompt` or `--interactive`, plus `--model`. The Tool permissions setting passes `--allow-all-tools`; finer `--allow-tool`/`--deny-tool` rules go in Extra arguments. |
 
 The router uses native authentication and forwards explicit user arguments.
 It never silently enables `--yolo`, `--force`, sandbox bypass, or permission bypass.
 The per-stage harness settings dialog (`c` on Workflow) can send explicit
 permission overrides. Codex sandbox and `approval_policy` config overrides,
 Claude `--permission-mode`, and Cursor `--sandbox` were checked against installed
-CLI help on 2026-10-04. Gemini's `--approval-mode` choices were checked against
+CLI help on 2026-10-04; Claude's choices again on 2026-11-05 (2.1.318:
+`acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`; older
+releases called `manual` `default`). Aider `--yes-always`, Goose `GOOSE_MODE`,
+and Copilot `--allow-all-tools` follow their documentation (not installed here). Gemini's `--approval-mode` choices were checked against
 its [CLI reference](https://geminicli.com/docs/cli/cli-reference/). Extra arguments
 remain available for other native settings; conflicting permission overrides
 are rejected before execution. No override is emitted for Harness default.
-Unknown effort/provider combinations are rejected rather than ignored. Custom
+Unknown effort/provider combinations are rejected rather than ignored; an
+effort value outside a harness's documented levels (Claude, Codex, Pi, omp) is
+a `validate` warning, since newer versions may add levels. Custom
 adapters can integrate other CLI versions or tools without changing Rust code.
 
 Discovery limitations are intentional and visible. Codex currently reads its
 local cache; Claude's native SDK model discovery is not implemented. The other
 non-enumerating adapters permit manual IDs and configured defaults. CLI catalog
-parsers fail back to manual entry instead of making paid access-test requests.
+parsers fail back to manual entry instead of making paid access-test requests:
+a listing that fails or does not parse keeps the default and saved selections
+and names the failure in the catalog note. Only a listing's last 2 MiB is read;
+the partial first line is dropped and the note says it was truncated. Harnesses
+that can use a router provider (Codex, OpenCode, Aider, Goose, custom) also
+list each configured provider's `/models`, keeping context length and prices
+(`providers::ModelInfo`).
 
 ## Provider routing references
 
@@ -46,7 +57,17 @@ reliably resolve its effective native configuration (Codex system, user, and
 profile layers; native registries). Claude Code is not routed: it reads
 credentials from sources the router cannot isolate. Codex and OpenCode receive injected providers under an
 isolated `model-router-NAME` id; OpenCode also gets model limits so
-compaction works.
+compaction works. Neither reads inherited `OPENAI_*` variables for that id
+(Codex applies `OPENAI_ORGANIZATION`/`OPENAI_PROJECT` headers only to its
+built-in `openai` provider). Aider (LiteLLM) and Goose do read them, so routed
+launches remove inherited `OPENAI_*` (and Aider's `AIDER_OPENAI_*`) variables
+other than the ones the router sets. Pi and omp have no runtime injection; a
+provider only the router defines is rejected for them.
+
+A `base_url` may not contain credentials, a query, or a fragment: it reaches
+Codex `--config` arguments, saved `command.json`, and previews. Previews redact
+every environment value. A project config's provider with its own endpoint,
+or a key variable other than the preset's, needs project trust.
 
 | Tool | Mechanism the router mirrors or emits |
 | --- | --- |
@@ -66,10 +87,10 @@ settings or an OpenAI-compatible gateway such as LiteLLM.
 `model-router doctor` checks each harness without sending a model request:
 
 ```text
-HARNESS   STATUS     VERSION  TESTED  CAPABILITIES                                     PATH
-codex     installed  0.160.0  tested  ok                                               ~/.local/bin/codex
-opencode  installed  2.0.22   tested  missing: --variant, --interactive (interactive)  ~/.opencode/bin/opencode
-gemini    missing    -        -       not checked                                      gemini
+HARNESS   STATUS     VERSION  TESTED          CAPABILITIES  PATH
+codex     installed  0.160.0  schema-derived  ok            ~/.local/bin/codex
+omp       installed  18.6.3   tested          ok            ~/.local/bin/omp
+gemini    missing    -        -               not checked   gemini
 
 Authentication is not checked: that needs a model request. Log in through each harness.
 ```
@@ -84,7 +105,11 @@ Authentication is not checked: that needs a model request. Log in through each h
   or long alias; a flag mentioned in prose does not. A flag is `supported`,
   `missing`, or `unknown` (help unavailable). Missing means current help lacks
   it: the harness removed or hid it.
-- **Tested** means the detected version has parser fixtures (below).
+- **Tested** means the detected version has captured parser fixtures (below).
+  A version whose fixtures are all schema-derived shows `schema-derived`
+  instead; others show `untested`. JSON reports carry `version_tested` (any
+  fixture) and `version_captured`. Doctor's detected version is reused by
+  adapters that change flags by version (OpenCode).
 - Custom adapters show `not declared`: they have no flag contract, so doctor
   does not run them.
 - Authentication is never checked.
@@ -99,16 +124,24 @@ on Enter.
 ### Parser fixtures
 
 `tests/fixtures/harness-output/manifest.toml` lists every fixture with its
-harness, output kind, harness version, scenario, provenance, source, and
-sanitization notes. `captured` fixtures are sanitized real output.
+harness, output kind, output format, harness version, scenario, provenance,
+source, and sanitization notes. The format must match what the adapter passes
+(`--output-format`, `--format`, `--json`, `--stream-json`, `--mode`), or a
+`format_note` explains the difference (Claude's older one-shot `json` fixtures,
+Cursor `json`); each required scenario needs a fixture in the adapter's
+format. `captured` fixtures are sanitized real output.
 `schema-derived` fixtures are built from event shapes in installed sources,
 schemas, or official documentation. All current fixtures are schema-derived:
 no router run output existed on disk, and none were produced by a model
 request. `tests/harness_output.rs` runs `handoff::normalize`, and
 `handoff::parse` for handoffs, on each fixture and checks the declared text,
 errors, and permission denials. Scenarios cover success, reported errors,
-retries, permission denials (Claude), and tool output or echoed prompts that
-contain fake handoffs.
+retries (Codex, Pi, Claude `api_retry`, Cursor `retry`, OpenCode, and an
+assumed Amp shape), permission denials (Claude), and tool output or echoed
+prompts that contain fake handoffs. An error event followed by a successful
+final event (Claude/Cursor/Amp `result` without `is_error`, Gemini `response`,
+OpenCode `step_finish` with reason `stop`) is a retry, not a failure. OpenCode's
+handoff is the text of its last message only, not every step.
 
 To record a real fixture (this sends one model request, which may be billed):
 
@@ -123,4 +156,4 @@ settings where available: Codex read-only sandbox, Claude plan mode, Cursor
 sandbox, and Gemini plan approval. The task asks for a fixed handoff block. It
 sanitizes the attempt's `stdout.log` (prompt echoes, paths, user and host
 names, emails, IDs, and keys) into `<harness>/captured-success.<ext>` and
-appends a `captured` manifest entry. Review both before committing.
+appends a `captured` manifest entry with the adapter's format. Review both before committing.

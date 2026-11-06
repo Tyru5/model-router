@@ -16,4 +16,5 @@ pub mod serve;
 pub mod snapshot;
 pub mod storage;
 pub mod task_import;
+pub mod trust;
 pub mod tui;

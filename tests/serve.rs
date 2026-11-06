@@ -108,6 +108,15 @@ fn project() -> tempfile::TempDir {
     settings
         .save(&dir.path().join(".model-router.toml"))
         .unwrap();
+    // The project config defines custom adapters, so the user trusts it once.
+    let trusted = Command::new(env!("CARGO_BIN_EXE_model-router"))
+        .arg("-C")
+        .arg(dir.path())
+        .args(["trust", "--yes"])
+        .env("MODEL_ROUTER_CONFIG_DIR", dir.path().join("config-home"))
+        .output()
+        .unwrap();
+    assert!(trusted.status.success(), "{trusted:?}");
     dir
 }
 
@@ -123,6 +132,7 @@ impl Mcp {
         let mut child = Command::new(env!("CARGO_BIN_EXE_model-router"))
             .arg("-C")
             .arg(project)
+            .env("MODEL_ROUTER_CONFIG_DIR", project.join("config-home"))
             .args(["serve", "--mcp"])
             .args(extra)
             .stdin(Stdio::piped())
@@ -418,6 +428,7 @@ fn http_api_requires_its_token_and_streams_events() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_model-router"))
         .arg("-C")
         .arg(dir.path())
+        .env("MODEL_ROUTER_CONFIG_DIR", dir.path().join("config-home"))
         .args(["serve", "--http", "127.0.0.1:0"])
         .env("MODEL_ROUTER_SERVE_TOKEN", token)
         .stdin(Stdio::null())
@@ -491,6 +502,7 @@ fn mcp_answers_calls_in_flight_when_stdin_closes() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_model-router"))
         .arg("-C")
         .arg(dir.path())
+        .env("MODEL_ROUTER_CONFIG_DIR", dir.path().join("config-home"))
         .args(["serve", "--mcp"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

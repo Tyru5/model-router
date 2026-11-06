@@ -47,6 +47,17 @@ DSR = b"\x1b[6n"  # cursor position query; crossterm sends it at startup
 _failures = 0
 
 
+def trust(project):
+    """Trust the project's custom adapter, as its user would once."""
+    import subprocess
+    subprocess.run(
+        [str(BINARY), "-C", str(project), "trust", "--yes"],
+        env=dict(os.environ, XDG_CONFIG_HOME=str(Path(project) / "config-home")),
+        check=True,
+        capture_output=True,
+    )
+
+
 def require_binary():
     assert BINARY.is_file(), f"Build model-router first (missing {BINARY})"
 

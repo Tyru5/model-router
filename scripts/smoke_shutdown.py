@@ -11,7 +11,7 @@ import sys
 import tempfile
 
 import smoke_common
-from smoke_common import alive, kill_all, require_binary, wait_until
+from smoke_common import alive, kill_all, require_binary, trust, wait_until
 
 
 def Terminal(project, *, animate=False, controlling=True):
@@ -51,6 +51,7 @@ role = "research"
 harness = "mock"
 mode = "{"interactive" if interactive else "unattended"}"
 """)
+    trust(project)
 
 
 def check_hangup(

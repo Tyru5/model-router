@@ -10,6 +10,21 @@ pub struct Setting {
     flag: &'static str,
     config_key: Option<&'static str>,
     conflicts: &'static [&'static str],
+    /// Choices that loosen the harness's own approvals or sandbox. A project
+    /// config needs trust to set them (see `trust`).
+    escalating: &'static [&'static str],
+    emit: Emit,
+}
+
+/// How a chosen value reaches the harness.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Emit {
+    /// `flag value`, or `--config key="value"` for Codex config keys.
+    Value,
+    /// The flag alone; the setting has one non-default choice.
+    Switch,
+    /// An environment variable named by `flag`.
+    Env,
 }
 
 const CODEX: &[Setting] = &[
@@ -26,6 +41,8 @@ const CODEX: &[Setting] = &[
             "--approve-for-me",
             "--dangerously-bypass-approvals-and-sandbox",
         ],
+        escalating: &["danger-full-access"],
+        emit: Emit::Value,
     },
     Setting {
         key: "approval_policy",
@@ -41,8 +58,13 @@ const CODEX: &[Setting] = &[
             "--approve-for-me",
             "--dangerously-bypass-approvals-and-sandbox",
         ],
+        escalating: &[],
+        emit: Emit::Value,
     },
 ];
+// Choices checked against `claude --help` 2.1.318 on 2026-11-05: acceptEdits,
+// auto, bypassPermissions, manual, dontAsk, plan. Older releases called
+// `manual` `default`.
 const CLAUDE: &[Setting] = &[Setting {
     key: "permission_mode",
     label: "Permission mode",
@@ -58,6 +80,8 @@ const CLAUDE: &[Setting] = &[Setting {
     flag: "--permission-mode",
     config_key: None,
     conflicts: &["--dangerously-skip-permissions"],
+    escalating: &["bypassPermissions"],
+    emit: Emit::Value,
 }];
 const CURSOR: &[Setting] = &[Setting {
     key: "sandbox",
@@ -67,6 +91,8 @@ const CURSOR: &[Setting] = &[Setting {
     flag: "--sandbox",
     config_key: None,
     conflicts: &[],
+    escalating: &["disabled"],
+    emit: Emit::Value,
 }];
 const GEMINI: &[Setting] = &[Setting {
     key: "approval_mode",
@@ -76,6 +102,8 @@ const GEMINI: &[Setting] = &[Setting {
     flag: "--approval-mode",
     config_key: None,
     conflicts: &["--yolo", "-y"],
+    escalating: &["yolo"],
+    emit: Emit::Value,
 }];
 
 const OMP: &[Setting] = &[Setting {
@@ -86,6 +114,46 @@ const OMP: &[Setting] = &[Setting {
     flag: "--approval-mode",
     config_key: None,
     conflicts: &["--auto-approve"],
+    escalating: &["yolo"],
+    emit: Emit::Value,
+}];
+
+/// Unattended Aider cannot answer its confirmation prompts without this.
+const AIDER: &[Setting] = &[Setting {
+    key: "confirmations",
+    label: "Confirmations",
+    choices: &["yes-always"],
+    help: "yes-always: answer yes to Aider's confirmation prompts (adding files, creating files). Aider still asks before running shell commands. Unattended runs cannot answer prompts.",
+    flag: "--yes-always",
+    config_key: None,
+    conflicts: &["--yes"],
+    escalating: &["yes-always"],
+    emit: Emit::Switch,
+}];
+
+/// Goose reads its permission mode from GOOSE_MODE; `run` has no flag.
+const GOOSE: &[Setting] = &[Setting {
+    key: "mode",
+    label: "Permission mode",
+    choices: &["approve", "smart_approve", "chat", "auto"],
+    help: "approve: ask before every tool. smart_approve: ask only for risky tools. chat: no tools. auto: run tools without asking. Set as GOOSE_MODE. Unattended runs cannot answer prompts.",
+    flag: "GOOSE_MODE",
+    config_key: None,
+    conflicts: &[],
+    escalating: &["auto"],
+    emit: Emit::Env,
+}];
+
+const COPILOT: &[Setting] = &[Setting {
+    key: "tool_permissions",
+    label: "Tool permissions",
+    choices: &["allow-all-tools"],
+    help: "allow-all-tools: let Copilot run every tool without asking, as programmatic mode requires for tool use. Use Extra arguments for --allow-tool/--deny-tool rules.",
+    flag: "--allow-all-tools",
+    config_key: None,
+    conflicts: &["--allow-all", "--yolo"],
+    escalating: &["allow-all-tools"],
+    emit: Emit::Switch,
 }];
 
 pub fn settings(harness: &str) -> &'static [Setting] {
@@ -95,12 +163,33 @@ pub fn settings(harness: &str) -> &'static [Setting] {
         "claude" => CLAUDE,
         "cursor" => CURSOR,
         "gemini" => GEMINI,
+        "aider" => AIDER,
+        "goose" => GOOSE,
+        "copilot" => COPILOT,
         _ => &[],
     }
 }
 
+/// Harnesses that only use their own account: no provider field and no
+/// router-defined provider.
+pub const OWN_ACCOUNT_ONLY: &[&str] = &["claude", "cursor", "gemini", "amp", "copilot"];
+
 pub fn supports_provider(harness: &str) -> bool {
-    !matches!(harness, "claude" | "cursor" | "gemini" | "amp" | "copilot")
+    !OWN_ACCOUNT_ONLY.contains(&harness)
+}
+
+/// `(key, value)` settings of `stage` that loosen the harness's own checks.
+pub fn escalations(stage: &Stage) -> Vec<(&str, &str)> {
+    settings(&stage.harness)
+        .iter()
+        .filter_map(|setting| {
+            let value = stage.harness_settings.get(setting.key)?;
+            setting
+                .escalating
+                .contains(&value.as_str())
+                .then_some((setting.key, value.as_str()))
+        })
+        .collect()
 }
 
 pub fn supports_effort(harness: &str) -> bool {
@@ -121,7 +210,7 @@ impl Setting {
     fn conflicts_with(&self, arguments: &[String]) -> bool {
         arguments.iter().enumerate().any(|(index, argument)| {
             // --config is repeatable; only the matching key conflicts.
-            (self.flag != "--config" && matches_flag(argument, self.flag))
+            (self.flag != "--config" && self.emit != Emit::Env && matches_flag(argument, self.flag))
                 || self
                     .conflicts
                     .iter()
@@ -177,15 +266,33 @@ pub fn arguments(stage: &Stage) -> Result<Vec<String>> {
             .get(setting.key)
             .filter(|v| !v.is_empty())
         {
-            args.push(setting.flag.into());
-            args.push(if setting.flag == "--config" {
-                format!("{}={}", setting.key, serde_json::to_string(value)?)
-            } else {
-                value.clone()
-            });
+            match setting.emit {
+                Emit::Env => {}
+                Emit::Switch => args.push(setting.flag.into()),
+                Emit::Value => {
+                    args.push(setting.flag.into());
+                    args.push(if setting.flag == "--config" {
+                        format!("{}={}", setting.key, serde_json::to_string(value)?)
+                    } else {
+                        value.clone()
+                    });
+                }
+            }
         }
     }
     Ok(args)
+}
+
+/// Environment variables the stage's settings set, e.g. Goose's GOOSE_MODE.
+pub fn environment(stage: &Stage) -> Vec<(String, String)> {
+    settings(&stage.harness)
+        .iter()
+        .filter(|setting| setting.emit == Emit::Env)
+        .filter_map(|setting| {
+            let value = stage.harness_settings.get(setting.key)?;
+            (!value.is_empty()).then(|| (setting.flag.to_owned(), value.clone()))
+        })
+        .collect()
 }
 
 pub fn summary(stage: &Stage) -> String {

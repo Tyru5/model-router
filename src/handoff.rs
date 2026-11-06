@@ -206,6 +206,8 @@ pub fn normalize(raw: &str, kind: OutputKind) -> Normalized {
     };
     let mut result = Normalized::default();
     let mut recognized = false;
+    // OpenCode: the message whose text parts form the handoff.
+    let mut message_id: Option<String> = None;
     for event in events {
         if event.get("is_error").and_then(Value::as_bool) == Some(true) {
             // Claude's error results carry `errors` instead of `result`.
@@ -233,15 +235,20 @@ pub fn normalize(raw: &str, kind: OutputKind) -> Normalized {
             result.permission_blocked = true;
         }
         let kind_name = event.get("type").and_then(Value::as_str).unwrap_or("");
-        if kind_name == "error"
+        let failed = kind_name == "error"
             || kind_name == "turn.failed"
-            || event.get("error").is_some_and(|v| !v.is_null())
-        {
+            || event.get("error").is_some_and(|v| !v.is_null());
+        if failed {
             result.error = Some(storage::truncate(&event.to_string(), 1500));
         }
+        // Retries report errors (Claude `api_retry`, provider errors) before
+        // the run succeeds; a later successful final event supersedes them.
         match kind {
             OutputKind::Claude | OutputKind::Cursor | OutputKind::Amp => {
                 if kind_name == "result" {
+                    if !failed && event.get("is_error").and_then(Value::as_bool) != Some(true) {
+                        result.error = None;
+                    }
                     if let Some(text) = event.get("result").and_then(Value::as_str) {
                         result.text = text.into();
                         recognized = true;
@@ -266,6 +273,13 @@ pub fn normalize(raw: &str, kind: OutputKind) -> Normalized {
                 if let Some(text) = event.get("response").and_then(Value::as_str) {
                     result.text = text.into();
                     recognized = true;
+                }
+                // JSON output carries `response`; stream-json ends with a result.
+                let succeeded = event.get("response").is_some_and(Value::is_string)
+                    || (kind_name == "result"
+                        && event.get("status").and_then(Value::as_str) == Some("success"));
+                if succeeded && !failed {
+                    result.error = None;
                 }
             }
             OutputKind::Codex => {
@@ -316,10 +330,26 @@ pub fn normalize(raw: &str, kind: OutputKind) -> Normalized {
             OutputKind::OpenCode => {
                 if kind_name == "text" {
                     if let Some(text) = event.pointer("/part/text").and_then(Value::as_str) {
+                        // Each step is its own message; only the latest one
+                        // with text is the final answer.
+                        let id = event
+                            .pointer("/part/messageID")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        if id != message_id {
+                            result.text.clear();
+                            message_id = id;
+                        }
                         result.text.push_str(text);
                         result.text.push('\n');
                         recognized = true;
                     }
+                }
+                // A step that finished normally ends the turn after any retry.
+                if kind_name == "step_finish"
+                    && event.pointer("/part/reason").and_then(Value::as_str) == Some("stop")
+                {
+                    result.error = None;
                 }
             }
             OutputKind::Text => {}
