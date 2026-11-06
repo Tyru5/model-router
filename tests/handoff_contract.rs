@@ -1,7 +1,7 @@
 //! Handoff contract v2: saved v1 runs, the prompt's contract size, and
 //! native output-schema flags gated by harness version.
 use model_router::{
-    config::{Mode, Role, Settings, Stage, Workflow},
+    config::{CustomAdapter, Mode, Role, Settings, Stage, Workflow},
     engine::{self, Run},
     handoff, report,
 };
@@ -52,7 +52,17 @@ Tests use status passed, failed, or not_run. Never claim a test ran if it did no
 #[test]
 fn contract_is_at_least_a_fifth_shorter_for_every_starter_role() {
     let dir = tempfile::tempdir().unwrap();
-    let settings = Settings::default();
+    // The contract depends only on the role; a stand-in adapter keeps the
+    // run creatable where no harness is installed (CI).
+    let mut settings = Settings::default();
+    settings.adapters.insert(
+        "standin".into(),
+        CustomAdapter {
+            command: "sh".into(),
+            interactive_args: Some(vec![]),
+            ..CustomAdapter::default()
+        },
+    );
     let mut workflow = settings.workflows[0].clone();
     // Cover every role, not only the starter's.
     for role in [Role::Planning, Role::Test, Role::Custom] {
@@ -61,6 +71,11 @@ fn contract_is_at_least_a_fifth_shorter_for_every_starter_role() {
             role,
             ..Stage::default()
         });
+    }
+    for stage in &mut workflow.stages {
+        stage.harness = "standin".into();
+        stage.harness_settings.clear();
+        stage.effort.clear();
     }
     let mut run =
         Run::create(dir.path(), &settings, &workflow, "Add a flag".into(), false).unwrap();

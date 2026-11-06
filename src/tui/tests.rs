@@ -653,6 +653,9 @@ fn stage_editor_model_field_picks_from_catalog_and_keeps_draft() {
     assert!(app.ui.alert.contains("Offline catalog"));
 
     // A pick fills model and provider in the draft, not the saved stage.
+    // The editor's own background read of the real catalog may have landed
+    // in the cache; drop it so the picker waits for the fixture below.
+    settle_catalog_reads(&mut app);
     app.key(key(Key::Enter)).unwrap();
     let (sender, receiver) = mpsc::channel();
     sender
@@ -780,6 +783,7 @@ fn harness_model_catalog_restores_draft_on_cancel_error_and_selection() {
         matches!(app.ui.dialog(), Some(Modal::Harness(e)) if e.error.contains("Offline catalog") && e.finish().unwrap().model == "draft-model")
     );
 
+    settle_catalog_reads(&mut app);
     app.key(key(Key::F(7))).unwrap();
     let (sender, receiver) = mpsc::channel();
     sender
@@ -850,6 +854,21 @@ fn deliver(app: &mut App, receiver: mpsc::Receiver<Result<Catalog, String>>) {
         result: receiver.recv().unwrap(),
     };
     app.update(app.tasks.generation(), msg);
+}
+
+/// Waits for the editors' background catalog reads, then forgets what they
+/// cached, so a test's picker reads its fixture instead of the real catalog.
+fn settle_catalog_reads(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while app.catalogs.reading.is_some() || !app.catalogs.queue.is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "catalog reads did not finish"
+        );
+        app.poll().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    app.catalogs.cached.clear();
 }
 
 /// The ticket of the Loading dialog on top.
