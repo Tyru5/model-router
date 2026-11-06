@@ -11,7 +11,7 @@ use super::{
 };
 use crate::{
     adapters, catalog,
-    config::{Check, Mode, Role, Stage},
+    config::{Check, Mode, Role, Sandbox, Stage},
     engine::{self, Run},
     harness_settings, presets, storage,
 };
@@ -41,12 +41,16 @@ const FIELDS: &[&str] = &[
     "Review repair target (stage ID; blank = nearest)",
     "Extra arguments (shell quoting; no shell execution)",
     "Router checks (one per line; ? prefix = optional)",
+    "Router sandbox (inherit = workflow default)",
     "Stage instructions",
 ];
 /// Multiline fields, where Enter inserts a newline.
 const CHECKS: usize = 10;
-const INSTRUCTIONS: usize = 11;
-const CHOICES: [usize; 3] = [1, 2, 6];
+const INSTRUCTIONS: usize = 12;
+const CHOICES: [usize; 4] = [1, 2, 6, SANDBOX];
+const SANDBOX: usize = 11;
+/// The sandbox choice that keeps the workflow's `sandbox_default`.
+const INHERIT: &str = "inherit";
 /// The model field: chosen from the harness catalog, typed only on request.
 pub(super) const MODEL: usize = 3;
 const PROVIDER: usize = 4;
@@ -99,6 +103,7 @@ impl StageEditor {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        let sandbox = stage.sandbox.map_or(INHERIT, Sandbox::label).to_owned();
         let fields = [
             &stage.name,
             stage.role.label(),
@@ -111,6 +116,7 @@ impl StageEditor {
             &stage.repair_target,
             &args,
             &checks,
+            &sandbox,
             &stage.instructions,
         ]
         .into_iter()
@@ -159,6 +165,10 @@ impl StageEditor {
                 levels.insert(0, String::new());
                 levels
             }
+            SANDBOX => std::iter::once(INHERIT)
+                .chain(Sandbox::ALL.map(Sandbox::label))
+                .map(String::from)
+                .collect(),
             _ => vec!["unattended".into(), "interactive".into()],
         }
     }
@@ -190,6 +200,8 @@ impl StageEditor {
             .context("Extra arguments have unmatched quotes")?;
         stage.checks = parse_checks(&content(&self.fields[CHECKS]), &self.stage.checks)?;
         stage.instructions = content(&self.fields[INSTRUCTIONS]);
+        let sandbox = content(&self.fields[SANDBOX]);
+        stage.sandbox = Sandbox::ALL.into_iter().find(|s| s.label() == sandbox);
         Ok(stage)
     }
     fn focus(&mut self, index: usize) {
@@ -854,7 +866,8 @@ pub(super) fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palett
             .get(&stage.harness)
             .and_then(|c| c.efforts_for(&stage.model, &stage.provider))
             .map(|efforts| effort_note(stage, &efforts));
-        draw_stage_detail(frame, stage, warning, effort, cols[1], palette);
+        let sandbox = stage.effective_sandbox(&app.settings.workflows[app.workflow]);
+        draw_stage_detail(frame, stage, sandbox, warning, effort, cols[1], palette);
     }
 }
 
@@ -886,6 +899,7 @@ fn effort_note(stage: &Stage, efforts: &catalog::Efforts) -> (String, bool) {
 fn draw_stage_detail(
     frame: &mut Frame<'_>,
     stage: &Stage,
+    sandbox: Sandbox,
     warning: Option<String>,
     effort_note: Option<(String, bool)>,
     area: Rect,
@@ -919,6 +933,12 @@ fn draw_stage_detail(
     lines.extend([
         kv(palette, "Model", model.0, model.1),
         kv(palette, "Execution", stage.mode.label(), true),
+        kv(
+            palette,
+            "Sandbox",
+            sandbox.label(),
+            stage.sandbox.is_some() || sandbox != Sandbox::Off,
+        ),
         kv(palette, "Provider", provider.0, provider.1),
         kv(palette, "Effort", effort.0, effort.1),
     ]);
@@ -1220,7 +1240,17 @@ mod tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 50)).unwrap();
         terminal
-            .draw(|frame| draw_stage_detail(frame, stage, None, None, frame.area(), palette))
+            .draw(|frame| {
+                draw_stage_detail(
+                    frame,
+                    stage,
+                    Sandbox::Off,
+                    None,
+                    None,
+                    frame.area(),
+                    palette,
+                )
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
@@ -1231,6 +1261,21 @@ mod tests {
                     + "\n"
             })
             .collect()
+    }
+
+    #[test]
+    fn sandbox_choice_cycles_and_inherits_by_default() {
+        let mut editor = StageEditor::new(Stage::default(), vec!["codex".into()]);
+        assert_eq!(editor.finish().unwrap().sandbox, None);
+        editor.focus(SANDBOX);
+        editor.key(KeyEvent::from(Key::Right));
+        editor.key(KeyEvent::from(Key::Right));
+        assert_eq!(editor.finish().unwrap().sandbox, Some(Sandbox::ReadOnly));
+        assert!(editor.changed());
+        editor.key(KeyEvent::from(Key::Left));
+        editor.key(KeyEvent::from(Key::Left));
+        assert_eq!(editor.finish().unwrap().sandbox, None);
+        assert!(!editor.changed());
     }
 
     #[test]
