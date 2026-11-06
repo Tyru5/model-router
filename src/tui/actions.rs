@@ -38,6 +38,7 @@ pub(super) enum ActionId {
     AddStage,
     DuplicateStage,
     RemoveStage,
+    Undo,
     MoveStageDown,
     MoveStageUp,
     ToggleWorktree,
@@ -238,7 +239,7 @@ const ACTIONS: &[Entry] = {
             .footer(),
         act(ChooseWorkflow, Workflow, ch('w'), "switch", "Select/clone workflow or add a preset"),
         act(RenameWorkflow, Workflow, ch('R'), "rename", "Rename workflow"),
-        act(DeleteWorkflow, Workflow, ch('X'), "delete", "Delete workflow"),
+        act(DeleteWorkflow, Workflow, ch('X'), "delete", "Delete workflow ([y] confirms; [u] undoes)"),
         act(PreviousStage, Workflow, key(KeyCode::Up), "select", "Select previous stage").also(&[ch('k')]),
         act(NextStage, Workflow, key(KeyCode::Down), "select", "Select next stage").also(&[ch('j')]),
         act(EditStage, Workflow, ch('e'), "edit", "Edit selected stage").also(&[key(KeyCode::Enter)]),
@@ -254,7 +255,8 @@ const ACTIONS: &[Entry] = {
         act(ToggleMode, Workflow, ch('v'), "execution", "Toggle unattended/interactive"),
         act(AddStage, Workflow, ch('a'), "add", "Add stage preset (edit, then [Ctrl+S] inserts; [Esc] cancels)"),
         act(DuplicateStage, Workflow, ch('d'), "duplicate", "Duplicate stage"),
-        act(RemoveStage, Workflow, ch('x'), "remove", "Remove stage"),
+        act(RemoveStage, Workflow, ch('x'), "remove", "Remove stage ([u] undoes)"),
+        act(Undo, Workflow, ch('u'), "undo", "Undo the last stage removal or workflow deletion"),
         act(MoveStageDown, Workflow, ch('J'), "move down", "Move stage down"),
         act(MoveStageUp, Workflow, ch('K'), "move up", "Move stage up"),
         act(ToggleWorktree, Workflow, ch('g'), "worktree", "Toggle isolated Git worktree"),
@@ -263,14 +265,14 @@ const ACTIONS: &[Entry] = {
         act(Save, Workflow, ch('s'), "save", "Save project").footer(),
         act(SaveGlobal, Workflow, ch('S'), "save global", "Save global templates"),
         // Monitor: while running, while idle, or both
-        act(CancelStage, MonitorRunning, ch('c'), "cancel stage", "Cancel active stage").footer(),
-        act(TakeOver, Monitor, ch('t'), "terminal", "Attach to the live interactive terminal, or reopen the stage's saved session (stops it first if unattended)")
+        act(CancelStage, MonitorRunning, ch('C'), "cancel stage", "Cancel active stage ([y] confirms)").footer(),
+        act(TakeOver, Monitor, ch('t'), "terminal", "Attach to the live interactive terminal, or reopen the stage's saved session (an unattended stage stops first; [y] confirms)")
             .footer_in(&[MonitorRunning]),
         act(PreviousSessionRun, Monitor, ch('['), "runs", "Show the previous run of this session").alias("[ ]").footer_in(&[MonitorRunning]),
         act(NextSessionRun, Monitor, ch(']'), "runs", "Show the next run of this session").alias("[ ]").footer_in(&[MonitorRunning]),
         act(CloseRun, MonitorIdle, ch('x'), "close", "Close this run in the session; its files stay and Runs [3] reopens it"),
         act(Advance, MonitorIdle, ch('a'), "advance", "Accept handoff and advance; also accepts a test stage's not-applicable waiver").footer(),
-        act(Continue, MonitorIdle, ch('c'), "continue", "Continue the run when idle").footer(),
+        act(Continue, MonitorIdle, ch('c'), "continue", "Continue the run when idle (not in the moment a stage stops)").footer(),
         act(Retry, MonitorIdle, ch('y'), "retry", "Explicitly retry current stage").footer(),
         act(RetryInteractive, MonitorIdle, ch('i'), "interactive", "Retry current stage interactively").footer(),
         act(ReplaceModel, MonitorIdle, ch('m'), "model", "Replace current model and retry").footer(),
@@ -315,11 +317,11 @@ const ACTIONS: &[Entry] = {
         act(ToggleVim, Global, key(KeyCode::F(8)), "Vim motions", "Toggle optional Vim motions in input fields (saved for all projects)")
             .more(&["Inputs start in Insert mode; Esc enters Normal mode; Esc again cancels", "Normal: h/j/k/l, w/b/e, 0/^/$, gg/G; i/a/I/A resume typing"]),
         act(Help, Global, ch('?'), "help", "Keyboard guide").footer_in(&[Workflow, MonitorIdle, Harnesses]),
-        act(Quit, Global, ch('q'), "quit", "Save workflow edits and exit (stops active work first)")
+        act(Quit, Global, ch('q'), "quit", "Exit, asking to save unsaved workflow edits (stops active work first)")
             .footer_in(&[Workflow, MonitorRunning, Runs, Harnesses]),
         act(Commands, Global, ch(':'), "commands", "Command menu: search this view's actions")
             .footer_in(&[MonitorRunning, Runs, Harnesses]),
-        act(Interrupt, Global, ctrl('c'), "cancel/exit", "Cancel work or exit"),
+        act(Interrupt, Global, ctrl('c'), "cancel/exit", "Cancel work, or exit (asks to save unsaved edits)"),
     ]
 };
 
@@ -348,18 +350,21 @@ pub(super) fn available(here: Scope) -> impl Iterator<Item = &'static Entry> {
     ACTIONS.iter().filter(move |entry| entry.scope.covers(here))
 }
 
-/// The action `key` triggers in `here`. Extra modifiers are ignored, as page
-/// keys always have (Shift+T is `T`), and the most specific binding wins, so
-/// Ctrl+C is not `c`.
+/// The action `key` triggers in `here`. Modifiers must match exactly, so
+/// Ctrl+R is not `r` and Ctrl+C is not `c`. Shift is implied by the character
+/// itself (Shift+T arrives as `T`), so it is ignored for character keys.
 pub(super) fn resolve(here: Scope, key: KeyEvent) -> Option<ActionId> {
+    let mut mods = key.modifiers;
+    if matches!(key.code, KeyCode::Char(_)) {
+        mods.remove(KeyModifiers::SHIFT);
+    }
     available(here)
         .flat_map(|entry| {
             std::iter::once(&entry.key)
                 .chain(entry.also)
                 .map(move |binding| (entry.id, binding))
         })
-        .filter(|(_, (code, mods))| *code == key.code && key.modifiers.contains(*mods))
-        .max_by_key(|(_, (_, mods))| mods.bits().count_ones())
+        .find(|(_, (code, bound))| *code == key.code && *bound == mods)
         .map(|(id, _)| id)
 }
 
@@ -478,6 +483,41 @@ mod tests {
             press(Scope::Global, KeyCode::Char('r'), KeyModifiers::NONE),
             None
         );
+        // Extra modifiers never reach a plain page key.
+        for (here, c) in [
+            (Scope::Workflow, 'r'),
+            (Scope::Workflow, 'x'),
+            (Scope::Workflow, 'd'),
+            (Scope::MonitorIdle, 'c'),
+            (Scope::Runs, 'D'),
+        ] {
+            let plain = press(here, KeyCode::Char(c), KeyModifiers::NONE);
+            assert!(plain.is_some());
+            for mods in [control, KeyModifiers::ALT, control | shift] {
+                assert_ne!(press(here, KeyCode::Char(c), mods), plain, "{c} {mods:?}");
+            }
+        }
+        for c in ['r', 'x', 'd'] {
+            assert_eq!(press(Scope::Workflow, KeyCode::Char(c), control), None);
+        }
+        assert_eq!(press(Scope::Workflow, KeyCode::Enter, control), None);
+        // Ctrl+C stays distinct from the page's `c`, idle or running.
+        assert_eq!(
+            press(Scope::MonitorIdle, KeyCode::Char('c'), control),
+            Some(ActionId::Interrupt)
+        );
+        assert_eq!(
+            press(Scope::MonitorRunning, KeyCode::Char('C'), shift),
+            Some(ActionId::CancelStage)
+        );
+        assert_eq!(
+            press(
+                Scope::MonitorRunning,
+                KeyCode::Char('c'),
+                KeyModifiers::NONE
+            ),
+            None
+        );
     }
 
     #[test]
@@ -492,6 +532,6 @@ mod tests {
             }
         }
         assert!(lines.contains(&"e / Enter\tEdit selected stage"));
-        assert!(lines.contains(&"Ctrl+C\tCancel work or exit"));
+        assert!(lines.contains(&"Ctrl+C\tCancel work, or exit (asks to save unsaved edits)"));
     }
 }

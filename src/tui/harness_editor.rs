@@ -219,6 +219,12 @@ impl HarnessEditor {
         }
     }
 
+    /// Whether the draft differs from the stage it opened with, or cannot be applied.
+    pub fn changed(&self) -> bool {
+        self.finish().map_or(true, |stage| {
+            serde_json::to_value(&stage).ok() != serde_json::to_value(&self.stage).ok()
+        })
+    }
     pub fn finish(&self) -> Result<Stage> {
         let mut stage = self.stage.clone();
         for field in &self.fields {

@@ -1,7 +1,7 @@
 use super::{
     actions::ActionId,
-    app::{App, Worker, draw},
-    modal::{Modal, PickValue},
+    app::{App, Job, Worker, draw},
+    modal::{Ask, Modal, PickValue},
     path_picker::PathPicker,
     theme::{self, Theme},
     widgets::textarea,
@@ -10,6 +10,7 @@ use super::{
 use crate::{
     catalog::{Catalog, Model},
     config::{self, Role, Settings, Stage},
+    engine::{Action, Event as RunEvent, Status},
     presets,
 };
 use crossterm::event::{KeyCode as Key, KeyEvent, KeyModifiers as Mods};
@@ -201,6 +202,19 @@ fn vim_stage_navigation_keeps_choices_and_refocus_behavior() {
     app.key(key(Key::Esc)).unwrap();
     app.key(key(Key::Char('k'))).unwrap();
     assert!(app.modal.as_mut().unwrap().active_input().is_some());
+    // Down returns to the last line first; only there does it leave the field.
+    app.key(key(Key::Down)).unwrap();
+    assert_eq!(
+        app.modal
+            .as_mut()
+            .unwrap()
+            .active_input()
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap(),
+        "last line"
+    );
     app.key(key(Key::Down)).unwrap();
     assert_eq!(
         super::widgets::content(app.modal.as_mut().unwrap().active_input().unwrap()),
@@ -502,7 +516,14 @@ fn harness_editor_applies_only_to_selected_stage_and_supports_cancel() {
             .unwrap();
     }
     app.key(key(Key::Right)).unwrap();
+    // A changed draft asks before Esc discards it; [n] returns to it.
     app.key(key(Key::Esc)).unwrap();
+    assert!(matches!(&app.modal, Some(Modal::Ask(_))));
+    app.key(key(Key::Char('n'))).unwrap();
+    assert!(matches!(&app.modal, Some(Modal::Harness(_))));
+    app.key(key(Key::Esc)).unwrap();
+    app.key(key(Key::Char('y'))).unwrap();
+    assert!(app.modal.is_none());
     assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
     assert!(!app.dirty);
 
@@ -554,6 +575,8 @@ fn harness_editor_applies_only_to_selected_stage_and_supports_cancel() {
     assert!(matches!(&app.modal, Some(Modal::Harness(e)) if e.error.contains("greater than zero")));
     assert_eq!(serde_json::to_value(&app.settings).unwrap(), saved_settings);
     app.key(key(Key::Esc)).unwrap();
+    app.key(key(Key::Char('y'))).unwrap();
+    assert!(app.modal.is_none());
 
     // Both ways of switching harness discard incompatible structured options.
     let mut editor = StageEditor::new(app.stage().clone(), vec!["codex".into(), "claude".into()]);
@@ -1048,4 +1071,384 @@ fn a_busy_checkout_sends_the_next_run_to_a_worktree() {
     // A finished run frees the checkout.
     app.focused.run.as_mut().unwrap().status = Status::Complete;
     assert_eq!(app.placement(false).unwrap(), (Placement::Project, None));
+}
+
+fn shift(c: char) -> KeyEvent {
+    KeyEvent::new(Key::Char(c), Mods::SHIFT)
+}
+
+fn ctrl(c: char) -> KeyEvent {
+    KeyEvent::new(Key::Char(c), Mods::CONTROL)
+}
+
+/// The app's screen as text rows at `width` × `height`.
+fn rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| draw(frame, app)).unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+        .collect()
+}
+
+/// A Monitor focused on a run whose unattended stage is running.
+fn running_app(project: &std::path::Path) -> App {
+    let mut app = theme_app(project);
+    let mut run = sample_run("live");
+    run.status = Status::Running;
+    run.cursor = 0;
+    app.adopt(run);
+    app.focused.worker = Some(Worker::stub());
+    app.page = 1;
+    app
+}
+
+#[test]
+fn cancel_has_its_own_key_and_asks_and_c_never_continues_a_stage_that_just_stopped() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = running_app(project.path());
+    let cancelled = |app: &App| app.focused.cancel.load(Ordering::Relaxed);
+    // `c` continues an idle run; it does nothing to a running one.
+    app.key(key(Key::Char('c'))).unwrap();
+    assert!(!cancelled(&app) && app.modal.is_none());
+    app.key(shift('C')).unwrap();
+    assert!(
+        matches!(&app.modal, Some(Modal::Ask(ask)) if matches!(**ask, Ask::CancelStage { .. }))
+    );
+    assert!(!cancelled(&app), "Cancelling waits for confirmation");
+    assert!(rows(&mut app, 65, 20).join("\n").contains("Cancel stage"));
+    app.key(key(Key::Char('n'))).unwrap();
+    assert!(app.modal.is_none() && !cancelled(&app));
+
+    // The stage stops while the question is open: yes cancels nothing.
+    app.key(shift('C')).unwrap();
+    let run = app.focused.run.clone().unwrap();
+    app.focused
+        .worker
+        .as_ref()
+        .unwrap()
+        .finish(run, Ok(Action::Stopped));
+    app.poll().unwrap();
+    assert!(app.focused.worker.is_none());
+    app.key(key(Key::Char('y'))).unwrap();
+    assert!(app.modal.is_none() && !cancelled(&app));
+    assert!(
+        app.message.contains("nothing was cancelled"),
+        "{}",
+        app.message
+    );
+    // `c` pressed as the stage stopped does not start the next one.
+    assert!(app.key(key(Key::Char('c'))).is_err());
+    assert!(app.focused.worker.is_none());
+
+    // A confirmed cancel of a running stage.
+    app.focused.worker = Some(Worker::stub());
+    app.key(shift('C')).unwrap();
+    app.key(key(Key::Enter)).unwrap();
+    assert!(cancelled(&app));
+
+    // Taking over an unattended stage stops it only once confirmed.
+    let mut app = running_app(project.path());
+    app.key(key(Key::Char('t'))).unwrap();
+    assert!(matches!(&app.modal, Some(Modal::Ask(ask)) if matches!(**ask, Ask::TakeOver { .. })));
+    assert!(!cancelled(&app) && !app.focused.takeover);
+    app.key(key(Key::Char('y'))).unwrap();
+    assert!(cancelled(&app) && app.focused.takeover);
+}
+
+#[test]
+fn modified_keys_do_not_trigger_page_actions() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    let stages = app.settings.workflows[0].stages.len();
+    for c in ['r', 'x', 'd', 'X'] {
+        app.key(ctrl(c)).unwrap();
+        app.key(KeyEvent::new(Key::Char(c), Mods::ALT)).unwrap();
+    }
+    assert_eq!(app.settings.workflows[0].stages.len(), stages);
+    assert!(app.modal.is_none() && app.starting.is_none() && !app.dirty);
+    // Ctrl+C still interrupts: with nothing running and nothing unsaved, it exits.
+    assert!(app.key(ctrl('c')).unwrap());
+}
+
+#[test]
+fn removed_stages_and_deleted_workflows_can_be_undone() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    let original = serde_json::to_value(&app.settings.workflows).unwrap();
+    app.key(key(Key::Char('u'))).unwrap();
+    assert_eq!(app.message, "Nothing to undo.");
+    let name = app.stage().name.clone();
+    app.key(key(Key::Char('x'))).unwrap();
+    assert_eq!(
+        app.message,
+        format!("Removed stage “{name}” — [u] to undo.")
+    );
+    app.key(key(Key::Char('j'))).unwrap();
+    app.key(key(Key::Char('x'))).unwrap();
+    app.key(key(Key::Char('u'))).unwrap();
+    app.key(key(Key::Char('u'))).unwrap();
+    assert_eq!(
+        serde_json::to_value(&app.settings.workflows).unwrap(),
+        original
+    );
+    assert_eq!(app.selected, 0);
+    assert!(app.dirty);
+
+    app.pick(PickValue::WorkflowPreset(2)).unwrap();
+    let both = serde_json::to_value(&app.settings.workflows).unwrap();
+    app.key(shift('X')).unwrap();
+    assert!(matches!(&app.modal, Some(Modal::Ask(_))));
+    assert!(
+        rows(&mut app, 65, 20)
+            .join("\n")
+            .contains("Delete workflow")
+    );
+    app.key(key(Key::Esc)).unwrap();
+    assert_eq!(app.settings.workflows.len(), 2);
+    app.key(shift('X')).unwrap();
+    app.key(key(Key::Char('y'))).unwrap();
+    assert_eq!(app.settings.workflows.len(), 1);
+    assert!(app.message.contains("[u] to undo"), "{}", app.message);
+    app.key(key(Key::Char('u'))).unwrap();
+    assert_eq!(serde_json::to_value(&app.settings.workflows).unwrap(), both);
+    assert_eq!(app.workflow, 1);
+}
+
+#[test]
+fn exit_asks_to_save_unsaved_edits_from_both_q_and_ctrl_c() {
+    let project = tempfile::tempdir().unwrap();
+    let saved = |app: &App| app.config_path.exists();
+    // Nothing unsaved: both exit at once.
+    let mut app = theme_app(project.path());
+    assert!(app.key(key(Key::Char('q'))).unwrap());
+    assert!(app.key(ctrl('c')).unwrap());
+
+    for (exit, answer, save) in [
+        (key(Key::Char('q')), 'n', false),
+        (ctrl('c'), 'n', false),
+        (key(Key::Char('q')), 'y', true),
+        (ctrl('c'), 'y', true),
+    ] {
+        let _ = std::fs::remove_file(&app.config_path);
+        let mut app = theme_app(project.path());
+        app.key(key(Key::Char(' '))).unwrap();
+        assert!(app.dirty);
+        assert!(!app.key(exit).unwrap());
+        assert!(matches!(&app.modal, Some(Modal::Ask(ask)) if matches!(**ask, Ask::SaveAndExit)));
+        assert!(rows(&mut app, 65, 20).join("\n").contains("Save changes?"));
+        // Esc stays, with the edits.
+        app.key(key(Key::Esc)).unwrap();
+        assert!(app.modal.is_none() && app.dirty && !saved(&app));
+        assert!(!app.key(exit).unwrap());
+        assert!(app.key(key(Key::Char(answer))).unwrap(), "{answer} exits");
+        assert_eq!(saved(&app), save, "{answer}");
+    }
+}
+
+#[test]
+fn switching_project_drops_catalogs_and_results_for_the_old_one() {
+    let project = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    let (old_sender, receiver) = mpsc::channel();
+    app.prefetch = Some(("codex".into(), Job::from_receiver(app.generation, receiver)));
+    app.prefetch_queue.push_back("claude".into());
+    app.catalogs.insert("pi".into(), Catalog::default());
+    let old = app.generation;
+    app.switch_project(other.path().into()).unwrap();
+    assert_ne!(app.generation, old);
+    assert!(app.catalogs.is_empty() && app.prefetch.is_none() && app.prefetch_queue.is_empty());
+    assert!(old_sender.send(Ok(Catalog::default())).is_err());
+    // A result tagged with the old project is dropped, even if its job survived.
+    let (sender, receiver) = mpsc::channel();
+    app.prefetch = Some(("codex".into(), Job::from_receiver(old, receiver)));
+    sender.send(Ok(Catalog::default())).unwrap();
+    let (runs, receiver) = mpsc::channel();
+    app.runs_job = Some(Job::from_receiver(old, receiver));
+    runs.send(Ok(crate::history::list(project.path()).unwrap()))
+        .unwrap();
+    app.poll().unwrap();
+    assert!(!app.catalogs.contains_key("codex"));
+    assert!(app.prefetch.is_none() && app.runs_job.is_none());
+
+    // From the browser, the project opens in the background; a bad path
+    // returns to the browser with the error.
+    let picker = Box::new(PathPicker::new(project.path(), vec![]).unwrap());
+    app.begin_switch(project.path().join("missing"), picker);
+    assert!(matches!(&app.modal, Some(Modal::Loading(_))));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while matches!(&app.modal, Some(Modal::Loading(_))) && std::time::Instant::now() < deadline {
+        app.poll().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(matches!(&app.modal, Some(Modal::Repositories(p)) if p.error.contains("not found")));
+    let picker = Box::new(PathPicker::new(project.path(), vec![]).unwrap());
+    app.begin_switch(project.path().into(), picker);
+    while app.modal.is_some() && std::time::Instant::now() < deadline {
+        app.poll().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(app.project, std::fs::canonicalize(project.path()).unwrap());
+}
+
+#[test]
+fn output_wraps_by_display_width() {
+    use super::monitor::wrap;
+    assert_eq!(wrap("雪雪雪", 4), ["雪雪", "雪"]);
+    assert_eq!(wrap("ab😀cd", 3), ["ab", "😀c", "d"]);
+    assert_eq!(wrap("", 5), [""]);
+    let project = tempfile::tempdir().unwrap();
+    let mut app = running_app(project.path());
+    app.focused.push_log(format!("● {}", "雪".repeat(20)));
+    app.focused.push_log("tail 😀 end".into());
+    let screen = rows(&mut app, 65, 20).join("");
+    // Every character reaches the screen; none is cut at the panel edge.
+    assert_eq!(screen.matches('雪').count(), 20, "{screen}");
+    // A wide character's second cell renders as a space.
+    assert!(
+        screen.replace("😀 ", "😀").contains("tail 😀 end"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn runs_with_no_stages_and_empty_choices_do_not_panic() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = running_app(project.path());
+    let run = app.focused.run.as_mut().unwrap();
+    run.stages.clear();
+    run.workflow.stages.clear();
+    run.cursor = 3;
+    for (width, height) in [(65, 20), (80, 24)] {
+        rows(&mut app, width, height);
+    }
+    app.focused.worker = None;
+    app.focused.run.as_mut().unwrap().status = Status::AwaitingConfirmation;
+    app.key(key(Key::Char('h'))).unwrap();
+    assert!(matches!(&app.modal, Some(Modal::Text { .. })));
+    app.modal = None;
+    app.key(key(Key::Char('e'))).unwrap();
+    rows(&mut app, 65, 20);
+    // A harness field with no harnesses to cycle through.
+    let mut editor = StageEditor::new(Stage::default(), vec![]);
+    for _ in 0..2 {
+        editor.key(key(Key::Down));
+    }
+    editor.key(key(Key::Right));
+    editor.key(key(Key::Left));
+}
+
+#[test]
+fn worker_output_never_blocks_and_marks_dropped_lines() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = running_app(project.path());
+    let worker = app.focused.worker.as_ref().unwrap();
+    let text: String = (0..2500).map(|n| format!("line {n}\n")).collect();
+    worker.send(RunEvent::Output(text));
+    let mut first = sample_run("live");
+    first.status = Status::Running;
+    let mut latest = first.clone();
+    latest.repair_passes = 7;
+    worker.send(RunEvent::State(Box::new(first)));
+    worker.send(RunEvent::State(Box::new(latest)));
+    app.poll().unwrap();
+    let logs: Vec<_> = app.focused.logs.iter().cloned().collect();
+    assert!(logs.len() <= 400);
+    assert_eq!(logs.last().unwrap(), "line 2499");
+    assert!(logs[0].contains("2101 lines skipped"), "{:?}", &logs[..3]);
+    assert_eq!(app.focused.run.as_ref().unwrap().repair_passes, 7);
+}
+
+#[test]
+fn interactive_terminal_waits_while_a_dialog_is_open() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    app.launch_interactive = true;
+    app.modal = Some(Modal::Loading("Reading".into()));
+    assert!(!app.take_launch());
+    assert!(app.message.contains("press [t]"), "{}", app.message);
+    app.modal = None;
+    app.launch_interactive = true;
+    assert!(app.take_launch());
+    assert!(!app.take_launch());
+}
+
+#[test]
+fn text_dialog_scrolling_stops_at_the_last_line() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    app.text("Three lines", "one\ntwo\nthree".into());
+    for _ in 0..3 {
+        app.key(key(Key::PageDown)).unwrap();
+    }
+    assert!(matches!(&app.modal, Some(Modal::Text { scroll: 2, .. })));
+    app.key(key(Key::Up)).unwrap();
+    assert!(matches!(&app.modal, Some(Modal::Text { scroll: 1, .. })));
+}
+
+#[test]
+fn stage_editor_asks_before_discarding_changes() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    let original = serde_json::to_value(&app.settings).unwrap();
+    // Unchanged: Esc closes at once.
+    app.key(key(Key::Char('e'))).unwrap();
+    app.key(key(Key::Esc)).unwrap();
+    assert!(app.modal.is_none());
+    app.key(key(Key::Char('e'))).unwrap();
+    app.key(key(Key::Char('!'))).unwrap();
+    app.key(key(Key::Esc)).unwrap();
+    assert!(matches!(&app.modal, Some(Modal::Ask(_))));
+    app.key(key(Key::Esc)).unwrap();
+    assert!(
+        matches!(&app.modal, Some(Modal::Stage { editor, .. }) if editor.finish().unwrap().name.ends_with('!'))
+    );
+    app.key(key(Key::Esc)).unwrap();
+    app.key(key(Key::Char('y'))).unwrap();
+    assert!(app.modal.is_none());
+    assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+}
+
+#[test]
+fn monitor_results_and_dialogs_fit_the_minimum_size() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = running_app(project.path());
+    for n in 0..50 {
+        app.focused.push_log(format!("✓ step {n} 雪"));
+    }
+    let screen = rows(&mut app, 65, 20).join("\n");
+    assert!(screen.contains("✓ step 49 雪"), "{screen}");
+    assert!(screen.contains("[C] cancel stage"), "{screen}");
+    // Finished: results, and the two panels scroll within their own lengths.
+    app.focused.worker = None;
+    app.focused.run = Some(sample_run("done"));
+    let screen = rows(&mut app, 65, 20).join("\n");
+    assert!(screen.contains("Results"), "{screen}");
+    for _ in 0..50 {
+        app.key(key(Key::PageDown)).unwrap();
+    }
+    let limit = app.focused.results_limit.get();
+    assert_eq!(app.focused.results_scroll, limit);
+    app.key(key(Key::PageUp)).unwrap();
+    assert_eq!(app.focused.results_scroll[0], limit[0].saturating_sub(5));
+    for modal in [
+        Modal::Ask(Box::new(Ask::CancelStage { run: "done".into() })),
+        Modal::Loading("Opening project…".into()),
+        Modal::Text {
+            title: "Guide".into(),
+            body: super::actions::guide(),
+            scroll: 0,
+            guide: true,
+        },
+    ] {
+        app.modal = Some(modal);
+        let screen = rows(&mut app, 65, 20).join("\n");
+        assert!(
+            ["Cancel stage", "Please wait", "WORKFLOW"]
+                .iter()
+                .any(|text| screen.contains(text)),
+            "{screen}"
+        );
+    }
 }

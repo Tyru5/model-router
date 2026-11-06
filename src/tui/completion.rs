@@ -121,7 +121,7 @@ impl App {
         }
         // A newly finished run opens on its results.
         self.focused.show_output = false;
-        self.focused.results_scroll = 0;
+        self.focused.results_scroll = [0; 2];
         let run = run.clone();
         let (sender, receiver) = mpsc::channel();
         self.focused.changes_job = Some((key, receiver));
@@ -363,7 +363,19 @@ pub(super) fn draw_completion(
     area: Rect,
     palette: Palette,
 ) {
-    let report = report::build(run);
+    // The report is rebuilt only when the run changes, not every frame.
+    let stamp = format!("{} {}", key(run), run.revision);
+    let report = {
+        let mut cache = app.focused.cache.borrow_mut();
+        match &cache.report {
+            Some((cached, report)) if *cached == stamp => report.clone(),
+            _ => {
+                let report = std::rc::Rc::new(report::build(run));
+                cache.report = Some((stamp, report.clone()));
+                report
+            }
+        }
+    };
     let summary = Line::styled(report::summary(&report), Style::default().fg(palette.fg));
     let usage = Line::from(vec![
         Span::styled("Usage ", palette.header_style()),
@@ -450,11 +462,20 @@ pub(super) fn draw_completion(
         "Changes"
     };
     let findings = findings_lines(&report, palette);
-    let mut panel = |title: &str, lines: Vec<Line<'static>>, keys: &[(&str, &str)], rect: Rect| {
-        let scroll = app
-            .focused
-            .results_scroll
-            .min(lines.len().saturating_sub(1) as u16);
+    let mut limits = [0; 2];
+    let mut panel = |index: usize,
+                     title: &str,
+                     lines: Vec<Line<'static>>,
+                     keys: &[(&str, &str)],
+                     rect: Rect| {
+        // Rows the wrapped text takes, less what fits: how far it can scroll.
+        let inner = rect.width.saturating_sub(2);
+        let rows: u16 = lines
+            .iter()
+            .map(|line| super::widgets::rows_for(line, inner, u16::MAX))
+            .fold(0, u16::saturating_add);
+        limits[index] = rows.saturating_sub(rect.height.saturating_sub(2));
+        let scroll = app.focused.results_scroll[index].min(limits[index]);
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
@@ -466,8 +487,9 @@ pub(super) fn draw_completion(
     if chunks[2].width >= 110 {
         let cols = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
             .split(chunks[2]);
-        panel(left, changes, &[("d", "diff"), ("o", "output")], cols[0]);
+        panel(0, left, changes, &[("d", "diff"), ("o", "output")], cols[0]);
         panel(
+            1,
             "Checks · Unresolved",
             findings,
             &[("PgUp/PgDn", "scroll")],
@@ -478,12 +500,14 @@ pub(super) fn draw_completion(
         lines.push(Line::raw(""));
         lines.extend(findings);
         panel(
+            0,
             "Results",
             lines,
             &[("d", "diff"), ("o", "output"), ("PgUp/PgDn", "scroll")],
             chunks[2],
         );
     }
+    app.focused.results_limit.set(limits);
 }
 
 #[cfg(test)]
