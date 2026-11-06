@@ -378,8 +378,9 @@ Initialization refuses to overwrite an existing config unless you pass
 Verification stages require a structured handoff. Blocking findings, failed
 required checks, or required checks marked `not_run` stop the run for inspection
 and explicit retry, even with reviews disabled. Automatic repair loops remain
-specific to enabled review stages. A review that still requests changes after
-the repair limit blocks the run; `resume RUN_ID --allow-repair` allows one more
+specific to enabled review stages; a failed required router check in a review
+requests a repair like its blocking findings do. A review that still requests
+changes after the repair limit blocks the run; `resume RUN_ID --allow-repair` allows one more
 pass. A repair request reaches only the repaired stages and the review that
 asked; it is dropped once that review passes.
 
@@ -433,6 +434,7 @@ model-router resume RUN_ID --allow-repair
 model-router report RUN_ID
 model-router report RUN_ID --json
 model-router report RUN_ID --diff
+model-router report RUN_ID --transitions   # status timeline; with --json too
 ```
 
 `--unattended` overrides execution mode for this run. `--with-review` enables
@@ -546,7 +548,8 @@ required or optional), unresolved findings, and each stage's active time,
 attempts, retries, and usage. `d` opens the full diff and `o` switches to the
 output log. The CLI prints the same summary after `Completed`. `report` prints
 it for any saved run, including stopped ones; `--json` gives the data and
-`--diff` the patch. Changes come from Git snapshots taken by the router
+`--diff` the patch; `--transitions` prints every run, stage, and attempt status
+change with its time, cause (engine, user, or recovery), and reason. Changes come from Git snapshots taken by the router
 (baseline at run start, then before and after each attempt), so edits made
 before the run are excluded. Outside Git they are labelled unavailable and the
 model-reported `files_changed` list is shown instead. Token counts and cost
@@ -692,7 +695,8 @@ evaluates it. `required` defaults to `true` and `timeout_seconds` to 600. The
 prompt lists these commands. Results are recorded independently of the model's
 handoff, in `run.json` and the attempt's `checks.json`, with logs under
 `checks/NN/`. A required check that fails, times out, or cannot start blocks the
-stage, whatever its role. Optional failures are only recorded.
+stage; in an enabled review it requests a repair instead while repair passes
+remain. Optional failures are only recorded.
 
 In the TUI, **e** on a stage edits **Router checks**: one command per line,
 shell-quoted (`npm run 'lint fix'`) but never run by a shell. A leading `?`
@@ -720,6 +724,7 @@ does not merge, commit, or delete worktrees automatically.
   runs/RUN_ID/
     run.json                    # task, workflow snapshot, state, attempts
     summary.json                # what history lists; rewritten with run.json
+    transitions.jsonl           # every status change, appended as it is saved
     snapshot.index              # private Git index for change snapshots
     changes.diff                # patch of changes made during the run
     01-research/attempt-001/
