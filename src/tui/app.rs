@@ -138,7 +138,11 @@ pub(super) struct RunSlot {
     pub(super) logs: VecDeque<String>,
     /// Counts lines ever added to `logs`, so cached wrapping knows when it is stale.
     pub(super) log_version: u64,
-    pub(super) log_scroll: usize,
+    /// Following new output, or paused at a line.
+    pub(super) log_view: super::output_search::LogView,
+    /// Rows of the output panel, as last drawn.
+    pub(super) log_visible: Cell<usize>,
+    pub(super) log_search: Option<super::output_search::LogSearch>,
     /// A finished run shows results unless the output log was chosen.
     pub(super) show_output: bool,
     /// Scroll offsets of the results panels, each kept within its own panel.
@@ -161,7 +165,7 @@ pub(super) type OutputKey = (usize, u64, Theme);
 /// Wrapped output and the results report from the last frame, with what they were built from.
 #[derive(Default)]
 pub(super) struct DrawCache {
-    pub(super) output: Option<(OutputKey, std::rc::Rc<Vec<Line<'static>>>)>,
+    pub(super) output: Option<(OutputKey, std::rc::Rc<super::output_search::Wrapped>)>,
     pub(super) report: Option<(String, std::rc::Rc<crate::report::RunReport>)>,
 }
 impl Default for RunSlot {
@@ -172,7 +176,9 @@ impl Default for RunSlot {
             cancel: Arc::new(AtomicBool::new(false)),
             logs: VecDeque::new(),
             log_version: 0,
-            log_scroll: 0,
+            log_view: Default::default(),
+            log_visible: Cell::new(0),
+            log_search: None,
             show_output: false,
             results_scroll: [0; 2],
             results_limit: Cell::new([0; 2]),
@@ -315,6 +321,8 @@ pub(super) struct App {
     pub(super) signal: Arc<AtomicBool>,
     /// The focused run's interactive stage gets the terminal on the next frame.
     pub(super) launch_interactive: bool,
+    /// A pager, editor, or difftool to give the terminal on the next frame.
+    pub(super) external: Option<super::external::Launch>,
     pub(super) history: Vec<Entry>,
     pub(super) history_selected: usize,
     pub(super) runs: RunsView,
@@ -456,6 +464,7 @@ impl App {
             focus_index: 0,
             signal: cancel,
             launch_interactive: false,
+            external: None,
             history: vec![],
             history_selected: 0,
             runs: RunsView::default(),
@@ -1228,6 +1237,9 @@ impl App {
         }
         if self.runs_filtering() {
             return self.runs_filter_key(key);
+        }
+        if self.page == 1 && self.output_search_key(key) {
+            return Ok(false);
         }
         if let Some(id) = actions::resolve(self.scope(), key) {
             return self.perform(id);

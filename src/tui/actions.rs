@@ -61,6 +61,11 @@ pub(super) enum ActionId {
     EditSummary,
     ScrollUp,
     ScrollDown,
+    OutputTop,
+    OutputBottom,
+    FollowOutput,
+    FindOutput,
+    OpenLog,
     Diff,
     ToggleResults,
     BackToWorkflow,
@@ -281,7 +286,8 @@ const ACTIONS: &[Entry] = {
         act(Retry, MonitorIdle, ch('y'), "retry", "Explicitly retry current stage").footer(),
         act(RetryInteractive, MonitorIdle, ch('i'), "interactive", "Retry current stage interactively").footer(),
         act(ReplaceModel, MonitorIdle, ch('m'), "model", "Replace current model and retry").footer(),
-        act(Handoff, Monitor, ch('h'), "handoff", "Inspect handoff/error").footer(),
+        act(Handoff, Monitor, ch('h'), "handoff", "Inspect handoff/error").footer()
+            .more(&["Findings by severity, tests by status; [↑↓] picks a changed file, [e]/[Enter] opens it in $EDITOR"]),
         act(EditSummary, MonitorIdle, ch('e'), "summary", "Edit interactive handoff summary").footer(),
         act(ScrollUp, Monitor, key(KeyCode::PageUp), "scroll", "Scroll output up")
             .alias("PgUp/PgDn")
@@ -289,7 +295,17 @@ const ACTIONS: &[Entry] = {
         act(ScrollDown, Monitor, key(KeyCode::PageDown), "scroll", "Scroll output down")
             .alias("PgUp/PgDn")
             .footer_in(&[MonitorRunning]),
-        act(Diff, MonitorIdle, ch('d'), "diff", "Show the diff of changes made during a finished run"),
+        act(OutputTop, Monitor, key(KeyCode::Home), "top", "Jump to the oldest output (pauses following)"),
+        act(OutputBottom, Monitor, key(KeyCode::End), "end", "Jump to the newest output and follow it again"),
+        act(FollowOutput, Monitor, ch('f'), "follow", "Pause or resume following new output; scrolling up also pauses"),
+        act(FindOutput, Monitor, ch('/'), "search", "Search the output log; matches are highlighted")
+            .more(&["Type, then [Enter]; [n]/[N] next/previous match while a search is shown; [Esc] clears it"]),
+        act(OpenLog, Monitor, ch('O'), "open log", "Open the focused attempt's raw stdout.log in $PAGER (default less -R)"),
+        act(Diff, MonitorIdle, ch('d'), "diff", "Show the diff of changes made during a finished run")
+            .more(&[
+                "Files left, hunks right: [ ] or n/p file; { } hunk; [/] search, n/N match; [w] wrap",
+                "[o] $PAGER; [e] $VISUAL/$EDITOR at the line in view; [D] git difftool --dir-diff (needs diff.tool)",
+            ]),
         act(ToggleResults, MonitorIdle, ch('o'), "output", "Switch a finished run between results and output log"),
         act(BackToWorkflow, MonitorIdle, ch('n'), "workflow", "Return to workflow editor").footer(),
         // Runs

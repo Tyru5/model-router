@@ -23,7 +23,7 @@ smoke *names: (_build)
     #!/usr/bin/env bash
     set -euo pipefail
     names="{{ names }}"
-    [[ -n "$names" ]] || names="tui repos imports stages themes harness_settings startup detach shutdown"
+    [[ -n "$names" ]] || names="tui repos imports stages themes harness_settings startup detach review shutdown"
     for name in $names; do
         echo "==> smoke_$name"
         {{ smoke_python }} "scripts/smoke_$name.py"

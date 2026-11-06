@@ -22,9 +22,6 @@ use std::{
     thread,
 };
 
-/// Diff text the dialog renders; the full patch stays in changes.diff.
-const DIFF_VIEW_LIMIT: usize = 256 * 1024;
-
 /// Changes and patch computed for one finished run state.
 pub(super) struct Loaded {
     key: String,
@@ -58,24 +55,38 @@ fn key(run: &Run) -> String {
     format!("{} {:?} {:?}", run.id, run.status, run.change_range())
 }
 
+/// The directory Git ran in for this run: its workspace, else the project.
+pub(super) fn run_dir(run: &Run) -> std::path::PathBuf {
+    if run.workspace.is_dir() {
+        run.workspace.clone()
+    } else {
+        run.project.clone()
+    }
+}
+
+/// The top of the repository holding `dir`, which Git paths start from.
+pub(super) fn repo_root(dir: &std::path::Path) -> std::path::PathBuf {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim_end_matches(['\n', '\r'])
+                .to_owned()
+        })
+        .filter(|root| !root.is_empty())
+        .map_or_else(|| dir.to_path_buf(), std::path::PathBuf::from)
+}
+
+/// The patch is kept whole (Git caps it); the diff view lays out only what
+/// shows and bounds each file's rows.
 fn load(run: &Run) -> Loaded {
-    let patch = report::diff(run)
-        .map_err(|e| format!("{e:#}"))
-        .map(|mut text| {
-            if text.len() > DIFF_VIEW_LIMIT {
-                let mut end = DIFF_VIEW_LIMIT;
-                while !text.is_char_boundary(end) {
-                    end -= 1;
-                }
-                text.truncate(end);
-                text.push_str(&format!(
-                    "\n[Shown up to {} KiB. Full patch: {}]\n",
-                    DIFF_VIEW_LIMIT / 1024,
-                    run.directory.join("changes.diff").display()
-                ));
-            }
-            text
-        });
+    let patch = report::diff(run).map_err(|e| format!("{e:#}"));
     Loaded {
         key: key(run),
         changes: report::changes(run),
@@ -144,6 +155,16 @@ impl App {
         });
     }
 
+    /// Where the focused run's files are.
+    pub(super) fn run_dir(&self) -> Result<std::path::PathBuf> {
+        Ok(run_dir(
+            self.focused
+                .run
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("No run selected"))?,
+        ))
+    }
+
     pub(super) fn toggle_results(&mut self) -> Result<()> {
         ensure!(
             self.focused.worker.is_none() && self.focused.run.as_ref().is_some_and(finished),
@@ -167,11 +188,8 @@ impl App {
                 self.message = "No files changed during this run.".into()
             }
             Ok(patch) => {
-                let patch = patch.clone();
-                self.text(
-                    "Changes during this run · [↑↓] scroll · [Esc] closes",
-                    patch,
-                );
+                let view = super::diff_view::DiffView::new(patch.clone());
+                self.modal = Some(super::modal::Modal::Diff(Box::new(view)));
             }
             Err(error) => bail!("{error}"),
         }
@@ -650,7 +668,7 @@ mod tests {
         app.focused.changes = Some(tracked());
         app.show_diff().unwrap();
         assert!(
-            matches!(&app.modal, Some(super::super::modal::Modal::Text { body, .. }) if body.contains("+fresh line"))
+            matches!(&app.modal, Some(super::super::modal::Modal::Diff(view)) if view.patch.contains("+fresh line"))
         );
         app.modal = None;
         app.toggle_results().unwrap();
