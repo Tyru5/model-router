@@ -2,8 +2,9 @@
 //! the session runs dialog (`L`), jumping to a run that needs input (`N`),
 //! and the notifications dialog (`F9`).
 use super::{
-    app::{App, Page, RunSlot},
+    app::{App, Page},
     modal::{Ask, InputTarget, Modal},
+    run_slot::RunSlot,
     theme::{self, Palette},
     widgets::{elapsed, menu_key, popup},
 };
@@ -12,7 +13,7 @@ use crate::{
     notify::{self, Backends, NotifyEvent},
     storage,
 };
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use crossterm::event::{KeyCode as Key, KeyEvent};
 use ratatui::{
     Frame,
@@ -32,17 +33,118 @@ pub(super) struct Notice {
     pub(super) alert: bool,
 }
 
+/// The runs started or opened in this session, in start order. Each keeps
+/// going while another is focused; the Monitor shows the focused one.
+#[derive(Default)]
+pub(super) struct Session {
+    pub(super) runs: Vec<RunSlot>,
+    /// Index of the focused run; meaningless while `runs` is empty.
+    pub(super) focus: usize,
+}
+
+impl Session {
+    pub(super) fn focused(&self) -> Option<&RunSlot> {
+        self.runs.get(self.focus)
+    }
+    pub(super) fn focused_mut(&mut self) -> Option<&mut RunSlot> {
+        self.runs.get_mut(self.focus)
+    }
+    /// The focused run.
+    pub(super) fn run(&self) -> Option<&Run> {
+        self.focused().map(|slot| &slot.run)
+    }
+    pub(super) fn run_mut(&mut self) -> Option<&mut Run> {
+        self.focused_mut().map(|slot| &mut slot.run)
+    }
+    /// Whether the focused run's stage is driving.
+    pub(super) fn running(&self) -> bool {
+        self.focused().is_some_and(|slot| slot.worker.is_some())
+    }
+    /// Every run, with whether it is focused.
+    pub(super) fn slots(&self) -> impl Iterator<Item = (&RunSlot, bool)> {
+        self.runs
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| (slot, index == self.focus))
+    }
+    pub(super) fn any_active(&self) -> bool {
+        self.runs.iter().any(|slot| slot.worker.is_some())
+    }
+    pub(super) fn cancel_all(&self) {
+        for slot in &self.runs {
+            if slot.worker.is_some() {
+                slot.cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    /// Focuses `run` in a new slot, after the others; they keep going.
+    pub(super) fn adopt(&mut self, run: Run) {
+        self.runs.push(RunSlot::new(run));
+        self.focus = self.runs.len() - 1;
+    }
+    /// Focuses the run at `index` (start order), if there is one.
+    pub(super) fn focus(&mut self, index: usize) {
+        if index < self.runs.len() {
+            self.focus = index;
+        }
+    }
+    /// Focuses the next or previous run, wrapping.
+    pub(super) fn cycle_focus(&mut self, forward: bool) {
+        let total = self.runs.len();
+        if total < 2 {
+            return;
+        }
+        self.focus = if forward {
+            (self.focus + 1) % total
+        } else {
+            (self.focus + total - 1) % total
+        };
+    }
+    /// Focuses the slot holding run `id`; false when none does.
+    pub(super) fn focus_run(&mut self, id: &str) -> bool {
+        let index = self.runs.iter().position(|slot| slot.run.id == id);
+        if let Some(index) = index {
+            self.focus = index;
+        }
+        index.is_some()
+    }
+    /// Removes the focused run from this session; its files stay on disk.
+    pub(super) fn dismiss(&mut self) -> Result<()> {
+        if self.runs.is_empty() {
+            return Ok(());
+        }
+        ensure!(!self.running(), "Cancel the stage before closing its run");
+        self.runs.remove(self.focus);
+        self.focus = self.focus.min(self.runs.len().saturating_sub(1));
+        Ok(())
+    }
+    /// Stops the stage of run `id`; false when it is not running.
+    pub(super) fn cancel_run(&self, id: &str) -> bool {
+        match self.runs.iter().find(|slot| slot.run.id == id) {
+            Some(slot) if slot.worker.is_some() => {
+                slot.cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
+    }
+    /// Runs waiting on the user.
+    pub(super) fn needing_input(&self) -> usize {
+        self.runs.iter().filter(|slot| slot.needs_input()).count()
+    }
+}
+
 impl RunSlot {
     /// Waiting on the user: an interactive stage ready for its terminal, or
     /// a handoff or waiver to accept.
     pub(super) fn needs_input(&self) -> bool {
         self.worker.is_none()
-            && self.run.as_ref().is_some_and(|run| {
-                matches!(
-                    run.status,
-                    Status::Interactive | Status::AwaitingConfirmation
-                )
-            })
+            && matches!(
+                self.run.status,
+                Status::Interactive | Status::AwaitingConfirmation
+            )
     }
 }
 
@@ -118,47 +220,35 @@ impl App {
         };
         self.text("Notices · newest first · [Esc] closes", body);
     }
-    /// Session runs waiting on the user.
-    pub(super) fn needing_input(&self) -> usize {
-        self.slots().filter(|(slot, _)| slot.needs_input()).count()
-    }
     /// Focuses the next run (after the focused one, wrapping) that needs
     /// input and shows it in the Monitor.
     pub(super) fn jump_to_input(&mut self) {
-        let total = self.slots().count();
-        let waiting: Vec<usize> = self
-            .slots()
-            .enumerate()
-            .filter(|(_, (slot, _))| slot.needs_input())
-            .map(|(index, _)| index)
-            .collect();
-        let start = if self.focused.run.is_some() {
-            self.focus_index + 1
-        } else {
-            0
-        };
+        let runs = &self.session.runs;
+        let total = runs.len();
+        let start = if total > 0 { self.session.focus + 1 } else { 0 };
         let Some(index) = (0..total)
             .map(|step| (start + step) % total.max(1))
-            .find(|index| waiting.contains(index))
+            .find(|index| runs[*index].needs_input())
         else {
             self.message = "No run of this session needs input.".into();
             return;
         };
-        self.focus(index);
+        self.session.focus(index);
         self.page = Page::Monitor;
         self.message = self.focus_message();
     }
     /// The status line after focusing a run from the list.
     fn focus_message(&self) -> String {
-        let Some(run) = &self.focused.run else {
+        let Some(slot) = self.session.focused() else {
             return String::new();
         };
+        let run = &slot.run;
         let name = format!("{} ({})", run.workflow.name, run.id);
         match run.status {
-            _ if self.focused.terminal().is_some() => {
+            _ if slot.terminal().is_some() => {
                 format!("{name}: its interactive session is live. [t] attaches.")
             }
-            Status::Interactive if self.focused.worker.is_none() => {
+            Status::Interactive if slot.worker.is_none() => {
                 format!(
                     "{name}: {} waits for you. [i] opens it.",
                     run.current_name()
@@ -175,17 +265,21 @@ impl App {
     }
     pub(super) fn session_runs(&mut self) {
         self.modal = Some(Modal::SessionRuns {
-            selected: self.focused.run.as_ref().map_or(0, |_| self.focus_index),
+            selected: if self.session.runs.is_empty() {
+                0
+            } else {
+                self.session.focus
+            },
         });
     }
     /// Keys for the session runs dialog; false closes it.
     pub(super) fn session_runs_key(&mut self, selected: &mut usize, key: KeyEvent) -> bool {
-        let total = self.slots().count();
+        let total = self.session.runs.len();
         match menu_key(key) {
             Key::Up | Key::Char('k') => *selected = selected.saturating_sub(1),
             Key::Down | Key::Char('j') => *selected = (*selected + 1).min(total.saturating_sub(1)),
             Key::Enter if *selected < total => {
-                self.focus(*selected);
+                self.session.focus(*selected);
                 self.page = Page::Monitor;
                 self.message = self.focus_message();
                 return false;
@@ -195,10 +289,10 @@ impl App {
                 return false;
             }
             Key::Char('C') => {
-                let Some((slot, _)) = self.slots().nth(*selected) else {
+                let Some(slot) = self.session.runs.get(*selected) else {
                     return true;
                 };
-                let Some(run) = &slot.run else { return true };
+                let run = &slot.run;
                 if slot.worker.is_some() {
                     self.modal = Some(Modal::Ask(Box::new(Ask::CancelRun {
                         run: run.id.clone(),
@@ -210,20 +304,6 @@ impl App {
             _ => {}
         }
         true
-    }
-    /// Stops the stage of session run `id`; false when it is not running.
-    pub(super) fn cancel_run(&mut self, id: &str) -> bool {
-        let slot = std::iter::once(&self.focused)
-            .chain(&self.parked)
-            .find(|slot| slot.run.as_ref().is_some_and(|run| run.id == id));
-        match slot {
-            Some(slot) if slot.worker.is_some() => {
-                slot.cancel
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                true
-            }
-            _ => false,
-        }
     }
     pub(super) fn notifications(&mut self) {
         self.modal = Some(Modal::Notifications {
@@ -383,7 +463,7 @@ pub(super) fn draw_session_runs(
 ) {
     let rect = popup(frame.area(), 100, 20);
     frame.render_widget(Clear, rect);
-    let waiting = app.needing_input();
+    let waiting = app.session.needing_input();
     let title = if waiting > 0 {
         format!("Session runs · {waiting} need input")
     } else {
@@ -395,10 +475,11 @@ pub(super) fn draw_session_runs(
     let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(inner);
     let now = chrono::Utc::now();
     let rows: Vec<Row> = app
+        .session
         .slots()
         .enumerate()
-        .filter_map(|(index, (slot, focused))| {
-            let run = slot.run.as_ref()?;
+        .map(|(index, (slot, focused))| {
+            let run = &slot.run;
             let end = if slot.in_progress() {
                 now
             } else {
@@ -418,7 +499,7 @@ pub(super) fn draw_session_runs(
             } else {
                 Span::raw("")
             };
-            Some(Row::new([
+            Row::new([
                 Cell::from(format!("{}{}", index + 1, if focused { "*" } else { "" })),
                 Cell::from(storage::truncate(&run.workflow.name, 24)),
                 Cell::from(run.id.clone()).style(Style::default().fg(palette.muted)),
@@ -427,7 +508,7 @@ pub(super) fn draw_session_runs(
                 Cell::from(elapsed((end - run.created_at).num_seconds().max(0)))
                     .style(Style::default().fg(palette.muted)),
                 Cell::from(note),
-            ]))
+            ])
         })
         .collect();
     if rows.is_empty() {

@@ -156,7 +156,7 @@ impl App {
                 // A run of this session is already live; never load a stale copy.
                 let open = self
                     .selected_run()
-                    .is_some_and(|entry| self.focus_run(entry.id()));
+                    .is_some_and(|entry| self.session.focus_run(entry.id()));
                 if open {
                     self.page = Page::Monitor;
                     self.message = "Run already open in this session.".into();
@@ -164,9 +164,11 @@ impl App {
                     self.selected_run().and_then(|entry| self.load_run(&entry))
                 {
                     let tail = saved_output(&run);
-                    self.adopt(run);
-                    for line in tail {
-                        self.focused.push_log(line);
+                    self.session.adopt(run);
+                    if let Some(slot) = self.session.focused_mut() {
+                        for line in tail {
+                            slot.push_log(line);
+                        }
                     }
                     self.page = Page::Monitor;
                     self.message =
@@ -335,9 +337,10 @@ impl App {
                 worktrees,
                 ids: vec![id.to_owned()],
                 protect: self
-                    .slots()
-                    .filter_map(|(slot, _)| slot.run.as_ref())
-                    .map(|run| run.id.clone())
+                    .session
+                    .runs
+                    .iter()
+                    .map(|slot| slot.run.id.clone())
                     .collect(),
                 ..Criteria::default()
             },
@@ -442,7 +445,7 @@ fn saved_output(run: &Run) -> Vec<String> {
             .lines()
             .map(|line| storage::truncate(line, 1500)),
     );
-    let keep = lines.len().saturating_sub(super::app::LOG_LINES);
+    let keep = lines.len().saturating_sub(super::run_slot::LOG_LINES);
     lines.drain(1..=keep.min(lines.len() - 1));
     lines
 }
@@ -907,7 +910,7 @@ mod tests {
         assert!(shows(&mut app, "✗ damaged"));
         app.key(key(Key::Enter)).unwrap();
         settle(&mut app);
-        assert!(app.focused.run.is_none());
+        assert!(app.session.run().is_none());
         assert_eq!(app.page, Page::Runs);
         match &app.modal {
             Some(Modal::Text { title, body, .. }) => {
@@ -935,7 +938,7 @@ mod tests {
         assert!(shows(&mut app, "Port the parser"));
         assert!(shows(&mut app, "not the current template"));
         app.key(key(Key::Esc)).unwrap();
-        assert!(app.modal.is_none() && app.focused.worker.is_none() && app.focused.run.is_none());
+        assert!(app.modal.is_none() && !app.session.running() && app.session.run().is_none());
         assert_eq!(run_dirs(project.path()), 1);
 
         press(&mut app, "n");
@@ -946,14 +949,14 @@ mod tests {
             "The run is created in the background"
         );
         settle(&mut app);
-        assert!(app.focused.worker.is_some());
+        assert!(app.session.running());
         assert_eq!(app.page, Page::Monitor);
         let deadline = Instant::now() + Duration::from_secs(20);
-        while app.focused.worker.is_some() && Instant::now() < deadline {
+        while app.session.running() && Instant::now() < deadline {
             app.poll().unwrap();
             thread::sleep(Duration::from_millis(20));
         }
-        let run = app.focused.run.as_ref().unwrap();
+        let run = app.session.run().unwrap();
         assert_eq!(run.rerun_of.as_deref(), Some(source.id.as_str()));
         assert_eq!(run.status, Status::Complete);
         assert_eq!(run_dirs(project.path()), 2);
@@ -1023,7 +1026,8 @@ mod tests {
         assert_eq!(app.history_selected, 0);
 
         // The run open in the monitor stays.
-        app.focused.run = Some(engine::load(project.path(), &kept.id).unwrap());
+        app.session
+            .adopt(engine::load(project.path(), &kept.id).unwrap());
         press(&mut app, "D");
         app.key(key(Key::Enter)).unwrap();
         settle(&mut app);
@@ -1048,11 +1052,11 @@ mod tests {
         let mut app = app(project.path(), settings);
         press(&mut app, "3");
         app.key(key(Key::Enter)).unwrap();
-        let logs: Vec<_> = app.focused.logs.iter().cloned().collect();
+        let logs: Vec<_> = app.slot().logs.iter().cloned().collect();
         assert_eq!(logs[0], "── research · attempt 1 · saved output ──");
         assert_eq!(logs.last().unwrap(), "final line");
-        assert!(logs.len() <= crate::tui::app::LOG_LINES);
-        app.focused.show_output = true;
+        assert!(logs.len() <= crate::tui::run_slot::LOG_LINES);
+        app.slot_mut().show_output = true;
         assert!(shows(&mut app, "final line"));
     }
 

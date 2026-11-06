@@ -31,6 +31,7 @@ mod modal;
 mod monitor;
 mod output_search;
 mod path_picker;
+mod run_slot;
 mod session;
 mod startup;
 mod stats_page;
@@ -170,7 +171,7 @@ pub fn run(
     let mut drawn = Instant::now();
     'run: loop {
         if app.signal.load(Ordering::Relaxed) {
-            app.cancel_all();
+            app.session.cancel_all();
             app.quit_after_stop = true;
         }
         if app.poll()? {
@@ -179,8 +180,10 @@ pub fn run(
         if app.take_launch() {
             let result = match app.interactive_terminal() {
                 Ok(session) => {
+                    let cancel = app.session.focused().map(|slot| slot.cancel.clone());
+                    let cancel = cancel.unwrap_or_default();
                     screen.restore();
-                    let result = session.attach(&app.focused.cancel, &app.signal);
+                    let result = session.attach(&cancel, &app.signal);
                     screen.resume()?;
                     result
                 }

@@ -8,6 +8,7 @@ use super::{
     harness_editor::HarnessEditor,
     history::{Compare, Confirm},
     path_picker::{PathPicker, PickerAction},
+    run_slot::RunSlot,
     session::draw_notifications,
     task_importer::{ImportAction, TaskImporter},
     theme::{self, Palette, Theme},
@@ -369,9 +370,8 @@ impl App {
                 self.dirty = true;
             }
             InputTarget::RetryModel => {
-                self.focused
-                    .run
-                    .as_mut()
+                self.session
+                    .run_mut()
                     .context("No run")?
                     .command(engine::Cmd::Retry {
                         interactive: false,
@@ -387,7 +387,7 @@ impl App {
                 self.dirty = true;
             }
             InputTarget::Handoff => {
-                engine::edit_handoff(self.focused.run.as_mut().context("No run")?, value)?
+                engine::edit_handoff(self.session.run_mut().context("No run")?, value)?
             }
             InputTarget::NotifyUrl => {
                 let url = value.trim().to_owned();
@@ -433,24 +433,24 @@ impl App {
             _ if !yes => {}
             Ask::CancelStage { run } => {
                 // The stage may have stopped while the question was open.
-                if self.running(&run) {
-                    self.focused.cancel.store(true, Ordering::Relaxed);
+                if let Some(slot) = self.running(&run) {
+                    slot.cancel.store(true, Ordering::Relaxed);
                     self.message = "Stopping stage…".into();
                 } else {
                     self.message = format!("{run} is not running a stage; nothing was cancelled.");
                 }
             }
             Ask::CancelRun { run } => {
-                self.message = if self.cancel_run(&run) {
+                self.message = if self.session.cancel_run(&run) {
                     format!("Stopping the stage of {run}…")
                 } else {
                     format!("{run} is not running a stage; nothing was cancelled.")
                 };
             }
             Ask::TakeOver { run } => {
-                if self.running(&run) {
-                    self.focused.takeover = true;
-                    self.focused.cancel.store(true, Ordering::Relaxed);
+                if let Some(slot) = self.running(&run) {
+                    slot.takeover = true;
+                    slot.cancel.store(true, Ordering::Relaxed);
                     self.message = "Stopping the unattended stage to open its session…".into();
                 } else {
                     self.message =
@@ -474,9 +474,11 @@ impl App {
         }
         Ok(false)
     }
-    /// Whether the focused run is `id` and still has a worker.
-    fn running(&self, id: &str) -> bool {
-        self.focused.worker.is_some() && self.focused.run.as_ref().is_some_and(|r| r.id == id)
+    /// The focused run's slot when it is `id` and still has a worker.
+    fn running(&mut self, id: &str) -> Option<&mut RunSlot> {
+        self.session
+            .focused_mut()
+            .filter(|slot| slot.worker.is_some() && slot.run.id == id)
     }
     pub(super) fn modal_key(&mut self, key: KeyEvent) -> Result<bool> {
         let Some(modal) = self.modal.take() else {
@@ -656,7 +658,7 @@ impl App {
                         self.external = Some(external::edit(&root.join(path), line, &root)?);
                     }
                     DiffAction::Difftool => {
-                        let run = self.focused.run.as_ref().context("No run")?;
+                        let run = self.session.run().context("No run")?;
                         let (from, to) = run
                             .change_range()
                             .map_err(|reason| anyhow::anyhow!("No difftool: {reason}"))?;

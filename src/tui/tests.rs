@@ -1,8 +1,9 @@
 use super::{
     actions::ActionId,
-    app::{App, Job, Page, Worker, draw},
+    app::{App, Job, Page, draw},
     modal::{Ask, Modal, PickValue},
     path_picker::PathPicker,
+    run_slot::Worker,
     theme::{self, Theme},
     widgets::textarea,
     workflow_page::StageEditor,
@@ -373,7 +374,7 @@ fn every_theme_reaches_pages_dialogs_and_text_inputs() {
             {
                 app.modal = None;
                 if step == 14 {
-                    app.focused.run = Some(crate::report::tests::sample());
+                    app.session.adopt(crate::report::tests::sample());
                 }
                 app.key(key(Key::Char(action))).unwrap();
                 terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -393,7 +394,7 @@ fn every_theme_reaches_pages_dialogs_and_text_inputs() {
                 );
             }
             assert!(app.results_shown());
-            app.focused.run = None;
+            app.session.runs.clear();
             app.modal = None;
         }
     }
@@ -866,7 +867,8 @@ fn command_menu_lists_only_actions_for_the_current_context() {
     assert!(idle.contains(&ActionId::Continue) && idle.contains(&ActionId::Handoff));
     assert!(!idle.contains(&ActionId::CancelStage) && !idle.contains(&ActionId::Run));
 
-    app.focused.worker = Some(Worker::stub());
+    app.session.adopt(sample_run("a"));
+    app.slot_mut().worker = Some(Worker::stub());
     let running = menu(&mut app);
     assert!(running.contains(&ActionId::CancelStage) && running.contains(&ActionId::Handoff));
     assert!(!running.contains(&ActionId::Continue) && !running.contains(&ActionId::Advance));
@@ -880,12 +882,12 @@ fn command_menu_lists_only_actions_for_the_current_context() {
     // A menu opened during a run does nothing once the run has stopped.
     app.page = Page::Monitor;
     app.key(key(Key::Char(':'))).unwrap();
-    app.focused.worker = None;
+    app.slot_mut().worker = None;
     for c in "cancel stage".chars() {
         app.key(key(Key::Char(c))).unwrap();
     }
     app.key(key(Key::Enter)).unwrap();
-    assert!(app.modal.is_none() && !app.focused.cancel.load(Ordering::Relaxed));
+    assert!(app.modal.is_none() && !app.slot().cancel.load(Ordering::Relaxed));
 
     app.page = Page::Runs;
     assert!(menu(&mut app).contains(&ActionId::OpenRun));
@@ -1001,9 +1003,10 @@ fn sample_run(id: &str) -> crate::engine::Run {
 }
 
 fn session(app: &App) -> String {
-    app.slots()
+    app.session
+        .slots()
         .map(|(slot, focused)| {
-            let id = slot.run.as_ref().unwrap().id.clone();
+            let id = slot.run.id.clone();
             if focused { format!("{id}*") } else { id }
         })
         .collect::<Vec<_>>()
@@ -1015,29 +1018,29 @@ fn session_runs_keep_their_order_as_focus_moves_and_runs_close() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
     for id in ["a", "b", "c"] {
-        app.adopt(sample_run(id));
+        app.session.adopt(sample_run(id));
     }
     assert_eq!(session(&app), "a b c*");
-    app.cycle_focus(true);
+    app.session.cycle_focus(true);
     assert_eq!(session(&app), "a* b c");
-    app.cycle_focus(false);
+    app.session.cycle_focus(false);
     assert_eq!(session(&app), "a b c*");
-    assert!(app.focus_run("b") && !app.focus_run("missing"));
+    assert!(app.session.focus_run("b") && !app.session.focus_run("missing"));
     assert_eq!(session(&app), "a b* c");
 
     // An active run cannot be closed; closing focuses its neighbour.
-    app.focused.worker = Some(Worker::stub());
-    assert!(app.dismiss().is_err());
-    app.focused.worker = None;
-    app.dismiss().unwrap();
+    app.slot_mut().worker = Some(Worker::stub());
+    assert!(app.session.dismiss().is_err());
+    app.slot_mut().worker = None;
+    app.session.dismiss().unwrap();
     assert_eq!(session(&app), "a c*");
-    app.adopt(sample_run("d"));
+    app.session.adopt(sample_run("d"));
     assert_eq!(session(&app), "a c d*");
     for _ in 0..3 {
-        app.dismiss().unwrap();
+        app.session.dismiss().unwrap();
     }
     assert_eq!(session(&app), "");
-    assert!(app.focused.run.is_none() && app.parked.is_empty());
+    assert!(app.session.run().is_none() && app.session.runs.is_empty());
 }
 
 #[test]
@@ -1049,7 +1052,7 @@ fn a_busy_checkout_sends_the_next_run_to_a_worktree() {
     let mut busy = sample_run("busy");
     busy.workspace = std::fs::canonicalize(project.path()).unwrap();
     busy.status = Status::AwaitingConfirmation;
-    app.adopt(busy);
+    app.session.adopt(busy);
     assert!(
         app.placement(false)
             .unwrap_err()
@@ -1069,7 +1072,7 @@ fn a_busy_checkout_sends_the_next_run_to_a_worktree() {
     );
     assert_eq!(app.placement(true).unwrap().0, Placement::Worktree);
     // A finished run frees the checkout.
-    app.focused.run.as_mut().unwrap().status = Status::Complete;
+    app.session.run_mut().unwrap().status = Status::Complete;
     assert_eq!(app.placement(false).unwrap(), (Placement::Project, None));
 }
 
@@ -1097,8 +1100,8 @@ fn running_app(project: &std::path::Path) -> App {
     let mut run = sample_run("live");
     run.status = Status::Running;
     run.cursor = 0;
-    app.adopt(run);
-    app.focused.worker = Some(Worker::stub());
+    app.session.adopt(run);
+    app.slot_mut().worker = Some(Worker::stub());
     app.page = Page::Monitor;
     app
 }
@@ -1107,7 +1110,7 @@ fn running_app(project: &std::path::Path) -> App {
 fn cancel_has_its_own_key_and_asks_and_c_never_continues_a_stage_that_just_stopped() {
     let project = tempfile::tempdir().unwrap();
     let mut app = running_app(project.path());
-    let cancelled = |app: &App| app.focused.cancel.load(Ordering::Relaxed);
+    let cancelled = |app: &App| app.slot().cancel.load(Ordering::Relaxed);
     // `c` continues an idle run; it does nothing to a running one.
     app.key(key(Key::Char('c'))).unwrap();
     assert!(!cancelled(&app) && app.modal.is_none());
@@ -1122,14 +1125,14 @@ fn cancel_has_its_own_key_and_asks_and_c_never_continues_a_stage_that_just_stopp
 
     // The stage stops while the question is open: yes cancels nothing.
     app.key(shift('C')).unwrap();
-    let run = app.focused.run.clone().unwrap();
-    app.focused
+    let run = app.slot().run.clone();
+    app.slot()
         .worker
         .as_ref()
         .unwrap()
         .finish(run, Ok(Action::Stopped));
     app.poll().unwrap();
-    assert!(app.focused.worker.is_none());
+    assert!(!app.session.running());
     app.key(key(Key::Char('y'))).unwrap();
     assert!(app.modal.is_none() && !cancelled(&app));
     assert!(
@@ -1139,10 +1142,10 @@ fn cancel_has_its_own_key_and_asks_and_c_never_continues_a_stage_that_just_stopp
     );
     // `c` pressed as the stage stopped does not start the next one.
     assert!(app.key(key(Key::Char('c'))).is_err());
-    assert!(app.focused.worker.is_none());
+    assert!(!app.session.running());
 
     // A confirmed cancel of a running stage.
-    app.focused.worker = Some(Worker::stub());
+    app.slot_mut().worker = Some(Worker::stub());
     app.key(shift('C')).unwrap();
     app.key(key(Key::Enter)).unwrap();
     assert!(cancelled(&app));
@@ -1151,9 +1154,9 @@ fn cancel_has_its_own_key_and_asks_and_c_never_continues_a_stage_that_just_stopp
     let mut app = running_app(project.path());
     app.key(key(Key::Char('t'))).unwrap();
     assert!(matches!(&app.modal, Some(Modal::Ask(ask)) if matches!(**ask, Ask::TakeOver { .. })));
-    assert!(!cancelled(&app) && !app.focused.takeover);
+    assert!(!cancelled(&app) && !app.slot().takeover);
     app.key(key(Key::Char('y'))).unwrap();
-    assert!(cancelled(&app) && app.focused.takeover);
+    assert!(cancelled(&app) && app.slot().takeover);
 }
 
 #[test]
@@ -1300,8 +1303,8 @@ fn output_wraps_by_display_width() {
     assert_eq!(wrap("", 5), [""]);
     let project = tempfile::tempdir().unwrap();
     let mut app = running_app(project.path());
-    app.focused.push_log(format!("● {}", "雪".repeat(20)));
-    app.focused.push_log("tail 😀 end".into());
+    app.slot_mut().push_log(format!("● {}", "雪".repeat(20)));
+    app.slot_mut().push_log("tail 😀 end".into());
     let screen = rows(&mut app, 65, 20).join("");
     // Every character reaches the screen; none is cut at the panel edge.
     assert_eq!(screen.matches('雪').count(), 20, "{screen}");
@@ -1316,15 +1319,15 @@ fn output_wraps_by_display_width() {
 fn runs_with_no_stages_and_empty_choices_do_not_panic() {
     let project = tempfile::tempdir().unwrap();
     let mut app = running_app(project.path());
-    let run = app.focused.run.as_mut().unwrap();
+    let run = app.session.run_mut().unwrap();
     run.stages.clear();
     run.workflow.stages.clear();
     run.cursor = 3;
     for (width, height) in [(65, 20), (80, 24)] {
         rows(&mut app, width, height);
     }
-    app.focused.worker = None;
-    app.focused.run.as_mut().unwrap().status = Status::AwaitingConfirmation;
+    app.slot_mut().worker = None;
+    app.session.run_mut().unwrap().status = Status::AwaitingConfirmation;
     app.key(key(Key::Char('h'))).unwrap();
     assert!(matches!(&app.modal, Some(Modal::Text { .. })));
     app.modal = None;
@@ -1343,7 +1346,7 @@ fn runs_with_no_stages_and_empty_choices_do_not_panic() {
 fn worker_output_never_blocks_and_marks_dropped_lines() {
     let project = tempfile::tempdir().unwrap();
     let mut app = running_app(project.path());
-    let worker = app.focused.worker.as_ref().unwrap();
+    let worker = app.slot().worker.as_ref().unwrap();
     let text: String = (0..2500).map(|n| format!("line {n}\n")).collect();
     worker.send(RunEvent::Output(text));
     let mut first = sample_run("live");
@@ -1353,11 +1356,11 @@ fn worker_output_never_blocks_and_marks_dropped_lines() {
     worker.send(RunEvent::State(Box::new(first)));
     worker.send(RunEvent::State(Box::new(latest)));
     app.poll().unwrap();
-    let logs: Vec<_> = app.focused.logs.iter().cloned().collect();
+    let logs: Vec<_> = app.slot().logs.iter().cloned().collect();
     assert!(logs.len() <= 400);
     assert_eq!(logs.last().unwrap(), "line 2499");
     assert!(logs[0].contains("2101 lines skipped"), "{:?}", &logs[..3]);
-    assert_eq!(app.focused.run.as_ref().unwrap().repair_passes, 7);
+    assert_eq!(app.session.run().unwrap().repair_passes, 7);
 }
 
 #[test]
@@ -1415,23 +1418,23 @@ fn monitor_results_and_dialogs_fit_the_minimum_size() {
     let project = tempfile::tempdir().unwrap();
     let mut app = running_app(project.path());
     for n in 0..50 {
-        app.focused.push_log(format!("✓ step {n} 雪"));
+        app.slot_mut().push_log(format!("✓ step {n} 雪"));
     }
     let screen = rows(&mut app, 65, 20).join("\n");
     assert!(screen.contains("✓ step 49 雪"), "{screen}");
     assert!(screen.contains("[C] cancel stage"), "{screen}");
     // Finished: results, and the two panels scroll within their own lengths.
-    app.focused.worker = None;
-    app.focused.run = Some(sample_run("done"));
+    app.slot_mut().worker = None;
+    app.session.adopt(sample_run("done"));
     let screen = rows(&mut app, 65, 20).join("\n");
     assert!(screen.contains("Results"), "{screen}");
     for _ in 0..50 {
         app.key(key(Key::PageDown)).unwrap();
     }
-    let limit = app.focused.results_limit.get();
-    assert_eq!(app.focused.results_scroll, limit);
+    let limit = app.slot().results_limit.get();
+    assert_eq!(app.slot().results_scroll, limit);
     app.key(key(Key::PageUp)).unwrap();
-    assert_eq!(app.focused.results_scroll[0], limit[0].saturating_sub(5));
+    assert_eq!(app.slot().results_scroll[0], limit[0].saturating_sub(5));
     for modal in [
         Modal::Ask(Box::new(Ask::CancelStage { run: "done".into() })),
         Modal::Loading("Opening project…".into()),
@@ -1465,12 +1468,12 @@ fn mixed_session(project: &std::path::Path) -> App {
     ] {
         let mut run = sample_run(id);
         run.status = status;
-        app.adopt(run);
+        app.session.adopt(run);
         if status == Status::Running {
-            app.focused.worker = Some(Worker::stub());
+            app.slot_mut().worker = Some(Worker::stub());
         }
     }
-    app.focus_run("busy");
+    app.session.focus_run("busy");
     app.page = Page::Monitor;
     app
 }
@@ -1480,7 +1483,7 @@ fn session_runs_dialog_lists_runs_focuses_cancels_and_jumps_to_input() {
     let project = tempfile::tempdir().unwrap();
     let mut app = mixed_session(project.path());
     assert_eq!(session(&app), "done review busy* term");
-    assert_eq!(app.needing_input(), 2);
+    assert_eq!(app.session.needing_input(), 2);
     let text = rows(&mut app, 120, 30).join("\n");
     assert!(text.contains("◆ 2 need input [N]"), "{text}");
 
@@ -1501,13 +1504,13 @@ fn session_runs_dialog_lists_runs_focuses_cancels_and_jumps_to_input() {
     app.key(shift('C')).unwrap();
     assert!(matches!(app.modal.as_deref_ask(), Some(Ask::CancelRun { run }) if run == "busy"));
     app.key(key(Key::Char('y'))).unwrap();
-    assert!(app.focused.cancel.load(Ordering::Relaxed));
+    assert!(app.slot().cancel.load(Ordering::Relaxed));
     assert!(
         app.message.contains("Stopping the stage of busy"),
         "{}",
         app.message
     );
-    app.focused.cancel.store(false, Ordering::Relaxed);
+    app.slot().cancel.store(false, Ordering::Relaxed);
 
     // [C] on a run that is not running cancels nothing.
     app.key(shift('L')).unwrap();
@@ -1531,10 +1534,8 @@ fn session_runs_dialog_lists_runs_focuses_cancels_and_jumps_to_input() {
     app.key(shift('N')).unwrap();
     assert_eq!(session(&app), "done review* busy term");
     assert_eq!(app.page, Page::Monitor);
-    for slot in std::iter::once(&mut app.focused).chain(&mut app.parked) {
-        if let Some(run) = &mut slot.run {
-            run.status = Status::Complete;
-        }
+    for slot in &mut app.session.runs {
+        slot.run.status = Status::Complete;
     }
     app.key(shift('N')).unwrap();
     assert!(app.message.contains("No run of this session needs input"));
@@ -1560,13 +1561,13 @@ fn background_run_events_queue_notices_instead_of_clobbering() {
     for id in ["first", "second", "third"] {
         let mut run = sample_run(id);
         run.status = Status::Running;
-        app.adopt(run);
-        app.focused.worker = Some(Worker::stub());
+        app.session.adopt(run);
+        app.slot_mut().worker = Some(Worker::stub());
     }
     app.page = Page::Workflow;
     let finish = |app: &App, index: usize, status, result| {
-        let slot = &app.parked[index];
-        let mut run = slot.run.clone().unwrap();
+        let slot = &app.session.runs[index];
+        let mut run = slot.run.clone();
         run.status = status;
         run.error = Some("tests failed".into());
         slot.worker.as_ref().unwrap().finish(run, result);
@@ -1575,7 +1576,7 @@ fn background_run_events_queue_notices_instead_of_clobbering() {
     finish(&app, 1, Status::AwaitingConfirmation, Ok(Action::Confirm));
     app.poll().unwrap();
     assert_eq!(app.notices.len(), 2);
-    let workflow = app.parked[0].run.as_ref().unwrap().workflow.name.clone();
+    let workflow = app.session.runs[0].run.workflow.name.clone();
     assert!(app.notices[0].alert);
     assert!(
         app.notices[0]
@@ -1591,9 +1592,9 @@ fn background_run_events_queue_notices_instead_of_clobbering() {
     assert!(text.contains("(+1 more · [!] notices)"), "{text}");
 
     // The focused run's stop is kept too, and [!] lists all, newest first.
-    let mut run = app.focused.run.clone().unwrap();
+    let mut run = app.slot().run.clone();
     run.status = Status::Complete;
-    app.focused
+    app.slot()
         .worker
         .as_ref()
         .unwrap()
@@ -1739,7 +1740,7 @@ fn diff_app(project: &std::path::Path, theme: Theme) -> App {
     let mut run = sample_run("done");
     run.project = project.into();
     run.workspace = project.into();
-    app.adopt(run);
+    app.session.adopt(run);
     app.page = Page::Monitor;
     app.modal = Some(Modal::Diff(Box::new(super::diff_view::DiffView::new(
         REVIEW_PATCH.into(),
@@ -1862,9 +1863,9 @@ fn diff_dialog_hands_the_patch_and_files_to_external_programs() {
 fn paused_output_keeps_its_place_as_new_lines_arrive() {
     let project = tempfile::tempdir().unwrap();
     let mut app = running_app(project.path());
-    app.focused.logs.clear();
+    app.slot_mut().logs.clear();
     for i in 0..100 {
-        app.focused.push_log(format!("line {i:03}"));
+        app.slot_mut().push_log(format!("line {i:03}"));
     }
     let output = |app: &mut App| -> Vec<String> {
         rows(app, 80, 30)
@@ -1882,7 +1883,7 @@ fn paused_output_keeps_its_place_as_new_lines_arrive() {
             .contains("▲ paused — End to follow")
     );
     for i in 100..150 {
-        app.focused.push_log(format!("line {i:03}"));
+        app.slot_mut().push_log(format!("line {i:03}"));
     }
     assert_eq!(
         output(&mut app),
@@ -1892,7 +1893,7 @@ fn paused_output_keeps_its_place_as_new_lines_arrive() {
     // Old lines leaving the bounded log do not move it either.
     let first = paused[0].clone();
     for i in 150..300 {
-        app.focused.push_log(format!("line {i:03}"));
+        app.slot_mut().push_log(format!("line {i:03}"));
     }
     assert_eq!(output(&mut app)[0], first);
     // Scrolling back down to the end follows again.
@@ -1903,24 +1904,24 @@ fn paused_output_keeps_its_place_as_new_lines_arrive() {
         "{text}"
     );
     app.key(key(Key::Home)).unwrap();
-    assert!(!app.focused.log_view.follow);
+    assert!(!app.slot().log_view.follow);
     app.key(key(Key::Char('f'))).unwrap();
-    assert!(app.focused.log_view.follow);
+    assert!(app.slot().log_view.follow);
     app.key(key(Key::Char('f'))).unwrap();
-    assert!(!app.focused.log_view.follow);
+    assert!(!app.slot().log_view.follow);
     for _ in 0..100 {
         app.key(key(Key::PageDown)).unwrap();
     }
-    assert!(app.focused.log_view.follow, "reaching the end follows");
+    assert!(app.slot().log_view.follow, "reaching the end follows");
 }
 
 #[test]
 fn output_search_highlights_matches_and_owns_n_while_shown() {
     let project = tempfile::tempdir().unwrap();
     let mut app = running_app(project.path());
-    app.focused.logs.clear();
+    app.slot_mut().logs.clear();
     for i in 0..80 {
-        app.focused.push_log(if i % 20 == 5 {
+        app.slot_mut().push_log(if i % 20 == 5 {
             format!("✗ failure number {i}")
         } else {
             format!("step {i}")
@@ -1945,7 +1946,7 @@ fn output_search_highlights_matches_and_owns_n_while_shown() {
     let palette = app.palette();
     let screen = buffer(&mut app, 80, 30);
     assert_eq!(cell_at(&screen, "failure number 65").bg, palette.accent);
-    assert!(!app.focused.log_view.follow, "a match pauses the output");
+    assert!(!app.slot().log_view.follow, "a match pauses the output");
     app.key(shift('N')).unwrap();
     app.key(shift('N')).unwrap();
     let text = rows(&mut app, 80, 30).join("\n");
@@ -1956,11 +1957,11 @@ fn output_search_highlights_matches_and_owns_n_while_shown() {
     app.key(key(Key::Char('n'))).unwrap();
     assert!(rows(&mut app, 80, 30).join("\n").contains("3/4"));
     // Idle, `n` returns to the workflow, except while a search is shown.
-    app.focused.worker = None;
+    app.slot_mut().worker = None;
     app.key(key(Key::Char('n'))).unwrap();
     assert_eq!(app.page, Page::Monitor);
     app.key(key(Key::Esc)).unwrap();
-    assert!(app.focused.log_search.is_none());
+    assert!(app.slot().log_search.is_none());
     app.key(key(Key::Char('n'))).unwrap();
     assert_eq!(app.page, Page::Workflow);
 }
@@ -1970,7 +1971,7 @@ fn handoff_dialog_colours_findings_and_tests_and_opens_changed_files() {
     use crate::handoff::{Finding, Severity, TestEvidence, TestStatus};
     let project = tempfile::tempdir().unwrap();
     let mut app = running_app(project.path());
-    let run = app.focused.run.as_mut().unwrap();
+    let run = app.session.run_mut().unwrap();
     run.workspace = project.path().into();
     let handoff = run.stages[0].handoff.get_or_insert_with(|| {
         serde_json::from_str(r#"{"summary":"s","verdict":"needs_changes"}"#).unwrap()
@@ -2033,7 +2034,7 @@ fn handoff_dialog_colours_findings_and_tests_and_opens_changed_files() {
 fn open_log_pages_the_focused_attempts_stdout() {
     let project = tempfile::tempdir().unwrap();
     let mut app = running_app(project.path());
-    let run = app.focused.run.as_mut().unwrap();
+    let run = app.session.run_mut().unwrap();
     let attempt = run.stages[0].attempts.last_mut().unwrap();
     attempt.directory = project.path().join("attempt");
     assert!(app.key(shift('O')).is_err(), "no log yet");

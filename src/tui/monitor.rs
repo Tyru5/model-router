@@ -1,10 +1,11 @@
 use super::{
     actions::ActionId,
-    app::{App, Page, SETTLE},
+    app::{App, Page},
     completion::{checks_cell, draw_completion},
     handoff_view::HandoffView,
     modal::{Ask, InputTarget, Modal},
     output_search::{Wrapped, visible_lines},
+    run_slot::{RunSlot, SETTLE},
     theme::Palette,
     widgets::{elapsed, empty_state, short_path},
 };
@@ -29,19 +30,20 @@ impl App {
     pub(super) fn perform_monitor(&mut self, id: ActionId) -> Result<()> {
         match id {
             ActionId::CancelStage => {
-                let run = self.focused.run.as_ref().context("No run selected")?;
+                let run = self.session.run().context("No run selected")?;
                 self.modal = Some(Modal::Ask(Box::new(Ask::CancelStage {
                     run: run.id.clone(),
                 })));
             }
             ActionId::TakeOver => {
-                if self.focused.terminal().is_some() {
+                let slot = self.session.focused().context("No run selected")?;
+                if slot.terminal().is_some() {
                     self.launch_interactive = true;
                     return Ok(());
                 }
-                let run = self.focused.run.as_ref().context("No run selected")?;
+                let run = &slot.run;
                 // A stage waiting for its terminal opens as it is.
-                if self.focused.worker.is_none() && run.status == Status::Interactive {
+                if slot.worker.is_none() && run.status == Status::Interactive {
                     self.launch_interactive = true;
                     return Ok(());
                 }
@@ -55,7 +57,7 @@ impl App {
                     "{} sessions cannot be resumed; [i] retries the stage interactively",
                     stage.harness
                 );
-                if self.focused.worker.is_some() {
+                if slot.worker.is_some() {
                     ensure!(
                         stage.mode == Mode::Unattended,
                         "This stage is already interactive"
@@ -64,47 +66,53 @@ impl App {
                         run: run.id.clone(),
                     })));
                 } else {
-                    self.focused
-                        .run
-                        .as_mut()
+                    self.session
+                        .run_mut()
                         .context("No run")?
                         .command(Cmd::TakeOver)?;
                     self.launch_interactive = true;
                 }
             }
-            ActionId::PreviousSessionRun => self.cycle_focus(false),
-            ActionId::NextSessionRun => self.cycle_focus(true),
+            ActionId::PreviousSessionRun => self.session.cycle_focus(false),
+            ActionId::NextSessionRun => self.session.cycle_focus(true),
             ActionId::CloseRun => {
-                self.dismiss()?;
+                self.session.dismiss()?;
                 self.message = "Run closed here; Runs [3] reopens it.".into();
             }
-            ActionId::ScrollUp if self.results_shown() => {
-                for scroll in &mut self.focused.results_scroll {
+            ActionId::ScrollUp if self.results_shown() => self.view(|slot| {
+                for scroll in &mut slot.results_scroll {
                     *scroll = scroll.saturating_sub(5);
                 }
-            }
+            }),
             // Each panel stops at its own end, so scrolling back moves both at once.
-            ActionId::ScrollDown if self.results_shown() => {
-                let limit = self.focused.results_limit.get();
-                for (scroll, limit) in self.focused.results_scroll.iter_mut().zip(limit) {
+            ActionId::ScrollDown if self.results_shown() => self.view(|slot| {
+                let limit = slot.results_limit.get();
+                for (scroll, limit) in slot.results_scroll.iter_mut().zip(limit) {
                     *scroll = scroll.saturating_add(5).min(limit);
                 }
-            }
+            }),
             // Scrolling up pauses the output; reaching the end follows again.
-            ActionId::ScrollUp => self.scroll_output(-10),
-            ActionId::ScrollDown => self.scroll_output(10),
-            ActionId::OutputTop if self.results_shown() => self.focused.results_scroll = [0; 2],
+            ActionId::ScrollUp => self.view(|slot| slot.scroll_output(-10)),
+            ActionId::ScrollDown => self.view(|slot| slot.scroll_output(10)),
+            ActionId::OutputTop if self.results_shown() => {
+                self.view(|slot| slot.results_scroll = [0; 2])
+            }
             ActionId::OutputBottom if self.results_shown() => {
-                self.focused.results_scroll = self.focused.results_limit.get()
+                self.view(|slot| slot.results_scroll = slot.results_limit.get())
             }
-            ActionId::OutputTop => self.output_home(),
-            ActionId::OutputBottom => self.output_end(),
-            ActionId::FollowOutput if self.results_shown() => {
-                self.focused.show_output = true;
-                self.output_end();
+            ActionId::OutputTop => self.view(RunSlot::output_home),
+            ActionId::OutputBottom => self.view(RunSlot::output_end),
+            ActionId::FollowOutput if self.results_shown() => self.view(|slot| {
+                slot.show_output = true;
+                slot.output_end();
+            }),
+            ActionId::FollowOutput => {
+                let message = self.session.focused_mut().and_then(RunSlot::toggle_follow);
+                if let Some(message) = message {
+                    self.message = message;
+                }
             }
-            ActionId::FollowOutput => self.toggle_follow(),
-            ActionId::FindOutput => self.start_output_search(),
+            ActionId::FindOutput => self.view(RunSlot::start_output_search),
             ActionId::OpenLog => {
                 let path = self.focused_log().context("No attempt has output yet")?;
                 self.external = Some(super::external::page_file(&path)?);
@@ -112,7 +120,7 @@ impl App {
             ActionId::Diff => self.show_diff()?,
             ActionId::ToggleResults => self.toggle_results()?,
             ActionId::Handoff => {
-                let run = self.focused.run.as_ref().context("No run selected")?;
+                let run = self.session.run().context("No run selected")?;
                 let index = run.cursor.min(run.stages.len().saturating_sub(1));
                 let found = run
                     .stages
@@ -151,25 +159,24 @@ impl App {
                 // `c` pressed as a stage stops was likely meant for the
                 // running stage, so it must not start the next one.
                 ensure!(
-                    self.focused
-                        .stopped_at
+                    self.session
+                        .focused()
+                        .and_then(|slot| slot.stopped_at)
                         .is_none_or(|at| at.elapsed() >= SETTLE),
                     "The stage just stopped; press [c] again to continue"
                 );
                 self.start_driver()?
             }
             ActionId::Advance => {
-                self.focused
-                    .run
-                    .as_mut()
+                self.session
+                    .run_mut()
                     .context("No run")?
                     .command(Cmd::Confirm)?;
                 self.start_driver()?;
             }
             ActionId::Retry => {
-                self.focused
-                    .run
-                    .as_mut()
+                self.session
+                    .run_mut()
                     .context("No run")?
                     .command(Cmd::Retry {
                         interactive: false,
@@ -178,7 +185,7 @@ impl App {
                 self.start_driver()?;
             }
             ActionId::RetryInteractive => {
-                let run = self.focused.run.as_mut().context("No run")?;
+                let run = self.session.run_mut().context("No run")?;
                 // A stage already waiting for the terminal opens as it is.
                 if run.status == Status::Interactive {
                     self.launch_interactive = true;
@@ -191,7 +198,7 @@ impl App {
                 }
             }
             ActionId::ReplaceModel => {
-                let run = self.focused.run.as_ref().context("No run")?;
+                let run = self.session.run().context("No run")?;
                 let stage = run
                     .workflow
                     .stages
@@ -204,7 +211,7 @@ impl App {
                 );
             }
             ActionId::EditSummary => {
-                let run = self.focused.run.as_ref().context("No run")?;
+                let run = self.session.run().context("No run")?;
                 ensure!(
                     run.status == Status::AwaitingConfirmation,
                     "Only interactive handoffs can be edited"
@@ -229,10 +236,29 @@ impl App {
 }
 
 impl App {
+    /// Changes the focused run's view; nothing without a run.
+    fn view(&mut self, change: impl FnOnce(&mut RunSlot)) {
+        if let Some(slot) = self.session.focused_mut() {
+            change(slot);
+        }
+    }
+
+    /// Keys for a search in the focused run's output; false passes the key on.
+    pub(super) fn output_search_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        let handled = self
+            .session
+            .focused_mut()
+            .and_then(|slot| slot.output_search_key(key));
+        if let Some(Some(message)) = &handled {
+            self.message = message.clone();
+        }
+        handled.is_some()
+    }
+
     /// stdout.log of the focused attempt: the current stage's latest, else
     /// the latest of any stage.
     pub(super) fn focused_log(&self) -> Option<std::path::PathBuf> {
-        let run = self.focused.run.as_ref()?;
+        let run = self.session.run()?;
         let index = run.cursor.min(run.stages.len().saturating_sub(1));
         let attempt = run
             .stages
@@ -251,12 +277,12 @@ impl App {
 /// One line listing this session's runs when there is more than one;
 /// false when there is nothing to list.
 fn draw_session(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) -> bool {
-    if app.slots().nth(1).is_none() {
+    if app.session.runs.len() < 2 {
         return false;
     }
     let mut spans = vec![Span::styled("[ ] ", Style::default().fg(palette.accent))];
-    for (index, (slot, focused)) in app.slots().enumerate() {
-        let Some(run) = &slot.run else { continue };
+    for (index, (slot, focused)) in app.session.slots().enumerate() {
+        let run = &slot.run;
         let label = format!(
             " {} {} · {} ",
             index + 1,
@@ -349,8 +375,8 @@ pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
 
 /// "  ·  ~$0.42 table of $5.00": spend so far, updated as each attempt
 /// records its usage; empty before any attempt without a budget.
-fn running_cost(app: &App, run: &crate::engine::Run) -> String {
-    let report = super::completion::cached_report(app, run);
+fn running_cost(slot: &RunSlot) -> String {
+    let report = super::completion::cached_report(slot);
     let (cost, budget) = (report.usage.cost, report.budget);
     if cost.attempts == 0 && budget.is_empty() {
         return String::new();
@@ -384,7 +410,7 @@ fn progress_rows(run: &engine::Run) -> usize {
 }
 
 pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
-    let Some(run) = &app.focused.run else {
+    let Some(slot) = app.session.focused() else {
         empty_state(
             frame,
             palette,
@@ -395,6 +421,7 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
         );
         return;
     };
+    let run = &slot.run;
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -416,12 +443,12 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
                     run.id,
                     run.repair_passes,
                     run.workflow.max_repair_passes,
-                    running_cost(app, run)
+                    running_cost(slot)
                 ),
                 Style::default().fg(palette.muted),
             ),
             Span::styled(
-                if app.focused.terminal().is_some() {
+                if slot.terminal().is_some() {
                     "   detached · [t] attach"
                 } else {
                     ""
@@ -439,7 +466,7 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
             height: area.height.saturating_sub(top - area.y),
             ..area
         };
-        draw_completion(frame, app, run, rest, palette);
+        draw_completion(frame, slot, rest, palette);
         return;
     }
     let name_width = run
@@ -557,7 +584,7 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
     );
     let cols = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(chunks[3]);
-    let paused = !app.focused.log_view.follow;
+    let paused = !slot.log_view.follow;
     let mut output_block = palette.panel_with(
         if paused {
             "Output · ▲ paused — End to follow"
@@ -571,15 +598,15 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
             &[("PgUp/PgDn", "scroll"), ("/", "search")]
         },
     );
-    if let Some(status) = app.output_search_status() {
+    if let Some(status) = slot.output_search_status() {
         output_block = output_block.title_bottom(Line::styled(
             format!(" {status} "),
             Style::default().fg(palette.accent),
         ));
     }
     let visible = output_block.inner(cols[0]).height as usize;
-    app.focused.log_visible.set(visible);
-    if app.focused.logs.is_empty() {
+    slot.log_visible.set(visible);
+    if slot.logs.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::styled(
                 "Harness output appears here. Some harnesses emit their final response only when the stage finishes. Full logs are saved on disk.",
@@ -593,29 +620,26 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
         // The panel's own inner width: borders and padding included.
         let width = output_block.inner(cols[0]).width as usize;
         // Wrapped lines are kept until the log, width, or theme changes.
-        let key = (width, app.focused.log_version, app.displayed_theme());
-        let mut cache = app.focused.cache.borrow_mut();
+        let key = (width, slot.log_version, app.displayed_theme());
+        let mut cache = slot.cache.borrow_mut();
         let lines = match &cache.output {
             Some((cached, lines)) if *cached == key => lines.clone(),
             _ => {
-                let first = app
-                    .focused
-                    .log_version
-                    .saturating_sub(app.focused.logs.len() as u64);
-                let lines = Rc::new(output_lines(&app.focused.logs, first, width, palette));
+                let first = slot.log_version.saturating_sub(slot.logs.len() as u64);
+                let lines = Rc::new(output_lines(&slot.logs, first, width, palette));
                 cache.output = Some((key, lines.clone()));
                 lines
             }
         };
         drop(cache);
         // Paused output keeps its top line as new output arrives.
-        let top = lines.top(app.focused.log_view, visible);
+        let top = lines.top(slot.log_view, visible);
         frame.render_widget(
             Paragraph::new(visible_lines(
                 &lines,
                 top,
                 visible,
-                app.focused.log_search.as_ref(),
+                slot.log_search.as_ref(),
                 palette,
             ))
             .block(output_block),
