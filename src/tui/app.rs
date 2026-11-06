@@ -4,8 +4,9 @@ use super::{
     harness_editor::HarnessEditor,
     harnesses::{HarnessChecks, draw_harnesses},
     history::{RunsView, draw_history},
-    modal::{Choice, InputTarget, Modal, PickValue, draw_modal, matching_choices},
+    modal::{Ask, Choice, InputTarget, Modal, PickValue, draw_modal, matching_choices},
     monitor::draw_run,
+    path_picker::PathPicker,
     theme::{self, Palette, Theme},
     widgets::{dim, rows_for, short_path, textarea},
     workflow_page::{StageEditor, draw_workflow},
@@ -27,34 +28,97 @@ use ratatui::{
     widgets::{Block, Paragraph, Wrap},
 };
 use std::{
+    cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
-enum WorkerMessage {
-    Event(RunEvent),
-    Done(Box<Run>, std::result::Result<Action, String>),
+/// What a worker thread hands the UI. The worker never blocks on it: the
+/// latest state replaces older ones, and output beyond `PENDING_LINES`
+/// drops its oldest lines, counted so the log can mark the gap.
+#[derive(Default)]
+pub(super) struct Inbox {
+    state: Option<Box<Run>>,
+    output: VecDeque<String>,
+    skipped: usize,
+    done: Option<(Box<Run>, std::result::Result<Action, String>)>,
+}
+/// Output lines a worker keeps while the UI is not reading, e.g. while
+/// another run's interactive session has the terminal.
+const PENDING_LINES: usize = 2000;
+/// Lines the Monitor keeps per run.
+pub(super) const LOG_LINES: usize = 400;
+impl Inbox {
+    fn push(&mut self, event: RunEvent) {
+        match event {
+            RunEvent::State(run) => self.state = Some(run),
+            RunEvent::Output(text) => {
+                for line in text.lines() {
+                    if self.output.len() >= PENDING_LINES {
+                        self.output.pop_front();
+                        self.skipped += 1;
+                    }
+                    self.output.push_back(storage::truncate(line, 1500));
+                }
+            }
+        }
+    }
+}
+type Shared = Arc<Mutex<Inbox>>;
+fn lock(shared: &Shared) -> std::sync::MutexGuard<'_, Inbox> {
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 pub(super) struct Worker {
-    receiver: Receiver<WorkerMessage>,
+    inbox: Shared,
     thread: Option<JoinHandle<()>>,
     terminal: Option<process::InteractiveSession>,
+}
+impl Worker {
+    /// Runs `work` on a thread that reports through the returned worker.
+    fn spawn(
+        terminal: Option<process::InteractiveSession>,
+        work: impl FnOnce(&mut dyn FnMut(RunEvent)) -> (Run, std::result::Result<Action, String>)
+        + Send
+        + 'static,
+    ) -> Self {
+        let inbox = Shared::default();
+        let shared = inbox.clone();
+        let thread = thread::spawn(move || {
+            let (run, result) = work(&mut |event| lock(&shared).push(event));
+            lock(&shared).done = Some((Box::new(run), result));
+        });
+        Self {
+            inbox,
+            thread: Some(thread),
+            terminal,
+        }
+    }
 }
 #[cfg(test)]
 impl Worker {
     /// A worker without a thread, so tests can put the app in its running state.
     pub(super) fn stub() -> Self {
         Self {
-            receiver: mpsc::sync_channel(1).1,
+            inbox: Shared::default(),
             thread: None,
             terminal: None,
         }
+    }
+    /// What a worker thread would report.
+    pub(super) fn send(&self, event: RunEvent) {
+        lock(&self.inbox).push(event);
+    }
+    pub(super) fn finish(&self, run: Run, result: std::result::Result<Action, String>) {
+        lock(&self.inbox).done = Some((Box::new(run), result));
     }
 }
 
@@ -64,16 +128,33 @@ pub(super) struct RunSlot {
     pub(super) worker: Option<Worker>,
     pub(super) cancel: Arc<AtomicBool>,
     pub(super) logs: VecDeque<String>,
+    /// Counts lines ever added to `logs`, so cached wrapping knows when it is stale.
+    pub(super) log_version: u64,
     pub(super) log_scroll: usize,
     /// A finished run shows results unless the output log was chosen.
     pub(super) show_output: bool,
-    pub(super) results_scroll: u16,
+    /// Scroll offsets of the results panels, each kept within its own panel.
+    pub(super) results_scroll: [u16; 2],
+    /// The furthest each results panel can scroll, as last drawn.
+    pub(super) results_limit: Cell<[u16; 2]>,
     pub(super) changes: Option<completion::Loaded>,
     pub(super) changes_job: Option<(String, Receiver<completion::Loaded>)>,
     /// The run checkpoint whose waiver the status line last announced.
     pub(super) waiver_shown: String,
     /// Reopen the stage's session interactively once its worker stops.
     pub(super) takeover: bool,
+    /// When the worker last stopped; a key pressed just after cannot continue.
+    pub(super) stopped_at: Option<Instant>,
+    /// Drawing caches, so frames do not rebuild what has not changed.
+    pub(super) cache: RefCell<DrawCache>,
+}
+/// Width, log version, and theme the output was wrapped for.
+pub(super) type OutputKey = (usize, u64, Theme);
+/// Wrapped output and the results report from the last frame, with what they were built from.
+#[derive(Default)]
+pub(super) struct DrawCache {
+    pub(super) output: Option<(OutputKey, std::rc::Rc<Vec<Line<'static>>>)>,
+    pub(super) report: Option<(String, std::rc::Rc<crate::report::RunReport>)>,
 }
 impl Default for RunSlot {
     fn default() -> Self {
@@ -82,13 +163,17 @@ impl Default for RunSlot {
             worker: None,
             cancel: Arc::new(AtomicBool::new(false)),
             logs: VecDeque::new(),
+            log_version: 0,
             log_scroll: 0,
             show_output: false,
-            results_scroll: 0,
+            results_scroll: [0; 2],
+            results_limit: Cell::new([0; 2]),
             changes: None,
             changes_job: None,
             waiver_shown: String::new(),
             takeover: false,
+            stopped_at: None,
+            cache: RefCell::default(),
         }
     }
 }
@@ -109,40 +194,61 @@ impl RunSlot {
                 )
             })
     }
-    /// Applies worker messages; returns the driver's result once it stops.
-    fn poll(&mut self) -> Option<std::result::Result<Action, String>> {
-        let messages: Vec<_> = self
-            .worker
-            .as_ref()
-            .map(|w| w.receiver.try_iter().collect())
-            .unwrap_or_default();
+    pub(super) fn push_log(&mut self, line: String) {
+        self.logs.push_back(line);
+        self.log_version += 1;
+        while self.logs.len() > LOG_LINES {
+            self.logs.pop_front();
+        }
+    }
+    /// Applies what the worker reported. Returns whether anything changed,
+    /// and the driver's result once it stops.
+    fn poll(&mut self) -> (bool, Option<std::result::Result<Action, String>>) {
+        let Some(worker) = &self.worker else {
+            self.cancel.store(false, Ordering::Relaxed);
+            return (false, None);
+        };
+        let (state, mut output, mut skipped, done) = {
+            let mut inbox = lock(&worker.inbox);
+            (
+                inbox.state.take(),
+                std::mem::take(&mut inbox.output),
+                std::mem::take(&mut inbox.skipped),
+                inbox.done.take(),
+            )
+        };
+        let changed = state.is_some() || !output.is_empty() || skipped > 0 || done.is_some();
+        if let Some(run) = state {
+            self.run = Some(*run);
+        }
+        // Lines the log could not keep anyway count toward the gap, so its
+        // marker stays in view above what follows.
+        if skipped > 0 && output.len() >= LOG_LINES {
+            let extra = output.len() + 1 - LOG_LINES;
+            output.drain(..extra);
+            skipped += extra;
+        }
+        if skipped > 0 {
+            self.push_log(format!(
+                "… {skipped} lines skipped while the view was busy; stdout.log has them"
+            ));
+        }
+        for line in output {
+            self.push_log(line);
+        }
         let mut stopped = None;
-        for message in messages {
-            match message {
-                WorkerMessage::Event(RunEvent::State(run)) => self.run = Some(*run),
-                WorkerMessage::Event(RunEvent::Output(text)) => {
-                    for line in text.lines() {
-                        self.logs.push_back(storage::truncate(line, 1500));
-                    }
-                    while self.logs.len() > 400 {
-                        self.logs.pop_front();
-                    }
-                }
-                WorkerMessage::Done(run, result) => {
-                    self.run = Some(*run);
-                    if let Some(mut worker) = self.worker.take() {
-                        if let Some(handle) = worker.thread.take() {
-                            let _ = handle.join();
-                        }
-                    }
-                    stopped = Some(self.settle(result));
+        if let Some((run, result)) = done {
+            self.run = Some(*run);
+            if let Some(mut worker) = self.worker.take() {
+                if let Some(handle) = worker.thread.take() {
+                    let _ = handle.join();
                 }
             }
-        }
-        if self.worker.is_none() {
+            self.stopped_at = Some(Instant::now());
             self.cancel.store(false, Ordering::Relaxed);
+            stopped = Some(self.settle(result));
         }
-        stopped
+        (changed, stopped)
     }
     /// A takeover turns the cancelled stage into one waiting for the terminal.
     fn settle(
@@ -162,7 +268,6 @@ impl Drop for RunSlot {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
         if let Some(mut worker) = self.worker.take() {
-            drop(worker.receiver);
             if let Some(thread) = worker.thread.take() {
                 let _ = thread.join();
             }
@@ -227,12 +332,99 @@ pub(super) struct App {
     /// Catalogs read so far, by harness; they supply effort levels to editors.
     pub(super) catalogs: BTreeMap<String, Catalog>,
     /// A catalog being read for an editor, without a picker.
-    prefetch: Option<(String, Receiver<std::result::Result<Catalog, String>>)>,
-    prefetch_queue: VecDeque<String>,
-    /// Git facts for the project, refreshed on start and project switch.
+    pub(super) prefetch: Option<(String, Job<std::result::Result<Catalog, String>>)>,
+    pub(super) prefetch_queue: VecDeque<String>,
+    /// Git facts for the project, refreshed in the background.
     pub(super) repo: Option<storage::RepoInfo>,
+    repo_job: Option<Job<Option<storage::RepoInfo>>>,
+    /// When the Git facts were last read; None reads them on the next poll.
+    repo_checked: Option<Instant>,
     pub(super) quit_after_stop: bool,
+    /// Counts project switches; background results for an earlier project are dropped.
+    pub(super) generation: u64,
+    /// A run being created (worktree, snapshot) before it starts.
+    pub(super) starting: Option<Job<std::result::Result<Started, String>>>,
+    /// A project being opened, with the browser to return to on failure.
+    project_job: Option<(ProjectJob, Box<PathPicker>)>,
+    /// Saved runs being read for the Runs page.
+    pub(super) runs_job: Option<Job<std::result::Result<Vec<Entry>, String>>>,
+    /// The Runs page needs reading when it is next shown.
+    pub(super) runs_stale: bool,
+    pub(super) runs_loaded: Option<Instant>,
+    /// Workflow snapshots from before removals and deletions, newest last.
+    pub(super) undo: Vec<Snapshot>,
+    /// Something changed that the next frame should show.
+    pub(super) redraw: bool,
 }
+
+/// Work on a background thread, tagged with the project generation it serves.
+pub(super) struct Job<T> {
+    generation: u64,
+    receiver: Receiver<T>,
+}
+pub(super) enum Got<T> {
+    Pending,
+    Ready(T),
+    /// The thread ended without a result.
+    Lost,
+}
+impl<T: Send + 'static> Job<T> {
+    pub(super) fn spawn(generation: u64, work: impl FnOnce() -> T + Send + 'static) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        Self {
+            generation,
+            receiver,
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn from_receiver(generation: u64, receiver: Receiver<T>) -> Self {
+        Self {
+            generation,
+            receiver,
+        }
+    }
+    fn get(&self) -> Got<T> {
+        match self.receiver.try_recv() {
+            Ok(value) => Got::Ready(value),
+            Err(mpsc::TryRecvError::Empty) => Got::Pending,
+            Err(mpsc::TryRecvError::Disconnected) => Got::Lost,
+        }
+    }
+}
+
+type ProjectJob = Job<std::result::Result<Opened, String>>;
+/// A created run, ready for its driver.
+pub(super) struct Started {
+    run: Run,
+    /// What was using the checkout, when the run got a worktree instead.
+    holder: Option<String>,
+    /// The task as submitted; the editor clears only if it still holds it.
+    task: Option<String>,
+    rerun_of: Option<String>,
+}
+/// A project read in the background.
+pub(super) struct Opened {
+    project: PathBuf,
+    settings: Settings,
+    config_path: PathBuf,
+    repo: Option<storage::RepoInfo>,
+}
+/// The workflows before a removal or deletion, for [u].
+pub(super) struct Snapshot {
+    workflows: Vec<config::Workflow>,
+    workflow: usize,
+    selected: usize,
+    what: String,
+}
+const UNDO_DEPTH: usize = 20;
+/// How often the header re-reads Git status, and Runs re-reads active runs.
+const REPO_EVERY: Duration = Duration::from_secs(5);
+const RUNS_EVERY: Duration = Duration::from_secs(3);
+/// A stage that stopped this recently cannot be continued by the same key.
+pub(super) const SETTLE: Duration = Duration::from_millis(600);
 impl App {
     pub(super) fn new(
         project: PathBuf,
@@ -275,7 +467,17 @@ impl App {
             prefetch: None,
             prefetch_queue: VecDeque::new(),
             repo,
+            repo_job: None,
+            repo_checked: Some(Instant::now()),
             quit_after_stop: false,
+            generation: 0,
+            starting: None,
+            project_job: None,
+            runs_job: None,
+            runs_stale: true,
+            runs_loaded: None,
+            undo: vec![],
+            redraw: true,
         }
     }
     pub(super) fn displayed_theme(&self) -> Theme {
@@ -344,7 +546,7 @@ impl App {
     pub(super) fn text(&mut self, title: &str, body: String) {
         self.modal = Some(Modal::Text {
             title: title.into(),
-            body,
+            body: storage::clean_terminal(&body),
             scroll: 0,
             guide: false,
         });
@@ -486,19 +688,10 @@ impl App {
         let mut run = self.focused.run.clone().context("No run selected")?;
         self.focused.cancel.store(false, Ordering::Relaxed);
         let cancel = self.focused.cancel.clone();
-        let (sender, receiver) = mpsc::sync_channel(128);
-        let handle = thread::spawn(move || {
-            let action = engine::drive(&mut run, &cancel, |event| {
-                let _ = sender.try_send(WorkerMessage::Event(event));
-            })
-            .map_err(|e| format!("{e:#}"));
-            let _ = sender.send(WorkerMessage::Done(Box::new(run), action));
-        });
-        self.focused.worker = Some(Worker {
-            receiver,
-            thread: Some(handle),
-            terminal: None,
-        });
+        self.focused.worker = Some(Worker::spawn(None, move |emit| {
+            let action = engine::drive(&mut run, &cancel, emit).map_err(|e| format!("{e:#}"));
+            (run, action)
+        }));
         Ok(())
     }
     /// Start the stage once; subsequent attachments reuse this worker's PTY.
@@ -517,37 +710,37 @@ impl App {
         let terminal = session.clone();
         self.focused.cancel.store(false, Ordering::Relaxed);
         let cancel = self.focused.cancel.clone();
-        let (sender, receiver) = mpsc::sync_channel(128);
-        let handle = thread::spawn(move || {
-            let result = engine::run_interactive(&mut run, &cancel, &terminal, |event| {
-                let _ = sender.try_send(WorkerMessage::Event(event));
-            })
-            .map(|()| {
-                if run.status == Status::AwaitingConfirmation {
-                    Action::Confirm
-                } else {
-                    Action::Stopped
-                }
-            })
-            .map_err(|error| format!("{error:#}"));
-            let _ = sender.send(WorkerMessage::Done(Box::new(run), result));
-        });
-        self.focused.worker = Some(Worker {
-            receiver,
-            thread: Some(handle),
-            terminal: Some(session.clone()),
-        });
+        self.focused.worker = Some(Worker::spawn(Some(session.clone()), move |emit| {
+            let result = engine::run_interactive(&mut run, &cancel, &terminal, emit)
+                .map(|()| {
+                    if run.status == Status::AwaitingConfirmation {
+                        Action::Confirm
+                    } else {
+                        Action::Stopped
+                    }
+                })
+                .map_err(|error| format!("{error:#}"));
+            (run, result)
+        }));
         Ok(session)
     }
     pub(super) fn poll(&mut self) -> Result<bool> {
-        if let Some(Modal::Import(importer)) = &mut self.modal {
-            importer.poll();
+        match &mut self.modal {
+            Some(Modal::Import(importer)) => self.redraw |= importer.poll(),
+            Some(Modal::Repositories(picker)) => self.redraw |= picker.poll(),
+            _ => {}
         }
-        if let Some(result) = self.focused.poll() {
+        let (changed, stopped) = self.focused.poll();
+        self.redraw |= changed;
+        if let Some(result) = stopped {
+            self.run_stopped();
             self.focused_stopped(result);
         }
         for index in 0..self.parked.len() {
-            if let Some(result) = self.parked[index].poll() {
+            let (changed, stopped) = self.parked[index].poll();
+            self.redraw |= changed;
+            if let Some(result) = stopped {
+                self.run_stopped();
                 if let Some(run) = &self.parked[index].run {
                     self.message = notice(run, &result);
                     if result.is_err() || result == Ok(Action::Stopped) {
@@ -556,22 +749,29 @@ impl App {
                 }
             }
         }
-        if let Some((harness, receiver)) = &self.prefetch {
-            if let Ok(result) = receiver.try_recv() {
-                let harness = harness.clone();
-                self.prefetch = None;
-                if let Ok(catalog) = result {
-                    self.catalogs.insert(harness.clone(), catalog);
-                    self.push_catalog(&harness);
-                }
-                if let Some(next) = self.prefetch_queue.pop_front() {
-                    self.request_catalog(next);
+        self.poll_jobs();
+        if let Some((harness, job)) = &self.prefetch {
+            match job.get() {
+                Got::Pending => {}
+                got => {
+                    let harness = harness.clone();
+                    let current = job.generation == self.generation;
+                    self.prefetch = None;
+                    if let (Got::Ready(Ok(catalog)), true) = (got, current) {
+                        self.catalogs.insert(harness.clone(), catalog);
+                        self.push_catalog(&harness);
+                    }
+                    if let Some(next) = self.prefetch_queue.pop_front() {
+                        self.request_catalog(next);
+                    }
+                    self.redraw = true;
                 }
             }
         }
         if let Some(receiver) = &self.catalog {
             if let Ok(result) = receiver.try_recv() {
                 self.catalog = None;
+                self.redraw = true;
                 match result {
                     Ok(catalog) => {
                         let harness = self.catalog_harness.clone();
@@ -598,11 +798,13 @@ impl App {
         }
         match self.harness_checks.poll() {
             Some(true) => {
+                self.redraw = true;
                 self.harness_selected = self
                     .harness_selected
                     .min(self.harness_checks.reports.len().saturating_sub(1))
             }
             Some(false) => {
+                self.redraw = true;
                 self.message = "Harness check failed. Press [r] to retry.".into();
                 self.alert = self.message.clone();
             }
@@ -610,6 +812,188 @@ impl App {
         }
         self.poll_completion();
         Ok(self.quit_after_stop && !self.any_active())
+    }
+    /// A run stopped: Git status and the saved runs list may have changed.
+    fn run_stopped(&mut self) {
+        self.redraw = true;
+        self.repo_checked = None;
+        self.runs_stale = true;
+    }
+    /// Collects background results and starts timed refreshes.
+    fn poll_jobs(&mut self) {
+        if let Some(job) = &self.starting {
+            match job.get() {
+                Got::Pending => {}
+                Got::Ready(result) => {
+                    self.starting = None;
+                    self.redraw = true;
+                    let started = result
+                        .map_err(anyhow::Error::msg)
+                        .and_then(|started| self.begin(started));
+                    if let Err(error) = started {
+                        self.message = format!("{error:#}");
+                        self.alert = self.message.clone();
+                    }
+                }
+                Got::Lost => {
+                    self.starting = None;
+                    self.message = "Starting the run stopped unexpectedly; try again.".into();
+                    self.alert = self.message.clone();
+                }
+            }
+        }
+        if let Some((job, _)) = &self.project_job {
+            let got = job.get();
+            if !matches!(got, Got::Pending) {
+                let (_, mut picker) = self.project_job.take().expect("project job");
+                self.redraw = true;
+                let opened = match got {
+                    Got::Ready(result) => result.map_err(anyhow::Error::msg),
+                    _ => Err(anyhow::anyhow!("Opening the project stopped unexpectedly")),
+                };
+                if let Err(error) = opened.and_then(|opened| self.open_project(opened)) {
+                    // Back to the browser, which shows why.
+                    picker.error = format!("{error:#}");
+                    self.modal = Some(Modal::Repositories(picker));
+                } else if matches!(self.modal, Some(Modal::Loading(_))) {
+                    self.modal = None;
+                }
+            }
+        }
+        if let Some(job) = &self.runs_job {
+            match job.get() {
+                Got::Pending => {}
+                got => {
+                    let current = job.generation == self.generation;
+                    self.runs_job = None;
+                    self.redraw = true;
+                    match got {
+                        Got::Ready(Ok(entries)) if current => self.show_runs(entries),
+                        Got::Ready(Err(error)) if current => {
+                            self.message = error;
+                            self.alert = self.message.clone();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if self.page == 2 {
+            let due = self.runs_loaded.is_none_or(|at| at.elapsed() >= RUNS_EVERY);
+            if due && self.slots().any(|(slot, _)| slot.in_progress()) {
+                self.runs_stale = true;
+            }
+            if self.runs_stale && self.runs_job.is_none() {
+                self.load_runs();
+            }
+        }
+        if let Some(job) = &self.repo_job {
+            match job.get() {
+                Got::Pending => {}
+                got => {
+                    if let (Got::Ready(repo), true) = (got, job.generation == self.generation) {
+                        self.redraw |= repo != self.repo;
+                        self.repo = repo;
+                    }
+                    self.repo_job = None;
+                    self.repo_checked = Some(Instant::now());
+                }
+            }
+        } else if self
+            .repo_checked
+            .is_none_or(|at| at.elapsed() >= REPO_EVERY)
+        {
+            let project = self.project.clone();
+            self.repo_job = Some(Job::spawn(self.generation, move || {
+                storage::repo_info(&project)
+            }));
+        }
+    }
+    /// Reads saved runs in the background; the page shows them when they arrive.
+    pub(super) fn load_runs(&mut self) {
+        self.runs_stale = false;
+        let project = self.project.clone();
+        self.runs_job = Some(Job::spawn(self.generation, move || {
+            crate::history::list(&project).map_err(|e| format!("{e:#}"))
+        }));
+    }
+    /// Adopts a created run and starts its driver.
+    fn begin(&mut self, started: Started) -> Result<()> {
+        let Started {
+            run,
+            holder,
+            task,
+            rerun_of,
+        } = started;
+        // An interactive first stage needs the terminal right away.
+        let interactive = run
+            .workflow
+            .stages
+            .iter()
+            .find(|s| s.enabled)
+            .is_some_and(|s| s.mode == config::Mode::Interactive);
+        let (id, workspace) = (run.id.clone(), run.workspace.clone());
+        self.adopt(run);
+        self.start_driver()?;
+        self.runs_stale = true;
+        if let Some(source) = rerun_of {
+            self.message = format!(
+                "Rerunning {source} as {id}{}…",
+                holder.map_or_else(String::new, |h| format!(
+                    " in a worktree ({h} is using the checkout)"
+                ))
+            );
+            self.page = 1;
+            return Ok(());
+        }
+        // The run has its own snapshot; the editor is free for the next one.
+        if task.is_some_and(|task| task == self.task) {
+            self.task.clear();
+        }
+        self.message = match holder {
+            Some(holder) => format!(
+                "Started {id} in worktree {}: {holder} is using the checkout, whose uncommitted changes are not included. ",
+                short_path(&workspace, 60)
+            ),
+            None => format!("Started {id}. "),
+        };
+        if interactive {
+            self.page = 1;
+        } else {
+            self.message
+                .push_str("Monitor [2] follows it. Define the next task here.");
+        }
+        Ok(())
+    }
+    /// Creates a run in the background (worktree and snapshot can be slow);
+    /// it starts once ready.
+    pub(super) fn start_run(
+        &mut self,
+        create: impl FnOnce(Placement) -> Result<Run> + Send + 'static,
+        worktree: bool,
+        task: Option<String>,
+        rerun_of: Option<String>,
+    ) -> Result<()> {
+        ensure!(
+            self.starting.is_none(),
+            "A run is still starting; wait for it to begin"
+        );
+        let (placement, holder) = self.placement(worktree)?;
+        self.message = match &rerun_of {
+            Some(id) => format!("Starting a rerun of {id}…"),
+            None => "Starting run…".into(),
+        };
+        self.starting = Some(Job::spawn(self.generation, move || {
+            create(placement)
+                .map(|run| Started {
+                    run,
+                    holder,
+                    task,
+                    rerun_of,
+                })
+                .map_err(|e| format!("{e:#}"))
+        }));
+        Ok(())
     }
     fn focused_stopped(&mut self, result: std::result::Result<Action, String>) {
         // Away from the Monitor, a terminal never takes over the screen.
@@ -721,13 +1105,13 @@ impl App {
         }
         let settings = self.settings.clone();
         let project = self.project.clone();
-        let (sender, receiver) = mpsc::channel();
-        self.prefetch = Some((harness.clone(), receiver));
-        thread::spawn(move || {
-            let _ = sender.send(
-                catalog::discover(&harness, &settings, &project).map_err(|e| format!("{e:#}")),
-            );
-        });
+        let name = harness.clone();
+        self.prefetch = Some((
+            harness,
+            Job::spawn(self.generation, move || {
+                catalog::discover(&name, &settings, &project).map_err(|e| format!("{e:#}"))
+            }),
+        ));
     }
     pub(super) fn model_picker(&mut self) {
         self.model_picker_for(self.stage().harness.clone());
@@ -751,14 +1135,46 @@ impl App {
             );
         });
     }
-    /// Runs of this session keep going in their own projects.
+    /// Reads `path` as a project now; `begin_switch` does it in the background.
+    #[cfg(test)]
     pub(super) fn switch_project(&mut self, path: PathBuf) -> Result<()> {
-        let project = catalog::check_project(&path)?;
+        let opened = read_project(path).map_err(anyhow::Error::msg)?;
+        self.open_project(opened)
+    }
+    /// Opens `path` in the background, returning to `picker` if it fails.
+    pub(super) fn begin_switch(&mut self, path: PathBuf, picker: Box<PathPicker>) {
+        self.project_job = Some((
+            Job::spawn(self.generation, move || read_project(path)),
+            picker,
+        ));
+        self.modal = Some(Modal::Loading("Opening project…".into()));
+    }
+    /// Stops opening a project; the browser comes back.
+    pub(super) fn cancel_switch(&mut self) -> bool {
+        match self.project_job.take() {
+            Some((_, picker)) => {
+                self.modal = Some(Modal::Repositories(picker));
+                true
+            }
+            None => false,
+        }
+    }
+    /// Shows `opened`. Runs of this session keep going in their own projects;
+    /// everything read for the previous project is dropped.
+    fn open_project(&mut self, opened: Opened) -> Result<()> {
         if self.dirty {
             self.save(false)?;
         }
-        let (settings, config_path) = config::load(&project, None)?;
-        self.repo = storage::repo_info(&project);
+        let Opened {
+            project,
+            settings,
+            config_path,
+            repo,
+        } = opened;
+        self.generation += 1;
+        self.repo = repo;
+        self.repo_job = None;
+        self.repo_checked = Some(Instant::now());
         self.project = project;
         self.settings = settings;
         self.config_path = config_path;
@@ -767,8 +1183,16 @@ impl App {
         self.task.clear();
         self.history.clear();
         self.history_selected = 0;
+        self.runs_job = None;
+        self.runs_stale = true;
+        self.runs_loaded = None;
         self.harness_selected = 0;
         self.harness_checks.clear();
+        self.catalog = None;
+        self.catalogs.clear();
+        self.prefetch = None;
+        self.prefetch_queue.clear();
+        self.undo.clear();
         self.page = 0;
         self.message = format!("Project: {}", self.project.display());
         if let Err(error) = storage::remember_project(&self.project) {
@@ -817,21 +1241,16 @@ impl App {
         match id {
             ActionId::Interrupt => {
                 if !self.any_active() {
-                    return Ok(true);
+                    return Ok(self.ask_to_save().is_none());
                 }
                 self.cancel_all();
                 self.message = "Stopping active stages and saving their artifacts…".into();
             }
             ActionId::Quit => {
-                if self.dirty {
-                    self.save(false)?;
+                if self.ask_to_save().is_some() {
+                    return Ok(false);
                 }
-                if !self.any_active() {
-                    return Ok(true);
-                }
-                self.cancel_all();
-                self.quit_after_stop = true;
-                self.message = "Stopping active runs and saving before exit…".into();
+                return Ok(self.quit());
             }
             ActionId::Themes => self.choose_theme(),
             ActionId::ToggleVim => {
@@ -866,14 +1285,74 @@ impl App {
         }
         Ok(false)
     }
+    /// Asks whether to save unsaved workflow edits before exiting; None when
+    /// there are none.
+    fn ask_to_save(&mut self) -> Option<()> {
+        self.dirty.then(|| {
+            self.modal = Some(Modal::Ask(Box::new(Ask::SaveAndExit)));
+        })
+    }
+    /// Exits now, or once active runs have stopped; true means exit now.
+    pub(super) fn quit(&mut self) -> bool {
+        if !self.any_active() {
+            return true;
+        }
+        self.cancel_all();
+        self.quit_after_stop = true;
+        self.message = "Stopping active runs and saving their artifacts before exit…".into();
+        false
+    }
     fn show(&mut self, page: usize) -> Result<()> {
         self.page = page;
         match page {
-            2 => self.refresh_runs()?,
+            // Read when shown, not while Tab passes through.
+            2 => self.runs_stale = true,
             3 => self.harness_checks.start(&self.settings, &self.project),
             _ => {}
         }
         Ok(())
+    }
+    /// Whether something on screen animates, so frames come faster.
+    pub(super) fn animating(&self) -> bool {
+        matches!(self.modal, Some(Modal::Loading(_)))
+            || self.starting.is_some()
+            || matches!(&self.modal, Some(Modal::Import(importer)) if importer.busy())
+    }
+    /// Whether the focused interactive stage may take the terminal now. An
+    /// open dialog keeps it waiting, and the status line says how to open it.
+    pub(super) fn take_launch(&mut self) -> bool {
+        if !std::mem::take(&mut self.launch_interactive) {
+            return false;
+        }
+        if self.modal.is_some() {
+            self.message = "Interactive stage ready — press [t] on the Monitor to open it.".into();
+            return false;
+        }
+        true
+    }
+    /// Saves the workflows so [u] can bring them back.
+    pub(super) fn remember(&mut self, what: String) {
+        if self.undo.len() == UNDO_DEPTH {
+            self.undo.remove(0);
+        }
+        self.undo.push(Snapshot {
+            workflows: self.settings.workflows.clone(),
+            workflow: self.workflow,
+            selected: self.selected,
+            what,
+        });
+    }
+    pub(super) fn undo(&mut self) {
+        let Some(snapshot) = self.undo.pop() else {
+            self.message = "Nothing to undo.".into();
+            return;
+        };
+        self.settings.workflows = snapshot.workflows;
+        self.workflow = snapshot.workflow.min(self.settings.workflows.len() - 1);
+        let stages = self.settings.workflows[self.workflow].stages.len();
+        self.selected = snapshot.selected.min(stages.saturating_sub(1));
+        self.dirty = true;
+        self.message = format!("Restored {}.", snapshot.what);
     }
     fn command_menu(&mut self) {
         let items = actions::available(self.scope())
@@ -913,6 +1392,22 @@ impl App {
 }
 
 const TABS: [&str; 4] = ["Workflow", "Monitor", "Runs", "Harnesses"];
+
+/// The settings and Git facts of the project at `path`; slow on network drives.
+fn read_project(path: PathBuf) -> std::result::Result<Opened, String> {
+    let read = || -> Result<Opened> {
+        let project = catalog::check_project(&path)?;
+        let (settings, config_path) = config::load(&project, None)?;
+        let repo = storage::repo_info(&project);
+        Ok(Opened {
+            project,
+            settings,
+            config_path,
+            repo,
+        })
+    };
+    read().map_err(|e| format!("{e:#}"))
+}
 
 pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let palette = app.palette();
@@ -1013,6 +1508,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
             .wrap(Wrap { trim: false }),
         chunks[4],
     );
+    let ask = match &app.modal {
+        Some(Modal::Ask(ask)) => Some(ask.text(app)),
+        _ => None,
+    };
     if let Some(modal) = &mut app.modal {
         if let Some(field) = modal.active_input() {
             field.set_vim(app.vim_motions);
@@ -1026,7 +1525,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         if !previewing_theme {
             dim(frame, palette);
         }
-        draw_modal(frame, modal, palette);
+        draw_modal(frame, modal, ask, palette);
     }
 }
 

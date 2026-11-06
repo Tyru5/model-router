@@ -3,11 +3,11 @@ use super::{
     actions::ActionId,
     app::App,
     harness_editor::HarnessEditor,
-    modal::{Choice, InputTarget, Modal, PickValue},
+    modal::{Ask, Choice, InputTarget, Modal, PickValue},
     path_picker::PathPicker,
     task_importer::TaskImporter,
     theme::Palette,
-    widgets::{content, focus_textarea, kv, or_default, short_path, textarea, wrapped_textarea},
+    widgets::{content, focus_textarea, kv, or_default, textarea, wrapped_textarea},
 };
 use crate::{
     adapters, catalog,
@@ -27,6 +27,7 @@ use ratatui::{
         TableState, Wrap,
     },
 };
+use tui_textarea::CursorMove;
 
 const FIELDS: &[&str] = &[
     "Name",
@@ -196,8 +197,35 @@ impl StageEditor {
         self.typing_model = false;
         focus_textarea(&mut self.fields[index]);
     }
+    /// Whether the draft differs from the stage it opened with, or cannot be applied.
+    pub(super) fn changed(&self) -> bool {
+        self.finish().map_or(true, |stage| {
+            serde_json::to_value(&stage).ok() != serde_json::to_value(&self.stage).ok()
+        })
+    }
+    /// Whether Up/Down move the cursor inside a multiline field instead of
+    /// leaving it: only on its first or last line do they switch fields.
+    fn moves_within(&self, key: &KeyEvent) -> bool {
+        if ![CHECKS, INSTRUCTIONS].contains(&self.selected) || !key.modifiers.is_empty() {
+            return false;
+        }
+        let field = &self.fields[self.selected];
+        let row = field.cursor().0;
+        match key.code {
+            Key::Up => row > 0,
+            Key::Down => row + 1 < field.lines().len(),
+            _ => false,
+        }
+    }
     pub(super) fn key(&mut self, key: KeyEvent) -> StageRequest {
-        if matches!(key.code, Key::Tab | Key::Down)
+        if self.moves_within(&key) {
+            // Moved directly, so Vim's Normal mode moves too.
+            self.fields[self.selected].move_cursor(if key.code == Key::Up {
+                CursorMove::Up
+            } else {
+                CursorMove::Down
+            });
+        } else if matches!(key.code, Key::Tab | Key::Down)
             || (key.code == Key::Char('n') && key.modifiers.contains(Mods::CONTROL))
         {
             self.focus((self.selected + 1) % self.fields.len());
@@ -225,6 +253,9 @@ impl StageEditor {
                 Key::Left | Key::Right | Key::Char(' ') | Key::Enter
             ) {
                 let values = self.choices(self.selected);
+                if values.is_empty() {
+                    return StageRequest::None;
+                }
                 let current = values
                     .iter()
                     .position(|v| *v == content(&self.fields[self.selected]))
@@ -456,7 +487,7 @@ impl App {
     pub(super) fn perform_workflow(&mut self, id: ActionId) -> Result<()> {
         let count = self.settings.workflows[self.workflow].stages.len();
         match id {
-            ActionId::NextStage => self.selected = (self.selected + 1).min(count - 1),
+            ActionId::NextStage => self.selected = (self.selected + 1).min(count.saturating_sub(1)),
             ActionId::PreviousStage => self.selected = self.selected.saturating_sub(1),
             ActionId::ToggleStage => {
                 let stage = self.stage_mut();
@@ -614,22 +645,25 @@ impl App {
             }
             ActionId::RemoveStage => {
                 ensure!(count > 1, "Keep at least one stage");
+                let name = self.stage().name.clone();
+                self.remember(format!("stage “{name}”"));
                 self.settings.workflows[self.workflow]
                     .stages
                     .remove(self.selected);
                 self.selected = self.selected.min(count - 2);
                 self.dirty = true;
+                self.message = format!("Removed stage “{name}” — [u] to undo.");
             }
             ActionId::DeleteWorkflow => {
                 ensure!(
                     self.settings.workflows.len() > 1,
                     "Keep at least one workflow"
                 );
-                self.settings.workflows.remove(self.workflow);
-                self.workflow = 0;
-                self.selected = 0;
-                self.dirty = true;
+                self.modal = Some(Modal::Ask(Box::new(Ask::DeleteWorkflow {
+                    index: self.workflow,
+                })));
             }
+            ActionId::Undo => self.undo(),
             ActionId::MoveStageUp => {
                 if self.selected > 0 {
                     self.settings.workflows[self.workflow]
@@ -661,39 +695,23 @@ impl App {
                 )?,
             ),
             ActionId::Run => {
-                let (placement, holder) = self.placement(self.worktree)?;
-                let run = Run::create_at(
-                    &self.project,
-                    &self.settings,
-                    &self.settings.workflows[self.workflow],
+                // Creating a worktree and snapshot can take a while, so the
+                // run starts in the background; the editor stays usable.
+                let (project, settings, task) = (
+                    self.project.clone(),
+                    self.settings.clone(),
                     self.task.clone(),
-                    placement,
+                );
+                let workflow = settings.workflows[self.workflow].clone();
+                crate::config::validate_task(&task)?;
+                self.start_run(
+                    move |placement| {
+                        Run::create_at(&project, &settings, &workflow, task, placement)
+                    },
+                    self.worktree,
+                    Some(self.task.clone()),
+                    None,
                 )?;
-                // An interactive first stage needs the terminal right away.
-                let interactive = run
-                    .workflow
-                    .stages
-                    .iter()
-                    .find(|s| s.enabled)
-                    .is_some_and(|s| s.mode == Mode::Interactive);
-                let (id, workspace) = (run.id.clone(), run.workspace.clone());
-                self.adopt(run);
-                self.start_driver()?;
-                // The run has its own snapshot; the editor is free for the next one.
-                self.task.clear();
-                self.message = match holder {
-                    Some(holder) => format!(
-                        "Started {id} in worktree {}: {holder} is using the checkout, whose uncommitted changes are not included. ",
-                        short_path(&workspace, 60)
-                    ),
-                    None => format!("Started {id}. "),
-                };
-                if interactive {
-                    self.page = 1;
-                } else {
-                    self.message
-                        .push_str("Monitor [2] follows it. Define the next task here.");
-                }
             }
             other => bail!("{other:?} is not a workflow action"),
         }

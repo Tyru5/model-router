@@ -27,6 +27,7 @@ use ratatui::{
         Wrap,
     },
 };
+use std::sync::atomic::Ordering;
 
 #[derive(Clone, Copy)]
 pub(super) enum InputTarget {
@@ -123,6 +124,86 @@ pub(super) enum Modal {
     },
     Loading(String),
     Confirm(Box<Confirm>),
+    /// A yes/no question before something hard to take back.
+    Ask(Box<Ask>),
+}
+
+/// Title, question, and key hints of an `Ask` dialog.
+pub(super) type AskText = (
+    &'static str,
+    String,
+    &'static [(&'static str, &'static str)],
+);
+/// What an `Ask` dialog confirms.
+pub(super) enum Ask {
+    /// Cancel the running stage of this run.
+    CancelStage {
+        run: String,
+    },
+    /// Stop this run's unattended stage and open its session.
+    TakeOver {
+        run: String,
+    },
+    DeleteWorkflow {
+        index: usize,
+    },
+    /// Unsaved workflow edits before exiting: [y] saves, [n] discards.
+    SaveAndExit,
+    /// Close this editor without applying its changes; [Esc] returns to it.
+    DiscardDraft(Box<Modal>),
+}
+impl Ask {
+    pub(super) fn text(&self, app: &App) -> AskText {
+        const YES_NO: &[(&str, &str)] = &[("y / Enter", "yes"), ("n / Esc", "no")];
+        match self {
+            Self::CancelStage { run } => (
+                "Cancel stage",
+                format!(
+                    "Stop the running stage of {run}? Its artifacts are kept; [y] in Monitor retries it."
+                ),
+                YES_NO,
+            ),
+            Self::TakeOver { run } => (
+                "Take over stage",
+                format!(
+                    "Stop the unattended stage of {run} and reopen its session in this terminal?"
+                ),
+                YES_NO,
+            ),
+            Self::DeleteWorkflow { index } => (
+                "Delete workflow",
+                format!(
+                    "Delete workflow “{}” and its {} stages? [u] undoes until you leave the project.",
+                    app.settings
+                        .workflows
+                        .get(*index)
+                        .map_or("", |w| w.name.as_str()),
+                    app.settings
+                        .workflows
+                        .get(*index)
+                        .map_or(0, |w| w.stages.len())
+                ),
+                YES_NO,
+            ),
+            Self::SaveAndExit => (
+                "Save changes?",
+                format!(
+                    "Workflow edits are not saved to {}.",
+                    app.config_path.display()
+                ),
+                &[
+                    ("y / Enter", "save and exit"),
+                    ("n", "exit without saving"),
+                    ("Esc", "cancel"),
+                ],
+            ),
+            Self::DiscardDraft(_) => (
+                "Discard changes?",
+                "This editor has changes that are not applied.".into(),
+                &[("y / Enter", "discard"), ("n / Esc", "keep editing")],
+            ),
+        }
+    }
 }
 
 impl Modal {
@@ -272,10 +353,79 @@ impl App {
         }
         Ok(())
     }
+    /// Keys for an `Ask` dialog; true means exit.
+    fn ask_key(&mut self, ask: Box<Ask>, key: KeyEvent) -> Result<bool> {
+        let yes = matches!(key.code, Key::Char('y') | Key::Enter)
+            && key.modifiers - Mods::SHIFT == Mods::NONE;
+        let no = key.code == Key::Esc
+            || (key.code == Key::Char('n') && key.modifiers - Mods::SHIFT == Mods::NONE);
+        if !yes && !no {
+            self.modal = Some(Modal::Ask(ask));
+            return Ok(false);
+        }
+        match *ask {
+            Ask::SaveAndExit if yes => {
+                self.save(false)?;
+                return Ok(self.quit());
+            }
+            Ask::SaveAndExit if key.code == Key::Char('n') => {
+                self.dirty = false;
+                return Ok(self.quit());
+            }
+            Ask::DiscardDraft(editor) if !yes => self.modal = Some(*editor),
+            _ if !yes => {}
+            Ask::CancelStage { run } => {
+                // The stage may have stopped while the question was open.
+                if self.running(&run) {
+                    self.focused.cancel.store(true, Ordering::Relaxed);
+                    self.message = "Stopping stage…".into();
+                } else {
+                    self.message = format!("{run} is not running a stage; nothing was cancelled.");
+                }
+            }
+            Ask::TakeOver { run } => {
+                if self.running(&run) {
+                    self.focused.takeover = true;
+                    self.focused.cancel.store(true, Ordering::Relaxed);
+                    self.message = "Stopping the unattended stage to open its session…".into();
+                } else {
+                    self.message =
+                        format!("{run}'s stage already stopped; [t] reopens its session.");
+                }
+            }
+            Ask::DeleteWorkflow { index } => {
+                ensure!(
+                    self.settings.workflows.len() > 1 && index < self.settings.workflows.len(),
+                    "Keep at least one workflow"
+                );
+                let name = self.settings.workflows[index].name.clone();
+                self.remember(format!("workflow “{name}”"));
+                self.settings.workflows.remove(index);
+                self.workflow = 0;
+                self.selected = 0;
+                self.dirty = true;
+                self.message = format!("Deleted workflow “{name}” — [u] to undo.");
+            }
+            Ask::SaveAndExit | Ask::DiscardDraft(_) => {}
+        }
+        Ok(false)
+    }
+    /// Whether the focused run is `id` and still has a worker.
+    fn running(&self, id: &str) -> bool {
+        self.focused.worker.is_some() && self.focused.run.as_ref().is_some_and(|r| r.id == id)
+    }
     pub(super) fn modal_key(&mut self, key: KeyEvent) -> Result<bool> {
-        let Some(mut modal) = self.modal.take() else {
+        let Some(modal) = self.modal.take() else {
             return Ok(false);
         };
+        let modal = match modal {
+            Modal::Ask(ask) => return self.ask_key(ask, key),
+            Modal::Loading(_) if key.code == Key::Esc && self.cancel_switch() => {
+                return Ok(false);
+            }
+            other => other,
+        };
+        let mut modal = modal;
         if let Some(field) = modal.active_input() {
             field.set_vim(self.vim_motions);
             if field.vim_key(key) {
@@ -284,6 +434,15 @@ impl App {
             }
         }
         if key.code == Key::Esc && !matches!(modal, Modal::Repositories(_) | Modal::Import(_)) {
+            let changed = match &modal {
+                Modal::Stage { editor, .. } => editor.changed(),
+                Modal::Harness(editor) => editor.changed(),
+                _ => false,
+            };
+            if changed {
+                self.modal = Some(Modal::Ask(Box::new(Ask::DiscardDraft(Box::new(modal)))));
+                return Ok(false);
+            }
             self.catalog = None;
             self.modal = self.model_editor.take().map(Modal::Harness);
             if let Some((editor, insert_at)) = self.stage_editor.take() {
@@ -302,6 +461,7 @@ impl App {
         let mut exit = false;
         let mut pick_model = false;
         let mut refresh_catalog = None;
+        let mut open_project = None;
         let result: Result<()> = (|| {
             match &mut modal {
                 Modal::Input { target, text, .. } => {
@@ -355,21 +515,12 @@ impl App {
                         editor.key(key);
                     }
                 }
-                Modal::Repositories(picker) => {
-                    let action = picker.key(key).and_then(|action| {
-                        if let PickerAction::Select(path) = action {
-                            self.switch_project(path)?;
-                            Ok(PickerAction::Close)
-                        } else {
-                            Ok(action)
-                        }
-                    });
-                    match action {
-                        Ok(PickerAction::Close) => keep = false,
-                        Ok(_) => {}
-                        Err(error) => picker.error = format!("{error:#}"),
-                    }
-                }
+                Modal::Repositories(picker) => match picker.key(key) {
+                    Ok(PickerAction::Close) => keep = false,
+                    Ok(PickerAction::Select(path)) => open_project = Some(path),
+                    Ok(PickerAction::Stay) => {}
+                    Err(error) => picker.error = format!("{error:#}"),
+                },
                 Modal::Import(importer) => match importer.key(key) {
                     ImportAction::Stay => {}
                     ImportAction::Close => keep = false,
@@ -379,14 +530,22 @@ impl App {
                         keep = false;
                     }
                 },
-                Modal::Text { scroll, .. } => match key.code {
-                    Key::Up | Key::Char('k') => *scroll = scroll.saturating_sub(1),
-                    Key::Down | Key::Char('j') => *scroll = scroll.saturating_add(1),
-                    Key::PageDown => *scroll = scroll.saturating_add(15),
-                    Key::PageUp => *scroll = scroll.saturating_sub(15),
-                    Key::Char('q') => keep = false,
-                    _ => {}
-                },
+                Modal::Text { scroll, body, .. } => {
+                    // Scrolling stops at the last line.
+                    let last =
+                        u16::try_from(body.lines().count().saturating_sub(1)).unwrap_or(u16::MAX);
+                    match key.code {
+                        Key::Up | Key::Char('k') => *scroll = scroll.saturating_sub(1),
+                        Key::Down | Key::Char('j') => *scroll = scroll.saturating_add(1),
+                        Key::PageDown => *scroll = scroll.saturating_add(15),
+                        Key::PageUp => *scroll = scroll.saturating_sub(15),
+                        Key::Home => *scroll = 0,
+                        Key::End => *scroll = last,
+                        Key::Char('q') => keep = false,
+                        _ => {}
+                    }
+                    *scroll = (*scroll).min(last);
+                }
                 Modal::Picker {
                     items,
                     selected,
@@ -415,7 +574,7 @@ impl App {
                         }
                     }
                 }
-                Modal::Loading(_) => {}
+                Modal::Loading(_) | Modal::Ask(_) => {}
                 Modal::Confirm(dialog) => keep = !self.confirm_key(dialog, key),
             }
             Ok(())
@@ -430,6 +589,13 @@ impl App {
                 ));
             }
         }
+        let modal = match (open_project, modal) {
+            (Some(path), Modal::Repositories(picker)) => {
+                self.begin_switch(path, picker);
+                return result.map(|()| exit);
+            }
+            (_, modal) => modal,
+        };
         if pick_model {
             if let Modal::Stage { editor, insert_at } = modal {
                 let harness = editor.harness();
@@ -470,10 +636,17 @@ impl App {
     }
 }
 
-pub(super) fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, palette: Palette) {
+/// `ask` is the text of an `Ask` dialog, which reads the app.
+pub(super) fn draw_modal(
+    frame: &mut Frame<'_>,
+    modal: &mut Modal,
+    ask: Option<AskText>,
+    palette: Palette,
+) {
     let (width, height) = match modal {
         Modal::Stage { .. } => (100, 35),
         Modal::Loading(_) => (64, 7),
+        Modal::Ask(_) => (72, 9),
         _ => (95, 26),
     };
     let rect = popup(frame.area(), width, height);
@@ -584,17 +757,40 @@ pub(super) fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, palette: Pale
             scroll,
             guide,
         } => {
+            // Only the lines that can show are laid out, so a long diff stays
+            // cheap to draw. The body was cleaned when the dialog opened.
+            let block = palette.modal(title, &[("↑↓", "scroll"), ("Esc", "close")]);
+            let lines = body
+                .lines()
+                .skip(usize::from(*scroll))
+                .take(usize::from(block.inner(rect).height));
             let body = if *guide {
-                guide_text(body, palette)
+                guide_text(lines, palette)
             } else {
-                Text::raw(storage::clean_terminal(body))
+                Text::from(lines.map(|l| Line::raw(l.to_owned())).collect::<Vec<_>>())
             };
             frame.render_widget(
-                Paragraph::new(body)
-                    .wrap(Wrap { trim: false })
-                    .scroll((*scroll, 0))
-                    .block(palette.modal(title, &[("↑↓", "scroll"), ("Esc", "close")])),
+                Paragraph::new(body).wrap(Wrap { trim: false }).block(block),
                 rect,
+            );
+        }
+        Modal::Ask(_) => {
+            let (title, question, keys) = ask.unwrap_or_default();
+            let block = palette.modal(title, &[]);
+            let inner = block.inner(rect);
+            frame.render_widget(block, rect);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::raw(""),
+                    Line::styled(
+                        storage::clean_terminal(&question),
+                        Style::default().fg(palette.fg),
+                    ),
+                    Line::raw(""),
+                    palette.hints(keys),
+                ])
+                .wrap(Wrap { trim: false }),
+                inner.inner(Margin::new(1, 0)),
             );
         }
         Modal::Loading(message) => {
@@ -603,7 +799,15 @@ pub(super) fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, palette: Pale
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() / 80)
                 .unwrap_or(0) as usize;
-            let block = palette.modal("Model discovery", &[("Esc", "cancel")]);
+            let discovery = message.starts_with("Reading");
+            let block = palette.modal(
+                if discovery {
+                    "Model discovery"
+                } else {
+                    "Please wait"
+                },
+                &[("Esc", "cancel")],
+            );
             let inner = block.inner(rect);
             frame.render_widget(block, rect);
             frame.render_widget(
@@ -617,7 +821,11 @@ pub(super) fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, palette: Pale
                         Span::raw(message.clone()),
                     ]),
                     Line::styled(
-                        "No inference is performed.",
+                        if discovery {
+                            "No inference is performed."
+                        } else {
+                            ""
+                        },
                         Style::default().fg(palette.muted),
                     ),
                 ])
@@ -640,8 +848,8 @@ pub(super) fn draw_modal(frame: &mut Frame<'_>, modal: &mut Modal, palette: Pale
 
 /// Render the keyboard guide: CAPS lines are headings, `key\tdescription`
 /// lines become aligned bindings, everything else is a muted note.
-fn guide_text(body: &str, palette: Palette) -> Text<'static> {
-    body.lines()
+fn guide_text<'a>(lines: impl Iterator<Item = &'a str>, palette: Palette) -> Text<'static> {
+    lines
         .map(|line| match line.split_once('\t') {
             Some((key, text)) => Line::from(vec![
                 Span::styled(

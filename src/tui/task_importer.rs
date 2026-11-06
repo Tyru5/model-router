@@ -91,7 +91,13 @@ impl TaskImporter {
         })
     }
 
-    pub fn poll(&mut self) {
+    /// Whether a URL import is running.
+    pub fn busy(&self) -> bool {
+        self.job.is_some()
+    }
+    /// Applies finished background work; true when the view changed.
+    pub fn poll(&mut self) -> bool {
+        let mut changed = self.picker.poll();
         let result = self
             .job
             .as_ref()
@@ -110,7 +116,9 @@ impl TaskImporter {
                 }
                 Err(error) => self.error = error,
             }
+            changed = true;
         }
+        changed
     }
 
     pub fn paste(&mut self, text: &str) {
@@ -339,6 +347,7 @@ mod tests {
         let text = "# Spec 雪\n\n- Do this\n";
         std::fs::write(&source, text).unwrap();
         let mut importer = TaskImporter::new(dir.path(), "Keep existing instructions").unwrap();
+        importer.picker.wait();
         importer.paste("spec.md");
         assert!(matches!(
             press(&mut importer, Key::Enter),
@@ -367,6 +376,7 @@ mod tests {
         std::fs::write(dir.path().join("spec.md"), "# Additional work").unwrap();
         let existing = "x".repeat(config::MAX_TASK_BYTES);
         let mut importer = TaskImporter::new(dir.path(), &existing).unwrap();
+        importer.picker.wait();
         importer.paste("spec.md");
         press(&mut importer, Key::Enter);
         assert!(matches!(

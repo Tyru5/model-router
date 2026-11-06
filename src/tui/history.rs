@@ -7,6 +7,7 @@ use super::{
     widgets::{content, empty_state, kv, menu_key, textarea},
 };
 use crate::{
+    adapters::OutputKind,
     engine::{self, Run, Status},
     history::{self, Criteria, Entry, Plan, StatusFilter},
     storage,
@@ -108,10 +109,12 @@ impl App {
             .unwrap_or(self.history_selected);
         self.history_selected = index.min(visible.len().saturating_sub(1));
     }
-    /// Reloads summaries and starts sizing them in the background.
-    pub(super) fn refresh_runs(&mut self) -> Result<()> {
+    /// Shows freshly read summaries, keeping the selection, and starts
+    /// sizing them in the background.
+    pub(super) fn show_runs(&mut self, entries: Vec<Entry>) {
         let selected = self.selected_run().map(|entry| entry.id().to_owned());
-        self.history = history::list(&self.project)?;
+        self.history = entries;
+        self.runs_loaded = Some(std::time::Instant::now());
         self.reselect(selected);
         let sizes = Arc::new(Mutex::new(HashMap::new()));
         self.runs.sizes = sizes.clone();
@@ -128,7 +131,6 @@ impl App {
                 }
             }
         });
-        Ok(())
     }
     pub(super) fn perform_runs(&mut self, id: ActionId) -> Result<()> {
         match id {
@@ -139,7 +141,7 @@ impl App {
             ActionId::PreviousRun => {
                 self.history_selected = self.history_selected.saturating_sub(1)
             }
-            ActionId::RefreshRuns => self.refresh_runs()?,
+            ActionId::RefreshRuns => self.load_runs(),
             ActionId::FilterRuns => {
                 self.runs.filtering = true;
                 self.runs.filter.set_vim(self.vim_motions);
@@ -161,7 +163,11 @@ impl App {
                 } else if let Some(run) =
                     self.selected_run().and_then(|entry| self.load_run(&entry))
                 {
+                    let tail = saved_output(&run);
                     self.adopt(run);
+                    for line in tail {
+                        self.focused.push_log(line);
+                    }
                     self.page = 1;
                     self.message =
                         "Saved run loaded. c continues; y retries; t reopens its session; i retries interactively.".into();
@@ -370,20 +376,16 @@ impl App {
             false
         })
     }
-    /// Starts a rerun through the same worker path as Workflow [r].
+    /// Starts a rerun through the same background path as Workflow [r].
     fn start_rerun(&mut self, id: &str, worktree: bool) -> Result<()> {
-        let (placement, holder) = self.placement(worktree)?;
-        let run = history::rerun_at(&self.project, &self.settings, id, placement)?;
-        self.message = format!(
-            "Rerunning {id} as {}{}…",
-            run.id,
-            holder.map_or_else(String::new, |h| format!(
-                " in a worktree ({h} is using the checkout)"
-            ))
-        );
-        self.adopt(run);
-        self.page = 1;
-        self.start_driver()
+        let (project, settings, source) =
+            (self.project.clone(), self.settings.clone(), id.to_owned());
+        self.start_run(
+            move |placement| history::rerun_at(&project, &settings, &source, placement),
+            worktree,
+            None,
+            Some(id.to_owned()),
+        )
     }
     fn clean_up(&mut self, plan: &Plan) -> Result<()> {
         let done = history::apply(plan);
@@ -396,8 +398,62 @@ impl App {
                 self.message.push_str(&format!(". {note}"));
             }
         }
-        self.refresh_runs()
+        self.load_runs();
+        Ok(())
     }
+}
+
+/// Lines of output a saved run's latest attempt left in stdout.log, formatted
+/// as the Monitor shows them live.
+fn saved_output(run: &Run) -> Vec<String> {
+    let Some((index, attempt)) = run
+        .stages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, state)| Some((index, state.attempts.last()?)))
+        .max_by_key(|(_, attempt)| attempt.started_at)
+    else {
+        return vec![];
+    };
+    let Ok(raw) = crate::process::read_tail(&attempt.directory.join("stdout.log"), 256 * 1024)
+    else {
+        return vec![];
+    };
+    let stage = &run.workflow.stages[index.min(run.workflow.stages.len().saturating_sub(1))];
+    let kind = if attempt.mode == crate::config::Mode::Interactive {
+        OutputKind::Text
+    } else {
+        match stage.harness.as_str() {
+            "codex" => OutputKind::Codex,
+            "claude" => OutputKind::Claude,
+            "pi" | "omp" => OutputKind::Pi,
+            "cursor" => OutputKind::Cursor,
+            "gemini" => OutputKind::Gemini,
+            "opencode" => OutputKind::OpenCode,
+            "amp" => OutputKind::Amp,
+            _ => OutputKind::Text,
+        }
+    };
+    // A tail can start mid-line; the first, partial line is dropped.
+    let raw = match raw.split_once('\n') {
+        Some((_, rest)) if raw.len() >= 256 * 1024 => rest.to_owned(),
+        _ => raw,
+    };
+    let mut formatter = crate::events::Formatter::new(kind);
+    let mut text = formatter.push(&raw).unwrap_or_default();
+    text.extend(formatter.finish());
+    let mut lines = vec![format!(
+        "── {} · attempt {} · saved output ──",
+        stage.name, attempt.number
+    )];
+    lines.extend(
+        storage::clean_terminal(&text)
+            .lines()
+            .map(|line| storage::truncate(line, 1500)),
+    );
+    let keep = lines.len().saturating_sub(super::app::LOG_LINES);
+    lines.drain(1..=keep.min(lines.len() - 1));
+    lines
 }
 
 impl Confirm {
@@ -689,9 +745,25 @@ mod tests {
     fn key(code: Key) -> KeyEvent {
         KeyEvent::new(code, Mods::NONE)
     }
+    /// Presses `keys`, letting background work (saved runs, starting runs)
+    /// land after each, as frames would.
     fn press(app: &mut App, keys: &str) {
         for c in keys.chars() {
             app.key(key(Key::Char(c))).unwrap();
+            settle(app);
+        }
+    }
+    fn settle(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            app.poll().unwrap();
+            let busy = app.runs_job.is_some()
+                || app.starting.is_some()
+                || (app.page == 2 && app.runs_stale);
+            if !busy || Instant::now() > deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -841,6 +913,7 @@ mod tests {
         press(&mut app, "3");
         assert!(shows(&mut app, "✗ damaged"));
         app.key(key(Key::Enter)).unwrap();
+        settle(&mut app);
         assert!(app.focused.run.is_none());
         assert_eq!(app.page, 2);
         match &app.modal {
@@ -875,6 +948,11 @@ mod tests {
         press(&mut app, "n");
         app.key(key(Key::Enter)).unwrap();
         assert!(app.modal.is_none());
+        assert!(
+            app.starting.is_some(),
+            "The run is created in the background"
+        );
+        settle(&mut app);
         assert!(app.focused.worker.is_some());
         assert_eq!(app.page, 1);
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -913,6 +991,7 @@ mod tests {
             _ => panic!("expected the stage picker"),
         }
         app.key(key(Key::Enter)).unwrap();
+        settle(&mut app);
         match &app.modal {
             Some(Modal::Text { title, body, .. }) => {
                 assert_eq!(title, "Compare · research");
@@ -954,12 +1033,34 @@ mod tests {
         app.focused.run = Some(engine::load(project.path(), &kept.id).unwrap());
         press(&mut app, "D");
         app.key(key(Key::Enter)).unwrap();
+        settle(&mut app);
         assert!(kept.directory.exists());
         assert!(
             app.message.contains("Open in the monitor"),
             "{}",
             app.message
         );
+    }
+
+    #[test]
+    fn opening_a_saved_run_shows_the_tail_of_its_output() {
+        let project = tempfile::tempdir().unwrap();
+        let settings = settings("test-model");
+        let mut run = create(project.path(), &settings, "Saved output");
+        assert_eq!(drive(&mut run), Action::Complete);
+        let attempt = &run.stages[0].attempts[0];
+        let mut log: String = (0..600).map(|n| format!("old line {n}\n")).collect();
+        log.push_str("\x1b[31mfinal line\x1b[0m\n");
+        fs::write(attempt.directory.join("stdout.log"), log).unwrap();
+        let mut app = app(project.path(), settings);
+        press(&mut app, "3");
+        app.key(key(Key::Enter)).unwrap();
+        let logs: Vec<_> = app.focused.logs.iter().cloned().collect();
+        assert_eq!(logs[0], "── research · attempt 1 · saved output ──");
+        assert_eq!(logs.last().unwrap(), "final line");
+        assert!(logs.len() <= crate::tui::app::LOG_LINES);
+        app.focused.show_output = true;
+        assert!(shows(&mut app, "final line"));
     }
 
     #[test]

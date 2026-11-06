@@ -13,7 +13,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 mod actions;
@@ -150,6 +150,7 @@ pub fn run(
         return Ok(());
     }
     let _ = storage::remember_project(&app.project);
+    let mut drawn = Instant::now();
     'run: loop {
         if app.signal.load(Ordering::Relaxed) {
             app.cancel_all();
@@ -158,8 +159,7 @@ pub fn run(
         if app.poll()? {
             break;
         }
-        if app.launch_interactive {
-            app.launch_interactive = false;
+        if app.take_launch() {
             let result = match app.interactive_terminal() {
                 Ok(session) => {
                     screen.restore();
@@ -171,7 +171,7 @@ pub fn run(
             };
             app.message = match result {
                 Ok(AttachOutcome::Detached) => {
-                    "Interactive session detached and still running. [t] reattaches; [c] stops it. /exit quits the harness.".into()
+                    "Interactive session detached and still running. [t] reattaches; [C] stops it. /exit quits the harness.".into()
                 }
                 Ok(AttachOutcome::Finished) => "Harness returned. Finishing stage…".into(),
                 Err(error) => {
@@ -180,10 +180,23 @@ pub fn run(
                 }
             };
             // Apply completion or shutdown before accepting another action.
+            app.redraw = true;
             continue;
         }
-        screen.terminal.draw(|frame| draw(frame, &mut app))?;
+        // Frames are drawn when something changed, and once a second for
+        // elapsed times; spinners animate faster.
+        let tick = if app.animating() {
+            Duration::from_millis(80)
+        } else {
+            Duration::from_secs(1)
+        };
+        if app.redraw || drawn.elapsed() >= tick {
+            screen.terminal.draw(|frame| draw(frame, &mut app))?;
+            app.redraw = false;
+            drawn = Instant::now();
+        }
         if event::poll(Duration::from_millis(70))? {
+            app.redraw = true;
             // Handle all queued input before drawing again, so slow frames do
             // not make typing lag one event per frame.
             for _ in 0..64 {
