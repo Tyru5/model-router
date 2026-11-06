@@ -51,6 +51,12 @@ pub struct Plan {
     pub network: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+    /// Read-only paths (a read-only stage's workspace and Git directories)
+    /// that lie inside a writable directory, such as a workspace under
+    /// `$TMPDIR`; they are made read-only again, with the attempt's own
+    /// writable paths inside them re-allowed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub protected: Vec<PathBuf>,
     /// Read-only paths re-exposed under the private `/tmp`.
     #[serde(skip)]
     readable: Vec<PathBuf>,
@@ -248,8 +254,19 @@ pub fn plan_with(
     tidy(&mut writable);
     tidy(&mut optional);
     optional.retain(|p| !writable.contains(p) && p != Path::new("/tmp"));
-    // Only paths hidden by the private /tmp need re-exposing.
     let all: Vec<PathBuf> = writable.iter().chain(&optional).cloned().collect();
+    // A read-only workspace inside a writable directory must not inherit it.
+    let mut protected: Vec<PathBuf> = if mode == Sandbox::ReadOnly {
+        readable
+            .iter()
+            .filter(|p| all.iter().any(|w| p.starts_with(w) && *p != w))
+            .cloned()
+            .collect()
+    } else {
+        vec![]
+    };
+    tidy(&mut protected);
+    // Only paths hidden by the private /tmp need re-exposing.
     readable
         .retain(|p| private_tmp && p.starts_with("/tmp") && !all.iter().any(|w| p.starts_with(w)));
     tidy(&mut readable);
@@ -262,6 +279,7 @@ pub fn plan_with(
         private_tmp,
         network: stage.sandbox_network,
         warning,
+        protected,
         readable,
     }))
 }
@@ -392,6 +410,12 @@ impl Plan {
             .readable
             .iter()
             .map(|p| (p, "--ro-bind"))
+            .chain(
+                self.protected
+                    .iter()
+                    .filter(|p| !self.readable.contains(p))
+                    .map(|p| (p, "--ro-bind")),
+            )
             .chain(self.writable.iter().map(|p| (p, "--bind")))
             .chain(self.writable_if_present.iter().map(|p| (p, "--bind-try")))
             .collect();
@@ -416,6 +440,32 @@ impl Plan {
             ));
         }
         text.push_str(")\n");
+        // Seatbelt's last matching rule wins: protect, then re-allow inside.
+        if !self.protected.is_empty() {
+            text.push_str("(deny file-write*");
+            for path in &self.protected {
+                text.push_str(&format!(
+                    "\n    (subpath {})",
+                    sbpl_string(&path.display().to_string())
+                ));
+            }
+            text.push_str(")\n");
+            let inside: Vec<&PathBuf> = self
+                .writable
+                .iter()
+                .filter(|w| self.protected.iter().any(|p| w.starts_with(p)))
+                .collect();
+            if !inside.is_empty() {
+                text.push_str("(allow file-write*");
+                for path in inside {
+                    text.push_str(&format!(
+                        "\n    (subpath {})",
+                        sbpl_string(&path.display().to_string())
+                    ));
+                }
+                text.push_str(")\n");
+            }
+        }
         if !self.network {
             text.push_str("(deny network*)\n");
         }
@@ -733,6 +783,61 @@ mod tests {
     }
 
     #[test]
+    fn read_only_workspace_inside_a_writable_directory_stays_read_only() {
+        let d = dirs();
+        // Like a workspace under $TMPDIR: its parent is writable.
+        let stage = Stage {
+            sandbox: Some(Sandbox::ReadOnly),
+            sandbox_writable: vec![d.root.display().to_string()],
+            ..Stage::default()
+        };
+        let detected = Ok((Backend::SandboxExec, PathBuf::from("/usr/bin/sandbox-exec")));
+        let plan = plan_for(&d, &stage, Sandbox::Off, detected)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.protected, vec![d.workspace.clone()]);
+        let profile = plan.profile();
+        let quoted = |p: &Path| format!("(subpath \"{}\")", p.display());
+        let deny = profile
+            .rfind(&format!("(deny file-write*\n    {}", quoted(&d.workspace)))
+            .expect(&profile);
+        let reallow = profile[deny..].find("(allow file-write*").expect(&profile) + deny;
+        assert!(
+            profile[reallow..].contains(&quoted(&d.attempt)),
+            "{profile}"
+        );
+        assert!(
+            profile[reallow..].contains(&quoted(&d.handoff)),
+            "{profile}"
+        );
+
+        let plan = plan_for(&d, &stage, Sandbox::Off, bwrap())
+            .unwrap()
+            .unwrap();
+        let args = plan.bwrap_args();
+        let at = |flag: &str, path: &Path| {
+            let path = path.display().to_string();
+            args.windows(3)
+                .position(|w| w[0] == flag && w[1] == path && w[2] == path)
+                .unwrap_or_else(|| panic!("{flag} {path} missing: {args:?}"))
+        };
+        let root = at("--bind", &d.root);
+        let workspace = at("--ro-bind", &d.workspace);
+        let attempt = at("--bind", &d.attempt);
+        assert!(root < workspace && workspace < attempt, "{args:?}");
+
+        // Workspace-write has nothing to protect.
+        let stage = Stage {
+            sandbox: Some(Sandbox::WorkspaceWrite),
+            ..stage
+        };
+        let plan = plan_for(&d, &stage, Sandbox::Off, bwrap())
+            .unwrap()
+            .unwrap();
+        assert!(plan.protected.is_empty());
+    }
+
+    #[test]
     fn seatbelt_profile_denies_writes_outside_quoted_subpaths() {
         let d = dirs();
         let stage = Stage {
@@ -759,7 +864,10 @@ mod tests {
         );
         assert!(profile.contains("(subpath \"/private/tmp\")"));
         assert!(profile.contains("(deny network*)"));
-        assert!(!profile.contains(&format!("(subpath \"{}\")", d.workspace.display())));
+        // The workspace is never in the allowed set (on macOS a temporary
+        // workspace may appear later, as a protected path).
+        let allowed = &profile[..profile.find("))\n").unwrap()];
+        assert!(!allowed.contains(&format!("(subpath \"{}\")", d.workspace.display())));
         let (program, argv) = plan.wrap("claude", &["-p".into()]);
         assert_eq!(program, "/usr/bin/sandbox-exec");
         assert_eq!(argv[0], "-p");
