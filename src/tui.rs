@@ -19,6 +19,7 @@ use std::{
 mod actions;
 mod app;
 mod completion;
+mod frame_marker;
 mod harness_editor;
 mod harnesses;
 mod history;
@@ -183,6 +184,7 @@ pub fn run(
             continue;
         }
         screen.terminal.draw(|frame| draw(frame, &mut app))?;
+        frame_marker::frame_drawn();
         if event::poll(Duration::from_millis(70))? {
             // Handle all queued input before drawing again, so slow frames do
             // not make typing lag one event per frame.
