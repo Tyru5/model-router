@@ -28,6 +28,14 @@ workflow or changes a saved run; reviews start disabled in workflow presets.
   changed files, tests, and unresolved issues. Retain complete attempt logs on disk.
 - Use a small structured handoff in subsequent prompts, with artifact paths for
   details. Never treat a missing review verdict as a passing review.
+- The handoff contract is versioned (`schema_version`, absent = 1; current 2,
+  published as `schema/handoff.schema.json`). Version 2 adds optional
+  `artifacts`, `confidence`, and `next_steps`; older handoffs and saved runs
+  stay readable. Read the handoff from the harness's native structured output
+  where supported and version-gated, then the handoff file, then the final
+  response's last marker block, fenced JSON, or bare JSON. Never accept the
+  prompt's example as an answer. Record the channel on the attempt and show it
+  in reports.
 - Verification (`test`) stages require structured handoffs and evidence: at
   least one passing required check, reported by the model or run by the router.
   Required failed or unrun checks, blocking findings, and missing evidence stop

@@ -4,7 +4,7 @@ use crate::{
     checks::{self, CheckResult},
     config::{CustomAdapter, Mode, Role, Settings, Workflow},
     events,
-    handoff::{self, Handoff, ProtocolError, TestStatus, Verdict},
+    handoff::{self, Handoff, HandoffSource, ProtocolError, TestStatus, Verdict},
     process, snapshot, storage,
     transitions::{self, Actor, Level, Target},
 };
@@ -128,20 +128,6 @@ impl Transition {
     }
 }
 
-/// Where a stage's handoff came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HandoffSource {
-    /// The handoff file the prompt asked the harness to write.
-    File,
-    /// The harness's own final-message file.
-    Final,
-    /// The final assistant message in the harness's output stream.
-    Stream,
-    /// An interactive stage wrote none; the router's placeholder stands in.
-    Placeholder,
-}
-
 /// A recovery or checkpoint command, applied by `command` under the run lock.
 #[derive(Debug, Clone)]
 pub enum Cmd {
@@ -193,7 +179,8 @@ pub struct Attempt {
     /// so the next `drive` can stop the orphaned group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_group: Option<u32>,
-    /// Where the attempt's handoff came from; None when it produced none.
+    /// Where the accepted handoff came from; None before it was read and in
+    /// runs saved before this was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_source: Option<HandoffSource>,
 }
@@ -1029,7 +1016,7 @@ pub fn history(project: &Path) -> Result<Vec<Run>> {
         .collect())
 }
 
-pub fn prompt(run: &Run, handoff_path: &Path) -> String {
+pub fn prompt(run: &Run, handoff_path: &Path, schema_path: &Path) -> String {
     let stage = &run.workflow.stages[run.cursor];
     let mut text = format!(
         "You are completing stage {:?} (role: {}) in a multi-stage workflow.\n\nORIGINAL USER TASK\n{}\n\nSTAGE INSTRUCTIONS\n{}\n\nWORKING DIRECTORY\n{}\n\nFollow the project's own instructions. Do not commit, merge, or push unless the original task explicitly requests it. Do not change router configuration, run state, or other stages' artifacts.\n",
@@ -1088,7 +1075,7 @@ pub fn prompt(run: &Run, handoff_path: &Path) -> String {
             ));
         }
     }
-    text.push_str(&format!("\nHANDOFF CONTRACT\nFinish with the JSON below between the exact markers. Replace example values with evidence. Also write the JSON object (without markers) to {} if your tools permit it. This file is router bookkeeping; research/review may write this file while leaving project code untouched. In interactive mode, complete this handoff before exiting.\n{}", handoff_path.display(), handoff::FORMAT));
+    text.push_str(&handoff::contract(stage.role, handoff_path, schema_path));
     text
 }
 
@@ -1113,6 +1100,8 @@ fn handoff_excerpt(handoff: &Handoff, max: usize, full: &Path) -> String {
         }
     }
     for field in [
+        "next_steps",
+        "artifacts",
         "files_changed",
         "decisions",
         "tests",
@@ -1187,13 +1176,16 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
         handoff_file.display()
     );
     let prompt_file = directory.join("prompt.md");
+    // The prompt names this copy of the handoff schema.
+    let schema_file = directory.join(handoff::SCHEMA_FILE);
+    storage::atomic_write(&schema_file, handoff::SCHEMA.as_bytes())?;
     let text = match &resume {
         Some(resume) => format!(
             "Interactive takeover of harness session {}. The session's own history holds the stage prompt. Write a new handoff for this attempt to {}; the previous attempt's file there was moved aside and is not read.\n",
             resume.session,
             handoff_file.display()
         ),
-        None => prompt(run, &handoff_file),
+        None => prompt(run, &handoff_file, &schema_file),
     };
     storage::atomic_write(&prompt_file, text.as_bytes())?;
     let paths = ContextPaths {
@@ -1384,7 +1376,7 @@ fn classify_exit(
 
 /// A successful attempt's handoff, or why the stage stops without one.
 enum Resolved {
-    Handoff(HandoffSource, Handoff),
+    Handoff(HandoffSource, Box<Handoff>),
     Stopped(Status, String),
 }
 
@@ -1412,36 +1404,40 @@ fn resolve_handoff(
             ));
         }
         let handoff = Handoff {
-            summary: format!(
+            unresolved: vec!["No model-authored handoff was produced".into()],
+            ..Handoff::unstructured(format!(
                 "Interactive stage exited without a structured handoff. Inspect the terminal transcript at {}. Reopen to produce a handoff, or supply a summary before advancing.",
                 prepared.directory.join("stdout.log").display()
-            ),
-            verdict: Verdict::Complete,
-            findings: vec![],
-            decisions: vec![],
-            files_changed: vec![],
-            tests: vec![],
-            unresolved: vec!["No model-authored handoff was produced".into()],
-            not_applicable: None,
-            structured: false,
+            ))
         };
-        return Ok(Resolved::Handoff(HandoffSource::Placeholder, handoff));
+        return Ok(Resolved::Handoff(
+            HandoffSource::Placeholder,
+            Box::new(handoff),
+        ));
     }
-    let (source, text) = if prepared.handoff_file.is_file() {
-        (
-            HandoffSource::File,
-            process::read_tail(&prepared.handoff_file, 1024 * 1024)?,
-        )
-    } else if prepared.invocation.final_file.is_file() {
-        (
-            HandoffSource::Final,
-            process::read_tail(&prepared.invocation.final_file, 1024 * 1024)?,
-        )
-    } else {
-        (HandoffSource::Stream, normalized.text)
+    let read = |path: &Path| -> Result<Option<String>> {
+        if path.is_file() {
+            Ok(Some(process::read_tail(path, 1024 * 1024)?))
+        } else {
+            Ok(None)
+        }
     };
-    Ok(match handoff::parse(&text, role) {
-        Ok(handoff) => Resolved::Handoff(source, handoff),
+    let file = read(&prepared.handoff_file)?;
+    let text = match read(&prepared.invocation.final_file)? {
+        Some(text) => text,
+        None => normalized.text.clone(),
+    };
+    let native = adapters::uses_output_schema(&prepared.invocation)
+        .then(|| handoff::native_output(&normalized, prepared.invocation.kind, &text))
+        .flatten();
+    // An interactive transcript echoes the prompt; only its file counts.
+    let sources = handoff::Sources {
+        native: native.as_deref(),
+        file: file.as_deref(),
+        text: (mode == Mode::Unattended).then_some(text.as_str()),
+    };
+    Ok(match handoff::resolve(sources, role) {
+        Ok((handoff, source)) => Resolved::Handoff(source, Box::new(handoff)),
         Err(error) => Resolved::Stopped(Status::Blocked, format!("{error:#}")),
     })
 }
@@ -1460,11 +1456,14 @@ fn finish(
         Exit::Stopped(status, message) => return run.stop(status, message, Actor::Engine, true),
     };
     let (source, handoff) = match resolve_handoff(run, prepared, normalized)? {
-        Resolved::Handoff(source, handoff) => (source, handoff),
+        Resolved::Handoff(source, handoff) => (source, *handoff),
         Resolved::Stopped(status, message) => {
             return run.stop(status, message, Actor::Engine, true);
         }
     };
+    if let Some(attempt) = run.stages[index].attempts.last_mut() {
+        attempt.handoff_source = Some(source);
+    }
     storage::write_json(&prepared.directory.join("handoff.json"), &handoff)?;
     if run.workflow.stages[index].role == Role::Summary && source != HandoffSource::Placeholder {
         // The brief is for a person: keep it readable outside the router.
@@ -1476,9 +1475,6 @@ fn finish(
     // A reported block stops the stage regardless of check results.
     let blocked = handoff.verdict == Verdict::Blocked;
     run.stages[index].handoff = Some(handoff);
-    if let Some(attempt) = run.stages[index].attempts.last_mut() {
-        attempt.handoff_source = Some(source);
-    }
     if !blocked && !run_checks(run, prepared, cancel, emit)? {
         return Ok(());
     }

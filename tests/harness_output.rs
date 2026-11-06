@@ -1,7 +1,7 @@
 use model_router::{
     adapters::{self, ContextPaths, OutputKind},
     config::{BUILTINS, CustomAdapter, Mode, Role, Settings, Stage},
-    handoff::{self, Verdict},
+    handoff::{self, HandoffSource, Verdict},
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -41,6 +41,9 @@ struct Fixture {
     #[serde(default)]
     permission_blocked: bool,
     handoff_summary: Option<String>,
+    /// Launched with the native output schema: the handoff must come from it.
+    #[serde(default)]
+    native: bool,
     role: Option<Role>,
     verdict: Option<Verdict>,
 }
@@ -72,8 +75,22 @@ fn check(root: &Path, f: &Fixture) {
         assert!(!out.text.contains(text.as_str()), "{name}: has {text:?}");
     }
     if let Some(summary) = &f.handoff_summary {
-        let parsed = handoff::parse(&out.text, f.role.unwrap_or(Role::Implementation))
+        let native = f
+            .native
+            .then(|| handoff::native_output(&out, f.kind, &out.text))
+            .flatten();
+        let sources = handoff::Sources {
+            native: native.as_deref(),
+            file: None,
+            text: Some(&out.text),
+        };
+        let (parsed, source) = handoff::resolve(sources, f.role.unwrap_or(Role::Implementation))
             .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        assert_eq!(
+            f.native,
+            source == HandoffSource::Native,
+            "{name}: {source:?}"
+        );
         assert!(parsed.structured, "{name}");
         assert_eq!(&parsed.summary, summary, "{name}");
         if let Some(verdict) = f.verdict {
@@ -274,7 +291,7 @@ fn doctor_reports_versions_and_flags_from_help_without_running_a_model() {
             ("--version", "codex-cli 0.160.0"),
             (
                 "exec --help",
-                "Usage: codex exec [OPTIONS] [PROMPT]\n  -m, --model <MODEL>\n      --json\n      --color <COLOR>\n  -o, --output-last-message <FILE>\n  -c, --config <key=value>\n      --oss\n      --local-provider <P>\n  -s, --sandbox <MODE>",
+                "Usage: codex exec [OPTIONS] [PROMPT]\n  -m, --model <MODEL>\n      --json\n      --color <COLOR>\n  -o, --output-last-message <FILE>\n      --output-schema <FILE>\n  -c, --config <key=value>\n      --oss\n      --local-provider <P>\n  -s, --sandbox <MODE>",
             ),
             (
                 "--help",
@@ -294,7 +311,7 @@ fn doctor_reports_versions_and_flags_from_help_without_running_a_model() {
             ("--version", "2.1.289 (Claude Code)"),
             (
                 "--help",
-                "  -p, --print       Print response and exit\n  --output-format <format>  Output format\n  --verbose  Verbose\n  --session-id <uuid>  Session\n  -r, --resume [value]  Resume\n  --model <model>   Model\n  --effort <level>  Effort\n  --permission-mode <mode>  Mode",
+                "  -p, --print       Print response and exit\n  --output-format <format>  Output format\n  --verbose  Verbose\n  --json-schema <schema>  Schema\n  --session-id <uuid>  Session\n  -r, --resume [value]  Resume\n  --model <model>   Model\n  --effort <level>  Effort\n  --permission-mode <mode>  Mode",
             ),
         ],
     );

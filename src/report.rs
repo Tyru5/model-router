@@ -3,7 +3,7 @@
 use crate::{
     config::Role,
     engine::{Attempt, Run, Status},
-    handoff::{Severity, TestStatus, Usage},
+    handoff::{HandoffSource, Severity, TestStatus, Usage},
     snapshot::{self, FileChange},
     transitions::{Level, Record},
 };
@@ -52,6 +52,8 @@ pub struct StageReport {
     pub checks: Vec<CheckLine>,
     /// Accepted not-applicable reason.
     pub waiver: Option<String>,
+    /// Where the latest attempt's handoff came from; None when unrecorded.
+    pub handoff_source: Option<HandoffSource>,
 }
 
 /// Sums of what attempts reported. A field stays None when no attempt
@@ -246,6 +248,7 @@ pub fn build(run: &Run) -> RunReport {
             usage: total(&state.attempts),
             checks,
             waiver: state.waiver.as_ref().map(|w| w.reason.clone()),
+            handoff_source: last.and_then(|a| a.handoff_source),
         });
     }
     // Stable, so each kind keeps stage order.
@@ -621,6 +624,9 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
                 },
                 usage_text(&stage.usage)
             );
+            if let Some(source) = stage.handoff_source {
+                let _ = write!(text, " · handoff: {}", source.label());
+            }
         }
         text.push('\n');
     }

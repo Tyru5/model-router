@@ -6,8 +6,8 @@ model entitlement database.
 
 | Adapter | Reference | Integration detail |
 | --- | --- | --- |
-| Codex | Installed `codex exec --help` and model-cache metadata | `--model`, `--config model_reasoning_effort`, JSON events, `--output-last-message`; interactive prompt is positional. Takeover runs `codex resume THREAD_ID`. |
-| Claude Code | Installed `claude --help`; [model configuration](https://code.claude.com/docs/en/model-config) | `--print --output-format stream-json --verbose`, stdin prompt, `--model`, `--effort`, `--session-id` (unattended and interactive) for takeover with `--resume`; explicit permission denials are handled. |
+| Codex | Installed `codex exec --help` and model-cache metadata | `--model`, `--config model_reasoning_effort`, JSON events, `--output-last-message`, `--output-schema` (handoff schema, 0.41.0+); interactive prompt is positional. Takeover runs `codex resume THREAD_ID`. |
+| Claude Code | Installed `claude --help`; [model configuration](https://code.claude.com/docs/en/model-config) | `--print --output-format stream-json --verbose`, `--json-schema` (handoff schema, 2.1.22+), stdin prompt, `--model`, `--effort`, `--session-id` (unattended and interactive) for takeover with `--resume`; explicit permission denials are handled. |
 | Pi | Installed `pi --help`; [CLI source/documentation](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) | `--print --mode json`, `@prompt-file`, `--provider`, `--model`, `--thinking`. Provider catalogs include extension-defined models. A provider defined only in the router's `[providers]` is rejected before launch. Takeover: router-chosen `--session-id`. |
 | omp (oh-my-pi) | Installed `omp --help` and `omp models --json` | `--print --mode json` (Pi's event format), `@prompt-file`, `--model provider/model`, `--thinking`, `--approval-mode`. Catalog from `omp models --json`, with per-model thinking levels. Takeover: `omp --resume ID` from its `session` event. |
 | Cursor Agent | Installed `cursor-agent --help` (2026.10.22); [CLI documentation](https://cursor.com/docs/cli/overview) | Print-mode stream JSON and account model listing. Uses `cursor-agent`; `agent` only when it links into Cursor's `cursor-agent` directory or its `--help` names the Cursor Agent, since other tools use that name. Unattended uses `--output-format stream-json`, whose retries emit `{type: retry}` events; takeover `--resume ID`. |
@@ -45,6 +45,28 @@ the partial first line is dropped and the note says it was truncated. Harnesses
 that can use a router provider (Codex, OpenCode, Aider, Goose, custom) also
 list each configured provider's `/models`, keeping context length and prices
 (`providers::ModelInfo`).
+
+## Native structured output
+
+The handoff's primary channel, where the harness has one; the prompt's
+`<router-handoff>` contract is the fallback everywhere.
+
+| Harness | Flag | Router behaviour |
+| --- | --- | --- |
+| Codex | `codex exec --output-schema FILE` (since 0.41.0, [openai/codex#4079](https://github.com/openai/codex/pull/4079); checked with 0.167.0 on 2026-11-05) | Writes `handoff::strict_schema()` to `output-schema.json` in the attempt directory at launch. Codex structured output is strict: every property is required, so optional scalars are nullable and lists may be empty. The final message (`--output-last-message`) is the handoff. |
+| Claude Code | `--print --json-schema JSON` (inline JSON only; a path is rejected; print-mode fix in 2.1.22; checked with 2.1.318) | Passes the published schema without annotations. The stream's `result` event carries `structured_output`, read as the handoff; `result` holds the same JSON as text. |
+| Gemini CLI, Cursor, OpenCode, Pi, omp, Amp | None in installed help (2026-11-05) or the Gemini [headless](https://geminicli.com/docs/cli/headless/) and [CLI](https://geminicli.com/docs/cli/cli-reference/) references | Marker fallback. |
+| Aider, Goose, Copilot, custom | Not documented | Marker fallback. |
+
+The flag is added only to unattended launches whose detected version
+(`--version`, or `MODEL_ROUTER_HARNESS_VERSIONS=codex=0.40.0,claude=2.1.21`)
+is at least the version above; unknown versions count as current. A user's own
+`--output-schema` or `--json-schema` in Extra arguments is kept and the
+router's is skipped. `doctor` checks the flag in help like any other. When a
+native response is missing or invalid, the router falls back to the handoff
+file and then the response text; the attempt records which channel it used
+(`handoff_source`: `native`, `file`, `marker`, `fence`, `json`, or
+`unstructured`).
 
 ## Provider routing references
 
@@ -131,11 +153,12 @@ source, and sanitization notes. The format must match what the adapter passes
 Cursor `json`); each required scenario needs a fixture in the adapter's
 format. `captured` fixtures are sanitized real output.
 `schema-derived` fixtures are built from event shapes in installed sources,
-schemas, or official documentation. All current fixtures are schema-derived:
-no router run output existed on disk, and none were produced by a model
-request. `tests/harness_output.rs` runs `handoff::normalize`, and
+schemas, or official documentation. All fixtures but
+`codex/structured-output.jsonl` (one Codex request with the strict handoff
+schema, 2026-11-05) are schema-derived. `tests/harness_output.rs` runs `handoff::normalize`, and
 `handoff::parse` for handoffs, on each fixture and checks the declared text,
-errors, and permission denials. Scenarios cover success, reported errors,
+errors, and permission denials; `native = true` fixtures were launched with the
+output schema and must yield a handoff from it. Scenarios cover success, reported errors,
 retries (Codex, Pi, Claude `api_retry`, Cursor `retry`, OpenCode, and an
 assumed Amp shape), permission denials (Claude), and tool output or echoed
 prompts that contain fake handoffs. An error event followed by a successful

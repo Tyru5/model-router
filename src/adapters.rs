@@ -1,6 +1,6 @@
 use crate::config::{CustomAdapter, Mode, Stage};
-use crate::harness_settings;
 use crate::providers::{self, Provider};
+use crate::{handoff, harness_settings};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -286,6 +286,51 @@ pub fn major_version(line: &str) -> Option<u64> {
         .and_then(|token| token.split('.').next()?.parse().ok())
 }
 
+/// The `[major, minor, patch]` version in a `--version` line, e.g.
+/// `[0, 41, 0]` in `codex-cli 0.41.0`; missing parts are 0.
+pub fn version_numbers(line: &str) -> Option<[u64; 3]> {
+    let token = line
+        .split(|c: char| c.is_whitespace() || matches!(c, '/' | '(' | ')' | ','))
+        .map(|token| token.strip_prefix('v').unwrap_or(token))
+        .find(|token| token.starts_with(|c: char| c.is_ascii_digit()))?;
+    let mut numbers = [0; 3];
+    for (slot, part) in numbers.iter_mut().zip(token.split('.')) {
+        let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+        *slot = digits.parse().ok()?;
+    }
+    Some(numbers)
+}
+
+/// The first harness versions whose unattended mode takes a native output
+/// schema: `codex exec --output-schema FILE` (0.41.0, openai/codex#4079) and
+/// Claude Code `--print --json-schema JSON` (fixed for print mode in 2.1.22).
+const OUTPUT_SCHEMA_SINCE: [(&str, [u64; 3]); 2] = [("codex", [0, 41, 0]), ("claude", [2, 1, 22])];
+
+/// Whether `version` (a `--version` line) takes the harness's native output
+/// schema flag. Unknown versions count as current.
+pub fn output_schema_supported(harness: &str, version: Option<&str>) -> bool {
+    let Some((_, since)) = OUTPUT_SCHEMA_SINCE
+        .iter()
+        .find(|(name, _)| *name == harness)
+    else {
+        return false;
+    };
+    version
+        .and_then(version_numbers)
+        .is_none_or(|found| found >= *since)
+}
+
+/// The Codex attempt file holding the strict handoff schema.
+pub const OUTPUT_SCHEMA_FILE: &str = "output-schema.json";
+
+/// Whether the invocation asks its harness for schema-constrained output.
+pub fn uses_output_schema(invocation: &Invocation) -> bool {
+    invocation
+        .args
+        .iter()
+        .any(|a| matches!(a.as_str(), "--output-schema" | "--json-schema"))
+}
+
 /// Whether the harness is older than `major`. Unknown versions count as
 /// current, so the newest flags are the default.
 fn older_than(harness: &str, program: &str, major: u64) -> bool {
@@ -482,6 +527,22 @@ pub fn build(
     } else {
         format!("{}/{}", stage.provider, stage.model)
     };
+    // Native structured output, unless the user passed their own schema or
+    // the detected harness predates the flag.
+    let schema_flag = match stage.harness.as_str() {
+        "codex" => "--output-schema",
+        "claude" => "--json-schema",
+        _ => "",
+    };
+    let native_schema = !interactive
+        && !schema_flag.is_empty()
+        && !extra_args
+            .iter()
+            .any(|a| a == schema_flag || a.starts_with(&format!("{schema_flag}=")))
+        && output_schema_supported(
+            &stage.harness,
+            harness_version(&stage.harness, &invocation.program).as_deref(),
+        );
     match stage.harness.as_str() {
         "codex" => {
             invocation.kind = OutputKind::Codex;
@@ -498,6 +559,15 @@ pub fn build(
                         .to_str()
                         .context("Output path must be UTF-8")?,
                 ]);
+            }
+            if native_schema {
+                // Codex structured output is strict; the file is written at launch.
+                let schema = paths.attempt_dir.join(OUTPUT_SCHEMA_FILE);
+                append(&[
+                    "--output-schema",
+                    schema.to_str().context("Schema path must be UTF-8")?,
+                ]);
+                invocation.files.push((schema, handoff::strict_schema()));
             }
             if !stage.model.is_empty() {
                 append(&["--model", &stage.model]);
@@ -557,6 +627,10 @@ pub fn build(
                 // Stream events so the monitor shows progress; print mode
                 // requires --verbose for stream-json.
                 append(&["--print", "--output-format", "stream-json", "--verbose"]);
+            }
+            if native_schema {
+                // Claude Code takes the schema inline, not as a path.
+                append(&["--json-schema", &handoff::compact_schema()]);
             }
             if !stage.model.is_empty() {
                 append(&["--model", &stage.model]);
@@ -1083,6 +1157,8 @@ mod tests {
                 "--output-format",
                 "stream-json",
                 "--verbose",
+                "--json-schema",
+                &handoff::compact_schema(),
                 "--model",
                 "m",
                 "--effort",
