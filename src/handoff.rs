@@ -371,17 +371,73 @@ impl std::ops::Add for Usage {
 
 /// Usage from unattended harness output; None when it reports none.
 pub fn usage(raw: &str, kind: OutputKind) -> Option<Usage> {
-    let mut found: Option<Usage> = None;
-    for event in json_values(raw) {
-        let Some(part) = event_usage(&event, kind) else {
-            continue;
-        };
-        found = Some(match found {
-            Some(sum) if summed(kind) => sum + part,
-            _ => part,
-        });
+    json_values(raw).fold(None, |found, event| add_usage(found, &event, kind))
+}
+
+fn add_usage(found: Option<Usage>, event: &Value, kind: OutputKind) -> Option<Usage> {
+    let Some(part) = event_usage(event, kind) else {
+        return found;
+    };
+    Some(match found {
+        Some(sum) if summed(kind) => sum + part,
+        _ => part,
+    })
+}
+
+/// Largest single JSON document (Gemini's output) read whole for usage.
+const DOCUMENT_LIMIT: u64 = 16 << 20;
+
+/// Usage from an unattended harness's stdout.log, read one line at a time
+/// so a long log is never held in memory. Gemini prints one JSON document,
+/// read whole up to `DOCUMENT_LIMIT`; a log with no JSON lines is read the
+/// same way, in case it is one pretty-printed document.
+pub fn usage_file(path: &std::path::Path, kind: OutputKind) -> Option<Usage> {
+    use std::io::{BufRead, Read};
+    let document = |path: &std::path::Path| {
+        let mut raw = String::new();
+        let file = std::fs::File::open(path).ok()?;
+        if file.metadata().ok()?.len() > DOCUMENT_LIMIT {
+            return None;
+        }
+        file.take(DOCUMENT_LIMIT)
+            .read_to_string(&mut raw)
+            .ok()
+            .and_then(|_| usage(&raw, kind))
+    };
+    if kind == OutputKind::Gemini {
+        return document(path);
     }
-    found
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    let mut line = Vec::new();
+    let (mut found, mut any) = (None, false);
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let text = String::from_utf8_lossy(&line);
+        for event in line_values(&text) {
+            any = true;
+            found = add_usage(found, &event, kind);
+        }
+    }
+    if any { found } else { document(path) }
+}
+
+/// The JSON value on one line of output, after any non-JSON prefix; arrays
+/// are flattened.
+fn line_values(line: &str) -> Vec<Value> {
+    let line = line.trim();
+    let value = serde_json::from_str::<Value>(line).ok().or_else(|| {
+        let start = line.find('{').filter(|start| *start > 0)?;
+        serde_json::from_str(&line[start..]).ok()
+    });
+    match value {
+        Some(Value::Array(items)) => items,
+        Some(value) if value.is_object() => vec![value],
+        _ => vec![],
+    }
 }
 
 /// Whether a harness reports usage per turn or step, rather than once for
@@ -397,9 +453,12 @@ fn summed(kind: OutputKind) -> bool {
 /// Arrays, such as Claude's verbose JSON, are flattened.
 fn json_values(raw: &str) -> impl Iterator<Item = Value> + '_ {
     let text = raw.trim();
-    let document = serde_json::from_str::<Value>(text)
-        .ok()
-        .or_else(|| serde_json::from_str(text.get(text.find('{')?..)?).ok());
+    // Parse from the first brace only when text precedes it; otherwise the
+    // second attempt would repeat the first.
+    let document = serde_json::from_str::<Value>(text).ok().or_else(|| {
+        let start = text.find('{').filter(|start| *start > 0)?;
+        serde_json::from_str(&text[start..]).ok()
+    });
     let lines = document.is_none().then(|| {
         text.lines()
             .filter_map(|line| serde_json::from_str::<Value>(line.get(line.find('{')?..)?).ok())
@@ -615,6 +674,37 @@ mod usage_tests {
         assert_eq!(
             usage(raw, OutputKind::Gemini),
             Some(tokens(500, 110, Some(600), None))
+        );
+    }
+
+    #[test]
+    fn usage_file_streams_lines_and_reads_documents_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout.log");
+        let turn = r#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}"#;
+        // A partial first line and noise between events.
+        std::fs::write(&path, format!("warning\n{turn}\nprefix {turn}\n{{\"type\"")).unwrap();
+        assert_eq!(
+            usage_file(&path, OutputKind::Codex),
+            Some(tokens(20, 10, None, None))
+        );
+        // Claude's verbose JSON array on one line.
+        let result = r#"{"type":"result","usage":{"input_tokens":1,"output_tokens":2}}"#;
+        std::fs::write(&path, format!(r#"[{{"type":"system"}},{result}]"#)).unwrap();
+        assert_eq!(
+            usage_file(&path, OutputKind::Claude),
+            Some(tokens(1, 2, None, None))
+        );
+        // Gemini pretty-prints one document across lines.
+        let gemini = "{\n  \"stats\": {\n    \"models\": {\"m\": {\"tokens\": {\"prompt\": 7, \"candidates\": 3}}}\n  }\n}\n";
+        std::fs::write(&path, gemini).unwrap();
+        assert_eq!(
+            usage_file(&path, OutputKind::Gemini),
+            Some(tokens(7, 3, None, None))
+        );
+        assert_eq!(
+            usage_file(&dir.path().join("missing"), OutputKind::Codex),
+            None
         );
     }
 

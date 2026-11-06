@@ -470,8 +470,7 @@ impl App {
             .map(|run| format!("run {}", run.id))
             .or_else(|| {
                 let lock = storage::metadata_dir(&project).ok()?.join("workspace.lock");
-                (lock.is_file() && storage::lock(&lock).is_err())
-                    .then(|| "another router process".to_owned())
+                storage::is_locked(&lock).then(|| "another router process".to_owned())
             });
         let Some(holder) = holder else {
             return Ok((Placement::Project, None));
