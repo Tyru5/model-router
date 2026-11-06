@@ -5,6 +5,11 @@ edition = "2024"
 rust-version = "1.85"
 description = "A terminal workflow router for agentic harnesses and models"
 license = "MIT"
+repository = "https://github.com/Tyru5/model-router"
+homepage = "https://github.com/Tyru5/model-router"
+readme = "README.md"
+keywords = ["cli", "tui", "ai", "agents", "workflow"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"
@@ -37,6 +42,11 @@ base64 = "0.22"
 [profile.release]
 lto = "thin"
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
 
 [[bin]]
 name = "model-router"

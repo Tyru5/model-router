@@ -22,6 +22,21 @@ project's design; select another ID or leave it blank if your account differs.
 
 ## Start
 
+### Install
+
+Each [release](https://github.com/Tyru5/model-router/releases) has prebuilt
+binaries for Linux (x86_64/aarch64, static) and macOS (x86_64/arm64), with
+checksums. The installer puts `model-router` and its `mr` alias in `~/.cargo/bin`:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Tyru5/model-router/releases/latest/download/model-router-installer.sh | sh
+```
+
+With Homebrew, once the tap is published: `brew install Tyru5/tap/model-router`.
+Pushing a `vX.Y.Z` tag builds a release; its notes come from `CHANGELOG.md`.
+
+### Build from source
+
 Requires Rust 1.85+ to build. Install and authenticate the harnesses you want to
 use separately. The router reuses their credentials and provider configuration.
 
