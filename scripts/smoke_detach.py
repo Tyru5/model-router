@@ -21,7 +21,7 @@ import time
 
 import pyte
 
-from smoke_shutdown import BINARY, Terminal as ShutdownTerminal, alive
+from smoke_shutdown import BINARY, Terminal as ShutdownTerminal, alive, trust
 
 
 class Terminal(ShutdownTerminal):
@@ -185,6 +185,7 @@ role = "research"
 harness = "mock"
 mode = "interactive"
 """)
+    trust(project)
 
 
 def state(project):

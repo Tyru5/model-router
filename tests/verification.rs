@@ -2,7 +2,7 @@ mod common;
 
 use common::{count, drive, fixture, stage};
 use model_router::{
-    config::{Check, Role, Settings, Stage},
+    config::{Check, Role, Stage},
     engine::{self, Action, Event, Status},
     handoff::TestStatus,
 };
@@ -406,7 +406,8 @@ fn records_and_configs_without_new_fields_still_load() {
         assert!(state["handoff"].get("not_applicable").is_none());
         assert!(state["attempts"][0].get("checks").is_none());
     }
-    let settings: Settings = toml::from_str(OLD_CONFIG).unwrap();
+    // v1 configs migrate on load.
+    let settings = model_router::config::parse(OLD_CONFIG).unwrap();
     settings.validate().unwrap();
     assert!(settings.workflows[0].stages[0].checks.is_empty());
     let saved: toml::Value = toml::from_str(&toml::to_string_pretty(&settings).unwrap()).unwrap();

@@ -112,7 +112,11 @@ pub fn capture(
             Stdio::null()
         })
         .process_group(0);
+    for name in inv.removed() {
+        command.env_remove(name);
+    }
     command.envs(inv.environment()?);
+    inv.write_files()?;
     let mut child = ChildGuard(
         command
             .spawn()
@@ -997,9 +1001,13 @@ pub fn interactive(
     })?;
     let mut cmd = CommandBuilder::new(&inv.program);
     cmd.args(&inv.args);
+    for name in inv.removed() {
+        cmd.env_remove(name);
+    }
     for (name, value) in inv.environment()? {
         cmd.env(name, value);
     }
+    inv.write_files()?;
     cmd.cwd(cwd);
     let mut transcript = File::create(dir.join("stdout.log"))?;
     File::create(dir.join("stderr.log"))?;

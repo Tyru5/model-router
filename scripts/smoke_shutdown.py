@@ -171,6 +171,17 @@ role = "research"
 harness = "mock"
 mode = "{"interactive" if interactive else "unattended"}"
 """)
+    trust(project)
+
+
+def trust(project):
+    """Trust the project's custom adapter, as its user would once."""
+    subprocess.run(
+        [str(BINARY), "-C", str(project), "trust", "--yes"],
+        env=dict(os.environ, XDG_CONFIG_HOME=str(project / "config-home")),
+        check=True,
+        capture_output=True,
+    )
 
 
 def check_hangup(

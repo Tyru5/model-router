@@ -305,7 +305,12 @@ fn adapter_contracts_keep_prompt_and_models_literal() {
                 &paths,
             )
             .unwrap();
-            assert!(invocation.args.iter().any(|a| a == &stage.model));
+            // Interactive OpenCode 2.x takes its model from inline config.
+            let in_config = invocation.env.iter().any(|(_, value)| {
+                matches!(value, adapters::EnvValue::JsonInsert { value, .. }
+                    if serde_json::from_str::<String>(value).is_ok_and(|m| m == stage.model))
+            });
+            assert!(invocation.args.iter().any(|a| a == &stage.model) || in_config);
             assert!(
                 !invocation
                     .args
@@ -345,7 +350,7 @@ fn structured_native_errors_override_success_exit_and_tool_echoes_are_ignored() 
 #[test]
 fn capture_drains_both_streams_without_deadlock_and_handles_early_closed_stdin() {
     let dir = tempfile::tempdir().unwrap();
-    let inv = adapters::Invocation { program: "python3".into(), args: vec!["-c".into(), "import sys; sys.stdin.close(); sys.stdout.write('x'*200000); sys.stderr.write('y'*200000)".into()], stdin: Some("z".repeat(100000)), kind: OutputKind::Text, final_file: dir.path().join("unused"), env: vec![] };
+    let inv = adapters::Invocation { program: "python3".into(), args: vec!["-c".into(), "import sys; sys.stdin.close(); sys.stdout.write('x'*200000); sys.stderr.write('y'*200000)".into()], stdin: Some("z".repeat(100000)), kind: OutputKind::Text, final_file: dir.path().join("unused"), env: vec![], files: vec![] };
     let result = process::capture(
         &inv,
         dir.path(),
@@ -376,6 +381,7 @@ fn cancelling_lets_a_harness_save_before_it_is_killed() {
         kind: OutputKind::Text,
         final_file: dir.path().join("unused"),
         env: vec![],
+        files: vec![],
     };
     // Cancel once the script's trap is installed.
     let cancel = AtomicBool::new(false);
@@ -541,11 +547,21 @@ fn capture_applies_environment_variables() {
     let dir = tempfile::tempdir().unwrap();
     let inv = adapters::Invocation {
         program: "python3".into(),
-        args: vec!["-c".into(), "import os; print(os.environ['ROUTED'])".into()],
+        args: vec![
+            "-c".into(),
+            "import os; print(os.environ['ROUTED'], open('aider.commands').read().strip(), 'HOME' in os.environ)".into(),
+        ],
         stdin: None,
         kind: OutputKind::Text,
         final_file: dir.path().join("unused"),
-        env: vec![("ROUTED".into(), adapters::EnvValue::Literal("yes".into()))],
+        env: vec![
+            ("ROUTED".into(), adapters::EnvValue::Literal("yes".into())),
+            // Removes inherited HOME* variables, but never one the invocation sets.
+            ("HOME".into(), adapters::EnvValue::UnsetPrefix),
+            ("ROUTED".into(), adapters::EnvValue::UnsetPrefix),
+        ],
+        // Written at launch, not when the invocation is built.
+        files: vec![(dir.path().join("aider.commands"), "/code go\n".into())],
     };
     let result = process::capture(
         &inv,
@@ -559,6 +575,6 @@ fn capture_applies_environment_variables() {
     assert!(result.success());
     assert_eq!(
         fs::read_to_string(dir.path().join("stdout.log")).unwrap(),
-        "yes\n"
+        "yes /code go False\n"
     );
 }

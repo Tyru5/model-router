@@ -335,6 +335,7 @@ fn github(endpoint: &str, query: &str, cancel: &AtomicBool) -> Result<Vec<u8>> {
         kind: OutputKind::Text,
         final_file: temp.path().join("unused"),
         env: vec![],
+        files: vec![],
     };
     let mut received = 0;
     let mut oversized = false;

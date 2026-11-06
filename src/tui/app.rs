@@ -772,6 +772,9 @@ impl App {
         self.harness_checks.clear();
         self.page = 0;
         self.message = format!("Project: {}", self.project.display());
+        if let Some(note) = super::trust_prompt::notice(&self.settings) {
+            self.message.push_str(&format!(" · {note}"));
+        }
         if let Err(error) = storage::remember_project(&self.project) {
             self.message
                 .push_str(&format!(" · Could not save recent projects: {error:#}"));

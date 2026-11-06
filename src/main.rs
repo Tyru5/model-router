@@ -6,7 +6,9 @@ use model_router::{
     doctor,
     engine::{self, Action, Event, Run, Status},
     history::{self, Criteria, Entry, StatusFilter},
-    presets, process, providers, task_import, tui,
+    presets, process, providers, task_import,
+    trust::{self, Trust},
+    tui,
 };
 use std::{
     io::{self, IsTerminal, Write},
@@ -165,6 +167,16 @@ enum Commands {
         /// Query this provider's OpenAI-compatible /models endpoint.
         name: Option<String>,
     },
+    /// Trust this project's .model-router.toml: its custom adapters, checks,
+    /// extra arguments, escalated permissions, and custom providers.
+    Trust {
+        /// Trust without asking.
+        #[arg(long)]
+        yes: bool,
+        /// Forget this project's trust; its dangerous sections are ignored again.
+        #[arg(long, conflicts_with = "yes")]
+        revoke: bool,
+    },
     /// Check harness executables, versions, and flags without a model request.
     Doctor {
         /// Print machine-readable JSON.
@@ -238,7 +250,40 @@ fn main_result() -> Result<()> {
         );
         return Ok(());
     }
-    let (settings, config_path) = config::load(&project, cli.config.as_deref())?;
+    if let Some(Commands::Trust { yes, revoke }) = &cli.command {
+        return trust_command(&project, cli.config.as_deref(), *yes, *revoke);
+    }
+    let loaded = config::load_config(&project, cli.config.as_deref())?;
+    let config_path = loaded.save_path.clone();
+    let review = loaded.review().cloned();
+    // Commands that execute a project's dangerous sections refuse until it is
+    // trusted; the TUI asks; read-only commands ignore those sections.
+    let settings = match (&cli.command, &review) {
+        (_, None) => loaded.settings,
+        (Some(Commands::Run { .. }), Some(review)) => bail!("{}", review.text().trim_end()),
+        (None, Some(review)) => {
+            ensure!(
+                io::stdin().is_terminal() && io::stdout().is_terminal(),
+                "The TUI requires a terminal. Try model-router --help for CLI commands"
+            );
+            match tui::trust_prompt::ask(review)? {
+                tui::trust_prompt::Choice::Trust => {
+                    trust::approve(review)?;
+                    loaded.settings
+                }
+                tui::trust_prompt::Choice::Ignore => loaded.safe(),
+                tui::trust_prompt::Choice::Quit => return Ok(()),
+            }
+        }
+        (Some(Commands::Validate), Some(_)) => loaded.safe(),
+        (Some(_), Some(review)) => {
+            eprintln!(
+                "Ignoring untrusted sections of {}; run `model-router trust` to use them.",
+                review.project.join(".model-router.toml").display()
+            );
+            loaded.safe()
+        }
+    };
     match cli.command {
         None => {
             ensure!(
@@ -257,12 +302,26 @@ fn main_result() -> Result<()> {
                 detected_from,
             )?;
         }
-        Some(Commands::Init { .. } | Commands::Presets) => unreachable!(),
-        Some(Commands::Validate) => println!(
-            "Valid: {} workflow(s). Save path: {}",
-            settings.workflows.len(),
-            config_path.display()
-        ),
+        Some(Commands::Init { .. } | Commands::Presets | Commands::Trust { .. }) => {
+            unreachable!()
+        }
+        Some(Commands::Validate) => {
+            println!(
+                "Valid: {} workflow(s). Save path: {}",
+                settings.workflows.len(),
+                config_path.display()
+            );
+            for warning in settings
+                .warnings
+                .iter()
+                .filter(|w| review.is_none() || !w.contains("untrusted"))
+            {
+                println!("Warning: {warning}");
+            }
+            if let Some(review) = &review {
+                print!("{}", review.text());
+            }
+        }
         Some(Commands::Report { id, json, diff }) => {
             use model_router::report;
             let run = engine::load(&project, &id)?;
@@ -341,8 +400,21 @@ fn main_result() -> Result<()> {
             let provider = providers::resolve(&name, &settings.providers).with_context(|| {
                 format!("Unknown provider {name}; see `model-router providers`")
             })?;
-            for id in providers::models(&provider)? {
-                println!("{id}");
+            for model in providers::models(&provider)? {
+                let mut line = model.id.clone();
+                if let Some(context) = model.context_length {
+                    line.push_str(&format!("\tcontext {context}"));
+                }
+                if let (Some(prompt), Some(completion)) =
+                    (model.prompt_price, model.completion_price)
+                {
+                    line.push_str(&format!(
+                        "\t${:.2}/${:.2} per M tokens",
+                        prompt * 1e6,
+                        completion * 1e6
+                    ));
+                }
+                println!("{line}");
             }
         }
         Some(Commands::Providers { name: None }) => {
@@ -559,6 +631,60 @@ fn main_result() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// `model-router trust`: approve the project config's dangerous sections as
+/// they are now, or revoke the approval.
+fn trust_command(project: &Path, explicit: Option<&Path>, yes: bool, revoke: bool) -> Result<()> {
+    if revoke {
+        if trust::revoke(project)? {
+            println!("Revoked trust for {}", project.display());
+        } else {
+            println!("{} was not trusted", project.display());
+        }
+        return Ok(());
+    }
+    let loaded = config::load_config(project, explicit)?;
+    if loaded.origin != config::Origin::Project {
+        println!(
+            "Nothing to trust: only a project's own .model-router.toml needs trust. Global and --config files are yours."
+        );
+        return Ok(());
+    }
+    let review = match loaded.trust {
+        Trust::Trusted if trust::dangerous(&loaded.settings).is_empty() => {
+            println!(
+                "Nothing to trust: the project config runs no commands and sends no credentials."
+            );
+            return Ok(());
+        }
+        Trust::Trusted => {
+            println!("Already trusted: {}", project.display());
+            return Ok(());
+        }
+        Trust::Untrusted(review) => review,
+    };
+    print!("{}", review.text());
+    if !yes {
+        ensure!(
+            io::stdin().is_terminal(),
+            "Confirm from a terminal, or pass --yes"
+        );
+        print!("Trust these sections? [y/N] ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            println!("Not trusted.");
+            return Ok(());
+        }
+    }
+    trust::approve(&review)?;
+    println!(
+        "Trusted {}. A change to these sections asks again.",
+        project.display()
+    );
     Ok(())
 }
 

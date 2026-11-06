@@ -26,6 +26,8 @@ struct Fixture {
     file: String,
     harness: String,
     kind: OutputKind,
+    format: String,
+    format_note: Option<String>,
     version: String,
     scenario: String,
     provenance: String,
@@ -89,6 +91,40 @@ fn every_fixture_normalizes_as_its_manifest_declares() {
     }
 }
 
+/// The output format the adapter asks for in unattended mode.
+fn format_of(harness: &str) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = ContextPaths {
+        workspace: dir.path(),
+        attempt_dir: dir.path(),
+        prompt_file: dir.path(),
+        handoff_file: dir.path(),
+    };
+    let stage = Stage {
+        harness: harness.into(),
+        model: "m".into(),
+        ..Stage::default()
+    };
+    let args = adapters::build(&stage, &BTreeMap::new(), &BTreeMap::new(), "task", &paths)
+        .unwrap()
+        .args;
+    let value = |flag: &str| {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1).cloned())
+    };
+    value("--output-format")
+        .or_else(|| value("--format"))
+        .or_else(|| {
+            ["--stream-json", "--json"]
+                .iter()
+                .find(|flag| args.iter().any(|a| a == *flag))
+                .map(|flag| flag.trim_start_matches('-').to_owned())
+        })
+        .or_else(|| value("--mode").filter(|_| matches!(harness, "pi" | "omp")))
+        .unwrap_or_else(|| "text".into())
+}
+
 fn kind_of(harness: &str) -> OutputKind {
     let dir = tempfile::tempdir().unwrap();
     let paths = ContextPaths {
@@ -137,16 +173,32 @@ fn manifest_is_labeled_matches_adapters_and_covers_each_scenario() {
             "{}: kind differs from adapter",
             f.file
         );
+        // A fixture in another format than the adapter's must say why.
+        let format = format_of(&f.harness);
+        assert!(
+            f.format == format || f.format_note.as_ref().is_some_and(|n| !n.trim().is_empty()),
+            "{}: format {} differs from the adapter's {format} without a format_note",
+            f.file,
+            f.format
+        );
         for field in [&f.version, &f.scenario, &f.source, &f.sanitization] {
             assert!(!field.trim().is_empty(), "{}: empty metadata", f.file);
         }
         assert!(listed.insert(f.file.clone()), "{} listed twice", f.file);
     }
     for harness in BUILTINS {
+        // Required scenarios count only in the format the adapter requests.
+        // Tool echoes may use another, explained format: Gemini's json output
+        // carries no tool output to echo.
+        let format = format_of(harness);
         let scenarios: BTreeSet<_> = manifest
             .fixture
             .iter()
-            .filter(|f| f.harness == *harness)
+            .filter(|f| {
+                f.harness == *harness
+                    && (f.format == format
+                        || (f.scenario == "tool-echo" && f.format_note.is_some()))
+            })
             .map(|f| f.scenario.as_str())
             .collect();
         let required: &[&str] = match (kind_of(harness), *harness) {
@@ -294,6 +346,8 @@ fn doctor_reports_versions_and_flags_from_help_without_running_a_model() {
     let codex = report("codex");
     assert_eq!(codex["version"], "codex-cli 0.160.0");
     assert_eq!(codex["version_tested"], true);
+    // Every codex fixture is schema-derived: not labelled "tested".
+    assert_eq!(codex["version_captured"], false);
     assert_eq!(
         codex["summary"],
         "missing: --skip-git-repo-check (unattended)"
@@ -357,7 +411,7 @@ fn doctor_reports_versions_and_flags_from_help_without_running_a_model() {
     for cell in [
         "installed",
         "0.160.0",
-        "tested",
+        "schema-derived",
         "missing: --skip-git-repo-check (unattended)",
     ] {
         assert!(codex.contains(cell), "{codex}");
@@ -430,7 +484,7 @@ fn capture_script_refuses_without_confirmation_and_sanitizes_offline_output() {
         "{}",
         String::from_utf8_lossy(&captured.stderr)
     );
-    let text = fs::read_to_string(out.join("claude/captured-success.json")).unwrap();
+    let text = fs::read_to_string(out.join("claude/captured-success.jsonl")).unwrap();
     let home = std::env::var("HOME").unwrap_or_default();
     for secret in [
         "router-capture-",

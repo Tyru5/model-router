@@ -981,6 +981,7 @@ dependencies = [
  "portable-pty",
  "ratatui",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "shell-words",

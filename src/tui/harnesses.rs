@@ -349,6 +349,7 @@ mod tests {
             version: None,
             tested_versions: vec![],
             version_tested: None,
+            version_captured: false,
             capabilities: None,
             summary: "not checked".into(),
             notes: vec![AUTH_NOTE.into()],

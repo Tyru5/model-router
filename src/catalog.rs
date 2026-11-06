@@ -21,6 +21,9 @@ pub struct Model {
     pub efforts: Vec<String>,
     #[serde(default)]
     pub default_effort: String,
+    /// Context length and prices from a router provider's `/models`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info: Option<crate::providers::ModelInfo>,
 }
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
@@ -83,6 +86,21 @@ const OMP_THINKING: [&str; 8] = [
     "off", "minimal", "low", "medium", "high", "xhigh", "max", "auto",
 ];
 
+/// Effort levels a harness documents, without running it; None when they
+/// depend on the model (OpenCode variants) or the harness has no effort.
+pub fn known_efforts(harness: &str) -> Option<&'static [&'static str]> {
+    match harness {
+        "claude" => Some(&CLAUDE_EFFORTS),
+        "codex" => Some(&CODEX_EFFORTS),
+        "pi" => Some(&PI_THINKING),
+        "omp" => Some(&OMP_THINKING),
+        _ => None,
+    }
+}
+
+/// Catalog output kept from the end of a listing.
+const LISTING_LIMIT: usize = 2 * 1024 * 1024;
+
 /// The text of one `--flag` entry in a clap/commander style help page.
 fn help_option(help: &str, flag: &str) -> Option<String> {
     let mut lines = help.lines();
@@ -139,12 +157,48 @@ fn strings(ids: &[&str]) -> Vec<String> {
     ids.iter().map(|s| (*s).to_owned()).collect()
 }
 
+/// A listing's output; `truncated` when only its last 2 MiB were kept.
+struct Listing {
+    text: String,
+    truncated: bool,
+}
+
+/// The last `limit` bytes of `path`, starting at a whole line.
+fn read_listing(path: &Path, limit: usize) -> Result<Listing> {
+    let size = fs::metadata(path)?.len();
+    let mut text = process::read_tail(path, limit)?;
+    let truncated = size > limit as u64;
+    if truncated {
+        // The tail starts mid-line; that line cannot be parsed.
+        text = text
+            .split_once('\n')
+            .map(|(_, rest)| rest.to_owned())
+            .unwrap_or_default();
+    }
+    Ok(Listing { text, truncated })
+}
+
 fn query(
     harness: &str,
     args: Vec<String>,
     custom: &BTreeMap<String, CustomAdapter>,
     project: &Path,
 ) -> Result<String> {
+    query_listing(harness, args, custom, project).map(|listing| listing.text)
+}
+
+fn query_listing(
+    harness: &str,
+    args: Vec<String>,
+    custom: &BTreeMap<String, CustomAdapter>,
+    project: &Path,
+) -> Result<Listing> {
+    if custom
+        .get(harness)
+        .is_some_and(|a| a.command == crate::trust::BLOCKED_COMMAND)
+    {
+        anyhow::bail!("{harness} comes from an untrusted project config; run `model-router trust`");
+    }
     let temp = tempfile::tempdir()?;
     let inv = Invocation {
         program: adapters::program(harness, custom),
@@ -153,7 +207,9 @@ fn query(
         kind: OutputKind::Text,
         final_file: temp.path().join("unused"),
         env: vec![],
+        files: vec![],
     };
+    let shown = format!("{} {}", inv.program, inv.args.join(" "));
     let result = process::capture(
         &inv,
         project,
@@ -164,23 +220,104 @@ fn query(
     )?;
     ensure!(
         result.success(),
-        "Catalog query failed or timed out: {}",
+        "`{shown}` failed or timed out: {}",
         storage::clean_terminal(
             &process::read_tail(&temp.path().join("stderr.log"), 1500).unwrap_or_default()
         )
+        .trim()
     );
-    Ok(storage::clean_terminal(&process::read_tail(
-        &temp.path().join("stdout.log"),
-        2 * 1024 * 1024,
-    )?))
+    let listing = read_listing(&temp.path().join("stdout.log"), LISTING_LIMIT)?;
+    Ok(Listing {
+        text: storage::clean_terminal(&listing.text),
+        truncated: listing.truncated,
+    })
+}
+
+/// A short label for a failed listing, shown in the catalog note.
+fn failure(error: &anyhow::Error) -> String {
+    let text = storage::clean_terminal(&format!("{error:#}"));
+    storage::truncate(text.lines().next().unwrap_or_default(), 300)
+}
+
+/// Router providers a harness can use, with their `/models` listings.
+/// Listings run in parallel; a failure becomes a note, never an error.
+fn provider_models(harness: &str, settings: &Settings) -> (Vec<Model>, Vec<String>) {
+    if !crate::harness_settings::supports_provider(harness) || matches!(harness, "pi" | "omp") {
+        return (vec![], vec![]);
+    }
+    let routed: Vec<(String, crate::providers::Provider)> = settings
+        .providers
+        .keys()
+        .filter_map(|name| {
+            crate::providers::route(harness, name, &settings.providers)
+                .map(|p| (name.clone(), p.into_owned()))
+        })
+        .collect();
+    let results: Vec<_> = std::thread::scope(|scope| {
+        let jobs: Vec<_> = routed
+            .iter()
+            .map(|(name, provider)| {
+                scope.spawn(move || {
+                    (
+                        name,
+                        crate::providers::models_within(provider, Duration::from_secs(8)),
+                    )
+                })
+            })
+            .collect();
+        jobs.into_iter().filter_map(|job| job.join().ok()).collect()
+    });
+    let mut models = vec![];
+    let mut notes = vec![];
+    for (name, result) in results {
+        match result {
+            Ok(list) => {
+                for info in list {
+                    let mut model = entry(
+                        &info.id,
+                        &format!("{name} /models"),
+                        "provider listing; entitlement not checked",
+                    );
+                    model.provider = name.clone();
+                    model.info = Some(info);
+                    models.push(model);
+                }
+            }
+            Err(error) => notes.push(format!(
+                "Could not list provider {name}'s models ({}).",
+                failure(&error)
+            )),
+        }
+    }
+    (models, notes)
+}
+
+/// Parses a successful listing with `parse`; a failed run or parse becomes
+/// a visible note (`Err`) and the catalog falls back to manual entry.
+fn listed(
+    listing: Result<Listing>,
+    command: &str,
+    truncated: &mut bool,
+    parse: impl FnOnce(&str) -> Result<String>,
+) -> std::result::Result<String, String> {
+    let fallback = |error: &anyhow::Error| {
+        format!(
+            "Could not read models from `{command}` ({}); enter a model ID manually.",
+            failure(error)
+        )
+    };
+    let listing = listing.map_err(|e| fallback(&e))?;
+    *truncated = listing.truncated;
+    parse(&listing.text).map_err(|e| fallback(&e))
 }
 
 pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Catalog> {
     let mut models = vec![entry("", "harness setting", "inherits configured default")];
     let mut efforts: Vec<String> = vec![];
     let mut effort_source = String::new();
+    let mut truncated = false;
 
-    let note: String = match harness {
+    let mut note: String = match harness {
         "codex" => {
             let dir = std::env::var_os("CODEX_HOME")
                 .map(std::path::PathBuf::from)
@@ -293,13 +430,11 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
             }
             "Amp selects modes, not arbitrary model IDs. Plugin mode keys may be entered manually.".into()
         }
-        "pi" => {
-            let output = query(
-                harness,
-                vec!["--list-models".into()],
-                &settings.adapters,
-                project,
-            )?;
+        "pi" => listed(
+            query_listing(harness, vec!["--list-models".into()], &settings.adapters, project),
+            "pi --list-models",
+            &mut truncated,
+            |output| {
             for line in output.lines() {
                 let cols: Vec<&str> = line.split_whitespace().collect();
                 if cols.len() >= 4
@@ -321,24 +456,38 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
                     models.push(m);
                 }
             }
+            Ok("Pi lists models from configured providers and extensions, with whether each supports thinking. Exact provider/model selections avoid fuzzy routing.".into())
+        },
+        )
+        .inspect(|_| {
             efforts = strings(&PI_THINKING);
             effort_source = "Pi thinking levels".into();
-            "Pi lists models from configured providers and extensions, with whether each supports thinking. Exact provider/model selections avoid fuzzy routing.".into()
-        }
+        })
+        .unwrap_or_else(|note| note),
         "omp" => {
-            let output = query(
-                harness,
-                vec!["models".into(), "--json".into()],
-                &settings.adapters,
-                project,
-            )?;
-            models.extend(parse_omp_models(&output)?);
             efforts = strings(&OMP_THINKING);
             effort_source = "omp thinking levels".into();
-            "omp lists chat models from its configured providers, with each model's thinking levels. The router passes provider/model as omp's --model selector.".into()
+            listed(
+                query_listing(
+                    harness,
+                    vec!["models".into(), "--json".into()],
+                    &settings.adapters,
+                    project,
+                ),
+                "omp models --json",
+                &mut truncated,
+                |output| {
+                    models.extend(parse_omp_models(output)?);
+                    Ok("omp lists chat models from its configured providers, with each model's thinking levels. The router passes provider/model as omp's --model selector.".into())
+                },
+            )
+            .unwrap_or_else(|note| note)
         }
-        "opencode" => {
-            let output = query(harness, vec!["models".into()], &settings.adapters, project)?;
+        "opencode" => listed(
+            query_listing(harness, vec!["models".into()], &settings.adapters, project),
+            "opencode models",
+            &mut truncated,
+            |output| {
             for line in output.lines().map(str::trim) {
                 if !line.contains(char::is_whitespace) && line.contains('/') {
                     models.push(entry(
@@ -348,15 +497,15 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
                     ));
                 }
             }
-            "Provider catalog, not an account entitlement check. Model IDs include the provider prefix.".into()
-        }
-        "cursor" => {
-            let output = query(
-                harness,
-                vec!["--list-models".into()],
-                &settings.adapters,
-                project,
-            )?;
+            Ok("Provider catalog, not an account entitlement check. Model IDs include the provider prefix.".into())
+        },
+        )
+        .unwrap_or_else(|note| note),
+        "cursor" => listed(
+            query_listing(harness, vec!["--list-models".into()], &settings.adapters, project),
+            "--list-models",
+            &mut truncated,
+            |output| {
             for line in output.lines() {
                 let line = line.trim().trim_start_matches(['*', '•', '-']).trim();
                 // Cursor lists `slug - Display name`; keep native parameterized slugs.
@@ -368,27 +517,50 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
                     }
                 }
             }
-            "Cursor-native account selections. If your CLI uses a different list format, enter its exact slug manually.".into()
-        }
+            Ok("Cursor-native account selections. If your CLI uses a different list format, enter its exact slug manually.".into())
+        },
+        )
+        .unwrap_or_else(|note| note),
         name if settings.adapters.contains_key(name) => {
             let custom = &settings.adapters[name];
-            if let Some(args) = &custom.models_args {
-                for line in query(name, args.clone(), &settings.adapters, project)?
-                    .lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                {
-                    models.push(entry(line, "custom catalog command", "adapter-reported"));
+            const NOTE: &str =
+                "Custom adapters can provide models_args returning one native model ID per line.";
+            match &custom.models_args {
+                _ if custom.command == crate::trust::BLOCKED_COMMAND => {
+                    "This adapter comes from an untrusted project config, so its model list is not run; run `model-router trust` to use it.".into()
                 }
+                Some(args) => listed(
+                    query_listing(name, args.clone(), &settings.adapters, project),
+                    "models_args",
+                    &mut truncated,
+                    |output| {
+                        for line in output.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                            models.push(entry(line, "custom catalog command", "adapter-reported"));
+                        }
+                        Ok(NOTE.into())
+                    },
+                )
+                .unwrap_or_else(|note| note),
+                None => NOTE.into(),
             }
-            "Custom adapters can provide models_args returning one native model ID per line."
-                    .into()
         }
         "gemini" | "aider" | "goose" | "copilot" => {
             "Use your harness's configured default, a saved selection, or enter a native model ID. This adapter does not probe account entitlements.".into()
         }
         _ => anyhow::bail!("Unknown harness {harness}"),
     };
+    if truncated {
+        note.push_str(" Listing truncated: only its last 2 MiB were read.");
+    }
+    let (listed, notes) = provider_models(harness, settings);
+    if !listed.is_empty() {
+        note.push_str(" Router provider listings come from each provider's /models.");
+    }
+    models.extend(listed);
+    for extra in notes {
+        note.push(' ');
+        note.push_str(&extra);
+    }
     for stage in settings
         .workflows
         .iter()
@@ -590,5 +762,91 @@ mod tests {
         let bare = root.join("bare");
         fs::create_dir(&bare).unwrap();
         assert_eq!(detect_project(&bare).unwrap(), root);
+    }
+
+    #[test]
+    fn truncated_listings_drop_the_partial_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout.log");
+        fs::write(&path, "first-model\nsecond-model\nthird-model\n").unwrap();
+        let whole = read_listing(&path, 1024).unwrap();
+        assert!(!whole.truncated && whole.text.starts_with("first-model"));
+        // The last 20 bytes start inside "second-model".
+        let tail = read_listing(&path, 20).unwrap();
+        assert!(tail.truncated);
+        assert_eq!(tail.text, "third-model\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_listings_fall_back_to_manual_entry_with_a_visible_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.workflows[0].stages[0].harness = "mine".into();
+        settings.workflows[0].stages[0].model = "saved-model".into();
+        settings.adapters.insert(
+            "mine".into(),
+            CustomAdapter {
+                command: "false".into(),
+                models_args: Some(vec![]),
+                ..CustomAdapter::default()
+            },
+        );
+        let catalog = discover("mine", &settings, dir.path()).unwrap();
+        assert!(
+            catalog.note.contains("Could not read models"),
+            "{}",
+            catalog.note
+        );
+        assert!(catalog.models.iter().any(|m| m.id == "saved-model"));
+        assert!(catalog.models.iter().any(|m| m.id.is_empty()));
+        // Untrusted adapters are never run.
+        crate::trust::ignore(&mut settings);
+        let blocked = discover("mine", &settings, dir.path()).unwrap();
+        assert!(blocked.note.contains("untrusted"), "{}", blocked.note);
+    }
+
+    #[test]
+    fn router_provider_listings_join_routable_harness_catalogs() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut bytes = [0; 4096];
+            let count = socket.read(&mut bytes).unwrap();
+            assert!(String::from_utf8_lossy(&bytes[..count]).starts_with("GET /v1/models"));
+            let body = r#"{"data":[{"id":"vendor/big","context_length":131072,"pricing":{"prompt":"0.000001","completion":"0.000002"}}]}"#;
+            let _ = write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+        let mut settings = Settings::default();
+        settings.providers.insert(
+            "local".into(),
+            crate::providers::Provider {
+                base_url: base,
+                ..crate::providers::Provider::default()
+            },
+        );
+        let (models, notes) = provider_models("aider", &settings);
+        server.join().unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        let model = &models[0];
+        assert_eq!(
+            (model.provider.as_str(), model.id.as_str()),
+            ("local", "vendor/big")
+        );
+        assert_eq!(model.info.as_ref().unwrap().context_length, Some(131_072));
+        // Own-account harnesses and Pi never list router providers.
+        for harness in ["claude", "pi"] {
+            assert!(provider_models(harness, &settings).0.is_empty());
+        }
     }
 }

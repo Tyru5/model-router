@@ -56,6 +56,15 @@ fn project() -> tempfile::TempDir {
     settings
         .save(&dir.path().join(".model-router.toml"))
         .unwrap();
+    // The project config defines a custom adapter, so it needs trust.
+    let trusted = Command::new(env!("CARGO_BIN_EXE_model-router"))
+        .arg("-C")
+        .arg(dir.path())
+        .args(["trust", "--yes"])
+        .env("MODEL_ROUTER_CONFIG_DIR", dir.path().join("config-home"))
+        .output()
+        .unwrap();
+    success(&trusted);
     let bin = dir.path().join("bin");
     fs::create_dir(&bin).unwrap();
     fs::write(bin.join("gh"), include_str!("../examples/mock_github.py")).unwrap();
@@ -77,6 +86,7 @@ fn command(project: &Path) -> Command {
     command
         .current_dir(project)
         .arg("run")
+        .env("MODEL_ROUTER_CONFIG_DIR", project.join("config-home"))
         .env("PATH", std::env::join_paths(paths).unwrap())
         .env("ROUTER_TEST_GH_TRACE", project.join("gh-requests.jsonl"));
     command

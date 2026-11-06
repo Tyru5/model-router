@@ -33,19 +33,20 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests/fixtures/harness-output"
-# Output kind (adapters::OutputKind), file extension, restrictive settings.
+# Output kind (adapters::OutputKind), file extension, restrictive settings,
+# and the output format the adapter requests (the manifest's `format`).
 HARNESSES = {
-    "codex": ("Codex", "jsonl", {"sandbox": "read-only"}),
-    "claude": ("Claude", "json", {"permission_mode": "plan"}),
-    "pi": ("Pi", "jsonl", {}),
-    "omp": ("Pi", "jsonl", {"approval_mode": "always-ask"}),
-    "cursor": ("Cursor", "json", {"sandbox": "enabled"}),
-    "gemini": ("Gemini", "json", {"approval_mode": "plan"}),
-    "opencode": ("OpenCode", "jsonl", {}),
-    "aider": ("Text", "txt", {}),
-    "goose": ("Text", "txt", {}),
-    "amp": ("Amp", "jsonl", {}),
-    "copilot": ("Text", "txt", {}),
+    "codex": ("Codex", "jsonl", {"sandbox": "read-only"}, "json"),
+    "claude": ("Claude", "jsonl", {"permission_mode": "plan"}, "stream-json"),
+    "pi": ("Pi", "jsonl", {}, "json"),
+    "omp": ("Pi", "jsonl", {"approval_mode": "always-ask"}, "json"),
+    "cursor": ("Cursor", "jsonl", {"sandbox": "enabled"}, "stream-json"),
+    "gemini": ("Gemini", "json", {"approval_mode": "plan"}, "json"),
+    "opencode": ("OpenCode", "jsonl", {}, "json"),
+    "aider": ("Text", "txt", {}, "text"),
+    "goose": ("Text", "txt", {}, "text"),
+    "amp": ("Amp", "jsonl", {}, "stream-json"),
+    "copilot": ("Text", "txt", {}, "text"),
 }
 PROMPT_PLACEHOLDER = "<router prompt omitted>"
 UUID = re.compile(
@@ -259,7 +260,7 @@ def main():
         )
     if not args.router.is_file():
         sys.exit(f"Router not found: {args.router}. Run cargo build or pass --router.")
-    kind, extension, settings = HARNESSES[args.harness]
+    kind, extension, settings, output_format = HARNESSES[args.harness]
     relative = f"{args.harness}/{args.scenario}.{extension}"
     target = args.output_dir / relative
     if target.exists():
@@ -321,6 +322,7 @@ def main():
             "file": relative,
             "harness": args.harness,
             "kind": kind,
+            "format": output_format,
             "version": version,
             "scenario": args.scenario,
             "provenance": "captured",

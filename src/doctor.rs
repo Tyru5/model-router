@@ -53,8 +53,10 @@ pub struct Report {
     pub version: Option<String>,
     /// Harness versions covered by parser fixtures.
     pub tested_versions: Vec<String>,
-    /// Whether `version` is a tested version; None when no version was detected.
+    /// Whether `version` has parser fixtures; None when no version was detected.
     pub version_tested: Option<bool>,
+    /// Whether a fixture for `version` is captured output, not schema-derived.
+    pub version_captured: bool,
     /// Derived from the adapter's own invocations. None for custom adapters,
     /// which declare no flag contract.
     pub capabilities: Option<Vec<Capability>>,
@@ -80,9 +82,12 @@ impl Report {
             None => "-".into(),
         }
     }
+    /// `tested` only for captured fixtures; fixtures built from schemas and
+    /// documentation say `schema-derived`.
     pub fn tested_label(&self) -> &'static str {
         match self.version_tested {
-            Some(true) => "tested",
+            Some(true) if self.version_captured => "tested",
+            Some(true) => "schema-derived",
             Some(false) => "untested",
             None => "-",
         }
@@ -114,6 +119,7 @@ pub fn inspect(harness: &str, settings: &Settings, project: &Path) -> Report {
         version: None,
         tested_versions: vec![],
         version_tested: None,
+        version_captured: false,
         capabilities: None,
         summary: "not declared".into(),
         notes: vec![AUTH_NOTE.into()],
@@ -178,7 +184,10 @@ fn check(report: &mut Report, project: &Path) {
             )
         });
         match version {
-            Ok((true, text)) => report.version = first_line(&text),
+            Ok((true, text)) => {
+                report.version = first_line(&text);
+                adapters::remember_version(program, report.version.as_deref());
+            }
             Ok((false, _)) => report.notes.push(format!("{program} --version failed.")),
             Err(error) => report.notes.push(format!("{program} --version: {error:#}")),
         }
@@ -202,9 +211,22 @@ fn check(report: &mut Report, project: &Path) {
             .notes
             .push(format!("{} not found on PATH.", report.program));
     }
-    report.version_tested = report.version.as_deref().map(|line| {
-        version_tokens(line).any(|token| report.tested_versions.iter().any(|v| v == token))
+    let matches =
+        |fixture: &Fixture, line: &str| version_tokens(line).any(|token| token == fixture.version);
+    report.version_tested = report
+        .version
+        .as_deref()
+        .map(|line| fixtures.iter().any(|f| matches(f, line)));
+    report.version_captured = report.version.as_deref().is_some_and(|line| {
+        fixtures
+            .iter()
+            .any(|f| f.provenance == "captured" && matches(f, line))
     });
+    if report.version_tested == Some(true) && !report.version_captured {
+        report
+            .notes
+            .push("Fixtures for this version are schema-derived, not captured output.".into());
+    }
     if report.version_tested == Some(false) {
         report.notes.push(format!(
             "Detected version is not a parser-tested version ({}).",
@@ -346,12 +368,15 @@ fn flag_uses(harness: &str) -> Result<Vec<FlagUse>> {
 
 fn sample(harness: &str, mode: Mode, provider: &str) -> Stage {
     let supported = |yes: bool, value: &str| if yes { value.into() } else { String::new() };
+    // Interactive OpenCode 2.x has no variant option.
+    let effort = harness_settings::supports_effort(harness)
+        && !(harness == "opencode" && mode == Mode::Interactive);
     Stage {
         harness: harness.into(),
         mode,
         model: "sample-model".into(),
         provider: supported(harness_settings::supports_provider(harness), provider),
-        effort: supported(harness_settings::supports_effort(harness), "high"),
+        effort: supported(effort, "high"),
         harness_settings: harness_settings::settings(harness)
             .iter()
             .map(|s| (s.key.into(), s.choices[0].into()))
@@ -411,6 +436,7 @@ fn probe(program: &str, args: &[String], cwd: &Path, timeout: Duration) -> Resul
         kind: OutputKind::Text,
         final_file: temp.path().join("unused"),
         env: vec![],
+        files: vec![],
     };
     let outcome = process::capture(
         &invocation,
@@ -611,8 +637,16 @@ mod tests {
         );
         assert_eq!(
             find("opencode", "--model"),
+            [("run --help".to_owned(), vec![Mode::Unattended])]
+        );
+        assert_eq!(
+            find("opencode", "--prompt"),
+            [("--help".to_owned(), vec![Mode::Interactive])]
+        );
+        assert_eq!(
+            find("aider", "--yes-always"),
             [(
-                "run --help".to_owned(),
+                "--help".to_owned(),
                 vec![Mode::Unattended, Mode::Interactive]
             )]
         );
