@@ -626,6 +626,44 @@ mod tests {
     }
 
     #[test]
+    fn fan_out_candidates_show_in_progress_and_results() {
+        let mut run = sample();
+        run.stages[0].fan_out = Some(
+            serde_json::from_value(serde_json::json!({
+                "base": "tree",
+                "base_commit": "commit",
+                "candidates": [
+                    {"id": "c1", "harness": "claude", "model": "sonnet", "status": "complete",
+                     "attempts": [], "handoff": null,
+                     "changes": {"files": ["a.rs"], "added": 5, "removed": 1, "patch": "/p1.diff"}},
+                    {"id": "c2", "harness": "codex", "model": "", "status": "failed",
+                     "attempts": [], "handoff": null, "error": "Harness exited"}
+                ],
+                "selection": {"candidate": "c1", "by": "auto", "reason": "auto: passing",
+                              "applied": true, "at": "2026-01-01T00:00:00Z"}
+            }))
+            .unwrap(),
+        );
+        let mut results = app(run.clone());
+        results.focused.changes = Some(tracked());
+        let text = screen(&mut results, 120, 40);
+        for expected in [
+            "Fan-out · Implement",
+            "judge auto: c1 applied (auto: passing)",
+            "★ c1 claude sonnet complete · 1 file +5 −1",
+            "· c2 codex default failed · Harness exited",
+        ] {
+            assert!(text.contains(expected), "lacks {expected:?}\n{text}");
+        }
+        // While it runs, the monitor lists candidates under their stage.
+        run.status = Status::Running;
+        let mut monitor = app(run);
+        let text = screen(&mut monitor, 120, 40);
+        assert!(text.contains("★ c1 · claude sonnet"), "{text}");
+        assert!(text.contains("↳ c2 · codex"), "{text}");
+    }
+
+    #[test]
     fn stopped_runs_highlight_the_error_and_label_missing_changes() {
         let mut run = sample();
         run.status = Status::Failed;
