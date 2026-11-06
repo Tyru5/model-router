@@ -86,6 +86,7 @@ pub(super) enum ActionId {
     ShowRuns,
     ShowHarnesses,
     Themes,
+    Stats,
     ToggleVim,
     Help,
     Quit,
@@ -314,6 +315,7 @@ const ACTIONS: &[Entry] = {
         act(Themes, Global, ch('T'), "themes", "Choose theme (type to filter; [↑↓] or [Ctrl+N/P] preview)")
             .more(&["[Enter] saves for all projects; [Esc] restores the current theme"])
             .footer(),
+        act(Stats, Global, ch('I'), "stats", "Routing stats: outcomes per role, harness, and model from saved runs (suggestions only)"),
         act(ToggleVim, Global, key(KeyCode::F(8)), "Vim motions", "Toggle optional Vim motions in input fields (saved for all projects)")
             .more(&["Inputs start in Insert mode; Esc enters Normal mode; Esc again cancels", "Normal: h/j/k/l, w/b/e, 0/^/$, gg/G; i/a/I/A resume typing"]),
         act(Help, Global, ch('?'), "help", "Keyboard guide").footer_in(&[Workflow, MonitorIdle, Harnesses]),

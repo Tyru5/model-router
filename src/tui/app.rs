@@ -323,6 +323,8 @@ pub(super) struct App {
     pub(super) runs: RunsView,
     pub(super) harness_selected: usize,
     pub(super) harness_checks: HarnessChecks,
+    /// Saved-run stats behind the stage hint and the Stats dialog.
+    pub(super) route_stats: super::stats_page::StatsCache,
     pub(super) catalog: Option<Receiver<std::result::Result<Catalog, String>>>,
     pub(super) model_editor: Option<Box<HarnessEditor>>,
     /// Stage editor parked while its model picker is open.
@@ -459,6 +461,7 @@ impl App {
             runs: RunsView::default(),
             harness_selected: 0,
             harness_checks: HarnessChecks::new(),
+            route_stats: Default::default(),
             catalog: None,
             model_editor: None,
             stage_editor: None,
@@ -1276,6 +1279,7 @@ impl App {
                 })
             }
             ActionId::Commands => self.command_menu(),
+            ActionId::Stats => self.show_stats(),
             ActionId::NextView => self.show((self.page + 1) % TABS.len())?,
             ActionId::ShowWorkflow => self.show(0)?,
             ActionId::ShowMonitor => self.show(1)?,
