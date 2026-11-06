@@ -1687,3 +1687,362 @@ fn notifications_dialog_saves_backends_with_older_preferences() {
     assert!(saved.vim_motions && saved.notifications.desktop && saved.notifications.webhook);
     assert_eq!(saved.theme, Theme::Dracula);
 }
+
+/// The app drawn into a test buffer.
+fn buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| draw(frame, app)).unwrap();
+    terminal.backend().buffer().clone()
+}
+
+/// The cell where `text` starts on screen.
+fn cell_at(buffer: &ratatui::buffer::Buffer, text: &str) -> ratatui::buffer::Cell {
+    let area = buffer.area;
+    for y in 0..area.height {
+        let row: Vec<_> = (0..area.width).map(|x| buffer[(x, y)].symbol()).collect();
+        let joined: String = row.concat();
+        if let Some(byte) = joined.find(text) {
+            // Columns, not bytes: count the symbols before the match.
+            let mut seen = 0;
+            for (x, symbol) in row.iter().enumerate() {
+                if seen == byte {
+                    return buffer[(x as u16, y)].clone();
+                }
+                seen += symbol.len();
+            }
+        }
+    }
+    panic!("{text:?} is not on screen");
+}
+
+const REVIEW_PATCH: &str = "diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,2 @@
+-fn gone() {}
++fn fresh() {}
+ fn kept() {}
+@@ -20 +20 @@
+-old tail
++new tail
+diff --git a/docs/notes.md b/docs/notes.md
+new file mode 100644
+--- /dev/null
++++ b/docs/notes.md
+@@ -0,0 +1 @@
++needle here
+";
+
+fn diff_app(project: &std::path::Path, theme: Theme) -> App {
+    let mut app = theme_app(project);
+    app.theme = theme;
+    let mut run = sample_run("done");
+    run.project = project.into();
+    run.workspace = project.into();
+    app.adopt(run);
+    app.page = 1;
+    app.modal = Some(Modal::Diff(Box::new(super::diff_view::DiffView::new(
+        REVIEW_PATCH.into(),
+    ))));
+    app
+}
+
+#[test]
+fn diff_dialog_colours_lines_by_theme_and_lists_files() {
+    let project = tempfile::tempdir().unwrap();
+    for theme in [Theme::ModelRouter, Theme::Terminal, Theme::CatppuccinLatte] {
+        let mut app = diff_app(project.path(), theme);
+        let palette = theme.palette();
+        let screen = buffer(&mut app, 120, 30);
+        assert_eq!(
+            cell_at(&screen, "+fn fresh").fg,
+            palette.success,
+            "{theme:?}"
+        );
+        assert_eq!(cell_at(&screen, "-fn gone").fg, palette.red, "{theme:?}");
+        assert_eq!(cell_at(&screen, "@@ -1,2").fg, palette.blue, "{theme:?}");
+        assert_eq!(cell_at(&screen, " fn kept").fg, palette.fg, "{theme:?}");
+        if theme == Theme::Terminal {
+            assert_eq!(
+                cell_at(&screen, "+fn fresh").fg,
+                ratatui::style::Color::Green
+            );
+        }
+        let text = rows(&mut app, 120, 30).join("\n");
+        for expected in [
+            "2 files · +3 −2",
+            "M src/lib.rs +2 −2",
+            "A docs/notes.md +1 −0",
+            "src/lib.rs  2 hunks",
+        ] {
+            assert!(
+                text.contains(expected),
+                "{theme:?} lacks {expected:?}\n{text}"
+            );
+        }
+    }
+    // The smallest screen still shows the file list, hunks, and keys.
+    let mut app = diff_app(project.path(), Theme::ModelRouter);
+    app.key(key(Key::Char('w'))).unwrap();
+    let text = rows(&mut app, 65, 20).join("\n");
+    for expected in ["M src/lib.rs", "+fn fresh", "wrap", "[{ }] hunk"] {
+        assert!(text.contains(expected), "65x20 lacks {expected:?}\n{text}");
+    }
+}
+
+#[test]
+fn diff_dialog_keys_move_between_files_hunks_and_matches() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = diff_app(project.path(), Theme::ModelRouter);
+    rows(&mut app, 100, 30);
+    app.key(key(Key::Char('}'))).unwrap();
+    app.key(key(Key::Char('}'))).unwrap();
+    assert!(rows(&mut app, 100, 30).join("\n").contains("hunk 2/2"));
+    app.key(key(Key::Char(']'))).unwrap();
+    let text = rows(&mut app, 100, 30).join("\n");
+    assert!(
+        text.contains("+needle here") && !text.contains("+fn fresh"),
+        "{text}"
+    );
+    app.key(key(Key::Char('['))).unwrap();
+    // Search reaches the other file and highlights the match.
+    for c in "/needle".chars() {
+        app.key(key(Key::Char(c))).unwrap();
+    }
+    app.key(key(Key::Enter)).unwrap();
+    let palette = Theme::ModelRouter.palette();
+    let screen = buffer(&mut app, 100, 30);
+    assert_eq!(cell_at(&screen, "needle here").bg, palette.accent);
+    assert!(rows(&mut app, 100, 30).join("\n").contains("/needle · 1/1"));
+    // Esc clears the search, then closes; the dialog's keys stay local.
+    app.key(key(Key::Esc)).unwrap();
+    assert!(matches!(app.modal, Some(Modal::Diff(_))));
+    assert_eq!(app.page, 1);
+    app.key(key(Key::Esc)).unwrap();
+    assert!(app.modal.is_none());
+}
+
+#[test]
+fn diff_dialog_hands_the_patch_and_files_to_external_programs() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = diff_app(project.path(), Theme::ModelRouter);
+    rows(&mut app, 100, 30);
+    app.key(key(Key::Char('o'))).unwrap();
+    let launch = app.external.take().expect("pager queued");
+    let file = launch.argv.last().unwrap().clone();
+    let coloured = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        coloured.contains("\x1b[32m+fn fresh() {}\x1b[0m"),
+        "{coloured}"
+    );
+    drop(launch);
+    assert!(
+        !std::path::Path::new(&file).exists(),
+        "temporary diff removed"
+    );
+    assert!(
+        matches!(app.modal, Some(Modal::Diff(_))),
+        "dialog stays open"
+    );
+
+    app.key(key(Key::Char('e'))).unwrap();
+    let launch = app.external.take().expect("editor queued");
+    let target = project.path().join("src/lib.rs");
+    assert!(
+        launch.argv.iter().any(|arg| {
+            let arg = arg.to_string_lossy();
+            arg == target.to_string_lossy() || arg.starts_with(&*target.to_string_lossy())
+        }),
+        "{launch:?}"
+    );
+    assert_eq!(launch.cwd.as_deref(), Some(project.path()));
+}
+
+#[test]
+fn paused_output_keeps_its_place_as_new_lines_arrive() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = running_app(project.path());
+    app.focused.logs.clear();
+    for i in 0..100 {
+        app.focused.push_log(format!("line {i:03}"));
+    }
+    let output = |app: &mut App| -> Vec<String> {
+        rows(app, 80, 30)
+            .into_iter()
+            .filter(|row| row.contains("line "))
+            .collect()
+    };
+    assert!(output(&mut app).iter().any(|r| r.contains("line 099")));
+    app.key(key(Key::PageUp)).unwrap();
+    let paused = output(&mut app);
+    assert!(!paused.iter().any(|r| r.contains("line 099")));
+    assert!(
+        rows(&mut app, 80, 30)
+            .join("\n")
+            .contains("▲ paused — End to follow")
+    );
+    for i in 100..150 {
+        app.focused.push_log(format!("line {i:03}"));
+    }
+    assert_eq!(
+        output(&mut app),
+        paused,
+        "new output must not move a paused view"
+    );
+    // Old lines leaving the bounded log do not move it either.
+    let first = paused[0].clone();
+    for i in 150..300 {
+        app.focused.push_log(format!("line {i:03}"));
+    }
+    assert_eq!(output(&mut app)[0], first);
+    // Scrolling back down to the end follows again.
+    app.key(key(Key::End)).unwrap();
+    let text = rows(&mut app, 80, 30).join("\n");
+    assert!(
+        text.contains("line 299") && !text.contains("paused"),
+        "{text}"
+    );
+    app.key(key(Key::Home)).unwrap();
+    assert!(!app.focused.log_view.follow);
+    app.key(key(Key::Char('f'))).unwrap();
+    assert!(app.focused.log_view.follow);
+    app.key(key(Key::Char('f'))).unwrap();
+    assert!(!app.focused.log_view.follow);
+    for _ in 0..100 {
+        app.key(key(Key::PageDown)).unwrap();
+    }
+    assert!(app.focused.log_view.follow, "reaching the end follows");
+}
+
+#[test]
+fn output_search_highlights_matches_and_owns_n_while_shown() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = running_app(project.path());
+    app.focused.logs.clear();
+    for i in 0..80 {
+        app.focused.push_log(if i % 20 == 5 {
+            format!("✗ failure number {i}")
+        } else {
+            format!("step {i}")
+        });
+    }
+    rows(&mut app, 80, 30);
+    app.key(key(Key::Char('/'))).unwrap();
+    for c in "FAILURE".chars() {
+        app.key(shift(c)).unwrap();
+    }
+    assert!(rows(&mut app, 80, 30).join("\n").contains("/FAILURE▏"));
+    // Smart case: an uppercase query is case-sensitive.
+    app.key(key(Key::Enter)).unwrap();
+    assert!(rows(&mut app, 80, 30).join("\n").contains("no matches"));
+    app.key(key(Key::Char('/'))).unwrap();
+    for c in "failure".chars() {
+        app.key(key(Key::Char(c))).unwrap();
+    }
+    app.key(key(Key::Enter)).unwrap();
+    let text = rows(&mut app, 80, 30).join("\n");
+    assert!(text.contains("/failure · 4/4"), "{text}");
+    let palette = app.palette();
+    let screen = buffer(&mut app, 80, 30);
+    assert_eq!(cell_at(&screen, "failure number 65").bg, palette.accent);
+    assert!(!app.focused.log_view.follow, "a match pauses the output");
+    app.key(shift('N')).unwrap();
+    app.key(shift('N')).unwrap();
+    let text = rows(&mut app, 80, 30).join("\n");
+    assert!(
+        text.contains("2/4") && text.contains("failure number 25"),
+        "{text}"
+    );
+    app.key(key(Key::Char('n'))).unwrap();
+    assert!(rows(&mut app, 80, 30).join("\n").contains("3/4"));
+    // Idle, `n` returns to the workflow, except while a search is shown.
+    app.focused.worker = None;
+    app.key(key(Key::Char('n'))).unwrap();
+    assert_eq!(app.page, 1);
+    app.key(key(Key::Esc)).unwrap();
+    assert!(app.focused.log_search.is_none());
+    app.key(key(Key::Char('n'))).unwrap();
+    assert_eq!(app.page, 0);
+}
+
+#[test]
+fn handoff_dialog_colours_findings_and_tests_and_opens_changed_files() {
+    use crate::handoff::{Finding, Severity, TestEvidence, TestStatus};
+    let project = tempfile::tempdir().unwrap();
+    let mut app = running_app(project.path());
+    let run = app.focused.run.as_mut().unwrap();
+    run.workspace = project.path().into();
+    let handoff = run.stages[0].handoff.get_or_insert_with(|| {
+        serde_json::from_str(r#"{"summary":"s","verdict":"needs_changes"}"#).unwrap()
+    });
+    handoff.summary = "Implemented the parser".into();
+    handoff.findings = vec![
+        Finding {
+            severity: Severity::Blocking,
+            description: "Crash on empty input".into(),
+        },
+        Finding {
+            severity: Severity::Advisory,
+            description: "Rename a helper".into(),
+        },
+    ];
+    handoff.tests = vec![
+        TestEvidence {
+            command: "cargo test".into(),
+            status: TestStatus::Passed,
+            required: true,
+        },
+        TestEvidence {
+            command: "cargo clippy".into(),
+            status: TestStatus::Failed,
+            required: false,
+        },
+    ];
+    handoff.files_changed = vec!["src/parser.rs".into(), "README.md".into()];
+    app.key(key(Key::Char('h'))).unwrap();
+    assert!(matches!(app.modal, Some(Modal::Handoff(_))));
+    let palette = app.palette();
+    let screen = buffer(&mut app, 120, 36);
+    assert_eq!(cell_at(&screen, "! blocking").fg, palette.red);
+    assert_eq!(cell_at(&screen, "· advisory").fg, palette.warn);
+    assert_eq!(cell_at(&screen, "✓ cargo test").fg, palette.success);
+    assert_eq!(cell_at(&screen, "✗ cargo clippy").fg, palette.red);
+    let text = rows(&mut app, 120, 36).join("\n");
+    for expected in [
+        "Implemented the parser",
+        "passed · required",
+        "failed · optional",
+        "Files changed (2)",
+        "README.md",
+    ] {
+        assert!(text.contains(expected), "lacks {expected:?}\n{text}");
+    }
+    app.key(key(Key::Down)).unwrap();
+    app.key(key(Key::Enter)).unwrap();
+    let launch = app.external.take().expect("editor queued");
+    assert_eq!(
+        launch.argv.last().unwrap(),
+        project.path().join("README.md").as_os_str()
+    );
+    assert!(matches!(app.modal, Some(Modal::Handoff(_))));
+    app.key(key(Key::Esc)).unwrap();
+    assert!(app.modal.is_none());
+}
+
+#[test]
+fn open_log_pages_the_focused_attempts_stdout() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = running_app(project.path());
+    let run = app.focused.run.as_mut().unwrap();
+    let attempt = run.stages[0].attempts.last_mut().unwrap();
+    attempt.directory = project.path().join("attempt");
+    assert!(app.key(shift('O')).is_err(), "no log yet");
+    std::fs::create_dir_all(project.path().join("attempt")).unwrap();
+    std::fs::write(project.path().join("attempt/stdout.log"), "raw").unwrap();
+    app.key(shift('O')).unwrap();
+    let launch = app.external.take().expect("pager queued");
+    assert_eq!(
+        launch.argv.last().unwrap(),
+        project.path().join("attempt/stdout.log").as_os_str()
+    );
+}

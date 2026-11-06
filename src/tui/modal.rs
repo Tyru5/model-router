@@ -2,6 +2,9 @@ use super::input::InputField;
 use super::{
     actions::{self, ActionId},
     app::App,
+    diff_view::{DiffAction, DiffView},
+    external,
+    handoff_view::{HandoffAction, HandoffView},
     harness_editor::HarnessEditor,
     history::{Compare, Confirm},
     path_picker::{PathPicker, PickerAction},
@@ -125,6 +128,10 @@ pub(super) enum Modal {
         guide: bool,
     },
     Loading(String),
+    /// The results view's diff: files, hunks, search, and external tools.
+    Diff(Box<DiffView>),
+    /// A stage's handoff, with its changed files.
+    Handoff(Box<HandoffView>),
     Confirm(Box<Confirm>),
     /// A yes/no question before something hard to take back.
     Ask(Box<Ask>),
@@ -490,7 +497,12 @@ impl App {
                 return Ok(false);
             }
         }
-        if key.code == Key::Esc && !matches!(modal, Modal::Repositories(_) | Modal::Import(_)) {
+        if key.code == Key::Esc
+            && !matches!(
+                modal,
+                Modal::Repositories(_) | Modal::Import(_) | Modal::Diff(_)
+            )
+        {
             let changed = match &modal {
                 Modal::Stage { editor, .. } => editor.changed(),
                 Modal::Harness(editor) => editor.changed(),
@@ -631,6 +643,34 @@ impl App {
                         }
                     }
                 }
+                Modal::Diff(view) => match view.key(key) {
+                    DiffAction::Stay => {}
+                    DiffAction::Close => keep = false,
+                    DiffAction::Pager => {
+                        self.external =
+                            Some(external::page_text(&super::diff_view::ansi(&view.patch))?)
+                    }
+                    DiffAction::Editor(path, line) => {
+                        // Git names files from the top of the repository.
+                        let root = super::completion::repo_root(&self.run_dir()?);
+                        self.external = Some(external::edit(&root.join(path), line, &root)?);
+                    }
+                    DiffAction::Difftool => {
+                        let run = self.focused.run.as_ref().context("No run")?;
+                        let (from, to) = run
+                            .change_range()
+                            .map_err(|reason| anyhow::anyhow!("No difftool: {reason}"))?;
+                        self.external = Some(external::difftool(&self.run_dir()?, from, to)?);
+                    }
+                },
+                Modal::Handoff(view) => match view.key(key) {
+                    HandoffAction::Stay => {}
+                    HandoffAction::Close => keep = false,
+                    HandoffAction::Edit(file) => {
+                        let dir = self.run_dir()?;
+                        self.external = Some(external::edit(&dir.join(file), None, &dir)?);
+                    }
+                },
                 Modal::Loading(_) | Modal::Ask(_) => {}
                 Modal::Confirm(dialog) => keep = !self.confirm_key(dialog, key),
                 Modal::SessionRuns { selected } => keep = self.session_runs_key(selected, key),
@@ -645,6 +685,9 @@ impl App {
         if let Err(error) = &result {
             if let Modal::Harness(editor) = &mut modal {
                 editor.error = format!("{error:#}");
+            }
+            if let Modal::Diff(view) = &mut modal {
+                view.note = storage::clean_terminal(&format!("{error:#}"));
             }
             if let Modal::Picker { note, .. } = &mut modal {
                 *note = storage::clean_terminal(&format!(
@@ -708,6 +751,9 @@ pub(super) fn draw_modal(
 ) {
     let (width, height) = match modal {
         Modal::Stage { .. } => (100, 35),
+        // As large as the screen allows.
+        Modal::Diff(_) => (u16::MAX, u16::MAX),
+        Modal::Handoff(_) => (100, 32),
         Modal::Loading(_) => (64, 7),
         Modal::Ask(_) => (72, 9),
         _ => (95, 26),
@@ -719,6 +765,8 @@ pub(super) fn draw_modal(
         Modal::Import(importer) => importer.draw(frame, rect, palette),
         Modal::Harness(editor) => editor.draw(frame, rect, palette),
         Modal::Confirm(dialog) => dialog.draw(frame, rect, palette),
+        Modal::Diff(view) => view.draw(frame, rect, palette),
+        Modal::Handoff(view) => view.draw(frame, rect, palette),
         Modal::Notifications {
             backends,
             selected,

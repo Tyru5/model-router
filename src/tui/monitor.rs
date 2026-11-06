@@ -2,7 +2,9 @@ use super::{
     actions::ActionId,
     app::{App, SETTLE},
     completion::{checks_cell, draw_completion},
+    handoff_view::HandoffView,
     modal::{Ask, InputTarget, Modal},
+    output_search::{Wrapped, visible_lines},
     theme::Palette,
     widgets::{elapsed, empty_state, short_path},
 };
@@ -88,38 +90,62 @@ impl App {
                     *scroll = scroll.saturating_add(5).min(limit);
                 }
             }
-            // Wrapped lines can outnumber log entries; drawing clamps the offset.
-            ActionId::ScrollUp => {
-                self.focused.log_scroll = self
-                    .focused
-                    .log_scroll
-                    .saturating_add(10)
-                    .min(self.focused.logs.len() * 4)
+            // Scrolling up pauses the output; reaching the end follows again.
+            ActionId::ScrollUp => self.scroll_output(-10),
+            ActionId::ScrollDown => self.scroll_output(10),
+            ActionId::OutputTop if self.results_shown() => self.focused.results_scroll = [0; 2],
+            ActionId::OutputBottom if self.results_shown() => {
+                self.focused.results_scroll = self.focused.results_limit.get()
             }
-            ActionId::ScrollDown => {
-                self.focused.log_scroll = self.focused.log_scroll.saturating_sub(10)
+            ActionId::OutputTop => self.output_home(),
+            ActionId::OutputBottom => self.output_end(),
+            ActionId::FollowOutput if self.results_shown() => {
+                self.focused.show_output = true;
+                self.output_end();
+            }
+            ActionId::FollowOutput => self.toggle_follow(),
+            ActionId::FindOutput => self.start_output_search(),
+            ActionId::OpenLog => {
+                let path = self.focused_log().context("No attempt has output yet")?;
+                self.external = Some(super::external::page_file(&path)?);
             }
             ActionId::Diff => self.show_diff()?,
             ActionId::ToggleResults => self.toggle_results()?,
             ActionId::Handoff => {
                 let run = self.focused.run.as_ref().context("No run selected")?;
                 let index = run.cursor.min(run.stages.len().saturating_sub(1));
-                let handoff = run
+                let found = run
                     .stages
                     .get(index)
-                    .and_then(|s| s.handoff.as_ref())
-                    .or_else(|| run.stages.iter().rev().find_map(|s| s.handoff.as_ref()));
-                let body = handoff
-                    .map(serde_json::to_string_pretty)
-                    .transpose()?
-                    .unwrap_or_else(|| {
-                        format!(
+                    .and_then(|s| s.handoff.as_ref().map(|h| (index, h)))
+                    .or_else(|| {
+                        run.stages
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            .find_map(|(i, s)| s.handoff.as_ref().map(|h| (i, h)))
+                    });
+                match found {
+                    Some((index, handoff)) => {
+                        let stage = run
+                            .workflow
+                            .stages
+                            .get(index)
+                            .map_or_else(String::new, |s| s.name.clone());
+                        self.modal = Some(Modal::Handoff(Box::new(HandoffView::new(
+                            handoff.clone(),
+                            stage,
+                        ))));
+                    }
+                    None => {
+                        let body = format!(
                             "No completed handoff yet.\n\n{}\n\nArtifacts: {}",
                             run.error.as_deref().unwrap_or(""),
                             run.directory.display()
-                        )
-                    });
-                self.text("Handoff · [↑↓] scroll · [Esc] closes", body);
+                        );
+                        self.text("Handoff · [↑↓] scroll · [Esc] closes", body);
+                    }
+                }
             }
             ActionId::Continue => {
                 // `c` pressed as a stage stops was likely meant for the
@@ -202,6 +228,26 @@ impl App {
     }
 }
 
+impl App {
+    /// stdout.log of the focused attempt: the current stage's latest, else
+    /// the latest of any stage.
+    pub(super) fn focused_log(&self) -> Option<std::path::PathBuf> {
+        let run = self.focused.run.as_ref()?;
+        let index = run.cursor.min(run.stages.len().saturating_sub(1));
+        let attempt = run
+            .stages
+            .get(index)
+            .and_then(|s| s.attempts.last())
+            .or_else(|| {
+                run.stages
+                    .iter()
+                    .flat_map(|s| &s.attempts)
+                    .max_by_key(|a| a.started_at)
+            })?;
+        Some(attempt.directory.join("stdout.log"))
+    }
+}
+
 /// One line listing this session's runs when there is more than one;
 /// false when there is nothing to list.
 fn draw_session(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) -> bool {
@@ -230,10 +276,17 @@ fn draw_session(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) 
 }
 
 /// Output lines wrapped to `width` columns and coloured by what they show:
-/// stage headers, assistant text, tool calls, results, and errors.
-fn output_lines(logs: &VecDeque<String>, width: usize, palette: Palette) -> Vec<Line<'static>> {
+/// stage headers, assistant text, tool calls, results, and errors. `first`
+/// is the absolute number of the first log line.
+pub(super) fn output_lines(
+    logs: &VecDeque<String>,
+    first: u64,
+    width: usize,
+    palette: Palette,
+) -> Wrapped {
     let width = width.max(10);
     let mut lines = Vec::new();
+    let mut starts = Vec::with_capacity(logs.len());
     let mut style = Style::default().fg(palette.muted);
     for log in logs {
         style = if log.starts_with("── ") {
@@ -261,11 +314,16 @@ fn output_lines(logs: &VecDeque<String>, width: usize, palette: Palette) -> Vec<
         } else {
             Style::default().fg(palette.muted)
         };
+        starts.push(lines.len());
         for row in wrap(log, width) {
             lines.push(Line::styled(row, style));
         }
     }
-    lines
+    Wrapped {
+        lines,
+        starts,
+        first,
+    }
 }
 
 /// `text` in rows of at most `width` display columns; wide characters
@@ -406,8 +464,28 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
     );
     let cols = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(chunks[3]);
-    let output_block = palette.panel_with("Output", &[("PgUp/PgDn", "scroll")]);
+    let paused = !app.focused.log_view.follow;
+    let mut output_block = palette.panel_with(
+        if paused {
+            "Output · ▲ paused — End to follow"
+        } else {
+            "Output"
+        },
+        // The paused notice needs the room at narrow widths.
+        if paused {
+            &[]
+        } else {
+            &[("PgUp/PgDn", "scroll"), ("/", "search")]
+        },
+    );
+    if let Some(status) = app.output_search_status() {
+        output_block = output_block.title_bottom(Line::styled(
+            format!(" {status} "),
+            Style::default().fg(palette.accent),
+        ));
+    }
     let visible = output_block.inner(cols[0]).height as usize;
+    app.focused.log_visible.set(visible);
     if app.focused.logs.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::styled(
@@ -427,20 +505,27 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
         let lines = match &cache.output {
             Some((cached, lines)) if *cached == key => lines.clone(),
             _ => {
-                let lines = Rc::new(output_lines(&app.focused.logs, width, palette));
+                let first = app
+                    .focused
+                    .log_version
+                    .saturating_sub(app.focused.logs.len() as u64);
+                let lines = Rc::new(output_lines(&app.focused.logs, first, width, palette));
                 cache.output = Some((key, lines.clone()));
                 lines
             }
         };
         drop(cache);
-        let scroll = app
-            .focused
-            .log_scroll
-            .min(lines.len().saturating_sub(visible));
-        let end = lines.len() - scroll;
-        let start = end.saturating_sub(visible);
+        // Paused output keeps its top line as new output arrives.
+        let top = lines.top(app.focused.log_view, visible);
         frame.render_widget(
-            Paragraph::new(lines[start..end].to_vec()).block(output_block),
+            Paragraph::new(visible_lines(
+                &lines,
+                top,
+                visible,
+                app.focused.log_search.as_ref(),
+                palette,
+            ))
+            .block(output_block),
             cols[0],
         );
     }

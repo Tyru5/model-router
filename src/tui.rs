@@ -19,13 +19,17 @@ use std::{
 mod actions;
 mod app;
 mod completion;
+mod diff_view;
+mod external;
 mod frame_marker;
+mod handoff_view;
 mod harness_editor;
 mod harnesses;
 mod history;
 mod input;
 mod modal;
 mod monitor;
+mod output_search;
 mod path_picker;
 mod session;
 mod startup;
@@ -194,6 +198,19 @@ pub fn run(
             };
             // Apply completion or shutdown before accepting another action.
             app.redraw = true;
+            continue;
+        }
+        if let Some(launch) = app.external.take() {
+            // The pager or editor owns the terminal, so Ctrl+C there is its
+            // own and must not stop the router.
+            let signalled = app.signal.load(Ordering::Relaxed);
+            screen.restore();
+            let result = launch.run();
+            screen.resume()?;
+            if !signalled {
+                app.signal.store(false, Ordering::Relaxed);
+            }
+            app.finish_external(result);
             continue;
         }
         // Frames are drawn when something changed, and once a second for

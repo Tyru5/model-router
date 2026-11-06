@@ -398,6 +398,46 @@ impl Palette {
         }
     }
 
+    /// Added diff lines; ANSI green in the Terminal theme.
+    pub fn diff_add(self) -> Style {
+        Style::default().fg(self.success)
+    }
+
+    /// Removed diff lines; ANSI red in the Terminal theme.
+    pub fn diff_del(self) -> Style {
+        Style::default().fg(self.red)
+    }
+
+    /// `@@` hunk headers.
+    pub fn diff_hunk(self) -> Style {
+        Style::default().fg(self.blue)
+    }
+
+    /// `diff --git` lines that start each file.
+    pub fn diff_file(self) -> Style {
+        Style::default()
+            .fg(self.accent)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// index, mode, rename, `---`, and `+++` lines.
+    pub fn diff_meta(self) -> Style {
+        Style::default().fg(self.violet)
+    }
+
+    /// A search match.
+    pub fn search_match(self) -> Style {
+        Style::default().fg(self.on_accent()).bg(self.warn)
+    }
+
+    /// The match search moved to.
+    pub fn search_current(self) -> Style {
+        Style::default()
+            .fg(self.on_accent())
+            .bg(self.accent)
+            .add_modifier(Modifier::BOLD)
+    }
+
     pub fn status_color(self, status: Status) -> Color {
         match status {
             Status::Complete => self.success,
@@ -568,6 +608,24 @@ mod tests {
                 contrast(p.selection_fg, p.selection_bg) >= 4.5,
                 "{theme:?}: selection"
             );
+            for (name, style) in [
+                ("added", p.diff_add()),
+                ("removed", p.diff_del()),
+                ("hunk", p.diff_hunk()),
+            ] {
+                // The theme's own status colours (Nord's red is the lowest);
+                // the +/− prefix tells the lines apart too.
+                assert!(
+                    contrast(style.fg.unwrap(), p.panel) >= 2.4,
+                    "{theme:?}: {name} diff lines"
+                );
+            }
+            for style in [p.search_match(), p.search_current()] {
+                assert!(
+                    contrast(style.fg.unwrap(), style.bg.unwrap()) >= 3.0,
+                    "{theme:?}: search match"
+                );
+            }
         }
     }
 
@@ -580,6 +638,26 @@ mod tests {
             p.violet,
         ];
         assert!(fields.iter().all(|c| !matches!(c, Color::Rgb(..))));
+        // Diff and search colours are ANSI too, so they follow the terminal's scheme.
+        for style in [
+            p.diff_add(),
+            p.diff_del(),
+            p.diff_hunk(),
+            p.diff_file(),
+            p.diff_meta(),
+            p.search_match(),
+            p.search_current(),
+        ] {
+            assert!(
+                [style.fg, style.bg]
+                    .iter()
+                    .flatten()
+                    .all(|c| !matches!(c, Color::Rgb(..))),
+                "{style:?}"
+            );
+        }
+        assert_eq!(p.diff_add().fg, Some(Color::Green));
+        assert_eq!(p.diff_del().fg, Some(Color::Red));
         assert!(p.selected_style().add_modifier.contains(Modifier::REVERSED));
         assert_eq!(p.on_accent(), Color::Black);
         let model_router = Theme::ModelRouter.palette();
