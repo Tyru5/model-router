@@ -55,6 +55,11 @@ pub(super) enum PickValue {
     Theme(Theme),
     Action(ActionId),
     Compare(Compare),
+    /// A stopped fan-out candidate to retry: stage ID and candidate ID.
+    Candidate {
+        stage: String,
+        candidate: String,
+    },
 }
 impl PickValue {
     fn detail(&self) -> Option<String> {
@@ -417,6 +422,17 @@ impl App {
                 self.perform(id)?;
             }
             PickValue::Compare(choice) => self.show_comparison(&choice)?,
+            PickValue::Candidate { stage, candidate } => {
+                self.session
+                    .run_mut()
+                    .context("No run")?
+                    .command(engine::Cmd::RetryCandidate {
+                        stage,
+                        candidate: candidate.clone(),
+                    })?;
+                self.start_driver()?;
+                self.ui.message = format!("Retrying candidate {candidate}…");
+            }
         }
         Ok(())
     }

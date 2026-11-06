@@ -1415,6 +1415,91 @@ fn esc_while_opening_a_project_returns_to_the_browser_and_drops_the_result() {
 }
 
 #[test]
+fn shift_y_retries_one_failed_fan_out_candidate_of_the_stopped_stage() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    app.ui.page = Page::Monitor;
+    let mut run = crate::report::tests::sample();
+    // No harness here exists, so the restarted driver cannot launch one.
+    for stage in &mut run.workflow.stages {
+        stage.harness = "no-such-harness".into();
+    }
+    run.workflow.stages[0].fan_out = Some(crate::config::FanOut {
+        candidates: ["c1", "c2"]
+            .map(|id| crate::config::Candidate {
+                id: id.into(),
+                harness: "no-such-harness".into(),
+                ..Default::default()
+            })
+            .into(),
+        judge: crate::config::AUTO_JUDGE.into(),
+    });
+    run.stages[0].fan_out = Some(
+        serde_json::from_value(serde_json::json!({
+            "base": "tree",
+            "base_commit": "commit",
+            "candidates": [
+                {"id": "c1", "harness": "no-such-harness", "model": "", "status": "complete",
+                 "attempts": [], "handoff": null},
+                {"id": "c2", "harness": "no-such-harness", "model": "m2", "status": "failed",
+                 "attempts": [], "handoff": null, "error": "Harness exited"}
+            ]
+        }))
+        .unwrap(),
+    );
+    run.stages[0].status = Status::Failed;
+    run.status = Status::Failed;
+    run.cursor = 0;
+    run.project = project.path().into();
+    run.workspace = project.path().into();
+    run.directory = crate::storage::run_dir(project.path(), &run.id).unwrap();
+    std::fs::create_dir_all(&run.directory).unwrap();
+    run.persist().unwrap();
+    app.session.adopt(run.clone());
+
+    app.key(shift('Y')).unwrap();
+    let Some(Modal::Picker { items, title, .. }) = app.ui.dialog() else {
+        panic!("no candidate picker");
+    };
+    assert_eq!(title, "Retry a fan-out candidate");
+    let labels: Vec<_> = items.iter().map(|c| c.label.as_str()).collect();
+    assert_eq!(labels, ["Implement · c2 · no-such-harness m2 · failed"]);
+    app.key(key(Key::Enter)).unwrap();
+    assert!(app.ui.dialog().is_none(), "{}", app.ui.message);
+    assert!(
+        app.ui.message.starts_with("Retrying candidate c2"),
+        "{}",
+        app.ui.message
+    );
+    let saved = crate::engine::load(project.path(), &run.id).unwrap();
+    let fan = saved.stages[0].fan_out.as_ref().unwrap();
+    assert_eq!(
+        fan.candidates[0].status,
+        Status::Complete,
+        "c1 keeps its result"
+    );
+    assert_eq!(fan.candidates[1].status, Status::Pending);
+    // Let the driver stop.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while app.session.running() && std::time::Instant::now() < deadline {
+        app.poll().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!app.session.running());
+
+    // Nothing to retry: the stage itself is not stopped, or no candidate is.
+    let mut app = theme_app(project.path());
+    app.ui.page = Page::Monitor;
+    app.session.adopt(crate::report::tests::sample());
+    let error = app.perform(ActionId::RetryCandidate).unwrap_err();
+    assert!(
+        format!("{error}").contains("No failed fan-out candidate"),
+        "{error}"
+    );
+    assert!(app.ui.dialog().is_none());
+}
+
+#[test]
 fn output_wraps_by_display_width() {
     use super::monitor::wrap;
     assert_eq!(wrap("雪雪雪", 4), ["雪雪", "雪"]);

@@ -3,11 +3,11 @@ use super::{
     app::{App, Page},
     completion::{checks_cell, draw_completion},
     handoff_view::HandoffView,
-    modal::{Ask, InputTarget, Modal},
+    modal::{Ask, Choice, InputTarget, Modal, PickValue},
     output_search::{Wrapped, visible_lines},
     run_slot::{RunSlot, SETTLE},
     theme::Palette,
-    widgets::{elapsed, empty_state, short_path},
+    widgets::{elapsed, empty_state, short_path, textarea},
 };
 use crate::{
     adapters,
@@ -197,6 +197,40 @@ impl App {
                     self.start_driver()?;
                 }
             }
+            ActionId::RetryCandidate => {
+                let run = self.session.run().context("No run selected")?;
+                let items: Vec<Choice> = retryable_candidates(run)
+                    .into_iter()
+                    .map(|(index, candidate)| Choice {
+                        label: format!(
+                            "{} · {} · {} · {}",
+                            run.workflow.stages[index].name,
+                            candidate.id,
+                            if candidate.model.is_empty() {
+                                candidate.harness.clone()
+                            } else {
+                                format!("{} {}", candidate.harness, candidate.model)
+                            },
+                            candidate.status.label()
+                        ),
+                        value: PickValue::Candidate {
+                            stage: run.workflow.stages[index].id.clone(),
+                            candidate: candidate.id.clone(),
+                        },
+                    })
+                    .collect();
+                ensure!(
+                    !items.is_empty(),
+                    "No failed fan-out candidate to retry; [y] retries the whole stage"
+                );
+                self.ui.open(Modal::Picker {
+                    title: "Retry a fan-out candidate".into(),
+                    items,
+                    selected: 0,
+                    filter: textarea(""),
+                    note: "Reruns the candidate from the fan-out base; the others keep their results and the judge chooses again.".into(),
+                });
+            }
             ActionId::ReplaceModel => {
                 let run = self.session.run().context("No run")?;
                 let stage = run
@@ -272,6 +306,27 @@ impl App {
             })?;
         Some(attempt.directory.join("stdout.log"))
     }
+}
+
+/// Stopped candidates the run can retry, with their stage's index: those of
+/// its stopped fan-out stage, or of any stopped fan-out stage of a graph run.
+fn retryable_candidates(run: &engine::Run) -> Vec<(usize, &engine::CandidateState)> {
+    let stopped = |status| matches!(status, Status::Failed | Status::Blocked | Status::Cancelled);
+    if !stopped(run.status) {
+        return vec![];
+    }
+    run.stages
+        .iter()
+        .enumerate()
+        .filter(|(index, state)| (run.graph() || *index == run.cursor) && stopped(state.status))
+        .filter_map(|(index, state)| Some((index, state.fan_out.as_ref()?)))
+        .flat_map(|(index, fan)| {
+            fan.candidates
+                .iter()
+                .filter(|candidate| stopped(candidate.status))
+                .map(move |candidate| (index, candidate))
+        })
+        .collect()
 }
 
 /// One line listing this session's runs when there is more than one;

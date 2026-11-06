@@ -46,7 +46,7 @@ pub(super) struct App {
     pub(super) session: Session,
     pub(super) runs: RunsPage,
     pub(super) harnesses: HarnessesPage,
-    /// Preferences, status line, dialog, and redraw flag.
+    /// Preferences, status line, dialog stack, and redraw flag.
     pub(super) ui: Ui,
     /// Ctrl+C from the terminal, shared with the signal handler.
     pub(super) signal: Arc<AtomicBool>,

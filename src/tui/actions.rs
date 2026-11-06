@@ -56,6 +56,7 @@ pub(super) enum ActionId {
     Continue,
     Retry,
     RetryInteractive,
+    RetryCandidate,
     ReplaceModel,
     Handoff,
     EditSummary,
@@ -285,6 +286,7 @@ const ACTIONS: &[Entry] = {
         act(Continue, MonitorIdle, ch('c'), "continue", "Continue the run when idle (not in the moment a stage stops)").footer(),
         act(Retry, MonitorIdle, ch('y'), "retry", "Explicitly retry current stage").footer(),
         act(RetryInteractive, MonitorIdle, ch('i'), "interactive", "Retry current stage interactively").footer(),
+        act(RetryCandidate, MonitorIdle, ch('Y'), "retry candidate", "Retry one failed fan-out candidate of the stopped stage; the others keep their results"),
         act(ReplaceModel, MonitorIdle, ch('m'), "model", "Replace current model and retry").footer(),
         act(Handoff, Monitor, ch('h'), "handoff", "Inspect handoff/error").footer()
             .more(&["Findings by severity, tests by status; [↑↓] picks a changed file, [e]/[Enter] opens it in $EDITOR"]),
