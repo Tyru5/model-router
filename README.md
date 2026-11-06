@@ -463,7 +463,8 @@ or send your keys elsewhere. These sections take effect only after you trust
 the file: custom adapters, stage checks, extra arguments, permission settings
 that loosen a harness's checks (`danger-full-access`, `bypassPermissions`,
 `yolo`, Cursor sandbox `disabled`, Aider `yes-always`, Goose `auto`, Copilot
-`allow-all-tools`), and providers with their own endpoint or key variable.
+`allow-all-tools`), ship stages with `confirm = false`, and providers with
+their own endpoint or key variable. While untrusted, ship stages ask first.
 
 ```sh
 model-router trust          # list them and confirm
@@ -636,6 +637,39 @@ The brief leads the Monitor's results when the run finishes, appears in
 enabled, to workflows without one; when Codex is not installed it uses the
 first enabled stage's harness with its default model. To opt out, disable it
 with `Space` or delete it: v2 files are not migrated again.
+
+### Shipping
+
+The router never commits unless you add a **Ship** stage (role `ship`; preset
+`Ship (commit + draft PR)`, disabled in workflow presets) and enable it. No
+model runs: the router itself commits exactly the files changed during the run
+(from its snapshots) on a new branch from `HEAD`, optionally pushes it, and
+optionally opens a draft PR with `gh`. First it stops at the checkpoint with a
+preview: branch, files, commit message, push, and PR title/body. `a` (or
+`resume RUN_ID --advance`) ships that exact plan; if anything changed since, it
+previews again. Other agents' `serve` clients cannot confirm it.
+
+```toml
+[workflows.stages.ship]       # all optional; the preset sets push/draft_pr
+branch = "mr/{run_id}-{slug}" # {slug} from the task's first line
+commit_message = ""           # "" = summary's first line + summary; or a template
+push = false                  # git push --set-upstream REMOTE BRANCH, never forced
+remote = "origin"
+draft_pr = false              # needs push; gh pr create --draft
+base = ""                     # "" = checkout's upstream branch, else gh's default branch
+confirm = true                # false skips the preview (needs project trust)
+include_untracked = true      # commit files the run created
+include_preexisting = false   # files you also edited before the run block the ship
+```
+
+Files you changed before the run stay uncommitted, as do your staged changes;
+a file changed both before and during the run blocks the ship unless
+`include_preexisting = true`. The commit uses your `git config` identity only
+(it refuses without one) and adds no trailers or attribution. Any Git or `gh`
+failure blocks the stage with its exact error and what was already done. The
+branch, commit, push, and PR URL appear in the handoff and `report`. To ship a
+completed run afterwards: `model-router ship RUN_ID [--push] [--draft-pr]
+[--yes]` previews, then asks (or needs `--yes` without a terminal).
 
 When an interactive harness exits, inspect its handoff and advance, reopen, or
 stop. `Ctrl+]` stops a stuck interactive harness. In the monitor, `h` inspects
@@ -821,7 +855,8 @@ a retry or repair discards it, so the rerun needs a new acceptance.
 All stages normally use your selected directory. Worktree mode requires a clean
 Git checkout and starts from committed `HEAD` on a new `model-router/RUN_ID`
 branch. The worktree is retained at `.model-router/worktrees/RUN_ID`. The router
-does not merge, commit, or delete worktrees automatically.
+does not merge, commit, or delete worktrees automatically; only an enabled
+[ship stage](#shipping) commits, after you confirm it.
 
 ```text
 .model-router/
