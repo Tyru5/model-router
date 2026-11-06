@@ -22,12 +22,18 @@ fn cli_presets_initialize_editable_workflows_without_overwriting_existing_files(
         let original = fs::read(&path).unwrap();
         let (settings, _) = config::load(dir.path(), Some(&path)).unwrap();
         assert_eq!(settings.workflows[0].name, preset.name);
+        // Optional reviews start disabled; a fan-out's judge chooses, so it starts enabled.
+        let judges: Vec<&str> = settings.workflows[0]
+            .stages
+            .iter()
+            .filter_map(|s| s.fan_out.as_ref().map(|f| f.judge.as_str()))
+            .collect();
         assert!(
             settings.workflows[0]
                 .stages
                 .iter()
                 .filter(|s| s.role == Role::Review)
-                .all(|s| !s.enabled)
+                .all(|s| s.enabled == judges.contains(&s.id.as_str()))
         );
         let output = Command::new(env!("CARGO_BIN_EXE_model-router"))
             .current_dir(dir.path())

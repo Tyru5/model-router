@@ -2,7 +2,7 @@
 //! and real Git repositories.
 mod common;
 
-use common::{count, create, drive, fixture, settings, stage, tempdir, workflow};
+use common::{count, create, drive, fixture, repository, settings, stage, tempdir, workflow};
 use model_router::{
     config::{Candidate, Check, FanOut, Role, Stage},
     engine::{self, Action, Attempt, Cmd, Event, Run, Status},
@@ -22,45 +22,6 @@ fn git(dir: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
-}
-
-/// A repository with one commit by the host's human identity, plus an
-/// uncommitted draft; None when that identity is unset, as tests never
-/// invent commit authorship.
-fn repository(dir: &Path) -> Option<()> {
-    let identity = |key| {
-        let output = Command::new("git")
-            .args(["config", "--get", key])
-            .output()
-            .unwrap();
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-    };
-    let (Some(name), Some(email)) = (identity("user.name"), identity("user.email")) else {
-        eprintln!("Skipping Git fixture: configure the human git identity first");
-        return None;
-    };
-    git(dir, &["init", "-q"]);
-    git(dir, &["config", "user.name", &name]);
-    git(dir, &["config", "user.email", &email]);
-    fs::write(dir.join("tracked.txt"), "original\n").unwrap();
-    git(dir, &["add", "tracked.txt"]);
-    git(
-        dir,
-        &[
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-qm",
-            "Test fixture",
-        ],
-    );
-    fs::write(dir.join("draft.txt"), "uncommitted draft\n").unwrap();
-    Some(())
 }
 
 fn delayed(id: &str, role: Role, after: &[&str], seconds: f32) -> Stage {
