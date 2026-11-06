@@ -8,6 +8,7 @@ pub mod events;
 pub mod handoff;
 pub mod harness_settings;
 pub mod history;
+pub mod notify;
 pub mod presets;
 pub mod process;
 pub mod providers;

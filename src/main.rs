@@ -6,7 +6,7 @@ use model_router::{
     doctor,
     engine::{self, Action, Event, Run, Status},
     history::{self, Criteria, Entry, StatusFilter},
-    presets, process, providers, task_import, tui,
+    notify, presets, process, providers, task_import, tui,
 };
 use std::{
     io::{self, IsTerminal, Write},
@@ -87,6 +87,10 @@ enum Commands {
         unattended: bool,
         #[arg(long)]
         with_review: bool,
+        /// Notify (bell/OSC, desktop, webhook per saved preferences) when the
+        /// run needs input, stops, or completes. Also MODEL_ROUTER_NOTIFY=1.
+        #[arg(long)]
+        notify: bool,
     },
     /// Resume a run. Retry and model changes are explicit.
     Resume {
@@ -102,6 +106,10 @@ enum Commands {
         /// Allow one more review repair pass after the repair limit stopped the run.
         #[arg(long, conflicts_with_all = ["retry", "interactive", "model", "advance"])]
         allow_repair: bool,
+        /// Notify (bell/OSC, desktop, webhook per saved preferences) when the
+        /// run needs input, stops, or completes. Also MODEL_ROUTER_NOTIFY=1.
+        #[arg(long)]
+        notify: bool,
     },
     /// Start a new run from a saved run's task and workflow snapshot.
     Rerun {
@@ -111,6 +119,10 @@ enum Commands {
         worktree: bool,
         #[arg(long)]
         unattended: bool,
+        /// Notify (bell/OSC, desktop, webhook per saved preferences) when the
+        /// run needs input, stops, or completes. Also MODEL_ROUTER_NOTIFY=1.
+        #[arg(long)]
+        notify: bool,
     },
     /// Compare two attempts of a stage, or a rerun's stage with its source's.
     Compare {
@@ -436,6 +448,7 @@ fn main_result() -> Result<()> {
             worktree,
             unattended,
             with_review,
+            notify,
         }) => {
             let task = match (task, task_file, task_url) {
                 (Some(task), _, _) => task,
@@ -454,7 +467,7 @@ fn main_result() -> Result<()> {
             }
             let mut run = Run::create(&project, &settings, &workflow, task, worktree)?;
             println!("Run: {}\nArtifacts: {}", run.id, run.directory.display());
-            cli_drive(&mut run, &cancel)?;
+            cli_drive(&mut run, &cancel, notify::cli_enabled(notify))?;
         }
         Some(Commands::Resume {
             id,
@@ -463,6 +476,7 @@ fn main_result() -> Result<()> {
             model,
             advance,
             allow_repair,
+            notify,
         }) => {
             let mut run = engine::load(&project, &id)?;
             if advance {
@@ -474,12 +488,13 @@ fn main_result() -> Result<()> {
             if retry || interactive || model.is_some() {
                 run.retry(interactive, model)?;
             }
-            cli_drive(&mut run, &cancel)?;
+            cli_drive(&mut run, &cancel, notify::cli_enabled(notify))?;
         }
         Some(Commands::Rerun {
             id,
             worktree,
             unattended,
+            notify,
         }) => {
             let mut run = history::rerun(&project, &settings, &id, worktree.then_some(true))?;
             if unattended {
@@ -493,7 +508,7 @@ fn main_result() -> Result<()> {
                 run.id,
                 run.directory.display()
             );
-            cli_drive(&mut run, &cancel)?;
+            cli_drive(&mut run, &cancel, notify::cli_enabled(notify))?;
         }
         Some(Commands::Compare {
             id,
@@ -624,9 +639,14 @@ fn drive_printing(run: &mut Run, cancel: &AtomicBool) -> Result<Action> {
     action
 }
 
-fn cli_drive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
+fn cli_drive(run: &mut Run, cancel: &AtomicBool, notify: bool) -> Result<()> {
     loop {
-        let action = drive_printing(run, cancel)?;
+        let action = drive_printing(run, cancel);
+        if notify {
+            let outcome = action.as_ref().map(|a| *a).map_err(|e| format!("{e:#}"));
+            notify::notify_outcome(run, &outcome);
+        }
+        let action = action?;
         match action {
             Action::Complete => {
                 use model_router::report;
