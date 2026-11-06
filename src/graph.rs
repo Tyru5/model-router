@@ -245,12 +245,8 @@ mod tests {
     }
     fn workflow(stages: Vec<Stage>) -> Workflow {
         Workflow {
-            sandbox_default: Default::default(),
-            budget: Default::default(),
-            name: "w".into(),
             max_repair_passes: 0,
-            max_parallel: 2,
-            stages,
+            ..Workflow::new("w", stages)
         }
     }
     fn fan(judge: &str) -> Option<FanOut> {

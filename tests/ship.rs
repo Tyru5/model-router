@@ -228,12 +228,8 @@ fn fixture(stages: Vec<Stage>, options: Option<ship::Options>) -> Option<Fixture
     });
     let settings = Settings {
         workflows: vec![Workflow {
-            max_parallel: 2,
-            name: "Ship test".into(),
             max_repair_passes: 0,
-            sandbox_default: Default::default(),
-            budget: Default::default(),
-            stages,
+            ..Workflow::new("Ship test", stages)
         }],
         adapters: BTreeMap::from([("mock".into(), adapter)]),
         ..Settings::default()

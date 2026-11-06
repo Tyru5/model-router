@@ -1,4 +1,5 @@
 use super::input::InputField;
+use super::tasks::{Msg, Spawner, ticket};
 use super::theme::Palette;
 use super::widgets::{content, menu_key, textarea};
 use crate::{catalog, storage};
@@ -14,18 +15,17 @@ use ratatui::{
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
-    thread,
 };
 use tui_textarea::CursorMove;
 
-struct Entry {
+/// A folder or file in a listing.
+pub(super) struct FolderEntry {
     path: PathBuf,
     repository: bool,
     directory: bool,
 }
 
-impl Entry {
+impl FolderEntry {
     fn new(path: PathBuf) -> Self {
         // Linked worktrees and submodules use a .git file instead of a directory.
         let git = path.join(".git");
@@ -56,25 +56,27 @@ struct Reading {
     directory: PathBuf,
     /// The entry to select once read.
     select: Option<PathBuf>,
-    receiver: Receiver<std::result::Result<Vec<Entry>, String>>,
+    /// Identifies the read's result.
+    ticket: u64,
 }
 
 pub(super) struct PathPicker {
     directory: PathBuf,
     reading: Option<Reading>,
-    entries: Vec<Entry>,
-    recent: Vec<Entry>,
+    entries: Vec<FolderEntry>,
+    recent: Vec<FolderEntry>,
     show_recent: bool,
     selected: usize,
     filter: InputField<'static>,
     path_input: Option<InputField<'static>>,
     pub error: String,
     files: bool,
+    spawner: Spawner,
 }
 
 /// The folders (and with `files`, files) in `directory`, repositories or
 /// folders first.
-fn read_entries(directory: &Path, files: bool) -> std::result::Result<Vec<Entry>, String> {
+fn read_entries(directory: &Path, files: bool) -> std::result::Result<Vec<FolderEntry>, String> {
     let mut entries: Vec<_> = fs::read_dir(directory)
         .map_err(|e| format!("Cannot browse {}: {e}", directory.display()))?
         .filter_map(|entry| entry.ok())
@@ -82,7 +84,7 @@ fn read_entries(directory: &Path, files: bool) -> std::result::Result<Vec<Entry>
             entry.file_name() != ".git"
                 && (entry.path().is_dir() || (files && entry.path().is_file()))
         })
-        .map(|entry| Entry::new(entry.path()))
+        .map(|entry| FolderEntry::new(entry.path()))
         .collect();
     entries.sort_by_cached_key(|entry| {
         (
@@ -102,7 +104,7 @@ impl PathPicker {
     pub(super) fn active_input(&mut self) -> &mut InputField<'static> {
         self.path_input.as_mut().unwrap_or(&mut self.filter)
     }
-    pub fn new(project: &Path, recent: Vec<PathBuf>) -> Result<Self> {
+    pub fn new(project: &Path, recent: Vec<PathBuf>, spawner: Spawner) -> Result<Self> {
         let mut picker = Self {
             directory: project.into(),
             reading: None,
@@ -110,7 +112,7 @@ impl PathPicker {
             recent: recent
                 .into_iter()
                 .filter(|p| p.is_dir())
-                .map(Entry::new)
+                .map(FolderEntry::new)
                 .collect(),
             show_recent: false,
             selected: 0,
@@ -118,6 +120,7 @@ impl PathPicker {
             path_input: None,
             error: String::new(),
             files: false,
+            spawner,
         };
         let parent = project.parent().unwrap_or(project);
         picker
@@ -126,7 +129,7 @@ impl PathPicker {
         Ok(picker)
     }
 
-    pub fn files(project: &Path) -> Result<Self> {
+    pub fn files(project: &Path, spawner: Spawner) -> Result<Self> {
         let mut picker = Self {
             directory: project.into(),
             reading: None,
@@ -138,6 +141,7 @@ impl PathPicker {
             path_input: None,
             error: String::new(),
             files: true,
+            spawner,
         };
         picker.visit(project)?;
         Ok(picker)
@@ -151,15 +155,16 @@ impl PathPicker {
     /// not a directory fails now, keeping the current view.
     fn visit_selecting(&mut self, path: &Path, select: Option<PathBuf>) -> Result<()> {
         let directory = catalog::check_project(path)?;
-        let (sender, receiver) = mpsc::channel();
-        let (target, files) = (directory.clone(), self.files);
-        thread::spawn(move || {
-            let _ = sender.send(read_entries(&target, files));
-        });
+        let (target, files, ticket) = (directory.clone(), self.files, ticket());
+        self.spawner.spawn(
+            "Reading the folder stopped",
+            move || read_entries(&target, files),
+            move |result| Msg::Folder { ticket, result },
+        );
         self.reading = Some(Reading {
             directory,
             select,
-            receiver,
+            ticket,
         });
         self.filter = textarea("");
         self.show_recent = false;
@@ -167,16 +172,21 @@ impl PathPicker {
         Ok(())
     }
 
-    /// Shows a folder that finished reading; true when the view changed.
-    pub(super) fn poll(&mut self) -> bool {
-        let Some(reading) = &self.reading else {
+    /// Whether the folder being read reports with `ticket`.
+    pub(super) fn waits_for(&self, ticket: u64) -> bool {
+        self.reading.as_ref().is_some_and(|r| r.ticket == ticket)
+    }
+
+    /// Shows a folder that finished reading; false when `ticket` is not
+    /// the read this picker waits for.
+    pub(super) fn folder_read(
+        &mut self,
+        ticket: u64,
+        result: std::result::Result<Vec<FolderEntry>, String>,
+    ) -> bool {
+        if !self.waits_for(ticket) {
             return false;
-        };
-        let result = match reading.receiver.try_recv() {
-            Ok(result) => result,
-            Err(mpsc::TryRecvError::Empty) => return false,
-            Err(mpsc::TryRecvError::Disconnected) => Err("Reading the folder stopped".into()),
-        };
+        }
         let reading = self.reading.take().expect("a folder was being read");
         match result {
             // Only replace the view after a successful read, so failed navigation is recoverable.
@@ -198,15 +208,15 @@ impl PathPicker {
 
     /// Waits for the folder being read, as tests need.
     #[cfg(test)]
-    pub(super) fn wait(&mut self) {
+    pub(super) fn wait(&mut self, inbox: &std::sync::mpsc::Receiver<(u64, Msg)>) {
         while self.reading.is_some() {
-            if !self.poll() {
-                thread::sleep(std::time::Duration::from_millis(2));
+            if let (_, Msg::Folder { ticket, result }) = inbox.recv().expect("a folder read") {
+                self.folder_read(ticket, result);
             }
         }
     }
 
-    fn entries(&self) -> &[Entry] {
+    fn entries(&self) -> &[FolderEntry] {
         if self.show_recent {
             &self.recent
         } else {
@@ -583,9 +593,23 @@ mod tests {
         );
     }
 
+    thread_local! {
+        /// Where this test's folder reads report.
+        static INBOX: std::cell::RefCell<Option<std::sync::mpsc::Receiver<(u64, Msg)>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    fn spawner() -> Spawner {
+        let (spawner, inbox) = Spawner::detached();
+        INBOX.with(|cell| *cell.borrow_mut() = Some(inbox));
+        spawner
+    }
+    fn wait(picker: &mut PathPicker) {
+        INBOX.with(|cell| picker.wait(cell.borrow().as_ref().expect("a spawner")));
+    }
+
     fn key(picker: &mut PathPicker, code: Key) -> Result<PickerAction> {
         let action = picker.key(KeyEvent::new(code, Mods::NONE));
-        picker.wait();
+        wait(picker);
         action
     }
 
@@ -596,14 +620,14 @@ mod tests {
     }
 
     fn browse(project: &Path, recent: Vec<PathBuf>) -> PathPicker {
-        let mut picker = PathPicker::new(project, recent).unwrap();
-        picker.wait();
+        let mut picker = PathPicker::new(project, recent, spawner()).unwrap();
+        wait(&mut picker);
         picker
     }
 
     fn files(project: &Path) -> PathPicker {
-        let mut picker = PathPicker::files(project).unwrap();
-        picker.wait();
+        let mut picker = PathPicker::files(project, spawner()).unwrap();
+        wait(&mut picker);
         picker
     }
 

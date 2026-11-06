@@ -20,14 +20,7 @@ pub fn tempdir() -> tempfile::TempDir {
         .unwrap()
 }
 pub fn workflow(stages: Vec<Stage>) -> Workflow {
-    Workflow {
-        name: "Test".into(),
-        max_repair_passes: 2,
-        max_parallel: 2,
-        sandbox_default: Default::default(),
-        budget: Default::default(),
-        stages,
-    }
+    Workflow::new("Test", stages)
 }
 /// Settings with the offline mock adapter and `workflow` saved.
 pub fn settings(workflow: &Workflow) -> Settings {

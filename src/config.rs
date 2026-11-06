@@ -358,6 +358,18 @@ fn is_two(value: &u32) -> bool {
     *value == 2
 }
 impl Workflow {
+    /// A workflow with `stages` and default settings: two repair passes, two
+    /// parallel processes, no sandbox default, and no budget.
+    pub fn new(name: impl Into<String>, stages: Vec<Stage>) -> Self {
+        Self {
+            name: name.into(),
+            max_repair_passes: two(),
+            sandbox_default: Sandbox::default(),
+            max_parallel: two(),
+            stages,
+            budget: Budget::default(),
+        }
+    }
     /// Appends the review summary unless a stage already has the summary role.
     /// Run once, by the v1→v2 migration: deleting the stage later opts out.
     /// The preset runs on Codex; when Codex is not installed the stage uses
@@ -1313,17 +1325,16 @@ checks = [
     #[test]
     fn summary_migration_uses_the_first_enabled_harness_without_codex() {
         let mut workflow = Workflow {
-            name: "w".into(),
             max_repair_passes: 0,
-            sandbox_default: Sandbox::Off,
-            budget: Default::default(),
-            max_parallel: 2,
-            stages: vec![Stage {
-                id: "a".into(),
-                harness: "claude".into(),
-                model: "opus".into(),
-                ..Stage::default()
-            }],
+            ..Workflow::new(
+                "w",
+                vec![Stage {
+                    id: "a".into(),
+                    harness: "claude".into(),
+                    model: "opus".into(),
+                    ..Stage::default()
+                }],
+            )
         };
         workflow.ensure_summary();
         let summary = workflow.stages.last().unwrap();

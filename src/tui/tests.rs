@@ -1,8 +1,10 @@
 use super::{
     actions::ActionId,
-    app::{App, Job, Worker, draw},
-    modal::{Ask, Modal, PickValue},
+    app::{App, Page, draw},
+    modal::{Ask, Loading, Modal, PickValue},
     path_picker::PathPicker,
+    run_slot::Worker,
+    tasks::Msg,
     theme::{self, Theme},
     widgets::textarea,
     workflow_page::StageEditor,
@@ -35,8 +37,8 @@ fn theme_app(project: &std::path::Path) -> App {
         project.join("config.toml"),
         Arc::new(AtomicBool::new(false)),
     );
-    app.theme_path = project.join("appearance.json");
-    app.harness_checks.probe = |_, _| vec![];
+    app.ui.theme_path = project.join("appearance.json");
+    app.harnesses.checks.probe = |_, _| vec![];
     app
 }
 
@@ -44,30 +46,30 @@ fn theme_app(project: &std::path::Path) -> App {
 fn vim_opt_in_persists_without_changing_the_theme_or_project() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    assert!(!app.vim_motions);
-    assert!(!theme::load(&app.theme_path).unwrap().vim_motions);
-    std::fs::write(&app.theme_path, r#"{"theme":"dracula"}"#).unwrap();
-    let legacy = theme::load(&app.theme_path).unwrap();
+    assert!(!app.ui.vim_motions);
+    assert!(!theme::load(&app.ui.theme_path).unwrap().vim_motions);
+    std::fs::write(&app.ui.theme_path, r#"{"theme":"dracula"}"#).unwrap();
+    let legacy = theme::load(&app.ui.theme_path).unwrap();
     assert!(!legacy.vim_motions);
-    app.theme = legacy.theme;
+    app.ui.theme = legacy.theme;
     app.key(key(Key::F(8))).unwrap();
-    let saved = theme::load(&app.theme_path).unwrap();
-    assert!(app.vim_motions && saved.vim_motions);
-    assert_eq!(saved.theme, app.theme);
-    assert!(!app.dirty);
+    let saved = theme::load(&app.ui.theme_path).unwrap();
+    assert!(app.ui.vim_motions && saved.vim_motions);
+    assert_eq!(saved.theme, app.ui.theme);
+    assert!(!app.editor.dirty);
     app.pick(PickValue::Theme(Theme::CatppuccinLatte)).unwrap();
-    assert!(theme::load(&app.theme_path).unwrap().vim_motions);
+    assert!(theme::load(&app.ui.theme_path).unwrap().vim_motions);
     app.key(key(Key::Char(':'))).unwrap();
     app.paste("Vim motions");
     app.key(key(Key::Enter)).unwrap();
-    assert!(!app.vim_motions);
-    assert!(!theme::load(&app.theme_path).unwrap().vim_motions);
-    assert_eq!(app.theme, Theme::CatppuccinLatte);
+    assert!(!app.ui.vim_motions);
+    assert!(!theme::load(&app.ui.theme_path).unwrap().vim_motions);
+    assert_eq!(app.ui.theme, Theme::CatppuccinLatte);
     let obstruction = project.path().join("file");
     std::fs::write(&obstruction, "unchanged").unwrap();
-    app.theme_path = obstruction.join("appearance.json");
+    app.ui.theme_path = obstruction.join("appearance.json");
     assert!(app.key(key(Key::F(8))).is_err());
-    assert!(!app.vim_motions);
+    assert!(!app.ui.vim_motions);
 }
 
 #[test]
@@ -77,9 +79,9 @@ fn vim_toggle_sits_below_header_options_on_the_right() {
     for width in [65, 80, 120] {
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
         for enabled in [false, true] {
-            app.vim_motions = enabled;
-            for page in 0..4 {
-                app.page = page;
+            app.ui.vim_motions = enabled;
+            for page in Page::ALL {
+                app.ui.page = page;
                 terminal.draw(|frame| draw(frame, &mut app)).unwrap();
                 let buffer = terminal.backend().buffer();
                 let first_row = (0..width)
@@ -111,14 +113,14 @@ fn vim_toggle_sits_below_header_options_on_the_right() {
             }
         }
     }
-    app.page = 0;
-    app.task = "Keep this draft".into();
+    app.ui.page = Page::Workflow;
+    app.editor.task = "Keep this draft".into();
     app.key(key(Key::Char('t'))).unwrap();
     app.key(key(Key::Esc)).unwrap();
     app.key(key(Key::F(8))).unwrap();
-    assert!(!app.vim_motions && app.modal.is_some());
+    assert!(!app.ui.vim_motions && app.ui.dialog().is_some());
     app.key(key(Key::F(8))).unwrap();
-    assert!(app.vim_motions && app.modal.is_some());
+    assert!(app.ui.vim_motions && app.ui.dialog().is_some());
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(65, 20)).unwrap();
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let buffer = terminal.backend().buffer();
@@ -128,7 +130,7 @@ fn vim_toggle_sits_below_header_options_on_the_right() {
         .map(|c| c.symbol())
         .collect::<String>();
     assert!(display.contains("VIM INSERT"));
-    let field = app.modal.as_mut().unwrap().active_input().unwrap();
+    let field = app.ui.dialog_mut().unwrap().active_input().unwrap();
     assert_eq!(super::widgets::content(field), "Keep this draft");
     assert!(field.mode_hint().unwrap().contains("INSERT"));
 }
@@ -137,19 +139,22 @@ fn vim_toggle_sits_below_header_options_on_the_right() {
 fn vim_task_editing_routes_escape_motions_paste_and_save() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    app.task = "first\nsecond".into();
+    app.editor.task = "first\nsecond".into();
     app.key(key(Key::Char('t'))).unwrap();
     app.key(key(Key::Char('h'))).unwrap();
     assert_eq!(
-        super::widgets::content(app.modal.as_mut().unwrap().active_input().unwrap()),
+        super::widgets::content(app.ui.dialog_mut().unwrap().active_input().unwrap()),
         "first\nsecondh"
     );
     app.key(key(Key::Esc)).unwrap();
-    assert!(app.modal.is_none(), "default Esc still cancels immediately");
+    assert!(
+        app.ui.dialog().is_none(),
+        "default Esc still cancels immediately"
+    );
     app.key(key(Key::F(8))).unwrap();
     app.key(key(Key::Char('t'))).unwrap();
     app.key(key(Key::Esc)).unwrap();
-    assert!(app.modal.is_some());
+    assert!(app.ui.dialog().is_some());
     for c in "gg0i".chars() {
         app.key(key(Key::Char(c))).unwrap();
     }
@@ -167,16 +172,21 @@ fn vim_task_editing_routes_escape_motions_paste_and_save() {
     assert!(display.contains("VIM NORMAL"));
     app.key(KeyEvent::new(Key::Char('s'), Mods::CONTROL))
         .unwrap();
-    assert!(app.modal.is_none());
-    assert_eq!(app.task, "Prefix first\nsecond");
+    assert!(app.ui.dialog().is_none());
+    assert_eq!(app.editor.task, "Prefix first\nsecond");
     app.key(key(Key::Char('t'))).unwrap();
     assert_eq!(
-        app.modal.as_mut().unwrap().active_input().unwrap().cursor(),
+        app.ui
+            .dialog_mut()
+            .unwrap()
+            .active_input()
+            .unwrap()
+            .cursor(),
         (1, 6)
     );
     app.key(key(Key::Esc)).unwrap();
     app.key(key(Key::Esc)).unwrap();
-    assert!(app.modal.is_none());
+    assert!(app.ui.dialog().is_none());
 }
 
 #[test]
@@ -185,15 +195,15 @@ fn vim_stage_navigation_keeps_choices_and_refocus_behavior() {
     let mut app = theme_app(project.path());
     app.key(key(Key::F(8))).unwrap();
     app.key(key(Key::Char('e'))).unwrap();
-    let original = super::widgets::content(app.modal.as_mut().unwrap().active_input().unwrap());
+    let original = super::widgets::content(app.ui.dialog_mut().unwrap().active_input().unwrap());
     app.key(key(Key::Esc)).unwrap();
     app.key(key(Key::Char('0'))).unwrap();
     app.key(key(Key::Char('g'))).unwrap();
     app.key(key(Key::Down)).unwrap(); // Role remains a choice, not a Vim input.
-    assert!(app.modal.as_mut().unwrap().active_input().is_none());
+    assert!(app.ui.dialog_mut().unwrap().active_input().is_none());
     app.key(key(Key::Up)).unwrap();
     app.key(key(Key::Char('!'))).unwrap();
-    let field = app.modal.as_mut().unwrap().active_input().unwrap();
+    let field = app.ui.dialog_mut().unwrap().active_input().unwrap();
     assert_eq!(super::widgets::content(field), format!("{original}!"));
     assert!(field.mode_hint().unwrap().contains("INSERT"));
     // Up goes to instructions; j/k move within the multiline input instead.
@@ -201,12 +211,12 @@ fn vim_stage_navigation_keeps_choices_and_refocus_behavior() {
     app.paste("\nlast line");
     app.key(key(Key::Esc)).unwrap();
     app.key(key(Key::Char('k'))).unwrap();
-    assert!(app.modal.as_mut().unwrap().active_input().is_some());
+    assert!(app.ui.dialog_mut().unwrap().active_input().is_some());
     // Down returns to the last line first; only there does it leave the field.
     app.key(key(Key::Down)).unwrap();
     assert_eq!(
-        app.modal
-            .as_mut()
+        app.ui
+            .dialog_mut()
             .unwrap()
             .active_input()
             .unwrap()
@@ -217,7 +227,7 @@ fn vim_stage_navigation_keeps_choices_and_refocus_behavior() {
     );
     app.key(key(Key::Down)).unwrap();
     assert_eq!(
-        super::widgets::content(app.modal.as_mut().unwrap().active_input().unwrap()),
+        super::widgets::content(app.ui.dialog_mut().unwrap().active_input().unwrap()),
         format!("{original}!")
     );
 }
@@ -226,15 +236,18 @@ fn vim_stage_navigation_keeps_choices_and_refocus_behavior() {
 fn vim_motions_reach_harness_path_import_and_filter_inputs() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    app.vim_motions = true;
+    app.ui.vim_motions = true;
     for modal in [
         Modal::Harness(Box::new(super::harness_editor::HarnessEditor::new(
             Stage::default(),
             Default::default(),
         ))),
-        Modal::Repositories(Box::new(PathPicker::new(project.path(), vec![]).unwrap())),
+        Modal::Repositories(Box::new(
+            PathPicker::new(project.path(), vec![], app.tasks.spawner()).unwrap(),
+        )),
         Modal::Import(Box::new(
-            super::task_importer::TaskImporter::new(project.path(), "").unwrap(),
+            super::task_importer::TaskImporter::new(project.path(), "", app.tasks.spawner())
+                .unwrap(),
         )),
         Modal::Picker {
             title: "Picker".into(),
@@ -244,22 +257,22 @@ fn vim_motions_reach_harness_path_import_and_filter_inputs() {
             note: String::new(),
         },
     ] {
-        app.modal = Some(modal);
+        app.ui.open(modal);
         app.paste("abc");
         app.key(key(Key::Esc)).unwrap();
         app.key(key(Key::Char('0'))).unwrap();
-        let field = app.modal.as_mut().unwrap().active_input().unwrap();
+        let field = app.ui.dialog_mut().unwrap().active_input().unwrap();
         assert_eq!(field.cursor(), (0, 0));
         assert_eq!(super::widgets::content(field), "abc");
         app.key(key(Key::Char('A'))).unwrap();
         app.key(key(Key::Char('!'))).unwrap();
         assert_eq!(
-            super::widgets::content(app.modal.as_mut().unwrap().active_input().unwrap()),
+            super::widgets::content(app.ui.dialog_mut().unwrap().active_input().unwrap()),
             "abc!"
         );
     }
-    app.modal = None;
-    app.page = 2;
+    app.ui.dialogs.clear();
+    app.ui.page = Page::Runs;
     app.key(key(Key::Char('/'))).unwrap();
     app.paste("abc");
     app.key(key(Key::Esc)).unwrap();
@@ -276,32 +289,32 @@ fn vim_motions_reach_harness_path_import_and_filter_inputs() {
 fn theme_preview_is_cancelable_and_only_enter_persists() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    app.task = "Keep my task".into();
-    let settings = toml::to_string(&app.settings).unwrap();
+    app.editor.task = "Keep my task".into();
+    let settings = toml::to_string(&app.editor.settings).unwrap();
     app.key(key(Key::Char('T'))).unwrap();
     app.key(KeyEvent::new(Key::Char('n'), Mods::CONTROL))
         .unwrap();
-    assert_eq!(app.displayed_theme(), Theme::Terminal);
-    assert_eq!(app.theme, Theme::ModelRouter);
-    assert!(!app.theme_path.exists());
+    assert_eq!(app.ui.displayed_theme(), Theme::Terminal);
+    assert_eq!(app.ui.theme, Theme::ModelRouter);
+    assert!(!app.ui.theme_path.exists());
     app.key(KeyEvent::new(Key::Char('p'), Mods::CONTROL))
         .unwrap();
-    assert_eq!(app.displayed_theme(), Theme::ModelRouter);
+    assert_eq!(app.ui.displayed_theme(), Theme::ModelRouter);
     app.key(key(Key::Down)).unwrap();
     app.key(key(Key::Esc)).unwrap();
-    assert_eq!(app.displayed_theme(), Theme::ModelRouter);
-    assert!(!app.theme_path.exists());
+    assert_eq!(app.ui.displayed_theme(), Theme::ModelRouter);
+    assert!(!app.ui.theme_path.exists());
 
     app.key(key(Key::Char('T'))).unwrap();
     for c in "latte".chars() {
         app.key(key(Key::Char(c))).unwrap();
     }
-    assert_eq!(app.displayed_theme(), Theme::CatppuccinLatte);
+    assert_eq!(app.ui.displayed_theme(), Theme::CatppuccinLatte);
     app.key(key(Key::Enter)).unwrap();
-    assert!(app.modal.is_none());
-    assert_eq!(app.theme, Theme::CatppuccinLatte);
+    assert!(app.ui.dialog().is_none());
+    assert_eq!(app.ui.theme, Theme::CatppuccinLatte);
     assert_eq!(
-        theme::load(&app.theme_path).unwrap().theme,
+        theme::load(&app.ui.theme_path).unwrap().theme,
         Theme::CatppuccinLatte
     );
 
@@ -313,18 +326,18 @@ fn theme_preview_is_cancelable_and_only_enter_persists() {
         .unwrap();
     app.key(key(Key::Enter)).unwrap();
     assert!(
-        app.modal.is_some(),
+        app.ui.dialog().is_some(),
         "An empty search must not choose a theme"
     );
     app.key(key(Key::Esc)).unwrap();
-    assert_eq!(app.displayed_theme(), Theme::CatppuccinLatte);
+    assert_eq!(app.ui.displayed_theme(), Theme::CatppuccinLatte);
     assert_eq!(
-        theme::load(&app.theme_path).unwrap().theme,
+        theme::load(&app.ui.theme_path).unwrap().theme,
         Theme::CatppuccinLatte
     );
-    assert!(!app.dirty);
-    assert_eq!(app.task, "Keep my task");
-    assert_eq!(toml::to_string(&app.settings).unwrap(), settings);
+    assert!(!app.editor.dirty);
+    assert_eq!(app.editor.task, "Keep my task");
+    assert_eq!(toml::to_string(&app.editor.settings).unwrap(), settings);
 }
 
 #[test]
@@ -333,32 +346,32 @@ fn failed_theme_save_preserves_committed_theme_and_allows_cancel() {
     let mut app = theme_app(project.path());
     let obstruction = project.path().join("not-a-directory");
     std::fs::write(&obstruction, "keep this file").unwrap();
-    app.theme_path = obstruction.join("appearance.json");
+    app.ui.theme_path = obstruction.join("appearance.json");
     app.choose_theme();
     for c in "dracula".chars() {
         app.key(key(Key::Char(c))).unwrap();
     }
     assert!(app.key(key(Key::Enter)).is_err());
     assert!(
-        matches!(&app.modal, Some(Modal::Picker { note, .. }) if note.contains("Could not apply selection"))
+        matches!(app.ui.dialog(), Some(Modal::Picker { note, .. }) if note.contains("Could not apply selection"))
     );
-    assert_eq!(app.theme, Theme::ModelRouter);
+    assert_eq!(app.ui.theme, Theme::ModelRouter);
     app.key(key(Key::Esc)).unwrap();
-    assert_eq!(app.displayed_theme(), Theme::ModelRouter);
+    assert_eq!(app.ui.displayed_theme(), Theme::ModelRouter);
     assert_eq!(
         std::fs::read_to_string(obstruction).unwrap(),
         "keep this file"
     );
-    assert!(!app.dirty);
+    assert!(!app.editor.dirty);
 }
 
 #[test]
 fn every_theme_reaches_pages_dialogs_and_text_inputs() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    app.task = "Preserve editor content".into();
+    app.editor.task = "Preserve editor content".into();
     for theme in Theme::ALL {
-        app.theme = theme;
+        app.ui.theme = theme;
         let palette = theme.palette();
         for (width, height) in [(120, 36), (80, 24)] {
             let mut terminal =
@@ -371,9 +384,9 @@ fn every_theme_reaches_pages_dialogs_and_text_inputs() {
             .into_iter()
             .enumerate()
             {
-                app.modal = None;
+                app.ui.dialogs.clear();
                 if step == 14 {
-                    app.focused.run = Some(crate::report::tests::sample());
+                    app.session.adopt(crate::report::tests::sample());
                 }
                 app.key(key(Key::Char(action))).unwrap();
                 terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -393,13 +406,13 @@ fn every_theme_reaches_pages_dialogs_and_text_inputs() {
                 );
             }
             assert!(app.results_shown());
-            app.focused.run = None;
-            app.modal = None;
+            app.session.runs.clear();
+            app.ui.dialogs.clear();
         }
     }
-    assert_eq!(app.task, "Preserve editor content");
-    assert!(!app.theme_path.exists());
-    assert!(!app.dirty);
+    assert_eq!(app.editor.task, "Preserve editor content");
+    assert!(!app.ui.theme_path.exists());
+    assert!(!app.editor.dirty);
 }
 
 #[test]
@@ -411,34 +424,34 @@ fn stage_presets_are_inserted_only_after_save_and_have_unique_ids() {
         project.path().join("config.toml"),
         Arc::new(AtomicBool::new(false)),
     );
-    let original = toml::to_string(&app.settings).unwrap();
+    let original = toml::to_string(&app.editor.settings).unwrap();
     let preset = presets::STAGES
         .iter()
         .position(|p| p.key == "plan")
         .unwrap();
     app.pick(PickValue::StagePreset(preset)).unwrap();
-    assert_eq!(toml::to_string(&app.settings).unwrap(), original);
+    assert_eq!(toml::to_string(&app.editor.settings).unwrap(), original);
     app.modal_key(key(Key::Esc)).unwrap();
-    assert!(!app.dirty);
-    assert_eq!(toml::to_string(&app.settings).unwrap(), original);
+    assert!(!app.editor.dirty);
+    assert_eq!(toml::to_string(&app.editor.settings).unwrap(), original);
     for _ in 0..2 {
         app.pick(PickValue::StagePreset(preset)).unwrap();
         app.modal_key(KeyEvent::new(Key::Char('s'), Mods::CONTROL))
             .unwrap();
-        assert_eq!(app.stage().role, Role::Planning);
+        assert_eq!(app.editor.stage().role, Role::Planning);
     }
-    let stages = &app.settings.workflows[0].stages;
+    let stages = &app.editor.settings.workflows[0].stages;
     assert_eq!(stages.len(), 6);
     assert_eq!(stages[0].id, "research");
     assert_eq!(stages[3].id, "implement");
     assert_eq!(stages[5].id, "summary");
     assert_ne!(stages[1].id, stages[2].id);
-    app.settings.validate().unwrap();
+    app.editor.settings.validate().unwrap();
     // Adding or duplicating at the limit must not leave an invalid workflow.
-    app.settings.workflows[0].stages = (0..64).map(|_| Stage::default()).collect();
+    app.editor.settings.workflows[0].stages = (0..64).map(|_| Stage::default()).collect();
     assert!(app.key(key(Key::Char('a'))).is_err());
     assert!(app.key(key(Key::Char('d'))).is_err());
-    assert_eq!(app.settings.workflows[0].stages.len(), 64);
+    assert_eq!(app.editor.settings.workflows[0].stages.len(), 64);
 }
 
 #[test]
@@ -450,19 +463,19 @@ fn workflow_presets_preserve_existing_workflows_and_task() {
         project.path().join("config.toml"),
         Arc::new(AtomicBool::new(false)),
     );
-    let original = toml::to_string(&app.settings.workflows[0]).unwrap();
-    app.task = "Keep the imported spec".into();
+    let original = toml::to_string(&app.editor.settings.workflows[0]).unwrap();
+    app.editor.task = "Keep the imported spec".into();
     app.pick(PickValue::WorkflowPreset(2)).unwrap();
     app.pick(PickValue::WorkflowPreset(2)).unwrap();
-    assert_eq!(app.settings.workflows.len(), 3);
-    assert_eq!(app.settings.workflows[1].name, "Bug fix");
-    assert_eq!(app.settings.workflows[2].name, "Bug fix (2)");
-    assert_eq!(app.task, "Keep the imported spec");
+    assert_eq!(app.editor.settings.workflows.len(), 3);
+    assert_eq!(app.editor.settings.workflows[1].name, "Bug fix");
+    assert_eq!(app.editor.settings.workflows[2].name, "Bug fix (2)");
+    assert_eq!(app.editor.task, "Keep the imported spec");
     assert_eq!(
-        toml::to_string(&app.settings.workflows[0]).unwrap(),
+        toml::to_string(&app.editor.settings.workflows[0]).unwrap(),
         original
     );
-    app.settings.validate().unwrap();
+    app.editor.settings.validate().unwrap();
 }
 
 #[test]
@@ -488,8 +501,8 @@ fn renders_starter_at_common_sizes() {
                 .collect::<String>();
             assert!(text.contains("MODEL ROUTER"));
         }
-        app.modal = Some(Modal::Repositories(Box::new(
-            PathPicker::new(&app.project, vec![]).unwrap(),
+        app.ui.open(Modal::Repositories(Box::new(
+            PathPicker::new(&app.project, vec![], app.tasks.spawner()).unwrap(),
         )));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         if width >= 65 {
@@ -509,7 +522,7 @@ fn renders_starter_at_common_sizes() {
 fn harness_editor_applies_only_to_selected_stage_and_supports_cancel() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    let original = serde_json::to_value(&app.settings).unwrap();
+    let original = serde_json::to_value(&app.editor.settings).unwrap();
     app.key(key(Key::Char('c'))).unwrap();
     for _ in 0..5 {
         app.key(KeyEvent::new(Key::Char('n'), Mods::CONTROL))
@@ -518,14 +531,17 @@ fn harness_editor_applies_only_to_selected_stage_and_supports_cancel() {
     app.key(key(Key::Right)).unwrap();
     // A changed draft asks before Esc discards it; [n] returns to it.
     app.key(key(Key::Esc)).unwrap();
-    assert!(matches!(&app.modal, Some(Modal::Ask(_))));
+    assert!(matches!(app.ui.dialog(), Some(Modal::Ask(_))));
     app.key(key(Key::Char('n'))).unwrap();
-    assert!(matches!(&app.modal, Some(Modal::Harness(_))));
+    assert!(matches!(app.ui.dialog(), Some(Modal::Harness(_))));
     app.key(key(Key::Esc)).unwrap();
     app.key(key(Key::Char('y'))).unwrap();
-    assert!(app.modal.is_none());
-    assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
-    assert!(!app.dirty);
+    assert!(app.ui.dialog().is_none());
+    assert_eq!(
+        serde_json::to_value(&app.editor.settings).unwrap(),
+        original
+    );
+    assert!(!app.editor.dirty);
 
     app.key(key(Key::Char('c'))).unwrap();
     for _ in 0..5 {
@@ -539,27 +555,30 @@ fn harness_editor_applies_only_to_selected_stage_and_supports_cancel() {
     app.key(key(Key::Right)).unwrap();
     app.key(KeyEvent::new(Key::Char('s'), Mods::CONTROL))
         .unwrap();
-    assert!(app.modal.is_none());
-    assert!(app.dirty);
-    assert_eq!(app.stage().harness_settings["sandbox"], "workspace-write");
+    assert!(app.ui.dialog().is_none());
+    assert!(app.editor.dirty);
     assert_eq!(
-        app.stage().harness_settings["approval_policy"],
+        app.editor.stage().harness_settings["sandbox"],
+        "workspace-write"
+    );
+    assert_eq!(
+        app.editor.stage().harness_settings["approval_policy"],
         "on-request"
     );
     for i in 1..3 {
         assert_eq!(
-            serde_json::to_value(&app.settings.workflows[0].stages[i]).unwrap(),
+            serde_json::to_value(&app.editor.settings.workflows[0].stages[i]).unwrap(),
             original["workflows"][0]["stages"][i]
         );
     }
     app.key(key(Key::Char('s'))).unwrap();
-    assert!(!app.dirty);
-    let (saved, _) = config::load(project.path(), Some(&app.config_path)).unwrap();
+    assert!(!app.editor.dirty);
+    let (saved, _) = config::load(project.path(), Some(&app.editor.config_path)).unwrap();
     assert_eq!(
         saved.workflows[0].stages[0].harness_settings,
-        app.stage().harness_settings
+        app.editor.stage().harness_settings
     );
-    let saved_settings = serde_json::to_value(&app.settings).unwrap();
+    let saved_settings = serde_json::to_value(&app.editor.settings).unwrap();
     app.key(key(Key::Char('c'))).unwrap();
     for _ in 0..4 {
         app.key(KeyEvent::new(Key::Char('n'), Mods::CONTROL))
@@ -572,25 +591,33 @@ fn harness_editor_applies_only_to_selected_stage_and_supports_cancel() {
     app.key(key(Key::Char('0'))).unwrap();
     app.key(KeyEvent::new(Key::Char('s'), Mods::CONTROL))
         .unwrap();
-    assert!(matches!(&app.modal, Some(Modal::Harness(e)) if e.error.contains("greater than zero")));
-    assert_eq!(serde_json::to_value(&app.settings).unwrap(), saved_settings);
+    assert!(
+        matches!(app.ui.dialog(), Some(Modal::Harness(e)) if e.error.contains("greater than zero"))
+    );
+    assert_eq!(
+        serde_json::to_value(&app.editor.settings).unwrap(),
+        saved_settings
+    );
     app.key(key(Key::Esc)).unwrap();
     app.key(key(Key::Char('y'))).unwrap();
-    assert!(app.modal.is_none());
+    assert!(app.ui.dialog().is_none());
 
     // Both ways of switching harness discard incompatible structured options.
-    let mut editor = StageEditor::new(app.stage().clone(), vec!["codex".into(), "claude".into()]);
+    let mut editor = StageEditor::new(
+        app.editor.stage().clone(),
+        vec!["codex".into(), "claude".into()],
+    );
     editor.fields[2] = textarea("claude");
     assert!(editor.finish().unwrap().harness_settings.is_empty());
     app.pick(PickValue::Harness("claude".into())).unwrap();
-    assert!(app.stage().harness_settings.is_empty());
+    assert!(app.editor.stage().harness_settings.is_empty());
 }
 
 #[test]
 fn stage_editor_model_field_picks_from_catalog_and_keeps_draft() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    let original = serde_json::to_value(&app.settings).unwrap();
+    let original = serde_json::to_value(&app.editor.settings).unwrap();
     app.key(key(Key::Char('e'))).unwrap();
     // Name, then a typed edit survives the round trip through the picker.
     for c in " draft".chars() {
@@ -602,25 +629,28 @@ fn stage_editor_model_field_picks_from_catalog_and_keeps_draft() {
     // The model field does not take typing; Enter opens the catalog.
     app.key(key(Key::Char('x'))).unwrap();
     assert!(
-        matches!(&app.modal, Some(Modal::Stage { editor, .. }) if !editor.finish().unwrap().model.contains('x'))
+        matches!(app.ui.dialog(), Some(Modal::Stage { editor, .. }) if !editor.finish().unwrap().model.contains('x'))
     );
     app.key(key(Key::Enter)).unwrap();
-    assert!(app.stage_editor.is_some());
-    assert!(matches!(app.modal, Some(Modal::Loading(_))));
+    // The picker opens above the editor, which keeps the draft.
+    assert!(matches!(
+        app.ui.dialogs.as_slice(),
+        [Modal::Stage { .. }, Modal::Loading(_)]
+    ));
     app.key(key(Key::Esc)).unwrap();
-    assert!(app.stage_editor.is_none());
+    assert_eq!(app.ui.dialogs.len(), 1);
     assert!(
-        matches!(&app.modal, Some(Modal::Stage { editor, .. }) if editor.finish().unwrap().name.contains("draft"))
+        matches!(app.ui.dialog(), Some(Modal::Stage { editor, .. }) if editor.finish().unwrap().name.contains("draft"))
     );
 
     // A failed catalog returns to the editor with the error shown.
     app.key(key(Key::Enter)).unwrap();
     let (sender, receiver) = mpsc::channel();
     sender.send(Err("Offline catalog".into())).unwrap();
-    app.catalog = Some(receiver);
+    deliver(&mut app, receiver);
     app.poll().unwrap();
-    assert!(matches!(&app.modal, Some(Modal::Stage { .. })));
-    assert!(app.alert.contains("Offline catalog"));
+    assert!(matches!(app.ui.dialog(), Some(Modal::Stage { .. })));
+    assert!(app.ui.alert.contains("Offline catalog"));
 
     // A pick fills model and provider in the draft, not the saved stage.
     app.key(key(Key::Enter)).unwrap();
@@ -639,17 +669,22 @@ fn stage_editor_model_field_picks_from_catalog_and_keeps_draft() {
             ..Catalog::default()
         }))
         .unwrap();
-    app.catalog = Some(receiver);
+    deliver(&mut app, receiver);
     app.poll().unwrap();
-    assert!(matches!(&app.modal, Some(Modal::Picker { title, .. }) if title.starts_with("codex ")));
+    assert!(
+        matches!(app.ui.dialog(), Some(Modal::Picker { title, .. }) if title.starts_with("codex "))
+    );
     app.key(key(Key::Enter)).unwrap();
-    let draft = match &app.modal {
+    let draft = match app.ui.dialog() {
         Some(Modal::Stage { editor, .. }) => editor.finish().unwrap(),
         other => panic!("expected stage editor, got {}", other.is_some()),
     };
     assert_eq!(draft.model, "picked-model");
     assert_eq!(draft.provider, "prov");
-    assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+    assert_eq!(
+        serde_json::to_value(&app.editor.settings).unwrap(),
+        original
+    );
 
     // Backspace returns to the harness default; i allows a custom ID.
     app.key(key(Key::Backspace)).unwrap();
@@ -659,16 +694,16 @@ fn stage_editor_model_field_picks_from_catalog_and_keeps_draft() {
     }
     app.key(KeyEvent::new(Key::Char('s'), Mods::CONTROL))
         .unwrap();
-    assert!(app.modal.is_none());
-    assert_eq!(app.stage().model, "custom-id");
-    assert_eq!(app.stage().provider, "prov");
+    assert!(app.ui.dialog().is_none());
+    assert_eq!(app.editor.stage().model, "custom-id");
+    assert_eq!(app.editor.stage().provider, "prov");
 }
 
 #[test]
 fn repository_line_follows_the_project() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    assert!(app.repo.is_none());
+    assert!(app.repo.info.is_none());
     let repo = project.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
     for args in [
@@ -689,7 +724,7 @@ fn repository_line_follows_the_project() {
     }
     std::fs::write(repo.join("new.txt"), "x").unwrap();
     app.switch_project(repo.clone()).unwrap();
-    let info = app.repo.clone().unwrap();
+    let info = app.repo.info.clone().unwrap();
     assert_eq!(info.name, "repo");
     assert_eq!(info.head, "trunk");
     assert!(!info.detached);
@@ -717,7 +752,7 @@ fn repository_line_follows_the_project() {
 fn harness_model_catalog_restores_draft_on_cancel_error_and_selection() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    let original = serde_json::to_value(&app.settings).unwrap();
+    let original = serde_json::to_value(&app.editor.settings).unwrap();
     app.key(key(Key::Char('c'))).unwrap();
     app.key(KeyEvent::new(Key::Char('a'), Mods::CONTROL))
         .unwrap();
@@ -727,19 +762,22 @@ fn harness_model_catalog_restores_draft_on_cancel_error_and_selection() {
         app.key(key(Key::Char(c))).unwrap();
     }
     app.key(key(Key::F(7))).unwrap();
-    assert!(app.model_editor.is_some());
+    assert!(matches!(
+        app.ui.dialogs.as_slice(),
+        [Modal::Harness(_), Modal::Loading(_)]
+    ));
     app.key(key(Key::Esc)).unwrap();
     assert!(
-        matches!(&app.modal, Some(Modal::Harness(e)) if e.finish().unwrap().model == "draft-model")
+        matches!(app.ui.dialog(), Some(Modal::Harness(e)) if e.finish().unwrap().model == "draft-model")
     );
 
     app.key(key(Key::F(7))).unwrap();
     let (sender, receiver) = mpsc::channel();
     sender.send(Err("Offline catalog".into())).unwrap();
-    app.catalog = Some(receiver);
+    deliver(&mut app, receiver);
     app.poll().unwrap();
     assert!(
-        matches!(&app.modal, Some(Modal::Harness(e)) if e.error.contains("Offline catalog") && e.finish().unwrap().model == "draft-model")
+        matches!(app.ui.dialog(), Some(Modal::Harness(e)) if e.error.contains("Offline catalog") && e.finish().unwrap().model == "draft-model")
     );
 
     app.key(key(Key::F(7))).unwrap();
@@ -758,23 +796,26 @@ fn harness_model_catalog_restores_draft_on_cancel_error_and_selection() {
             ..Catalog::default()
         }))
         .unwrap();
-    app.catalog = Some(receiver);
+    deliver(&mut app, receiver);
     app.poll().unwrap();
     app.key(key(Key::Enter)).unwrap();
     assert!(
-        matches!(&app.modal, Some(Modal::Harness(e)) if e.finish().unwrap().model == "selected-model")
+        matches!(app.ui.dialog(), Some(Modal::Harness(e)) if e.finish().unwrap().model == "selected-model")
     );
-    assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+    assert_eq!(
+        serde_json::to_value(&app.editor.settings).unwrap(),
+        original
+    );
     app.key(KeyEvent::new(Key::Char('s'), Mods::CONTROL))
         .unwrap();
-    assert_eq!(app.stage().model, "selected-model");
-    assert_eq!(app.stage().provider, "provider");
+    assert_eq!(app.editor.stage().model, "selected-model");
+    assert_eq!(app.editor.stage().provider, "provider");
 }
 
 /// Choose `id` from the command menu, as a user would.
 fn choose(app: &mut App, id: ActionId) -> bool {
     app.key(key(Key::Char(':'))).unwrap();
-    let Some(Modal::Picker { items, .. }) = &app.modal else {
+    let Some(Modal::Picker { items, .. }) = app.ui.dialog() else {
         panic!("The command menu did not open");
     };
     let position = items
@@ -789,7 +830,7 @@ fn choose(app: &mut App, id: ActionId) -> bool {
 
 fn menu(app: &mut App) -> Vec<ActionId> {
     app.key(key(Key::Char(':'))).unwrap();
-    let Some(Modal::Picker { items, .. }) = app.modal.take() else {
+    let Some(Modal::Picker { items, .. }) = app.ui.dialogs.pop() else {
         panic!("The command menu did not open");
     };
     items
@@ -801,8 +842,26 @@ fn menu(app: &mut App) -> Vec<ActionId> {
         .collect()
 }
 
+/// Hands the picker waiting on top the catalog `receiver` holds, as its read would.
+fn deliver(app: &mut App, receiver: mpsc::Receiver<Result<Catalog, String>>) {
+    let msg = Msg::Catalog {
+        harness: app.editor.stage().harness.clone(),
+        ticket: Some(waiting(app)),
+        result: receiver.recv().unwrap(),
+    };
+    app.update(app.tasks.generation(), msg);
+}
+
+/// The ticket of the Loading dialog on top.
+fn waiting(app: &App) -> u64 {
+    match app.ui.dialog() {
+        Some(Modal::Loading(loading)) => loading.ticket,
+        _ => panic!("nothing is loading"),
+    }
+}
+
 fn dialog(app: &App) -> Option<&str> {
-    app.modal.as_ref().map(|modal| match modal {
+    app.ui.dialog().map(|modal| match modal {
         Modal::Picker { title, .. } | Modal::Text { title, .. } | Modal::Input { title, .. } => {
             title.as_str()
         }
@@ -826,16 +885,21 @@ fn command_menu_actions_match_their_keys() {
         let exit = pressed.key(key(code)).unwrap();
         assert_eq!(choose(&mut chosen, id), exit, "{id:?}");
         assert_eq!(
-            serde_json::to_value(&chosen.settings).unwrap(),
-            serde_json::to_value(&pressed.settings).unwrap(),
+            serde_json::to_value(&chosen.editor.settings).unwrap(),
+            serde_json::to_value(&pressed.editor.settings).unwrap(),
             "{id:?}"
         );
         assert_eq!(
-            (chosen.page, chosen.dirty, &chosen.message, dialog(&chosen)),
             (
-                pressed.page,
-                pressed.dirty,
-                &pressed.message,
+                chosen.ui.page,
+                chosen.editor.dirty,
+                &chosen.ui.message,
+                dialog(&chosen)
+            ),
+            (
+                pressed.ui.page,
+                pressed.editor.dirty,
+                &pressed.ui.message,
                 dialog(&pressed)
             ),
             "{id:?}"
@@ -843,14 +907,14 @@ fn command_menu_actions_match_their_keys() {
     }
     // Errors surface as a key's do: the menu closes and the caller reports them.
     let mut app = theme_app(project.path());
-    app.settings.workflows[0].stages.truncate(1);
+    app.editor.settings.workflows[0].stages.truncate(1);
     let pressed = app.key(key(Key::Char('x'))).unwrap_err().to_string();
     app.key(key(Key::Char(':'))).unwrap();
     for c in "remove".chars() {
         app.key(key(Key::Char(c))).unwrap();
     }
     assert_eq!(app.key(key(Key::Enter)).unwrap_err().to_string(), pressed);
-    assert!(app.modal.is_none());
+    assert!(app.ui.dialog().is_none());
 }
 
 #[test]
@@ -861,35 +925,36 @@ fn command_menu_lists_only_actions_for_the_current_context() {
     assert!(workflow.contains(&ActionId::Run) && workflow.contains(&ActionId::Commands));
     assert!(!workflow.contains(&ActionId::CancelStage) && !workflow.contains(&ActionId::OpenRun));
 
-    app.page = 1;
+    app.ui.page = Page::Monitor;
     let idle = menu(&mut app);
     assert!(idle.contains(&ActionId::Continue) && idle.contains(&ActionId::Handoff));
     assert!(!idle.contains(&ActionId::CancelStage) && !idle.contains(&ActionId::Run));
 
-    app.focused.worker = Some(Worker::stub());
+    app.session.adopt(sample_run("a"));
+    app.slot_mut().worker = Some(Worker::stub());
     let running = menu(&mut app);
     assert!(running.contains(&ActionId::CancelStage) && running.contains(&ActionId::Handoff));
     assert!(!running.contains(&ActionId::Continue) && !running.contains(&ActionId::Advance));
 
     // Runs snapshot their workflow, so editing and starting another continue.
-    app.page = 0;
+    app.ui.page = Page::Workflow;
     let editing = menu(&mut app);
     assert!(editing.contains(&ActionId::Run) && editing.contains(&ActionId::EditTask));
     assert!(!editing.contains(&ActionId::CancelStage));
 
     // A menu opened during a run does nothing once the run has stopped.
-    app.page = 1;
+    app.ui.page = Page::Monitor;
     app.key(key(Key::Char(':'))).unwrap();
-    app.focused.worker = None;
+    app.slot_mut().worker = None;
     for c in "cancel stage".chars() {
         app.key(key(Key::Char(c))).unwrap();
     }
     app.key(key(Key::Enter)).unwrap();
-    assert!(app.modal.is_none() && !app.focused.cancel.load(Ordering::Relaxed));
+    assert!(app.ui.dialog().is_none() && !app.slot().cancel.load(Ordering::Relaxed));
 
-    app.page = 2;
+    app.ui.page = Page::Runs;
     assert!(menu(&mut app).contains(&ActionId::OpenRun));
-    app.page = 3;
+    app.ui.page = Page::Harnesses;
     assert!(menu(&mut app).contains(&ActionId::HarnessDetails));
 }
 
@@ -907,7 +972,7 @@ fn screen(terminal: &Terminal<ratatui::backend::TestBackend>) -> String {
 fn effort_levels_come_from_the_harness_catalog_in_both_editors() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    let harness = app.stage().harness.clone();
+    let harness = app.editor.stage().harness.clone();
     let mut listed = Model {
         id: "listed-model".into(),
         efforts: vec!["low".into(), "max".into()],
@@ -916,7 +981,7 @@ fn effort_levels_come_from_the_harness_catalog_in_both_editors() {
         ..Model::default()
     };
     listed.label = listed.id.clone();
-    app.catalogs.insert(
+    app.catalogs.cached.insert(
         harness.clone(),
         Catalog {
             models: vec![listed],
@@ -925,7 +990,7 @@ fn effort_levels_come_from_the_harness_catalog_in_both_editors() {
             ..Catalog::default()
         },
     );
-    app.stage_mut().effort = "custom".into();
+    app.editor.stage_mut().effort = "custom".into();
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
 
     // Workflow detail flags a level the catalog does not list.
@@ -951,10 +1016,10 @@ fn effort_levels_come_from_the_harness_catalog_in_both_editors() {
     app.key(key(Key::Right)).unwrap(); // high
     app.key(KeyEvent::new(Key::Char('s'), Mods::CONTROL))
         .unwrap();
-    assert_eq!(app.stage().effort, "high");
+    assert_eq!(app.editor.stage().effort, "high");
 
     // Harness editor: a listed model narrows the levels to its own.
-    app.stage_mut().model = "listed-model".into();
+    app.editor.stage_mut().model = "listed-model".into();
     app.key(key(Key::Char('c'))).unwrap();
     app.key(key(Key::Tab)).unwrap(); // provider
     app.key(key(Key::Tab)).unwrap(); // effort
@@ -970,7 +1035,7 @@ fn effort_levels_come_from_the_harness_catalog_in_both_editors() {
     app.key(key(Key::Right)).unwrap(); // low
     app.key(KeyEvent::new(Key::Char('s'), Mods::CONTROL))
         .unwrap();
-    assert_eq!(app.stage().effort, "low");
+    assert_eq!(app.editor.stage().effort, "low");
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     assert!(screen(&terminal).contains("listed by fixture cache"));
 
@@ -979,12 +1044,14 @@ fn effort_levels_come_from_the_harness_catalog_in_both_editors() {
     app.key(key(Key::Tab)).unwrap();
     app.key(key(Key::Tab)).unwrap();
     app.key(key(Key::Right)).unwrap();
-    let changed = match &app.modal {
+    let changed = match app.ui.dialog() {
         Some(Modal::Stage { editor, .. }) => editor.harness(),
         _ => panic!("stage editor expected"),
     };
     assert_ne!(changed, harness);
-    app.catalogs.insert(changed.clone(), Catalog::default());
+    app.catalogs
+        .cached
+        .insert(changed.clone(), Catalog::default());
     app.request_catalog(changed);
     for _ in 0..3 {
         app.key(key(Key::Tab)).unwrap();
@@ -1001,9 +1068,10 @@ fn sample_run(id: &str) -> crate::engine::Run {
 }
 
 fn session(app: &App) -> String {
-    app.slots()
+    app.session
+        .slots()
         .map(|(slot, focused)| {
-            let id = slot.run.as_ref().unwrap().id.clone();
+            let id = slot.run.id.clone();
             if focused { format!("{id}*") } else { id }
         })
         .collect::<Vec<_>>()
@@ -1015,29 +1083,29 @@ fn session_runs_keep_their_order_as_focus_moves_and_runs_close() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
     for id in ["a", "b", "c"] {
-        app.adopt(sample_run(id));
+        app.session.adopt(sample_run(id));
     }
     assert_eq!(session(&app), "a b c*");
-    app.cycle_focus(true);
+    app.session.cycle_focus(true);
     assert_eq!(session(&app), "a* b c");
-    app.cycle_focus(false);
+    app.session.cycle_focus(false);
     assert_eq!(session(&app), "a b c*");
-    assert!(app.focus_run("b") && !app.focus_run("missing"));
+    assert!(app.session.focus_run("b") && !app.session.focus_run("missing"));
     assert_eq!(session(&app), "a b* c");
 
     // An active run cannot be closed; closing focuses its neighbour.
-    app.focused.worker = Some(Worker::stub());
-    assert!(app.dismiss().is_err());
-    app.focused.worker = None;
-    app.dismiss().unwrap();
+    app.slot_mut().worker = Some(Worker::stub());
+    assert!(app.session.dismiss().is_err());
+    app.slot_mut().worker = None;
+    app.session.dismiss().unwrap();
     assert_eq!(session(&app), "a c*");
-    app.adopt(sample_run("d"));
+    app.session.adopt(sample_run("d"));
     assert_eq!(session(&app), "a c d*");
     for _ in 0..3 {
-        app.dismiss().unwrap();
+        app.session.dismiss().unwrap();
     }
     assert_eq!(session(&app), "");
-    assert!(app.focused.run.is_none() && app.parked.is_empty());
+    assert!(app.session.run().is_none() && app.session.runs.is_empty());
 }
 
 #[test]
@@ -1049,7 +1117,7 @@ fn a_busy_checkout_sends_the_next_run_to_a_worktree() {
     let mut busy = sample_run("busy");
     busy.workspace = std::fs::canonicalize(project.path()).unwrap();
     busy.status = Status::AwaitingConfirmation;
-    app.adopt(busy);
+    app.session.adopt(busy);
     assert!(
         app.placement(false)
             .unwrap_err()
@@ -1062,14 +1130,14 @@ fn a_busy_checkout_sends_the_next_run_to_a_worktree() {
         .status()
         .unwrap();
     assert!(init.success());
-    app.repo = crate::storage::repo_info(project.path());
+    app.repo.info = crate::storage::repo_info(project.path());
     assert_eq!(
         app.placement(false).unwrap(),
         (Placement::WorktreeFromHead, Some("run busy".into()))
     );
     assert_eq!(app.placement(true).unwrap().0, Placement::Worktree);
     // A finished run frees the checkout.
-    app.focused.run.as_mut().unwrap().status = Status::Complete;
+    app.session.run_mut().unwrap().status = Status::Complete;
     assert_eq!(app.placement(false).unwrap(), (Placement::Project, None));
 }
 
@@ -1097,9 +1165,9 @@ fn running_app(project: &std::path::Path) -> App {
     let mut run = sample_run("live");
     run.status = Status::Running;
     run.cursor = 0;
-    app.adopt(run);
-    app.focused.worker = Some(Worker::stub());
-    app.page = 1;
+    app.session.adopt(run);
+    app.slot_mut().worker = Some(Worker::stub());
+    app.ui.page = Page::Monitor;
     app
 }
 
@@ -1107,42 +1175,42 @@ fn running_app(project: &std::path::Path) -> App {
 fn cancel_has_its_own_key_and_asks_and_c_never_continues_a_stage_that_just_stopped() {
     let project = tempfile::tempdir().unwrap();
     let mut app = running_app(project.path());
-    let cancelled = |app: &App| app.focused.cancel.load(Ordering::Relaxed);
+    let cancelled = |app: &App| app.slot().cancel.load(Ordering::Relaxed);
     // `c` continues an idle run; it does nothing to a running one.
     app.key(key(Key::Char('c'))).unwrap();
-    assert!(!cancelled(&app) && app.modal.is_none());
+    assert!(!cancelled(&app) && app.ui.dialog().is_none());
     app.key(shift('C')).unwrap();
     assert!(
-        matches!(&app.modal, Some(Modal::Ask(ask)) if matches!(**ask, Ask::CancelStage { .. }))
+        matches!(app.ui.dialog(), Some(Modal::Ask(ask)) if matches!(**ask, Ask::CancelStage { .. }))
     );
     assert!(!cancelled(&app), "Cancelling waits for confirmation");
     assert!(rows(&mut app, 65, 20).join("\n").contains("Cancel stage"));
     app.key(key(Key::Char('n'))).unwrap();
-    assert!(app.modal.is_none() && !cancelled(&app));
+    assert!(app.ui.dialog().is_none() && !cancelled(&app));
 
     // The stage stops while the question is open: yes cancels nothing.
     app.key(shift('C')).unwrap();
-    let run = app.focused.run.clone().unwrap();
-    app.focused
+    let run = app.slot().run.clone();
+    app.slot()
         .worker
         .as_ref()
         .unwrap()
         .finish(run, Ok(Action::Stopped));
     app.poll().unwrap();
-    assert!(app.focused.worker.is_none());
+    assert!(!app.session.running());
     app.key(key(Key::Char('y'))).unwrap();
-    assert!(app.modal.is_none() && !cancelled(&app));
+    assert!(app.ui.dialog().is_none() && !cancelled(&app));
     assert!(
-        app.message.contains("nothing was cancelled"),
+        app.ui.message.contains("nothing was cancelled"),
         "{}",
-        app.message
+        app.ui.message
     );
     // `c` pressed as the stage stopped does not start the next one.
     assert!(app.key(key(Key::Char('c'))).is_err());
-    assert!(app.focused.worker.is_none());
+    assert!(!app.session.running());
 
     // A confirmed cancel of a running stage.
-    app.focused.worker = Some(Worker::stub());
+    app.slot_mut().worker = Some(Worker::stub());
     app.key(shift('C')).unwrap();
     app.key(key(Key::Enter)).unwrap();
     assert!(cancelled(&app));
@@ -1150,23 +1218,25 @@ fn cancel_has_its_own_key_and_asks_and_c_never_continues_a_stage_that_just_stopp
     // Taking over an unattended stage stops it only once confirmed.
     let mut app = running_app(project.path());
     app.key(key(Key::Char('t'))).unwrap();
-    assert!(matches!(&app.modal, Some(Modal::Ask(ask)) if matches!(**ask, Ask::TakeOver { .. })));
-    assert!(!cancelled(&app) && !app.focused.takeover);
+    assert!(
+        matches!(app.ui.dialog(), Some(Modal::Ask(ask)) if matches!(**ask, Ask::TakeOver { .. }))
+    );
+    assert!(!cancelled(&app) && !app.slot().takeover);
     app.key(key(Key::Char('y'))).unwrap();
-    assert!(cancelled(&app) && app.focused.takeover);
+    assert!(cancelled(&app) && app.slot().takeover);
 }
 
 #[test]
 fn modified_keys_do_not_trigger_page_actions() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    let stages = app.settings.workflows[0].stages.len();
+    let stages = app.editor.settings.workflows[0].stages.len();
     for c in ['r', 'x', 'd', 'X'] {
         app.key(ctrl(c)).unwrap();
         app.key(KeyEvent::new(Key::Char(c), Mods::ALT)).unwrap();
     }
-    assert_eq!(app.settings.workflows[0].stages.len(), stages);
-    assert!(app.modal.is_none() && app.starting.is_none() && !app.dirty);
+    assert_eq!(app.editor.settings.workflows[0].stages.len(), stages);
+    assert!(app.ui.dialog().is_none() && !app.starting && !app.editor.dirty);
     // Ctrl+C still interrupts: with nothing running and nothing unsaved, it exits.
     assert!(app.key(ctrl('c')).unwrap());
 }
@@ -1175,13 +1245,13 @@ fn modified_keys_do_not_trigger_page_actions() {
 fn removed_stages_and_deleted_workflows_can_be_undone() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    let original = serde_json::to_value(&app.settings.workflows).unwrap();
+    let original = serde_json::to_value(&app.editor.settings.workflows).unwrap();
     app.key(key(Key::Char('u'))).unwrap();
-    assert_eq!(app.message, "Nothing to undo.");
-    let name = app.stage().name.clone();
+    assert_eq!(app.ui.message, "Nothing to undo.");
+    let name = app.editor.stage().name.clone();
     app.key(key(Key::Char('x'))).unwrap();
     assert_eq!(
-        app.message,
+        app.ui.message,
         format!("Removed stage “{name}” — [u] to undo.")
     );
     app.key(key(Key::Char('j'))).unwrap();
@@ -1189,36 +1259,39 @@ fn removed_stages_and_deleted_workflows_can_be_undone() {
     app.key(key(Key::Char('u'))).unwrap();
     app.key(key(Key::Char('u'))).unwrap();
     assert_eq!(
-        serde_json::to_value(&app.settings.workflows).unwrap(),
+        serde_json::to_value(&app.editor.settings.workflows).unwrap(),
         original
     );
-    assert_eq!(app.selected, 0);
-    assert!(app.dirty);
+    assert_eq!(app.editor.selected, 0);
+    assert!(app.editor.dirty);
 
     app.pick(PickValue::WorkflowPreset(2)).unwrap();
-    let both = serde_json::to_value(&app.settings.workflows).unwrap();
+    let both = serde_json::to_value(&app.editor.settings.workflows).unwrap();
     app.key(shift('X')).unwrap();
-    assert!(matches!(&app.modal, Some(Modal::Ask(_))));
+    assert!(matches!(app.ui.dialog(), Some(Modal::Ask(_))));
     assert!(
         rows(&mut app, 65, 20)
             .join("\n")
             .contains("Delete workflow")
     );
     app.key(key(Key::Esc)).unwrap();
-    assert_eq!(app.settings.workflows.len(), 2);
+    assert_eq!(app.editor.settings.workflows.len(), 2);
     app.key(shift('X')).unwrap();
     app.key(key(Key::Char('y'))).unwrap();
-    assert_eq!(app.settings.workflows.len(), 1);
-    assert!(app.message.contains("[u] to undo"), "{}", app.message);
+    assert_eq!(app.editor.settings.workflows.len(), 1);
+    assert!(app.ui.message.contains("[u] to undo"), "{}", app.ui.message);
     app.key(key(Key::Char('u'))).unwrap();
-    assert_eq!(serde_json::to_value(&app.settings.workflows).unwrap(), both);
-    assert_eq!(app.workflow, 1);
+    assert_eq!(
+        serde_json::to_value(&app.editor.settings.workflows).unwrap(),
+        both
+    );
+    assert_eq!(app.editor.workflow, 1);
 }
 
 #[test]
 fn exit_asks_to_save_unsaved_edits_from_both_q_and_ctrl_c() {
     let project = tempfile::tempdir().unwrap();
-    let saved = |app: &App| app.config_path.exists();
+    let saved = |app: &App| app.editor.config_path.exists();
     // Nothing unsaved: both exit at once.
     let mut app = theme_app(project.path());
     assert!(app.key(key(Key::Char('q'))).unwrap());
@@ -1230,16 +1303,18 @@ fn exit_asks_to_save_unsaved_edits_from_both_q_and_ctrl_c() {
         (key(Key::Char('q')), 'y', true),
         (ctrl('c'), 'y', true),
     ] {
-        let _ = std::fs::remove_file(&app.config_path);
+        let _ = std::fs::remove_file(&app.editor.config_path);
         let mut app = theme_app(project.path());
         app.key(key(Key::Char(' '))).unwrap();
-        assert!(app.dirty);
+        assert!(app.editor.dirty);
         assert!(!app.key(exit).unwrap());
-        assert!(matches!(&app.modal, Some(Modal::Ask(ask)) if matches!(**ask, Ask::SaveAndExit)));
+        assert!(
+            matches!(app.ui.dialog(), Some(Modal::Ask(ask)) if matches!(**ask, Ask::SaveAndExit))
+        );
         assert!(rows(&mut app, 65, 20).join("\n").contains("Save changes?"));
         // Esc stays, with the edits.
         app.key(key(Key::Esc)).unwrap();
-        assert!(app.modal.is_none() && app.dirty && !saved(&app));
+        assert!(app.ui.dialog().is_none() && app.editor.dirty && !saved(&app));
         assert!(!app.key(exit).unwrap());
         assert!(app.key(key(Key::Char(answer))).unwrap(), "{answer} exits");
         assert_eq!(saved(&app), save, "{answer}");
@@ -1251,45 +1326,177 @@ fn switching_project_drops_catalogs_and_results_for_the_old_one() {
     let project = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    let (old_sender, receiver) = mpsc::channel();
-    app.prefetch = Some(("codex".into(), Job::from_receiver(app.generation, receiver)));
-    app.prefetch_queue.push_back("claude".into());
-    app.catalogs.insert("pi".into(), Catalog::default());
-    let old = app.generation;
+    app.catalogs.reading = Some("codex".into());
+    app.catalogs.queue.push_back("claude".into());
+    app.catalogs.cached.insert("pi".into(), Catalog::default());
+    let old = app.tasks.generation();
     app.switch_project(other.path().into()).unwrap();
-    assert_ne!(app.generation, old);
-    assert!(app.catalogs.is_empty() && app.prefetch.is_none() && app.prefetch_queue.is_empty());
-    assert!(old_sender.send(Ok(Catalog::default())).is_err());
-    // A result tagged with the old project is dropped, even if its job survived.
-    let (sender, receiver) = mpsc::channel();
-    app.prefetch = Some(("codex".into(), Job::from_receiver(old, receiver)));
-    sender.send(Ok(Catalog::default())).unwrap();
-    let (runs, receiver) = mpsc::channel();
-    app.runs_job = Some(Job::from_receiver(old, receiver));
-    runs.send(Ok(crate::history::list(project.path()).unwrap()))
-        .unwrap();
-    app.poll().unwrap();
-    assert!(!app.catalogs.contains_key("codex"));
-    assert!(app.prefetch.is_none() && app.runs_job.is_none());
+    assert_ne!(app.tasks.generation(), old);
+    assert!(
+        app.catalogs.cached.is_empty()
+            && app.catalogs.reading.is_none()
+            && app.catalogs.queue.is_empty()
+    );
+    // Results tagged with the old project are dropped when they arrive.
+    app.update(
+        old,
+        Msg::Catalog {
+            harness: "codex".into(),
+            ticket: None,
+            result: Ok(Catalog::default()),
+        },
+    );
+    app.runs.loading = true;
+    app.update(
+        old,
+        Msg::Runs(Ok(crate::history::list(project.path()).unwrap())),
+    );
+    assert!(!app.catalogs.cached.contains_key("codex"));
+    assert!(
+        app.runs.loading,
+        "a stale result leaves the current read pending"
+    );
 
     // From the browser, the project opens in the background; a bad path
     // returns to the browser with the error.
-    let picker = Box::new(PathPicker::new(project.path(), vec![]).unwrap());
-    app.begin_switch(project.path().join("missing"), picker);
-    assert!(matches!(&app.modal, Some(Modal::Loading(_))));
+    let picker = Box::new(PathPicker::new(project.path(), vec![], app.tasks.spawner()).unwrap());
+    app.ui.open(Modal::Repositories(picker));
+    app.begin_switch(project.path().join("missing"));
+    assert!(matches!(app.ui.dialog(), Some(Modal::Loading(_))));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while matches!(&app.modal, Some(Modal::Loading(_))) && std::time::Instant::now() < deadline {
+    while matches!(app.ui.dialog(), Some(Modal::Loading(_))) && std::time::Instant::now() < deadline
+    {
         app.poll().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(matches!(&app.modal, Some(Modal::Repositories(p)) if p.error.contains("not found")));
-    let picker = Box::new(PathPicker::new(project.path(), vec![]).unwrap());
-    app.begin_switch(project.path().into(), picker);
-    while app.modal.is_some() && std::time::Instant::now() < deadline {
+    assert!(
+        matches!(app.ui.dialog(), Some(Modal::Repositories(p)) if p.error.contains("not found"))
+    );
+    let picker = Box::new(PathPicker::new(project.path(), vec![], app.tasks.spawner()).unwrap());
+    app.ui.dialogs.clear();
+    app.ui.open(Modal::Repositories(picker));
+    app.begin_switch(project.path().into());
+    while app.ui.dialog().is_some() && std::time::Instant::now() < deadline {
         app.poll().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert_eq!(app.project, std::fs::canonicalize(project.path()).unwrap());
+}
+
+#[test]
+fn esc_while_opening_a_project_returns_to_the_browser_and_drops_the_result() {
+    let project = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    let picker = Box::new(PathPicker::new(project.path(), vec![], app.tasks.spawner()).unwrap());
+    app.ui.open(Modal::Repositories(picker));
+    app.begin_switch(other.path().into());
+    assert!(matches!(
+        app.ui.dialogs.as_slice(),
+        [Modal::Repositories(_), Modal::Loading(_)]
+    ));
+    app.key(key(Key::Esc)).unwrap();
+    assert!(matches!(
+        app.ui.dialogs.as_slice(),
+        [Modal::Repositories(_)]
+    ));
+    // The read finishes after the wait was closed: nothing changes.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.tasks.busy() && std::time::Instant::now() < deadline {
+        app.poll().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!app.tasks.busy());
+    assert_eq!(app.project, project.path());
+    assert!(matches!(
+        app.ui.dialogs.as_slice(),
+        [Modal::Repositories(_)]
+    ));
+}
+
+#[test]
+fn shift_y_retries_one_failed_fan_out_candidate_of_the_stopped_stage() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    app.ui.page = Page::Monitor;
+    let mut run = crate::report::tests::sample();
+    // No harness here exists, so the restarted driver cannot launch one.
+    for stage in &mut run.workflow.stages {
+        stage.harness = "no-such-harness".into();
+    }
+    run.workflow.stages[0].fan_out = Some(crate::config::FanOut {
+        candidates: ["c1", "c2"]
+            .map(|id| crate::config::Candidate {
+                id: id.into(),
+                harness: "no-such-harness".into(),
+                ..Default::default()
+            })
+            .into(),
+        judge: crate::config::AUTO_JUDGE.into(),
+    });
+    run.stages[0].fan_out = Some(
+        serde_json::from_value(serde_json::json!({
+            "base": "tree",
+            "base_commit": "commit",
+            "candidates": [
+                {"id": "c1", "harness": "no-such-harness", "model": "", "status": "complete",
+                 "attempts": [], "handoff": null},
+                {"id": "c2", "harness": "no-such-harness", "model": "m2", "status": "failed",
+                 "attempts": [], "handoff": null, "error": "Harness exited"}
+            ]
+        }))
+        .unwrap(),
+    );
+    run.stages[0].status = Status::Failed;
+    run.status = Status::Failed;
+    run.cursor = 0;
+    run.project = project.path().into();
+    run.workspace = project.path().into();
+    run.directory = crate::storage::run_dir(project.path(), &run.id).unwrap();
+    std::fs::create_dir_all(&run.directory).unwrap();
+    run.persist().unwrap();
+    app.session.adopt(run.clone());
+
+    app.key(shift('Y')).unwrap();
+    let Some(Modal::Picker { items, title, .. }) = app.ui.dialog() else {
+        panic!("no candidate picker");
+    };
+    assert_eq!(title, "Retry a fan-out candidate");
+    let labels: Vec<_> = items.iter().map(|c| c.label.as_str()).collect();
+    assert_eq!(labels, ["Implement · c2 · no-such-harness m2 · failed"]);
+    app.key(key(Key::Enter)).unwrap();
+    assert!(app.ui.dialog().is_none(), "{}", app.ui.message);
+    assert!(
+        app.ui.message.starts_with("Retrying candidate c2"),
+        "{}",
+        app.ui.message
+    );
+    let saved = crate::engine::load(project.path(), &run.id).unwrap();
+    let fan = saved.stages[0].fan_out.as_ref().unwrap();
+    assert_eq!(
+        fan.candidates[0].status,
+        Status::Complete,
+        "c1 keeps its result"
+    );
+    assert_eq!(fan.candidates[1].status, Status::Pending);
+    // Let the driver stop.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while app.session.running() && std::time::Instant::now() < deadline {
+        app.poll().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!app.session.running());
+
+    // Nothing to retry: the stage itself is not stopped, or no candidate is.
+    let mut app = theme_app(project.path());
+    app.ui.page = Page::Monitor;
+    app.session.adopt(crate::report::tests::sample());
+    let error = app.perform(ActionId::RetryCandidate).unwrap_err();
+    assert!(
+        format!("{error}").contains("No failed fan-out candidate"),
+        "{error}"
+    );
+    assert!(app.ui.dialog().is_none());
 }
 
 #[test]
@@ -1300,8 +1507,8 @@ fn output_wraps_by_display_width() {
     assert_eq!(wrap("", 5), [""]);
     let project = tempfile::tempdir().unwrap();
     let mut app = running_app(project.path());
-    app.focused.push_log(format!("● {}", "雪".repeat(20)));
-    app.focused.push_log("tail 😀 end".into());
+    app.slot_mut().push_log(format!("● {}", "雪".repeat(20)));
+    app.slot_mut().push_log("tail 😀 end".into());
     let screen = rows(&mut app, 65, 20).join("");
     // Every character reaches the screen; none is cut at the panel edge.
     assert_eq!(screen.matches('雪').count(), 20, "{screen}");
@@ -1316,18 +1523,18 @@ fn output_wraps_by_display_width() {
 fn runs_with_no_stages_and_empty_choices_do_not_panic() {
     let project = tempfile::tempdir().unwrap();
     let mut app = running_app(project.path());
-    let run = app.focused.run.as_mut().unwrap();
+    let run = app.session.run_mut().unwrap();
     run.stages.clear();
     run.workflow.stages.clear();
     run.cursor = 3;
     for (width, height) in [(65, 20), (80, 24)] {
         rows(&mut app, width, height);
     }
-    app.focused.worker = None;
-    app.focused.run.as_mut().unwrap().status = Status::AwaitingConfirmation;
+    app.slot_mut().worker = None;
+    app.session.run_mut().unwrap().status = Status::AwaitingConfirmation;
     app.key(key(Key::Char('h'))).unwrap();
-    assert!(matches!(&app.modal, Some(Modal::Text { .. })));
-    app.modal = None;
+    assert!(matches!(app.ui.dialog(), Some(Modal::Text { .. })));
+    app.ui.dialogs.clear();
     app.key(key(Key::Char('e'))).unwrap();
     rows(&mut app, 65, 20);
     // A harness field with no harnesses to cycle through.
@@ -1343,7 +1550,7 @@ fn runs_with_no_stages_and_empty_choices_do_not_panic() {
 fn worker_output_never_blocks_and_marks_dropped_lines() {
     let project = tempfile::tempdir().unwrap();
     let mut app = running_app(project.path());
-    let worker = app.focused.worker.as_ref().unwrap();
+    let worker = app.slot().worker.as_ref().unwrap();
     let text: String = (0..2500).map(|n| format!("line {n}\n")).collect();
     worker.send(RunEvent::Output(text));
     let mut first = sample_run("live");
@@ -1353,23 +1560,23 @@ fn worker_output_never_blocks_and_marks_dropped_lines() {
     worker.send(RunEvent::State(Box::new(first)));
     worker.send(RunEvent::State(Box::new(latest)));
     app.poll().unwrap();
-    let logs: Vec<_> = app.focused.logs.iter().cloned().collect();
+    let logs: Vec<_> = app.slot().logs.iter().cloned().collect();
     assert!(logs.len() <= 400);
     assert_eq!(logs.last().unwrap(), "line 2499");
     assert!(logs[0].contains("2101 lines skipped"), "{:?}", &logs[..3]);
-    assert_eq!(app.focused.run.as_ref().unwrap().repair_passes, 7);
+    assert_eq!(app.session.run().unwrap().repair_passes, 7);
 }
 
 #[test]
 fn interactive_terminal_waits_while_a_dialog_is_open() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    app.launch_interactive = true;
-    app.modal = Some(Modal::Loading("Reading".into()));
+    app.session.launch_interactive = true;
+    app.ui.open(Modal::Loading(Loading::new("Reading")));
     assert!(!app.take_launch());
-    assert!(app.message.contains("press [t]"), "{}", app.message);
-    app.modal = None;
-    app.launch_interactive = true;
+    assert!(app.ui.message.contains("press [t]"), "{}", app.ui.message);
+    app.ui.dialogs.clear();
+    app.session.launch_interactive = true;
     assert!(app.take_launch());
     assert!(!app.take_launch());
 }
@@ -1382,32 +1589,41 @@ fn text_dialog_scrolling_stops_at_the_last_line() {
     for _ in 0..3 {
         app.key(key(Key::PageDown)).unwrap();
     }
-    assert!(matches!(&app.modal, Some(Modal::Text { scroll: 2, .. })));
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Text { scroll: 2, .. })
+    ));
     app.key(key(Key::Up)).unwrap();
-    assert!(matches!(&app.modal, Some(Modal::Text { scroll: 1, .. })));
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Text { scroll: 1, .. })
+    ));
 }
 
 #[test]
 fn stage_editor_asks_before_discarding_changes() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    let original = serde_json::to_value(&app.settings).unwrap();
+    let original = serde_json::to_value(&app.editor.settings).unwrap();
     // Unchanged: Esc closes at once.
     app.key(key(Key::Char('e'))).unwrap();
     app.key(key(Key::Esc)).unwrap();
-    assert!(app.modal.is_none());
+    assert!(app.ui.dialog().is_none());
     app.key(key(Key::Char('e'))).unwrap();
     app.key(key(Key::Char('!'))).unwrap();
     app.key(key(Key::Esc)).unwrap();
-    assert!(matches!(&app.modal, Some(Modal::Ask(_))));
+    assert!(matches!(app.ui.dialog(), Some(Modal::Ask(_))));
     app.key(key(Key::Esc)).unwrap();
     assert!(
-        matches!(&app.modal, Some(Modal::Stage { editor, .. }) if editor.finish().unwrap().name.ends_with('!'))
+        matches!(app.ui.dialog(), Some(Modal::Stage { editor, .. }) if editor.finish().unwrap().name.ends_with('!'))
     );
     app.key(key(Key::Esc)).unwrap();
     app.key(key(Key::Char('y'))).unwrap();
-    assert!(app.modal.is_none());
-    assert_eq!(serde_json::to_value(&app.settings).unwrap(), original);
+    assert!(app.ui.dialog().is_none());
+    assert_eq!(
+        serde_json::to_value(&app.editor.settings).unwrap(),
+        original
+    );
 }
 
 #[test]
@@ -1415,26 +1631,26 @@ fn monitor_results_and_dialogs_fit_the_minimum_size() {
     let project = tempfile::tempdir().unwrap();
     let mut app = running_app(project.path());
     for n in 0..50 {
-        app.focused.push_log(format!("✓ step {n} 雪"));
+        app.slot_mut().push_log(format!("✓ step {n} 雪"));
     }
     let screen = rows(&mut app, 65, 20).join("\n");
     assert!(screen.contains("✓ step 49 雪"), "{screen}");
     assert!(screen.contains("[C] cancel stage"), "{screen}");
     // Finished: results, and the two panels scroll within their own lengths.
-    app.focused.worker = None;
-    app.focused.run = Some(sample_run("done"));
+    app.slot_mut().worker = None;
+    app.session.adopt(sample_run("done"));
     let screen = rows(&mut app, 65, 20).join("\n");
     assert!(screen.contains("Results"), "{screen}");
     for _ in 0..50 {
         app.key(key(Key::PageDown)).unwrap();
     }
-    let limit = app.focused.results_limit.get();
-    assert_eq!(app.focused.results_scroll, limit);
+    let limit = app.slot().results_limit.get();
+    assert_eq!(app.slot().results_scroll, limit);
     app.key(key(Key::PageUp)).unwrap();
-    assert_eq!(app.focused.results_scroll[0], limit[0].saturating_sub(5));
+    assert_eq!(app.slot().results_scroll[0], limit[0].saturating_sub(5));
     for modal in [
         Modal::Ask(Box::new(Ask::CancelStage { run: "done".into() })),
-        Modal::Loading("Opening project…".into()),
+        Modal::Loading(Loading::new("Opening project…")),
         Modal::Text {
             title: "Guide".into(),
             body: super::actions::guide(),
@@ -1442,7 +1658,7 @@ fn monitor_results_and_dialogs_fit_the_minimum_size() {
             guide: true,
         },
     ] {
-        app.modal = Some(modal);
+        app.ui.open(modal);
         let screen = rows(&mut app, 65, 20).join("\n");
         assert!(
             ["Cancel stage", "Please wait", "WORKFLOW"]
@@ -1465,13 +1681,13 @@ fn mixed_session(project: &std::path::Path) -> App {
     ] {
         let mut run = sample_run(id);
         run.status = status;
-        app.adopt(run);
+        app.session.adopt(run);
         if status == Status::Running {
-            app.focused.worker = Some(Worker::stub());
+            app.slot_mut().worker = Some(Worker::stub());
         }
     }
-    app.focus_run("busy");
-    app.page = 1;
+    app.session.focus_run("busy");
+    app.ui.page = Page::Monitor;
     app
 }
 
@@ -1480,13 +1696,13 @@ fn session_runs_dialog_lists_runs_focuses_cancels_and_jumps_to_input() {
     let project = tempfile::tempdir().unwrap();
     let mut app = mixed_session(project.path());
     assert_eq!(session(&app), "done review busy* term");
-    assert_eq!(app.needing_input(), 2);
+    assert_eq!(app.session.needing_input(), 2);
     let text = rows(&mut app, 120, 30).join("\n");
     assert!(text.contains("◆ 2 need input [N]"), "{text}");
 
     app.key(shift('L')).unwrap();
     assert!(matches!(
-        app.modal,
+        app.ui.dialog(),
         Some(Modal::SessionRuns { selected: 2 })
     ));
     let text = rows(&mut app, 120, 30).join("\n");
@@ -1499,52 +1715,68 @@ fn session_runs_dialog_lists_runs_focuses_cancels_and_jumps_to_input() {
 
     // [C] on the running run asks, then cancels only that run.
     app.key(shift('C')).unwrap();
-    assert!(matches!(app.modal.as_deref_ask(), Some(Ask::CancelRun { run }) if run == "busy"));
-    app.key(key(Key::Char('y'))).unwrap();
-    assert!(app.focused.cancel.load(Ordering::Relaxed));
     assert!(
-        app.message.contains("Stopping the stage of busy"),
-        "{}",
-        app.message
+        matches!(app.ui.dialog().as_deref_ask(), Some(Ask::CancelRun { run }) if run == "busy")
     );
-    app.focused.cancel.store(false, Ordering::Relaxed);
+    app.key(key(Key::Char('y'))).unwrap();
+    assert!(app.slot().cancel.load(Ordering::Relaxed));
+    assert!(
+        app.ui.message.contains("Stopping the stage of busy"),
+        "{}",
+        app.ui.message
+    );
+    app.slot().cancel.store(false, Ordering::Relaxed);
 
     // [C] on a run that is not running cancels nothing.
     app.key(shift('L')).unwrap();
     app.key(key(Key::Up)).unwrap();
     app.key(shift('C')).unwrap();
-    assert!(matches!(app.modal, Some(Modal::SessionRuns { .. })));
-    assert!(app.message.contains("nothing to cancel"), "{}", app.message);
+    assert!(matches!(app.ui.dialog(), Some(Modal::SessionRuns { .. })));
+    assert!(
+        app.ui.message.contains("nothing to cancel"),
+        "{}",
+        app.ui.message
+    );
 
     // [Enter] focuses the selected run.
     app.key(key(Key::Enter)).unwrap();
-    assert!(app.modal.is_none());
+    assert!(app.ui.dialog().is_none());
     assert_eq!(session(&app), "done review* busy term");
-    assert!(app.message.contains("[a] advances"), "{}", app.message);
+    assert!(
+        app.ui.message.contains("[a] advances"),
+        "{}",
+        app.ui.message
+    );
 
     // [n] in the dialog and [N] anywhere jump to the next run needing input, wrapping.
     app.key(shift('L')).unwrap();
     app.key(key(Key::Char('n'))).unwrap();
     assert_eq!(session(&app), "done review busy term*");
-    assert!(app.message.contains("[i] opens it"), "{}", app.message);
-    app.page = 0;
+    assert!(
+        app.ui.message.contains("[i] opens it"),
+        "{}",
+        app.ui.message
+    );
+    app.ui.page = Page::Workflow;
     app.key(shift('N')).unwrap();
     assert_eq!(session(&app), "done review* busy term");
-    assert_eq!(app.page, 1);
-    for slot in std::iter::once(&mut app.focused).chain(&mut app.parked) {
-        if let Some(run) = &mut slot.run {
-            run.status = Status::Complete;
-        }
+    assert_eq!(app.ui.page, Page::Monitor);
+    for slot in &mut app.session.runs {
+        slot.run.status = Status::Complete;
     }
     app.key(shift('N')).unwrap();
-    assert!(app.message.contains("No run of this session needs input"));
+    assert!(
+        app.ui
+            .message
+            .contains("No run of this session needs input")
+    );
     assert!(!rows(&mut app, 120, 30).join("\n").contains("need input"));
 }
 
 trait AskModal {
     fn as_deref_ask(&self) -> Option<&Ask>;
 }
-impl AskModal for Option<Modal> {
+impl AskModal for Option<&Modal> {
     fn as_deref_ask(&self) -> Option<&Ask> {
         match self {
             Some(Modal::Ask(ask)) => Some(ask),
@@ -1560,13 +1792,13 @@ fn background_run_events_queue_notices_instead_of_clobbering() {
     for id in ["first", "second", "third"] {
         let mut run = sample_run(id);
         run.status = Status::Running;
-        app.adopt(run);
-        app.focused.worker = Some(Worker::stub());
+        app.session.adopt(run);
+        app.slot_mut().worker = Some(Worker::stub());
     }
-    app.page = 0;
+    app.ui.page = Page::Workflow;
     let finish = |app: &App, index: usize, status, result| {
-        let slot = &app.parked[index];
-        let mut run = slot.run.clone().unwrap();
+        let slot = &app.session.runs[index];
+        let mut run = slot.run.clone();
         run.status = status;
         run.error = Some("tests failed".into());
         slot.worker.as_ref().unwrap().finish(run, result);
@@ -1574,26 +1806,26 @@ fn background_run_events_queue_notices_instead_of_clobbering() {
     finish(&app, 0, Status::Blocked, Ok(Action::Stopped));
     finish(&app, 1, Status::AwaitingConfirmation, Ok(Action::Confirm));
     app.poll().unwrap();
-    assert_eq!(app.notices.len(), 2);
-    let workflow = app.parked[0].run.as_ref().unwrap().workflow.name.clone();
-    assert!(app.notices[0].alert);
+    assert_eq!(app.session.notices.len(), 2);
+    let workflow = app.session.runs[0].run.workflow.name.clone();
+    assert!(app.session.notices[0].alert);
     assert!(
-        app.notices[0]
+        app.session.notices[0]
             .text
             .starts_with(&format!("{workflow} (first) stopped: tests failed")),
         "{}",
-        app.notices[0].text
+        app.session.notices[0].text
     );
     // The newest shows; the status line counts the rest.
-    assert!(app.message.contains("(second)") && app.message.contains("[N] jumps"));
+    assert!(app.ui.message.contains("(second)") && app.ui.message.contains("[N] jumps"));
     assert_eq!(app.more_notices(), 1);
     let text = rows(&mut app, 120, 30).join("\n");
     assert!(text.contains("(+1 more · [!] notices)"), "{text}");
 
     // The focused run's stop is kept too, and [!] lists all, newest first.
-    let mut run = app.focused.run.clone().unwrap();
+    let mut run = app.slot().run.clone();
     run.status = Status::Complete;
-    app.focused
+    app.slot()
         .worker
         .as_ref()
         .unwrap()
@@ -1601,7 +1833,7 @@ fn background_run_events_queue_notices_instead_of_clobbering() {
     app.poll().unwrap();
     assert_eq!(app.more_notices(), 2);
     app.key(shift('!')).unwrap();
-    let Some(Modal::Text { body, .. }) = &app.modal else {
+    let Some(Modal::Text { body, .. }) = app.ui.dialog() else {
         panic!("Notice history did not open");
     };
     let lines: Vec<_> = body.lines().collect();
@@ -1616,25 +1848,29 @@ fn background_run_events_queue_notices_instead_of_clobbering() {
     for n in 0..60 {
         app.push_notice(format!("notice {n}"), false);
     }
-    assert_eq!(app.notices.len(), super::session::NOTICES);
-    assert_eq!(app.notices.back().unwrap().text, "notice 59");
+    assert_eq!(app.session.notices.len(), super::session::NOTICES);
+    assert_eq!(app.session.notices.back().unwrap().text, "notice 59");
 }
 
 #[test]
 fn notifications_dialog_saves_backends_with_older_preferences() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    std::fs::write(&app.theme_path, r#"{"theme":"nord","vim_motions":false}"#).unwrap();
-    let loaded = theme::load(&app.theme_path).unwrap();
-    app.theme = loaded.theme;
-    app.notifications = loaded.notifications;
-    assert!(app.notifications.terminal && !app.notifications.desktop);
+    std::fs::write(
+        &app.ui.theme_path,
+        r#"{"theme":"nord","vim_motions":false}"#,
+    )
+    .unwrap();
+    let loaded = theme::load(&app.ui.theme_path).unwrap();
+    app.ui.theme = loaded.theme;
+    app.ui.notifications = loaded.notifications;
+    assert!(app.ui.notifications.terminal && !app.ui.notifications.desktop);
 
     // The command menu reaches the dialog, as F9 does.
     app.key(key(Key::Char(':'))).unwrap();
     app.paste("Notifications");
     app.key(key(Key::Enter)).unwrap();
-    assert!(matches!(app.modal, Some(Modal::Notifications { .. })));
+    assert!(matches!(app.ui.dialog(), Some(Modal::Notifications { .. })));
     let text = rows(&mut app, 100, 30).join("\n");
     assert!(
         text.contains("[x] Terminal") && text.contains("[ ] Desktop"),
@@ -1643,16 +1879,16 @@ fn notifications_dialog_saves_backends_with_older_preferences() {
 
     app.key(key(Key::Down)).unwrap();
     app.key(key(Key::Char(' '))).unwrap();
-    let saved = theme::load(&app.theme_path).unwrap();
+    let saved = theme::load(&app.ui.theme_path).unwrap();
     assert!(saved.notifications.desktop && saved.notifications.terminal);
     assert_eq!(saved.theme, Theme::Nord);
-    assert!(app.notifications.desktop);
+    assert!(app.ui.notifications.desktop);
 
     // Webhook URL: invalid ones are refused, a valid one turns the webhook on.
     app.key(key(Key::Down)).unwrap();
     app.key(key(Key::Down)).unwrap();
     app.key(key(Key::Enter)).unwrap();
-    assert!(matches!(app.modal, Some(Modal::Input { .. })));
+    assert!(matches!(app.ui.dialog(), Some(Modal::Input { .. })));
     app.paste("ftp://nope");
     assert!(app.key(ctrl('s')).is_err());
     app.key(key(Key::Esc)).unwrap();
@@ -1664,17 +1900,17 @@ fn notifications_dialog_saves_backends_with_older_preferences() {
     app.paste("https://ntfy.sh/mr-test");
     app.key(ctrl('s')).unwrap();
     assert!(matches!(
-        app.modal,
+        app.ui.dialog(),
         Some(Modal::Notifications { selected: 3, .. })
     ));
-    let saved = theme::load(&app.theme_path).unwrap();
+    let saved = theme::load(&app.ui.theme_path).unwrap();
     assert!(saved.notifications.webhook);
     assert_eq!(saved.notifications.webhook_url, "https://ntfy.sh/mr-test");
 
     // The test button reports what it sent.
     app.key(key(Key::Down)).unwrap();
     app.key(key(Key::Enter)).unwrap();
-    let Some(Modal::Notifications { status, .. }) = &app.modal else {
+    let Some(Modal::Notifications { status, .. }) = app.ui.dialog() else {
         panic!("dialog closed");
     };
     assert!(status.starts_with("Sent"), "{status}");
@@ -1683,7 +1919,7 @@ fn notifications_dialog_saves_backends_with_older_preferences() {
     // Other preference changes keep the backends.
     app.key(key(Key::F(8))).unwrap();
     app.pick(PickValue::Theme(Theme::Dracula)).unwrap();
-    let saved = theme::load(&app.theme_path).unwrap();
+    let saved = theme::load(&app.ui.theme_path).unwrap();
     assert!(saved.vim_motions && saved.notifications.desktop && saved.notifications.webhook);
     assert_eq!(saved.theme, Theme::Dracula);
 }
@@ -1735,15 +1971,16 @@ new file mode 100644
 
 fn diff_app(project: &std::path::Path, theme: Theme) -> App {
     let mut app = theme_app(project);
-    app.theme = theme;
+    app.ui.theme = theme;
     let mut run = sample_run("done");
     run.project = project.into();
     run.workspace = project.into();
-    app.adopt(run);
-    app.page = 1;
-    app.modal = Some(Modal::Diff(Box::new(super::diff_view::DiffView::new(
-        REVIEW_PATCH.into(),
-    ))));
+    app.session.adopt(run);
+    app.ui.page = Page::Monitor;
+    app.ui
+        .open(Modal::Diff(Box::new(super::diff_view::DiffView::new(
+            REVIEW_PATCH.into(),
+        ))));
     app
 }
 
@@ -1816,10 +2053,10 @@ fn diff_dialog_keys_move_between_files_hunks_and_matches() {
     assert!(rows(&mut app, 100, 30).join("\n").contains("/needle · 1/1"));
     // Esc clears the search, then closes; the dialog's keys stay local.
     app.key(key(Key::Esc)).unwrap();
-    assert!(matches!(app.modal, Some(Modal::Diff(_))));
-    assert_eq!(app.page, 1);
+    assert!(matches!(app.ui.dialog(), Some(Modal::Diff(_))));
+    assert_eq!(app.ui.page, Page::Monitor);
     app.key(key(Key::Esc)).unwrap();
-    assert!(app.modal.is_none());
+    assert!(app.ui.dialog().is_none());
 }
 
 #[test]
@@ -1828,7 +2065,7 @@ fn diff_dialog_hands_the_patch_and_files_to_external_programs() {
     let mut app = diff_app(project.path(), Theme::ModelRouter);
     rows(&mut app, 100, 30);
     app.key(key(Key::Char('o'))).unwrap();
-    let launch = app.external.take().expect("pager queued");
+    let launch = app.ui.external.take().expect("pager queued");
     let file = launch.argv.last().unwrap().clone();
     let coloured = std::fs::read_to_string(&file).unwrap();
     assert!(
@@ -1841,12 +2078,12 @@ fn diff_dialog_hands_the_patch_and_files_to_external_programs() {
         "temporary diff removed"
     );
     assert!(
-        matches!(app.modal, Some(Modal::Diff(_))),
+        matches!(app.ui.dialog(), Some(Modal::Diff(_))),
         "dialog stays open"
     );
 
     app.key(key(Key::Char('e'))).unwrap();
-    let launch = app.external.take().expect("editor queued");
+    let launch = app.ui.external.take().expect("editor queued");
     let target = project.path().join("src/lib.rs");
     assert!(
         launch.argv.iter().any(|arg| {
@@ -1862,9 +2099,9 @@ fn diff_dialog_hands_the_patch_and_files_to_external_programs() {
 fn paused_output_keeps_its_place_as_new_lines_arrive() {
     let project = tempfile::tempdir().unwrap();
     let mut app = running_app(project.path());
-    app.focused.logs.clear();
+    app.slot_mut().logs.clear();
     for i in 0..100 {
-        app.focused.push_log(format!("line {i:03}"));
+        app.slot_mut().push_log(format!("line {i:03}"));
     }
     let output = |app: &mut App| -> Vec<String> {
         rows(app, 80, 30)
@@ -1882,7 +2119,7 @@ fn paused_output_keeps_its_place_as_new_lines_arrive() {
             .contains("▲ paused — End to follow")
     );
     for i in 100..150 {
-        app.focused.push_log(format!("line {i:03}"));
+        app.slot_mut().push_log(format!("line {i:03}"));
     }
     assert_eq!(
         output(&mut app),
@@ -1892,7 +2129,7 @@ fn paused_output_keeps_its_place_as_new_lines_arrive() {
     // Old lines leaving the bounded log do not move it either.
     let first = paused[0].clone();
     for i in 150..300 {
-        app.focused.push_log(format!("line {i:03}"));
+        app.slot_mut().push_log(format!("line {i:03}"));
     }
     assert_eq!(output(&mut app)[0], first);
     // Scrolling back down to the end follows again.
@@ -1903,24 +2140,24 @@ fn paused_output_keeps_its_place_as_new_lines_arrive() {
         "{text}"
     );
     app.key(key(Key::Home)).unwrap();
-    assert!(!app.focused.log_view.follow);
+    assert!(!app.slot().log_view.follow);
     app.key(key(Key::Char('f'))).unwrap();
-    assert!(app.focused.log_view.follow);
+    assert!(app.slot().log_view.follow);
     app.key(key(Key::Char('f'))).unwrap();
-    assert!(!app.focused.log_view.follow);
+    assert!(!app.slot().log_view.follow);
     for _ in 0..100 {
         app.key(key(Key::PageDown)).unwrap();
     }
-    assert!(app.focused.log_view.follow, "reaching the end follows");
+    assert!(app.slot().log_view.follow, "reaching the end follows");
 }
 
 #[test]
 fn output_search_highlights_matches_and_owns_n_while_shown() {
     let project = tempfile::tempdir().unwrap();
     let mut app = running_app(project.path());
-    app.focused.logs.clear();
+    app.slot_mut().logs.clear();
     for i in 0..80 {
-        app.focused.push_log(if i % 20 == 5 {
+        app.slot_mut().push_log(if i % 20 == 5 {
             format!("✗ failure number {i}")
         } else {
             format!("step {i}")
@@ -1942,10 +2179,10 @@ fn output_search_highlights_matches_and_owns_n_while_shown() {
     app.key(key(Key::Enter)).unwrap();
     let text = rows(&mut app, 80, 30).join("\n");
     assert!(text.contains("/failure · 4/4"), "{text}");
-    let palette = app.palette();
+    let palette = app.ui.palette();
     let screen = buffer(&mut app, 80, 30);
     assert_eq!(cell_at(&screen, "failure number 65").bg, palette.accent);
-    assert!(!app.focused.log_view.follow, "a match pauses the output");
+    assert!(!app.slot().log_view.follow, "a match pauses the output");
     app.key(shift('N')).unwrap();
     app.key(shift('N')).unwrap();
     let text = rows(&mut app, 80, 30).join("\n");
@@ -1956,13 +2193,13 @@ fn output_search_highlights_matches_and_owns_n_while_shown() {
     app.key(key(Key::Char('n'))).unwrap();
     assert!(rows(&mut app, 80, 30).join("\n").contains("3/4"));
     // Idle, `n` returns to the workflow, except while a search is shown.
-    app.focused.worker = None;
+    app.slot_mut().worker = None;
     app.key(key(Key::Char('n'))).unwrap();
-    assert_eq!(app.page, 1);
+    assert_eq!(app.ui.page, Page::Monitor);
     app.key(key(Key::Esc)).unwrap();
-    assert!(app.focused.log_search.is_none());
+    assert!(app.slot().log_search.is_none());
     app.key(key(Key::Char('n'))).unwrap();
-    assert_eq!(app.page, 0);
+    assert_eq!(app.ui.page, Page::Workflow);
 }
 
 #[test]
@@ -1970,7 +2207,7 @@ fn handoff_dialog_colours_findings_and_tests_and_opens_changed_files() {
     use crate::handoff::{Finding, Severity, TestEvidence, TestStatus};
     let project = tempfile::tempdir().unwrap();
     let mut app = running_app(project.path());
-    let run = app.focused.run.as_mut().unwrap();
+    let run = app.session.run_mut().unwrap();
     run.workspace = project.path().into();
     let handoff = run.stages[0].handoff.get_or_insert_with(|| {
         serde_json::from_str(r#"{"summary":"s","verdict":"needs_changes"}"#).unwrap()
@@ -2000,8 +2237,8 @@ fn handoff_dialog_colours_findings_and_tests_and_opens_changed_files() {
     ];
     handoff.files_changed = vec!["src/parser.rs".into(), "README.md".into()];
     app.key(key(Key::Char('h'))).unwrap();
-    assert!(matches!(app.modal, Some(Modal::Handoff(_))));
-    let palette = app.palette();
+    assert!(matches!(app.ui.dialog(), Some(Modal::Handoff(_))));
+    let palette = app.ui.palette();
     let screen = buffer(&mut app, 120, 36);
     assert_eq!(cell_at(&screen, "! blocking").fg, palette.red);
     assert_eq!(cell_at(&screen, "· advisory").fg, palette.warn);
@@ -2019,28 +2256,28 @@ fn handoff_dialog_colours_findings_and_tests_and_opens_changed_files() {
     }
     app.key(key(Key::Down)).unwrap();
     app.key(key(Key::Enter)).unwrap();
-    let launch = app.external.take().expect("editor queued");
+    let launch = app.ui.external.take().expect("editor queued");
     assert_eq!(
         launch.argv.last().unwrap(),
         project.path().join("README.md").as_os_str()
     );
-    assert!(matches!(app.modal, Some(Modal::Handoff(_))));
+    assert!(matches!(app.ui.dialog(), Some(Modal::Handoff(_))));
     app.key(key(Key::Esc)).unwrap();
-    assert!(app.modal.is_none());
+    assert!(app.ui.dialog().is_none());
 }
 
 #[test]
 fn open_log_pages_the_focused_attempts_stdout() {
     let project = tempfile::tempdir().unwrap();
     let mut app = running_app(project.path());
-    let run = app.focused.run.as_mut().unwrap();
+    let run = app.session.run_mut().unwrap();
     let attempt = run.stages[0].attempts.last_mut().unwrap();
     attempt.directory = project.path().join("attempt");
     assert!(app.key(shift('O')).is_err(), "no log yet");
     std::fs::create_dir_all(project.path().join("attempt")).unwrap();
     std::fs::write(project.path().join("attempt/stdout.log"), "raw").unwrap();
     app.key(shift('O')).unwrap();
-    let launch = app.external.take().expect("pager queued");
+    let launch = app.ui.external.take().expect("pager queued");
     assert_eq!(
         launch.argv.last().unwrap(),
         project.path().join("attempt/stdout.log").as_os_str()

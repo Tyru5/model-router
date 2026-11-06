@@ -326,12 +326,8 @@ mod tests {
             assert!(keys.insert(preset.key));
             let settings = Settings {
                 workflows: vec![Workflow {
-                    name: "Preset".into(),
                     max_repair_passes: 0,
-                    sandbox_default: Default::default(),
-                    budget: Default::default(),
-                    max_parallel: 2,
-                    stages: vec![preset.build()],
+                    ..Workflow::new("Preset", vec![preset.build()])
                 }],
                 ..Settings::default()
             };

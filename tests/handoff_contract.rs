@@ -104,21 +104,20 @@ fn preview(versions: Option<&str>) -> String {
     };
     let settings = Settings {
         workflows: vec![Workflow {
-            max_parallel: 2,
-            name: "Native".into(),
             max_repair_passes: 0,
-            budget: Default::default(),
-            sandbox_default: Default::default(),
-            stages: vec![
-                stage("codex"),
-                stage("claude"),
-                Stage {
-                    id: "summary".into(),
-                    role: Role::Summary,
-                    enabled: false,
-                    ..stage("codex")
-                },
-            ],
+            ..Workflow::new(
+                "Native",
+                vec![
+                    stage("codex"),
+                    stage("claude"),
+                    Stage {
+                        id: "summary".into(),
+                        role: Role::Summary,
+                        enabled: false,
+                        ..stage("codex")
+                    },
+                ],
+            )
         }],
         ..Settings::default()
     };

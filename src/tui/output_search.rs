@@ -4,7 +4,7 @@
 //! While following, the panel shows the newest output. Scrolling up pauses
 //! it: the position is then kept as the log line at the top of the panel, so
 //! new output (and old lines leaving the bounded log) never moves the view.
-use super::{app::App, theme::Palette};
+use super::{run_slot::RunSlot, theme::Palette};
 use crossterm::event::{KeyCode as Key, KeyEvent, KeyModifiers as Mods};
 use ratatui::{
     style::Style,
@@ -217,12 +217,12 @@ pub(super) fn visible_lines(
         .collect()
 }
 
-impl App {
+impl RunSlot {
     /// The output as last drawn, and the panel height.
     fn drawn_output(&self) -> Option<(std::rc::Rc<Wrapped>, usize)> {
-        let cache = self.focused.cache.borrow();
+        let cache = self.cache.borrow();
         let (_, wrapped) = cache.output.as_ref()?;
-        Some((wrapped.clone(), self.focused.log_visible.get().max(1)))
+        Some((wrapped.clone(), self.log_visible.get().max(1)))
     }
 
     /// Moves the output by `delta` rows; reaching the end follows again.
@@ -231,9 +231,9 @@ impl App {
             return;
         };
         let last = wrapped.lines.len().saturating_sub(visible);
-        let top = wrapped.top(self.focused.log_view, visible);
+        let top = wrapped.top(self.log_view, visible);
         let top = top.saturating_add_signed(delta).min(last);
-        self.focused.log_view = if top >= last {
+        self.log_view = if top >= last {
             LogView::default()
         } else {
             LogView {
@@ -249,9 +249,9 @@ impl App {
         };
         let last = wrapped.lines.len().saturating_sub(visible);
         if last == 0 {
-            self.focused.log_view = LogView::default();
+            self.log_view = LogView::default();
         } else {
-            self.focused.log_view = LogView {
+            self.log_view = LogView {
                 follow: false,
                 anchor: wrapped.anchor(0),
             };
@@ -259,82 +259,74 @@ impl App {
     }
 
     pub(super) fn output_end(&mut self) {
-        self.focused.log_view = LogView::default();
+        self.log_view = LogView::default();
     }
 
-    /// Pauses at the current view, or resumes following.
-    pub(super) fn toggle_follow(&mut self) {
-        if !self.focused.log_view.follow {
-            self.focused.log_view = LogView::default();
-            self.message = "Following new output.".into();
-            return;
+    /// Pauses at the current view, or resumes following; returns the status line.
+    pub(super) fn toggle_follow(&mut self) -> Option<String> {
+        if !self.log_view.follow {
+            self.log_view = LogView::default();
+            return Some("Following new output.".into());
         }
-        let Some((wrapped, visible)) = self.drawn_output() else {
-            return;
-        };
-        let top = wrapped.top(self.focused.log_view, visible);
-        self.focused.log_view = LogView {
+        let (wrapped, visible) = self.drawn_output()?;
+        let top = wrapped.top(self.log_view, visible);
+        self.log_view = LogView {
             follow: false,
             anchor: wrapped.anchor(top),
         };
-        self.message = "Output paused; [End] or [f] follows again.".into();
+        Some("Output paused; [End] or [f] follows again.".into())
     }
 
     pub(super) fn start_output_search(&mut self) {
-        self.focused.show_output = true;
-        self.focused.log_search = Some(LogSearch {
+        self.show_output = true;
+        self.log_search = Some(LogSearch {
             typing: true,
             ..LogSearch::default()
         });
     }
 
-    /// Keys for a search in the output panel; false passes the key on.
-    pub(super) fn output_search_key(&mut self, key: KeyEvent) -> bool {
-        let Some(search) = self.focused.log_search.as_mut() else {
-            return false;
-        };
+    /// Keys for a search in the output panel; None passes the key on,
+    /// Some carries a status line when there is one.
+    pub(super) fn output_search_key(&mut self, key: KeyEvent) -> Option<Option<String>> {
+        let search = self.log_search.as_mut()?;
         let plain = key.modifiers - Mods::SHIFT == Mods::NONE;
         if search.typing {
             match key.code {
-                Key::Esc => self.focused.log_search = None,
-                Key::Enter if search.query.is_empty() => self.focused.log_search = None,
+                Key::Esc => self.log_search = None,
+                Key::Enter if search.query.is_empty() => self.log_search = None,
                 Key::Enter => {
                     search.typing = false;
-                    self.jump_to_match(None);
+                    return Some(self.jump_to_match(None));
                 }
                 Key::Backspace => {
                     search.query.pop();
                 }
                 Key::Char(c) if plain => search.query.push(c),
                 // Ctrl+C and other shortcuts keep working while typing.
-                _ => return false,
+                _ => return None,
             }
-            return true;
+            return Some(None);
         }
         match key.code {
-            Key::Esc => self.focused.log_search = None,
-            Key::Char('n') if plain => self.jump_to_match(Some(true)),
-            Key::Char('N') if plain => self.jump_to_match(Some(false)),
-            _ => return false,
+            Key::Esc => self.log_search = None,
+            Key::Char('n') if plain => return Some(self.jump_to_match(Some(true))),
+            Key::Char('N') if plain => return Some(self.jump_to_match(Some(false))),
+            _ => return None,
         }
-        true
+        Some(None)
     }
 
     /// Moves to the next or previous match, or (None) the nearest one at or
-    /// above the bottom of the panel, and pauses the output there.
-    fn jump_to_match(&mut self, forward: Option<bool>) {
-        let Some((wrapped, visible)) = self.drawn_output() else {
-            return;
-        };
-        let Some(search) = self.focused.log_search.as_mut() else {
-            return;
-        };
+    /// above the bottom of the panel, and pauses the output there. Returns
+    /// the status line when nothing matches.
+    fn jump_to_match(&mut self, forward: Option<bool>) -> Option<String> {
+        let (wrapped, visible) = self.drawn_output()?;
+        let search = self.log_search.as_mut()?;
         let matches = wrapped.matches(&search.query);
         if matches.is_empty() {
-            self.message = format!("No output matches “{}”.", search.query);
-            return;
+            return Some(format!("No output matches “{}”.", search.query));
         }
-        let top = wrapped.top(self.focused.log_view, visible);
+        let top = wrapped.top(self.log_view, visible);
         let current = match forward {
             None => matches
                 .iter()
@@ -353,16 +345,17 @@ impl App {
             top
         };
         // Paused even at the end, so new output does not carry the match away.
-        self.focused.log_view = LogView {
+        self.log_view = LogView {
             follow: false,
             anchor: wrapped.anchor(top),
         };
+        None
     }
 
     /// The search line under the output panel: the query being typed, or
     /// the match count.
     pub(super) fn output_search_status(&self) -> Option<String> {
-        let search = self.focused.log_search.as_ref()?;
+        let search = self.log_search.as_ref()?;
         if search.typing {
             return Some(format!("/{}▏", search.query));
         }

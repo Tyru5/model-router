@@ -1,7 +1,7 @@
 use super::input::InputField;
 use super::{
     actions::ActionId,
-    app::App,
+    app::{App, Page},
     modal::{Choice, Modal, PickValue},
     theme::Palette,
     widgets::{content, empty_state, kv, menu_key, textarea},
@@ -43,9 +43,17 @@ const STATUSES: [(&str, &[StatusFilter]); 6] = [
     ("damaged", &[StatusFilter::Damaged]),
 ];
 
-/// Runs page state besides the list and its selection.
-#[derive(Default)]
-pub(super) struct RunsView {
+/// The Runs page: saved runs of the project, filters, and selection.
+pub(super) struct RunsPage {
+    /// Saved runs as last read, newest first.
+    pub(super) entries: Vec<Entry>,
+    /// Index into the visible entries.
+    pub(super) selected: usize,
+    /// Saved runs are being read.
+    pub(super) loading: bool,
+    /// The list needs reading when the page is next shown.
+    pub(super) stale: bool,
+    pub(super) loaded_at: Option<std::time::Instant>,
     filter: InputField<'static>,
     /// Keys go to the filter field.
     filtering: bool,
@@ -55,7 +63,23 @@ pub(super) struct RunsView {
     sizes: Arc<Mutex<HashMap<String, u64>>>,
 }
 
-impl RunsView {
+impl Default for RunsPage {
+    fn default() -> Self {
+        Self {
+            entries: vec![],
+            selected: 0,
+            loading: false,
+            stale: true,
+            loaded_at: None,
+            filter: InputField::default(),
+            filtering: false,
+            status: 0,
+            sizes: Arc::default(),
+        }
+    }
+}
+
+impl RunsPage {
     pub(super) fn set_vim(&mut self, enabled: bool) {
         self.filter.set_vim(enabled);
     }
@@ -87,38 +111,41 @@ pub(super) struct Compare {
     attempts: Option<(usize, usize)>,
 }
 
-impl App {
+impl RunsPage {
     /// Entries the filters show, newest first.
-    pub(super) fn visible_runs(&self) -> Vec<&Entry> {
+    pub(super) fn visible(&self) -> Vec<&Entry> {
         history::filter(
-            &self.history,
-            STATUSES[self.runs.status].1,
-            &content(&self.runs.filter),
+            &self.entries,
+            STATUSES[self.status].1,
+            &content(&self.filter),
         )
     }
-    fn selected_run(&self) -> Option<Entry> {
-        self.visible_runs()
-            .get(self.history_selected)
+    pub(super) fn selected_entry(&self) -> Option<Entry> {
+        self.visible()
+            .get(self.selected)
             .map(|entry| (*entry).clone())
+    }
+    fn selected_id(&self) -> Option<String> {
+        self.selected_entry().map(|entry| entry.id().to_owned())
     }
     /// Keeps `id` selected when it is still shown; otherwise keeps the row in range.
     fn reselect(&mut self, id: Option<String>) {
-        let visible = self.visible_runs();
+        let visible = self.visible();
         let index = id
             .and_then(|id| visible.iter().position(|entry| entry.id() == id))
-            .unwrap_or(self.history_selected);
-        self.history_selected = index.min(visible.len().saturating_sub(1));
+            .unwrap_or(self.selected);
+        self.selected = index.min(visible.len().saturating_sub(1));
     }
     /// Shows freshly read summaries, keeping the selection, and starts
     /// sizing them in the background.
-    pub(super) fn show_runs(&mut self, entries: Vec<Entry>) {
-        let selected = self.selected_run().map(|entry| entry.id().to_owned());
-        self.history = entries;
-        self.runs_loaded = Some(std::time::Instant::now());
+    pub(super) fn show(&mut self, entries: Vec<Entry>, project: &std::path::Path) {
+        let selected = self.selected_id();
+        self.entries = entries;
+        self.loaded_at = Some(std::time::Instant::now());
         self.reselect(selected);
         let sizes = Arc::new(Mutex::new(HashMap::new()));
-        self.runs.sizes = sizes.clone();
-        let (project, entries) = (self.project.clone(), self.history.clone());
+        self.sizes = sizes.clone();
+        let (project, entries) = (project.to_path_buf(), self.entries.clone());
         thread::spawn(move || {
             for entry in entries {
                 // A refresh or exit dropped the map.
@@ -132,51 +159,61 @@ impl App {
             }
         });
     }
+}
+
+impl App {
     pub(super) fn perform_runs(&mut self, id: ActionId) -> Result<()> {
         match id {
             ActionId::NextRun => {
-                self.history_selected =
-                    (self.history_selected + 1).min(self.visible_runs().len().saturating_sub(1))
+                self.runs.selected =
+                    (self.runs.selected + 1).min(self.runs.visible().len().saturating_sub(1))
             }
-            ActionId::PreviousRun => {
-                self.history_selected = self.history_selected.saturating_sub(1)
-            }
+            ActionId::PreviousRun => self.runs.selected = self.runs.selected.saturating_sub(1),
             ActionId::RefreshRuns => self.load_runs(),
             ActionId::FilterRuns => {
                 self.runs.filtering = true;
-                self.runs.filter.set_vim(self.vim_motions);
+                self.runs.filter.set_vim(self.ui.vim_motions);
                 super::widgets::focus_textarea(&mut self.runs.filter);
             }
             ActionId::CycleStatus => {
-                let selected = self.selected_run().map(|entry| entry.id().to_owned());
+                let selected = self.runs.selected_id();
                 self.runs.status = (self.runs.status + 1) % STATUSES.len();
-                self.reselect(selected);
+                self.runs.reselect(selected);
             }
             ActionId::OpenRun => {
                 // A run of this session is already live; never load a stale copy.
                 let open = self
-                    .selected_run()
-                    .is_some_and(|entry| self.focus_run(entry.id()));
+                    .runs
+                    .selected_entry()
+                    .is_some_and(|entry| self.session.focus_run(entry.id()));
                 if open {
-                    self.page = 1;
-                    self.message = "Run already open in this session.".into();
-                } else if let Some(run) =
-                    self.selected_run().and_then(|entry| self.load_run(&entry))
+                    self.ui.page = Page::Monitor;
+                    self.ui.message = "Run already open in this session.".into();
+                } else if let Some(run) = self
+                    .runs
+                    .selected_entry()
+                    .and_then(|entry| self.load_run(&entry))
                 {
                     let tail = saved_output(&run);
-                    self.adopt(run);
-                    for line in tail {
-                        self.focused.push_log(line);
+                    self.session.adopt(run);
+                    if let Some(slot) = self.session.focused_mut() {
+                        for line in tail {
+                            slot.push_log(line);
+                        }
                     }
-                    self.page = 1;
-                    self.message =
+                    self.ui.page = Page::Monitor;
+                    self.ui.message =
                         "Saved run loaded. c continues; y retries; t reopens its session; i retries interactively.".into();
                 }
             }
             ActionId::Rerun => {
-                if let Some(source) = self.selected_run().and_then(|entry| self.load_run(&entry)) {
+                if let Some(source) = self
+                    .runs
+                    .selected_entry()
+                    .and_then(|entry| self.load_run(&entry))
+                {
                     let worktree = source.worktree;
-                    self.modal = Some(Modal::Confirm(Box::new(Confirm {
+                    self.ui.open(Modal::Confirm(Box::new(Confirm {
                         kind: Kind::Rerun {
                             source: Box::new(source),
                             worktree,
@@ -186,15 +223,19 @@ impl App {
                 }
             }
             ActionId::CompareAttempts => {
-                if let Some(run) = self.selected_run().and_then(|entry| self.load_run(&entry)) {
+                if let Some(run) = self
+                    .runs
+                    .selected_entry()
+                    .and_then(|entry| self.load_run(&entry))
+                {
                     self.compare_picker(&run);
                 }
             }
             ActionId::CleanUp => {
-                if let Some(entry) = self.selected_run() {
+                if let Some(entry) = self.runs.selected_entry() {
                     let id = entry.id().to_owned();
                     let plan = self.cleanup_plan(&id, false)?;
-                    self.modal = Some(Modal::Confirm(Box::new(Confirm {
+                    self.ui.open(Modal::Confirm(Box::new(Confirm {
                         kind: Kind::Cleanup {
                             id,
                             plan,
@@ -229,11 +270,11 @@ impl App {
     }
     /// Keys while the filter field has focus. True means exit.
     pub(super) fn runs_filter_key(&mut self, key: KeyEvent) -> Result<bool> {
-        self.runs.filter.set_vim(self.vim_motions);
+        self.runs.filter.set_vim(self.ui.vim_motions);
         if self.runs.filter.vim_key(key) {
             return Ok(false);
         }
-        let selected = self.selected_run().map(|entry| entry.id().to_owned());
+        let selected = self.runs.selected_id();
         match menu_key(key) {
             Key::Esc => {
                 self.runs.filter = InputField::default();
@@ -250,18 +291,18 @@ impl App {
                 self.runs.filter.input(key);
             }
         }
-        self.reselect(selected);
+        self.runs.reselect(selected);
         Ok(false)
     }
     pub(super) fn paste_runs_filter(&mut self, text: &str) {
-        if self.page == 2 && self.runs.filtering {
-            let selected = self.selected_run().map(|entry| entry.id().to_owned());
+        if self.ui.page == Page::Runs && self.runs.filtering {
+            let selected = self.runs.selected_id();
             self.runs.filter.insert_str(text.replace(['\r', '\n'], " "));
-            self.reselect(selected);
+            self.runs.reselect(selected);
         }
     }
     pub(super) fn runs_filtering(&self) -> bool {
-        self.page == 2 && self.runs.filtering
+        self.ui.page == Page::Runs && self.runs.filtering
     }
     fn compare_picker(&mut self, run: &Run) {
         let mut items = vec![];
@@ -300,10 +341,10 @@ impl App {
             }
         }
         if items.is_empty() {
-            self.message = "No stage in this run has two attempts to compare.".into();
+            self.ui.message = "No stage in this run has two attempts to compare.".into();
             return;
         }
-        self.modal = Some(Modal::Picker {
+        self.ui.open(Modal::Picker {
             title: format!("Compare attempts · {}", run.id),
             items,
             selected: 0,
@@ -335,9 +376,10 @@ impl App {
                 worktrees,
                 ids: vec![id.to_owned()],
                 protect: self
-                    .slots()
-                    .filter_map(|(slot, _)| slot.run.as_ref())
-                    .map(|run| run.id.clone())
+                    .session
+                    .runs
+                    .iter()
+                    .map(|slot| slot.run.id.clone())
                     .collect(),
                 ..Criteria::default()
             },
@@ -378,8 +420,11 @@ impl App {
     }
     /// Starts a rerun through the same background path as Workflow [r].
     fn start_rerun(&mut self, id: &str, worktree: bool) -> Result<()> {
-        let (project, settings, source) =
-            (self.project.clone(), self.settings.clone(), id.to_owned());
+        let (project, settings, source) = (
+            self.project.clone(),
+            self.editor.settings.clone(),
+            id.to_owned(),
+        );
         self.start_run(
             move |placement| history::rerun_at(&project, &settings, &source, placement),
             worktree,
@@ -390,12 +435,11 @@ impl App {
     fn clean_up(&mut self, plan: &Plan) -> Result<()> {
         let done = history::apply(plan);
         if let Some((id, reason)) = done.skipped.first() {
-            self.message = format!("Kept {id}: {reason}");
-            self.alert = self.message.clone();
+            self.ui.error(format!("Kept {id}: {reason}"));
         } else if let Some(item) = done.items.first() {
-            self.message = format!("Removed {} ({})", item.id, history::human(item.bytes()));
+            self.ui.message = format!("Removed {} ({})", item.id, history::human(item.bytes()));
             if let Some(note) = &item.note {
-                self.message.push_str(&format!(". {note}"));
+                self.ui.message.push_str(&format!(". {note}"));
             }
         }
         self.load_runs();
@@ -442,7 +486,7 @@ fn saved_output(run: &Run) -> Vec<String> {
             .lines()
             .map(|line| storage::truncate(line, 1500)),
     );
-    let keep = lines.len().saturating_sub(super::app::LOG_LINES);
+    let keep = lines.len().saturating_sub(super::run_slot::LOG_LINES);
     lines.drain(1..=keep.min(lines.len() - 1));
     lines
 }
@@ -570,7 +614,7 @@ fn rerun_lines(source: &Run, worktree: bool, palette: Palette) -> Vec<Line<'stat
 }
 
 pub(super) fn draw_history(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
-    if app.history.is_empty() {
+    if app.runs.entries.is_empty() {
         empty_state(
             frame,
             palette,
@@ -581,7 +625,7 @@ pub(super) fn draw_history(frame: &mut Frame<'_>, app: &App, area: Rect, palette
         );
         return;
     }
-    let visible = app.visible_runs();
+    let visible = app.runs.visible();
     let mut title = String::from("Saved runs");
     if app.runs.status > 0 {
         title.push_str(&format!(" · {}", STATUSES[app.runs.status].0));
@@ -599,7 +643,7 @@ pub(super) fn draw_history(frame: &mut Frame<'_>, app: &App, area: Rect, palette
     title.push_str(&format!(
         " · {} of {} runs",
         visible.len(),
-        app.history.len()
+        app.runs.entries.len()
     ));
     let block = palette.panel_with(&title, &[("Enter", "open")]);
     let outer = area;
@@ -713,7 +757,7 @@ pub(super) fn draw_history(frame: &mut Frame<'_>, app: &App, area: Rect, palette
         .highlight_spacing(HighlightSpacing::Always)
         .row_highlight_style(palette.selected_style()),
         area,
-        &mut TableState::default().with_selected(Some(app.history_selected.min(visible.len() - 1))),
+        &mut TableState::default().with_selected(Some(app.runs.selected.min(visible.len() - 1))),
     );
 }
 
@@ -748,9 +792,8 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             app.poll().unwrap();
-            let busy = app.runs_job.is_some()
-                || app.starting.is_some()
-                || (app.page == 2 && app.runs_stale);
+            let busy =
+                app.runs.loading || app.starting || (app.ui.page == Page::Runs && app.runs.stale);
             if !busy || Instant::now() > deadline {
                 break;
             }
@@ -778,20 +821,19 @@ mod tests {
         };
         Settings {
             workflows: vec![Workflow {
-                name: "Test".into(),
                 max_repair_passes: 0,
-                sandbox_default: Default::default(),
-                budget: Default::default(),
-                max_parallel: 2,
-                stages: vec![Stage {
-                    id: "research".into(),
-                    name: "research".into(),
-                    role: Role::Research,
-                    harness: "mock".into(),
-                    provider: "research".into(),
-                    model: model.into(),
-                    ..Stage::default()
-                }],
+                ..Workflow::new(
+                    "Test",
+                    vec![Stage {
+                        id: "research".into(),
+                        name: "research".into(),
+                        role: Role::Research,
+                        harness: "mock".into(),
+                        provider: "research".into(),
+                        model: model.into(),
+                        ..Stage::default()
+                    }],
+                )
             }],
             adapters: BTreeMap::from([("mock".into(), adapter)]),
             ..Settings::default()
@@ -817,7 +859,7 @@ mod tests {
             project.join("config.toml"),
             Arc::new(AtomicBool::new(false)),
         );
-        app.theme_path = project.join("appearance.json");
+        app.ui.theme_path = project.join("appearance.json");
         app
     }
     fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
@@ -848,26 +890,26 @@ mod tests {
         fs::create_dir_all(project.path().join(".model-router/runs/broken")).unwrap();
         let mut app = app(project.path(), settings);
         press(&mut app, "3");
-        assert_eq!(app.history.len(), 3);
+        assert_eq!(app.runs.entries.len(), 3);
         press(&mut app, "jjj");
-        assert_eq!(app.history_selected, 2);
+        assert_eq!(app.runs.selected, 2);
         assert!(shows(&mut app, "Saved runs · 3 of 3 runs"));
 
         press(&mut app, "/docs");
         assert!(app.runs_filtering());
-        assert_eq!(app.visible_runs().len(), 1);
-        assert_eq!(app.history_selected, 0);
+        assert_eq!(app.runs.visible().len(), 1);
+        assert_eq!(app.runs.selected, 0);
         // Action keys type into the field while it has focus.
-        assert_eq!(app.page, 2);
+        assert_eq!(app.ui.page, Page::Runs);
         assert!(shows(&mut app, "1 of 3 runs"));
         app.key(key(Key::Esc)).unwrap();
         assert!(!app.runs_filtering());
-        assert_eq!(app.visible_runs().len(), 3);
+        assert_eq!(app.runs.visible().len(), 3);
 
         press(&mut app, "/parser");
         app.key(key(Key::Enter)).unwrap();
         assert!(!app.runs_filtering());
-        assert_eq!(app.visible_runs()[0].id(), failed.id);
+        assert_eq!(app.runs.visible()[0].id(), failed.id);
         assert!(shows(&mut app, "“parser” · 1 of 3 runs"));
         press(&mut app, "/");
         app.key(key(Key::Esc)).unwrap();
@@ -875,8 +917,8 @@ mod tests {
         let mut seen = vec![];
         for _ in 0..STATUSES.len() {
             press(&mut app, "f");
-            let visible = app.visible_runs();
-            assert!(app.history_selected <= visible.len().saturating_sub(1));
+            let visible = app.runs.visible();
+            assert!(app.runs.selected <= visible.len().saturating_sub(1));
             seen.push((STATUSES[app.runs.status].0, visible.len()));
         }
         assert_eq!(
@@ -908,9 +950,9 @@ mod tests {
         assert!(shows(&mut app, "✗ damaged"));
         app.key(key(Key::Enter)).unwrap();
         settle(&mut app);
-        assert!(app.focused.run.is_none());
-        assert_eq!(app.page, 2);
-        match &app.modal {
+        assert!(app.session.run().is_none());
+        assert_eq!(app.ui.page, Page::Runs);
+        match app.ui.dialog() {
             Some(Modal::Text { title, body, .. }) => {
                 assert_eq!(title, "Damaged run record");
                 assert!(body.contains(&broken.display().to_string()), "{body}");
@@ -919,7 +961,7 @@ mod tests {
         }
         app.key(key(Key::Esc)).unwrap();
         press(&mut app, "n");
-        assert!(matches!(&app.modal, Some(Modal::Text { .. })));
+        assert!(matches!(app.ui.dialog(), Some(Modal::Text { .. })));
     }
 
     #[test]
@@ -930,31 +972,28 @@ mod tests {
         assert_eq!(drive(&mut source), Action::Complete);
         let mut app = app(project.path(), settings);
         press(&mut app, "3n");
-        assert!(matches!(&app.modal, Some(Modal::Confirm(_))));
+        assert!(matches!(app.ui.dialog(), Some(Modal::Confirm(_))));
         assert!(shows(&mut app, "Rerun as a new run"));
         assert!(shows(&mut app, "research · mock / test-model · unattended"));
         assert!(shows(&mut app, "Port the parser"));
         assert!(shows(&mut app, "not the current template"));
         app.key(key(Key::Esc)).unwrap();
-        assert!(app.modal.is_none() && app.focused.worker.is_none() && app.focused.run.is_none());
+        assert!(app.ui.dialog().is_none() && !app.session.running() && app.session.run().is_none());
         assert_eq!(run_dirs(project.path()), 1);
 
         press(&mut app, "n");
         app.key(key(Key::Enter)).unwrap();
-        assert!(app.modal.is_none());
-        assert!(
-            app.starting.is_some(),
-            "The run is created in the background"
-        );
+        assert!(app.ui.dialog().is_none());
+        assert!(app.starting, "The run is created in the background");
         settle(&mut app);
-        assert!(app.focused.worker.is_some());
-        assert_eq!(app.page, 1);
+        assert!(app.session.running());
+        assert_eq!(app.ui.page, Page::Monitor);
         let deadline = Instant::now() + Duration::from_secs(20);
-        while app.focused.worker.is_some() && Instant::now() < deadline {
+        while app.session.running() && Instant::now() < deadline {
             app.poll().unwrap();
             thread::sleep(Duration::from_millis(20));
         }
-        let run = app.focused.run.as_ref().unwrap();
+        let run = app.session.run().unwrap();
         assert_eq!(run.rerun_of.as_deref(), Some(source.id.as_str()));
         assert_eq!(run.status, Status::Complete);
         assert_eq!(run_dirs(project.path()), 2);
@@ -973,12 +1012,16 @@ mod tests {
         assert_eq!(drive(&mut once), Action::Complete);
         let mut app = app(project.path(), settings);
         press(&mut app, "3c");
-        assert!(app.modal.is_none());
-        assert!(app.message.contains("two attempts"), "{}", app.message);
+        assert!(app.ui.dialog().is_none());
+        assert!(
+            app.ui.message.contains("two attempts"),
+            "{}",
+            app.ui.message
+        );
         press(&mut app, "j");
-        assert_eq!(app.selected_run().unwrap().id(), retried.id);
+        assert_eq!(app.runs.selected_entry().unwrap().id(), retried.id);
         press(&mut app, "c");
-        match &app.modal {
+        match app.ui.dialog() {
             Some(Modal::Picker { items, .. }) => {
                 assert_eq!(items[0].label, "research · attempt 1 vs 2");
             }
@@ -986,7 +1029,7 @@ mod tests {
         }
         app.key(key(Key::Enter)).unwrap();
         settle(&mut app);
-        match &app.modal {
+        match app.ui.dialog() {
             Some(Modal::Text { title, body, .. }) => {
                 assert_eq!(title, "Compare · research");
                 assert!(body.contains("failed → complete"), "{body}");
@@ -1004,35 +1047,36 @@ mod tests {
         let kept = create(project.path(), &settings, "Newer work");
         let mut app = app(project.path(), settings);
         press(&mut app, "3j");
-        assert_eq!(app.selected_run().unwrap().id(), run.id);
+        assert_eq!(app.runs.selected_entry().unwrap().id(), run.id);
         press(&mut app, "D");
-        assert!(matches!(&app.modal, Some(Modal::Confirm(_))));
+        assert!(matches!(app.ui.dialog(), Some(Modal::Confirm(_))));
         assert!(shows(&mut app, "Would remove 1 run"));
         assert!(shows(
             &mut app,
             &format!(".model-router/handoffs/{}", run.id)
         ));
         app.key(key(Key::Esc)).unwrap();
-        assert!(app.modal.is_none());
+        assert!(app.ui.dialog().is_none());
         assert!(run.directory.exists());
 
         press(&mut app, "Dy");
-        assert!(app.modal.is_none());
+        assert!(app.ui.dialog().is_none());
         assert!(!run.directory.exists() && kept.directory.exists());
-        assert!(app.message.starts_with(&format!("Removed {}", run.id)));
-        assert_eq!(app.history.len(), 1);
-        assert_eq!(app.history_selected, 0);
+        assert!(app.ui.message.starts_with(&format!("Removed {}", run.id)));
+        assert_eq!(app.runs.entries.len(), 1);
+        assert_eq!(app.runs.selected, 0);
 
         // The run open in the monitor stays.
-        app.focused.run = Some(engine::load(project.path(), &kept.id).unwrap());
+        app.session
+            .adopt(engine::load(project.path(), &kept.id).unwrap());
         press(&mut app, "D");
         app.key(key(Key::Enter)).unwrap();
         settle(&mut app);
         assert!(kept.directory.exists());
         assert!(
-            app.message.contains("Open in the monitor"),
+            app.ui.message.contains("Open in the monitor"),
             "{}",
-            app.message
+            app.ui.message
         );
     }
 
@@ -1049,11 +1093,11 @@ mod tests {
         let mut app = app(project.path(), settings);
         press(&mut app, "3");
         app.key(key(Key::Enter)).unwrap();
-        let logs: Vec<_> = app.focused.logs.iter().cloned().collect();
+        let logs: Vec<_> = app.slot().logs.iter().cloned().collect();
         assert_eq!(logs[0], "── research · attempt 1 · saved output ──");
         assert_eq!(logs.last().unwrap(), "final line");
-        assert!(logs.len() <= crate::tui::app::LOG_LINES);
-        app.focused.show_output = true;
+        assert!(logs.len() <= crate::tui::run_slot::LOG_LINES);
+        app.slot_mut().show_output = true;
         assert!(shows(&mut app, "final line"));
     }
 
@@ -1069,7 +1113,10 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         let bytes = app.runs.sizes.lock().unwrap()[&run.id];
-        assert_eq!(bytes, history::run_size(project.path(), &app.history[0]));
+        assert_eq!(
+            bytes,
+            history::run_size(project.path(), &app.runs.entries[0])
+        );
         assert!(shows(&mut app, &history::human(bytes)));
         let lines = screen(&mut app, 80, 24);
         let footer = lines[22..].join("\n");

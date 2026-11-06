@@ -60,19 +60,18 @@ fn run_probe(mode: Sandbox) -> (tempfile::TempDir, Run) {
         ..CustomAdapter::default()
     };
     let workflow = Workflow {
-        max_parallel: 2,
-        name: "Sandbox".into(),
         max_repair_passes: 0,
-        budget: Default::default(),
-        sandbox_default: Sandbox::Off,
-        stages: vec![Stage {
-            id: "research".into(),
-            name: "Research".into(),
-            role: Role::Research,
-            harness: "probe".into(),
-            sandbox: Some(mode),
-            ..Stage::default()
-        }],
+        ..Workflow::new(
+            "Sandbox",
+            vec![Stage {
+                id: "research".into(),
+                name: "Research".into(),
+                role: Role::Research,
+                harness: "probe".into(),
+                sandbox: Some(mode),
+                ..Stage::default()
+            }],
+        )
     };
     let settings = Settings {
         workflows: vec![workflow.clone()],
@@ -138,12 +137,9 @@ fn interactive_harnesses_keep_their_terminal_inside_the_sandbox() {
     let attempt = dir.path().join("attempt");
     fs::create_dir(&attempt).unwrap();
     let workflow = Workflow {
-        max_parallel: 2,
-        name: "w".into(),
         max_repair_passes: 0,
-        budget: Default::default(),
         sandbox_default: Sandbox::ReadOnly,
-        stages: vec![],
+        ..Workflow::new("w", vec![])
     };
     let plan = sandbox::plan(
         &workflow,
