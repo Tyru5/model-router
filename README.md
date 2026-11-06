@@ -728,10 +728,13 @@ passes are allowed by default; a limit of zero disables automatic repair. If no
 implementation target exists, or the limit is reached, the run stops for you.
 
 Each stage receives the original task, its instructions, bounded prior handoffs,
-and artifact paths. Full logs stay on disk. Prompts request this handoff format:
+and artifact paths. Full logs stay on disk. Prompts request this handoff
+(schema version 2, [`schema/handoff.schema.json`](schema/handoff.schema.json);
+a copy is written to each attempt directory):
 
 ```json
 {
+  "schema_version": 2,
   "summary": "What changed or was established",
   "verdict": "complete",
   "findings": [],
@@ -745,12 +748,20 @@ and artifact paths. Full logs stay on disk. Prompts request this handoff format:
 Normal stages use `complete`; reviews use `pass` or `needs_changes`. Any stage
 can report `blocked`. Findings contain `severity` (`blocking` or `advisory`) and
 `description`. Test status is `passed`, `failed`, or `not_run`. A test stage
-that cannot apply any check may add `"not_applicable": "reason"`.
+that cannot apply any check may add `"not_applicable": "reason"`. Optional:
+`artifacts` (`[{"kind": "patch|file|url|note", "path_or_url", "description"}]`),
+`confidence` (`low`, `medium`, `high`), and `next_steps`. A handoff without
+`schema_version` is version 1, which lacks those three; saved runs stay valid.
 
-Models can write the given handoff file or, when unattended, emit the object
-between `<router-handoff>` and `</router-handoff>`. Plain text is accepted for
-unattended stages other than review/verification and labeled unstructured.
-Tool output and echoed prompts are not extracted as assistant verdicts.
+The router reads the first valid handoff from, in order: the harness's native
+structured output (Codex `--output-schema`, Claude Code `--json-schema`, when
+the detected version supports them), the handoff file, the last
+`<router-handoff>` block of the final response, fenced JSON, or a bare JSON
+response. A repeated contract example is never an answer, and invalid fields
+are named with their allowed values. Plain text is accepted for unattended
+stages other than review/verification and labeled unstructured. Tool output
+and echoed prompts are not extracted as assistant verdicts. Reports show each
+stage's handoff source.
 
 ### Verification
 
@@ -808,6 +819,7 @@ does not merge, commit, or delete worktrees automatically.
     changes.diff                # patch of changes made during the run
     01-research/attempt-001/
       prompt.md
+      handoff.schema.json       # the handoff schema the prompt names
       command.json              # executable and literal argument vector
       stdout.log
       stderr.log
