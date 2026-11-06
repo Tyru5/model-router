@@ -1,5 +1,6 @@
 //! Completion summaries: what a run changed, checked, left unresolved, and
-//! spent. `build` and `render` are pure; `changes` and `diff` run Git.
+//! spent. `render` is pure and `build` reads only saved ship results;
+//! `changes` and `diff` run Git.
 use crate::{
     config::Role,
     engine::{Attempt, Run, Status},
@@ -34,6 +35,9 @@ pub struct RunReport {
     pub reported_files: Vec<String>,
     /// The latest review summary stage's brief, Markdown; also review.md.
     pub review: Option<String>,
+    /// Ships of this run: by ship stages, then `model-router ship`. Read
+    /// from each ship's ship.json.
+    pub shipped: Vec<crate::ship::Outcome>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -228,7 +232,9 @@ pub fn build(run: &Run) -> RunReport {
                 ),
             );
         }
-        if let Some(waiver) = &state.waiver {
+        // A ship stage's acceptance is its plan's confirmation.
+        let waiver = state.waiver.as_ref().filter(|_| stage.role != Role::Ship);
+        if let Some(waiver) = waiver {
             item(
                 ItemKind::Waiver,
                 format!("verification not applicable: {}", waiver.reason),
@@ -245,7 +251,7 @@ pub fn build(run: &Run) -> RunReport {
             active_seconds: state.attempts.iter().map(seconds).sum(),
             usage: total(&state.attempts),
             checks,
-            waiver: state.waiver.as_ref().map(|w| w.reason.clone()),
+            waiver: waiver.map(|w| w.reason.clone()),
         });
     }
     // Stable, so each kind keeps stage order.
@@ -279,6 +285,7 @@ pub fn build(run: &Run) -> RunReport {
             .filter(|(stage, _)| stage.role == Role::Summary)
             .find_map(|(_, state)| state.handoff.as_ref())
             .map(|handoff| handoff.summary.trim().to_owned()),
+        shipped: crate::ship::outcomes(run),
     }
 }
 
@@ -543,6 +550,12 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
     }
     if let Some(review) = &report.review {
         let _ = writeln!(text, "\nReview summary:\n{review}");
+    }
+    for ship in &report.shipped {
+        let _ = writeln!(text, "\nShipped:");
+        for line in ship.lines() {
+            let _ = writeln!(text, "  {line}");
+        }
     }
     if let Some(changes) = changes {
         let _ = writeln!(text, "\n{}", changes_heading(changes));

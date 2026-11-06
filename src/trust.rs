@@ -122,6 +122,13 @@ pub fn dangerous(settings: &Settings) -> Vec<String> {
             for (key, value) in harness_settings::escalations(stage) {
                 items.push(format!("{} {key} = {value} in {at}", stage.harness));
             }
+            if unconfirmed_ship(stage) {
+                let options = stage.ship.clone().unwrap_or_default();
+                items.push(format!(
+                    "ship without confirmation in {at}: {}",
+                    options.describe()
+                ));
+            }
         }
     }
     for (name, provider) in &settings.providers {
@@ -144,6 +151,11 @@ pub fn dangerous(settings: &Settings) -> Vec<String> {
         }
     }
     items
+}
+
+/// A ship stage that commits (and maybe pushes) without showing its plan.
+fn unconfirmed_ship(stage: &config::Stage) -> bool {
+    stage.role == config::Role::Ship && stage.ship.as_ref().is_some_and(|s| !s.confirm)
 }
 
 fn adapter_argv(adapter: &CustomAdapter) -> Vec<String> {
@@ -259,6 +271,8 @@ struct IgnoredStage {
     checks: Vec<Check>,
     extra_args: Vec<String>,
     settings: BTreeMap<String, String>,
+    /// A ship stage's `confirm = false`, forced on while untrusted.
+    ship_unconfirmed: bool,
 }
 
 /// Neutralizes every dangerous section: custom adapters keep their names but
@@ -293,11 +307,19 @@ pub fn ignore(settings: &mut Settings) {
                 .into_iter()
                 .map(|(k, v)| (k.to_owned(), v.to_owned()))
                 .collect();
-            if stage.checks.is_empty() && stage.extra_args.is_empty() && escalated.is_empty() {
+            let ship_unconfirmed = unconfirmed_ship(stage);
+            if stage.checks.is_empty()
+                && stage.extra_args.is_empty()
+                && escalated.is_empty()
+                && !ship_unconfirmed
+            {
                 continue;
             }
             for key in escalated.keys() {
                 stage.harness_settings.remove(key);
+            }
+            if let Some(ship) = stage.ship.as_mut().filter(|_| ship_unconfirmed) {
+                ship.confirm = true;
             }
             ignored.stages.insert(
                 (workflow.name.clone(), stage.id.clone()),
@@ -305,12 +327,13 @@ pub fn ignore(settings: &mut Settings) {
                     checks: std::mem::take(&mut stage.checks),
                     extra_args: std::mem::take(&mut stage.extra_args),
                     settings: escalated,
+                    ship_unconfirmed,
                 },
             );
         }
     }
     settings.warnings.push(
-        "Project config is untrusted: its custom adapters, checks, extra arguments, escalated permissions, and custom providers are ignored this session. Run `model-router trust` to use them.".into(),
+        "Project config is untrusted: its custom adapters, checks, extra arguments, escalated permissions, and custom providers are ignored, and its ship stages ask for confirmation, this session. Run `model-router trust` to use them.".into(),
     );
     settings.ignored = Some(Box::new(ignored));
 }
@@ -353,6 +376,9 @@ pub fn restore(settings: &Settings) -> Settings {
                 if current.is_empty() {
                     *current = value.clone();
                 }
+            }
+            if let Some(ship) = stage.ship.as_mut().filter(|_| original.ship_unconfirmed) {
+                ship.confirm = false;
             }
         }
     }
@@ -473,5 +499,32 @@ mod tests {
         assert_eq!(dangerous(&saved), dangerous(&original));
         assert_eq!(saved.workflows[0].stages[1].model, "opus");
         assert!(saved.ignored.is_none());
+    }
+
+    #[test]
+    fn ship_without_confirmation_needs_trust_and_asks_while_untrusted() {
+        let mut settings = Settings::default();
+        let ship = |confirm| Stage {
+            id: "ship".into(),
+            role: config::Role::Ship,
+            ship: Some(crate::ship::Options {
+                confirm,
+                ..crate::ship::Options::default()
+            }),
+            ..Stage::default()
+        };
+        settings.workflows[0].stages.push(ship(true));
+        assert!(dangerous(&settings).is_empty());
+        *settings.workflows[0].stages.last_mut().unwrap() = ship(false);
+        let items = dangerous(&settings);
+        assert!(
+            items.len() == 1 && items[0].starts_with("ship without confirmation in"),
+            "{items:?}"
+        );
+        let mut ignored = settings.clone();
+        ignore(&mut ignored);
+        let options = |s: &Settings| s.workflows[0].stages.last().unwrap().ship.clone().unwrap();
+        assert!(options(&ignored).confirm);
+        assert!(!options(&restore(&ignored)).confirm);
     }
 }

@@ -119,6 +119,10 @@ pub fn samples(run: &Run) -> Vec<Sample> {
         let Some(last) = state.attempts.last() else {
             continue;
         };
+        // The router ships; no harness or model to rate.
+        if stage.role == Role::Ship {
+            continue;
+        }
         if matches!(state.status, Status::Running | Status::Interactive)
             || state.attempts.iter().any(|a| a.status == Status::Running)
         {

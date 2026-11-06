@@ -11,6 +11,21 @@ pub struct StagePreset {
 
 impl StagePreset {
     pub fn build(&self) -> Stage {
+        if self.role == Role::Ship {
+            // The router ships; harness and model are unused.
+            return Stage {
+                id: self.key.into(),
+                name: self.name.into(),
+                role: self.role,
+                model: String::new(),
+                ship: Some(crate::ship::Options {
+                    push: true,
+                    draft_pr: true,
+                    ..crate::ship::Options::default()
+                }),
+                ..Stage::default()
+            };
+        }
         let edits = matches!(self.key, "implement" | "document");
         Stage {
             id: self.key.into(),
@@ -136,6 +151,13 @@ pub const STAGES: &[StagePreset] = &[
         instructions: "Summarize the task outcome using prior stage handoffs and their artifacts. State what was established or changed, decisions, checks actually run, unresolved issues, and practical next steps. Preserve uncertainty and failed or missing checks. Do not modify project files, publish, commit, or deploy anything. Return the summary in the required handoff format.",
     },
     StagePreset {
+        key: "ship",
+        name: "Ship (commit + draft PR)",
+        role: Role::Ship,
+        purpose: "The router commits the run's changes on a new branch, pushes, and opens a draft PR, after showing you exactly what it will do.",
+        instructions: "",
+    },
+    StagePreset {
         key: "custom",
         name: "Custom stage",
         role: Role::Custom,
@@ -161,8 +183,9 @@ impl WorkflowPreset {
                 .iter()
                 .map(|key| {
                     let mut stage = stage(key).build();
-                    // Selecting a workflow must never implicitly opt into a review.
-                    stage.enabled = stage.role != Role::Review;
+                    // Selecting a workflow must never implicitly opt into a
+                    // review, or into the router committing.
+                    stage.enabled = !matches!(stage.role, Role::Review | Role::Ship);
                     stage
                 })
                 .collect(),
@@ -175,7 +198,7 @@ pub const WORKFLOWS: &[WorkflowPreset] = &[
         key: "quick-task",
         name: "Quick task",
         purpose: "Implement a clear task, verify it, optionally review, and summarize for you.",
-        stages: &["implement", "verify", "review", "summary"],
+        stages: &["implement", "verify", "review", "summary", "ship"],
     },
     WorkflowPreset {
         key: "full-feature",
@@ -192,13 +215,21 @@ pub const WORKFLOWS: &[WorkflowPreset] = &[
             "security",
             "document",
             "summary",
+            "ship",
         ],
     },
     WorkflowPreset {
         key: "bug-fix",
         name: "Bug fix",
         purpose: "Diagnose the cause, implement a fix, verify the regression, and summarize for you.",
-        stages: &["diagnose", "implement", "verify", "review", "summary"],
+        stages: &[
+            "diagnose",
+            "implement",
+            "verify",
+            "review",
+            "summary",
+            "ship",
+        ],
     },
     WorkflowPreset {
         key: "investigation",
@@ -219,7 +250,7 @@ pub fn listing() -> String {
             preset.purpose
         ));
     }
-    text.push_str("\nWORKFLOW PRESETS (reviews start disabled)\n");
+    text.push_str("\nWORKFLOW PRESETS (reviews start disabled, as does ship)\n");
     for preset in WORKFLOWS {
         text.push_str(&format!(
             "  {} — {}\n    {}\n",
@@ -266,7 +297,7 @@ mod tests {
                 loaded.workflows[0]
                     .stages
                     .iter()
-                    .filter(|s| s.role == Role::Review)
+                    .filter(|s| matches!(s.role, Role::Review | Role::Ship))
                     .all(|s| !s.enabled)
             );
             assert_eq!(loaded.workflows[0].stages.len(), preset.stages.len());
@@ -286,7 +317,11 @@ mod tests {
             .into_iter()
             .chain(WORKFLOWS.iter().map(WorkflowPreset::build))
         {
-            let last = workflow.stages.last().unwrap();
+            let last = workflow
+                .stages
+                .iter()
+                .rfind(|s| s.role != Role::Ship)
+                .unwrap();
             assert!(
                 last.role == Role::Summary && last.enabled,
                 "{}",

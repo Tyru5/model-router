@@ -543,6 +543,16 @@ fn idle_run(server: &Server, project: Option<&str>, id: &str) -> Result<Run> {
 
 fn confirm_stage(server: &Server, a: RunArgs) -> Result<Value> {
     let mut run = idle_run(server, a.project.as_deref(), &a.run_id)?;
+    // The ship checkpoint is a person's decision to commit and publish.
+    ensure!(
+        run.workflow
+            .stages
+            .get(run.cursor)
+            .is_none_or(|s| s.role != crate::config::Role::Ship),
+        "Run {} waits for a person to confirm its ship plan: model-router resume {} --advance, or [a] in the TUI",
+        run.id,
+        run.id
+    );
     run.confirm()?;
     server.runs.drive(&run.project.clone(), run.clone())?;
     Ok(status_value(&run, &server.runs.info(&run.id)))
