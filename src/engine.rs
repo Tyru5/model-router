@@ -1317,6 +1317,15 @@ fn classify_exit(
         attempt.process_group = None;
         if attempt.mode == Mode::Unattended {
             attempt.usage = handoff::usage_file(&stdout, prepared.invocation.kind);
+        } else {
+            // Best effort, from the harness's own session log.
+            attempt.usage = handoff::session_usage(
+                &run.workflow.stages[index].harness,
+                attempt.session.as_deref(),
+                &run.workspace,
+                attempt.started_at,
+                Utc::now(),
+            );
         }
     }
     if outcome.cancelled {
@@ -1728,6 +1737,12 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
             save_changes(run);
             return Ok(Action::Stopped);
         }
+        // Spend is recorded per attempt; a cap stops the run before more.
+        if let Some(reason) = crate::cost::check_budget(run) {
+            run.stop(Status::Blocked, reason, Actor::Engine, false)?;
+            emit(Event::State(Box::new(run.clone())));
+            continue;
+        }
         if run.workflow.stages[run.cursor].mode == Mode::Interactive {
             let reason = format!(
                 "Stage {} waits for its terminal",
@@ -2011,6 +2026,7 @@ mod tests {
                 name: "Interactive".into(),
                 max_repair_passes: 0,
                 sandbox_default: Default::default(),
+                budget: Default::default(),
                 stages: vec![
                     Stage {
                         harness: "mock".into(),

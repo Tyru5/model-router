@@ -289,6 +289,31 @@ pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
+/// "  ·  ~$0.42 table of $5.00": spend so far, updated as each attempt
+/// records its usage; empty before any attempt without a budget.
+fn running_cost(app: &App, run: &crate::engine::Run) -> String {
+    let report = super::completion::cached_report(app, run);
+    let (cost, budget) = (report.usage.cost, report.budget);
+    if cost.attempts == 0 && budget.is_empty() {
+        return String::new();
+    }
+    let mut text = format!("  ·  cost {}", cost.short());
+    if cost.known() {
+        text.push_str(&format!(" {}", cost.sources()));
+    }
+    if let Some(cap) = budget.max_usd {
+        text.push_str(&format!(" of {}", crate::report::dollars(cap)));
+    }
+    if let Some(cap) = budget.max_tokens {
+        text.push_str(&format!(
+            " · {} of {} tokens",
+            crate::report::tokens(cost.tokens),
+            crate::report::tokens(cap)
+        ));
+    }
+    text
+}
+
 pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
     let Some(run) = &app.focused.run else {
         empty_state(
@@ -318,8 +343,11 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
             palette.status_span(run.status),
             Span::styled(
                 format!(
-                    "   {}  ·  repairs {}/{}",
-                    run.id, run.repair_passes, run.workflow.max_repair_passes
+                    "   {}  ·  repairs {}/{}{}",
+                    run.id,
+                    run.repair_passes,
+                    run.workflow.max_repair_passes,
+                    running_cost(app, run)
                 ),
                 Style::default().fg(palette.muted),
             ),

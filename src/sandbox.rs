@@ -489,6 +489,7 @@ mod tests {
             name: "w".into(),
             max_repair_passes: 0,
             sandbox_default: default,
+            budget: Default::default(),
             stages: vec![],
         }
     }

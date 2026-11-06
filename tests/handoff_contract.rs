@@ -106,6 +106,7 @@ fn preview(versions: Option<&str>) -> String {
         workflows: vec![Workflow {
             name: "Native".into(),
             max_repair_passes: 0,
+            budget: Default::default(),
             sandbox_default: Default::default(),
             stages: vec![
                 stage("codex"),

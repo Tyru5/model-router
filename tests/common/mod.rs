@@ -30,6 +30,7 @@ pub fn fixture(stages: Vec<Stage>) -> (tempfile::TempDir, Settings, Run) {
         name: "Test".into(),
         max_repair_passes: 2,
         sandbox_default: Default::default(),
+        budget: Default::default(),
         stages,
     };
     // Saved configs gain an enabled Codex summary on load; opt out to stay offline.

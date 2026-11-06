@@ -62,6 +62,7 @@ fn run_probe(mode: Sandbox) -> (tempfile::TempDir, Run) {
     let workflow = Workflow {
         name: "Sandbox".into(),
         max_repair_passes: 0,
+        budget: Default::default(),
         sandbox_default: Sandbox::Off,
         stages: vec![Stage {
             id: "research".into(),
@@ -138,6 +139,7 @@ fn interactive_harnesses_keep_their_terminal_inside_the_sandbox() {
     let workflow = Workflow {
         name: "w".into(),
         max_repair_passes: 0,
+        budget: Default::default(),
         sandbox_default: Sandbox::ReadOnly,
         stages: vec![],
     };

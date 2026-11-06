@@ -16,6 +16,7 @@ fn project() -> tempfile::TempDir {
             name: "Import test".into(),
             max_repair_passes: 0,
             sandbox_default: Default::default(),
+            budget: Default::default(),
             stages: vec![
                 Stage {
                     id: "implementation".into(),

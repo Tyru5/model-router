@@ -60,6 +60,7 @@ fn project() -> tempfile::TempDir {
         name: name.into(),
         max_repair_passes: 2,
         sandbox_default: Default::default(),
+        budget: Default::default(),
         stages: stages.into_iter().chain([summary.clone()]).collect(),
     };
     let settings = Settings {

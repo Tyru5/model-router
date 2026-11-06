@@ -790,6 +790,7 @@ mod tests {
                 name: "Test".into(),
                 max_repair_passes: 0,
                 sandbox_default: Default::default(),
+                budget: Default::default(),
                 stages: vec![Stage {
                     id: "research".into(),
                     name: "research".into(),

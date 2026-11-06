@@ -1048,6 +1048,241 @@ fn event_usage(event: &Value, kind: OutputKind) -> Option<Usage> {
     (usage != Usage::default()).then_some(usage)
 }
 
+/// Where harnesses keep native session logs: `CLAUDE_CONFIG_DIR` or
+/// `~/.claude`, and `CODEX_HOME` or `~/.codex`.
+#[derive(Debug, Clone, Default)]
+pub struct SessionRoots {
+    pub claude: Option<std::path::PathBuf>,
+    pub codex: Option<std::path::PathBuf>,
+}
+impl SessionRoots {
+    pub fn from_env() -> Self {
+        let home = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+        let dir = |var: &str, default: &str| {
+            std::env::var_os(var)
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from)
+                .or_else(|| home.as_ref().map(|home| home.join(default)))
+        };
+        Self {
+            claude: dir("CLAUDE_CONFIG_DIR", ".claude"),
+            codex: dir("CODEX_HOME", ".codex"),
+        }
+    }
+}
+
+/// Usage an interactive stage spent, read best effort from the harness's
+/// own session log between `since` and `until`: Claude Code's
+/// `projects/*/<session>.jsonl` (assistant `message.usage`, once per message
+/// ID) and Codex's `sessions/**/rollout-*.jsonl` (`token_count` totals,
+/// matched by session ID or else by workspace). None for other harnesses
+/// or when no log is found. Only tokens: these logs carry no cost.
+pub fn session_usage(
+    harness: &str,
+    session: Option<&str>,
+    workspace: &std::path::Path,
+    since: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
+) -> Option<Usage> {
+    session_usage_in(
+        &SessionRoots::from_env(),
+        harness,
+        session,
+        workspace,
+        since,
+        until,
+    )
+}
+
+pub fn session_usage_in(
+    roots: &SessionRoots,
+    harness: &str,
+    session: Option<&str>,
+    workspace: &std::path::Path,
+    since: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
+) -> Option<Usage> {
+    // Log timestamps and the router's clock may disagree slightly.
+    let slack = chrono::Duration::seconds(5);
+    let (since, until) = (since - slack, until + slack);
+    match harness {
+        "claude" => claude_session_usage(roots.claude.as_deref()?, session?, since, until),
+        "codex" => codex_session_usage(roots.codex.as_deref()?, session, workspace, since, until),
+        _ => None,
+    }
+}
+
+/// Parsed JSON lines of a log file, skipping lines that do not parse.
+fn log_lines(path: &std::path::Path) -> impl Iterator<Item = Value> {
+    use std::io::BufRead;
+    std::fs::File::open(path)
+        .ok()
+        .map(std::io::BufReader::new)
+        .into_iter()
+        .flat_map(|reader| reader.lines().map_while(Result::ok))
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+}
+
+fn timestamp(event: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    let text = event.get("timestamp")?.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+fn claude_session_usage(
+    root: &std::path::Path,
+    session: &str,
+    since: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
+) -> Option<Usage> {
+    // Session IDs are UUIDs; anything else cannot name a log file.
+    if session.is_empty() || !session.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+        return None;
+    }
+    let name = format!("{session}.jsonl");
+    let mut files = vec![];
+    for project in std::fs::read_dir(root.join("projects")).ok()?.flatten() {
+        let path = project.path();
+        if path.join(&name).is_file() {
+            files.push(path.join(&name));
+        }
+        // Subagent transcripts of the session, in newer Claude Code versions.
+        if let Ok(entries) = std::fs::read_dir(path.join(session).join("subagents")) {
+            files.extend(
+                entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().is_some_and(|x| x == "jsonl")),
+            );
+        }
+    }
+    // Streamed messages repeat their usage; the last copy of an ID counts.
+    let mut messages: std::collections::BTreeMap<String, Usage> = Default::default();
+    for (index, event) in files.iter().flat_map(|f| log_lines(f)).enumerate() {
+        if event.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if !timestamp(&event).is_some_and(|t| t >= since && t <= until) {
+            continue;
+        }
+        let Some(usage) = event.pointer("/message/usage") else {
+            continue;
+        };
+        let count = |key: &str| usage.get(key).and_then(Value::as_u64);
+        let id = event
+            .pointer("/message/id")
+            .and_then(Value::as_str)
+            .map_or_else(|| format!("line-{index}"), str::to_owned);
+        messages.insert(
+            id,
+            Usage {
+                input_tokens: count("input_tokens"),
+                output_tokens: count("output_tokens"),
+                cache_read_tokens: count("cache_read_input_tokens"),
+                cache_write_tokens: count("cache_creation_input_tokens"),
+                cost_usd: None,
+            },
+        );
+    }
+    let sum = messages.into_values().reduce(|a, b| a + b)?;
+    (sum != Usage::default()).then_some(sum)
+}
+
+fn codex_session_usage(
+    root: &std::path::Path,
+    session: Option<&str>,
+    workspace: &std::path::Path,
+    since: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
+) -> Option<Usage> {
+    let canonical =
+        |path: &std::path::Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let workspace = canonical(workspace);
+    let mut files = vec![];
+    let mut dirs = vec![root.join("sessions")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                dirs.push(path);
+            } else if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
+                // Logs not written since the attempt started cannot hold it.
+                && meta
+                    .modified()
+                    .is_ok_and(|m| chrono::DateTime::<chrono::Utc>::from(m) >= since)
+            {
+                files.push(path);
+            }
+        }
+    }
+    let mut found: Option<Usage> = None;
+    for path in files {
+        let mut events = log_lines(&path);
+        let Some(meta) = events
+            .by_ref()
+            .find(|e| e.get("type").and_then(Value::as_str) == Some("session_meta"))
+        else {
+            continue;
+        };
+        let matches = match session {
+            Some(id) => meta.pointer("/payload/id").and_then(Value::as_str) == Some(id),
+            None => meta
+                .pointer("/payload/cwd")
+                .and_then(Value::as_str)
+                .is_some_and(|cwd| canonical(std::path::Path::new(cwd)) == workspace),
+        };
+        if !matches {
+            continue;
+        }
+        // Totals are cumulative over the session: the attempt spent the
+        // last total in its window minus the last one before it.
+        let (mut before, mut end) = (None, None);
+        for event in events {
+            if event.pointer("/payload/type").and_then(Value::as_str) != Some("token_count") {
+                continue;
+            }
+            let (Some(at), Some(total)) = (
+                timestamp(&event),
+                event.pointer("/payload/info/total_token_usage"),
+            ) else {
+                continue;
+            };
+            let count = |key: &str| total.get(key).and_then(Value::as_u64).unwrap_or(0);
+            let cached = count("cached_input_tokens");
+            let totals = [
+                count("input_tokens").saturating_sub(cached),
+                count("output_tokens"),
+                cached,
+            ];
+            if at < since {
+                before = Some(totals);
+            } else if at <= until {
+                end = Some(totals);
+            }
+        }
+        let Some(end) = end else { continue };
+        let before = before.unwrap_or_default();
+        let spent = |i: usize| Some(end[i].saturating_sub(before[i]));
+        let part = Usage {
+            input_tokens: spent(0),
+            output_tokens: spent(1),
+            cache_read_tokens: spent(2),
+            cache_write_tokens: None,
+            cost_usd: None,
+        };
+        found = Some(match found {
+            Some(sum) => sum + part,
+            None => part,
+        });
+    }
+    found
+}
+
 #[cfg(test)]
 mod usage_tests {
     use super::*;
@@ -1191,6 +1426,115 @@ mod usage_tests {
         );
         assert_eq!(
             usage_file(&dir.path().join("missing"), OutputKind::Codex),
+            None
+        );
+    }
+
+    fn session_roots() -> SessionRoots {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/session-logs");
+        SessionRoots {
+            claude: Some(root.join("claude")),
+            codex: Some(root.join("codex")),
+        }
+    }
+
+    fn at(time: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(&format!("2026-11-05T{time}Z"))
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn claude_session_logs_count_each_message_once_within_the_attempt() {
+        let roots = session_roots();
+        let workspace = std::path::Path::new("/tmp/fixture-workspace");
+        let session = Some("5f0c1d2e-0000-4000-8000-00000000c1a0");
+        let spent = session_usage_in(
+            &roots,
+            "claude",
+            session,
+            workspace,
+            at("10:00:00"),
+            at("10:30:00"),
+        );
+        // msg_1's last copy, msg_2, and the subagent; the 09:00 message is
+        // an earlier attempt's.
+        assert_eq!(spent, Some(tokens(14, 58, Some(300), Some(20))));
+        let earlier = session_usage_in(
+            &roots,
+            "claude",
+            session,
+            workspace,
+            at("08:00:00"),
+            at("09:30:00"),
+        );
+        assert_eq!(earlier, Some(tokens(999, 999, None, None)));
+        // No session, an unknown one, or a path-like one: nothing.
+        for session in [
+            None,
+            Some("00000000-0000-4000-8000-000000000000"),
+            Some("../x"),
+        ] {
+            assert_eq!(
+                session_usage_in(
+                    &roots,
+                    "claude",
+                    session,
+                    workspace,
+                    at("10:00:00"),
+                    at("10:30:00")
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn codex_rollouts_subtract_totals_from_before_the_attempt() {
+        let roots = session_roots();
+        let workspace = std::path::Path::new("/tmp/fixture-workspace");
+        // Found by workspace when the router assigned no session; the other
+        // project's rollout in the same window is ignored.
+        let spent = session_usage_in(
+            &roots,
+            "codex",
+            None,
+            workspace,
+            at("10:00:00"),
+            at("10:30:00"),
+        );
+        assert_eq!(spent, Some(tokens(800, 300, Some(1_200), None)));
+        // A takeover names its session.
+        let other = session_usage_in(
+            &roots,
+            "codex",
+            Some("0c0de000-0000-4000-8000-000000000002"),
+            workspace,
+            at("10:00:00"),
+            at("10:30:00"),
+        );
+        assert_eq!(other, Some(tokens(50, 5, Some(0), None)));
+        assert_eq!(
+            session_usage_in(
+                &roots,
+                "codex",
+                None,
+                std::path::Path::new("/nowhere"),
+                at("10:00:00"),
+                at("10:30:00")
+            ),
+            None
+        );
+        assert_eq!(
+            session_usage_in(
+                &roots,
+                "gemini",
+                None,
+                workspace,
+                at("10:00:00"),
+                at("10:30:00")
+            ),
             None
         );
     }

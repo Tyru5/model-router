@@ -157,6 +157,7 @@ impl WorkflowPreset {
             name: self.name.into(),
             max_repair_passes: 2,
             sandbox_default: Default::default(),
+            budget: Default::default(),
             stages: self
                 .stages
                 .iter()
@@ -247,6 +248,7 @@ mod tests {
                     name: "Preset".into(),
                     max_repair_passes: 0,
                     sandbox_default: Default::default(),
+                    budget: Default::default(),
                     stages: vec![preset.build()],
                 }],
                 ..Settings::default()
