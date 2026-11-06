@@ -17,6 +17,10 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 - Review summary stage that briefs the reviewer; loaded workflows get one
   unless a stage already has the summary role (disable it to opt out).
 - omp harness.
+- Stage graphs: `after` runs read-only stages side by side (`max_parallel`),
+  and `fan_out` runs best-of-N candidates in their own worktrees for an auto
+  or review-stage judge, applying the winner; Best-of-3 implement preset;
+  `resume --retry-candidate`.
 - Router providers: OpenRouter plus presets; research model-router profile.
 - Harness effort levels discovered from local catalogs and editable per stage.
 - Stage models picked from the harness catalog; project root detection and a

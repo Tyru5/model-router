@@ -14,9 +14,11 @@ remain visible, including Amp's mode selection and provider-specific identifiers
 
 Provide editable stage presets for requirements, research, diagnosis, design,
 planning, implementation, verification, code/security review, documentation,
-handoff, and a blank custom stage. Provide Quick task, Full feature, Bug fix,
-and Investigation workflow presets. Adding a preset never overwrites an existing
-workflow or changes a saved run; reviews start disabled in workflow presets.
+handoff, judging fan-out candidates, and a blank custom stage. Provide Quick
+task, Full feature, Bug fix, Investigation, and Best-of-3 implement workflow
+presets. Adding a preset never overwrites an existing workflow or changes a
+saved run; optional reviews start disabled in workflow presets, while a
+fan-out's judge starts enabled because it chooses rather than gates.
 
 ## Execution and handoff
 
@@ -48,6 +50,58 @@ workflow or changes a saved run; reviews start disabled in workflow presets.
 - Surface reported permission denials and errors. Unattended processes have no
   interactive stdin. A harness that does not report approval requirements clearly
   can be cancelled or timed out and reopened interactively.
+
+## Graphs and fan-out
+
+- A workflow without `after` on any stage runs in list order, exactly as
+  before. Once any stage sets `after = [ids]`, the workflow is a dependency
+  graph: a stage starts when every stage it transitively runs after is
+  complete or disabled (disabled stages are transparent); a stage without
+  `after` is a root. Unknown IDs, self-dependencies, and cycles fail
+  validation. "Upstream" (prompts' prior handoffs, repair targets, the
+  feedback's reach) means "runs before" in the graph and "earlier" in a list.
+- Ready stages run side by side only when they cannot conflict in the shared
+  workspace: unattended research, planning, review, and summary stages, and
+  fan-out stages (their candidates have worktrees). Other stages wait for
+  running ones and run alone, in list order, with a note in the output.
+  Interactive stages always run alone. A workflow's `max_parallel` (default 2,
+  1–16) caps concurrent harness processes, candidates included.
+- Each concurrent process has its own process group, logs, and artifacts.
+  Worker threads only supervise processes; the driver thread, holding the run
+  lock, applies every status change through the run's transition validation,
+  logs it, and saves. While stages run side by side, a stop or a review's
+  repair request stops new launches; the run's own status settles once the
+  running ones end (a held repair first, then the first stopped stage, then a
+  waiting checkpoint).
+- A `fan_out` stage (unattended; implementation or custom role; 2–8
+  candidates, each a harness, model, provider, and effort, with an optional
+  `id`, default `c1`…) runs a round: it snapshots the workspace (HEAD plus
+  uncommitted, non-ignored changes) as a private commit kept by
+  `refs/model-router/runs/<run>/base/<stage>-<round>`, and checks it out once
+  per candidate attempt as a detached worktree under
+  `.model-router/candidates/<run>/`. User branches, HEAD, and the user's index
+  never change. Each round is a stage attempt; candidates are child records
+  with their own attempts and statuses (`candidate` transitions in
+  transitions.jsonl). A candidate succeeds with a complete handoff; its router
+  checks run in its worktree and its patch from the base is saved.
+- The judge is `auto` (required router checks passing, then fewest changed
+  lines, then list order) or an enabled review stage that runs after the
+  fan-out (in a list, the next enabled stage; in a graph, it lists the fan-out
+  in `after`, and the fan-out's other dependents also wait for it). It sees
+  every candidate's handoff, checks, diff stat, and patch and worktree paths,
+  and must return `"selected": "<id>"` naming a complete candidate; anything
+  else blocks it. A judge never requests repairs. A disabled judge means auto.
+- The router applies the chosen patch to the workspace (plain apply, then a
+  three-way merge in a private index). On conflict it restores the patch's
+  files, leaving the workspace unchanged, and blocks with the patch and
+  worktree paths. A round with no successful candidate blocks; cancellation
+  cancels it. Unchosen candidates stay on disk, listed in the report, until
+  `clean` removes the run (candidate worktrees with force: they are the
+  router's own).
+- A crash marks running candidates failed, never retried silently.
+  `resume --retry-candidate STAGE/ID` (`Cmd::RetryCandidate`) reruns one
+  stopped candidate of a stopped fan-out stage in a new round with the same
+  base; the others keep their results. Retrying the stage reruns all.
 
 ## Optional reviews
 
@@ -145,6 +199,9 @@ API clients, automatic task classification, and embedded IDE control are exclude
   and flag/environment bypass. No model calls or simulated loading operations.
 - Workflow editor with task, project, stage order, enable toggle, execution mode,
   model selector, provider, reasoning effort, instructions, and extra arguments.
+- Stage editor fields for `after` (comma-separated IDs) and fan-out
+  candidates (one per line, `[id:] harness [model] [provider] [effort]`, and a
+  `judge = auto|ID` line).
 - Workflow picker with built-in presets and local/global template saving.
 - Searchable stage catalog with purpose and default routing. Selecting a preset
   opens an editor; saving inserts after the current stage. Cancelling the picker
@@ -174,12 +231,14 @@ API clients, automatic task classification, and embedded IDE control are exclude
   and persistent recent projects. Recognizes Git directories and `.git` files
   for linked worktrees/submodules; non-Git folders can also be selected.
   Saves workflow edits and loads the selected project's configuration.
-- Run monitor with stage state, elapsed time, check results, logs, cancellation,
-  handoff view, and explicit recovery actions. Finished runs show a results view:
+- Run monitor with stage state (fan-out candidates indented under their
+  stage), elapsed time, check results, logs, cancellation, handoff view, and
+  explicit recovery actions. Finished runs show a results view:
   files changed during the run (from private Git snapshots), checks by source,
   unresolved findings, per-stage time, retries, and harness-reported usage, with
-  unavailable values labelled; the full diff opens in a dialog. `report` prints
-  the same summary from the CLI.
+  unavailable values labelled, plus each fan-out's candidates, judge decision,
+  and whether its patch was applied; the full diff opens in a dialog. `report`
+  prints the same summary from the CLI.
 - Run history with live text and status filters, damaged-record rows,
   background-computed sizes, confirmed reruns, attempt comparison, and cleanup
   previews; harness availability/catalog view.
@@ -218,3 +277,8 @@ API clients, automatic task classification, and embedded IDE control are exclude
 12. Add, edit, reorder, and persist stage/workflow presets through the real TUI.
     All built-in workflows execute in order with mocked harnesses, keep reviews
     optional, and stop when verification reports required failures or missing checks.
+13. List workflows run exactly as before. Graph workflows run ready read-only
+    stages side by side and writers alone; fan-out candidates run in their own
+    worktrees from the uncommitted workspace, the auto or stage judge's choice
+    is applied, a conflicting choice blocks without changing the workspace, a
+    crash fails running candidates, and one candidate can be retried alone.

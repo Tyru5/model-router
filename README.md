@@ -373,6 +373,7 @@ after the selected stage; `Esc` cancels without changing the workflow.
 | Implement | Code changes and appropriate tests |
 | Verify tests | Acceptance checks with actual results; no code fixes |
 | Code review | Correctness, regressions, and optional repair requests |
+| Judge candidates | Compare a fan-out stage's candidates and choose the one to apply |
 | Security review | Relevant trust boundaries, permissions, and data handling |
 | Update documentation | Usage, examples, and operational notes |
 | Review summary | A brief for you: outcome, changes, verification, review focus, open questions |
@@ -393,9 +394,11 @@ Press `w` and choose **+ Preset:** to add a workflow:
 | Full feature | Clarify → research → design → plan → implement → verify → document → review summary |
 | Bug fix | Diagnose → implement → verify → review summary |
 | Investigation | Research → review summary |
+| Best-of-3 implement | Research → implement with Claude, Codex, and OpenCode side by side → judge → verify → review summary |
 
 The first three include a disabled code review; Full feature also includes a
-disabled security review. Enable either with `Space` when wanted. Adding a
+disabled security review. Best-of-3's judge starts enabled: it chooses a
+candidate rather than gating the run (disable it to choose automatically). Enable either with `Space` when wanted. Adding a
 review through `a` explicitly opts that stage in. All stages can be disabled,
 reordered, duplicated, removed, or reassigned to another harness/model.
 Repeated workflow presets get distinct names and leave existing workflows intact.
@@ -456,6 +459,55 @@ flag, `harness`, `model`, `provider`, `effort`, `mode`, `instructions`,
 `extra_args`, `harness_settings`, and `timeout_seconds`. A review may also set `repair_target` to
 an upstream implementation stage ID. Blank chooses the nearest enabled one.
 
+### Parallel stages and best-of-N
+
+Without `after`, stages run in list order. Give any stage `after` and the
+workflow becomes a dependency graph: each stage runs once the stages it names
+are complete (a stage without `after` starts right away; disabled stages are
+skipped through). Ready research, planning, review, and summary stages and
+fan-out stages run side by side, at most `max_parallel` harness processes
+(default 2). Stages that write the shared workspace, and interactive stages,
+wait and run alone in list order. `validate` rejects unknown IDs and cycles.
+
+```toml
+[[workflows]]
+name = "Best of two"
+max_parallel = 3
+
+[[workflows.stages]]
+id = "implement"
+role = "implementation"
+fan_out = { judge = "judge", candidates = [
+  { harness = "claude", model = "sonnet" },
+  { harness = "codex", model = "gpt-6-astra", effort = "high" },
+] }
+
+[[workflows.stages]]
+id = "judge"
+role = "review"
+after = ["implement"]
+
+[[workflows.stages]]
+id = "verify"
+role = "test"
+after = ["implement"]   # also waits for the judge
+```
+
+A `fan_out` stage (unattended; implementation or custom) runs each candidate
+in its own detached Git worktree under `.model-router/candidates/RUN_ID/`,
+started from the workspace as it is, uncommitted changes included. Candidates
+get IDs `c1`, `c2`, … unless they set `id`. The judge is `auto` (the default:
+required router checks passing, then fewest changed lines) or a review stage
+that runs after the fan-out (in a list, right after it) and names its choice
+in its handoff as `"selected": "c2"`. The router then applies that
+candidate's patch to the workspace; if it conflicts with changes made since,
+the workspace stays as it was and the run blocks with the patch and worktree
+paths. A disabled judge stage means `auto`. Losing candidates stay on disk
+until `clean` removes the run. The stage editor edits `after` (comma
+separated) and candidates (one per line: `[id:] harness [model] [provider]
+[effort]`, plus a `judge = auto|ID` line); the Monitor lists candidates under
+their stage, ★ marking the choice.
+
 ### Project trust
 
 A cloned repository's `.model-router.toml` could run commands on your machine
@@ -496,6 +548,7 @@ model-router resume RUN_ID --model NEW_NATIVE_MODEL_ID
 model-router resume RUN_ID --interactive
 model-router resume RUN_ID --advance
 model-router resume RUN_ID --allow-repair
+model-router resume RUN_ID --retry-candidate implement/c2   # one stopped fan-out candidate
 model-router report RUN_ID
 model-router report RUN_ID --json
 model-router report RUN_ID --diff
