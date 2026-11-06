@@ -11,7 +11,8 @@
 # Expectations: text_contains/text_excludes apply to the normalized text;
 # error_contains (absent means no error); permission_blocked (default false);
 # handoff_summary means handoff::parse succeeds with that summary (role
-# defaults to implementation; verdict is checked when given).
+# defaults to implementation; verdict is checked when given); native = true
+# means the stage used a native output schema and the handoff must come from it.
 
 [[fixture]]
 file = "claude/success.json"
@@ -547,3 +548,33 @@ source = "opencode 2.2.5 binary run --format json emitter: an error event {error
 sanitization = "Synthetic: placeholder IDs; error text illustrative"
 text_excludes = ["Partial text"]
 handoff_summary = "OpenCode: finished after a provider retry"
+
+[[fixture]]
+file = "codex/structured-output.jsonl"
+harness = "codex"
+kind = "Codex"
+format = "json"
+version = "0.167.0"
+scenario = "structured-output"
+provenance = "captured"
+source = "codex exec --json --output-schema with the router's strict handoff schema (handoff::strict_schema), read-only sandbox, 2026-11-05"
+sanitization = "Thread ID replaced with zeros; prompt not echoed by codex exec --json"
+native = true
+handoff_summary = "The claim 2+2=4 is correct."
+role = "review"
+verdict = "pass"
+
+[[fixture]]
+file = "claude/structured-output-stream.jsonl"
+harness = "claude"
+kind = "Claude"
+format = "stream-json"
+version = "2.1.318"
+scenario = "structured-output"
+provenance = "schema-derived"
+source = "claude --print --output-format stream-json --verbose --json-schema: a StructuredOutput tool_use, then a result whose result is the JSON text and structured_output the object (event shape from a 2.1.318 run with a toy schema)"
+sanitization = "Synthetic handoff; session ID zeros; usage and cost illustrative"
+native = true
+handoff_summary = "Claude: README.md matches the build"
+role = "review"
+verdict = "pass"

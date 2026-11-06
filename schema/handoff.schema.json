@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Tyru5/model-router/blob/main/schema/handoff.schema.json",
+  "title": "model-router stage handoff",
+  "description": "The JSON object a stage ends with. Version 2; a handoff without schema_version is version 1, which has the same fields minus artifacts, confidence, and next_steps.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "enum": [1, 2]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "What the stage established or changed, with evidence."
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["complete", "pass", "needs_changes", "blocked"],
+      "description": "Reviews use pass or needs_changes; other stages complete. blocked when the stage cannot finish."
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["blocking", "advisory"]
+          },
+          "description": {
+            "type": "string"
+          }
+        },
+        "required": ["severity", "description"],
+        "additionalProperties": false
+      }
+    },
+    "decisions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "files_changed": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "tests": {
+      "type": "array",
+      "description": "Checks actually run; never a check that did not run.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["passed", "failed", "not_run"]
+          },
+          "required": {
+            "type": "boolean"
+          }
+        },
+        "required": ["command", "status"],
+        "additionalProperties": false
+      }
+    },
+    "unresolved": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "not_applicable": {
+      "type": "string",
+      "description": "Test stages only: why no check can apply. The user must accept it."
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": ["patch", "file", "url", "note"]
+          },
+          "path_or_url": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          }
+        },
+        "required": ["kind", "path_or_url"],
+        "additionalProperties": false
+      }
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["low", "medium", "high"]
+    },
+    "next_steps": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "required": ["summary", "verdict"],
+  "additionalProperties": false
+}
