@@ -75,6 +75,11 @@ pub struct Attempt {
     /// taken over interactively. Codex reports its own in stdout.log instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// The unattended or interactive harness's process group while it runs.
+    /// Cleared when the harness is reaped; still set after mr itself died,
+    /// so the next `drive` can stop the orphaned group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_group: Option<u32>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageState {
@@ -115,13 +120,25 @@ pub struct Run {
     pub stages: Vec<StageState>,
     pub cursor: usize,
     pub repair_passes: u32,
+    /// Repair passes the user allowed beyond the workflow's limit.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub extra_repair_passes: u32,
     pub repair_feedback: Option<String>,
+    /// Index of the review whose findings `repair_feedback` holds. Stages up
+    /// to and including it see the feedback; it is cleared once that review
+    /// passes. None in runs saved before this was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_review: Option<usize>,
     pub status: Status,
     pub error: Option<String>,
     /// The next interactive attempt resumes this harness session instead of
     /// starting a new one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<Resume>,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// An unattended attempt's session, reopened in the native interactive CLI.
@@ -275,7 +292,9 @@ impl Run {
                 .collect(),
             cursor: 0,
             repair_passes: 0,
+            extra_repair_passes: 0,
             repair_feedback: None,
+            repair_review: None,
             status: Status::Pending,
             error: None,
             resume: None,
@@ -285,14 +304,18 @@ impl Run {
     }
 
     /// Saves run.json, then the summary that history listing reads instead.
+    /// The summary records run.json's revision and size, so listing can tell
+    /// when the two disagree.
     pub fn persist(&mut self) -> Result<()> {
         self.revision += 1;
         self.updated_at = Utc::now();
-        storage::write_json(&self.directory.join("run.json"), self)?;
-        storage::write_json(
-            &self.directory.join("summary.json"),
-            &crate::history::RunSummary::from(&*self),
-        )
+        let record = serde_json::to_vec_pretty(&*self)?;
+        storage::atomic_write(&self.directory.join("run.json"), &record)?;
+        let summary = crate::history::RunSummary {
+            run_bytes: Some(record.len() as u64),
+            ..crate::history::RunSummary::from(&*self)
+        };
+        storage::write_json(&self.directory.join("summary.json"), &summary)
     }
     pub fn current_name(&self) -> &str {
         self.workflow
@@ -372,6 +395,7 @@ impl Run {
                 handoff::session_id(&head)
             })
             .context("The harness did not report a session for this attempt; retry interactively with [i] instead")?;
+        set_aside_handoff(&attempt.handoff_file, &attempt.directory)?;
         self.resume = Some(Resume {
             session,
             handoff_file: attempt.handoff_file.clone(),
@@ -381,6 +405,44 @@ impl Run {
         self.status = Status::Interactive;
         self.error = None;
         Ok(())
+    }
+
+    /// Allows one more review repair pass after the workflow's limit stopped
+    /// the run, then sends the review's findings to the implementation stage
+    /// as an automatic repair would. `model-router resume <id> --allow-repair`.
+    pub fn allow_repair(&mut self) -> Result<()> {
+        ensure!(
+            self.status == Status::Blocked && self.cursor < self.stages.len(),
+            "Only a run stopped by its repair limit can get another repair pass"
+        );
+        let stage = &self.workflow.stages[self.cursor];
+        let requests_repair = self.stages[self.cursor]
+            .handoff
+            .as_ref()
+            .is_some_and(Handoff::requires_repair);
+        ensure!(
+            stage.role == Role::Review
+                && requests_repair
+                && self.gate().is_none()
+                && self.repair_passes >= self.repair_limit(),
+            "Only a run stopped by its repair limit can get another repair pass"
+        );
+        self.extra_repair_passes += 1;
+        self.stages[self.cursor].status = Status::Complete;
+        if let Some(attempt) = self.stages[self.cursor].attempts.last_mut() {
+            // The review itself completed; only the limit held it.
+            attempt.status = Status::Complete;
+            attempt.error = None;
+        }
+        self.error = None;
+        self.status = Status::Pending;
+        self.apply_handoff()
+    }
+
+    fn repair_limit(&self) -> u32 {
+        self.workflow
+            .max_repair_passes
+            .saturating_add(self.extra_repair_passes)
     }
 
     /// Return stages from `from` onward to pending, discarding handoffs and acceptances.
@@ -512,7 +574,7 @@ impl Run {
         );
         match self.gate() {
             Some(Gate::Block(message)) => {
-                self.fail(Status::Blocked, message);
+                self.fail_attempt(Status::Blocked, message);
                 return Ok(());
             }
             Some(Gate::Waiver) => {
@@ -533,8 +595,14 @@ impl Run {
                 stage.name,
                 serde_json::to_string_pretty(handoff)?
             );
-            if self.repair_passes >= self.workflow.max_repair_passes {
-                self.fail(Status::Blocked, format!("Review still requests changes after {} repair passes. Inspect findings and continue explicitly", self.repair_passes));
+            if self.repair_passes >= self.repair_limit() {
+                let message = format!(
+                    "Review still requests changes after {} repair passes. Inspect its findings, then allow another pass with: model-router -C {} resume {} --allow-repair",
+                    self.repair_passes,
+                    self.project.display(),
+                    self.id
+                );
+                self.fail_attempt(Status::Blocked, message);
                 return Ok(());
             }
             let target = self.workflow.stages[..self.cursor].iter().rposition(|s| {
@@ -543,7 +611,7 @@ impl Run {
                     && (stage.repair_target.is_empty() || s.id == stage.repair_target)
             });
             let Some(target) = target else {
-                self.fail(
+                self.fail_attempt(
                     Status::Blocked,
                     "Review requested changes, but no enabled upstream implementation stage exists"
                         .into(),
@@ -551,6 +619,7 @@ impl Run {
                 return Ok(());
             };
             self.repair_feedback = Some(feedback);
+            self.repair_review = Some(self.cursor);
             self.repair_passes += 1;
             // Invalidate all downstream handoffs, including previously passing reviews.
             self.reset(target);
@@ -559,30 +628,63 @@ impl Run {
             return Ok(());
         }
         if handoff.verdict == Verdict::NeedsChanges {
-            self.fail(
+            self.fail_attempt(
                 Status::Blocked,
                 "Stage reports incomplete work; inspect its handoff and retry".into(),
             );
             return Ok(());
         }
         self.stages[self.cursor].status = Status::Complete;
+        // The review that asked for the repair passed: later stages, and
+        // later retries, must not see its old request.
+        if self.repair_review == Some(self.cursor) {
+            self.repair_feedback = None;
+            self.repair_review = None;
+        }
         self.cursor += 1;
         self.status = Status::Pending;
         Ok(())
     }
 
+    /// Stops the run at the current stage without touching its attempts: the
+    /// error belongs to no attempt of this execution, e.g. a launch that
+    /// failed before its attempt was recorded, or a cancel between stages.
     fn fail(&mut self, status: Status, message: String) {
         self.status = status;
-        self.error = Some(message.clone());
+        self.error = Some(message);
         if let Some(stage) = self.stages.get_mut(self.cursor) {
             stage.status = status;
-            if let Some(attempt) = stage.attempts.last_mut() {
-                attempt.status = status;
-                attempt.error = Some(message);
-                attempt.finished_at = Some(Utc::now());
-            }
         }
     }
+
+    /// Stops the run and records the error on the current stage's attempt,
+    /// which this execution created or just finished.
+    fn fail_attempt(&mut self, status: Status, message: String) {
+        self.fail(status, message.clone());
+        if let Some(attempt) = self
+            .stages
+            .get_mut(self.cursor)
+            .and_then(|s| s.attempts.last_mut())
+        {
+            attempt.status = status;
+            attempt.error = Some(message);
+            attempt.finished_at.get_or_insert_with(Utc::now);
+        }
+    }
+}
+
+/// The resumed session only knows the handoff path its original prompt
+/// named, so a takeover writes there again. Move the earlier attempt's file
+/// into that attempt's directory first, so the takeover can never accept a
+/// stale handoff the resumed session did not write.
+fn set_aside_handoff(handoff_file: &Path, attempt_dir: &Path) -> Result<()> {
+    if handoff_file.exists() {
+        fs::create_dir_all(attempt_dir)?;
+        fs::rename(handoff_file, attempt_dir.join("handoff-file.json")).with_context(|| {
+            format!("Move the previous handoff {} aside", handoff_file.display())
+        })?;
+    }
+    Ok(())
 }
 
 pub fn load(project: &Path, id: &str) -> Result<Run> {
@@ -620,23 +722,32 @@ pub fn prompt(run: &Run, handoff_path: &Path) -> String {
     for (index, state) in run.stages[..run.cursor].iter().enumerate().rev() {
         if state.status == Status::Complete {
             if let Some(handoff) = &state.handoff {
-                let json = serde_json::to_string_pretty(handoff).unwrap_or_default();
-                let excerpt = storage::truncate(&json, remaining.min(5000));
+                let directory = state
+                    .attempts
+                    .last()
+                    .map(|a| a.directory.clone())
+                    .unwrap_or_default();
+                let excerpt = handoff_excerpt(
+                    handoff,
+                    remaining.min(5000),
+                    &directory.join("handoff.json"),
+                );
                 remaining = remaining.saturating_sub(excerpt.len());
                 text.push_str(&format!(
                     "\nPRIOR STAGE: {}\n{}\nFull artifacts: {}\n",
                     run.workflow.stages[index].name,
                     excerpt,
-                    state
-                        .attempts
-                        .last()
-                        .map(|a| a.directory.display().to_string())
-                        .unwrap_or_default()
+                    directory.display()
                 ));
             }
         }
     }
-    if let Some(feedback) = &run.repair_feedback {
+    // Only the repaired stages and the review that asked see its request.
+    let feedback = run
+        .repair_feedback
+        .as_ref()
+        .filter(|_| run.repair_review.is_none_or(|review| run.cursor <= review));
+    if let Some(feedback) = feedback {
         text.push_str(&format!(
             "\nREPAIR REQUEST\n{}\n",
             storage::truncate(feedback, 4000)
@@ -660,6 +771,67 @@ pub fn prompt(run: &Run, handoff_path: &Path) -> String {
     text
 }
 
+/// A handoff as pretty JSON of at most about `max` bytes that stays valid
+/// JSON: long strings are shortened and long lists cut, then whole fields
+/// dropped, least important first, rather than cutting the text mid-object.
+fn handoff_excerpt(handoff: &Handoff, max: usize, full: &Path) -> String {
+    let Ok(mut value) = serde_json::to_value(handoff) else {
+        return String::new();
+    };
+    let render =
+        |value: &serde_json::Value| serde_json::to_string_pretty(value).unwrap_or_default();
+    let mut json = render(&value);
+    if json.len() <= max {
+        return json;
+    }
+    for (chars, items) in [(1000, 40), (400, 20), (160, 10), (60, 5)] {
+        shorten(&mut value, chars, items);
+        json = render(&value);
+        if json.len() <= max {
+            break;
+        }
+    }
+    for field in [
+        "files_changed",
+        "decisions",
+        "tests",
+        "unresolved",
+        "findings",
+    ] {
+        if json.len() <= max {
+            break;
+        }
+        if let Some(object) = value.as_object_mut().filter(|o| o.contains_key(field)) {
+            object.insert(field.into(), serde_json::Value::String("omitted".into()));
+            json = render(&value);
+        }
+    }
+    format!("{json}\n[truncated; full artifact at {}]", full.display())
+}
+
+/// Cuts every string to `chars` characters and every list to `items` items,
+/// noting how many were left out.
+fn shorten(value: &mut serde_json::Value, chars: usize, items: usize) {
+    use serde_json::Value;
+    match value {
+        Value::String(text) if text.chars().count() > chars => {
+            *text = format!("{}…", text.chars().take(chars).collect::<String>());
+        }
+        Value::Array(list) => {
+            if list.len() > items {
+                let more = list.len() - items;
+                list.truncate(items);
+                list.push(Value::String(format!("… {more} more")));
+            }
+            list.iter_mut().for_each(|item| shorten(item, chars, items));
+        }
+        Value::Object(map) => map
+            .values_mut()
+            .for_each(|item| shorten(item, chars, items)),
+        _ => {}
+    }
+}
+
 struct Prepared {
     invocation: Invocation,
     directory: PathBuf,
@@ -681,19 +853,21 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
     fs::create_dir_all(&handoff_dir)?;
     let resume = run.resume.clone();
     let handoff_file = match &resume {
-        // The resumed session already knows its handoff path.
+        // The resumed session only knows the path its original prompt named;
+        // `take_over` moved that attempt's file aside, so whatever is there
+        // after this attempt was written by it.
         Some(resume) => resume.handoff_file.clone(),
         None => handoff_dir.join(format!("{}-{number:03}.json", stage.id)),
     };
     ensure!(
-        resume.is_some() || !handoff_file.exists(),
+        !handoff_file.exists(),
         "Handoff path already exists: {}",
         handoff_file.display()
     );
     let prompt_file = directory.join("prompt.md");
     let text = match &resume {
         Some(resume) => format!(
-            "Interactive takeover of harness session {}. The session's own history holds the stage prompt; write its handoff to {}.\n",
+            "Interactive takeover of harness session {}. The session's own history holds the stage prompt. Write a new handoff for this attempt to {}; the previous attempt's file there was moved aside and is not read.\n",
             resume.session,
             handoff_file.display()
         ),
@@ -744,6 +918,7 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
         tree_after: None,
         usage: None,
         session,
+        process_group: None,
     });
     run.resume = None;
     run.stages[index].status = Status::Running;
@@ -775,7 +950,11 @@ fn finish(
     let outcome = match result {
         Ok(outcome) => outcome,
         Err(error) => {
-            run.fail(Status::Failed, format!("{error:#}"));
+            // The supervisor ended the group before returning its error.
+            if let Some(attempt) = run.stages[index].attempts.last_mut() {
+                attempt.process_group = None;
+            }
+            run.fail_attempt(Status::Failed, format!("{error:#}"));
             return Ok(());
         }
     };
@@ -784,21 +963,23 @@ fn finish(
         attempt.finished_at = Some(Utc::now());
         // Spend counts whether or not the stage succeeded. Usage events can be
         // spread through the log, so read far more than the final response needs.
+        attempt.process_group = None;
         if attempt.mode == Mode::Unattended {
-            attempt.usage = process::read_tail(&prepared.directory.join("stdout.log"), 64 << 20)
-                .ok()
-                .and_then(|raw| handoff::usage(&raw, prepared.invocation.kind));
+            attempt.usage = handoff::usage_file(
+                &prepared.directory.join("stdout.log"),
+                prepared.invocation.kind,
+            );
         }
     }
     if outcome.cancelled {
-        run.fail(
+        run.fail_attempt(
             Status::Cancelled,
             "Stage cancelled. Filesystem changes are retained; retry explicitly".into(),
         );
         return Ok(());
     }
     if outcome.timed_out {
-        run.fail(
+        run.fail_attempt(
             Status::Failed,
             "Stage timed out. Inspect logs or reopen interactively; existing changes are retained"
                 .into(),
@@ -820,7 +1001,7 @@ fn finish(
                     .unwrap_or_default(),
             ),
         };
-        run.fail(
+        run.fail_attempt(
             Status::Failed,
             format!("Harness exited with code {:?}. {detail}", outcome.code),
         );
@@ -840,7 +1021,7 @@ fn finish(
         handoff::normalize(&raw, prepared.invocation.kind)
     };
     if normalized.permission_blocked {
-        run.fail(Status::Blocked, "Harness reported denied tool permissions. Reopen interactively or set explicit permission arguments and retry".into());
+        run.fail_attempt(Status::Blocked, "Harness reported denied tool permissions. Reopen interactively or set explicit permission arguments and retry".into());
         return Ok(());
     }
     // A handoff file may replace a missing assistant text event, but not a real
@@ -849,7 +1030,7 @@ fn finish(
         if !error.starts_with("No final assistant")
             || (!prepared.handoff_file.is_file() && !prepared.invocation.final_file.is_file())
         {
-            run.fail(Status::Failed, error.clone());
+            run.fail_attempt(Status::Failed, error.clone());
             return Ok(());
         }
     }
@@ -857,7 +1038,7 @@ fn finish(
     // the example JSON). Never infer a structured verdict from an echoed prompt.
     if mode == Mode::Interactive && !prepared.handoff_file.is_file() {
         if matches!(role, Role::Review | Role::Test) {
-            run.fail(Status::Blocked, format!("Interactive {} did not write its handoff file. Reopen it to produce a structured verdict and evidence", role.label()));
+            run.fail_attempt(Status::Blocked, format!("Interactive {} did not write its handoff file. Reopen it to produce a structured verdict and evidence", role.label()));
             return Ok(());
         }
         let handoff = Handoff {
@@ -896,7 +1077,7 @@ fn finish(
     let handoff = match handoff::parse(&source, role) {
         Ok(handoff) => handoff,
         Err(error) => {
-            run.fail(Status::Blocked, format!("{error:#}"));
+            run.fail_attempt(Status::Blocked, format!("{error:#}"));
             return Ok(());
         }
     };
@@ -950,7 +1131,7 @@ fn run_checks(
         attempt.checks = results;
     }
     if cancelled {
-        run.fail(
+        run.fail_attempt(
             Status::Cancelled,
             "Stage cancelled during checks. Filesystem changes are retained; retry explicitly"
                 .into(),
@@ -966,10 +1147,17 @@ fn execute_stage(
     emit: &mut impl FnMut(Event),
 ) -> Result<()> {
     let index = run.cursor;
+    let attempts = run.stages[index].attempts.len();
     let prepared = match prepare(run) {
         Ok(p) => p,
         Err(e) => {
-            run.fail(Status::Failed, format!("{e:#}"));
+            // Errors before the attempt was recorded belong to the stage,
+            // never to an earlier, finished attempt.
+            if run.stages[index].attempts.len() > attempts {
+                run.fail_attempt(Status::Failed, format!("{e:#}"));
+            } else {
+                run.fail(Status::Failed, format!("{e:#}"));
+            }
             run.persist()?;
             emit(Event::State(Box::new(run.clone())));
             return Ok(());
@@ -985,23 +1173,34 @@ fn execute_stage(
         if stage.model.is_empty() { "" } else { " " },
         stage.model
     )));
+    let workspace = run.workspace.clone();
+    // Recorded so a later drive can stop the group if mr dies meanwhile.
+    let record = |run: &mut Run, pgid: u32| {
+        if let Some(attempt) = run.stages[index].attempts.last_mut() {
+            attempt.process_group = Some(pgid);
+        }
+        let _ = run.persist();
+    };
     let result = if let Some(session) = interactive {
         process::interactive(
             &prepared.invocation,
-            &run.workspace,
+            &workspace,
             &prepared.directory,
             cancel,
             session,
+            |pgid| record(run, pgid),
         )
     } else {
         // Events become readable lines; stdout.log keeps them raw.
         let mut formatter = events::Formatter::new(prepared.invocation.kind);
-        let result = process::capture(
+        let timeout = Duration::from_secs(run.workflow.stages[index].timeout_seconds);
+        let result = process::capture_with(
             &prepared.invocation,
-            &run.workspace,
+            &workspace,
             &prepared.directory,
-            Duration::from_secs(run.workflow.stages[run.cursor].timeout_seconds),
+            timeout,
             cancel,
+            |pgid| record(run, pgid),
             |err, text| {
                 if err {
                     emit(Event::Output(format!(
@@ -1019,7 +1218,7 @@ fn execute_stage(
         result
     };
     if let Err(error) = finish(run, &prepared, result, cancel, emit) {
-        run.fail(
+        run.fail_attempt(
             Status::Failed,
             format!("Could not complete stage bookkeeping: {error:#}"),
         );
@@ -1044,12 +1243,51 @@ fn save_changes(run: &Run) {
     }
 }
 
+/// How long `drive` waits for the run and workspace locks. Short probes
+/// (history cleanup, the TUI's busy-checkout check) hold them briefly.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+fn lock_run(run: &Run) -> Result<(storage::FileLock, storage::FileLock)> {
+    let run_lock = storage::lock_wait(&run.directory.join("run.lock"), LOCK_WAIT)?;
+    let workspace_lock = storage::lock_wait(
+        &storage::metadata_dir(&run.workspace)?.join("workspace.lock"),
+        LOCK_WAIT,
+    )?;
+    Ok((run_lock, workspace_lock))
+}
+
+/// Stops harness process groups left by an mr process that died while they
+/// ran (no PR_SET_PDEATHSIG outside Linux, and background children survive
+/// it everywhere), so a retry never runs two agents on one workspace. Holding
+/// both locks means no live router owns them. Process group IDs are not
+/// reused while any member lives; a stale ID whose group is gone is ignored.
+fn stop_orphans(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
+    let mut changed = false;
+    for state in &mut run.stages {
+        for attempt in &mut state.attempts {
+            let Some(pgid) = attempt.process_group.take() else {
+                continue;
+            };
+            changed = true;
+            if process::group_alive(pgid) {
+                emit(Event::Output(format!(
+                    "Stopping process group {pgid} left running by an interrupted execution\n"
+                )));
+                process::end_group(pgid, process::GRACE, || {});
+            }
+        }
+    }
+    if changed {
+        run.persist()?;
+    }
+    Ok(())
+}
+
 /// Drive until completion, failure, or a terminal/confirmation is required.
 pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) -> Result<Action> {
-    let _lock = storage::lock(&run.directory.join("run.lock"))?;
-    let _workspace_lock =
-        storage::lock(&storage::metadata_dir(&run.workspace)?.join("workspace.lock"))?;
+    let (_lock, _workspace_lock) = lock_run(run)?;
     run.check_revision()?;
+    stop_orphans(run, &mut emit)?;
     loop {
         match run.status {
             Status::AwaitingConfirmation => return Ok(Action::Confirm),
@@ -1059,7 +1297,7 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
                 return Ok(Action::Stopped);
             }
             Status::Running => {
-                run.fail(
+                run.fail_attempt(
                     Status::Failed,
                     "A previous execution was interrupted. Inspect artifacts and retry explicitly"
                         .into(),
@@ -1118,10 +1356,9 @@ pub fn run_interactive(
         run.status == Status::Interactive,
         "No interactive stage is ready"
     );
-    let _lock = storage::lock(&run.directory.join("run.lock"))?;
-    let _workspace_lock =
-        storage::lock(&storage::metadata_dir(&run.workspace)?.join("workspace.lock"))?;
+    let (_lock, _workspace_lock) = lock_run(run)?;
     run.check_revision()?;
+    stop_orphans(run, &mut emit)?;
     execute_stage(run, cancel, Some(session), &mut emit)?;
     if matches!(
         run.status,
@@ -1142,7 +1379,7 @@ pub fn edit_handoff(run: &mut Run, summary: String) -> Result<()> {
         !summary.trim().is_empty() && summary.len() <= 12000,
         "Enter a summary of 1–12000 bytes"
     );
-    let _lock = storage::lock(&run.directory.join("run.lock"))?;
+    let _lock = storage::lock_wait(&run.directory.join("run.lock"), LOCK_WAIT)?;
     run.check_revision()?;
     let state = &mut run.stages[run.cursor];
     let handoff = state.handoff.as_mut().context("No handoff")?;
@@ -1270,6 +1507,56 @@ mod tests {
         run.status = Status::Failed;
         run.workflow.stages[0].harness = "gemini".into();
         assert!(run.take_over().is_err());
+    }
+
+    #[test]
+    fn take_over_never_accepts_the_previous_attempts_handoff() {
+        let implement = Stage {
+            id: "implement".into(),
+            role: Role::Implementation,
+            ..Stage::default()
+        };
+        let (_dir, mut run) =
+            interactive(implement, Some(r#"{"summary":"Old","verdict":"complete"}"#));
+        assert_eq!(run.status, Status::AwaitingConfirmation);
+        run.workflow.stages[0].harness = "claude".into();
+        let previous = run.stages[0].attempts[0].clone();
+        run.stages[0].attempts[0].session = Some("s-1".into());
+        run.take_over().unwrap();
+        assert!(
+            !previous.handoff_file.exists(),
+            "stale handoff left in place"
+        );
+        assert!(previous.directory.join("handoff-file.json").is_file());
+        let prepared = prepare(&mut run).unwrap();
+        let prompt = fs::read_to_string(prepared.directory.join("prompt.md")).unwrap();
+        assert!(prompt.contains(&prepared.handoff_file.display().to_string()));
+        assert!(!prepared.handoff_file.exists());
+    }
+
+    #[test]
+    fn prior_handoffs_are_cut_to_valid_json() {
+        let long = "word ".repeat(2000);
+        let handoff: Handoff = serde_json::from_value(serde_json::json!({
+            "summary": long,
+            "verdict": "complete",
+            "decisions": vec![long.clone(); 30],
+            "files_changed": (0..500).map(|i| format!("src/file{i}.rs")).collect::<Vec<_>>(),
+        }))
+        .unwrap();
+        let full = Path::new("/runs/x/handoff.json");
+        let excerpt = handoff_excerpt(&handoff, 5000, full);
+        let (json, note) = excerpt.rsplit_once('\n').unwrap();
+        assert_eq!(note, "[truncated; full artifact at /runs/x/handoff.json]");
+        assert!(json.len() <= 5000, "{}", json.len());
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(value["verdict"], "complete");
+        assert!(value["summary"].as_str().unwrap().ends_with('…'));
+        // A small handoff is shown whole, without a note.
+        let small: Handoff =
+            serde_json::from_str(r#"{"summary":"Done","verdict":"complete"}"#).unwrap();
+        let whole = handoff_excerpt(&small, 5000, full);
+        assert!(serde_json::from_str::<serde_json::Value>(&whole).is_ok());
     }
 
     const NOT_APPLICABLE: &str = r#"{"summary":"Docs only","verdict":"complete","tests":[],"not_applicable":"No code changed"}"#;

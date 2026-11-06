@@ -562,3 +562,180 @@ fn capture_applies_environment_variables() {
         "yes\n"
     );
 }
+
+#[cfg(target_os = "linux")]
+fn running(pid: i32) -> bool {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    !stat.is_empty() && stat.split_whitespace().nth(2) != Some("Z")
+}
+#[cfg(all(unix, not(target_os = "linux")))]
+fn running(pid: i32) -> bool {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let stat = String::from_utf8_lossy(&output.stdout);
+    let stat = stat.trim();
+    !stat.is_empty() && !stat.starts_with('Z')
+}
+
+#[test]
+fn background_children_end_with_a_harness_that_exits_normally() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("server.pid");
+    let inv = adapters::Invocation {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            "sleep 30 & echo $! > server.pid; echo done".into(),
+        ],
+        stdin: None,
+        kind: OutputKind::Text,
+        final_file: dir.path().join("unused"),
+        env: vec![],
+    };
+    let mut group = None;
+    let started = Instant::now();
+    let result = process::capture_with(
+        &inv,
+        dir.path(),
+        dir.path(),
+        Duration::from_secs(10),
+        &AtomicBool::new(false),
+        |pgid| group = Some(pgid),
+        |_, _| {},
+    )
+    .unwrap();
+    assert!(result.success());
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let pid: i32 = fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert!(!running(pid), "background child outlived its harness");
+    assert!(!process::group_alive(group.unwrap()));
+}
+
+#[test]
+fn drive_stops_a_harness_group_left_by_a_dead_router() {
+    let (dir, _, mut run) = fixture(vec![stage("implementation", Role::Implementation)]);
+    assert_eq!(drive(&mut run), Action::Complete);
+    // A crash mid-stage leaves the attempt running with its group recorded.
+    let mut leader = {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & echo $! > orphan.pid"])
+            .current_dir(dir.path())
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    };
+    let pgid = leader.id();
+    leader.wait().unwrap();
+    let pid: i32 = fs::read_to_string(dir.path().join("orphan.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(process::group_alive(pgid));
+    run.cursor = 0;
+    run.status = Status::Running;
+    let attempt = run.stages[0].attempts.last_mut().unwrap();
+    attempt.status = Status::Running;
+    attempt.process_group = Some(pgid);
+    run.persist().unwrap();
+    assert_eq!(drive(&mut run), Action::Stopped);
+    assert!(run.error.as_deref().unwrap().contains("interrupted"));
+    assert!(run.stages[0].attempts[0].process_group.is_none());
+    thread::sleep(Duration::from_millis(100));
+    assert!(!running(pid), "orphaned harness child still running");
+}
+
+#[test]
+fn repair_request_reaches_only_the_repair_and_its_review() {
+    let mut review = stage("review", Role::Review);
+    review.extra_args = vec!["--review-fail-until".into(), "1".into()];
+    let (dir, _, mut run) = fixture(vec![
+        stage("implementation", Role::Implementation),
+        review,
+        stage("docs", Role::Custom),
+    ]);
+    assert_eq!(drive(&mut run), Action::Complete);
+    let prompt = |role: &str| {
+        fs::read_to_string(dir.path().join(format!(".model-router/mock/{role}.prompt"))).unwrap()
+    };
+    assert!(prompt("implementation").contains("REPAIR REQUEST"));
+    assert!(prompt("review").contains("REPAIR REQUEST"));
+    assert!(
+        !prompt("docs").contains("REPAIR REQUEST"),
+        "a stage after the passing review saw a stale repair request"
+    );
+    assert!(run.repair_feedback.is_none() && run.repair_review.is_none());
+}
+
+#[test]
+fn errors_outside_an_attempt_leave_finished_attempts_alone() {
+    // A launch that fails before its attempt exists.
+    let mut implement = stage("implementation", Role::Implementation);
+    implement.model = "fail".into();
+    let (_dir, _, mut run) = fixture(vec![implement]);
+    assert_eq!(drive(&mut run), Action::Stopped);
+    let first = run.stages[0].attempts[0].clone();
+    run.retry(false, Some("test-model".into())).unwrap();
+    let taken = first.handoff_file.with_file_name("implementation-002.json");
+    fs::write(&taken, "{}").unwrap();
+    assert_eq!(drive(&mut run), Action::Stopped);
+    assert!(run.error.as_deref().unwrap().contains("already exists"));
+    assert_eq!(run.stages[0].attempts.len(), 1);
+    let kept = &run.stages[0].attempts[0];
+    assert_eq!((kept.status, &kept.error), (first.status, &first.error));
+
+    // A cancel after a repair moved the cursor back to a finished stage.
+    let mut review = stage("review", Role::Review);
+    review.extra_args = vec!["--review-fail-until".into(), "1".into()];
+    let (_dir, _, mut run) = fixture(vec![stage("implementation", Role::Implementation), review]);
+    let cancel = AtomicBool::new(false);
+    let action = engine::drive(&mut run, &cancel, |event| {
+        if let engine::Event::State(state) = event {
+            if state.repair_passes == 1 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
+    })
+    .unwrap();
+    assert_eq!(
+        (action, run.status, run.cursor),
+        (Action::Stopped, Status::Cancelled, 0)
+    );
+    assert_eq!(run.stages[0].attempts.len(), 1);
+    assert_eq!(run.stages[0].attempts[0].status, Status::Complete);
+    assert!(run.stages[0].attempts[0].error.is_none());
+}
+
+#[test]
+fn repair_limit_can_be_extended_explicitly() {
+    let mut review = stage("review", Role::Review);
+    review.extra_args = vec!["--review-fail-until".into(), "3".into()];
+    let (dir, _, mut run) = fixture(vec![stage("implementation", Role::Implementation), review]);
+    assert!(run.allow_repair().is_err(), "nothing is blocked yet");
+    assert_eq!(drive(&mut run), Action::Stopped);
+    assert_eq!((run.status, run.repair_passes), (Status::Blocked, 2));
+    let error = run.error.clone().unwrap();
+    assert!(
+        error.contains(&format!("resume {} --allow-repair", run.id)),
+        "{error}"
+    );
+    let mut resumed = engine::load(dir.path(), &run.id).unwrap();
+    resumed.allow_repair().unwrap();
+    assert_eq!((resumed.cursor, resumed.status), (0, Status::Pending));
+    assert_eq!(
+        resumed.stages[1].attempts.last().unwrap().status,
+        Status::Complete
+    );
+    assert_eq!(drive(&mut resumed), Action::Complete);
+    assert_eq!(resumed.repair_passes, 3);
+    assert_eq!(count(dir.path(), "implementation"), 4);
+    assert!(resumed.allow_repair().is_err());
+}

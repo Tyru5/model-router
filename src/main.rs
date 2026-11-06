@@ -99,6 +99,9 @@ enum Commands {
         model: Option<String>,
         #[arg(long, conflicts_with_all = ["retry", "interactive", "model"])]
         advance: bool,
+        /// Allow one more review repair pass after the repair limit stopped the run.
+        #[arg(long, conflicts_with_all = ["retry", "interactive", "model", "advance"])]
+        allow_repair: bool,
     },
     /// Start a new run from a saved run's task and workflow snapshot.
     Rerun {
@@ -459,10 +462,14 @@ fn main_result() -> Result<()> {
             interactive,
             model,
             advance,
+            allow_repair,
         }) => {
             let mut run = engine::load(&project, &id)?;
             if advance {
                 run.confirm()?;
+            }
+            if allow_repair {
+                run.allow_repair()?;
             }
             if retry || interactive || model.is_some() {
                 run.retry(interactive, model)?;
@@ -562,15 +569,64 @@ fn main_result() -> Result<()> {
     Ok(())
 }
 
+/// Lines queued for printing while the engine runs. A stalled stdout (a
+/// paused pager or pipe) fills it, and further lines are dropped and
+/// counted, so the engine's timeouts and cancellation keep working.
+const PRINT_QUEUE: usize = 1024;
+
+enum Line {
+    Out(String),
+    Err(String),
+}
+
+/// `engine::drive`, printing its events from another thread.
+fn drive_printing(run: &mut Run, cancel: &AtomicBool) -> Result<Action> {
+    let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (tx, rx) = mpsc::sync_channel::<Line>(PRINT_QUEUE);
+    let counter = dropped.clone();
+    let printer = std::thread::spawn(move || {
+        let note = |count: usize| {
+            println!(
+                "[{count} output updates dropped while output was blocked; see the attempt's stdout.log]"
+            );
+        };
+        for line in rx {
+            let missed = counter.swap(0, Ordering::Relaxed);
+            if missed > 0 {
+                note(missed);
+            }
+            match line {
+                Line::Out(text) => {
+                    print!("{text}");
+                    let _ = io::stdout().flush();
+                }
+                Line::Err(text) => eprintln!("{text}"),
+            }
+        }
+        let missed = counter.swap(0, Ordering::Relaxed);
+        if missed > 0 {
+            note(missed);
+        }
+    });
+    let action = engine::drive(run, cancel, |event| {
+        let line = match event {
+            Event::State(run) => {
+                Line::Err(format!("[{}] {}", run.status.label(), run.current_name()))
+            }
+            Event::Output(text) => Line::Out(text),
+        };
+        if tx.try_send(line).is_err() {
+            dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    drop(tx);
+    let _ = printer.join();
+    action
+}
+
 fn cli_drive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
     loop {
-        let action = engine::drive(run, cancel, |event| match event {
-            Event::State(run) => eprintln!("[{}] {}", run.status.label(), run.current_name()),
-            Event::Output(text) => {
-                print!("{text}");
-                let _ = io::stdout().flush();
-            }
-        })?;
+        let action = drive_printing(run, cancel)?;
         match action {
             Action::Complete => {
                 use model_router::report;

@@ -51,18 +51,97 @@ fn signal_group(pid: u32, signal: i32) {
     }
 }
 
-/// How long a cancelled or timed-out harness may take to save its session
-/// (for takeover) after SIGTERM, before SIGKILL.
-const GRACE: Duration = Duration::from_secs(5);
+/// Whether any process, including a zombie, is still in group `pgid`.
+pub fn group_alive(pgid: u32) -> bool {
+    // SAFETY: signal 0 only checks existence and permission.
+    pgid > 1 && unsafe { libc::kill(-(pgid as i32), 0) } == 0
+}
 
-struct ChildGuard(Child, bool);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if self.1 {
-            kill_group(self.0.id());
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+/// How long a cancelled or timed-out harness may take to save its session
+/// (for takeover) after SIGTERM, before SIGKILL. Also how long leftover
+/// background children get after a harness exits.
+pub const GRACE: Duration = Duration::from_secs(5);
+
+/// Ends process group `pgid`: SIGTERM, up to `grace` for a clean exit, then
+/// SIGKILL for whatever is left. `reap` reaps the leader when it is our
+/// child, so its zombie does not count as alive.
+pub fn end_group(pgid: u32, grace: Duration, mut reap: impl FnMut()) {
+    reap();
+    if !group_alive(pgid) {
+        return;
+    }
+    signal_group(pgid, libc::SIGTERM);
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+        reap();
+        if !group_alive(pgid) {
+            return;
         }
+    }
+    kill_group(pgid);
+    reap();
+}
+
+/// A harness leader and its process group. Background children (dev
+/// servers, watchers) must not keep editing the workspace after its lock is
+/// released, so dropping this always ends the whole group, after a normal
+/// exit too: SIGTERM, `GRACE`, then SIGKILL.
+struct ProcessGroup {
+    child: Child,
+}
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        let child = &mut self.child;
+        end_group(child.id(), GRACE, || {
+            let _ = child.try_wait();
+        });
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Decodes a byte stream as UTF-8 across reads: a character split between
+/// two chunks is held back, not replaced.
+#[derive(Default)]
+pub struct Utf8Stream {
+    partial: Vec<u8>,
+}
+impl Utf8Stream {
+    pub fn decode(&mut self, bytes: &[u8]) -> String {
+        let mut data = std::mem::take(&mut self.partial);
+        data.extend_from_slice(bytes);
+        let mut text = String::with_capacity(data.len());
+        let mut rest = &data[..];
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(valid) => {
+                    text.push_str(valid);
+                    break;
+                }
+                Err(error) => {
+                    let (valid, after) = rest.split_at(error.valid_up_to());
+                    text.push_str(std::str::from_utf8(valid).unwrap_or_default());
+                    match error.error_len() {
+                        Some(length) => {
+                            text.push(char::REPLACEMENT_CHARACTER);
+                            rest = &after[length..];
+                        }
+                        // An incomplete character at the end: wait for the rest.
+                        None => {
+                            self.partial = after.to_vec();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        text
+    }
+
+    /// Whatever incomplete character the stream ended with.
+    pub fn finish(&mut self) -> String {
+        String::from_utf8_lossy(&std::mem::take(&mut self.partial)).into_owned()
     }
 }
 
@@ -70,6 +149,7 @@ fn drain(
     reader: &mut impl Read,
     log: &mut File,
     stderr: bool,
+    decoder: &mut Utf8Stream,
     on_output: &mut impl FnMut(bool, &str),
 ) -> Result<()> {
     let mut bytes = [0u8; 8192];
@@ -79,7 +159,10 @@ fn drain(
             Ok(0) => break,
             Ok(n) => {
                 log.write_all(&bytes[..n])?;
-                on_output(stderr, &String::from_utf8_lossy(&bytes[..n]));
+                let text = decoder.decode(&bytes[..n]);
+                if !text.is_empty() {
+                    on_output(stderr, &text);
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -89,12 +172,56 @@ fn drain(
     Ok(())
 }
 
+/// Asks the kernel to SIGTERM the harness when the thread that spawned it
+/// dies (Linux only): if mr is killed or OOM-killed, the harness must not
+/// keep editing a workspace whose lock died with mr. PR_SET_PDEATHSIG fires
+/// when the *forking thread* exits, so spawn from the thread that waits on
+/// the child, as `capture` does. Other platforms rely on the attempt's
+/// recorded process group being stopped by the next `drive` instead.
+fn die_with_parent(command: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: getpid is async-signal-safe.
+        let parent = unsafe { libc::getpid() };
+        // SAFETY: the hook only makes async-signal-safe calls (prctl,
+        // getppid, raise) between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // The parent may have died before prctl took effect.
+                if libc::getppid() != parent {
+                    libc::raise(libc::SIGTERM);
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = command;
+}
+
 pub fn capture(
     inv: &Invocation,
     cwd: &Path,
     dir: &Path,
     timeout: Duration,
     cancel: &AtomicBool,
+    on_output: impl FnMut(bool, &str),
+) -> Result<Outcome> {
+    capture_with(inv, cwd, dir, timeout, cancel, |_| {}, on_output)
+}
+
+/// `capture`, reporting the harness's process group ID once it starts, so
+/// the caller can record it for crash recovery.
+pub fn capture_with(
+    inv: &Invocation,
+    cwd: &Path,
+    dir: &Path,
+    timeout: Duration,
+    cancel: &AtomicBool,
+    on_spawn: impl FnOnce(u32),
     mut on_output: impl FnMut(bool, &str),
 ) -> Result<Outcome> {
     let mut stdout_log = File::create(dir.join("stdout.log"))?;
@@ -113,28 +240,42 @@ pub fn capture(
         })
         .process_group(0);
     command.envs(inv.environment()?);
-    let mut child = ChildGuard(
-        command
+    die_with_parent(&mut command);
+    let mut child = ProcessGroup {
+        child: command
             .spawn()
             .with_context(|| format!("Launch {}", inv.program))?,
-        true,
-    );
-    let mut stdout = child.0.stdout.take().context("No stdout pipe")?;
-    let mut stderr = child.0.stderr.take().context("No stderr pipe")?;
-    let mut stdin = child.0.stdin.take();
+    };
+    on_spawn(child.child.id());
+    let mut stdout = child.child.stdout.take().context("No stdout pipe")?;
+    let mut stderr = child.child.stderr.take().context("No stderr pipe")?;
+    let mut stdin = child.child.stdin.take();
     nonblocking(stdout.as_raw_fd())?;
     nonblocking(stderr.as_raw_fd())?;
     if let Some(input) = &stdin {
         nonblocking(input.as_raw_fd())?;
     }
+    let (mut out_text, mut err_text) = (Utf8Stream::default(), Utf8Stream::default());
     let input = inv.stdin.as_deref().unwrap_or("").as_bytes();
     let mut sent = 0;
     let started = Instant::now();
     let mut cancelled = false;
     let mut timed_out = false;
     let status = loop {
-        drain(&mut stdout, &mut stdout_log, false, &mut on_output)?;
-        drain(&mut stderr, &mut stderr_log, true, &mut on_output)?;
+        drain(
+            &mut stdout,
+            &mut stdout_log,
+            false,
+            &mut out_text,
+            &mut on_output,
+        )?;
+        drain(
+            &mut stderr,
+            &mut stderr_log,
+            true,
+            &mut err_text,
+            &mut on_output,
+        )?;
         if let Some(pipe) = &mut stdin {
             match pipe.write(&input[sent..]) {
                 Ok(n) => sent += n,
@@ -148,7 +289,7 @@ pub fn capture(
                 stdin.take();
             }
         }
-        if let Some(status) = child.0.try_wait()? {
+        if let Some(status) = child.child.try_wait()? {
             break status;
         }
         cancelled = cancel.load(Ordering::Relaxed);
@@ -156,20 +297,32 @@ pub fn capture(
         if cancelled || timed_out {
             // Ask first: harnesses such as omp only save a session they can
             // resume when they exit cleanly.
-            signal_group(child.0.id(), libc::SIGTERM);
+            signal_group(child.child.id(), libc::SIGTERM);
             let deadline = Instant::now() + GRACE;
             let status = loop {
-                drain(&mut stdout, &mut stdout_log, false, &mut on_output)?;
-                drain(&mut stderr, &mut stderr_log, true, &mut on_output)?;
-                if let Some(status) = child.0.try_wait()? {
+                drain(
+                    &mut stdout,
+                    &mut stdout_log,
+                    false,
+                    &mut out_text,
+                    &mut on_output,
+                )?;
+                drain(
+                    &mut stderr,
+                    &mut stderr_log,
+                    true,
+                    &mut err_text,
+                    &mut on_output,
+                )?;
+                if let Some(status) = child.child.try_wait()? {
                     // Leftover group members never get the grace period twice.
-                    kill_group(child.0.id());
+                    kill_group(child.child.id());
                     break status;
                 }
                 if Instant::now() >= deadline {
-                    kill_group(child.0.id());
-                    let _ = child.0.kill();
-                    break child.0.wait()?;
+                    kill_group(child.child.id());
+                    let _ = child.child.kill();
+                    break child.child.wait()?;
                 }
                 thread::sleep(Duration::from_millis(25));
             };
@@ -179,11 +332,30 @@ pub fn capture(
     };
     // Once the leader exits, drain available bytes without waiting for inherited
     // descriptors held by background grandchildren.
-    drain(&mut stdout, &mut stdout_log, false, &mut on_output)?;
-    drain(&mut stderr, &mut stderr_log, true, &mut on_output)?;
+    drain(
+        &mut stdout,
+        &mut stdout_log,
+        false,
+        &mut out_text,
+        &mut on_output,
+    )?;
+    drain(
+        &mut stderr,
+        &mut stderr_log,
+        true,
+        &mut err_text,
+        &mut on_output,
+    )?;
+    for (stderr, decoder) in [(false, &mut out_text), (true, &mut err_text)] {
+        let rest = decoder.finish();
+        if !rest.is_empty() {
+            on_output(stderr, &rest);
+        }
+    }
+    // Background children (dev servers, watchers) end with the stage.
+    drop(child);
     stdout_log.sync_all()?;
     stderr_log.sync_all()?;
-    child.1 = false;
     Ok(Outcome {
         code: status.code(),
         cancelled,
@@ -946,19 +1118,26 @@ impl Drop for SessionFinish<'_> {
         self.0.finish();
     }
 }
+/// A PTY harness and its session's process group, ended on drop like
+/// `ProcessGroup`. portable-pty makes the harness a session leader with the
+/// PTY as its controlling terminal, so if mr dies, closing the master sends
+/// it SIGHUP; PR_SET_PDEATHSIG is not available through portable-pty.
 struct PtyChild {
     child: Box<dyn portable_pty::Child + Send + Sync>,
-    finished: bool,
+    pid: Option<u32>,
 }
 impl Drop for PtyChild {
     fn drop(&mut self) {
-        if !self.finished {
-            if let Some(pid) = self.child.process_id() {
-                kill_group(pid);
-            }
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        let child = &mut self.child;
+        if let Some(pid) = self.pid {
+            end_group(pid, GRACE, || {
+                let _ = child.try_wait();
+            });
         }
+        if matches!(child.try_wait(), Ok(None)) {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
     }
 }
 
@@ -970,6 +1149,7 @@ pub fn interactive(
     dir: &Path,
     cancel: &AtomicBool,
     session: &InteractiveSession,
+    on_spawn: impl FnOnce(u32),
 ) -> Result<Outcome> {
     let mut size = {
         let mut state = session.state();
@@ -1010,11 +1190,15 @@ pub fn interactive(
     nonblocking(fd)?;
     let mut reader = pair.master.try_clone_reader()?;
     let mut writer = pair.master.take_writer()?;
+    let spawned = pair.slave.spawn_command(cmd)?;
+    let pid = spawned.process_id();
     let mut child = PtyChild {
-        child: pair.slave.spawn_command(cmd)?,
-        finished: false,
+        child: spawned,
+        pid,
     };
-    let pid = child.child.process_id();
+    if let Some(pid) = pid {
+        on_spawn(pid);
+    }
     drop(pair.slave);
     let mut decoder = OutputDecoder::default();
     let mut bytes = [0u8; 8192];
@@ -1026,11 +1210,7 @@ pub fn interactive(
             cancelled |= cancel.load(Ordering::Relaxed) || state.cancelled || state.finished;
             if cancelled {
                 cancel.store(true, Ordering::Relaxed);
-                if let Some(pid) = pid {
-                    kill_group(pid);
-                }
-                let _ = child.child.kill();
-                break child.child.wait()?;
+                break None;
             }
             if state.size != size {
                 size = state.size;
@@ -1071,7 +1251,7 @@ pub fn interactive(
             &mut eof,
         )?;
         if let Some(status) = child.child.try_wait()? {
-            break status;
+            break Some(status);
         }
         if eof {
             thread::sleep(Duration::from_millis(40));
@@ -1090,11 +1270,42 @@ pub fn interactive(
             }
         }
     };
-    // No descendant is allowed to outlive mr's owned harness session.
-    if let Some(pid) = pid {
-        kill_group(pid);
-    }
-    child.finished = true;
+    let status = match status {
+        Some(status) => status,
+        // Ask first, as for unattended stages: omp only saves a session it
+        // can resume when it exits cleanly. Keep draining so a harness
+        // blocked on a full PTY can still exit.
+        None => {
+            if let Some(pid) = pid {
+                signal_group(pid, libc::SIGTERM);
+            }
+            let deadline = Instant::now() + GRACE;
+            loop {
+                drain_pty(
+                    &mut reader,
+                    &mut transcript,
+                    &mut decoder,
+                    session,
+                    &mut bytes,
+                    &mut eof,
+                )?;
+                if let Some(status) = child.child.try_wait()? {
+                    if let Some(pid) = pid {
+                        kill_group(pid);
+                    }
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    if let Some(pid) = pid {
+                        kill_group(pid);
+                    }
+                    let _ = child.child.kill();
+                    break child.child.wait()?;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+    };
     drain_pty(
         &mut reader,
         &mut transcript,
@@ -1103,6 +1314,8 @@ pub fn interactive(
         &mut bytes,
         &mut eof,
     )?;
+    // No descendant is allowed to outlive mr's owned harness session.
+    drop(child);
     session.finish();
     transcript.sync_all()?;
     Ok(Outcome {
@@ -1203,6 +1416,52 @@ mod tests {
         assert_eq!(output, b"hello\x1b[?2004h");
         decoder.process(b"\x95\x8c", |bytes| output.extend_from_slice(bytes));
         assert_eq!(output, "hello\x1b[?2004h界".as_bytes());
+    }
+
+    #[test]
+    fn utf8_split_across_reads_is_decoded_whole() {
+        let mut stream = Utf8Stream::default();
+        let text = "雪 ok".as_bytes();
+        assert_eq!(stream.decode(&text[..1]), "");
+        assert_eq!(stream.decode(&text[1..2]), "");
+        assert_eq!(stream.decode(&text[2..]), "雪 ok");
+        // Invalid bytes are still replaced, and a dangling prefix is flushed.
+        assert_eq!(stream.decode(b"a\xffb\xe9"), "a\u{fffd}b");
+        assert_eq!(stream.finish(), "\u{fffd}");
+    }
+
+    #[test]
+    fn cancelling_an_interactive_harness_lets_it_exit_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let inv = Invocation {
+            program: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "trap 'echo saved > saved; exit 0' TERM; echo ready > ready; while :; do sleep 0.05; done".into(),
+            ],
+            stdin: None,
+            kind: crate::adapters::OutputKind::Text,
+            final_file: dir.path().join("unused"),
+            env: vec![],
+        };
+        let session = InteractiveSession::new(80, 24);
+        let cancel = AtomicBool::new(false);
+        let ready = dir.path().join("ready");
+        let outcome = thread::scope(|scope| {
+            scope.spawn(|| {
+                let start = Instant::now();
+                while !ready.exists() && start.elapsed() < Duration::from_secs(10) {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                cancel.store(true, Ordering::Relaxed);
+            });
+            interactive(&inv, dir.path(), dir.path(), &cancel, &session, |_| {}).unwrap()
+        });
+        assert!(outcome.cancelled);
+        assert!(
+            dir.path().join("saved").exists(),
+            "SIGKILL before a clean exit"
+        );
     }
 
     #[test]
