@@ -969,6 +969,15 @@ fn finish(
                 &prepared.directory.join("stdout.log"),
                 prepared.invocation.kind,
             );
+        } else {
+            // Best effort, from the harness's own session log.
+            attempt.usage = handoff::session_usage(
+                &run.workflow.stages[index].harness,
+                attempt.session.as_deref(),
+                &run.workspace,
+                attempt.started_at,
+                Utc::now(),
+            );
         }
     }
     if outcome.cancelled {
@@ -1328,6 +1337,12 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
             save_changes(run);
             return Ok(Action::Stopped);
         }
+        // Spend is recorded per attempt; a cap stops the run before more.
+        if let Some(reason) = crate::cost::check_budget(run) {
+            run.fail(Status::Blocked, reason);
+            emit(Event::State(Box::new(run.clone())));
+            continue;
+        }
         if run.workflow.stages[run.cursor].mode == Mode::Interactive {
             run.status = Status::Interactive;
             run.persist()?;
@@ -1573,6 +1588,7 @@ mod tests {
             workflows: vec![Workflow {
                 name: "Interactive".into(),
                 max_repair_passes: 0,
+                budget: Default::default(),
                 stages: vec![
                     Stage {
                         harness: "mock".into(),

@@ -1,7 +1,9 @@
 //! Completion summaries: what a run changed, checked, left unresolved, and
-//! spent. `build` and `render` are pure; `changes` and `diff` run Git.
+//! spent. `build_with` and `render` are pure; `build` also reads pricing
+//! files (never the network); `changes` and `diff` run Git.
 use crate::{
-    config::Role,
+    config::{Budget, Role},
+    cost::{self, CostTotal, Pricing},
     engine::{Attempt, Run, Status},
     handoff::{Severity, TestStatus, Usage},
     snapshot::{self, FileChange},
@@ -26,6 +28,10 @@ pub struct RunReport {
     pub repair_passes: u32,
     pub max_repair_passes: u32,
     pub usage: UsageTotal,
+    /// The run's spend caps.
+    pub budget: Budget,
+    /// When the built-in price table was last checked.
+    pub prices_as_of: String,
     pub stages: Vec<StageReport>,
     /// Most severe first.
     pub unresolved: Vec<Item>,
@@ -47,6 +53,7 @@ pub struct StageReport {
     pub retries: usize,
     pub active_seconds: i64,
     pub usage: UsageTotal,
+    pub budget: Budget,
     /// Router checks from the latest attempt, then model-reported tests.
     pub checks: Vec<CheckLine>,
     /// Accepted not-applicable reason.
@@ -54,7 +61,8 @@ pub struct StageReport {
 }
 
 /// Sums of what attempts reported. A field stays None when no attempt
-/// reported it; unreported attempts are counted, never estimated.
+/// reported it; unreported attempts are counted, never estimated. `cost`
+/// adds estimates, each labelled with its source.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct UsageTotal {
     pub sum: Usage,
@@ -62,6 +70,7 @@ pub struct UsageTotal {
     /// Attempts that reported any usage, and any cost.
     pub reported: usize,
     pub cost_reported: usize,
+    pub cost: CostTotal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -124,7 +133,24 @@ pub enum Changes {
     },
 }
 
+/// `build_with` the project's pricing.
 pub fn build(run: &Run) -> RunReport {
+    build_with(run, &Pricing::load(&run.project))
+}
+
+pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
+    let estimates: Vec<Vec<cost::Estimate>> = run
+        .stages
+        .iter()
+        .enumerate()
+        .map(|(index, state)| {
+            state
+                .attempts
+                .iter()
+                .map(|a| cost::attempt_estimate(run, index, a, pricing))
+                .collect()
+        })
+        .collect();
     // Only an unfinished attempt reads the clock.
     let now = Utc::now();
     let seconds = |a: &Attempt| {
@@ -142,7 +168,7 @@ pub fn build(run: &Run) -> RunReport {
     }
     let mut reported_files: Vec<String> = vec![];
     let mut stages = vec![];
-    for (stage, state) in run.workflow.stages.iter().zip(&run.stages) {
+    for ((stage, state), estimates) in run.workflow.stages.iter().zip(&run.stages).zip(&estimates) {
         let last = state.attempts.last();
         let mut checks: Vec<_> = last
             .map_or(&[][..], |a| &a.checks)
@@ -242,7 +268,8 @@ pub fn build(run: &Run) -> RunReport {
             attempts: state.attempts.len(),
             retries: state.attempts.len().saturating_sub(1),
             active_seconds: state.attempts.iter().map(seconds).sum(),
-            usage: total(&state.attempts),
+            usage: total(state.attempts.iter().zip(estimates)),
+            budget: stage.budget,
             checks,
             waiver: state.waiver.as_ref().map(|w| w.reason.clone()),
         });
@@ -265,7 +292,14 @@ pub fn build(run: &Run) -> RunReport {
         retries: stages.iter().map(|s| s.retries).sum(),
         repair_passes: run.repair_passes,
         max_repair_passes: run.workflow.max_repair_passes,
-        usage: total(attempts()),
+        usage: total(
+            run.stages
+                .iter()
+                .zip(&estimates)
+                .flat_map(|(s, e)| s.attempts.iter().zip(e)),
+        ),
+        budget: run.workflow.budget,
+        prices_as_of: cost::table_as_of().into(),
         stages,
         unresolved,
         reported_files,
@@ -281,10 +315,11 @@ pub fn build(run: &Run) -> RunReport {
     }
 }
 
-fn total<'a>(attempts: impl IntoIterator<Item = &'a Attempt>) -> UsageTotal {
+fn total<'a>(attempts: impl IntoIterator<Item = (&'a Attempt, &'a cost::Estimate)>) -> UsageTotal {
     let mut total = UsageTotal::default();
-    for attempt in attempts {
+    for (attempt, estimate) in attempts {
         total.attempts += 1;
+        total.cost.add(estimate);
         if let Some(usage) = attempt.usage {
             total.reported += 1;
             total.cost_reported += usize::from(usage.cost_usd.is_some());
@@ -404,6 +439,21 @@ pub fn usage_text(total: &UsageTotal) -> String {
     parts.join(" · ")
 }
 
+/// E.g. "~$0.31 (reported $0.25 + table $0.06) · budget $5.00 / 2.0M tokens".
+pub fn cost_text(cost: &CostTotal, budget: &Budget) -> String {
+    let mut text = cost.text();
+    let caps: Vec<String> = budget
+        .max_usd
+        .map(dollars)
+        .into_iter()
+        .chain(budget.max_tokens.map(|n| format!("{} tokens", tokens(n))))
+        .collect();
+    if !caps.is_empty() {
+        text.push_str(&format!(" · budget {}", caps.join(" / ")));
+    }
+    text
+}
+
 /// "+40 -5", or "binary" without line counts.
 pub fn counts(file: &FileChange) -> String {
     match (file.added, file.removed) {
@@ -490,6 +540,11 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
         summary(report)
     );
     let _ = writeln!(text, "Usage: {}", usage_text(&report.usage));
+    let _ = writeln!(
+        text,
+        "Cost: {}",
+        cost_text(&report.usage.cost, &report.budget)
+    );
     if let Some(error) = &report.error {
         let _ = writeln!(text, "Error: {error}");
     }
@@ -550,7 +605,11 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
             let _ = writeln!(text, "  {} {}", item_glyph(item.kind), item_text(item));
         }
     }
-    let _ = writeln!(text, "\nStages:");
+    let _ = writeln!(
+        text,
+        "\nStages (costs not reported by the harness are estimates; table prices as of {}):",
+        report.prices_as_of
+    );
     let width = report
         .stages
         .iter()
@@ -562,7 +621,7 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
         if stage.attempts > 0 {
             let _ = write!(
                 text,
-                " · {} · {} · {} {} · {}",
+                " · {} · {} · {} {} · {} · cost {}",
                 count(stage.attempts, "attempt", "attempts"),
                 duration(stage.active_seconds),
                 stage.harness,
@@ -571,7 +630,8 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
                 } else {
                     &stage.model
                 },
-                usage_text(&stage.usage)
+                usage_text(&stage.usage),
+                cost_text(&stage.usage.cost, &stage.budget)
             );
         }
         text.push('\n');
@@ -650,6 +710,7 @@ pub(crate) mod tests {
         let workflow = Workflow {
             name: "Feature".into(),
             max_repair_passes: 2,
+            budget: Default::default(),
             stages: names
                 .iter()
                 .map(|(id, name)| Stage {
@@ -725,6 +786,41 @@ pub(crate) mod tests {
         .unwrap();
         run.stages = vec![implement, verify, stage(Status::Skipped, vec![])];
         run
+    }
+
+    #[test]
+    fn report_labels_cost_sources_per_stage_and_in_total() {
+        let mut run = sample();
+        run.workflow.budget.max_usd = Some(5.0);
+        // model-a is not in the table: only the reported cost is known.
+        let report = build_with(&run, &Pricing::default());
+        assert_eq!(
+            report.usage.cost.text(),
+            "$0.25 (reported) · cost unknown for 2 of 3 attempts"
+        );
+        let price = cost::Price {
+            input: 100.0,
+            output: 1000.0,
+            cache_read: None,
+            cache_write: None,
+        };
+        let report = build_with(&run, &Pricing::default().with_override("model-a", price));
+        // Verify: 800 in at $100/M + 100 out at $1000/M = $0.18.
+        assert_eq!(report.stages[1].usage.cost.text(), "~$0.18 (config)");
+        assert_eq!(
+            cost_text(&report.usage.cost, &report.budget),
+            "~$0.43 (reported $0.25 + config $0.18) · cost unknown for 1 of 3 attempts · budget $5.00"
+        );
+        let text = render(&report, None);
+        assert!(
+            text.contains("\nCost: ~$0.43 (reported $0.25 + config $0.18)"),
+            "{text}"
+        );
+        assert!(text.contains("cost ~$0.18 (config)"), "{text}");
+        assert!(text.contains(cost::table_as_of()), "{text}");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["usage"]["cost"]["config"]["attempts"], 1);
+        assert_eq!(json["budget"]["max_usd"], 5.0);
     }
 
     #[test]

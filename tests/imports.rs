@@ -15,6 +15,7 @@ fn project() -> tempfile::TempDir {
         workflows: vec![Workflow {
             name: "Import test".into(),
             max_repair_passes: 0,
+            budget: Default::default(),
             stages: vec![
                 Stage {
                     id: "implementation".into(),

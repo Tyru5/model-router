@@ -88,6 +88,9 @@ pub struct Stage {
     /// Commands the router runs after the harness succeeds, independent of its handoff.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<Check>,
+    /// Caps on this stage's spend across its attempts; see `cost`.
+    #[serde(skip_serializing_if = "Budget::is_empty")]
+    pub budget: Budget,
 }
 impl Default for Stage {
     fn default() -> Self {
@@ -107,7 +110,36 @@ impl Default for Stage {
             timeout_seconds: 3600,
             repair_target: String::new(),
             checks: vec![],
+            budget: Budget::default(),
         }
+    }
+}
+
+/// Spend caps. A run stops before its next stage once known estimated cost
+/// exceeds `max_usd` or counted tokens exceed `max_tokens` (input, output,
+/// and cache writes). Unknown fields warn, like the workflow's.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Budget {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+}
+impl Budget {
+    pub fn is_empty(&self) -> bool {
+        self.max_usd.is_none() && self.max_tokens.is_none()
+    }
+    fn validate(&self, scope: &str) -> Result<()> {
+        ensure!(
+            self.max_usd.is_none_or(|usd| usd.is_finite() && usd > 0.0),
+            "{scope} budget max_usd must be a positive amount"
+        );
+        ensure!(
+            self.max_tokens != Some(0),
+            "{scope} budget max_tokens must be positive"
+        );
+        Ok(())
     }
 }
 
@@ -137,6 +169,9 @@ pub struct Workflow {
     #[serde(default = "two")]
     pub max_repair_passes: u32,
     pub stages: Vec<Stage>,
+    /// Caps on the whole run's spend; see `cost`.
+    #[serde(default, skip_serializing_if = "Budget::is_empty")]
+    pub budget: Budget,
 }
 fn two() -> u32 {
     2
@@ -172,7 +207,7 @@ impl Workflow {
 }
 impl Default for Workflow {
     fn default() -> Self {
-        Self { name: "Feature development".into(), max_repair_passes: 2, stages: vec![
+        Self { name: "Feature development".into(), max_repair_passes: 2, budget: Budget::default(), stages: vec![
         Stage { id: "research".into(), name: "Investigate".into(), role: Role::Research, model: "gpt-6-astra".into(),
             instructions: "Investigate the task and relevant project files. Explain the root cause or requirements, cite evidence, and propose a concrete implementation plan. Do not change project code.".into(), ..Stage::default() },
         Stage { id: "implement".into(), name: "Implement".into(), role: Role::Implementation, harness: "claude".into(), model: "sonnet".into(), mode: Mode::Interactive,
@@ -207,6 +242,9 @@ pub struct Settings {
     /// OpenAI-compatible providers routed into harnesses; see `providers`.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, Provider>,
+    /// Price overrides by model ID, USD per million tokens; see `cost`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub pricing: BTreeMap<String, crate::cost::Price>,
     /// Load notes: unknown fields, migrations, effort levels, trust. Not saved.
     #[serde(skip)]
     pub warnings: Vec<String>,
@@ -221,6 +259,7 @@ impl Default for Settings {
             workflows: vec![Workflow::default()],
             adapters: BTreeMap::new(),
             providers: BTreeMap::new(),
+            pricing: BTreeMap::new(),
             warnings: vec![],
             ignored: None,
         }
@@ -290,6 +329,17 @@ pub fn unknown_fields(value: &toml::Value) -> Vec<String> {
     }
     let mut sample = Settings::default();
     sample.providers.insert("p".into(), Provider::default());
+    let price = crate::cost::Price {
+        input: 1.0,
+        output: 1.0,
+        cache_read: Some(1.0),
+        cache_write: Some(1.0),
+    };
+    sample.pricing.insert("m".into(), price);
+    let budget = keys(&Budget {
+        max_usd: Some(1.0),
+        max_tokens: Some(1),
+    });
     let adapter = CustomAdapter {
         interactive_args: Some(vec![]),
         models_args: Some(vec![]),
@@ -310,9 +360,33 @@ pub fn unknown_fields(value: &toml::Value) -> Vec<String> {
         .flatten()
         .enumerate()
     {
-        extra(item, &workflow, &format!("workflows[{index}]"), &mut out);
+        let at = format!("workflows[{index}]");
+        extra(item, &workflow, &at, &mut out);
+        if let Some(value) = item.get("budget") {
+            extra(value, &budget, &format!("{at}.budget"), &mut out);
+        }
+        for (number, stage) in item
+            .get("stages")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            if let Some(value) = stage.get("budget") {
+                extra(
+                    value,
+                    &budget,
+                    &format!("{at}.stages[{number}].budget"),
+                    &mut out,
+                );
+            }
+        }
     }
-    for (section, known) in [("adapters", keys(&adapter)), ("providers", keys(&provider))] {
+    for (section, known) in [
+        ("adapters", keys(&adapter)),
+        ("providers", keys(&provider)),
+        ("pricing", keys(&price)),
+    ] {
         for (name, item) in value
             .get(section)
             .and_then(toml::Value::as_table)
@@ -377,6 +451,9 @@ impl Settings {
                 "Workflow {} must contain 1–64 stages",
                 workflow.name
             );
+            workflow
+                .budget
+                .validate(&format!("Workflow {}", workflow.name))?;
             let mut ids = HashSet::new();
             for (index, stage) in workflow.stages.iter().enumerate() {
                 ensure!(
@@ -412,6 +489,7 @@ impl Settings {
                     "Unknown harness {}",
                     stage.harness
                 );
+                stage.budget.validate(&format!("Stage {}", stage.name))?;
                 ensure!(
                     stage.checks.len() <= 16,
                     "Stage {} can have at most 16 checks",
@@ -468,6 +546,12 @@ impl Settings {
         }
         for (name, provider) in &self.providers {
             crate::providers::validate(name, provider)?;
+        }
+        for (model, price) in &self.pricing {
+            ensure!(
+                price.is_valid(),
+                "Pricing for {model} must use finite, non-negative USD per million tokens"
+            );
         }
         Ok(())
     }
@@ -711,6 +795,59 @@ checks = [
     }
 
     #[test]
+    fn budgets_and_pricing_roundtrip_and_validate() {
+        let text = CHECKS.replace(
+            "[[workflows]]\nname = \"Verify\"",
+            "[pricing.\"my-model\"]\ninput = 1.5\noutput = 6.0\ncache_read = 0.15\n[[workflows]]\nname = \"Verify\"\n[workflows.budget]\nmax_usd = 5.0\nmax_tokens = 2_000_000\nhard = true",
+        )
+        .replace("role = \"test\"", "role = \"test\"\nbudget = { max_usd = 1.25, max_tokens = 9 }");
+        let settings = parse(&text).unwrap();
+        settings.validate().unwrap();
+        let workflow = &settings.workflows[0];
+        assert_eq!(workflow.budget.max_usd, Some(5.0));
+        assert_eq!(workflow.budget.max_tokens, Some(2_000_000));
+        assert_eq!(workflow.stages[0].budget.max_usd, Some(1.25));
+        assert_eq!(settings.pricing["my-model"].cache_read, Some(0.15));
+        assert_eq!(settings.pricing["my-model"].cache_write, None);
+        // Future budget fields warn instead of failing.
+        assert!(
+            settings
+                .warnings
+                .iter()
+                .any(|w| w.contains("workflows[0].budget.hard")),
+            "{:?}",
+            settings.warnings
+        );
+        let saved = parse(&toml::to_string_pretty(&settings).unwrap()).unwrap();
+        assert_eq!(saved.workflows[0].budget, workflow.budget);
+        assert_eq!(
+            saved.workflows[0].stages[0].budget,
+            workflow.stages[0].budget
+        );
+        assert_eq!(saved.pricing, settings.pricing);
+        // Unset budgets and pricing are not written.
+        let plain = toml::to_string_pretty(&Settings::default()).unwrap();
+        assert!(
+            !plain.contains("budget") && !plain.contains("pricing"),
+            "{plain}"
+        );
+        let invalid = |edit: fn(&mut Settings)| {
+            let mut settings = parse(&text).unwrap();
+            edit(&mut settings);
+            settings.validate().unwrap_err().to_string()
+        };
+        assert!(invalid(|s| s.workflows[0].budget.max_usd = Some(0.0)).contains("max_usd"));
+        assert!(invalid(|s| s.workflows[0].budget.max_usd = Some(f64::NAN)).contains("max_usd"));
+        assert!(
+            invalid(|s| s.workflows[0].stages[0].budget.max_tokens = Some(0))
+                .contains("max_tokens")
+        );
+        assert!(
+            invalid(|s| s.pricing.get_mut("my-model").unwrap().output = -1.0).contains("Pricing")
+        );
+    }
+
+    #[test]
     fn versions_migrate_forward_and_newer_versions_fail() {
         let v1 = parse(&CHECKS.replace("version = 2", "version = 1")).unwrap();
         assert_eq!(v1.version, VERSION);
@@ -735,6 +872,7 @@ checks = [
         let mut workflow = Workflow {
             name: "w".into(),
             max_repair_passes: 0,
+            budget: Default::default(),
             stages: vec![Stage {
                 id: "a".into(),
                 harness: "claude".into(),

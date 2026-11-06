@@ -2,6 +2,7 @@ pub mod adapters;
 pub mod catalog;
 pub mod checks;
 pub mod config;
+pub mod cost;
 pub mod doctor;
 pub mod engine;
 pub mod events;
