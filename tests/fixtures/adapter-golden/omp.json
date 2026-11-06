@@ -1,0 +1,1768 @@
+{
+  "unattended/default": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+provider": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "openrouter/m-1",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "openrouter/m-1",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "openrouter/m-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+local-provider": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "ollama/m-1",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "ollama/m-1",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "ollama/m-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+lmstudio": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "lmstudio/m-1",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "lmstudio/m-1",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "lmstudio/m-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+effort": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--thinking",
+        "high"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/effort-only": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--thinking",
+        "high"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+provider+effort": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "openrouter/m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "openrouter/m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "openrouter/m-1",
+        "--thinking",
+        "high"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/routed": {
+    "build": {
+      "error": "omp cannot use provider proxy: it is defined only in model-router's [providers.proxy], and omp uses its own provider registry. Define it in omp's models.json, or choose a provider listed by `model-router models omp`"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "omp cannot use provider proxy: it is defined only in model-router's [providers.proxy], and omp uses its own provider registry. Define it in omp's models.json, or choose a provider listed by `model-router models omp`"
+    }
+  },
+  "unattended/routed-keyless": {
+    "build": {
+      "error": "omp cannot use provider local: it is defined only in model-router's [providers.local], and omp uses its own provider registry. Define it in omp's models.json, or choose a provider listed by `model-router models omp`"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "omp cannot use provider local: it is defined only in model-router's [providers.local], and omp uses its own provider registry. Define it in omp's models.json, or choose a provider listed by `model-router models omp`"
+    }
+  },
+  "unattended/routed-preset": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "groq/m-1",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "groq/m-1",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "groq/m-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/routed+effort": {
+    "build": {
+      "error": "omp cannot use provider proxy: it is defined only in model-router's [providers.proxy], and omp uses its own provider registry. Define it in omp's models.json, or choose a provider listed by `model-router models omp`"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "omp cannot use provider proxy: it is defined only in model-router's [providers.proxy], and omp uses its own provider registry. Define it in omp's models.json, or choose a provider listed by `model-router models omp`"
+    }
+  },
+  "unattended/provider-without-model": {
+    "build": {
+      "error": "A provider override requires a model"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "A provider override requires a model"
+    }
+  },
+  "unattended/structured-off-old-version": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--thinking",
+        "high"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/old-version-routed": {
+    "build": {
+      "error": "omp cannot use provider proxy: it is defined only in model-router's [providers.proxy], and omp uses its own provider registry. Define it in omp's models.json, or choose a provider listed by `model-router models omp`"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "omp cannot use provider proxy: it is defined only in model-router's [providers.proxy], and omp uses its own provider registry. Define it in omp's models.json, or choose a provider listed by `model-router models omp`"
+    }
+  },
+  "unattended/old-version-default": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/extra-args": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/user-output-schema": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    }
+  },
+  "unattended/user-json-schema": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--json-schema={}"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/unknown-setting": {
+    "build": {
+      "error": "omp has no stage setting nope"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "omp has no stage setting nope"
+    }
+  },
+  "unattended/setting:approval_mode=always-ask": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--approval-mode",
+        "always-ask",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--approval-mode",
+        "always-ask",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--approval-mode",
+        "always-ask"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/setting:approval_mode=write": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--approval-mode",
+        "write",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--approval-mode",
+        "write",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--approval-mode",
+        "write"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/setting:approval_mode=yolo": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--approval-mode",
+        "yolo",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--approval-mode",
+        "yolo",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--approval-mode",
+        "yolo"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/setting:approval_mode=": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/setting:approval_mode+invalid": {
+    "build": {
+      "error": "Invalid Approval mode for omp: not-a-choice"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "Invalid Approval mode for omp: not-a-choice"
+    }
+  },
+  "interactive/default": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--model",
+        "m-1",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+provider": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--model",
+        "openrouter/m-1",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "openrouter/m-1",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "openrouter/m-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+local-provider": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--model",
+        "ollama/m-1",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "ollama/m-1",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "ollama/m-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+lmstudio": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--model",
+        "lmstudio/m-1",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "lmstudio/m-1",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "lmstudio/m-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+effort": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--thinking",
+        "high"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/effort-only": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--thinking",
+        "high"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+provider+effort": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--model",
+        "openrouter/m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "openrouter/m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "openrouter/m-1",
+        "--thinking",
+        "high"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/routed": {
+    "build": {
+      "error": "omp cannot use provider proxy: it is defined only in model-router's [providers.proxy], and omp uses its own provider registry. Define it in omp's models.json, or choose a provider listed by `model-router models omp`"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "omp cannot use provider proxy: it is defined only in model-router's [providers.proxy], and omp uses its own provider registry. Define it in omp's models.json, or choose a provider listed by `model-router models omp`"
+    }
+  },
+  "interactive/routed-keyless": {
+    "build": {
+      "error": "omp cannot use provider local: it is defined only in model-router's [providers.local], and omp uses its own provider registry. Define it in omp's models.json, or choose a provider listed by `model-router models omp`"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "omp cannot use provider local: it is defined only in model-router's [providers.local], and omp uses its own provider registry. Define it in omp's models.json, or choose a provider listed by `model-router models omp`"
+    }
+  },
+  "interactive/routed-preset": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--model",
+        "groq/m-1",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "groq/m-1",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "groq/m-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/routed+effort": {
+    "build": {
+      "error": "omp cannot use provider proxy: it is defined only in model-router's [providers.proxy], and omp uses its own provider registry. Define it in omp's models.json, or choose a provider listed by `model-router models omp`"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "omp cannot use provider proxy: it is defined only in model-router's [providers.proxy], and omp uses its own provider registry. Define it in omp's models.json, or choose a provider listed by `model-router models omp`"
+    }
+  },
+  "interactive/provider-without-model": {
+    "build": {
+      "error": "A provider override requires a model"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "A provider override requires a model"
+    }
+  },
+  "interactive/structured-off-old-version": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--thinking",
+        "high"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/old-version-routed": {
+    "build": {
+      "error": "omp cannot use provider proxy: it is defined only in model-router's [providers.proxy], and omp uses its own provider registry. Define it in omp's models.json, or choose a provider listed by `model-router models omp`"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "omp cannot use provider proxy: it is defined only in model-router's [providers.proxy], and omp uses its own provider registry. Define it in omp's models.json, or choose a provider listed by `model-router models omp`"
+    }
+  },
+  "interactive/old-version-default": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/extra-args": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/user-output-schema": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    }
+  },
+  "interactive/user-json-schema": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--json-schema={}"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/unknown-setting": {
+    "build": {
+      "error": "omp has no stage setting nope"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "omp has no stage setting nope"
+    }
+  },
+  "interactive/setting:approval_mode=always-ask": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--model",
+        "m-1",
+        "--approval-mode",
+        "always-ask",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--approval-mode",
+        "always-ask",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--approval-mode",
+        "always-ask"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/setting:approval_mode=write": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--model",
+        "m-1",
+        "--approval-mode",
+        "write",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--approval-mode",
+        "write",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--approval-mode",
+        "write"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/setting:approval_mode=yolo": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--model",
+        "m-1",
+        "--approval-mode",
+        "yolo",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--approval-mode",
+        "yolo",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--approval-mode",
+        "yolo"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/setting:approval_mode=": {
+    "build": {
+      "program": "omp",
+      "args": [
+        "--model",
+        "m-1",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "@$TMP/prompt.md"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "omp",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/setting:approval_mode+invalid": {
+    "build": {
+      "error": "Invalid Approval mode for omp: not-a-choice"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "Invalid Approval mode for omp: not-a-choice"
+    }
+  }
+}

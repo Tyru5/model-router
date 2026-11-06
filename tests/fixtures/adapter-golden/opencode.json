@@ -1,0 +1,2186 @@
+{
+  "unattended/default": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+provider": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "openrouter/m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "openrouter/m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"openrouter/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+local-provider": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "ollama/m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "ollama/m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"ollama/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+lmstudio": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "lmstudio/m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "lmstudio/m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"lmstudio/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+effort": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "m-1#high",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "m-1#high",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/effort-only": {
+    "build": {
+      "error": "OpenCode selects a variant (effort) as part of the model; choose a model"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+provider+effort": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "openrouter/m-1#high",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "openrouter/m-1#high",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"openrouter/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/routed": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "model-router-proxy/m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-proxy"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"proxy\",\"options\":{\"baseURL\":\"http://localhost:4000/v1\",\"apiKey\":\"{env:PROXY_KEY}\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "model-router-proxy/m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-proxy"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"proxy\",\"options\":{\"baseURL\":\"http://localhost:4000/v1\",\"apiKey\":\"{env:PROXY_KEY}\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"model-router-proxy/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/routed-keyless": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "model-router-local/m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-local"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"local\",\"options\":{\"baseURL\":\"http://localhost:8000\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "model-router-local/m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-local"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"local\",\"options\":{\"baseURL\":\"http://localhost:8000\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"model-router-local/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/routed-preset": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "model-router-groq/m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GROQ_API_KEY",
+          {
+            "var": "GROQ_API_KEY"
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-groq"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"groq\",\"options\":{\"baseURL\":\"https://api.groq.com/openai/v1\",\"apiKey\":\"{env:GROQ_API_KEY}\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "model-router-groq/m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GROQ_API_KEY",
+          {
+            "var": "GROQ_API_KEY"
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-groq"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"groq\",\"options\":{\"baseURL\":\"https://api.groq.com/openai/v1\",\"apiKey\":\"{env:GROQ_API_KEY}\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"model-router-groq/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/routed+effort": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "model-router-proxy/m-1#high",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-proxy"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"proxy\",\"options\":{\"baseURL\":\"http://localhost:4000/v1\",\"apiKey\":\"{env:PROXY_KEY}\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "model-router-proxy/m-1#high",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-proxy"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"proxy\",\"options\":{\"baseURL\":\"http://localhost:4000/v1\",\"apiKey\":\"{env:PROXY_KEY}\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"model-router-proxy/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/provider-without-model": {
+    "build": {
+      "error": "A provider override requires a model"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "A provider override requires a model"
+    }
+  },
+  "unattended/structured-off-old-version": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "m-1",
+        "--variant",
+        "high",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "m-1",
+        "--variant",
+        "high",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/old-version-routed": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "model-router-proxy/m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-proxy"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"proxy\",\"options\":{\"baseURL\":\"http://localhost:4000/v1\",\"apiKey\":\"{env:PROXY_KEY}\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "model-router-proxy/m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-proxy"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"proxy\",\"options\":{\"baseURL\":\"http://localhost:4000/v1\",\"apiKey\":\"{env:PROXY_KEY}\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/old-version-default": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/extra-args": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/user-output-schema": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/user-json-schema": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/unknown-setting": {
+    "build": {
+      "error": "opencode has no stage setting nope"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "opencode has no stage setting nope"
+    }
+  },
+  "interactive/default": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+provider": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"openrouter/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"openrouter/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+local-provider": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"ollama/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"ollama/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+lmstudio": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"lmstudio/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"lmstudio/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+effort": {
+    "build": {
+      "error": "Interactive OpenCode has no variant option; leave effort empty or run unattended"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/effort-only": {
+    "build": {
+      "error": "OpenCode selects a variant (effort) as part of the model; choose a model"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+provider+effort": {
+    "build": {
+      "error": "Interactive OpenCode has no variant option; leave effort empty or run unattended"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"openrouter/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/routed": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-proxy"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"proxy\",\"options\":{\"baseURL\":\"http://localhost:4000/v1\",\"apiKey\":\"{env:PROXY_KEY}\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"model-router-proxy/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-proxy"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"proxy\",\"options\":{\"baseURL\":\"http://localhost:4000/v1\",\"apiKey\":\"{env:PROXY_KEY}\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"model-router-proxy/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/routed-keyless": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-local"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"local\",\"options\":{\"baseURL\":\"http://localhost:8000\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"model-router-local/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-local"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"local\",\"options\":{\"baseURL\":\"http://localhost:8000\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"model-router-local/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/routed-preset": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GROQ_API_KEY",
+          {
+            "var": "GROQ_API_KEY"
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-groq"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"groq\",\"options\":{\"baseURL\":\"https://api.groq.com/openai/v1\",\"apiKey\":\"{env:GROQ_API_KEY}\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"model-router-groq/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GROQ_API_KEY",
+          {
+            "var": "GROQ_API_KEY"
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-groq"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"groq\",\"options\":{\"baseURL\":\"https://api.groq.com/openai/v1\",\"apiKey\":\"{env:GROQ_API_KEY}\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"model-router-groq/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/routed+effort": {
+    "build": {
+      "error": "Interactive OpenCode has no variant option; leave effort empty or run unattended"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-proxy"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"proxy\",\"options\":{\"baseURL\":\"http://localhost:4000/v1\",\"apiKey\":\"{env:PROXY_KEY}\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"model-router-proxy/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/provider-without-model": {
+    "build": {
+      "error": "A provider override requires a model"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "A provider override requires a model"
+    }
+  },
+  "interactive/structured-off-old-version": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--variant",
+        "high",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--interactive",
+        "--model",
+        "m-1",
+        "--variant",
+        "high",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/old-version-routed": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--interactive",
+        "--model",
+        "model-router-proxy/m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-proxy"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"proxy\",\"options\":{\"baseURL\":\"http://localhost:4000/v1\",\"apiKey\":\"{env:PROXY_KEY}\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--interactive",
+        "--model",
+        "model-router-proxy/m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-proxy"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"proxy\",\"options\":{\"baseURL\":\"http://localhost:4000/v1\",\"apiKey\":\"{env:PROXY_KEY}\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/old-version-default": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--interactive",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--interactive",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/extra-args": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "--extra-flag",
+        "v",
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--extra-flag",
+        "v",
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/user-output-schema": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "--output-schema",
+        "mine.json",
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--output-schema",
+        "mine.json",
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/user-json-schema": {
+    "build": {
+      "program": "opencode",
+      "args": [
+        "--json-schema={}",
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--json-schema={}",
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "opencode",
+      "args": [
+        "--session",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "model"
+              ],
+              "value": "\"m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/unknown-setting": {
+    "build": {
+      "error": "opencode has no stage setting nope"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "opencode has no stage setting nope"
+    }
+  }
+}

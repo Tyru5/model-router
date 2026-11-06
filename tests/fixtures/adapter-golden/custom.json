@@ -1,0 +1,405 @@
+{
+  "mine/unattended/default": {
+    "build": {
+      "program": "mine-cli",
+      "args": [
+        "run",
+        "--model=",
+        "--provider=",
+        "--effort=",
+        "--base=",
+        "--key=",
+        "$TMP/prompt.md",
+        "$TMP/handoff.json",
+        "$TMP/workspace",
+        "$TMP/attempt"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--model=",
+        "--provider=",
+        "--effort=",
+        "--base=",
+        "--key=",
+        "$TMP/prompt.md",
+        "$TMP/handoff.json",
+        "$TMP/workspace",
+        "$TMP/attempt"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "mine/unattended/model+effort": {
+    "build": {
+      "program": "mine-cli",
+      "args": [
+        "run",
+        "--model=m-1",
+        "--provider=",
+        "--effort=high",
+        "--base=",
+        "--key=",
+        "$TMP/prompt.md",
+        "$TMP/handoff.json",
+        "$TMP/workspace",
+        "$TMP/attempt"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--model=m-1",
+        "--provider=",
+        "--effort=high",
+        "--base=",
+        "--key=",
+        "$TMP/prompt.md",
+        "$TMP/handoff.json",
+        "$TMP/workspace",
+        "$TMP/attempt"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "mine/unattended/native-provider": {
+    "build": {
+      "program": "mine-cli",
+      "args": [
+        "run",
+        "--model=m-1",
+        "--provider=openrouter",
+        "--effort=",
+        "--base=",
+        "--key=",
+        "$TMP/prompt.md",
+        "$TMP/handoff.json",
+        "$TMP/workspace",
+        "$TMP/attempt"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--model=m-1",
+        "--provider=openrouter",
+        "--effort=",
+        "--base=",
+        "--key=",
+        "$TMP/prompt.md",
+        "$TMP/handoff.json",
+        "$TMP/workspace",
+        "$TMP/attempt"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "mine/unattended/routed": {
+    "build": {
+      "program": "mine-cli",
+      "args": [
+        "run",
+        "--model=m-1",
+        "--provider=proxy",
+        "--effort=",
+        "--base=http://localhost:4000/v1",
+        "--key=PROXY_KEY",
+        "$TMP/prompt.md",
+        "$TMP/handoff.json",
+        "$TMP/workspace",
+        "$TMP/attempt",
+        "--x"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "run",
+        "--model=m-1",
+        "--provider=proxy",
+        "--effort=",
+        "--base=http://localhost:4000/v1",
+        "--key=PROXY_KEY",
+        "$TMP/prompt.md",
+        "$TMP/handoff.json",
+        "$TMP/workspace",
+        "$TMP/attempt",
+        "--x"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "mine/interactive/default": {
+    "build": {
+      "program": "mine-cli",
+      "args": [
+        "chat",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "chat",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "mine/interactive/model+effort": {
+    "build": {
+      "program": "mine-cli",
+      "args": [
+        "chat",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "chat",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "mine/interactive/native-provider": {
+    "build": {
+      "program": "mine-cli",
+      "args": [
+        "chat",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "chat",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "mine/interactive/routed": {
+    "build": {
+      "program": "mine-cli",
+      "args": [
+        "chat",
+        "Do the task.\nLine two {model} $(x)",
+        "--x"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "chat",
+        "Do the task.\nLine two {model} $(x)",
+        "--x"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "plain/unattended/default": {
+    "build": {
+      "program": "./bin/plain",
+      "args": [
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "plain/unattended/model+effort": {
+    "build": {
+      "program": "./bin/plain",
+      "args": [
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "plain/unattended/native-provider": {
+    "build": {
+      "program": "./bin/plain",
+      "args": [
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "plain/unattended/routed": {
+    "build": {
+      "program": "./bin/plain",
+      "args": [
+        "Do the task.\nLine two {model} $(x)",
+        "--x"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "Do the task.\nLine two {model} $(x)",
+        "--x"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "plain/interactive/default": {
+    "build": {
+      "error": "plain does not define interactive_args"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "plain/interactive/model+effort": {
+    "build": {
+      "error": "plain does not define interactive_args"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "plain/interactive/native-provider": {
+    "build": {
+      "error": "plain does not define interactive_args"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "plain/interactive/routed": {
+    "build": {
+      "error": "plain does not define interactive_args"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  }
+}
