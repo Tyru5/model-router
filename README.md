@@ -375,7 +375,10 @@ Initialization refuses to overwrite an existing config unless you pass
 Verification stages require a structured handoff. Blocking findings, failed
 required checks, or required checks marked `not_run` stop the run for inspection
 and explicit retry, even with reviews disabled. Automatic repair loops remain
-specific to enabled review stages.
+specific to enabled review stages. A review that still requests changes after
+the repair limit blocks the run; `resume RUN_ID --allow-repair` allows one more
+pass. A repair request reaches only the repaired stages and the review that
+asked; it is dropped once that review passes.
 
 ## Workflow files
 
@@ -420,6 +423,7 @@ model-router resume RUN_ID --retry
 model-router resume RUN_ID --model NEW_NATIVE_MODEL_ID
 model-router resume RUN_ID --interactive
 model-router resume RUN_ID --advance
+model-router resume RUN_ID --allow-repair
 model-router report RUN_ID
 model-router report RUN_ID --json
 model-router report RUN_ID --diff
@@ -723,11 +727,24 @@ model-writable handoffs are inside the worktree. Writes to run state are atomic,
 and execution uses run/workspace locks. Native harness session storage is
 independent.
 
+A stage's harness runs in its own process group, and the whole group ends with
+the stage, after a normal exit too: SIGTERM, five seconds, then SIGKILL. Dev
+servers or watchers a harness started do not outlive the workspace lock. On
+Linux an unattended harness also gets SIGTERM if mr dies; an interactive one
+gets SIGHUP from its closed terminal. Each attempt records its process group
+while it runs, so after a crash the next `resume` stops any group still alive
+before doing anything else (process group IDs are not reused while a member
+lives).
+
+Snapshot trees are kept by refs under `refs/model-router/runs/RUN_ID/`, so
+`git gc` cannot prune them; `clean` deletes a run's refs with the run.
+
 `model-router clean [--older-than DAYS] [--status S,..] [--keep N] [--worktrees]`
 previews which runs it would remove, with sizes and skipped runs; add `--yes`
 to remove them. It deletes each run directory and its handoffs. With
 `--worktrees` it runs `git worktree remove` only on clean worktrees, never
-forces, and keeps branches. Runs whose `run.lock` is held are skipped.
+forces, and keeps branches. Runs whose `run.lock` is held are skipped. It
+also deletes the run's snapshot refs (`refs/model-router/runs/RUN_ID/`).
 
 Read-only stage instructions are intent; effective tool access comes from the
 harness. Credentials stay in native configuration/environment variables. Extra
