@@ -181,15 +181,20 @@ folder, or a `~/` path.
 Press `Ctrl+U` in the browser to paste a URL instead:
 
 - Direct HTTP(S) links to Markdown or plain text.
-- GitHub issue URLs, importing the title, body, and source link.
+- GitHub issue and pull request URLs, importing the title, body, and source link.
 - GitHub file links (`blob`, `raw`, or `raw.githubusercontent.com`), including
   branches with slashes, tags, and commit references.
+- The same links on GitHub Enterprise hosts that `gh` is logged in to
+  (`gh auth login --hostname HOST`, or `GH_HOST`).
 
 GitHub links use the GitHub CLI (`gh`) and its existing login, including private
 repositories. Run `gh auth login` if needed. Imports only read the selected
-file or issue; issue comments are not included. Other text URLs are fetched
-without GitHub credentials. Export HTML pages, PDFs, or Word documents to
-Markdown/plain text first.
+file, issue, or pull request; comments are not included. Other text URLs are
+fetched without GitHub credentials. They may not redirect from HTTPS to HTTP,
+and neither redirects nor DNS answers may reach loopback, link-local
+(`169.254.0.0/16`, `fe80::/10`), or private (RFC 1918, `fc00::/7`) addresses,
+unless the URL you entered names such a host itself. Export HTML pages, PDFs,
+or Word documents to Markdown/plain text first.
 
 The preview is editable. `Tab` switches between **Append to task** and
 **Replace task**, preserving edits in each draft. An existing task defaults to
@@ -221,12 +226,12 @@ before starting a run.
 | Harness | Selection | Integration |
 | --- | --- | --- |
 | Codex | Native model ID, optional provider and reasoning effort | `exec` JSON events; native interactive CLI; final response file |
-| Claude Code | Alias or full model ID; optional effort | Print-mode JSON; native interactive CLI |
+| Claude Code | Alias or full model ID; optional effort | Print-mode stream JSON; native interactive CLI |
 | Pi | Provider and exact model ID; optional thinking | Print-mode JSON events; native interactive CLI |
 | omp (oh-my-pi) | Provider and model ID, passed as its `provider/model` selector; optional thinking | Print-mode JSON events (Pi's format); native interactive CLI; approval mode |
-| Cursor Agent | Cursor model slug | Print-mode JSON; native interactive CLI |
+| Cursor Agent | Cursor model slug | Print-mode stream JSON; native interactive CLI |
 | Gemini CLI | Gemini model ID | Headless JSON; interactive prompt |
-| OpenCode | `provider/model`; optional variant | Run-mode JSON; interactive run |
+| OpenCode | `provider/model`; optional variant (unattended) | Run-mode JSON; interactive TUI with `--prompt` (`run --interactive` before 2.x) |
 | Aider | Native/LiteLLM model ID | Message file; interactive command file; automatic commits disabled |
 | Goose | Provider and model | `run`; optional interactive continuation |
 | Amp | Mode key, such as `high` | Execute-mode JSON; native interactive CLI |
@@ -267,8 +272,8 @@ output_limit = 16384                     # optional
 | --- | --- |
 | Codex | `--config model_providers.model-router-NAME.{name,base_url,env_key}` and `model_provider`. Needs a Responses API endpoint. |
 | OpenCode | Adds an `@ai-sdk/openai-compatible` provider `model-router-NAME` to `OPENCODE_CONFIG_CONTENT`, keeping inherited inline config and its order. Model limits default to 32,768 context and, when unset, an output limit of a quarter of the context (at most 8,192), so compaction works; set `context_limit`/`output_limit` for the real values. Output must be below context. |
-| Aider | `--model openai/MODEL` with `OPENAI_API_BASE`/`OPENAI_API_KEY`. |
-| Goose | `--provider openai` with `OPENAI_HOST`/`OPENAI_BASE_PATH`/`OPENAI_API_KEY`. |
+| Aider | `--model openai/MODEL` and `--openai-api-base`, with `OPENAI_API_BASE`/`OPENAI_API_KEY`. Inherited `OPENAI_*` and `AIDER_OPENAI_*` variables (organization, project, headers, keys meant for OpenAI) are removed. Aider still loads `.env` files from your home, the Git root, and the working directory; it has no option to skip them. |
+| Goose | `--provider openai` with `OPENAI_HOST`/`OPENAI_BASE_PATH`/`OPENAI_API_KEY`; inherited `OPENAI_*` variables are removed. |
 | Custom | `{provider}`, `{base_url}`, and `{api_key_env}` placeholders (configured entries only). |
 | Claude Code, Cursor, Gemini, Amp, Copilot | Not supported; they use only their own accounts. |
 
@@ -276,6 +281,8 @@ Which providers are injected:
 
 - **`[providers.NAME]` entries** route into every harness in the table above,
   custom adapters included. Pi and omp always use their own registries.
+- Pi and omp reject a provider that only `[providers.NAME]` defines (not a
+  preset name): define it in their `models.json` instead.
 - **Names without an entry**, presets included, pass to the harness unchanged,
   so its own definition wins: Codex config layers and profiles (including
   `--oss` for `ollama`/`lmstudio`), and the OpenCode, Aider, Goose, and Pi
@@ -289,14 +296,25 @@ native endpoint, key, header, or stored login.
 
 Keys stay in your environment. The router copies the named variable at launch,
 fails before a run starts if it is unset, and records only variable names in
-`command.json` and previews. `model-router providers NAME` lists the provider's
-models via `GET /models` (no inference request).
+`command.json`; previews show `NAME=<redacted>` for every value. A `base_url`
+with credentials (`user:pass@`), a query, or a fragment is rejected: name the
+key's variable in `api_key_env`. `model-router providers NAME` lists the
+provider's models via `GET /models` (no inference request), with context length
+and prices when the provider reports them. Model catalogs of harnesses that can
+use a configured provider include its listing.
+
+A project's `.model-router.toml` that points a provider at its own endpoint, or
+names a different key variable than a preset, needs [trust](#project-trust).
 
 Model discovery is deliberately labeled:
 
 - **Codex:** local cache, which may be stale. Refresh it through Codex.
 - **Pi/omp/OpenCode:** configured-provider catalogs, not an entitlement guarantee.
-- **Cursor:** account-reported CLI list.
+- **Cursor:** account-reported CLI list. Cursor's newer `agent` command is used
+  only when `cursor-agent` is missing and `agent` is Cursor's.
+- **Router providers:** each configured provider's `/models` listing.
+- A listing that fails or cannot be parsed shows why in the catalog note and
+  falls back to manual entry; one longer than 2 MiB is marked truncated.
 - **Claude/Amp:** documented aliases/modes plus your saved selections.
 - **Other adapters:** native default, saved selections, and manual entry.
 
@@ -389,7 +407,16 @@ model-router preview
 Configuration precedence is explicit `--config`, project `.model-router.toml`,
 global config, then the starter workflow. The project file replaces the global
 template set. Global configuration uses your platform's config directory
-(`~/.config/model-router/config.toml` on Linux).
+(`~/.config/model-router/config.toml` on Linux; `MODEL_ROUTER_CONFIG_DIR`
+overrides it).
+
+Files carry `version = 2`. Older files migrate when loaded and are written as
+v2 when saved; version 1 gained the review summary stage. A file from a newer
+model-router fails with a clear message. Unknown fields outside stages and
+checks are ignored with a warning (shown by `validate` and the TUI status
+line), so a newer release's additions do not break this one; stage and check
+fields stay strict, so typos fail. `validate` also warns about effort values
+the harness does not document.
 
 `s` saves project templates; `S` saves global templates. `w` chooses, clones,
 or adds a workflow preset; `R` renames and `X` deletes the current workflow.
@@ -402,6 +429,28 @@ Each stage has a stable `id`, human-readable `name`, semantic `role`, `enabled`
 flag, `harness`, `model`, `provider`, `effort`, `mode`, `instructions`,
 `extra_args`, `harness_settings`, and `timeout_seconds`. A review may also set `repair_target` to
 an upstream implementation stage ID. Blank chooses the nearest enabled one.
+
+### Project trust
+
+A cloned repository's `.model-router.toml` could run commands on your machine
+or send your keys elsewhere. These sections take effect only after you trust
+the file: custom adapters, stage checks, extra arguments, permission settings
+that loosen a harness's checks (`danger-full-access`, `bypassPermissions`,
+`yolo`, Cursor sandbox `disabled`, Aider `yes-always`, Goose `auto`, Copilot
+`allow-all-tools`), and providers with their own endpoint or key variable.
+
+```sh
+model-router trust          # list them and confirm
+model-router trust --yes    # trust without asking
+model-router trust --revoke
+```
+
+Trust is stored as a SHA-256 digest of those sections per project in
+`trust.json` in your config directory; changing any of them asks again.
+`run` refuses an untrusted config and lists what it would run. The TUI asks
+once: trust, continue with them ignored (saving keeps them in the file), or
+quit. Other commands ignore them and say so. Your global config and a file you
+pass with `--config` are always trusted.
 
 ## Running and recovering
 
@@ -516,9 +565,10 @@ brief for the person reviewing the work:
 
 The brief leads the Monitor's results when the run finishes, appears in
 `model-router report` and the CLI's completion output, and is saved as
-`.model-router/runs/RUN_ID/review.md`. Loading a workflow with no `summary`
-stage, such as one saved before the stage existed, appends it enabled. To opt
-out, disable it with `Space`; a deleted stage comes back on the next load.
+`.model-router/runs/RUN_ID/review.md`. Migrating a v1 config appends it,
+enabled, to workflows without one; when Codex is not installed it uses the
+first enabled stage's harness with its default model. To opt out, disable it
+with `Space` or delete it: v2 files are not migrated again.
 
 When an interactive harness exits, inspect its handoff and advance, reopen, or
 stop. `Ctrl+]` stops a stuck interactive harness. In the monitor, `h` inspects
@@ -584,6 +634,10 @@ arguments. **F7** browses models and returns to the settings draft.
 | Claude Code | Permission mode (`manual`, `acceptEdits`, `plan`, `dontAsk`, `auto`, `bypassPermissions`) |
 | Cursor | Sandbox (`enabled`, `disabled`) |
 | Gemini | Approval mode (`default`, `auto_edit`, `plan`, `yolo`) |
+| omp | Approval mode (`always-ask`, `write`, `yolo`) |
+| Aider | Confirmations (`yes-always`, which unattended runs need to answer prompts; Aider still asks before shell commands) |
+| Goose | Permission mode (`approve`, `smart_approve`, `chat`, `auto`), set as `GOOSE_MODE` |
+| Copilot | Tool permissions (`allow-all-tools`) |
 | Other/custom harnesses | Native permission arguments through **Extra arguments** |
 
 Permission controls default to **Harness default**, which sends no override. Native
@@ -605,7 +659,8 @@ harness_settings = { sandbox = "workspace-write", approval_policy = "on-request"
 ```
 
 Keys are `sandbox` and `approval_policy` (Codex), `permission_mode` (Claude),
-`sandbox` (Cursor), and `approval_mode` (Gemini). Omitted keys inherit native
+`sandbox` (Cursor), `approval_mode` (Gemini, omp), `confirmations` (Aider),
+`mode` (Goose), and `tool_permissions` (Copilot). Omitted keys inherit native
 configuration. They do not edit
 the harness's global configuration or credentials. Changing harness clears
 its structured settings along with model/provider/effort; explicit extra
@@ -755,6 +810,8 @@ is passed through to the process. Built-in provider names are not injected:
 `{provider}` holds the name, and `{base_url}`/`{api_key_env}` expand empty.
 Arguments are passed directly; no shell evaluates them. Placeholder substitution
 does not recursively interpret content supplied by a task or model.
+
+A project's own adapters run only after [trust](#project-trust).
 
 Set `prompt_stdin = true` for tools that read an unattended prompt from stdin.
 Omit `interactive_args` when the tool has no interactive interface. A catalog

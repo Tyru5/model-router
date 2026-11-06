@@ -56,6 +56,25 @@ so stale reviews cannot approve changed code. Allow two repair passes per run by
 default. Suggestions alone do not trigger repair. Disabled reviews never gate a
 run, and a run with no review ends after its last enabled stage.
 
+## Configuration and trust
+
+Config files carry a `version` (currently 2). Older versions migrate in order
+when loaded (v1→v2 adds the review summary stage once) and save as the current
+version; a newer version fails with an upgrade message. Unknown fields outside
+stages and checks are warnings shown by `validate` and the TUI, so newer
+releases can add fields; stage and check fields stay strict.
+
+A project's `.model-router.toml` is untrusted until the user approves its
+dangerous sections: custom adapters, checks, extra arguments, permission
+settings that loosen a harness's checks, and providers with their own endpoint
+or key variable. Approval stores a SHA-256 digest of those sections per
+canonical project path in the user's `trust.json`; any change asks again.
+`run` refuses an untrusted config and lists the sections; the TUI asks once
+(trust, continue with them ignored, or quit); read-only commands ignore them.
+Ignored sections are kept when the config is saved. The global config and an
+explicit `--config` file are trusted. `model-router trust [--yes]` approves and
+`--revoke` forgets.
+
 ## Persistence and recovery
 
 Save reusable workflows as TOML and snapshot them into each run. Save every
@@ -88,6 +107,10 @@ Built-in targets: Codex, Claude Code, Pi, Cursor Agent, Gemini CLI, OpenCode,
 Aider, Goose, Amp, and GitHub Copilot CLI. Custom adapters declare executable,
 unattended and interactive arguments, and optionally a model-list command.
 
+Router providers never put secrets in arguments or artifacts: `base_url`
+cannot hold credentials or a query, previews redact environment values, and
+routed launches drop inherited variables meant for the native provider.
+
 Reuse native authentication and provider configurations. No credential store,
 no automatic installation of harnesses, and no model inference during discovery.
 Label account-reported, cached, provider-catalog, and unverified selections
@@ -105,7 +128,11 @@ API clients, automatic task classification, and embedded IDE control are exclude
   opens an editor; saving inserts after the current stage. Cancelling the picker
   or editor leaves the workflow unchanged. Preserve freely editable custom stages.
 - Task/spec import from local Markdown/UTF-8 files, direct HTTP(S) text URLs,
-  and GitHub issue/file links. Reuse `gh` authentication for GitHub access.
+  and GitHub issue, pull request, and file links, including GitHub Enterprise
+  hosts `gh` is logged in to. Reuse `gh` authentication for GitHub access.
+  Direct URLs cannot redirect from HTTPS to HTTP, and redirects or DNS cannot
+  reach loopback, link-local, or private addresses unless the entered URL
+  names one.
   Browse files or enter a path/URL, then edit an append/replace preview.
   Default to append when a task exists. Apply explicitly; importing never starts
   execution. Cancellation and errors preserve the current task. Limit the final
