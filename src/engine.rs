@@ -189,7 +189,8 @@ pub struct StageState {
     pub status: Status,
     pub attempts: Vec<Attempt>,
     pub handoff: Option<Handoff>,
-    /// User acceptance of a test stage that reported no applicable check.
+    /// User acceptance of a test stage that reported no applicable check,
+    /// or of a ship stage's plan (see `ship::confirm`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiver: Option<Waiver>,
 }
@@ -325,7 +326,12 @@ impl Run {
             "Enable at least one stage"
         );
         // Catch every missing selected harness before any stage mutates the project.
-        for stage in workflow.stages.iter().filter(|s| s.enabled) {
+        // Ship stages run in the router, without a harness.
+        for stage in workflow
+            .stages
+            .iter()
+            .filter(|s| s.enabled && s.role != Role::Ship)
+        {
             let program = adapters::program(&stage.harness, &settings.adapters);
             ensure!(
                 adapters::executable_at(&program, project).is_some(),
@@ -668,6 +674,9 @@ impl Run {
             self.status == Status::AwaitingConfirmation,
             "No handoff awaits confirmation"
         );
+        if self.workflow.stages[self.cursor].role == Role::Ship {
+            return crate::ship::confirm(self);
+        }
         if let Some(reason) = self.pending_waiver().map(str::to_owned) {
             self.stages[self.cursor].waiver = Some(Waiver {
                 reason,
@@ -856,7 +865,7 @@ impl Run {
 
     /// Acts on the current stage's finished handoff: blocks, waits for the
     /// user's acceptance, sends a review's request to a repair, or moves on.
-    fn advance(&mut self, actor: Actor) -> Result<()> {
+    pub(crate) fn advance(&mut self, actor: Actor) -> Result<()> {
         let index = self.cursor;
         let name = self.workflow.stages[index].name.clone();
         match self.decide()? {
@@ -931,7 +940,13 @@ impl Run {
     /// just finished; without, the error belongs to no attempt of this
     /// execution, e.g. a launch that failed before its attempt was recorded,
     /// or a cancel between stages.
-    fn stop(&mut self, status: Status, message: String, actor: Actor, attempt: bool) -> Result<()> {
+    pub(crate) fn stop(
+        &mut self,
+        status: Status,
+        message: String,
+        actor: Actor,
+        attempt: bool,
+    ) -> Result<()> {
         let index = self.cursor;
         let has_attempt = attempt
             && self
@@ -1743,6 +1758,10 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
             emit(Event::State(Box::new(run.clone())));
             continue;
         }
+        if run.workflow.stages[run.cursor].role == Role::Ship {
+            crate::ship::execute(run, &mut emit)?;
+            continue;
+        }
         if run.workflow.stages[run.cursor].mode == Mode::Interactive {
             let reason = format!(
                 "Stage {} waits for its terminal",
@@ -1811,6 +1830,16 @@ pub fn preview(
     for (index, stage) in workflow.stages.iter().enumerate() {
         if !stage.enabled {
             text.push_str(&format!("{}. {} [disabled]\n", index + 1, stage.name));
+            continue;
+        }
+        if stage.role == Role::Ship {
+            let options = stage.ship.clone().unwrap_or_default();
+            text.push_str(&format!(
+                "{}. {} | ship | router, no harness\n   {}\n",
+                index + 1,
+                stage.name,
+                options.describe()
+            ));
             continue;
         }
         let paths = ContextPaths {

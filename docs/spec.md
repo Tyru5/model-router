@@ -14,9 +14,9 @@ remain visible, including Amp's mode selection and provider-specific identifiers
 
 Provide editable stage presets for requirements, research, diagnosis, design,
 planning, implementation, verification, code/security review, documentation,
-handoff, and a blank custom stage. Provide Quick task, Full feature, Bug fix,
+handoff, ship, and a blank custom stage. Provide Quick task, Full feature, Bug fix,
 and Investigation workflow presets. Adding a preset never overwrites an existing
-workflow or changes a saved run; reviews start disabled in workflow presets.
+workflow or changes a saved run; reviews and ship stages start disabled in workflow presets.
 
 ## Execution and handoff
 
@@ -87,7 +87,8 @@ A project's `.model-router.toml` is untrusted until the user approves its
 dangerous sections: custom adapters, checks, extra arguments, permission
 settings that loosen a harness's checks, router sandbox loosening (a stage mode
 weaker than its workflow default, `sandbox_writable`, `sandbox_fallback =
-"warn"`), and providers with their own endpoint or key variable. Approval stores a SHA-256 digest of those sections per
+"warn"`), ship stages without confirmation, and providers with their own
+endpoint or key variable. Approval stores a SHA-256 digest of those sections per
 canonical project path in the user's `trust.json`; any change asks again.
 `run` refuses an untrusted config and lists the sections; the TUI asks once
 (trust, continue with them ignored, or quit); read-only commands ignore them.
@@ -117,6 +118,20 @@ changes. Default timeout: 60 minutes per unattended stage.
 
 Use the selected working directory by default. Optional Git worktrees start from
 committed HEAD, remain on disk, and are never merged or committed automatically.
+
+The router commits only in a ship stage the user explicitly added and enabled
+(disabled in workflow presets), or with `model-router ship`; agents are still
+told not to commit. No harness runs: the router commits exactly the files
+changed during the run on a new branch from HEAD, optionally pushes it (never
+forced), and optionally opens a draft PR with `gh`. By default it first waits
+at the human checkpoint with a preview of branch, files, commit message, push,
+and PR, and ships only that confirmed plan; a changed plan is previewed again.
+Server clients cannot confirm it, and skipping the preview requires project
+trust. Files changed before the run, and the user's index, stay out; a file
+changed both before and during the run blocks unless explicitly included. It
+commits as the user's Git identity only, refusing without one, and adds no
+trailers or attribution. It never amends or moves an existing branch; failures
+block with Git's or `gh`'s error.
 Store generated artifacts in a self-ignored `.model-router` directory. Retain
 history until the user removes it. Aider's automatic commits are disabled.
 
@@ -209,7 +224,7 @@ API clients, automatic task classification, and embedded IDE control are exclude
   background-computed sizes, confirmed reruns, attempt comparison, and cleanup
   previews; harness availability/catalog view.
 - CLI equivalents for initialization, validation, previews, execution, discovery,
-  history (filters, JSON, sizes), rerun, compare, clean, and resume; all share
+  history (filters, JSON, sizes), rerun, compare, clean, resume, and ship; all share
   the same execution engine.
 - Headless `serve`: MCP over stdio and a loopback, token-protected HTTP/SSE
   API with the same engine. Server runs are unattended only; interactive

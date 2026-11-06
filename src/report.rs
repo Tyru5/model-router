@@ -1,6 +1,6 @@
 //! Completion summaries: what a run changed, checked, left unresolved, and
 //! spent. `build_with` and `render` are pure; `build` also reads pricing
-//! files (never the network); `changes` and `diff` run Git.
+//! files and saved ship results (never the network); `changes` and `diff` run Git.
 use crate::{
     config::{Budget, Role},
     cost::{self, CostTotal, Pricing},
@@ -40,6 +40,9 @@ pub struct RunReport {
     pub reported_files: Vec<String>,
     /// The latest review summary stage's brief, Markdown; also review.md.
     pub review: Option<String>,
+    /// Ships of this run: by ship stages, then `model-router ship`. Read
+    /// from each ship's ship.json.
+    pub shipped: Vec<crate::ship::Outcome>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -256,7 +259,9 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
                 ),
             );
         }
-        if let Some(waiver) = &state.waiver {
+        // A ship stage's acceptance is its plan's confirmation.
+        let waiver = state.waiver.as_ref().filter(|_| stage.role != Role::Ship);
+        if let Some(waiver) = waiver {
             item(
                 ItemKind::Waiver,
                 format!("verification not applicable: {}", waiver.reason),
@@ -274,7 +279,7 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
             usage: total(state.attempts.iter().zip(estimates)),
             budget: stage.budget,
             checks,
-            waiver: state.waiver.as_ref().map(|w| w.reason.clone()),
+            waiver: waiver.map(|w| w.reason.clone()),
             handoff_source: last.and_then(|a| a.handoff_source),
         });
     }
@@ -316,6 +321,7 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
             .filter(|(stage, _)| stage.role == Role::Summary)
             .find_map(|(_, state)| state.handoff.as_ref())
             .map(|handoff| handoff.summary.trim().to_owned()),
+        shipped: crate::ship::outcomes(run),
     }
 }
 
@@ -609,6 +615,12 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
     }
     if let Some(review) = &report.review {
         let _ = writeln!(text, "\nReview summary:\n{review}");
+    }
+    for ship in &report.shipped {
+        let _ = writeln!(text, "\nShipped:");
+        for line in ship.lines() {
+            let _ = writeln!(text, "  {line}");
+        }
     }
     if let Some(changes) = changes {
         let _ = writeln!(text, "\n{}", changes_heading(changes));

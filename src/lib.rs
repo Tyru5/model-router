@@ -17,6 +17,7 @@ pub mod providers;
 pub mod report;
 pub mod sandbox;
 pub mod serve;
+pub mod ship;
 pub mod snapshot;
 pub mod stats;
 pub mod storage;

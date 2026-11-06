@@ -118,11 +118,11 @@ def main():
                 assert workflows[0] == original, (
                     "Preset overwrote the original workflow"
                 )
-                assert len(workflows[-1]["stages"]) == 10
+                assert len(workflows[-1]["stages"]) == 11
                 assert all(
                     not s["enabled"]
                     for s in workflows[-1]["stages"]
-                    if s["role"] == "review"
+                    if s["role"] in ("review", "ship")
                 )
                 assert "Keep this task" in terminal.text()
             assert workflows[-1]["name"] == "Full feature (2)"

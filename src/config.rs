@@ -91,17 +91,21 @@ pub enum Role {
     Test,
     /// Summarizes the run's work for the person reviewing it.
     Summary,
+    /// The router commits the run's changes, optionally pushes and opens a
+    /// draft PR; no harness runs. See `ship`.
+    Ship,
     #[default]
     Custom,
 }
 impl Role {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Research,
         Self::Planning,
         Self::Implementation,
         Self::Review,
         Self::Test,
         Self::Summary,
+        Self::Ship,
         Self::Custom,
     ];
     pub fn label(self) -> &'static str {
@@ -112,6 +116,7 @@ impl Role {
             Self::Review => "review",
             Self::Test => "test",
             Self::Summary => "summary",
+            Self::Ship => "ship",
             Self::Custom => "custom",
         }
     }
@@ -155,6 +160,9 @@ pub struct Stage {
     /// Caps on this stage's spend across its attempts; see `cost`.
     #[serde(skip_serializing_if = "Budget::is_empty")]
     pub budget: Budget,
+    /// Ship stage settings; None in a ship stage means the defaults.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ship: Option<crate::ship::Options>,
 }
 fn is_true(value: &bool) -> bool {
     *value
@@ -196,6 +204,7 @@ impl Default for Stage {
             sandbox_network: true,
             sandbox_fallback: SandboxFallback::Refuse,
             budget: Budget::default(),
+            ship: None,
         }
     }
 }
@@ -628,8 +637,22 @@ impl Settings {
                         stage.name
                     );
                 }
-                if stage.enabled {
-                    crate::adapters::validate_options(stage, &self.providers)?;
+                if stage.role == Role::Ship {
+                    ensure!(
+                        stage.checks.is_empty(),
+                        "Ship stage {} cannot have checks",
+                        stage.name
+                    );
+                    stage.ship.clone().unwrap_or_default().validate()?;
+                } else {
+                    ensure!(
+                        stage.ship.is_none(),
+                        "Stage {} has ship options but is not a ship stage",
+                        stage.name
+                    );
+                    if stage.enabled {
+                        crate::adapters::validate_options(stage, &self.providers)?;
+                    }
                 }
             }
         }

@@ -17,6 +17,9 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 - Review summary stage that briefs the reviewer; loaded workflows get one
   unless a stage already has the summary role (disable it to opt out).
 - omp harness.
+- Opt-in Ship stage and `model-router ship`: the router commits the run's
+  changes on a new branch after a confirmed preview, optionally pushing and
+  opening a draft PR.
 - Router providers: OpenRouter plus presets; research model-router profile.
 - Harness effort levels discovered from local catalogs and editable per stage.
 - Stage models picked from the harness catalog; project root detection and a

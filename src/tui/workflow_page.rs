@@ -43,12 +43,15 @@ const FIELDS: &[&str] = &[
     "Router checks (one per line; ? prefix = optional)",
     "Router sandbox (inherit = workflow default)",
     "Stage instructions",
+    "Ship options (TOML; ship role only)",
 ];
 /// Multiline fields, where Enter inserts a newline.
 const CHECKS: usize = 10;
-const INSTRUCTIONS: usize = 12;
-const CHOICES: [usize; 4] = [1, 2, 6, SANDBOX];
 const SANDBOX: usize = 11;
+const INSTRUCTIONS: usize = 12;
+const SHIP: usize = 13;
+const MULTILINE: [usize; 3] = [CHECKS, INSTRUCTIONS, SHIP];
+const CHOICES: [usize; 4] = [1, 2, 6, SANDBOX];
 /// The sandbox choice that keeps the workflow's `sandbox_default`.
 const INHERIT: &str = "inherit";
 /// The model field: chosen from the harness catalog, typed only on request.
@@ -104,6 +107,7 @@ impl StageEditor {
             .collect::<Vec<_>>()
             .join("\n");
         let sandbox = stage.sandbox.map_or(INHERIT, Sandbox::label).to_owned();
+        let ship = ship_text(&stage);
         let fields = [
             &stage.name,
             stage.role.label(),
@@ -118,6 +122,7 @@ impl StageEditor {
             &checks,
             &sandbox,
             &stage.instructions,
+            &ship,
         ]
         .into_iter()
         .map(textarea)
@@ -202,6 +207,11 @@ impl StageEditor {
         stage.instructions = content(&self.fields[INSTRUCTIONS]);
         let sandbox = content(&self.fields[SANDBOX]);
         stage.sandbox = Sandbox::ALL.into_iter().find(|s| s.label() == sandbox);
+        stage.ship = parse_ship(stage.role, &content(&self.fields[SHIP]))?;
+        // A ship stage without options already means the defaults.
+        if self.stage.ship.is_none() && stage.ship == Some(crate::ship::Options::default()) {
+            stage.ship = None;
+        }
         Ok(stage)
     }
     fn focus(&mut self, index: usize) {
@@ -218,7 +228,7 @@ impl StageEditor {
     /// Whether Up/Down move the cursor inside a multiline field instead of
     /// leaving it: only on its first or last line do they switch fields.
     fn moves_within(&self, key: &KeyEvent) -> bool {
-        if ![CHECKS, INSTRUCTIONS].contains(&self.selected) || !key.modifiers.is_empty() {
+        if !MULTILINE.contains(&self.selected) || !key.modifiers.is_empty() {
             return false;
         }
         let field = &self.fields[self.selected];
@@ -286,7 +296,7 @@ impl StageEditor {
                     return StageRequest::Catalog;
                 }
             }
-        } else if key.code == Key::Enter && ![CHECKS, INSTRUCTIONS].contains(&self.selected) {
+        } else if key.code == Key::Enter && !MULTILINE.contains(&self.selected) {
             self.focus((self.selected + 1) % self.fields.len());
         } else {
             self.fields[self.selected].input(key);
@@ -438,6 +448,8 @@ impl StageEditor {
         keys.spans.push(Span::styled(
             if self.selected == CHECKS {
                 "   ·  argv per line, no shell; edit timeout_seconds in TOML"
+            } else if self.selected == SHIP {
+                "   ·  e.g. push = true, draft_pr = true; blank = defaults (commit only, confirm)"
             } else if self.selected == MODEL {
                 "   ·  Enter lists the harness's models; blank inherits its default"
             } else if self.selected == EFFORT && self.catalog.is_none() {
@@ -452,6 +464,33 @@ impl StageEditor {
             chunks[1],
         );
     }
+}
+
+/// A ship stage's options as TOML lines; empty for other stages.
+fn ship_text(stage: &Stage) -> String {
+    if stage.role != Role::Ship && stage.ship.is_none() {
+        return String::new();
+    }
+    toml::to_string(&stage.ship.clone().unwrap_or_default())
+        .unwrap_or_default()
+        .trim_end()
+        .to_owned()
+}
+
+/// Parses the ship options field. Blank means the defaults for a ship stage
+/// and none for other roles.
+fn parse_ship(role: Role, text: &str) -> Result<Option<crate::ship::Options>> {
+    if text.trim().is_empty() {
+        return Ok((role == Role::Ship).then(crate::ship::Options::default));
+    }
+    ensure!(
+        role == Role::Ship,
+        "Ship options apply to ship stages only; clear the field or choose the ship role"
+    );
+    let options: crate::ship::Options =
+        toml::from_str(text).map_err(|e| anyhow::anyhow!("Ship options: {}", e.message()))?;
+    options.validate()?;
+    Ok(Some(options))
 }
 
 /// Parses the router checks field: one shell-quoted argv per nonempty line, a
@@ -561,7 +600,7 @@ impl App {
                     items,
                     selected: self.workflow,
                     filter: textarea(""),
-                    note: "Presets add an editable workflow. Reviews start disabled; existing workflows are kept."
+                    note: "Presets add an editable workflow. Reviews start disabled, as does ship; existing workflows are kept."
                         .into(),
                 });
             }
@@ -1109,10 +1148,35 @@ mod tests {
             assert_eq!(editor.fields[0].cursor(), (0, 8));
         }
         editor.key(KeyEvent::new(Key::Up, Mods::NONE));
+        assert_eq!(editor.selected, SHIP);
+        editor.key(KeyEvent::new(Key::Up, Mods::NONE));
         assert_eq!(editor.selected, INSTRUCTIONS);
         assert_eq!(editor.fields[INSTRUCTIONS].cursor(), (1, 4));
         editor.key(KeyEvent::new(Key::Char('!'), Mods::NONE));
         assert_eq!(editor.finish().unwrap().instructions, "first\nlast!");
+    }
+
+    #[test]
+    fn ship_options_edit_as_toml_for_ship_stages_only() {
+        let ship = crate::presets::stage("ship").build();
+        let mut editor = StageEditor::new(ship, vec!["codex".into()]);
+        assert!(content(&editor.fields[SHIP]).contains("draft_pr = true"));
+        assert!(!editor.changed());
+        editor.fields[SHIP] = textarea("push = false\nbranch = \"ship/{slug}\"");
+        let options = editor.finish().unwrap().ship.unwrap();
+        assert!(!options.push && !options.draft_pr && options.confirm);
+        assert_eq!(options.branch, "ship/{slug}");
+        editor.fields[SHIP] = textarea("draft_pr = true");
+        assert!(format!("{:#}", editor.finish().unwrap_err()).contains("requires push"));
+        editor.fields[SHIP] = textarea("pushh = true");
+        assert!(format!("{:#}", editor.finish().unwrap_err()).contains("unknown field"));
+
+        let plain = StageEditor::new(Stage::default(), vec!["codex".into()]);
+        assert_eq!(content(&plain.fields[SHIP]), "");
+        assert!(plain.finish().unwrap().ship.is_none());
+        let mut plain = plain;
+        plain.fields[SHIP] = textarea("push = true");
+        assert!(plain.finish().is_err());
     }
 
     #[test]
