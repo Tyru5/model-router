@@ -101,7 +101,11 @@ fn read_only_blocks_workspace_writes_but_not_the_handoff() {
     )
     .unwrap();
     assert_eq!(command["sandbox"]["mode"], "read-only");
-    assert_eq!(command["sandbox"]["backend"], "bubblewrap");
+    let (backend, _) = sandbox::detect().unwrap();
+    assert_eq!(
+        command["sandbox"]["backend"],
+        serde_json::to_value(backend).unwrap()
+    );
     assert!(
         command["sandbox"]["writable"]
             .as_array()
@@ -110,11 +114,13 @@ fn read_only_blocks_workspace_writes_but_not_the_handoff() {
             .any(|p| Path::new(p.as_str().unwrap()) == stage.attempts[0].directory),
         "{command}"
     );
-    // The sandbox's /tmp was private.
-    assert!(
-        !Path::new("/tmp/probe.txt").exists()
-            || fs::read_to_string("/tmp/probe.txt").unwrap() != "x"
-    );
+    // Under bubblewrap the sandbox's /tmp was private; sandbox-exec shares it.
+    if backend == sandbox::Backend::Bubblewrap {
+        assert!(
+            !Path::new("/tmp/probe.txt").exists()
+                || fs::read_to_string("/tmp/probe.txt").unwrap() != "x"
+        );
+    }
 }
 
 #[test]
