@@ -293,6 +293,30 @@ fn review_lines(report: &RunReport, palette: Palette) -> Vec<Line<'static>> {
 
 fn findings_lines(report: &RunReport, palette: Palette) -> Vec<Line<'static>> {
     let mut lines = vec![];
+    // Best-of-N stages: the judge's choice first, then each candidate.
+    for stage in &report.stages {
+        let Some(fan) = &stage.fan_out else {
+            continue;
+        };
+        lines.push(Line::styled(
+            format!("Fan-out · {}", stage.name),
+            palette.header_style(),
+        ));
+        for (index, line) in report::fan_out_text(fan).into_iter().enumerate() {
+            let color = if index == 0 && !fan.applied {
+                palette.warn
+            } else if line.starts_with('★') {
+                palette.success
+            } else {
+                palette.fg
+            };
+            lines.push(Line::styled(
+                storage::clean_terminal(&line),
+                Style::default().fg(color),
+            ));
+        }
+        lines.push(Line::raw(""));
+    }
     let checks: Vec<_> = report
         .stages
         .iter()

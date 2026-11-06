@@ -52,6 +52,39 @@ pub struct StageReport {
     pub checks: Vec<CheckLine>,
     /// Accepted not-applicable reason.
     pub waiver: Option<String>,
+    /// A best-of-N stage's candidates and choice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fan_out: Option<FanOutReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FanOutReport {
+    /// `auto`, or the judge stage's name.
+    pub judge: String,
+    pub candidates: Vec<CandidateReport>,
+    /// The chosen candidate, why, and whether its patch reached the workspace.
+    pub selected: Option<String>,
+    pub reason: Option<String>,
+    pub applied: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CandidateReport {
+    pub id: String,
+    pub harness: String,
+    pub model: String,
+    pub status: Status,
+    pub attempts: usize,
+    pub usage: UsageTotal,
+    /// Changed files and lines from the round's base.
+    pub files: Option<usize>,
+    pub added: Option<u64>,
+    pub removed: Option<u64>,
+    /// Whether every required router check passed in its worktree.
+    pub checks_pass: bool,
+    pub error: Option<String>,
+    pub worktree: Option<std::path::PathBuf>,
+    pub patch: Option<std::path::PathBuf>,
 }
 
 /// Sums of what attempts reported. A field stays None when no attempt
@@ -234,6 +267,54 @@ pub fn build(run: &Run) -> RunReport {
                 format!("verification not applicable: {}", waiver.reason),
             );
         }
+        let fan_out = state.fan_out.as_ref().map(|fan| {
+            let judge = stage.fan_out.as_ref().map_or_else(
+                || crate::config::AUTO_JUDGE.to_owned(),
+                |f| {
+                    run.workflow
+                        .stages
+                        .iter()
+                        .find(|s| s.id == f.judge && s.enabled)
+                        .map_or_else(|| crate::config::AUTO_JUDGE.to_owned(), |s| s.name.clone())
+                },
+            );
+            if let Some(selection) = fan.selection.as_ref().filter(|s| !s.applied) {
+                item(
+                    ItemKind::Error,
+                    format!("chosen candidate {} was not applied", selection.candidate),
+                );
+            }
+            FanOutReport {
+                judge,
+                candidates: fan
+                    .candidates
+                    .iter()
+                    .map(|c| CandidateReport {
+                        id: c.id.clone(),
+                        harness: c.harness.clone(),
+                        model: c.model.clone(),
+                        status: c.status,
+                        attempts: c.attempts.len(),
+                        usage: total(&c.attempts),
+                        files: c.changes.as_ref().map(|x| x.files.len()),
+                        added: c.changes.as_ref().map(|x| x.added),
+                        removed: c.changes.as_ref().map(|x| x.removed),
+                        checks_pass: c.checks_pass(),
+                        error: c.error.clone(),
+                        worktree: c.attempts.last().and_then(|a| a.worktree.clone()),
+                        patch: c.changes.as_ref().map(|x| x.patch.clone()),
+                    })
+                    .collect(),
+                selected: fan.selection.as_ref().map(|s| s.candidate.clone()),
+                reason: fan.selection.as_ref().map(|s| s.reason.clone()),
+                applied: fan.selection.as_ref().is_some_and(|s| s.applied),
+            }
+        });
+        let candidate_attempts = state
+            .fan_out
+            .iter()
+            .flat_map(|f| &f.candidates)
+            .flat_map(|c| &c.attempts);
         stages.push(StageReport {
             name: stage.name.clone(),
             role: stage.role,
@@ -243,9 +324,11 @@ pub fn build(run: &Run) -> RunReport {
             attempts: state.attempts.len(),
             retries: state.attempts.len().saturating_sub(1),
             active_seconds: state.attempts.iter().map(seconds).sum(),
-            usage: total(&state.attempts),
+            // Spend counts every candidate's.
+            usage: total(state.attempts.iter().chain(candidate_attempts)),
             checks,
             waiver: state.waiver.as_ref().map(|w| w.reason.clone()),
+            fan_out,
         });
     }
     // Stable, so each kind keeps stage order.
@@ -266,7 +349,15 @@ pub fn build(run: &Run) -> RunReport {
         retries: stages.iter().map(|s| s.retries).sum(),
         repair_passes: run.repair_passes,
         max_repair_passes: run.workflow.max_repair_passes,
-        usage: total(attempts()),
+        usage: total(
+            attempts().chain(
+                run.stages
+                    .iter()
+                    .flat_map(|s| &s.fan_out)
+                    .flat_map(|f| &f.candidates)
+                    .flat_map(|c| &c.attempts),
+            ),
+        ),
         stages,
         unresolved,
         reported_files,
@@ -627,8 +718,72 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
             );
         }
         text.push('\n');
+        if let Some(fan) = &stage.fan_out {
+            for line in fan_out_text(fan) {
+                let _ = writeln!(text, "    {line}");
+            }
+        }
     }
     text
+}
+
+/// A best-of-N stage's judge, choice, and candidates, one line each.
+pub fn fan_out_text(fan: &FanOutReport) -> Vec<String> {
+    let mut lines = vec![match &fan.selected {
+        Some(id) => format!(
+            "judge {}: {id} {}{}",
+            fan.judge,
+            if fan.applied {
+                "applied"
+            } else {
+                "not applied"
+            },
+            fan.reason
+                .as_deref()
+                .filter(|r| !r.is_empty())
+                .map(|r| format!(" ({})", r.lines().next().unwrap_or("")))
+                .unwrap_or_default()
+        ),
+        None => format!("judge {}: no choice yet", fan.judge),
+    }];
+    for candidate in &fan.candidates {
+        let mut line = format!(
+            "{} {} {} {} {}",
+            if fan.selected.as_ref() == Some(&candidate.id) {
+                "★"
+            } else {
+                "·"
+            },
+            candidate.id,
+            candidate.harness,
+            if candidate.model.is_empty() {
+                "default"
+            } else {
+                &candidate.model
+            },
+            candidate.status.label()
+        );
+        if let (Some(files), Some(added), Some(removed)) =
+            (candidate.files, candidate.added, candidate.removed)
+        {
+            let _ = write!(
+                line,
+                " · {} +{added} −{removed}",
+                count(files, "file", "files")
+            );
+            if !candidate.checks_pass {
+                line.push_str(" · checks failed");
+            }
+        }
+        if let Some(error) = &candidate.error {
+            let _ = write!(line, " · {}", clip(error.lines().next().unwrap_or(""), 80));
+        }
+        if let Some(tree) = &candidate.worktree {
+            let _ = write!(line, " · {}", tree.display());
+        }
+        lines.push(line);
+    }
+    lines
 }
 
 #[cfg(test)]

@@ -111,6 +111,9 @@ enum Commands {
         /// Allow one more review repair pass after the repair limit stopped the run.
         #[arg(long, conflicts_with_all = ["retry", "interactive", "model", "advance"])]
         allow_repair: bool,
+        /// Rerun one stopped fan-out candidate, keeping the others: STAGE/CANDIDATE.
+        #[arg(long, value_name = "STAGE/CANDIDATE", conflicts_with_all = ["retry", "interactive", "model", "advance", "allow_repair"])]
+        retry_candidate: Option<String>,
         /// Notify (bell/OSC, desktop, webhook per saved preferences) when the
         /// run needs input, stops, or completes. Also MODEL_ROUTER_NOTIFY=1.
         #[arg(long)]
@@ -618,9 +621,19 @@ fn main_result() -> Result<()> {
             model,
             advance,
             allow_repair,
+            retry_candidate,
             notify,
         }) => {
             let mut run = engine::load(&project, &id)?;
+            if let Some(target) = retry_candidate {
+                let (stage, candidate) = target
+                    .split_once('/')
+                    .context("Use --retry-candidate STAGE/CANDIDATE, e.g. implement/c2")?;
+                run.command(Cmd::RetryCandidate {
+                    stage: stage.into(),
+                    candidate: candidate.into(),
+                })?;
+            }
             if advance {
                 run.command(Cmd::Confirm)?;
             }

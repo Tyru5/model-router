@@ -229,6 +229,13 @@ fn auto_judge_applies_the_smallest_candidate_whose_checks_pass() {
             panic!("{report:?}");
         };
         assert!(files.iter().any(|f| f.path == "out.txt"));
+        let text = model_router::report::render(&model_router::report::build(&run), None);
+        assert!(
+            text.contains(&format!("judge auto: {winner} applied")),
+            "{text}"
+        );
+        assert!(text.contains(&format!("★ {winner} mock")), "{text}");
+        assert!(text.contains("· c3 mock fail failed"), "{text}");
         let records = transitions::read(&run.directory).unwrap();
         for id in ["c1", "c2", "c3"] {
             assert!(
@@ -431,6 +438,37 @@ fn a_crashed_candidate_fails_and_retries_alone() {
         2,
         "each round is a stage attempt"
     );
+}
+
+#[test]
+fn cleaning_a_run_removes_its_candidate_worktrees() {
+    let Some((dir, mut run)) = git_run(vec![fan_out(
+        &[("implement", "lines-1"), ("implement", "lines-2")],
+        "auto",
+    )]) else {
+        return;
+    };
+    assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+    let candidates = dir.path().join(".model-router/candidates").join(&run.id);
+    assert!(candidates.is_dir());
+    assert_eq!(git(dir.path(), &["worktree", "list"]).lines().count(), 3);
+    let criteria = model_router::history::Criteria {
+        ids: vec![run.id.clone()],
+        ..Default::default()
+    };
+    let plan = model_router::history::cleanup_plan(dir.path(), &criteria).unwrap();
+    assert!(
+        plan.text(false).contains(".model-router/candidates/"),
+        "{}",
+        plan.text(false)
+    );
+    let done = model_router::history::apply(&plan);
+    assert_eq!(done.items.len(), 1, "{}", done.text(true));
+    assert!(!candidates.exists());
+    assert_eq!(git(dir.path(), &["worktree", "list"]).lines().count(), 1);
+    assert!(git(dir.path(), &["for-each-ref", "refs/model-router/"]).is_empty());
+    // The applied change stays in the workspace.
+    assert_eq!(lines(&dir.path().join("out.txt")).len(), 1);
 }
 
 #[test]
