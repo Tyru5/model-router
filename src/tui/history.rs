@@ -789,6 +789,7 @@ mod tests {
             workflows: vec![Workflow {
                 name: "Test".into(),
                 max_repair_passes: 0,
+                max_parallel: 2,
                 stages: vec![Stage {
                     id: "research".into(),
                     name: "research".into(),

@@ -74,17 +74,27 @@ pub fn is_repository(dir: &Path) -> bool {
 /// The working tree as a Git tree ID. None outside Git or when Git fails; a
 /// snapshot never fails a run.
 pub fn tree(workspace: &Path, run_dir: &Path) -> Option<String> {
-    let index = std::path::absolute(run_dir.join("snapshot.index")).ok()?;
+    let run = run_dir.file_name().and_then(|name| name.to_str())?;
+    tree_with(workspace, &run_dir.join("snapshot.index"), run)
+}
+
+/// `tree` with its own private index, e.g. for a fan-out candidate's
+/// worktree; kept under run `run`'s refs.
+pub fn tree_with(workspace: &Path, index: &Path, run: &str) -> Option<String> {
+    let index = std::path::absolute(index).ok()?;
     let tree = capture(workspace, &index).ok().flatten()?;
-    if let Some(run) = run_dir.file_name().and_then(|name| name.to_str()) {
-        // Best effort: an unkept tree still serves until the next gc.
-        let _ = git(
-            workspace,
-            None,
-            &["update-ref", &format!("{}/{tree}", namespace(run)), &tree],
-        );
-    }
+    // Best effort: an unkept tree still serves until the next gc.
+    let _ = git(
+        workspace,
+        None,
+        &["update-ref", &format!("{}/{tree}", namespace(run)), &tree],
+    );
     Some(tree)
+}
+
+/// The ref keeping fan-out base commit `name` of run `run`.
+pub fn base_ref(run: &str, name: &str) -> String {
+    format!("{}/base/{name}", namespace(run))
 }
 
 fn namespace(run: &str) -> String {

@@ -354,9 +354,13 @@ pub fn render_transitions(run: &Run, records: &[Record]) -> String {
             .stage_index
             .and_then(|i| run.workflow.stages.get(i))
             .map_or_else(String::new, |s| s.name.clone());
+        let stage = match &record.candidate {
+            Some(candidate) => format!("{stage}/{candidate}"),
+            None => stage,
+        };
         let subject = match (record.level, record.attempt) {
             (Level::Run, _) => "run".to_owned(),
-            (Level::Stage, _) => stage,
+            (Level::Stage | Level::Candidate, _) => stage,
             (Level::Attempt, Some(number)) => format!("{stage} #{number}"),
             (Level::Attempt, None) => format!("{stage} #?"),
         };
@@ -698,6 +702,7 @@ pub(crate) mod tests {
         let workflow = Workflow {
             name: "Feature".into(),
             max_repair_passes: 2,
+            max_parallel: 2,
             stages: names
                 .iter()
                 .map(|(id, name)| Stage {

@@ -156,6 +156,7 @@ impl WorkflowPreset {
         Workflow {
             name: self.name.into(),
             max_repair_passes: 2,
+            max_parallel: 2,
             stages: self
                 .stages
                 .iter()
@@ -245,6 +246,7 @@ mod tests {
                 workflows: vec![Workflow {
                     name: "Preset".into(),
                     max_repair_passes: 0,
+                    max_parallel: 2,
                     stages: vec![preset.build()],
                 }],
                 ..Settings::default()

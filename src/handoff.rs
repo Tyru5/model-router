@@ -56,6 +56,9 @@ pub struct Handoff {
     pub not_applicable: Option<String>,
     #[serde(default = "yes")]
     pub structured: bool,
+    /// The fan-out candidate a judge stage chose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<String>,
 }
 fn yes() -> bool {
     true
@@ -155,6 +158,7 @@ pub fn parse(text: &str, role: Role) -> Result<Handoff> {
         unresolved: vec![],
         not_applicable: None,
         structured: false,
+        selected: None,
     })
 }
 

@@ -88,7 +88,85 @@ pub struct Stage {
     /// Commands the router runs after the harness succeeds, independent of its handoff.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<Check>,
+    /// Stage IDs this stage runs after. Set on any stage, the workflow is a
+    /// dependency graph instead of a list; see `graph`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
+    /// Best-of-N: candidates run in their own worktrees and a judge picks one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fan_out: Option<FanOut>,
 }
+
+/// `judge` value that picks the winner without a model.
+pub const AUTO_JUDGE: &str = "auto";
+
+/// Several harness/model candidates for one stage, each in its own Git
+/// worktree. The judge, `auto` or a review stage's ID, picks the one whose
+/// changes the router applies to the workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FanOut {
+    pub candidates: Vec<Candidate>,
+    #[serde(default = "auto_judge")]
+    pub judge: String,
+}
+fn auto_judge() -> String {
+    AUTO_JUDGE.into()
+}
+impl FanOut {
+    /// Each candidate's ID: its own, else `c1`, `c2`, … by position.
+    pub fn ids(&self) -> Vec<String> {
+        self.candidates
+            .iter()
+            .enumerate()
+            .map(|(index, c)| c.key(index))
+            .collect()
+    }
+    pub fn is_auto(&self) -> bool {
+        self.judge == AUTO_JUDGE
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Candidate {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    pub harness: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub provider: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub effort: String,
+}
+impl Candidate {
+    /// The ID at `index`: its own, else `c<index + 1>`.
+    pub fn key(&self, index: usize) -> String {
+        if self.id.is_empty() {
+            format!("c{}", index + 1)
+        } else {
+            self.id.clone()
+        }
+    }
+    /// `stage` as this candidate runs it: its harness, model, provider, and
+    /// effort. Harness-specific settings and arguments stay only when the
+    /// harness is the stage's own.
+    pub fn stage(&self, stage: &Stage) -> Stage {
+        let mut out = stage.clone();
+        if self.harness != stage.harness {
+            out.harness_settings.clear();
+            out.extra_args.clear();
+        }
+        out.harness = self.harness.clone();
+        out.model = self.model.clone();
+        out.provider = self.provider.clone();
+        out.effort = self.effort.clone();
+        out.fan_out = None;
+        out
+    }
+}
+
 impl Default for Stage {
     fn default() -> Self {
         Self {
@@ -107,6 +185,8 @@ impl Default for Stage {
             timeout_seconds: 3600,
             repair_target: String::new(),
             checks: vec![],
+            after: vec![],
+            fan_out: None,
         }
     }
 }
@@ -136,10 +216,16 @@ pub struct Workflow {
     pub name: String,
     #[serde(default = "two")]
     pub max_repair_passes: u32,
+    /// Harness processes a graph workflow or fan-out may run at once.
+    #[serde(default = "two", skip_serializing_if = "is_two")]
+    pub max_parallel: u32,
     pub stages: Vec<Stage>,
 }
 fn two() -> u32 {
     2
+}
+fn is_two(value: &u32) -> bool {
+    *value == 2
 }
 impl Workflow {
     /// Appends the review summary unless a stage already has the summary role.
@@ -172,7 +258,7 @@ impl Workflow {
 }
 impl Default for Workflow {
     fn default() -> Self {
-        Self { name: "Feature development".into(), max_repair_passes: 2, stages: vec![
+        Self { name: "Feature development".into(), max_repair_passes: 2, max_parallel: 2, stages: vec![
         Stage { id: "research".into(), name: "Investigate".into(), role: Role::Research, model: "gpt-6-astra".into(),
             instructions: "Investigate the task and relevant project files. Explain the root cause or requirements, cite evidence, and propose a concrete implementation plan. Do not change project code.".into(), ..Stage::default() },
         Stage { id: "implement".into(), name: "Implement".into(), role: Role::Implementation, harness: "claude".into(), model: "sonnet".into(), mode: Mode::Interactive,
@@ -302,7 +388,11 @@ pub fn unknown_fields(value: &toml::Value) -> Vec<String> {
     };
     let mut out = vec![];
     extra(value, &keys(&sample), "", &mut out);
-    let workflow = keys(&Workflow::default());
+    let workflow = keys(&Workflow {
+        // Saved only when not the default.
+        max_parallel: 3,
+        ..Workflow::default()
+    });
     for (index, item) in value
         .get("workflows")
         .and_then(toml::Value::as_array)
@@ -377,7 +467,18 @@ impl Settings {
                 "Workflow {} must contain 1–64 stages",
                 workflow.name
             );
+            ensure!(
+                (1..=16).contains(&workflow.max_parallel),
+                "Workflow {} max_parallel must be 1–16",
+                workflow.name
+            );
             let mut ids = HashSet::new();
+            for stage in &workflow.stages {
+                ensure!(ids.insert(&stage.id), "Duplicate stage ID {}", stage.id);
+            }
+            crate::graph::validate(workflow)
+                .with_context(|| format!("Workflow {}", workflow.name))?;
+            let order = crate::graph::order(workflow);
             for (index, stage) in workflow.stages.iter().enumerate() {
                 ensure!(
                     !stage.id.is_empty()
@@ -387,7 +488,6 @@ impl Settings {
                             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
                     "Stage IDs must contain only letters, digits, '-' and '_'"
                 );
-                ensure!(ids.insert(&stage.id), "Duplicate stage ID {}", stage.id);
                 ensure!(
                     !stage.name.trim().is_empty(),
                     "Stage {} needs a name",
@@ -442,17 +542,37 @@ impl Settings {
                         "Only reviews can set a repair target"
                     );
                     ensure!(
-                        workflow.stages[..index]
-                            .iter()
-                            .any(|s| s.id == stage.repair_target
+                        workflow.stages.iter().enumerate().any(|(i, s)| {
+                            order.precedes(i, index)
+                                && s.id == stage.repair_target
                                 && s.role == Role::Implementation
-                                && s.enabled),
+                                && s.enabled
+                        }),
                         "Review {} needs an enabled upstream implementation target",
                         stage.name
                     );
                 }
                 if stage.enabled {
                     crate::adapters::validate_options(stage, &self.providers)?;
+                }
+                for candidate in stage.fan_out.iter().flat_map(|f| &f.candidates) {
+                    ensure!(
+                        BUILTINS.contains(&candidate.harness.as_str())
+                            || self.adapters.contains_key(&candidate.harness),
+                        "Unknown harness {} in fan-out stage {}",
+                        candidate.harness,
+                        stage.id
+                    );
+                    ensure!(
+                        !candidate.model.contains('\0') && !candidate.provider.contains('\0'),
+                        "Model and provider cannot contain NUL"
+                    );
+                    if stage.enabled {
+                        crate::adapters::validate_options(
+                            &candidate.stage(stage),
+                            &self.providers,
+                        )?;
+                    }
                 }
             }
         }
@@ -735,6 +855,7 @@ checks = [
         let mut workflow = Workflow {
             name: "w".into(),
             max_repair_passes: 0,
+            max_parallel: 2,
             stages: vec![Stage {
                 id: "a".into(),
                 harness: "claude".into(),
@@ -775,6 +896,49 @@ checks = [
         let (settings, _) = load(dir.path(), Some(&path)).unwrap();
         assert_eq!(settings.workflows[0].stages.len(), 2);
         assert!(!settings.workflows[0].stages[1].enabled);
+    }
+
+    #[test]
+    fn graph_and_fan_out_fields_are_optional_and_saved_only_when_set() {
+        let plain = toml::to_string_pretty(&Settings::default()).unwrap();
+        for field in ["after", "fan_out", "max_parallel"] {
+            assert!(!plain.contains(field), "{field}: {plain}");
+        }
+        let text = CHECKS.replace(
+            "[[workflows.stages]]\nid = \"verify\"",
+            "max_parallel = 3\n[[workflows.stages]]\nid = \"build\"\nrole = \"implementation\"\nfan_out = { candidates = [{ harness = \"codex\" }, { harness = \"claude\", model = \"sonnet\", id = \"second\" }] }\n[[workflows.stages]]\nid = \"verify\"\nafter = [\"build\"]",
+        );
+        let settings = parse(&text).unwrap();
+        settings.validate().unwrap();
+        assert!(settings.warnings.is_empty(), "{:?}", settings.warnings);
+        let workflow = &settings.workflows[0];
+        assert_eq!(workflow.max_parallel, 3);
+        let fan = workflow.stages[0].fan_out.as_ref().unwrap();
+        assert!(fan.is_auto());
+        assert_eq!(fan.ids(), ["c1", "second"]);
+        assert_eq!(workflow.stages[1].after, ["build"]);
+        let saved = parse(&toml::to_string_pretty(&settings).unwrap()).unwrap();
+        assert_eq!(
+            saved.workflows[0].stages[0].fan_out,
+            workflow.stages[0].fan_out
+        );
+        let mut unknown = settings.clone();
+        unknown.workflows[0].stages[0]
+            .fan_out
+            .as_mut()
+            .unwrap()
+            .candidates[0]
+            .harness = "nope".into();
+        assert!(
+            unknown
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("Unknown harness nope")
+        );
+        let mut cycle = settings;
+        cycle.workflows[0].stages[0].after = vec!["verify".into()];
+        assert!(format!("{:#}", cycle.validate().unwrap_err()).contains("cycle"));
     }
 
     #[test]
