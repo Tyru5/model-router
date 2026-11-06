@@ -90,6 +90,10 @@ pub(super) enum ActionId {
     Help,
     Quit,
     Commands,
+    SessionRuns,
+    NextNeedsInput,
+    Notices,
+    Notifications,
     Interrupt,
 }
 
@@ -321,6 +325,12 @@ const ACTIONS: &[Entry] = {
             .footer_in(&[Workflow, MonitorRunning, Runs, Harnesses]),
         act(Commands, Global, ch(':'), "commands", "Command menu: search this view's actions")
             .footer_in(&[MonitorRunning, Runs, Harnesses]),
+        act(SessionRuns, Global, ch('L'), "session runs", "List this session's runs: status, stage, elapsed, needs input")
+            .more(&["[Enter] focuses; [n] jumps to the next needing input; [C] cancels a run's stage ([y] confirms)"]),
+        act(NextNeedsInput, Global, ch('N'), "needs input", "Jump to the next run of this session that needs input"),
+        act(Notices, Global, ch('!'), "notices", "Notice history: what this session's runs reported, newest first"),
+        act(Notifications, Global, key(KeyCode::F(9)), "notifications", "Notifications…: terminal, desktop, and webhook backends, with a test")
+            .more(&["Sent when a run needs input, stops blocked or failed, or completes (saved for all projects)"]),
         act(Interrupt, Global, ctrl('c'), "cancel/exit", "Cancel work, or exit (asks to save unsaved edits)"),
     ]
 };

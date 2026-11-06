@@ -26,6 +26,7 @@ mod input;
 mod modal;
 mod monitor;
 mod path_picker;
+mod session;
 mod startup;
 mod task_importer;
 #[cfg(test)]
@@ -140,6 +141,8 @@ pub fn run(
         Ok(preferences) => {
             app.theme = preferences.theme;
             app.vim_motions = preferences.vim_motions;
+            crate::notify::global().set_backends(preferences.notifications.clone());
+            app.notifications = preferences.notifications;
         }
         Err(error) => {
             app.message = format!("{error:#}. Using Model Router colours; T chooses a theme.");
@@ -191,6 +194,8 @@ pub fn run(
             Duration::from_secs(1)
         };
         if app.redraw || drawn.elapsed() >= tick {
+            // Notifications from worker threads wait for the frame.
+            let _terminal = crate::notify::terminal_lock();
             screen.terminal.draw(|frame| draw(frame, &mut app))?;
             app.redraw = false;
             drawn = Instant::now();
