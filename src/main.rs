@@ -161,6 +161,33 @@ enum Commands {
         #[arg(long)]
         sizes: bool,
     },
+    /// Outcomes per role, harness, and model across saved runs, ranked.
+    /// Suggestions only; never changes a workflow.
+    Stats {
+        /// Only this role: research, planning, implementation, review, test, summary, custom.
+        #[arg(long, value_parser = parse_role)]
+        role: Option<Role>,
+        #[arg(long)]
+        json: bool,
+        /// Include every recent project, not only this one.
+        #[arg(long)]
+        all_projects: bool,
+    },
+    /// Run tasks under a matrix of stage assignments, each unattended in its
+    /// own Git worktree, and summarize the outcomes.
+    Bench {
+        /// Bench file (TOML); see examples/bench.toml.
+        file: PathBuf,
+        /// Runs at a time.
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        jobs: usize,
+        /// Show the matrix without running anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Run the workflow's interactive stages unattended instead of refusing.
+        #[arg(long)]
+        allow_interactive: bool,
+    },
     /// List model/mode selections without sending an inference request.
     Models { harness: String },
     /// List router providers, or a provider's model IDs (one listing request).
@@ -310,6 +337,27 @@ fn main_result() -> Result<()> {
                 "An installed harness lacks a flag the router passes"
             );
         }
+        Some(Commands::Stats {
+            role,
+            json,
+            all_projects,
+        }) => stats_command(&project, role, json, all_projects)?,
+        Some(Commands::Bench {
+            file,
+            jobs,
+            dry_run,
+            allow_interactive,
+        }) => bench_command(
+            &project,
+            &settings,
+            &file,
+            &model_router::bench::Options {
+                jobs,
+                allow_interactive,
+            },
+            dry_run,
+            &cancel,
+        )?,
         Some(Commands::Models { harness }) => {
             let catalog = catalog::discover(&harness, &settings, &project)?;
             for model in catalog.models {
@@ -566,6 +614,66 @@ fn main_result() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn parse_role(text: &str) -> std::result::Result<Role, String> {
+    Role::ALL
+        .into_iter()
+        .find(|role| role.label() == text)
+        .ok_or_else(|| {
+            let names: Vec<_> = Role::ALL.iter().map(|r| r.label()).collect();
+            format!("expected one of {}", names.join(", "))
+        })
+}
+
+fn stats_command(project: &Path, role: Option<Role>, json: bool, all: bool) -> Result<()> {
+    use model_router::stats::{self, Stats};
+    let stats = Stats::collect(&stats::projects(project, all));
+    if json {
+        let mut value = serde_json::to_value(&stats)?;
+        if let Some(role) = role {
+            value["metrics"] = serde_json::to_value(
+                stats
+                    .metrics
+                    .iter()
+                    .filter(|m| m.role == role)
+                    .collect::<Vec<_>>(),
+            )?;
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        print!("{}", stats.table(role));
+    }
+    Ok(())
+}
+
+fn bench_command(
+    project: &Path,
+    settings: &Settings,
+    file: &Path,
+    options: &model_router::bench::Options,
+    dry_run: bool,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    use model_router::bench;
+    let plan = bench::Plan::new(file, &bench::load(file)?, settings, options)?;
+    print!("{}", plan.preview());
+    if dry_run {
+        println!("\nDry run: nothing started.");
+        return Ok(());
+    }
+    println!();
+    let results = bench::run(project, settings, &plan, options, cancel, &|line| {
+        eprintln!("{line}")
+    })?;
+    let (json, markdown) = bench::save(project, &results)?;
+    println!("{}", bench::markdown(&results));
+    println!("Saved {}\nSaved {}", json.display(), markdown.display());
+    ensure!(
+        !cancel.load(Ordering::Relaxed),
+        "Bench cancelled; unfinished cells are marked skipped"
+    );
     Ok(())
 }
 

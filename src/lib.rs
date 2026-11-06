@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod bench;
 pub mod catalog;
 pub mod checks;
 pub mod config;
@@ -13,6 +14,7 @@ pub mod process;
 pub mod providers;
 pub mod report;
 pub mod snapshot;
+pub mod stats;
 pub mod storage;
 pub mod task_import;
 pub mod tui;
