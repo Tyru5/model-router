@@ -207,6 +207,12 @@ enum Commands {
     },
     /// List model/mode selections without sending an inference request.
     Models { harness: String },
+    /// List built-in and custom harnesses, or print resolved specs as JSON.
+    Harnesses {
+        /// Print the resolved spec of NAME, or of every harness, as JSON.
+        #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
+        spec: Option<String>,
+    },
     /// List router providers, or a provider's model IDs (one listing request).
     Providers {
         /// Query this provider's OpenAI-compatible /models endpoint.
@@ -452,6 +458,7 @@ fn main_result() -> Result<()> {
             dry_run,
             &cancel,
         )?,
+        Some(Commands::Harnesses { spec }) => harnesses_command(&settings, spec.as_deref())?,
         Some(Commands::Models { harness }) => {
             let catalog = catalog::discover(&harness, &settings, &project)?;
             for model in catalog.models {
@@ -527,7 +534,7 @@ fn main_result() -> Result<()> {
                     provider.base_url
                 );
             }
-            println!("\n{}", providers::NOTE);
+            println!("\n{}", providers::note());
         }
         Some(Commands::History {
             status,
@@ -1122,5 +1129,62 @@ fn cli_interactive_events(events: &mpsc::Receiver<Event>) -> Result<()> {
         }
     }
     stdout.flush()?;
+    Ok(())
+}
+
+/// `harnesses`: a table, or with `--spec` the resolved specs as JSON.
+fn harnesses_command(settings: &Settings, spec: Option<&str>) -> Result<()> {
+    use model_router::{adapters, harness};
+    let names = catalog::known_harnesses(settings);
+    let resolved = |name: &str| -> Result<serde_json::Value> {
+        if let Some(spec) = harness::get(name) {
+            let mut value = serde_json::to_value(spec)?;
+            value["builtin"] = true.into();
+            value["program"] = adapters::program(name, &settings.adapters).into();
+            return Ok(value);
+        }
+        let adapter = settings
+            .adapters
+            .get(name)
+            .with_context(|| format!("Unknown harness {name}; see `model-router harnesses`"))?;
+        let mut value = serde_json::to_value(adapter)?;
+        value["name"] = name.into();
+        value["builtin"] = false.into();
+        value["output"] = adapters::output_kind(name, &settings.adapters)
+            .name()
+            .into();
+        value["resumable"] = adapters::resumable(name, &settings.adapters).into();
+        Ok(value)
+    };
+    match spec {
+        Some("") => {
+            let all = names
+                .iter()
+                .map(|name| resolved(name))
+                .collect::<Result<Vec<_>>>()?;
+            println!("{}", serde_json::to_string_pretty(&all)?);
+        }
+        Some(name) => println!("{}", serde_json::to_string_pretty(&resolved(name)?)?),
+        None => {
+            println!("HARNESS\tKIND\tPROGRAM\tOUTPUT\tRESUME");
+            for name in &names {
+                println!(
+                    "{name}\t{}\t{}\t{}\t{}",
+                    if harness::get(name).is_some() {
+                        "built-in"
+                    } else {
+                        "custom"
+                    },
+                    adapters::program(name, &settings.adapters),
+                    adapters::output_kind(name, &settings.adapters).name(),
+                    if adapters::resumable(name, &settings.adapters) {
+                        "yes"
+                    } else {
+                        "no"
+                    }
+                );
+            }
+        }
+    }
     Ok(())
 }

@@ -3,8 +3,8 @@
 use crate::{
     adapters::{self, ContextPaths, Invocation, OutputKind},
     catalog,
-    config::{BUILTINS, Mode, Settings, Stage},
-    harness_settings, process, storage,
+    config::{Mode, Settings, Stage},
+    process, storage,
 };
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -113,7 +113,7 @@ pub fn inspect(harness: &str, settings: &Settings, project: &Path) -> Report {
     let program = adapters::program(harness, &settings.adapters);
     let mut report = Report {
         harness: harness.into(),
-        builtin: BUILTINS.contains(&harness),
+        builtin: crate::harness::get(harness).is_some(),
         path: adapters::executable_at(&program, project),
         program,
         version: None,
@@ -313,7 +313,12 @@ struct FlagUse {
     modes: Vec<Mode>,
 }
 
-/// Builds sample invocations with the adapter itself, so checks follow its code.
+/// A router-defined provider for samples of harnesses that route them, so
+/// routed-only flags are probed too. Never contacted.
+const SAMPLE_ROUTED: &str = "model-router-sample";
+
+/// Builds sample invocations from the harness spec with the adapter itself,
+/// so probed flags follow the spec and cannot drift from what runs.
 fn flag_uses(harness: &str) -> Result<Vec<FlagUse>> {
     let temp = tempfile::tempdir()?;
     let prompt_file = temp.path().join("prompt.md");
@@ -324,13 +329,27 @@ fn flag_uses(harness: &str) -> Result<Vec<FlagUse>> {
         handoff_file: &prompt_file,
     };
     let mut uses: Vec<FlagUse> = vec![];
+    let routes = crate::harness::get(harness).is_some_and(|spec| spec.routing.injects());
+    let configured = BTreeMap::from([(
+        SAMPLE_ROUTED.to_owned(),
+        crate::providers::Provider {
+            base_url: "http://127.0.0.1:9/v1".into(),
+            ..Default::default()
+        },
+    )]);
+    // A hosted and a local provider reach both native provider code paths;
+    // a router provider reaches the routed one.
+    let providers: &[&str] = if routes {
+        &["openai", "ollama", SAMPLE_ROUTED]
+    } else {
+        &["openai", "ollama"]
+    };
     for mode in [Mode::Unattended, Mode::Interactive] {
-        // A hosted and a local provider reach both provider code paths.
-        for provider in ["openai", "ollama"] {
+        for provider in providers {
             let stage = sample(harness, mode, provider);
             let none = BTreeMap::new();
             let mut invocation =
-                adapters::build(&stage, &none, &BTreeMap::new(), SAMPLE_PROMPT, &paths)?;
+                adapters::build(&stage, &none, &configured, SAMPLE_PROMPT, &paths)?;
             adapters::assign_session(&mut invocation, harness);
             let mut invocations = vec![invocation];
             // Takeover reopens an unattended session in the interactive CLI.
@@ -338,7 +357,7 @@ fn flag_uses(harness: &str) -> Result<Vec<FlagUse>> {
                 invocations.push(adapters::resume(
                     &stage,
                     &none,
-                    &BTreeMap::new(),
+                    &configured,
                     "sample-session",
                     &paths,
                 )?);
@@ -366,18 +385,20 @@ fn flag_uses(harness: &str) -> Result<Vec<FlagUse>> {
     Ok(uses)
 }
 
+/// A stage that sets everything the spec says the mode accepts.
 fn sample(harness: &str, mode: Mode, provider: &str) -> Stage {
+    let spec = crate::harness::get(harness);
     let supported = |yes: bool, value: &str| if yes { value.into() } else { String::new() };
     // Interactive OpenCode 2.x has no variant option.
-    let effort = harness_settings::supports_effort(harness)
-        && !(harness == "opencode" && mode == Mode::Interactive);
+    let effort = spec.is_some_and(|s| s.accepts_effort(mode == Mode::Interactive));
     Stage {
         harness: harness.into(),
         mode,
         model: "sample-model".into(),
-        provider: supported(harness_settings::supports_provider(harness), provider),
+        provider: supported(spec.is_some_and(|s| s.supports_provider()), provider),
         effort: supported(effort, "high"),
-        harness_settings: harness_settings::settings(harness)
+        harness_settings: spec
+            .map_or(&[][..], |s| s.settings)
             .iter()
             .map(|s| (s.key.into(), s.choices[0].into()))
             .collect(),
@@ -437,6 +458,7 @@ fn probe(program: &str, args: &[String], cwd: &Path, timeout: Duration) -> Resul
         final_file: temp.path().join("unused"),
         env: vec![],
         files: vec![],
+        assign: None,
     };
     let outcome = process::capture(
         &invocation,
@@ -673,7 +695,7 @@ mod tests {
             find("amp", "--stream-json"),
             [("--help".to_owned(), vec![Mode::Unattended])]
         );
-        for harness in BUILTINS {
+        for harness in crate::config::BUILTINS {
             let uses = flag_uses(harness).unwrap();
             assert!(
                 uses.iter()
@@ -683,6 +705,20 @@ mod tests {
                 uses.iter()
                     .all(|u| u.flag.starts_with('-') && u.help.ends_with(&["--help".to_owned()]))
             );
+        }
+    }
+
+    #[test]
+    fn every_flag_a_spec_declares_is_probed() {
+        for spec in crate::harness::SPECS {
+            let uses = flag_uses(spec.name).unwrap();
+            for flag in spec.declared_flags() {
+                assert!(
+                    uses.iter().any(|u| u.flag == flag),
+                    "{}: {flag} is declared but never probed",
+                    spec.name
+                );
+            }
         }
     }
 
@@ -738,7 +774,7 @@ mod tests {
     fn manifest_names_builtins_and_custom_adapters_are_not_run() {
         let fixtures = manifest();
         assert!(!fixtures.is_empty(), "manifest must parse");
-        for harness in BUILTINS {
+        for harness in crate::config::BUILTINS {
             assert!(fixtures.iter().any(|f| f.harness == *harness), "{harness}");
         }
         let mut settings = Settings::default();

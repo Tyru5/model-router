@@ -7,10 +7,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const BUILTINS: &[&str] = &[
-    "codex", "claude", "pi", "omp", "cursor", "gemini", "opencode", "aider", "goose", "amp",
-    "copilot",
-];
+/// Built-in harness names, from the spec table (`harness::SPECS`).
+pub const BUILTINS: &[&str] = &crate::harness::NAMES;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -281,6 +279,167 @@ pub struct CustomAdapter {
     /// Optional arguments to list model IDs (one per line) using the same executable.
     pub models_args: Option<Vec<String>>,
     pub prompt_stdin: bool,
+    /// Output parser for unattended runs; plain text by default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<CustomOutput>,
+    /// How the router learns the session: `{ assign = "--session-id" }` or
+    /// `{ reported = true }` (read from `output` events).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<CustomSession>,
+    /// Interactive arguments that reopen `{session}`; enables takeover.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_args: Option<Vec<String>>,
+    /// `FLAG model`, after `args`, when the stage sets a model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_flag: Option<String>,
+    /// `FLAG effort`, after the model, when the stage sets an effort.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort_flag: Option<String>,
+    /// How the prompt is passed after the arguments: `"stdin"` (as
+    /// `prompt_stdin`), `"arg"`, or `{ flag = "-p" }`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<CustomPrompt>,
+}
+
+/// A custom adapter's output parser, named after the built-in formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CustomOutput {
+    #[serde(rename = "text")]
+    Text,
+    #[serde(rename = "codex-jsonl")]
+    CodexJsonl,
+    #[serde(rename = "claude-stream")]
+    ClaudeStream,
+    #[serde(rename = "pi")]
+    Pi,
+    #[serde(rename = "cursor-stream")]
+    CursorStream,
+    #[serde(rename = "gemini-json")]
+    GeminiJson,
+    #[serde(rename = "opencode")]
+    Opencode,
+    #[serde(rename = "amp-stream")]
+    AmpStream,
+}
+impl CustomOutput {
+    pub fn kind(self) -> crate::adapters::OutputKind {
+        use crate::adapters::OutputKind;
+        match self {
+            Self::Text => OutputKind::Text,
+            Self::CodexJsonl => OutputKind::Codex,
+            Self::ClaudeStream => OutputKind::Claude,
+            Self::Pi => OutputKind::Pi,
+            Self::CursorStream => OutputKind::Cursor,
+            Self::GeminiJson => OutputKind::Gemini,
+            Self::Opencode => OutputKind::OpenCode,
+            Self::AmpStream => OutputKind::Amp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CustomSession {
+    /// The router picks an ID and appends `FLAG id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assign: Option<String>,
+    /// The harness reports its session in its output events.
+    pub reported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CustomPrompt {
+    Mode(PromptMode),
+    Flag { flag: String },
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptMode {
+    Stdin,
+    Arg,
+}
+impl CustomAdapter {
+    /// Whether unattended runs send the prompt on standard input.
+    pub fn stdin_prompt(&self) -> bool {
+        self.prompt_stdin || self.prompt == Some(CustomPrompt::Mode(PromptMode::Stdin))
+    }
+    /// Arguments other than `command` that reach the executable, by field,
+    /// for trust digests. Old adapters add nothing beyond `args`.
+    pub fn launch_fields(&self) -> Vec<(&'static str, Vec<String>)> {
+        let mut fields = vec![];
+        if let Some(args) = &self.resume_args {
+            fields.push(("resume", args.clone()));
+        }
+        for (name, flag) in [
+            ("model flag", &self.model_flag),
+            ("effort flag", &self.effort_flag),
+        ] {
+            if let Some(flag) = flag {
+                fields.push((name, vec![flag.clone()]));
+            }
+        }
+        match &self.prompt {
+            Some(CustomPrompt::Flag { flag }) => fields.push(("prompt flag", vec![flag.clone()])),
+            Some(CustomPrompt::Mode(PromptMode::Arg)) => {
+                fields.push(("prompt", vec!["arg".into()]))
+            }
+            _ => {}
+        }
+        if let Some(flag) = self.session.as_ref().and_then(|s| s.assign.as_ref()) {
+            fields.push(("session flag", vec![flag.clone()]));
+        }
+        fields
+    }
+    fn validate(&self, name: &str) -> Result<()> {
+        ensure!(
+            !self.command.trim().is_empty(),
+            "Custom adapter {name} needs a command"
+        );
+        let flag = |value: &str| value.starts_with('-') && !value.contains(char::is_whitespace);
+        for (field, value) in [
+            ("model_flag", &self.model_flag),
+            ("effort_flag", &self.effort_flag),
+        ] {
+            if let Some(value) = value {
+                ensure!(
+                    flag(value),
+                    "Custom adapter {name} {field} must be a flag like --model"
+                );
+            }
+        }
+        if let Some(CustomPrompt::Flag { flag: value }) = &self.prompt {
+            ensure!(
+                flag(value),
+                "Custom adapter {name} prompt flag must be a flag like -p"
+            );
+        }
+        ensure!(
+            !self.prompt_stdin
+                || matches!(
+                    self.prompt,
+                    None | Some(CustomPrompt::Mode(PromptMode::Stdin))
+                ),
+            "Custom adapter {name} sets both prompt_stdin and another prompt"
+        );
+        if let Some(session) = &self.session {
+            ensure!(
+                session.assign.is_some() != session.reported,
+                "Custom adapter {name} session needs exactly one of assign or reported"
+            );
+            if let Some(value) = &session.assign {
+                ensure!(
+                    flag(value),
+                    "Custom adapter {name} session assign must be a flag like --session-id"
+                );
+            }
+        }
+        ensure!(
+            self.resume_args.is_none() || self.session.is_some(),
+            "Custom adapter {name} resume_args needs a session (assign or reported)"
+        );
+        Ok(())
+    }
 }
 
 /// The config format this binary writes. Older files migrate on load.
@@ -381,6 +540,12 @@ pub fn unknown_fields(value: &toml::Value) -> Vec<String> {
     let adapter = CustomAdapter {
         interactive_args: Some(vec![]),
         models_args: Some(vec![]),
+        output: Some(CustomOutput::Text),
+        session: Some(CustomSession::default()),
+        resume_args: Some(vec![]),
+        model_flag: Some(String::new()),
+        effort_flag: Some(String::new()),
+        prompt: Some(CustomPrompt::Mode(PromptMode::Arg)),
         ..CustomAdapter::default()
     };
     let provider = Provider {
@@ -560,10 +725,7 @@ impl Settings {
                 !BUILTINS.contains(&name.as_str()),
                 "Custom adapter cannot replace built-in {name}"
             );
-            ensure!(
-                !adapter.command.trim().is_empty(),
-                "Custom adapter {name} needs a command"
-            );
+            adapter.validate(name)?;
         }
         for (name, provider) in &self.providers {
             crate::providers::validate(name, provider)?;

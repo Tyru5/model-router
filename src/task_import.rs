@@ -528,6 +528,7 @@ fn github(host: &str, endpoint: &str, query: &str, cancel: &AtomicBool) -> Resul
         final_file: temp.path().join("unused"),
         env: vec![],
         files: vec![],
+        assign: None,
     };
     let mut received = 0;
     let mut oversized = false;

@@ -180,12 +180,20 @@ fn details(harness: &str, report: Option<&Report>) -> String {
     text.push_str(&format!(
         "\n{}\n\nSelect this harness with [h] on the workflow page, then press [m] to load model selections. Use [c] on Workflow to configure the selected stage, including permissions and extra arguments.\n\nPermissions inherit the harness configuration unless overridden for a stage.\n\n{}\n\nCustom adapters are defined in TOML. See README.md for the template contract.",
         doctor::AUTH_NOTE,
-        if harness == "amp" {
-            "Amp uses mode keys. A mode determines its model and tools."
-        } else {
-            "A model must be supported by the selected harness/provider."
+        match crate::harness::get(harness) {
+            Some(spec) if matches!(spec.model, crate::harness::ModelPass::Mode(_)) => format!(
+                "{} uses mode keys. A mode determines its model and tools.",
+                spec.display
+            ),
+            _ => "A model must be supported by the selected harness/provider.".into(),
         }
     ));
+    if let Some(spec) = crate::harness::get(harness) {
+        text.push_str(&format!(
+            "\n{}: {} `model-router harnesses --spec {harness}` prints its full spec.\n",
+            spec.display, spec.notes
+        ));
+    }
     text
 }
 

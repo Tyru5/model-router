@@ -2,180 +2,18 @@
 use crate::config::Stage;
 use anyhow::{Context, Result, ensure};
 
-pub struct Setting {
-    pub key: &'static str,
-    pub label: &'static str,
-    pub choices: &'static [&'static str],
-    pub help: &'static str,
-    flag: &'static str,
-    config_key: Option<&'static str>,
-    conflicts: &'static [&'static str],
-    /// Choices that loosen the harness's own approvals or sandbox. A project
-    /// config needs trust to set them (see `trust`).
-    escalating: &'static [&'static str],
-    emit: Emit,
-}
+use crate::harness::Emit;
+pub use crate::harness::Setting;
 
-/// How a chosen value reaches the harness.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Emit {
-    /// `flag value`, or `--config key="value"` for Codex config keys.
-    Value,
-    /// The flag alone; the setting has one non-default choice.
-    Switch,
-    /// An environment variable named by `flag`.
-    Env,
-}
-
-const CODEX: &[Setting] = &[
-    Setting {
-        key: "sandbox",
-        label: "Sandbox",
-        choices: &["read-only", "workspace-write", "danger-full-access"],
-        help: "read-only: inspect files. workspace-write: allow changes in the workspace. danger-full-access: run without sandbox restrictions.",
-        flag: "--sandbox",
-        config_key: Some("sandbox_mode"),
-        conflicts: &[
-            "-s",
-            "--full-auto",
-            "--approve-for-me",
-            "--dangerously-bypass-approvals-and-sandbox",
-        ],
-        escalating: &["danger-full-access"],
-        emit: Emit::Value,
-    },
-    Setting {
-        key: "approval_policy",
-        label: "Approval policy",
-        choices: &["on-request", "never"],
-        help: "on-request: the harness can request approval. never: no approval prompts; commands blocked by the sandbox stay blocked. Unattended runs cannot answer prompts.",
-        flag: "--config",
-        config_key: Some("approval_policy"),
-        conflicts: &[
-            "-a",
-            "--ask-for-approval",
-            "--full-auto",
-            "--approve-for-me",
-            "--dangerously-bypass-approvals-and-sandbox",
-        ],
-        escalating: &[],
-        emit: Emit::Value,
-    },
-];
-// Choices checked against `claude --help` 2.1.318 on 2026-11-05: acceptEdits,
-// auto, bypassPermissions, manual, dontAsk, plan. Older releases called
-// `manual` `default`.
-const CLAUDE: &[Setting] = &[Setting {
-    key: "permission_mode",
-    label: "Permission mode",
-    choices: &[
-        "manual",
-        "acceptEdits",
-        "plan",
-        "dontAsk",
-        "auto",
-        "bypassPermissions",
-    ],
-    help: "manual: ask for permissions. acceptEdits: approve file edits. plan: planning only. dontAsk: deny unapproved tools. auto: native automatic review. bypassPermissions: skip checks. Modes depend on your Claude version and account.",
-    flag: "--permission-mode",
-    config_key: None,
-    conflicts: &["--dangerously-skip-permissions"],
-    escalating: &["bypassPermissions"],
-    emit: Emit::Value,
-}];
-const CURSOR: &[Setting] = &[Setting {
-    key: "sandbox",
-    label: "Sandbox",
-    choices: &["enabled", "disabled"],
-    help: "Explicitly enable or disable Cursor's sandbox for this stage. Additional tool permissions can be supplied in Extra arguments.",
-    flag: "--sandbox",
-    config_key: None,
-    conflicts: &[],
-    escalating: &["disabled"],
-    emit: Emit::Value,
-}];
-const GEMINI: &[Setting] = &[Setting {
-    key: "approval_mode",
-    label: "Approval mode",
-    choices: &["default", "auto_edit", "plan", "yolo"],
-    help: "default: prompt for tool approval. auto_edit: approve edits. plan: planning mode. yolo: approve all actions. Unattended runs cannot answer prompts.",
-    flag: "--approval-mode",
-    config_key: None,
-    conflicts: &["--yolo", "-y"],
-    escalating: &["yolo"],
-    emit: Emit::Value,
-}];
-
-const OMP: &[Setting] = &[Setting {
-    key: "approval_mode",
-    label: "Approval mode",
-    choices: &["always-ask", "write", "yolo"],
-    help: "always-ask: prompt before tools run. write: approve edits automatically. yolo: approve all tool calls. Unattended runs cannot answer prompts.",
-    flag: "--approval-mode",
-    config_key: None,
-    conflicts: &["--auto-approve"],
-    escalating: &["yolo"],
-    emit: Emit::Value,
-}];
-
-/// Unattended Aider cannot answer its confirmation prompts without this.
-const AIDER: &[Setting] = &[Setting {
-    key: "confirmations",
-    label: "Confirmations",
-    choices: &["yes-always"],
-    help: "yes-always: answer yes to Aider's confirmation prompts (adding files, creating files). Aider still asks before running shell commands. Unattended runs cannot answer prompts.",
-    flag: "--yes-always",
-    config_key: None,
-    conflicts: &["--yes"],
-    escalating: &["yes-always"],
-    emit: Emit::Switch,
-}];
-
-/// Goose reads its permission mode from GOOSE_MODE; `run` has no flag.
-const GOOSE: &[Setting] = &[Setting {
-    key: "mode",
-    label: "Permission mode",
-    choices: &["approve", "smart_approve", "chat", "auto"],
-    help: "approve: ask before every tool. smart_approve: ask only for risky tools. chat: no tools. auto: run tools without asking. Set as GOOSE_MODE. Unattended runs cannot answer prompts.",
-    flag: "GOOSE_MODE",
-    config_key: None,
-    conflicts: &[],
-    escalating: &["auto"],
-    emit: Emit::Env,
-}];
-
-const COPILOT: &[Setting] = &[Setting {
-    key: "tool_permissions",
-    label: "Tool permissions",
-    choices: &["allow-all-tools"],
-    help: "allow-all-tools: let Copilot run every tool without asking, as programmatic mode requires for tool use. Use Extra arguments for --allow-tool/--deny-tool rules.",
-    flag: "--allow-all-tools",
-    config_key: None,
-    conflicts: &["--allow-all", "--yolo"],
-    escalating: &["allow-all-tools"],
-    emit: Emit::Switch,
-}];
-
+/// The harness's native settings, from its spec; none for custom adapters.
 pub fn settings(harness: &str) -> &'static [Setting] {
-    match harness {
-        "codex" => CODEX,
-        "omp" => OMP,
-        "claude" => CLAUDE,
-        "cursor" => CURSOR,
-        "gemini" => GEMINI,
-        "aider" => AIDER,
-        "goose" => GOOSE,
-        "copilot" => COPILOT,
-        _ => &[],
-    }
+    crate::harness::get(harness).map_or(&[], |spec| spec.settings)
 }
 
-/// Harnesses that only use their own account: no provider field and no
-/// router-defined provider.
-pub const OWN_ACCOUNT_ONLY: &[&str] = &["claude", "cursor", "gemini", "amp", "copilot"];
-
+/// Whether a stage can set a provider: not for harnesses that only use their
+/// own account. Custom adapters can.
 pub fn supports_provider(harness: &str) -> bool {
-    !OWN_ACCOUNT_ONLY.contains(&harness)
+    crate::harness::get(harness).is_none_or(|spec| spec.supports_provider())
 }
 
 /// `(key, value)` settings of `stage` that loosen the harness's own checks.
@@ -192,11 +30,9 @@ pub fn escalations(stage: &Stage) -> Vec<(&str, &str)> {
         .collect()
 }
 
+/// Whether the harness has a portable effort option. Custom adapters do.
 pub fn supports_effort(harness: &str) -> bool {
-    !matches!(
-        harness,
-        "cursor" | "gemini" | "aider" | "goose" | "amp" | "copilot"
-    )
+    crate::harness::get(harness).is_none_or(|spec| spec.supports_effort())
 }
 
 fn matches_flag(argument: &str, flag: &str) -> bool {

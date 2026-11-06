@@ -1473,6 +1473,7 @@ mod tests {
             final_file: dir.path().join("unused"),
             env: vec![],
             files: vec![],
+            assign: None,
         };
         let session = InteractiveSession::new(80, 24);
         let cancel = AtomicBool::new(false);

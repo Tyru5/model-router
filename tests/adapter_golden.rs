@@ -358,6 +358,7 @@ fn adapter_output_matches_golden_files() {
                 interactive_args: Some(vec!["chat".into(), "{prompt}".into()]),
                 models_args: Some(vec!["models".into()]),
                 prompt_stdin: true,
+                ..CustomAdapter::default()
             },
         ),
         (

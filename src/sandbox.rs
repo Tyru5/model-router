@@ -281,14 +281,7 @@ pub fn harness_dirs(harness: &str) -> Vec<String> {
         ".cache".into(),
         ".local/state".into(),
     ];
-    let extra: &[&str] = match harness {
-        "claude" => &[".claude.json", ".claude.json.backup"],
-        "cursor" => &[".cursor", ".config/cursor"],
-        "copilot" => &[".copilot", ".config/github-copilot"],
-        "amp" => &[".amp", ".config/amp", ".local/share/amp"],
-        "aider" => &[".aider"],
-        _ => &[],
-    };
+    let extra = crate::harness::get(harness).map_or(&[][..], |spec| spec.state_dirs);
     dirs.extend(extra.iter().map(|d| (*d).to_owned()));
     dirs
 }

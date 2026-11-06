@@ -105,6 +105,11 @@ pub fn dangerous(settings: &Settings) -> Vec<String> {
         if let Some(args) = &adapter.models_args {
             line.push_str(&format!("; models: {}", quoted(args)));
         }
+        // Newer fields that reach the executable; absent ones add nothing,
+        // so older adapters keep their digest.
+        for (field, args) in adapter.launch_fields() {
+            line.push_str(&format!("; {field}: {}", quoted(&args)));
+        }
         items.push(line);
     }
     for workflow in &settings.workflows {
@@ -303,12 +308,15 @@ pub fn ignore(settings: &mut Settings) {
     let mut ignored = Ignored::default();
     for (name, adapter) in &mut settings.adapters {
         ignored.adapters.insert(name.clone(), adapter.clone());
+        // Only the shape stays (which modes exist, how output and sessions
+        // work); the blocked command never runs.
         *adapter = CustomAdapter {
             command: BLOCKED_COMMAND.into(),
-            args: vec![],
             interactive_args: adapter.interactive_args.as_ref().map(|_| vec![]),
-            models_args: None,
-            prompt_stdin: false,
+            resume_args: adapter.resume_args.as_ref().map(|_| vec![]),
+            output: adapter.output,
+            session: adapter.session.clone(),
+            ..CustomAdapter::default()
         };
     }
     let names: Vec<String> = settings
