@@ -1,9 +1,10 @@
 use super::{
     actions::ActionId,
-    app::{App, Job, Page, draw},
+    app::{App, Page, draw},
     modal::{Ask, Loading, Modal, PickValue},
     path_picker::PathPicker,
     run_slot::Worker,
+    tasks::Msg,
     theme::{self, Theme},
     widgets::textarea,
     workflow_page::StageEditor,
@@ -241,9 +242,12 @@ fn vim_motions_reach_harness_path_import_and_filter_inputs() {
             Stage::default(),
             Default::default(),
         ))),
-        Modal::Repositories(Box::new(PathPicker::new(project.path(), vec![]).unwrap())),
+        Modal::Repositories(Box::new(
+            PathPicker::new(project.path(), vec![], app.tasks.spawner()).unwrap(),
+        )),
         Modal::Import(Box::new(
-            super::task_importer::TaskImporter::new(project.path(), "").unwrap(),
+            super::task_importer::TaskImporter::new(project.path(), "", app.tasks.spawner())
+                .unwrap(),
         )),
         Modal::Picker {
             title: "Picker".into(),
@@ -498,7 +502,7 @@ fn renders_starter_at_common_sizes() {
             assert!(text.contains("MODEL ROUTER"));
         }
         app.ui.open(Modal::Repositories(Box::new(
-            PathPicker::new(&app.project, vec![]).unwrap(),
+            PathPicker::new(&app.project, vec![], app.tasks.spawner()).unwrap(),
         )));
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         if width >= 65 {
@@ -643,7 +647,7 @@ fn stage_editor_model_field_picks_from_catalog_and_keeps_draft() {
     app.key(key(Key::Enter)).unwrap();
     let (sender, receiver) = mpsc::channel();
     sender.send(Err("Offline catalog".into())).unwrap();
-    app.catalog = Some((waiting(&app), app.editor.stage().harness.clone(), receiver));
+    deliver(&mut app, receiver);
     app.poll().unwrap();
     assert!(matches!(app.ui.dialog(), Some(Modal::Stage { .. })));
     assert!(app.ui.alert.contains("Offline catalog"));
@@ -665,7 +669,7 @@ fn stage_editor_model_field_picks_from_catalog_and_keeps_draft() {
             ..Catalog::default()
         }))
         .unwrap();
-    app.catalog = Some((waiting(&app), app.editor.stage().harness.clone(), receiver));
+    deliver(&mut app, receiver);
     app.poll().unwrap();
     assert!(
         matches!(app.ui.dialog(), Some(Modal::Picker { title, .. }) if title.starts_with("codex "))
@@ -699,7 +703,7 @@ fn stage_editor_model_field_picks_from_catalog_and_keeps_draft() {
 fn repository_line_follows_the_project() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    assert!(app.repo.is_none());
+    assert!(app.repo.info.is_none());
     let repo = project.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
     for args in [
@@ -720,7 +724,7 @@ fn repository_line_follows_the_project() {
     }
     std::fs::write(repo.join("new.txt"), "x").unwrap();
     app.switch_project(repo.clone()).unwrap();
-    let info = app.repo.clone().unwrap();
+    let info = app.repo.info.clone().unwrap();
     assert_eq!(info.name, "repo");
     assert_eq!(info.head, "trunk");
     assert!(!info.detached);
@@ -770,7 +774,7 @@ fn harness_model_catalog_restores_draft_on_cancel_error_and_selection() {
     app.key(key(Key::F(7))).unwrap();
     let (sender, receiver) = mpsc::channel();
     sender.send(Err("Offline catalog".into())).unwrap();
-    app.catalog = Some((waiting(&app), app.editor.stage().harness.clone(), receiver));
+    deliver(&mut app, receiver);
     app.poll().unwrap();
     assert!(
         matches!(app.ui.dialog(), Some(Modal::Harness(e)) if e.error.contains("Offline catalog") && e.finish().unwrap().model == "draft-model")
@@ -792,7 +796,7 @@ fn harness_model_catalog_restores_draft_on_cancel_error_and_selection() {
             ..Catalog::default()
         }))
         .unwrap();
-    app.catalog = Some((waiting(&app), app.editor.stage().harness.clone(), receiver));
+    deliver(&mut app, receiver);
     app.poll().unwrap();
     app.key(key(Key::Enter)).unwrap();
     assert!(
@@ -836,6 +840,16 @@ fn menu(app: &mut App) -> Vec<ActionId> {
             _ => panic!("The command menu lists a non-action"),
         })
         .collect()
+}
+
+/// Hands the picker waiting on top the catalog `receiver` holds, as its read would.
+fn deliver(app: &mut App, receiver: mpsc::Receiver<Result<Catalog, String>>) {
+    let msg = Msg::Catalog {
+        harness: app.editor.stage().harness.clone(),
+        ticket: Some(waiting(app)),
+        result: receiver.recv().unwrap(),
+    };
+    app.update(app.tasks.generation(), msg);
 }
 
 /// The ticket of the Loading dialog on top.
@@ -967,7 +981,7 @@ fn effort_levels_come_from_the_harness_catalog_in_both_editors() {
         ..Model::default()
     };
     listed.label = listed.id.clone();
-    app.catalogs.insert(
+    app.catalogs.cached.insert(
         harness.clone(),
         Catalog {
             models: vec![listed],
@@ -1035,7 +1049,9 @@ fn effort_levels_come_from_the_harness_catalog_in_both_editors() {
         _ => panic!("stage editor expected"),
     };
     assert_ne!(changed, harness);
-    app.catalogs.insert(changed.clone(), Catalog::default());
+    app.catalogs
+        .cached
+        .insert(changed.clone(), Catalog::default());
     app.request_catalog(changed);
     for _ in 0..3 {
         app.key(key(Key::Tab)).unwrap();
@@ -1114,7 +1130,7 @@ fn a_busy_checkout_sends_the_next_run_to_a_worktree() {
         .status()
         .unwrap();
     assert!(init.success());
-    app.repo = crate::storage::repo_info(project.path());
+    app.repo.info = crate::storage::repo_info(project.path());
     assert_eq!(
         app.placement(false).unwrap(),
         (Placement::WorktreeFromHead, Some("run busy".into()))
@@ -1220,7 +1236,7 @@ fn modified_keys_do_not_trigger_page_actions() {
         app.key(KeyEvent::new(Key::Char(c), Mods::ALT)).unwrap();
     }
     assert_eq!(app.editor.settings.workflows[0].stages.len(), stages);
-    assert!(app.ui.dialog().is_none() && app.starting.is_none() && !app.editor.dirty);
+    assert!(app.ui.dialog().is_none() && !app.starting && !app.editor.dirty);
     // Ctrl+C still interrupts: with nothing running and nothing unsaved, it exits.
     assert!(app.key(ctrl('c')).unwrap());
 }
@@ -1310,30 +1326,40 @@ fn switching_project_drops_catalogs_and_results_for_the_old_one() {
     let project = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    let (old_sender, receiver) = mpsc::channel();
-    app.prefetch = Some(("codex".into(), Job::from_receiver(app.generation, receiver)));
-    app.prefetch_queue.push_back("claude".into());
-    app.catalogs.insert("pi".into(), Catalog::default());
-    let old = app.generation;
+    app.catalogs.reading = Some("codex".into());
+    app.catalogs.queue.push_back("claude".into());
+    app.catalogs.cached.insert("pi".into(), Catalog::default());
+    let old = app.tasks.generation();
     app.switch_project(other.path().into()).unwrap();
-    assert_ne!(app.generation, old);
-    assert!(app.catalogs.is_empty() && app.prefetch.is_none() && app.prefetch_queue.is_empty());
-    assert!(old_sender.send(Ok(Catalog::default())).is_err());
-    // A result tagged with the old project is dropped, even if its job survived.
-    let (sender, receiver) = mpsc::channel();
-    app.prefetch = Some(("codex".into(), Job::from_receiver(old, receiver)));
-    sender.send(Ok(Catalog::default())).unwrap();
-    let (runs, receiver) = mpsc::channel();
-    app.runs.job = Some(Job::from_receiver(old, receiver));
-    runs.send(Ok(crate::history::list(project.path()).unwrap()))
-        .unwrap();
-    app.poll().unwrap();
-    assert!(!app.catalogs.contains_key("codex"));
-    assert!(app.prefetch.is_none() && app.runs.job.is_none());
+    assert_ne!(app.tasks.generation(), old);
+    assert!(
+        app.catalogs.cached.is_empty()
+            && app.catalogs.reading.is_none()
+            && app.catalogs.queue.is_empty()
+    );
+    // Results tagged with the old project are dropped when they arrive.
+    app.update(
+        old,
+        Msg::Catalog {
+            harness: "codex".into(),
+            ticket: None,
+            result: Ok(Catalog::default()),
+        },
+    );
+    app.runs.loading = true;
+    app.update(
+        old,
+        Msg::Runs(Ok(crate::history::list(project.path()).unwrap())),
+    );
+    assert!(!app.catalogs.cached.contains_key("codex"));
+    assert!(
+        app.runs.loading,
+        "a stale result leaves the current read pending"
+    );
 
     // From the browser, the project opens in the background; a bad path
     // returns to the browser with the error.
-    let picker = Box::new(PathPicker::new(project.path(), vec![]).unwrap());
+    let picker = Box::new(PathPicker::new(project.path(), vec![], app.tasks.spawner()).unwrap());
     app.ui.open(Modal::Repositories(picker));
     app.begin_switch(project.path().join("missing"));
     assert!(matches!(app.ui.dialog(), Some(Modal::Loading(_))));
@@ -1346,7 +1372,7 @@ fn switching_project_drops_catalogs_and_results_for_the_old_one() {
     assert!(
         matches!(app.ui.dialog(), Some(Modal::Repositories(p)) if p.error.contains("not found"))
     );
-    let picker = Box::new(PathPicker::new(project.path(), vec![]).unwrap());
+    let picker = Box::new(PathPicker::new(project.path(), vec![], app.tasks.spawner()).unwrap());
     app.ui.dialogs.clear();
     app.ui.open(Modal::Repositories(picker));
     app.begin_switch(project.path().into());
@@ -1362,7 +1388,7 @@ fn esc_while_opening_a_project_returns_to_the_browser_and_drops_the_result() {
     let project = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    let picker = Box::new(PathPicker::new(project.path(), vec![]).unwrap());
+    let picker = Box::new(PathPicker::new(project.path(), vec![], app.tasks.spawner()).unwrap());
     app.ui.open(Modal::Repositories(picker));
     app.begin_switch(other.path().into());
     assert!(matches!(
@@ -1376,11 +1402,11 @@ fn esc_while_opening_a_project_returns_to_the_browser_and_drops_the_result() {
     ));
     // The read finishes after the wait was closed: nothing changes.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while app.project_job_pending() && std::time::Instant::now() < deadline {
+    while app.tasks.busy() && std::time::Instant::now() < deadline {
         app.poll().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(!app.project_job_pending());
+    assert!(!app.tasks.busy());
     assert_eq!(app.project, project.path());
     assert!(matches!(
         app.ui.dialogs.as_slice(),

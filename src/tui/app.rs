@@ -4,16 +4,18 @@ use super::{
     harnesses::{HarnessesPage, draw_harnesses},
     history::{RunsPage, draw_history},
     modal::{Ask, Choice, InputTarget, Loading, Modal, PickValue, draw_modal},
+    models::Catalogs,
     monitor::draw_run,
     run_slot::{RunSlot, Worker},
     session::{Session, draw_session_runs, notice_text},
+    tasks::{Msg, Tasks},
     theme::{self, Palette, Theme},
     ui::Ui,
     widgets::{dim, rows_for, short_path, textarea},
     workflow_page::draw_workflow,
 };
 use crate::{
-    catalog::{self, Catalog},
+    catalog,
     config::{self, Settings},
     engine::{self, Action, Placement, Run, Status},
     process, storage,
@@ -28,14 +30,11 @@ use ratatui::{
     widgets::{Block, Paragraph, Wrap},
 };
 use std::{
-    collections::{BTreeMap, VecDeque},
     path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver},
     },
-    thread,
     time::{Duration, Instant},
 };
 
@@ -53,67 +52,33 @@ pub(super) struct App {
     pub(super) signal: Arc<AtomicBool>,
     /// Saved-run stats behind the stage hint and the Stats dialog.
     pub(super) route_stats: super::stats_page::StatsCache,
-    /// A catalog being read for the model picker: the ticket of its Loading
-    /// dialog, and the harness.
-    pub(super) catalog: Option<(u64, String, CatalogRead)>,
-    /// Catalogs read so far, by harness; they supply effort levels to editors.
-    pub(super) catalogs: BTreeMap<String, Catalog>,
-    /// A catalog being read for an editor, without a picker.
-    pub(super) prefetch: Option<(String, Job<std::result::Result<Catalog, String>>)>,
-    pub(super) prefetch_queue: VecDeque<String>,
-    /// Git facts for the project, refreshed in the background.
-    pub(super) repo: Option<storage::RepoInfo>,
-    repo_job: Option<Job<Option<storage::RepoInfo>>>,
-    /// When the Git facts were last read; None reads them on the next poll.
-    repo_checked: Option<Instant>,
-    /// Counts project switches; background results for an earlier project are dropped.
-    pub(super) generation: u64,
-    /// A run being created (worktree, snapshot) before it starts.
-    pub(super) starting: Option<Job<std::result::Result<Started, String>>>,
-    /// A project being opened, with the ticket of its Loading dialog.
-    project_job: Option<(u64, ProjectJob)>,
+    /// Harness model catalogs, for pickers and editors.
+    pub(super) catalogs: Catalogs,
+    /// Git facts for the header.
+    pub(super) repo: Repo,
+    /// A run is being created (worktree, snapshot) before it starts.
+    pub(super) starting: bool,
+    /// Background work and the channel its results arrive on.
+    pub(super) tasks: Tasks,
 }
 
-/// Work on a background thread, tagged with the project generation it serves.
-pub(super) struct Job<T> {
-    generation: u64,
-    receiver: Receiver<T>,
+/// Git facts for the project, refreshed in the background.
+pub(super) struct Repo {
+    pub(super) info: Option<storage::RepoInfo>,
+    /// When the facts were last read; None reads them on the next poll.
+    pub(super) checked: Option<Instant>,
+    pub(super) reading: bool,
 }
-pub(super) enum Got<T> {
-    Pending,
-    Ready(T),
-    /// The thread ended without a result.
-    Lost,
-}
-impl<T: Send + 'static> Job<T> {
-    pub(super) fn spawn(generation: u64, work: impl FnOnce() -> T + Send + 'static) -> Self {
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let _ = sender.send(work());
-        });
+impl Repo {
+    fn new(info: Option<storage::RepoInfo>) -> Self {
         Self {
-            generation,
-            receiver,
-        }
-    }
-    #[cfg(test)]
-    pub(super) fn from_receiver(generation: u64, receiver: Receiver<T>) -> Self {
-        Self {
-            generation,
-            receiver,
-        }
-    }
-    fn get(&self) -> Got<T> {
-        match self.receiver.try_recv() {
-            Ok(value) => Got::Ready(value),
-            Err(mpsc::TryRecvError::Empty) => Got::Pending,
-            Err(mpsc::TryRecvError::Disconnected) => Got::Lost,
+            info,
+            checked: Some(Instant::now()),
+            reading: false,
         }
     }
 }
 
-type ProjectJob = Job<std::result::Result<Opened, String>>;
-pub(super) type CatalogRead = Receiver<std::result::Result<Catalog, String>>;
 /// A created run, ready for its driver.
 pub(super) struct Started {
     run: Run,
@@ -139,9 +104,6 @@ impl App {
     pub(super) fn slot_mut(&mut self) -> &mut RunSlot {
         self.session.focused_mut().expect("a focused run")
     }
-    pub(super) fn project_job_pending(&self) -> bool {
-        self.project_job.is_some()
-    }
 }
 /// How often the header re-reads Git status, and Runs re-reads active runs.
 const REPO_EVERY: Duration = Duration::from_secs(5);
@@ -163,16 +125,10 @@ impl App {
             ui: Ui::default(),
             signal: cancel,
             route_stats: Default::default(),
-            catalog: None,
-            catalogs: BTreeMap::new(),
-            prefetch: None,
-            prefetch_queue: VecDeque::new(),
-            repo,
-            repo_job: None,
-            repo_checked: Some(Instant::now()),
-            generation: 0,
-            starting: None,
-            project_job: None,
+            catalogs: Catalogs::default(),
+            repo: Repo::new(repo),
+            starting: false,
+            tasks: Tasks::default(),
         }
     }
     pub(super) fn choose_theme(&mut self) {
@@ -245,7 +201,7 @@ impl App {
             return Ok((Placement::Project, None));
         };
         ensure!(
-            self.repo.is_some(),
+            self.repo.info.is_some(),
             "{holder} is using this folder. It is not a Git repository, so a second run cannot get its own worktree; wait for the first to finish"
         );
         Ok((Placement::WorktreeFromHead, Some(holder)))
@@ -304,11 +260,11 @@ impl App {
         ));
         Ok(session)
     }
+    /// Applies background results and run progress, and starts timed
+    /// refreshes; true means exit now.
     pub(super) fn poll(&mut self) -> Result<bool> {
-        match self.ui.dialog_mut() {
-            Some(Modal::Import(importer)) => self.ui.redraw |= importer.poll(),
-            Some(Modal::Repositories(picker)) => self.ui.redraw |= picker.poll(),
-            _ => {}
+        while let Some((generation, msg)) = self.tasks.try_recv() {
+            self.update(generation, msg);
         }
         // The focused run first, then the others in start order.
         let focus = self.session.focus;
@@ -329,117 +285,19 @@ impl App {
                 self.push_notice(notice_text(run, &result), alert);
             }
         }
-        self.poll_jobs();
-        if let Some((harness, job)) = &self.prefetch {
-            match job.get() {
-                Got::Pending => {}
-                got => {
-                    let harness = harness.clone();
-                    let current = job.generation == self.generation;
-                    self.prefetch = None;
-                    if let (Got::Ready(Ok(catalog)), true) = (got, current) {
-                        self.catalogs.insert(harness.clone(), catalog);
-                        self.push_catalog(&harness);
-                    }
-                    if let Some(next) = self.prefetch_queue.pop_front() {
-                        self.request_catalog(next);
-                    }
-                    self.ui.redraw = true;
-                }
-            }
-        }
-        if let Some((ticket, harness, receiver)) = &self.catalog {
-            if let Ok(result) = receiver.try_recv() {
-                let (ticket, harness) = (*ticket, harness.clone());
-                self.catalog = None;
-                self.ui.redraw = true;
-                // A closed picker drops what it was waiting for.
-                if self.ui.take_loading(ticket) {
-                    self.show_catalog_result(harness, result);
-                }
-            }
-        }
-        match self.harnesses.checks.poll() {
-            Some(true) => {
-                self.ui.redraw = true;
-                self.harnesses.selected = self
-                    .harnesses
-                    .selected
-                    .min(self.harnesses.checks.reports.len().saturating_sub(1))
-            }
-            Some(false) => {
-                self.ui.redraw = true;
-                self.ui
-                    .error("Harness check failed. Press [r] to retry.".into());
-            }
-            None => {}
-        }
+        self.refresh();
         self.poll_completion();
         Ok(self.session.quit_after_stop && !self.session.any_active())
     }
     /// A run stopped: Git status and the saved runs list may have changed.
     fn run_stopped(&mut self) {
         self.ui.redraw = true;
-        self.repo_checked = None;
+        self.repo.checked = None;
         self.runs.stale = true;
     }
-    /// Collects background results and starts timed refreshes.
-    fn poll_jobs(&mut self) {
-        if let Some(job) = &self.starting {
-            match job.get() {
-                Got::Pending => {}
-                Got::Ready(result) => {
-                    self.starting = None;
-                    self.ui.redraw = true;
-                    let started = result
-                        .map_err(anyhow::Error::msg)
-                        .and_then(|started| self.begin(started));
-                    if let Err(error) = started {
-                        self.ui.error(format!("{error:#}"));
-                    }
-                }
-                Got::Lost => {
-                    self.starting = None;
-                    self.ui
-                        .error("Starting the run stopped unexpectedly; try again.".into());
-                }
-            }
-        }
-        if let Some((ticket, job)) = &self.project_job {
-            let got = job.get();
-            if !matches!(got, Got::Pending) {
-                let ticket = *ticket;
-                self.project_job = None;
-                self.ui.redraw = true;
-                let opened = match got {
-                    Got::Ready(result) => result.map_err(anyhow::Error::msg),
-                    _ => Err(anyhow::anyhow!("Opening the project stopped unexpectedly")),
-                };
-                // Esc closed the wait and went back to the browser.
-                if self.ui.take_loading(ticket) {
-                    self.project_opened(opened);
-                }
-            }
-        }
-        if let Some(job) = &self.runs.job {
-            match job.get() {
-                Got::Pending => {}
-                got => {
-                    let current = job.generation == self.generation;
-                    self.runs.job = None;
-                    self.ui.redraw = true;
-                    match got {
-                        Got::Ready(Ok(entries)) if current => {
-                            self.runs.show(entries, &self.project)
-                        }
-                        Got::Ready(Err(error)) if current => {
-                            self.ui.error(error);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
+    /// Starts reads that are due: saved runs on the Runs page, Git status,
+    /// and stats for the Workflow page's hint.
+    fn refresh(&mut self) {
         if self.ui.page == Page::Runs {
             let due = self
                 .runs
@@ -448,42 +306,40 @@ impl App {
             if due && self.session.runs.iter().any(RunSlot::in_progress) {
                 self.runs.stale = true;
             }
-            if self.runs.stale && self.runs.job.is_none() {
+            if self.runs.stale && !self.runs.loading {
                 self.load_runs();
             }
         }
-        if let Some(job) = &self.repo_job {
-            match job.get() {
-                Got::Pending => {}
-                got => {
-                    if let (Got::Ready(repo), true) = (got, job.generation == self.generation) {
-                        self.ui.redraw |= repo != self.repo;
-                        self.repo = repo;
-                    }
-                    self.repo_job = None;
-                    self.repo_checked = Some(Instant::now());
-                }
-            }
-        } else if self
-            .repo_checked
-            .is_none_or(|at| at.elapsed() >= REPO_EVERY)
-        {
+        let due = self
+            .repo
+            .checked
+            .is_none_or(|at| at.elapsed() >= REPO_EVERY);
+        if due && !self.repo.reading {
+            self.repo.reading = true;
             let project = self.project.clone();
-            self.repo_job = Some(Job::spawn(self.generation, move || {
-                storage::repo_info(&project)
-            }));
+            self.tasks.spawn(
+                "Reading Git status stopped unexpectedly",
+                move || Ok(storage::repo_info(&project)),
+                Msg::Repo,
+            );
+        }
+        if self.ui.page == Page::Workflow {
+            self.refresh_stats();
         }
     }
     /// Reads saved runs in the background; the page shows them when they arrive.
     pub(super) fn load_runs(&mut self) {
         self.runs.stale = false;
+        self.runs.loading = true;
         let project = self.project.clone();
-        self.runs.job = Some(Job::spawn(self.generation, move || {
-            crate::history::list(&project).map_err(|e| format!("{e:#}"))
-        }));
+        self.tasks.spawn(
+            "Reading saved runs stopped unexpectedly; [r] retries.",
+            move || crate::history::list(&project).map_err(|e| format!("{e:#}")),
+            Msg::Runs,
+        );
     }
     /// Adopts a created run and starts its driver.
-    fn begin(&mut self, started: Started) -> Result<()> {
+    pub(super) fn begin(&mut self, started: Started) -> Result<()> {
         let Started {
             run,
             holder,
@@ -541,7 +397,7 @@ impl App {
         rerun_of: Option<String>,
     ) -> Result<()> {
         ensure!(
-            self.starting.is_none(),
+            !self.starting,
             "A run is still starting; wait for it to begin"
         );
         let (placement, holder) = self.placement(worktree)?;
@@ -549,16 +405,23 @@ impl App {
             Some(id) => format!("Starting a rerun of {id}…"),
             None => "Starting run…".into(),
         };
-        self.starting = Some(Job::spawn(self.generation, move || {
-            create(placement)
-                .map(|run| Started {
-                    run,
-                    holder,
-                    task,
-                    rerun_of,
-                })
-                .map_err(|e| format!("{e:#}"))
-        }));
+        self.starting = true;
+        self.tasks.spawn(
+            "Starting the run stopped unexpectedly; try again.",
+            move || {
+                create(placement)
+                    .map(|run| {
+                        Box::new(Started {
+                            run,
+                            holder,
+                            task,
+                            rerun_of,
+                        })
+                    })
+                    .map_err(|e| format!("{e:#}"))
+            },
+            Msg::Started,
+        );
         Ok(())
     }
     fn focused_stopped(&mut self, result: std::result::Result<Action, String>) {
@@ -595,129 +458,6 @@ impl App {
             }
         }
     }
-    /// Shows a catalog read for the model picker: the picker on success; on
-    /// failure, the reason, in the editor the picker was opened from.
-    fn show_catalog_result(
-        &mut self,
-        harness: String,
-        result: std::result::Result<Catalog, String>,
-    ) {
-        match result {
-            Ok(catalog) => {
-                self.catalogs.insert(harness.clone(), catalog.clone());
-                self.push_catalog(&harness);
-                self.show_catalog(&harness, catalog);
-            }
-            Err(error) => match self.ui.dialog_mut() {
-                Some(Modal::Stage { .. }) => self
-                    .ui
-                    .error(format!("{error}. Type a model ID with [i] instead.")),
-                Some(Modal::Harness(editor)) => {
-                    let message =
-                        format!("{error}. Enter a model ID manually in harness settings [c].");
-                    editor.error = message.clone();
-                    self.ui.error(message);
-                }
-                _ => self.ui.error(format!(
-                    "{error}. Enter a model ID manually in harness settings [c]."
-                )),
-            },
-        }
-    }
-    fn show_catalog(&mut self, harness: &str, catalog: Catalog) {
-        let items = catalog
-            .models
-            .into_iter()
-            .map(|model| Choice {
-                label: format!(
-                    "{}{}{}  ·  {}{}",
-                    if model.provider.is_empty() {
-                        ""
-                    } else {
-                        &model.provider
-                    },
-                    if model.provider.is_empty() { "" } else { "/" },
-                    model.label,
-                    model.availability,
-                    if model.efforts.is_empty() {
-                        String::new()
-                    } else {
-                        format!("  ·  {}", model.efforts.join("/"))
-                    }
-                ),
-                value: PickValue::Model(model),
-            })
-            .collect();
-        self.ui.open(Modal::Picker {
-            title: format!("{harness} selections · type to filter"),
-            items,
-            selected: 0,
-            filter: textarea(""),
-            note: catalog.note,
-        });
-    }
-    /// Hands a cached catalog to the open editors for `harness`, including
-    /// any under a picker.
-    fn push_catalog(&mut self, harness: &str) {
-        let Some(catalog) = self.catalogs.get(harness) else {
-            return;
-        };
-        for dialog in &mut self.ui.dialogs {
-            match dialog {
-                Modal::Harness(editor) if editor.harness() == harness => {
-                    editor.set_catalog(catalog.clone());
-                }
-                Modal::Stage { editor, .. } if editor.harness() == harness => {
-                    editor.set_catalog(catalog.clone());
-                }
-                _ => {}
-            }
-        }
-    }
-    /// Makes `harness`'s catalog available to editors: from the cache now, or
-    /// read in the background without opening a picker.
-    pub(super) fn request_catalog(&mut self, harness: String) {
-        if self.catalogs.contains_key(&harness) {
-            self.push_catalog(&harness);
-            return;
-        }
-        if self.prefetch_queue.contains(&harness)
-            || self.prefetch.as_ref().is_some_and(|(h, _)| *h == harness)
-        {
-            return;
-        }
-        if self.prefetch.is_some() {
-            self.prefetch_queue.push_back(harness);
-            return;
-        }
-        let settings = self.editor.settings.clone();
-        let project = self.project.clone();
-        let name = harness.clone();
-        self.prefetch = Some((
-            harness,
-            Job::spawn(self.generation, move || {
-                catalog::discover(&name, &settings, &project).map_err(|e| format!("{e:#}"))
-            }),
-        ));
-    }
-    /// Opens the model picker for `harness` above the open dialogs.
-    pub(super) fn model_picker_for(&mut self, harness: String) {
-        if let Some(catalog) = self.catalogs.get(&harness).cloned() {
-            self.show_catalog(&harness, catalog);
-            return;
-        }
-        let settings = self.editor.settings.clone();
-        let project = self.project.clone();
-        let (sender, receiver) = mpsc::channel();
-        let loading = Loading::new(format!("Reading {harness} model selections…"));
-        self.catalog = Some((loading.ticket, harness.clone(), receiver));
-        self.ui.open(Modal::Loading(loading));
-        thread::spawn(move || {
-            let _ = sender.send(
-                catalog::discover(&harness, &settings, &project).map_err(|e| format!("{e:#}")),
-            );
-        });
-    }
     /// Reads `path` as a project now; `begin_switch` does it in the background.
     #[cfg(test)]
     pub(super) fn switch_project(&mut self, path: PathBuf) -> Result<()> {
@@ -727,15 +467,17 @@ impl App {
     /// Opens `path` in the background, above the repository browser.
     pub(super) fn begin_switch(&mut self, path: PathBuf) {
         let loading = Loading::new("Opening project…");
-        self.project_job = Some((
-            loading.ticket,
-            Job::spawn(self.generation, move || read_project(path)),
-        ));
+        let ticket = loading.ticket;
+        self.tasks.spawn(
+            "Opening the project stopped unexpectedly",
+            move || read_project(path),
+            move |result| Msg::Opened { ticket, result },
+        );
         self.ui.open(Modal::Loading(loading));
     }
     /// Shows the project read in the background and closes the browser, or
     /// returns to the browser, which shows why it could not open.
-    fn project_opened(&mut self, opened: Result<Opened>) {
+    pub(super) fn project_opened(&mut self, opened: Result<Opened>) {
         match opened.and_then(|opened| self.open_project(opened)) {
             Ok(()) => {
                 if matches!(self.ui.dialog(), Some(Modal::Repositories(_))) {
@@ -760,10 +502,9 @@ impl App {
             config_path,
             repo,
         } = opened;
-        self.generation += 1;
-        self.repo = repo;
-        self.repo_job = None;
-        self.repo_checked = Some(Instant::now());
+        // What is still being read for the old project is dropped on arrival.
+        self.tasks.next_generation();
+        self.repo = Repo::new(repo);
         self.project = project;
         self.editor.settings = settings;
         self.editor.config_path = config_path;
@@ -772,15 +513,12 @@ impl App {
         self.editor.task.clear();
         self.runs.entries.clear();
         self.runs.selected = 0;
-        self.runs.job = None;
+        self.runs.loading = false;
         self.runs.stale = true;
         self.runs.loaded_at = None;
         self.harnesses.selected = 0;
         self.harnesses.checks.clear();
-        self.catalog = None;
-        self.catalogs.clear();
-        self.prefetch = None;
-        self.prefetch_queue.clear();
+        self.catalogs = Catalogs::default();
         self.editor.undo.clear();
         self.ui.page = Page::Workflow;
         self.ui.message = format!("Project: {}", self.project.display());
@@ -912,17 +650,18 @@ impl App {
         match page {
             // Read when shown, not while Tab passes through.
             Page::Runs => self.runs.stale = true,
-            Page::Harnesses => self
-                .harnesses
-                .checks
-                .start(&self.editor.settings, &self.project),
+            Page::Harnesses => {
+                self.harnesses
+                    .checks
+                    .start(&self.editor.settings, &self.project, &self.tasks)
+            }
             Page::Workflow | Page::Monitor => {}
         }
     }
     /// Whether something on screen animates, so frames come faster.
     pub(super) fn animating(&self) -> bool {
         matches!(self.ui.dialog(), Some(Modal::Loading(_)))
-            || self.starting.is_some()
+            || self.starting
             || matches!(self.ui.dialog(), Some(Modal::Import(importer)) if importer.busy())
     }
     /// Whether the focused interactive stage may take the terminal now. An
@@ -1228,7 +967,7 @@ fn vim_toggle(enabled: bool, palette: Palette) -> Line<'static> {
 
 /// Repository name and branch, or the project directory when not a Git repository.
 fn repository_line(app: &App, palette: Palette) -> Line<'static> {
-    let spans = match &app.repo {
+    let spans = match &app.repo.info {
         Some(repo) => {
             let mut spans = vec![
                 Span::styled(" ⎇ ", Style::default().fg(palette.accent)),

@@ -248,10 +248,9 @@ pub(super) struct Loading {
 }
 impl Loading {
     pub(super) fn new(text: impl Into<String>) -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
             text: text.into(),
-            ticket: NEXT.fetch_add(1, Ordering::Relaxed),
+            ticket: super::tasks::ticket(),
         }
     }
 }
@@ -667,7 +666,7 @@ impl App {
                     StageRequest::PickModel => self.model_picker_for(editor.harness()),
                     StageRequest::Catalog => {
                         let harness = editor.harness();
-                        match self.catalogs.get(&harness) {
+                        match self.catalogs.cached.get(&harness) {
                             Some(catalog) => editor.set_catalog(catalog.clone()),
                             None => self.request_catalog(harness),
                         }

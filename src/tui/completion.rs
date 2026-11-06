@@ -1,7 +1,12 @@
 //! The Monitor's results view for a finished run: what changed, which checks
 //! ran, what is unresolved, and what each stage took and spent. Git work runs
 //! on a background thread; the view shows "Computing changes…" until it lands.
-use super::{app::App, run_slot::RunSlot, theme::Palette};
+use super::{
+    app::App,
+    run_slot::RunSlot,
+    tasks::{Msg, Tasks},
+    theme::Palette,
+};
 use crate::{
     engine::{Run, Status},
     handoff::TestStatus,
@@ -16,10 +21,6 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Cell, HighlightSpacing, Paragraph, Row, Table, Wrap},
-};
-use std::{
-    sync::mpsc::{self, TryRecvError},
-    thread,
 };
 
 /// Changes and patch computed for one finished run state.
@@ -105,19 +106,20 @@ impl RunSlot {
         self.changes.as_ref().filter(|l| l.key == key(&self.run))
     }
 
-    /// Collects finished Git work and starts it for a newly finished run.
-    /// Returns the status line for a pending waiver, once per checkpoint.
-    fn poll_completion(&mut self) -> Option<String> {
-        if let Some((_, receiver)) = &self.changes_job {
-            match receiver.try_recv() {
-                Ok(loaded) => {
-                    self.changes = Some(loaded);
-                    self.changes_job = None;
-                }
-                Err(TryRecvError::Disconnected) => self.changes_job = None,
-                Err(TryRecvError::Empty) => {}
-            }
+    /// Computed changes for `key`; kept when still the ones waited for.
+    pub(super) fn changes_read(&mut self, key: &str, result: Result<Loaded, String>) {
+        if self.changes_pending.as_deref() != Some(key) {
+            return;
         }
+        self.changes_pending = None;
+        if let Ok(loaded) = result {
+            self.changes = Some(loaded);
+        }
+    }
+
+    /// Starts Git work for a newly finished run. Returns the status line for
+    /// a pending waiver, once per checkpoint.
+    fn poll_completion(&mut self, tasks: &Tasks) -> Option<String> {
         let run = &self.run;
         let mut message = None;
         if let Some(reason) = run.pending_waiver() {
@@ -135,19 +137,25 @@ impl RunSlot {
         }
         let key = key(run);
         let current = self.changes.as_ref().is_some_and(|l| l.key == key)
-            || self.changes_job.as_ref().is_some_and(|(k, _)| *k == key);
+            || self.changes_pending.as_ref() == Some(&key);
         if current {
             return message;
         }
         // A newly finished run opens on its results.
         self.show_output = false;
         self.results_scroll = [0; 2];
+        self.changes_pending = Some(key.clone());
         let run = run.clone();
-        let (sender, receiver) = mpsc::channel();
-        self.changes_job = Some((key, receiver));
-        thread::spawn(move || {
-            let _ = sender.send(load(&run));
-        });
+        let id = run.id.clone();
+        tasks.spawn(
+            "Computing changes stopped unexpectedly",
+            move || Ok(load(&run)),
+            move |result| Msg::Changes {
+                run: id,
+                key,
+                result,
+            },
+        );
         message
     }
 }
@@ -160,10 +168,11 @@ impl App {
 
     /// See `RunSlot::poll_completion`; only the focused run is followed.
     pub(super) fn poll_completion(&mut self) {
+        let tasks = &self.tasks;
         let message = self
             .session
             .focused_mut()
-            .and_then(RunSlot::poll_completion);
+            .and_then(|slot| slot.poll_completion(tasks));
         if let Some(message) = message {
             self.ui.message = message;
         }
@@ -765,17 +774,17 @@ mod tests {
         let mut app = app(run);
         app.slot_mut().show_output = true;
         app.poll_completion();
-        assert!(app.slot().changes_job.is_some());
+        assert!(app.slot().changes_pending.is_some());
         assert!(
             !app.slot().show_output,
             "A newly finished run opens on its results"
         );
         for _ in 0..500 {
-            app.poll_completion();
-            if app.slot().changes_job.is_none() {
+            app.poll().unwrap();
+            if app.slot().changes_pending.is_none() {
                 break;
             }
-            thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let loaded = app
             .session
@@ -786,7 +795,7 @@ mod tests {
         assert!(matches!(loaded.changes, Changes::NotGit));
         // The same state does not start another job.
         app.poll_completion();
-        assert!(app.slot().changes_job.is_none());
+        assert!(app.slot().changes_pending.is_none());
     }
 
     #[test]
@@ -808,7 +817,7 @@ mod tests {
             "The test stage reported verification is not applicable: Docs only. [a] accepts without checks; [y] retries."
         );
         assert!(
-            app.slot().changes_job.is_none(),
+            app.slot().changes_pending.is_none(),
             "Unfinished runs compute no changes"
         );
         // Announced once per checkpoint, so later messages stay visible.

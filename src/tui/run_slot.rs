@@ -10,7 +10,6 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::Receiver,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -127,7 +126,8 @@ pub(super) struct RunSlot {
     /// The furthest each results panel can scroll, as last drawn.
     pub(super) results_limit: Cell<[u16; 2]>,
     pub(super) changes: Option<completion::Loaded>,
-    pub(super) changes_job: Option<(String, Receiver<completion::Loaded>)>,
+    /// The key of the changes being computed.
+    pub(super) changes_pending: Option<String>,
     /// The run checkpoint whose waiver the status line last announced.
     pub(super) waiver_shown: String,
     /// Reopen the stage's session interactively once its worker stops.
@@ -160,7 +160,7 @@ impl RunSlot {
             results_scroll: [0; 2],
             results_limit: Cell::new([0; 2]),
             changes: None,
-            changes_job: None,
+            changes_pending: None,
             waiver_shown: String::new(),
             takeover: false,
             stopped_at: None,

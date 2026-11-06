@@ -662,12 +662,14 @@ impl App {
                 self.ui.open(Modal::Repositories(Box::new(PathPicker::new(
                     &self.project,
                     storage::recent_projects(),
+                    self.tasks.spawner(),
                 )?)));
             }
             ActionId::ImportTask => {
                 self.ui.open(Modal::Import(Box::new(TaskImporter::new(
                     &self.project,
                     &self.editor.task,
+                    self.tasks.spawner(),
                 )?)));
             }
             ActionId::ChooseWorkflow => {
@@ -1011,6 +1013,7 @@ pub(super) fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palett
         let warning = app.harnesses.checks.warning(&stage.harness);
         let effort = app
             .catalogs
+            .cached
             .get(&stage.harness)
             .and_then(|c| c.efforts_for(&stage.model, &stage.provider))
             .map(|efforts| effort_note(stage, &efforts));

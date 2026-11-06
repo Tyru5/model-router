@@ -1,3 +1,4 @@
+use super::tasks::{Msg, Tasks};
 use super::{actions::ActionId, app::App, theme::Palette, widgets::short_path};
 use crate::{
     catalog,
@@ -12,11 +13,7 @@ use ratatui::{
     text::Line,
     widgets::{Cell, HighlightSpacing, Row, Table, TableState},
 };
-use std::{
-    path::Path,
-    sync::mpsc::{self, Receiver, TryRecvError},
-    thread,
-};
+use std::path::Path;
 
 pub(super) type Probe = fn(&Settings, &Path) -> Vec<Report>;
 
@@ -25,7 +22,8 @@ pub(super) type Probe = fn(&Settings, &Path) -> Vec<Report>;
 /// thread when the page opens.
 pub(super) struct HarnessChecks {
     pub(super) reports: Vec<Report>,
-    receiver: Option<Receiver<Vec<Report>>>,
+    /// A check is running.
+    pub(super) checking: bool,
     /// Tests swap in a stub so no harness runs.
     pub(super) probe: Probe,
 }
@@ -45,41 +43,26 @@ impl HarnessChecks {
     pub(super) fn new() -> Self {
         Self {
             reports: vec![],
-            receiver: None,
+            checking: false,
             probe: doctor::inspect_all,
         }
     }
     /// Starts a check unless one is running. Old results stay until new ones arrive.
-    pub(super) fn start(&mut self, settings: &Settings, project: &Path) {
-        if self.checking() {
+    pub(super) fn start(&mut self, settings: &Settings, project: &Path, tasks: &Tasks) {
+        if self.checking {
             return;
         }
-        let (sender, receiver) = mpsc::channel();
+        self.checking = true;
         let (settings, project, probe) = (settings.clone(), project.to_path_buf(), self.probe);
-        thread::spawn(move || {
-            let _ = sender.send(probe(&settings, &project));
-        });
-        self.receiver = Some(receiver);
-    }
-    pub(super) fn checking(&self) -> bool {
-        self.receiver.is_some()
-    }
-    /// Some(true) when results arrived, Some(false) when the check died.
-    pub(super) fn poll(&mut self) -> Option<bool> {
-        let arrived = match self.receiver.as_ref()?.try_recv() {
-            Ok(reports) => {
-                self.reports = reports;
-                true
-            }
-            Err(TryRecvError::Empty) => return None,
-            Err(TryRecvError::Disconnected) => false,
-        };
-        self.receiver = None;
-        Some(arrived)
+        tasks.spawn(
+            "Harness check failed",
+            move || Ok(probe(&settings, &project)),
+            Msg::Checks,
+        );
     }
     pub(super) fn clear(&mut self) {
         self.reports.clear();
-        self.receiver = None;
+        self.checking = false;
     }
     pub(super) fn report(&self, harness: &str) -> Option<&Report> {
         self.reports.iter().find(|r| r.harness == harness)
@@ -149,10 +132,11 @@ impl App {
                 let body = details(&harness, self.harnesses.checks.report(&harness));
                 self.text(&harness, body);
             }
-            ActionId::RefreshHarnesses => self
-                .harnesses
-                .checks
-                .start(&self.editor.settings, &self.project),
+            ActionId::RefreshHarnesses => {
+                self.harnesses
+                    .checks
+                    .start(&self.editor.settings, &self.project, &self.tasks)
+            }
             other => bail!("{other:?} is not a Harnesses action"),
         }
         Ok(())
@@ -255,7 +239,7 @@ pub(super) fn draw_harnesses(frame: &mut Frame<'_>, app: &App, area: Rect, palet
             return Row::new([
                 Cell::from(clip(name, name_width)),
                 styled(
-                    if checks.checking() {
+                    if checks.checking {
                         "checking…"
                     } else {
                         "not checked"
@@ -316,7 +300,7 @@ pub(super) fn draw_harnesses(frame: &mut Frame<'_>, app: &App, area: Rect, palet
             palette.muted
         }))
     });
-    let note = if checks.checking() {
+    let note = if checks.checking {
         " checking… "
     } else {
         " uses existing logins and provider settings "
@@ -432,13 +416,13 @@ mod tests {
 
     fn wait(app: &mut App) {
         let start = Instant::now();
-        while app.harnesses.checks.checking() {
+        while app.harnesses.checks.checking {
             assert!(
                 start.elapsed() < Duration::from_secs(5),
                 "check never finished"
             );
             app.poll().unwrap();
-            thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -470,7 +454,7 @@ mod tests {
         let mut app = app();
         let palette = app.ui.palette();
         press(&mut app, KeyCode::Char('4'));
-        assert!(app.harnesses.checks.checking());
+        assert!(app.harnesses.checks.checking);
         let (text, _) = render(&mut app, 80, "checking…");
         assert!(
             text.contains("codex") && text.contains("checking…"),
@@ -502,7 +486,7 @@ mod tests {
         // Refresh keeps old rows until fresh results arrive.
         app.harnesses.checks.reports.truncate(1);
         press(&mut app, KeyCode::Char('r'));
-        assert!(app.harnesses.checks.checking());
+        assert!(app.harnesses.checks.checking);
         assert_eq!(app.harnesses.checks.reports.len(), 1);
         wait(&mut app);
         assert_eq!(app.harnesses.checks.reports.len(), 3);
@@ -561,7 +545,7 @@ mod tests {
         };
         assert!(!draw(&mut app).contains("lacks"));
         assert!(
-            !app.harnesses.checks.checking(),
+            !app.harnesses.checks.checking,
             "Workflow must not run doctor"
         );
         app.harnesses.checks.reports = stub(&app.editor.settings, &app.project);

@@ -1,7 +1,7 @@
 use super::input::InputField;
 use super::{
     actions::ActionId,
-    app::{App, Job, Page},
+    app::{App, Page},
     modal::{Choice, Modal, PickValue},
     theme::Palette,
     widgets::{content, empty_state, kv, menu_key, textarea},
@@ -49,8 +49,8 @@ pub(super) struct RunsPage {
     pub(super) entries: Vec<Entry>,
     /// Index into the visible entries.
     pub(super) selected: usize,
-    /// Saved runs being read.
-    pub(super) job: Option<Job<std::result::Result<Vec<Entry>, String>>>,
+    /// Saved runs are being read.
+    pub(super) loading: bool,
     /// The list needs reading when the page is next shown.
     pub(super) stale: bool,
     pub(super) loaded_at: Option<std::time::Instant>,
@@ -68,7 +68,7 @@ impl Default for RunsPage {
         Self {
             entries: vec![],
             selected: 0,
-            job: None,
+            loading: false,
             stale: true,
             loaded_at: None,
             filter: InputField::default(),
@@ -792,9 +792,8 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             app.poll().unwrap();
-            let busy = app.runs.job.is_some()
-                || app.starting.is_some()
-                || (app.ui.page == Page::Runs && app.runs.stale);
+            let busy =
+                app.runs.loading || app.starting || (app.ui.page == Page::Runs && app.runs.stale);
             if !busy || Instant::now() > deadline {
                 break;
             }
@@ -985,10 +984,7 @@ mod tests {
         press(&mut app, "n");
         app.key(key(Key::Enter)).unwrap();
         assert!(app.ui.dialog().is_none());
-        assert!(
-            app.starting.is_some(),
-            "The run is created in the background"
-        );
+        assert!(app.starting, "The run is created in the background");
         settle(&mut app);
         assert!(app.session.running());
         assert_eq!(app.ui.page, Page::Monitor);

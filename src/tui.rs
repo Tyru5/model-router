@@ -29,6 +29,7 @@ mod harnesses;
 mod history;
 mod input;
 mod modal;
+mod models;
 mod monitor;
 mod output_search;
 mod path_picker;
@@ -37,6 +38,7 @@ mod session;
 mod startup;
 mod stats_page;
 mod task_importer;
+mod tasks;
 #[cfg(test)]
 mod tests;
 mod theme;
