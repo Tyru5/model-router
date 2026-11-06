@@ -107,8 +107,10 @@ def main():
             terminal.send("3")
             # Runs load in the background; wait for the row before opening it.
             terminal.wait_for(
-                lambda: "complete" in terminal.text().split("Runs", 1)[-1]
-                and "Loading" not in terminal.text(),
+                lambda: (
+                    "complete" in terminal.text().split("Runs", 1)[-1]
+                    and "Loading" not in terminal.text()
+                ),
                 "Runs page did not list the run",
             )
             terminal.send("\r")

@@ -47,12 +47,22 @@ DSR = b"\x1b[6n"  # cursor position query; crossterm sends it at startup
 _failures = 0
 
 
+def config_env(home):
+    """Config dir under `home` on every OS: macOS ignores XDG_CONFIG_HOME."""
+    home = Path(home)
+    return {
+        "XDG_CONFIG_HOME": str(home),
+        "MODEL_ROUTER_CONFIG_DIR": str(home / "model-router"),
+    }
+
+
 def trust(project):
     """Trust the project's custom adapter, as its user would once."""
     import subprocess
+
     subprocess.run(
         [str(BINARY), "-C", str(project), "trust", "--yes"],
-        env=dict(os.environ, XDG_CONFIG_HOME=str(Path(project) / "config-home")),
+        env=dict(os.environ, **config_env(Path(project) / "config-home")),
         check=True,
         capture_output=True,
     )
@@ -152,7 +162,7 @@ class Terminal:
         full_env = dict(
             os.environ,
             TERM="xterm-256color",
-            XDG_CONFIG_HOME=str(self.project / "config-home"),
+            **config_env(self.project / "config-home"),
             MODEL_ROUTER_FRAME_MARKER="1",
             MODEL_ROUTER_FRAME_FILE=str(self.frame_file),
         )

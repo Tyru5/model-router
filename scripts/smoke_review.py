@@ -173,7 +173,9 @@ def main():
             paged = json.loads(
                 terminal.wait_for_file(pager_out, message="Pager did not run")
             )
-            assert "\x1b[32m+written by first attempt 1 line 1\x1b[0m" in paged["text"], paged
+            assert (
+                "\x1b[32m+written by first attempt 1 line 1\x1b[0m" in paged["text"]
+            ), paged
             terminal.wait_for_text(
                 "Returned from", message="TUI did not resume after the pager"
             )

@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import tempfile
 
-from smoke_common import ARTIFACTS, ROOT, Terminal, records
+from smoke_common import ARTIFACTS, ROOT, Terminal, config_env, records
 
 
 THEMES = [
@@ -54,7 +54,7 @@ def main():
             (folder / ".model-router.toml").write_text(config)
             (folder / "notes.md").write_text("A theme must not change task contents")
         env = {
-            "XDG_CONFIG_HOME": str(config_home),
+            **config_env(config_home),
             "NO_COLOR": "",
             "MODEL_ROUTER_NO_ANIMATION": "0",
         }

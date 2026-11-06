@@ -294,7 +294,9 @@ def detached_end(action, *, cli=False, controlling=True):
                 terminal.hangup()
             else:
                 # The TUI cancels with [C] and a confirmation; the CLI with c.
-                terminal.send("Cy" if not cli and action == "c" else action, settle=None)
+                terminal.send(
+                    "Cy" if not cli and action == "c" else action, settle=None
+                )
                 terminal.wait_for(
                     lambda: record(project).get("status") == "cancelled",
                     "Detached cancellation did not persist",
