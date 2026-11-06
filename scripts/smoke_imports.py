@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify file/URL task imports in the real TUI with offline fixtures.
 
-Run: uv run --with pyte python scripts/smoke_imports.py
+Run: uv run --with-requirements scripts/requirements-smoke.txt python scripts/smoke_imports.py
 """
 
 import json
@@ -13,7 +13,10 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from smoke_tui import ARTIFACTS, ROOT, Terminal, records
+from smoke_common import ARTIFACTS, ROOT, Terminal, demo_config, records
+
+
+SLOW_SERVED = threading.Event()
 
 
 class Documents(BaseHTTPRequestHandler):
@@ -33,6 +36,8 @@ class Documents(BaseHTTPRequestHandler):
             self.wfile.write(body)
         except BrokenPipeError:
             pass
+        if self.path == "/slow.md":
+            SLOW_SERVED.set()
 
 
 def paste(terminal, text):
@@ -47,14 +52,16 @@ def escape(terminal, count):
 def verify_task(terminal, text):
     # The Workflow summary shows only three lines; inspect the full task editor.
     terminal.send("t")
-    terminal.wait(lambda: text in terminal.text(), "Task editor lost imported edits")
+    terminal.wait_for(
+        lambda: text in terminal.text(), "Task editor lost imported edits"
+    )
     escape(terminal, 1)
 
 
 def url_import(terminal, url):
     terminal.send("f")
     terminal.send(b"\x15")  # Ctrl+U
-    terminal.wait(
+    terminal.wait_for(
         lambda: "Import from URL" in terminal.text(), "URL entry did not open"
     )
     paste(terminal, url)
@@ -68,13 +75,7 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix="router task import ") as name:
             project = Path(name)
-            config = (
-                (ROOT / "examples/demo.toml")
-                .read_text()
-                .replace(
-                    "examples/mock_harness.py", str(ROOT / "examples/mock_harness.py")
-                )
-            )
+            config = demo_config()
             (project / ".model-router.toml").write_text(config)
             docs = project / "docs"
             docs.mkdir()
@@ -94,14 +95,14 @@ def main():
             terminal = Terminal(
                 project,
                 ["--no-animation"],
-                extra_env={
+                env={
                     "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
                     "ROUTER_TEST_GH_TRACE": str(trace),
                 },
                 size=(80, 24),
             )
             try:
-                terminal.wait(
+                terminal.wait_for(
                     lambda: "1 Workflow" in terminal.text(), "TUI did not render"
                 )
                 assert "[f] import" in terminal.text(), (
@@ -111,7 +112,7 @@ def main():
                 paste(terminal, "Existing instructions")
                 terminal.send(b"\x13")
                 terminal.send("fdocs\rFeature\r")
-                terminal.wait(
+                terminal.wait_for(
                     lambda: "Preview task/spec" in terminal.text(),
                     "File preview did not open",
                 )
@@ -120,7 +121,7 @@ def main():
                 )
                 terminal.snapshot("import-preview-80x24.txt")
                 escape(terminal, 2)
-                terminal.wait(
+                terminal.wait_for(
                     lambda: (
                         "Preview task/spec" not in terminal.text()
                         and "Existing instructions" in terminal.text()
@@ -129,12 +130,12 @@ def main():
                 )
                 assert not records(project), "Preview started a workflow"
                 terminal.send("fdocs\rFeature\r")
-                terminal.wait(
+                terminal.wait_for(
                     lambda: "Preview task/spec" in terminal.text(),
                     "Second preview missing",
                 )
                 terminal.send(b"\x13")
-                terminal.wait(
+                terminal.wait_for(
                     lambda: "Task imported" in terminal.text(), "Import did not apply"
                 )
                 assert source.read_bytes() == raw, (
@@ -142,7 +143,7 @@ def main():
                 )
                 source.unlink()  # The workflow must use its imported snapshot.
                 terminal.send("r")
-                terminal.wait(
+                terminal.wait_for(
                     lambda: (
                         records(project)
                         and records(project)[-1]["status"] == "complete"
@@ -157,7 +158,7 @@ def main():
                         in (project / f".model-router/mock/{stage}.prompt").read_text()
                     )
                 # Starting a run frees the editor for the next task.
-                terminal.wait(
+                terminal.wait_for(
                     lambda: "Existing instructions" not in terminal.text(),
                     "Starting a run did not clear the task",
                 )
@@ -174,7 +175,7 @@ def main():
                     terminal.send(b"\x0c")
                     paste(terminal, str(docs / file))
                     terminal.send("\r")
-                    terminal.wait(
+                    terminal.wait_for(
                         lambda: error in terminal.text(),
                         f"{file} did not report an import error",
                     )
@@ -182,7 +183,7 @@ def main():
                     assert "Existing instructions" in terminal.text()
 
                 url_import(terminal, base + "/spec.md")
-                terminal.wait(
+                terminal.wait_for(
                     lambda: "Preview task/spec" in terminal.text(),
                     "Text URL was not imported",
                 )
@@ -190,7 +191,7 @@ def main():
                 assert "Existing instructions" not in terminal.text()
                 paste(terminal, "Edited draft\n\n")
                 terminal.send(b"\x13")
-                terminal.wait(
+                terminal.wait_for(
                     lambda: (
                         "Preview task/spec" not in terminal.text()
                         and "Task imported" in terminal.text()
@@ -200,18 +201,20 @@ def main():
                 verify_task(terminal, "Edited draft")
 
                 url_import(terminal, base + "/slow.md")
-                terminal.wait(
+                terminal.wait_for(
                     lambda: "Fetching task/spec" in terminal.text(),
                     "Slow import did not remain responsive",
                 )
                 escape(terminal, 3)
-                terminal.pump(1.1)
+                # Let the cancelled response arrive and a few frames handle it.
+                terminal.wait_for(SLOW_SERVED.is_set, "Slow response never sent")
+                terminal.wait_frame(count=5)
                 assert "Preview task/spec" not in terminal.text(), (
                     "Cancelled result reopened the preview"
                 )
                 verify_task(terminal, "Edited draft")
                 url_import(terminal, base + "/denied.md")
-                terminal.wait(
+                terminal.wait_for(
                     lambda: "returned an error" in terminal.text(),
                     "HTTP failure did not report an error",
                 )
@@ -220,7 +223,7 @@ def main():
 
                 terminal.resize(120, 36)
                 url_import(terminal, "https://github.com/acme/project/issues/7")
-                terminal.wait(
+                terminal.wait_for(
                     lambda: "Preview task/spec" in terminal.text(),
                     "GitHub issue was not imported",
                 )
@@ -231,7 +234,7 @@ def main():
                     and "Acceptance criteria" in terminal.text()
                 )
                 terminal.send(b"\x13")
-                terminal.wait(
+                terminal.wait_for(
                     lambda: "Task imported" in terminal.text(),
                     "GitHub issue did not apply",
                 )
@@ -239,13 +242,13 @@ def main():
                     terminal,
                     "https://github.com/acme/project/blob/feature/new/docs/spec.md",
                 )
-                terminal.wait(
+                terminal.wait_for(
                     lambda: "Preview task/spec" in terminal.text(),
                     "GitHub file was not imported",
                 )
                 terminal.send("\t")
                 terminal.send(b"\x13")
-                terminal.wait(
+                terminal.wait_for(
                     lambda: "GitHub file spec" in terminal.text(),
                     "GitHub file did not replace the task",
                 )

@@ -19,6 +19,7 @@ use std::{
 mod actions;
 mod app;
 mod completion;
+mod frame_marker;
 mod harness_editor;
 mod harnesses;
 mod history;
@@ -192,6 +193,7 @@ pub fn run(
         };
         if app.redraw || drawn.elapsed() >= tick {
             screen.terminal.draw(|frame| draw(frame, &mut app))?;
+            frame_marker::frame_drawn();
             app.redraw = false;
             drawn = Instant::now();
         }

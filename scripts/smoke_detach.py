@@ -1,99 +1,33 @@
 #!/usr/bin/env python3
 """Exercise live native-terminal detachment without providers or credentials.
 
-Run: uv run --with pyte python scripts/smoke_detach.py [path/to/model-router]
+Run: uv run --with-requirements scripts/requirements-smoke.txt python scripts/smoke_detach.py [path/to/model-router]
 Build the binary first. All workflows, harnesses, and artifacts are temporary.
 """
 
-import codecs
-import fcntl
 import json
-import os
 from pathlib import Path
-import pty
-import signal
-import struct
-import subprocess
 import sys
 import tempfile
-import termios
-import time
 
-import pyte
+import smoke_common
+from smoke_common import alive, kill_all, require_binary, wait_until
 
-from smoke_shutdown import BINARY, Terminal as ShutdownTerminal, alive
-
-
-class Terminal(ShutdownTerminal):
-    """Use shutdown smoke polling/cleanup with CLI argv and a rendered screen."""
-
-    def __init__(self, project, *, cli=False, controlling=True):
-        self.master, slave = pty.openpty()
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 36, 120, 0, 0))
-
-        def setup():
-            os.setsid()
-            if controlling:
-                fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
-
-        env = dict(
-            os.environ,
-            TERM="xterm-256color",
-            XDG_CONFIG_HOME=str(project / "config-home"),
-            MODEL_ROUTER_NO_ANIMATION="1",
-        )
-        argv = [str(BINARY), "-C", str(project), "--no-animation"]
-        if cli:
-            argv += ["run", "--task", "Offline native terminal detach regression"]
-        try:
-            self.process = subprocess.Popen(
-                argv,
-                cwd=project,
-                env=env,
-                stdin=slave,
-                stdout=slave,
-                stderr=slave,
-                preexec_fn=setup,
-            )
-        except BaseException:
-            os.close(self.master)
-            raise
-        finally:
-            os.close(slave)
-        self.raw = bytearray()
-        self.screen = pyte.Screen(120, 36)
-        self.stream = pyte.Stream(self.screen)
-        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
-
-    def pump(self, duration=0.05):
-        start = len(self.raw)
-        super().pump(duration)
-        self.stream.feed(self.decoder.decode(self.raw[start:]))
-
-    def text(self):
-        return "\n".join(self.screen.display)
-
-    def resize(self, cols, rows):
-        self.screen.resize(lines=rows, columns=cols)
-        fcntl.ioctl(
-            self.master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0)
-        )
-        os.kill(self.process.pid, signal.SIGWINCH)
-        self.pump(0.2)
-
-    def exit(self, expected=0):
-        self.wait_for(
-            lambda: self.process.poll() is not None,
-            "Router did not exit",
-            timeout=5,
-        )
-        assert self.process.returncode == expected, self.text()
-        attributes = termios.tcgetattr(self.master)
-        assert attributes[3] & termios.ICANON, "Terminal left in raw mode"
-        assert attributes[3] & termios.ECHO, "Terminal echo was not restored"
+TASK = "Offline native terminal detach regression"
 
 
-HARNESS = r'''
+def Terminal(project, *, cli=False, controlling=True):
+    args = ["--no-animation"] + (["run", "--task", TASK] if cli else [])
+    return smoke_common.Terminal(
+        project,
+        args,
+        env={"MODEL_ROUTER_NO_ANIMATION": "1"},
+        controlling=controlling,
+        config=False,
+    )
+
+
+HARNESS = r"""
 import json
 import os
 from pathlib import Path
@@ -164,7 +98,7 @@ finally:
     child.wait(timeout=2)
     emit("\x1b[?2004l\x1b[?25h\x1b[?1049l")
     termios.tcsetattr(0, termios.TCSANOW, old)
-'''
+"""
 
 
 def workflow(project):
@@ -200,10 +134,10 @@ def record(project):
 
 def start(terminal, project, *, cli):
     if not cli:
-        terminal.wait_for(lambda: "Workflow" in terminal.text(), "TUI did not render")
+        terminal.wait_for_text("Workflow", message="TUI did not render")
         terminal.send(b"t")
-        terminal.send(b"Offline native terminal detach regression\x13")
-        terminal.send(b"r")
+        terminal.send(TASK.encode() + b"\x13")
+        terminal.send(b"r", settle=None)
     terminal.wait_for(
         lambda: "FAKE NATIVE READY" in terminal.text() and bool(state(project)),
         "Native terminal did not open",
@@ -213,11 +147,14 @@ def start(terminal, project, *, cli):
 
 def pids(project):
     path = project / "mock-pids.json"
-    return json.loads(path.read_text()) if path.exists() else []
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, ValueError):  # not written yet, or mid-write
+        return []
 
 
 def detach(terminal, project, *, cli):
-    terminal.send(b"\x02")
+    terminal.send(b"\x02", settle=None)
     terminal.wait_for(
         lambda: (
             "Harness still running" in terminal.text()
@@ -245,21 +182,17 @@ def detach(terminal, project, *, cli):
 
 
 def assert_reaped(project):
-    end = time.monotonic() + 3
-    while any(alive(pid) for pid in pids(project)) and time.monotonic() < end:
-        time.sleep(0.02)
-    assert not any(alive(pid) for pid in pids(project)), "Harness descendants survived"
+    wait_until(
+        lambda: not any(alive(pid) for pid in pids(project)),
+        "Harness descendants survived",
+        timeout=3,
+    )
 
 
 def cleanup(terminal, project):
     terminal.cleanup()
     # Avoid leaving fixture descendants behind when exercising a broken binary.
-    for pid in pids(project):
-        if alive(pid):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+    kill_all(pids(project))
 
 
 def checkpoint(terminal, project):
@@ -283,12 +216,14 @@ def round_trip(*, cli=False):
             start(terminal, project, cli=cli)
             original_pid = state(project)["pid"]
             detach(terminal, project, cli=cli)
-            terminal.resize(80, 24)
+            terminal.resize(80, 24, settle="quiet")
             replay_start = len(terminal.raw)
-            terminal.send(b"t")
+            terminal.send(b"t", settle=None)
             terminal.wait_for(
-                lambda: "DETACH SCREEN SENTINEL" in terminal.text()
-                and b"DETACH SCREEN SENTINEL" in terminal.raw[replay_start:],
+                lambda: (
+                    "DETACH SCREEN SENTINEL" in terminal.text()
+                    and b"DETACH SCREEN SENTINEL" in terminal.raw[replay_start:]
+                ),
                 "Reattach did not replay the unchanged native screen",
             )
             terminal.wait_for(
@@ -296,7 +231,7 @@ def round_trip(*, cli=False):
                 "Detached resize was not applied to the native PTY",
             )
             assert state(project)["pid"] == original_pid
-            terminal.send("\x1b[200~reattached 雪\x1b[201~\r".encode())
+            terminal.send("\x1b[200~reattached 雪\x1b[201~\r", settle=None)
             terminal.wait_for(
                 lambda: state(project)["inputs"] == ["reattached 雪"],
                 "Reattached Unicode paste did not reach the same harness",
@@ -305,21 +240,28 @@ def round_trip(*, cli=False):
                 lambda: "ACK reattached 雪" in terminal.text(),
                 "Reattached output was not visible",
             )
-            terminal.resize(96, 28)
+            terminal.resize(96, 28, settle="quiet")
             terminal.wait_for(
                 lambda: (state(project)["cols"], state(project)["rows"]) == (96, 28),
                 "Attached resize was not applied to the native PTY",
             )
             assert "DETACH SCREEN SENTINEL" in terminal.text()
-            terminal.send(b"/exit\r")
+            terminal.send(b"/exit\r", settle=None)
             checkpoint(terminal, project)
             terminal.wait_for(
-                lambda: "Save and stop" in terminal.text() if cli else "MODEL ROUTER" in terminal.text(),
+                lambda: (
+                    "Save and stop" in terminal.text()
+                    if cli
+                    else "MODEL ROUTER" in terminal.text()
+                ),
                 "Router was not restored after harness exit",
             )
             terminal.send(b"q\r" if cli else b"q")
             terminal.exit()
-            print(f"PASS: {label} detach, progress, same PID, screen replay, resize, paste, /exit", flush=True)
+            print(
+                f"PASS: {label} detach, progress, same PID, screen replay, resize, paste, /exit",
+                flush=True,
+            )
         finally:
             cleanup(terminal, project)
 
@@ -338,7 +280,11 @@ def detached_end(action, *, cli=False, controlling=True):
                 (project / "finish-harness").touch()
                 checkpoint(terminal, project)
                 terminal.wait_for(
-                    lambda: "Save and stop" in terminal.text() if cli else "MODEL ROUTER" in terminal.text(),
+                    lambda: (
+                        "Save and stop" in terminal.text()
+                        if cli
+                        else "MODEL ROUTER" in terminal.text()
+                    ),
                     "Detached completion did not update the foreground",
                 )
                 terminal.send(b"q\r" if cli else b"q")
@@ -347,7 +293,7 @@ def detached_end(action, *, cli=False, controlling=True):
                 terminal.hangup()
             else:
                 # The TUI cancels with [C] and a confirmation; the CLI with c.
-                terminal.send(b"Cy" if not cli and action == "c" else action.encode())
+                terminal.send("Cy" if not cli and action == "c" else action, settle=None)
                 terminal.wait_for(
                     lambda: record(project).get("status") == "cancelled",
                     "Detached cancellation did not persist",
@@ -358,13 +304,16 @@ def detached_end(action, *, cli=False, controlling=True):
             if action != "complete":
                 assert record(project)["status"] == "cancelled"
                 assert_reaped(project)
-            print(f"PASS: {label} detached {action} (controlling={controlling})", flush=True)
+            print(
+                f"PASS: {label} detached {action} (controlling={controlling})",
+                flush=True,
+            )
         finally:
             cleanup(terminal, project)
 
 
 def main():
-    assert BINARY.is_file(), "Build model-router first"
+    require_binary()
     for cli in (False, True):
         round_trip(cli=cli)
         for action in ("complete", "c", "q"):
