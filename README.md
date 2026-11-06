@@ -589,7 +589,14 @@ next stage).
 The Monitor's Output pane shows each stage's events as readable lines:
 assistant text (`●`), tool calls and shell commands (`⚙`, `$`) with a one-line
 result (`↳`), file edits (`✎`), reasoning (`∴`), and errors (`✗`). Hook, delta,
-and bookkeeping events are hidden. `stdout.log` keeps the raw events.
+and bookkeeping events are hidden. `stdout.log` keeps the raw events; `O`
+opens the focused attempt's log in `$PAGER` (default `less -R`).
+
+The Output pane follows new lines. `PgUp` or `Home` pauses it
+(`▲ paused — End to follow`) and holds the view still as output arrives;
+`End`, `f`, or scrolling back down follows again. `/` searches the output
+(lowercase queries ignore case): matches are highlighted, `n`/`N` step through
+them while the search is shown, and `Esc` clears it.
 
 To work in the session yourself, press `t` in the Monitor and confirm with `y`:
 the router stops the unattended process and reopens the same session in the harness's native
@@ -639,15 +646,29 @@ with `Space` or delete it: v2 files are not migrated again.
 
 When an interactive harness exits, inspect its handoff and advance, reopen, or
 stop. `Ctrl+]` stops a stuck interactive harness. In the monitor, `h` inspects
-the handoff, `a` advances, `i` reopens interactively, `y` retries, and `m` replaces
+the handoff (findings by severity, tests by status; `↑`/`↓` and `e` open a
+changed file in `$EDITOR`), `a` advances, `i` reopens interactively, `y` retries, and `m` replaces
 the model before retrying. `e` edits a non-review interactive handoff summary.
 The CLI's `--advance` is the equivalent explicit handoff acceptance.
 
 When a run completes or stops, the monitor shows its results: files changed
 during this run with line counts, checks performed (router or model-reported,
 required or optional), unresolved findings, and each stage's active time,
-attempts, retries, and usage. `d` opens the full diff and `o` switches to the
-output log. The CLI prints the same summary after `Completed`. `report` prints
+attempts, retries, and usage. `d` opens the diff and `o` switches to the
+output log.
+
+| Diff key | Action |
+| --- | --- |
+| `]` / `[` (`n` / `p` without a search) | Next/previous file |
+| `}` / `{` | Next/previous hunk |
+| `/`, then `n` / `N` | Search the diff; next/previous match; `Esc` clears |
+| `w` | Toggle word wrap |
+| `o` | Open the coloured patch in `$PAGER` (default `less -R`) |
+| `e` / `Enter` | Open the file at the line in view in `$VISUAL`/`$EDITOR` (`+N` for vi, Vim, Neovim, nano, Emacs; `file:N` for Helix; `-g file:N` for VS Code) |
+| `D` | `git difftool --dir-diff` over the run's changes (needs `git config diff.tool`) |
+
+`$PAGER` and `$EDITOR` are split like shell words and run without a shell.
+Each file shows up to 5,000 diff lines; the pager shows the rest. The CLI prints the same summary after `Completed`. `report` prints
 it for any saved run, including stopped ones; `--json` gives the data and
 `--diff` the patch; `--transitions` prints every run, stage, and attempt status
 change with its time, cause (engine, user, or recovery), and reason. Changes come from Git snapshots taken by the router

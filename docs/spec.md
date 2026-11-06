@@ -178,8 +178,10 @@ API clients, automatic task classification, and embedded IDE control are exclude
   handoff view, and explicit recovery actions. Finished runs show a results view:
   files changed during the run (from private Git snapshots), checks by source,
   unresolved findings, per-stage time, retries, and harness-reported usage, with
-  unavailable values labelled; the full diff opens in a dialog. `report` prints
-  the same summary from the CLI.
+  unavailable values labelled; the diff opens in a dialog with a file list,
+  coloured hunks, search, and hand-offs to `$PAGER`, `$VISUAL`/`$EDITOR`, and
+  `git difftool` (argv only, never a shell). The output log can be paused,
+  searched, and opened in `$PAGER`. `report` prints the same summary from the CLI.
 - Run history with live text and status filters, damaged-record rows,
   background-computed sizes, confirmed reruns, attempt comparison, and cleanup
   previews; harness availability/catalog view.
