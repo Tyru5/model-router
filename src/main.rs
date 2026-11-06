@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use model_router::{
     catalog,
     config::{self, Mode, Role, Settings},
-    doctor,
+    cost, doctor,
     engine::{self, Action, Event, Run, Status},
     history::{self, Criteria, Entry, StatusFilter},
     presets, process, providers, task_import,
@@ -104,6 +104,20 @@ enum Commands {
         /// Allow one more review repair pass after the repair limit stopped the run.
         #[arg(long, conflicts_with_all = ["retry", "interactive", "model", "advance"])]
         allow_repair: bool,
+        /// Set the run's USD budget (and any exceeded stage cap) to N and continue.
+        #[arg(long, value_name = "N")]
+        budget_usd: Option<f64>,
+        /// Set the run's token budget (and any exceeded stage cap) to N and continue.
+        #[arg(long, value_name = "N")]
+        budget_tokens: Option<u64>,
+    },
+    /// Estimated spend over saved runs, by harness and model.
+    Cost {
+        /// Only attempts started within this long ago, e.g. 7d, 12h, 2w.
+        #[arg(long, value_name = "AGE")]
+        since: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// Start a new run from a saved run's task and workflow snapshot.
     Rerun {
@@ -336,6 +350,7 @@ fn main_result() -> Result<()> {
         Some(Commands::Report { id, json, diff }) => {
             use model_router::report;
             let run = engine::load(&project, &id)?;
+            cost::refresh_provider_prices(&project, &cost::routed_providers(&run));
             if diff {
                 print!("{}", report::diff(&run)?);
             } else if json {
@@ -534,6 +549,13 @@ fn main_result() -> Result<()> {
             }
             let mut run = Run::create(&project, &settings, &workflow, task, worktree)?;
             println!("Run: {}\nArtifacts: {}", run.id, run.directory.display());
+            // Provider prices for estimates; never delays the run, and an
+            // offline lookup just keeps the cache.
+            let routed = cost::routed_providers(&run);
+            if !routed.is_empty() {
+                let project = project.clone();
+                std::thread::spawn(move || cost::refresh_provider_prices(&project, &routed));
+            }
             cli_drive(&mut run, &cancel)?;
         }
         Some(Commands::Resume {
@@ -543,8 +565,13 @@ fn main_result() -> Result<()> {
             model,
             advance,
             allow_repair,
+            budget_usd,
+            budget_tokens,
         }) => {
             let mut run = engine::load(&project, &id)?;
+            if budget_usd.is_some() || budget_tokens.is_some() {
+                cost::raise_budget(&mut run, budget_usd, budget_tokens)?;
+            }
             if advance {
                 run.confirm()?;
             }
@@ -555,6 +582,25 @@ fn main_result() -> Result<()> {
                 run.retry(interactive, model)?;
             }
             cli_drive(&mut run, &cancel)?;
+        }
+        Some(Commands::Cost { since, json }) => {
+            let since = since
+                .as_deref()
+                .map(cost::parse_since)
+                .transpose()?
+                .map(|age| chrono::Utc::now() - age);
+            let runs = engine::history(&project)?;
+            let mut routed = std::collections::BTreeMap::new();
+            for run in &runs {
+                routed.extend(cost::routed_providers(run));
+            }
+            cost::refresh_provider_prices(&project, &routed);
+            let summary = cost::aggregate(&runs, since, &cost::Pricing::load(&project));
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                print!("{}", cost::render_summary(&summary));
+            }
         }
         Some(Commands::Rerun {
             id,

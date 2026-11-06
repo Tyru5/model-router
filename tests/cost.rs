@@ -215,3 +215,56 @@ fn runs_without_a_budget_are_never_gated() {
     assert!(cost::raise_budget(&mut run, None, None).is_err());
     assert!(cost::raise_budget(&mut run, Some(-1.0), None).is_err());
 }
+
+#[test]
+fn cli_resumes_with_a_raised_budget_and_aggregates_history() {
+    let budget = Budget {
+        max_usd: Some(1.0),
+        max_tokens: None,
+    };
+    let stages = vec![
+        stage("a", "cost-2"),
+        stage("b", "cost-1"),
+        stage("c", "cost-1"),
+    ];
+    let (dir, mut run) = create(stages, budget);
+    assert_eq!(drive(&mut run), Action::Stopped);
+    let cli = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_model-router"))
+            .arg("-C")
+            .arg(dir.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let resumed = cli(&["resume", &run.id, "--budget-usd", "2.5"]);
+    assert!(
+        !resumed.status.success(),
+        "b runs, then $3 > $2.50 stops c: {}",
+        String::from_utf8_lossy(&resumed.stdout)
+    );
+    let saved = engine::load(dir.path(), &run.id).unwrap();
+    assert_eq!(saved.workflow.budget.max_usd, Some(2.5));
+    assert!(cost::budget_blocked(&saved), "{:?}", saved.error);
+    assert!(
+        cli(&["resume", &run.id, "--budget-usd", "5"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        engine::load(dir.path(), &run.id).unwrap().status,
+        Status::Complete
+    );
+    let out = cli(&["cost", "--json", "--since", "1h"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["total"]["reported"]["usd"], 4.0);
+    assert_eq!(json["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(json["rows"][0]["harness"], "claude");
+    let text = String::from_utf8_lossy(&cli(&["cost"]).stdout).into_owned();
+    assert!(text.contains("Total: $4.00 (reported)"), "{text}");
+}
