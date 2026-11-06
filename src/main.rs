@@ -423,6 +423,7 @@ fn main_result() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&reports)?);
             } else {
                 print!("{}", doctor::table(&reports));
+                println!("\n{}", doctor::sandbox_line());
                 println!("\n{}", doctor::AUTH_NOTE);
             }
             ensure!(

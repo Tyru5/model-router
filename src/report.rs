@@ -698,6 +698,7 @@ pub(crate) mod tests {
         let workflow = Workflow {
             name: "Feature".into(),
             max_repair_passes: 2,
+            sandbox_default: Default::default(),
             stages: names
                 .iter()
                 .map(|(id, name)| Stage {

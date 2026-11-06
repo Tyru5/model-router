@@ -463,7 +463,8 @@ or send your keys elsewhere. These sections take effect only after you trust
 the file: custom adapters, stage checks, extra arguments, permission settings
 that loosen a harness's checks (`danger-full-access`, `bypassPermissions`,
 `yolo`, Cursor sandbox `disabled`, Aider `yes-always`, Goose `auto`, Copilot
-`allow-all-tools`), and providers with their own endpoint or key variable.
+`allow-all-tools`), router sandbox loosening (see [Sandboxing](#sandboxing)),
+and providers with their own endpoint or key variable.
 
 ```sh
 model-router trust          # list them and confirm
@@ -735,6 +736,44 @@ configuration. They do not edit
 the harness's global configuration or credentials. Changing harness clears
 its structured settings along with model/provider/effort; explicit extra
 arguments are kept for you to review.
+
+### Sandboxing
+
+Harness permissions above are enforced by each harness. The router can add its
+own OS-level filesystem sandbox around any harness, off by default:
+
+```toml
+[[workflows]]
+name = "Feature development"
+sandbox_default = "by-role"   # off | read-only | workspace-write | by-role
+
+[[workflows.stages]]
+id = "review"
+sandbox = "read-only"           # unset inherits sandbox_default
+sandbox_writable = ["~/.npm"]   # extra writable paths (absolute or ~/)
+sandbox_network = false         # default true: harnesses need their APIs
+sandbox_fallback = "warn"       # default "refuse"
+```
+
+- `read-only`: everything is readable; only the attempt directory, the run's
+  handoff directory, a private `/tmp`, the harness's state directories
+  (`~/.<harness>`, `~/.config/<harness>`, `~/.local/share/<harness>`,
+  `~/.cache`, `~/.local/state`, plus `~/.claude.json` for Claude), and
+  `sandbox_writable` are writable.
+- `workspace-write`: also the workspace and, for a linked worktree, its Git
+  directories.
+- `by-role`: read-only for research, planning, review, and summary stages;
+  workspace-write for the rest.
+
+Linux uses [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`);
+macOS uses `sandbox-exec` with a generated profile. Interactive stages keep
+their terminal. If no backend works, the stage fails before launch rather than
+running unsandboxed, unless `sandbox_fallback = "warn"`. `model-router doctor`
+reports the backend, `preview` and the stage panel show each stage's sandbox,
+and the attempt's `command.json` records the backend and writable paths. The
+**Router sandbox** stage field picks the mode in the TUI. Harness state
+directories stay writable, so a harness could still change its own settings;
+a project config replaces your global one, so set the sandbox there too.
 
 Failures, cancellation, malformed review verdicts, and timeouts stop progress.
 Retries preserve existing filesystem changes and get separate attempt logs.

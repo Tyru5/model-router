@@ -6,7 +6,7 @@
 //! so any change to a dangerous section asks again. The user's global config
 //! and an explicit `--config` file are always trusted.
 use crate::{
-    config::{self, Check, CustomAdapter, Settings},
+    config::{self, Check, CustomAdapter, Sandbox, SandboxFallback, Settings, Stage, Workflow},
     harness_settings,
     providers::{self, Provider},
 };
@@ -122,6 +122,7 @@ pub fn dangerous(settings: &Settings) -> Vec<String> {
             for (key, value) in harness_settings::escalations(stage) {
                 items.push(format!("{} {key} = {value} in {at}", stage.harness));
             }
+            items.extend(sandbox_loosening(workflow, stage, &at));
         }
     }
     for (name, provider) in &settings.providers {
@@ -144,6 +145,37 @@ pub fn dangerous(settings: &Settings) -> Vec<String> {
         }
     }
     items
+}
+
+/// Sandbox settings that weaken the router sandbox: a stage mode looser than
+/// its workflow's default, extra writable paths, and running unsandboxed when
+/// no backend works. Tighter settings (a stricter mode, no network) are safe.
+fn sandbox_loosening(workflow: &Workflow, stage: &Stage, at: &str) -> Vec<String> {
+    let mut items = vec![];
+    if downgrades_sandbox(workflow, stage) {
+        items.push(format!(
+            "sandbox = {} in {at} (workflow default: {})",
+            stage.effective_sandbox(workflow).label(),
+            workflow.sandbox_default.resolve(stage.role).label()
+        ));
+    }
+    if !stage.sandbox_writable.is_empty() {
+        items.push(format!(
+            "sandbox writable paths in {at}: {}",
+            quoted(&stage.sandbox_writable)
+        ));
+    }
+    if stage.sandbox_fallback == SandboxFallback::Warn {
+        items.push(format!("sandbox_fallback = warn in {at}"));
+    }
+    items
+}
+
+/// Whether the stage's own mode is looser than its workflow's default.
+/// `Sandbox` orders off < workspace-write < read-only.
+fn downgrades_sandbox(workflow: &Workflow, stage: &Stage) -> bool {
+    stage.sandbox.is_some()
+        && stage.effective_sandbox(workflow) < workflow.sandbox_default.resolve(stage.role)
 }
 
 fn adapter_argv(adapter: &CustomAdapter) -> Vec<String> {
@@ -259,6 +291,9 @@ struct IgnoredStage {
     checks: Vec<Check>,
     extra_args: Vec<String>,
     settings: BTreeMap<String, String>,
+    sandbox: Option<Sandbox>,
+    sandbox_writable: Vec<String>,
+    sandbox_fallback: SandboxFallback,
 }
 
 /// Neutralizes every dangerous section: custom adapters keep their names but
@@ -288,12 +323,23 @@ pub fn ignore(settings: &mut Settings) {
         }
     }
     for workflow in &mut settings.workflows {
+        let default = Workflow {
+            stages: vec![],
+            ..workflow.clone()
+        };
         for stage in &mut workflow.stages {
             let escalated: BTreeMap<String, String> = harness_settings::escalations(stage)
                 .into_iter()
                 .map(|(k, v)| (k.to_owned(), v.to_owned()))
                 .collect();
-            if stage.checks.is_empty() && stage.extra_args.is_empty() && escalated.is_empty() {
+            let downgraded = downgrades_sandbox(&default, stage);
+            if stage.checks.is_empty()
+                && stage.extra_args.is_empty()
+                && escalated.is_empty()
+                && !downgraded
+                && stage.sandbox_writable.is_empty()
+                && stage.sandbox_fallback == SandboxFallback::Refuse
+            {
                 continue;
             }
             for key in escalated.keys() {
@@ -305,12 +351,20 @@ pub fn ignore(settings: &mut Settings) {
                     checks: std::mem::take(&mut stage.checks),
                     extra_args: std::mem::take(&mut stage.extra_args),
                     settings: escalated,
+                    // The stage inherits the stricter workflow default instead.
+                    sandbox: if downgraded {
+                        stage.sandbox.take()
+                    } else {
+                        None
+                    },
+                    sandbox_writable: std::mem::take(&mut stage.sandbox_writable),
+                    sandbox_fallback: std::mem::take(&mut stage.sandbox_fallback),
                 },
             );
         }
     }
     settings.warnings.push(
-        "Project config is untrusted: its custom adapters, checks, extra arguments, escalated permissions, and custom providers are ignored this session. Run `model-router trust` to use them.".into(),
+        "Project config is untrusted: its custom adapters, checks, extra arguments, escalated permissions, sandbox loosening, and custom providers are ignored this session. Run `model-router trust` to use them.".into(),
     );
     settings.ignored = Some(Box::new(ignored));
 }
@@ -353,6 +407,15 @@ pub fn restore(settings: &Settings) -> Settings {
                 if current.is_empty() {
                     *current = value.clone();
                 }
+            }
+            if stage.sandbox.is_none() {
+                stage.sandbox = original.sandbox;
+            }
+            if stage.sandbox_writable.is_empty() {
+                stage.sandbox_writable = original.sandbox_writable.clone();
+            }
+            if stage.sandbox_fallback == SandboxFallback::Refuse {
+                stage.sandbox_fallback = original.sandbox_fallback;
             }
         }
     }
@@ -449,6 +512,56 @@ mod tests {
             .providers
             .insert("openrouter".into(), Provider::default());
         assert!(dangerous(&settings).is_empty());
+    }
+
+    #[test]
+    fn loosening_the_sandbox_needs_trust_and_tightening_does_not() {
+        let mut settings = Settings::default();
+        let workflow = &mut settings.workflows[0];
+        workflow.sandbox_default = Sandbox::ByRole;
+        // Stricter than the role default, and offline: safe.
+        workflow.stages[1].sandbox = Some(Sandbox::ReadOnly);
+        workflow.stages[1].sandbox_network = false;
+        workflow.stages[0].sandbox = Some(Sandbox::ReadOnly);
+        assert!(
+            dangerous(&settings).is_empty(),
+            "{:?}",
+            dangerous(&settings)
+        );
+        let original = {
+            let stage = &mut settings.workflows[0].stages[0];
+            stage.sandbox = Some(Sandbox::Off);
+            stage.sandbox_writable = vec!["~/.ssh".into()];
+            stage.sandbox_fallback = SandboxFallback::Warn;
+            settings.clone()
+        };
+        let text = dangerous(&settings).join("\n");
+        for part in [
+            "sandbox = off in Feature development / research (workflow default: read-only)",
+            "sandbox writable paths in Feature development / research: '~/.ssh'",
+            "sandbox_fallback = warn in Feature development / research",
+        ] {
+            assert!(text.contains(part), "{part}: {text}");
+        }
+        // Lowering the workflow default only matters to stages that inherit it.
+        let mut lowered = Settings::default();
+        lowered.workflows[0].stages[0].sandbox = Some(Sandbox::WorkspaceWrite);
+        assert!(dangerous(&lowered).is_empty());
+
+        ignore(&mut settings);
+        let stage = &settings.workflows[0].stages[0];
+        assert_eq!(
+            stage.effective_sandbox(&settings.workflows[0]),
+            Sandbox::ReadOnly
+        );
+        assert!(stage.sandbox_writable.is_empty());
+        assert_eq!(stage.sandbox_fallback, SandboxFallback::Refuse);
+        assert_eq!(
+            settings.workflows[0].stages[1].sandbox,
+            Some(Sandbox::ReadOnly)
+        );
+        assert!(dangerous(&settings).is_empty());
+        assert_eq!(dangerous(&restore(&settings)), dangerous(&original));
     }
 
     #[test]

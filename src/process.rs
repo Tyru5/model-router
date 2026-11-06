@@ -1,5 +1,5 @@
 //! Unix process supervision. No command is evaluated by a shell.
-use crate::adapters::Invocation;
+use crate::{adapters::Invocation, sandbox::Plan};
 use anyhow::{Context, Result, ensure};
 use portable_pty::{CommandBuilder, PtySize};
 use std::{
@@ -210,25 +210,40 @@ pub fn capture(
     cancel: &AtomicBool,
     on_output: impl FnMut(bool, &str),
 ) -> Result<Outcome> {
-    capture_with(inv, cwd, dir, timeout, cancel, |_| {}, on_output)
+    capture_with(inv, cwd, dir, timeout, cancel, None, |_| {}, on_output)
 }
 
-/// `capture`, reporting the harness's process group ID once it starts, so
-/// the caller can record it for crash recovery.
+/// The program and arguments to launch: `inv`'s, inside `sandbox` if any.
+fn launch(inv: &Invocation, sandbox: Option<&Plan>) -> (String, Vec<String>) {
+    match sandbox {
+        Some(plan) => plan.wrap(&inv.program, &inv.args),
+        None => (inv.program.clone(), inv.args.clone()),
+    }
+}
+
+/// `capture` inside an optional sandbox, reporting the harness's process
+/// group ID once it starts, so the caller can record it for crash recovery.
+#[allow(clippy::too_many_arguments)]
 pub fn capture_with(
     inv: &Invocation,
     cwd: &Path,
     dir: &Path,
     timeout: Duration,
     cancel: &AtomicBool,
+    sandbox: Option<&Plan>,
     on_spawn: impl FnOnce(u32),
     mut on_output: impl FnMut(bool, &str),
 ) -> Result<Outcome> {
     let mut stdout_log = File::create(dir.join("stdout.log"))?;
     let mut stderr_log = File::create(dir.join("stderr.log"))?;
-    let mut command = Command::new(&inv.program);
+    if let Some(warning) = sandbox.and_then(|plan| plan.warning.as_deref()) {
+        writeln!(stderr_log, "{warning}")?;
+        on_output(true, &format!("{warning}\n"));
+    }
+    let (program, args) = launch(inv, sandbox);
+    let mut command = Command::new(&program);
     command
-        .args(&inv.args)
+        .args(&args)
         .current_dir(cwd)
         .env("NO_COLOR", "1")
         .stdout(Stdio::piped())
@@ -1153,6 +1168,7 @@ pub fn interactive(
     dir: &Path,
     cancel: &AtomicBool,
     session: &InteractiveSession,
+    sandbox: Option<&Plan>,
     on_spawn: impl FnOnce(u32),
 ) -> Result<Outcome> {
     let mut size = {
@@ -1179,8 +1195,9 @@ pub fn interactive(
         pixel_width: 0,
         pixel_height: 0,
     })?;
-    let mut cmd = CommandBuilder::new(&inv.program);
-    cmd.args(&inv.args);
+    let (program, args) = launch(inv, sandbox);
+    let mut cmd = CommandBuilder::new(&program);
+    cmd.args(&args);
     for name in inv.removed() {
         cmd.env_remove(name);
     }
@@ -1190,7 +1207,11 @@ pub fn interactive(
     inv.write_files()?;
     cmd.cwd(cwd);
     let mut transcript = File::create(dir.join("stdout.log"))?;
-    File::create(dir.join("stderr.log"))?;
+    let mut stderr_log = File::create(dir.join("stderr.log"))?;
+    if let Some(warning) = sandbox.and_then(|plan| plan.warning.as_deref()) {
+        writeln!(stderr_log, "{warning}")?;
+        session.state().output(format!("{warning}\r\n").as_bytes());
+    }
     let fd = pair
         .master
         .as_raw_fd()
@@ -1464,7 +1485,16 @@ mod tests {
                 }
                 cancel.store(true, Ordering::Relaxed);
             });
-            interactive(&inv, dir.path(), dir.path(), &cancel, &session, |_| {}).unwrap()
+            interactive(
+                &inv,
+                dir.path(),
+                dir.path(),
+                &cancel,
+                &session,
+                None,
+                |_| {},
+            )
+            .unwrap()
         });
         assert!(outcome.cancelled);
         assert!(

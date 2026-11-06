@@ -495,6 +495,11 @@ fn manifest() -> Vec<Fixture> {
         .unwrap_or_default()
 }
 
+/// Whether a router sandbox backend works here; see `sandbox`.
+pub fn sandbox_line() -> String {
+    crate::sandbox::doctor_line()
+}
+
 /// The `doctor` table: one row per harness.
 pub fn table(reports: &[Report]) -> String {
     let header = [

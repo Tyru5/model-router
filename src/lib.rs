@@ -14,6 +14,7 @@ pub mod presets;
 pub mod process;
 pub mod providers;
 pub mod report;
+pub mod sandbox;
 pub mod serve;
 pub mod snapshot;
 pub mod stats;

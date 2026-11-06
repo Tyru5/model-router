@@ -42,9 +42,15 @@ workflow or changes a saved run; reviews start disabled in workflow presets.
   times out, or cannot start blocks the stage, except in an enabled review,
   where it requests a repair (see Optional reviews); optional failures are
   recorded.
-- Read-only stage intent is expressed in instructions. Effective execution
-  permissions are supplied by the harness and the user's explicit overrides;
-  the router is not a universal sandbox.
+- Read-only stage intent is expressed in instructions; harness permissions come
+  from the harness and the user's explicit overrides. An optional router
+  sandbox (stage `sandbox`, workflow `sandbox_default`; off by default) enforces
+  it independently of the harness: `read-only` leaves writable only the attempt
+  and handoff directories, a private `/tmp`, harness state directories, and
+  `sandbox_writable` paths; `workspace-write` adds the workspace and its Git
+  directory. Linux uses bubblewrap, macOS `sandbox-exec`. A stage whose sandbox
+  cannot be set up fails before launch unless `sandbox_fallback = "warn"`.
+  `command.json` records the effective sandbox.
 - Surface reported permission denials and errors. Unattended processes have no
   interactive stdin. A harness that does not report approval requirements clearly
   can be cancelled or timed out and reopened interactively.
@@ -71,8 +77,9 @@ releases can add fields; stage and check fields stay strict.
 
 A project's `.model-router.toml` is untrusted until the user approves its
 dangerous sections: custom adapters, checks, extra arguments, permission
-settings that loosen a harness's checks, and providers with their own endpoint
-or key variable. Approval stores a SHA-256 digest of those sections per
+settings that loosen a harness's checks, router sandbox loosening (a stage mode
+weaker than its workflow default, `sandbox_writable`, `sandbox_fallback =
+"warn"`), and providers with their own endpoint or key variable. Approval stores a SHA-256 digest of those sections per
 canonical project path in the user's `trust.json`; any change asks again.
 `run` refuses an untrusted config and lists the sections; the TUI asks once
 (trust, continue with them ignored, or quit); read-only commands ignore them.
