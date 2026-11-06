@@ -1,0 +1,698 @@
+{
+  "unattended/default": {
+    "build": {
+      "program": "copilot",
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/model": {
+    "build": {
+      "program": "copilot",
+      "args": [
+        "--model",
+        "m-1",
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/model+provider": {
+    "build": {
+      "error": "copilot uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/model+local-provider": {
+    "build": {
+      "error": "copilot uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/model+lmstudio": {
+    "build": {
+      "error": "copilot uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/model+effort": {
+    "build": {
+      "error": "copilot has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/effort-only": {
+    "build": {
+      "error": "copilot has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/model+provider+effort": {
+    "build": {
+      "error": "copilot uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/routed": {
+    "build": {
+      "error": "copilot cannot use router provider proxy; it only uses its own account"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/routed-keyless": {
+    "build": {
+      "error": "copilot cannot use router provider local; it only uses its own account"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/routed-preset": {
+    "build": {
+      "error": "copilot cannot use router provider groq; it only uses its own account"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/routed+effort": {
+    "build": {
+      "error": "copilot cannot use router provider proxy; it only uses its own account"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/provider-without-model": {
+    "build": {
+      "error": "copilot uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/structured-off-old-version": {
+    "build": {
+      "error": "copilot has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/old-version-routed": {
+    "build": {
+      "error": "copilot cannot use router provider proxy; it only uses its own account"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/old-version-default": {
+    "build": {
+      "program": "copilot",
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/extra-args": {
+    "build": {
+      "program": "copilot",
+      "args": [
+        "--model",
+        "m-1",
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)",
+        "--extra-flag",
+        "v"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)",
+        "--extra-flag",
+        "v"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/user-output-schema": {
+    "build": {
+      "program": "copilot",
+      "args": [
+        "--model",
+        "m-1",
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)",
+        "--output-schema",
+        "mine.json"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)",
+        "--output-schema",
+        "mine.json"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/user-json-schema": {
+    "build": {
+      "program": "copilot",
+      "args": [
+        "--model",
+        "m-1",
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)",
+        "--json-schema={}"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)",
+        "--json-schema={}"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/unknown-setting": {
+    "build": {
+      "error": "copilot has no stage setting nope"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/setting:tool_permissions=allow-all-tools": {
+    "build": {
+      "program": "copilot",
+      "args": [
+        "--model",
+        "m-1",
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)",
+        "--allow-all-tools"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)",
+        "--allow-all-tools"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/setting:tool_permissions=": {
+    "build": {
+      "program": "copilot",
+      "args": [
+        "--model",
+        "m-1",
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--prompt",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/setting:tool_permissions+invalid": {
+    "build": {
+      "error": "Invalid Tool permissions for copilot: not-a-choice"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/default": {
+    "build": {
+      "program": "copilot",
+      "args": [
+        "--interactive",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--interactive",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/model": {
+    "build": {
+      "program": "copilot",
+      "args": [
+        "--model",
+        "m-1",
+        "--interactive",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--interactive",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/model+provider": {
+    "build": {
+      "error": "copilot uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/model+local-provider": {
+    "build": {
+      "error": "copilot uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/model+lmstudio": {
+    "build": {
+      "error": "copilot uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/model+effort": {
+    "build": {
+      "error": "copilot has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/effort-only": {
+    "build": {
+      "error": "copilot has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/model+provider+effort": {
+    "build": {
+      "error": "copilot uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/routed": {
+    "build": {
+      "error": "copilot cannot use router provider proxy; it only uses its own account"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/routed-keyless": {
+    "build": {
+      "error": "copilot cannot use router provider local; it only uses its own account"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/routed-preset": {
+    "build": {
+      "error": "copilot cannot use router provider groq; it only uses its own account"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/routed+effort": {
+    "build": {
+      "error": "copilot cannot use router provider proxy; it only uses its own account"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/provider-without-model": {
+    "build": {
+      "error": "copilot uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/structured-off-old-version": {
+    "build": {
+      "error": "copilot has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/old-version-routed": {
+    "build": {
+      "error": "copilot cannot use router provider proxy; it only uses its own account"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/old-version-default": {
+    "build": {
+      "program": "copilot",
+      "args": [
+        "--interactive",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--interactive",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/extra-args": {
+    "build": {
+      "program": "copilot",
+      "args": [
+        "--model",
+        "m-1",
+        "--interactive",
+        "Do the task.\nLine two {model} $(x)",
+        "--extra-flag",
+        "v"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--interactive",
+        "Do the task.\nLine two {model} $(x)",
+        "--extra-flag",
+        "v"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/user-output-schema": {
+    "build": {
+      "program": "copilot",
+      "args": [
+        "--model",
+        "m-1",
+        "--interactive",
+        "Do the task.\nLine two {model} $(x)",
+        "--output-schema",
+        "mine.json"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--interactive",
+        "Do the task.\nLine two {model} $(x)",
+        "--output-schema",
+        "mine.json"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/user-json-schema": {
+    "build": {
+      "program": "copilot",
+      "args": [
+        "--model",
+        "m-1",
+        "--interactive",
+        "Do the task.\nLine two {model} $(x)",
+        "--json-schema={}"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--interactive",
+        "Do the task.\nLine two {model} $(x)",
+        "--json-schema={}"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/unknown-setting": {
+    "build": {
+      "error": "copilot has no stage setting nope"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/setting:tool_permissions=allow-all-tools": {
+    "build": {
+      "program": "copilot",
+      "args": [
+        "--model",
+        "m-1",
+        "--interactive",
+        "Do the task.\nLine two {model} $(x)",
+        "--allow-all-tools"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--interactive",
+        "Do the task.\nLine two {model} $(x)",
+        "--allow-all-tools"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/setting:tool_permissions=": {
+    "build": {
+      "program": "copilot",
+      "args": [
+        "--model",
+        "m-1",
+        "--interactive",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--interactive",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/setting:tool_permissions+invalid": {
+    "build": {
+      "error": "Invalid Tool permissions for copilot: not-a-choice"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  }
+}

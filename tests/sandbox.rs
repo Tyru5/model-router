@@ -166,6 +166,7 @@ fn interactive_harnesses_keep_their_terminal_inside_the_sandbox() {
         final_file: attempt.join("unused"),
         env: vec![],
         files: vec![],
+        assign: None,
     };
     let session = InteractiveSession::new(100, 30);
     let cancel = AtomicBool::new(false);

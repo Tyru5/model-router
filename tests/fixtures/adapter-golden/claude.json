@@ -1,0 +1,1836 @@
+{
+  "unattended/default": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+provider": {
+    "build": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "unattended/model+local-provider": {
+    "build": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "unattended/model+lmstudio": {
+    "build": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "unattended/model+effort": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--effort",
+        "high"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--effort",
+        "high"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--effort",
+        "high"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/effort-only": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--effort",
+        "high"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--effort",
+        "high"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--effort",
+        "high"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+provider+effort": {
+    "build": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "unattended/routed": {
+    "build": {
+      "error": "claude cannot use router provider proxy; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude cannot use router provider proxy; it only uses its own account"
+    }
+  },
+  "unattended/routed-keyless": {
+    "build": {
+      "error": "claude cannot use router provider local; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude cannot use router provider local; it only uses its own account"
+    }
+  },
+  "unattended/routed-preset": {
+    "build": {
+      "error": "claude cannot use router provider groq; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude cannot use router provider groq; it only uses its own account"
+    }
+  },
+  "unattended/routed+effort": {
+    "build": {
+      "error": "claude cannot use router provider proxy; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude cannot use router provider proxy; it only uses its own account"
+    }
+  },
+  "unattended/provider-without-model": {
+    "build": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "unattended/structured-off-old-version": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--model",
+        "m-1",
+        "--effort",
+        "high"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--model",
+        "m-1",
+        "--effort",
+        "high"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--effort",
+        "high"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/old-version-routed": {
+    "build": {
+      "error": "claude cannot use router provider proxy; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude cannot use router provider proxy; it only uses its own account"
+    }
+  },
+  "unattended/old-version-default": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/extra-args": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/user-output-schema": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    }
+  },
+  "unattended/user-json-schema": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--model",
+        "m-1",
+        "--json-schema={}"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--model",
+        "m-1",
+        "--json-schema={}"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--json-schema={}"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/unknown-setting": {
+    "build": {
+      "error": "claude has no stage setting nope"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude has no stage setting nope"
+    }
+  },
+  "unattended/setting:permission_mode=manual": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "manual"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "manual"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "manual"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/setting:permission_mode=acceptEdits": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "acceptEdits"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "acceptEdits"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "acceptEdits"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/setting:permission_mode=plan": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "plan"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "plan"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "plan"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/setting:permission_mode=dontAsk": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "dontAsk"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "dontAsk"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "dontAsk"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/setting:permission_mode=auto": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "auto"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "auto"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "auto"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/setting:permission_mode=bypassPermissions": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "bypassPermissions"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "bypassPermissions"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "bypassPermissions"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/setting:permission_mode=": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"type\":\"object\"}",
+        "--model",
+        "m-1"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/setting:permission_mode+invalid": {
+    "build": {
+      "error": "Invalid Permission mode for claude: not-a-choice"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "Invalid Permission mode for claude: not-a-choice"
+    }
+  },
+  "interactive/default": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--model",
+        "m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--model",
+        "m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+provider": {
+    "build": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "interactive/model+local-provider": {
+    "build": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "interactive/model+lmstudio": {
+    "build": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "interactive/model+effort": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--model",
+        "m-1",
+        "--effort",
+        "high",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--model",
+        "m-1",
+        "--effort",
+        "high",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--effort",
+        "high"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/effort-only": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--effort",
+        "high",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--effort",
+        "high",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--effort",
+        "high"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+provider+effort": {
+    "build": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "interactive/routed": {
+    "build": {
+      "error": "claude cannot use router provider proxy; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude cannot use router provider proxy; it only uses its own account"
+    }
+  },
+  "interactive/routed-keyless": {
+    "build": {
+      "error": "claude cannot use router provider local; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude cannot use router provider local; it only uses its own account"
+    }
+  },
+  "interactive/routed-preset": {
+    "build": {
+      "error": "claude cannot use router provider groq; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude cannot use router provider groq; it only uses its own account"
+    }
+  },
+  "interactive/routed+effort": {
+    "build": {
+      "error": "claude cannot use router provider proxy; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude cannot use router provider proxy; it only uses its own account"
+    }
+  },
+  "interactive/provider-without-model": {
+    "build": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "interactive/structured-off-old-version": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--model",
+        "m-1",
+        "--effort",
+        "high",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--model",
+        "m-1",
+        "--effort",
+        "high",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--effort",
+        "high"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/old-version-routed": {
+    "build": {
+      "error": "claude cannot use router provider proxy; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude cannot use router provider proxy; it only uses its own account"
+    }
+  },
+  "interactive/old-version-default": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/extra-args": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/user-output-schema": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    }
+  },
+  "interactive/user-json-schema": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--json-schema={}"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/unknown-setting": {
+    "build": {
+      "error": "claude has no stage setting nope"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "claude has no stage setting nope"
+    }
+  },
+  "interactive/setting:permission_mode=manual": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "manual",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "manual",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "manual"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/setting:permission_mode=acceptEdits": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "acceptEdits",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "acceptEdits",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "acceptEdits"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/setting:permission_mode=plan": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "plan",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "plan",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "plan"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/setting:permission_mode=dontAsk": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "dontAsk",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "dontAsk",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "dontAsk"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/setting:permission_mode=auto": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "auto",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "auto",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "auto"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/setting:permission_mode=bypassPermissions": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "bypassPermissions",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "bypassPermissions",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "bypassPermissions"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/setting:permission_mode=": {
+    "build": {
+      "program": "claude",
+      "args": [
+        "--model",
+        "m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--session-id",
+        "<session-id>",
+        "--model",
+        "m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--model",
+        "m-1"
+      ],
+      "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/setting:permission_mode+invalid": {
+    "build": {
+      "error": "Invalid Permission mode for claude: not-a-choice"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "Invalid Permission mode for claude: not-a-choice"
+    }
+  }
+}

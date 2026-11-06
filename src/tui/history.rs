@@ -423,16 +423,7 @@ fn saved_output(run: &Run) -> Vec<String> {
     let kind = if attempt.mode == crate::config::Mode::Interactive {
         OutputKind::Text
     } else {
-        match stage.harness.as_str() {
-            "codex" => OutputKind::Codex,
-            "claude" => OutputKind::Claude,
-            "pi" | "omp" => OutputKind::Pi,
-            "cursor" => OutputKind::Cursor,
-            "gemini" => OutputKind::Gemini,
-            "opencode" => OutputKind::OpenCode,
-            "amp" => OutputKind::Amp,
-            _ => OutputKind::Text,
-        }
+        crate::adapters::output_kind(&stage.harness, &run.adapters)
     };
     // A tail can start mid-line; the first, partial line is dropped.
     let raw = match raw.split_once('\n') {

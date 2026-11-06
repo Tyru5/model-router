@@ -1,0 +1,1484 @@
+{
+  "unattended/default": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+provider": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--provider",
+        "openrouter",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--provider",
+        "openrouter",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "openrouter",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+local-provider": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--provider",
+        "ollama",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--provider",
+        "ollama",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "ollama",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+lmstudio": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--provider",
+        "lmstudio",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--provider",
+        "lmstudio",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "lmstudio",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+effort": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/effort-only": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--thinking",
+        "high",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+provider+effort": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--provider",
+        "openrouter",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--provider",
+        "openrouter",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "openrouter",
+        "--thinking",
+        "high",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/routed": {
+    "build": {
+      "error": "pi cannot use provider proxy: it is defined only in model-router's [providers.proxy], and pi uses its own provider registry. Define it in pi's models.json, or choose a provider listed by `model-router models pi`"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "pi cannot use provider proxy: it is defined only in model-router's [providers.proxy], and pi uses its own provider registry. Define it in pi's models.json, or choose a provider listed by `model-router models pi`"
+    }
+  },
+  "unattended/routed-keyless": {
+    "build": {
+      "error": "pi cannot use provider local: it is defined only in model-router's [providers.local], and pi uses its own provider registry. Define it in pi's models.json, or choose a provider listed by `model-router models pi`"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "pi cannot use provider local: it is defined only in model-router's [providers.local], and pi uses its own provider registry. Define it in pi's models.json, or choose a provider listed by `model-router models pi`"
+    }
+  },
+  "unattended/routed-preset": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--provider",
+        "groq",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--provider",
+        "groq",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "groq",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/routed+effort": {
+    "build": {
+      "error": "pi cannot use provider proxy: it is defined only in model-router's [providers.proxy], and pi uses its own provider registry. Define it in pi's models.json, or choose a provider listed by `model-router models pi`"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "pi cannot use provider proxy: it is defined only in model-router's [providers.proxy], and pi uses its own provider registry. Define it in pi's models.json, or choose a provider listed by `model-router models pi`"
+    }
+  },
+  "unattended/provider-without-model": {
+    "build": {
+      "error": "A provider override requires a model"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "A provider override requires a model"
+    }
+  },
+  "unattended/structured-off-old-version": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/old-version-routed": {
+    "build": {
+      "error": "pi cannot use provider proxy: it is defined only in model-router's [providers.proxy], and pi uses its own provider registry. Define it in pi's models.json, or choose a provider listed by `model-router models pi`"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "pi cannot use provider proxy: it is defined only in model-router's [providers.proxy], and pi uses its own provider registry. Define it in pi's models.json, or choose a provider listed by `model-router models pi`"
+    }
+  },
+  "unattended/old-version-default": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/extra-args": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/user-output-schema": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    }
+  },
+  "unattended/user-json-schema": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--print",
+        "--mode",
+        "json",
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/unknown-setting": {
+    "build": {
+      "error": "pi has no stage setting nope"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "pi has no stage setting nope"
+    }
+  },
+  "interactive/default": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--model",
+        "m-1",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+provider": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "openrouter",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "openrouter",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "openrouter",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+local-provider": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "ollama",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "ollama",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "ollama",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+lmstudio": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "lmstudio",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "lmstudio",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "lmstudio",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+effort": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/effort-only": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--thinking",
+        "high",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+provider+effort": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "openrouter",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "openrouter",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "openrouter",
+        "--thinking",
+        "high",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/routed": {
+    "build": {
+      "error": "pi cannot use provider proxy: it is defined only in model-router's [providers.proxy], and pi uses its own provider registry. Define it in pi's models.json, or choose a provider listed by `model-router models pi`"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "pi cannot use provider proxy: it is defined only in model-router's [providers.proxy], and pi uses its own provider registry. Define it in pi's models.json, or choose a provider listed by `model-router models pi`"
+    }
+  },
+  "interactive/routed-keyless": {
+    "build": {
+      "error": "pi cannot use provider local: it is defined only in model-router's [providers.local], and pi uses its own provider registry. Define it in pi's models.json, or choose a provider listed by `model-router models pi`"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "pi cannot use provider local: it is defined only in model-router's [providers.local], and pi uses its own provider registry. Define it in pi's models.json, or choose a provider listed by `model-router models pi`"
+    }
+  },
+  "interactive/routed-preset": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "groq",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "groq",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--provider",
+        "groq",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/routed+effort": {
+    "build": {
+      "error": "pi cannot use provider proxy: it is defined only in model-router's [providers.proxy], and pi uses its own provider registry. Define it in pi's models.json, or choose a provider listed by `model-router models pi`"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "pi cannot use provider proxy: it is defined only in model-router's [providers.proxy], and pi uses its own provider registry. Define it in pi's models.json, or choose a provider listed by `model-router models pi`"
+    }
+  },
+  "interactive/provider-without-model": {
+    "build": {
+      "error": "A provider override requires a model"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "A provider override requires a model"
+    }
+  },
+  "interactive/structured-off-old-version": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--thinking",
+        "high",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/old-version-routed": {
+    "build": {
+      "error": "pi cannot use provider proxy: it is defined only in model-router's [providers.proxy], and pi uses its own provider registry. Define it in pi's models.json, or choose a provider listed by `model-router models pi`"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "pi cannot use provider proxy: it is defined only in model-router's [providers.proxy], and pi uses its own provider registry. Define it in pi's models.json, or choose a provider listed by `model-router models pi`"
+    }
+  },
+  "interactive/old-version-default": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/extra-args": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/user-output-schema": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    }
+  },
+  "interactive/user-json-schema": {
+    "build": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "@$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": true,
+      "args": [
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "@$TMP/prompt.md",
+        "--session-id",
+        "<session-id>"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "pi",
+      "args": [
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "--session-id",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Pi",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/unknown-setting": {
+    "build": {
+      "error": "pi has no stage setting nope"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "pi has no stage setting nope"
+    }
+  }
+}

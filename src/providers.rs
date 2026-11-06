@@ -135,7 +135,10 @@ pub fn builtins() -> BTreeMap<String, Provider> {
         .collect()
 }
 
-pub const NOTE: &str = "Built-in names are presets: add an empty [providers.NAME] to route one into codex (needs Responses API support), opencode, aider, goose, or custom adapters; without it the name passes to the harness unchanged, so its own provider definition wins. Add other providers with [providers.NAME] base_url/api_key_env. Pi always uses its own registry. Claude Code, Cursor, Gemini, Amp, and Copilot use only their own accounts.";
+/// How router providers reach each harness, derived from the harness table.
+pub fn note() -> String {
+    crate::harness::provider_note()
+}
 
 /// The provider the router injects for `harness`, or None to pass the name to
 /// the harness unchanged. Only `[providers.NAME]` entries route: harnesses may
@@ -148,7 +151,9 @@ pub fn route<'a>(
     name: &str,
     configured: &'a BTreeMap<String, Provider>,
 ) -> Option<Cow<'a, Provider>> {
-    if matches!(harness, "pi" | "omp") || !configured.contains_key(name) {
+    let registry = crate::harness::get(harness)
+        .is_some_and(|spec| spec.routing == crate::harness::Routing::Registry);
+    if registry || !configured.contains_key(name) {
         return None;
     }
     resolve(name, configured)

@@ -350,7 +350,7 @@ fn structured_native_errors_override_success_exit_and_tool_echoes_are_ignored() 
 #[test]
 fn capture_drains_both_streams_without_deadlock_and_handles_early_closed_stdin() {
     let dir = tempfile::tempdir().unwrap();
-    let inv = adapters::Invocation { program: "python3".into(), args: vec!["-c".into(), "import sys; sys.stdin.close(); sys.stdout.write('x'*200000); sys.stderr.write('y'*200000)".into()], stdin: Some("z".repeat(100000)), kind: OutputKind::Text, final_file: dir.path().join("unused"), env: vec![], files: vec![] };
+    let inv = adapters::Invocation { program: "python3".into(), args: vec!["-c".into(), "import sys; sys.stdin.close(); sys.stdout.write('x'*200000); sys.stderr.write('y'*200000)".into()], stdin: Some("z".repeat(100000)), kind: OutputKind::Text, final_file: dir.path().join("unused"), env: vec![], files: vec![], assign: None };
     let result = process::capture(
         &inv,
         dir.path(),
@@ -382,6 +382,7 @@ fn cancelling_lets_a_harness_save_before_it_is_killed() {
         final_file: dir.path().join("unused"),
         env: vec![],
         files: vec![],
+        assign: None,
     };
     // Cancel once the script's trap is installed.
     let cancel = AtomicBool::new(false);
@@ -562,6 +563,7 @@ fn capture_applies_environment_variables() {
         ],
         // Written at launch, not when the invocation is built.
         files: vec![(dir.path().join("aider.commands"), "/code go\n".into())],
+        assign: None,
     };
     let result = process::capture(
         &inv,
@@ -610,6 +612,7 @@ fn background_children_end_with_a_harness_that_exits_normally() {
         final_file: dir.path().join("unused"),
         env: vec![],
         files: vec![],
+        assign: None,
     };
     let mut group = None;
     let started = Instant::now();

@@ -1,6 +1,7 @@
 use crate::{
     adapters::{self, Invocation, OutputKind},
     config::{CustomAdapter, Settings},
+    harness::CatalogSource,
     process, storage,
 };
 use anyhow::{Context, Result, ensure};
@@ -78,24 +79,12 @@ fn entry(id: &str, source: &str, availability: &str) -> Model {
     }
 }
 
-const CLAUDE_ALIASES: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
-const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-const CODEX_EFFORTS: [&str; 5] = ["minimal", "low", "medium", "high", "xhigh"];
-const PI_THINKING: [&str; 6] = ["off", "minimal", "low", "medium", "high", "xhigh"];
-const OMP_THINKING: [&str; 8] = [
-    "off", "minimal", "low", "medium", "high", "xhigh", "max", "auto",
-];
-
 /// Effort levels a harness documents, without running it; None when they
 /// depend on the model (OpenCode variants) or the harness has no effort.
 pub fn known_efforts(harness: &str) -> Option<&'static [&'static str]> {
-    match harness {
-        "claude" => Some(&CLAUDE_EFFORTS),
-        "codex" => Some(&CODEX_EFFORTS),
-        "pi" => Some(&PI_THINKING),
-        "omp" => Some(&OMP_THINKING),
-        _ => None,
-    }
+    crate::harness::get(harness)
+        .map(|spec| spec.efforts)
+        .filter(|levels| !levels.is_empty())
 }
 
 /// Catalog output kept from the end of a listing.
@@ -208,6 +197,7 @@ fn query_listing(
         final_file: temp.path().join("unused"),
         env: vec![],
         files: vec![],
+        assign: None,
     };
     let shown = format!("{} {}", inv.program, inv.args.join(" "));
     let result = process::capture(
@@ -242,7 +232,8 @@ fn failure(error: &anyhow::Error) -> String {
 /// Router providers a harness can use, with their `/models` listings.
 /// Listings run in parallel; a failure becomes a note, never an error.
 fn provider_models(harness: &str, settings: &Settings) -> (Vec<Model>, Vec<String>) {
-    if !crate::harness_settings::supports_provider(harness) || matches!(harness, "pi" | "omp") {
+    // Only harnesses the router injects providers into (and custom adapters).
+    if crate::harness::get(harness).is_some_and(|spec| !spec.routing.injects()) {
         return (vec![], vec![]);
     }
     let routed: Vec<(String, crate::providers::Provider)> = settings
@@ -317,8 +308,14 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
     let mut effort_source = String::new();
     let mut truncated = false;
 
-    let mut note: String = match harness {
-        "codex" => {
+    let spec = crate::harness::get(harness);
+    ensure!(
+        spec.is_some() || settings.adapters.contains_key(harness),
+        "Unknown harness {harness}"
+    );
+    let known_levels: &[&str] = spec.map_or(&[], |s| s.efforts);
+    let mut note: String = match spec.map(|s| s.catalog) {
+        Some(CatalogSource::CodexCache) => {
             let dir = std::env::var_os("CODEX_HOME")
                 .map(std::path::PathBuf::from)
                 .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".codex")));
@@ -375,14 +372,14 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
                 }
             }
             if efforts.is_empty() {
-                efforts = strings(&CODEX_EFFORTS);
+                efforts = strings(known_levels);
                 effort_source = "documented Codex levels".into();
             } else {
                 effort_source = "Codex local cache".into();
             }
             "Reads Codex's local model cache, including each model's reasoning levels. Open Codex to refresh its account catalog; custom IDs remain editable.".into()
         }
-        "claude" => {
+        Some(CatalogSource::ClaudeHelp { aliases: known }) => {
             let help = query(harness, vec!["--help".into()], &settings.adapters, project);
             let (aliases, levels) = help
                 .as_deref()
@@ -396,7 +393,7 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
                     "unverified; depends on account/provider",
                 ));
             }
-            for id in CLAUDE_ALIASES {
+            for &id in known {
                 if !aliases.iter().any(|a| a == id) {
                     models.push(entry(
                         id,
@@ -406,7 +403,7 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
                 }
             }
             if levels.is_empty() {
-                efforts = strings(&CLAUDE_EFFORTS);
+                efforts = strings(known_levels);
                 effort_source = "documented Claude levels".into();
             } else {
                 efforts = levels;
@@ -424,13 +421,13 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
                 ),
             }
         }
-        "amp" => {
-            for id in ["low", "medium", "high", "ultra"] {
+        Some(CatalogSource::Modes(modes)) => {
+            for &id in modes {
                 models.push(entry(id, "Amp mode", "mode; underlying model may change"));
             }
             "Amp selects modes, not arbitrary model IDs. Plugin mode keys may be entered manually.".into()
         }
-        "pi" => listed(
+        Some(CatalogSource::PiList) => listed(
             query_listing(harness, vec!["--list-models".into()], &settings.adapters, project),
             "pi --list-models",
             &mut truncated,
@@ -449,7 +446,7 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
                     m.provider = cols[0].into();
                     // The `thinking` column says whether --thinking levels apply.
                     m.efforts = match cols.get(4).copied() {
-                        Some("yes") => strings(&PI_THINKING),
+                        Some("yes") => strings(known_levels),
                         Some("no") => vec!["off".into()],
                         _ => vec![],
                     };
@@ -460,12 +457,12 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
         },
         )
         .inspect(|_| {
-            efforts = strings(&PI_THINKING);
+            efforts = strings(known_levels);
             effort_source = "Pi thinking levels".into();
         })
         .unwrap_or_else(|note| note),
-        "omp" => {
-            efforts = strings(&OMP_THINKING);
+        Some(CatalogSource::OmpJson) => {
+            efforts = strings(known_levels);
             effort_source = "omp thinking levels".into();
             listed(
                 query_listing(
@@ -483,7 +480,7 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
             )
             .unwrap_or_else(|note| note)
         }
-        "opencode" => listed(
+        Some(CatalogSource::OpencodeModels) => listed(
             query_listing(harness, vec!["models".into()], &settings.adapters, project),
             "opencode models",
             &mut truncated,
@@ -501,7 +498,7 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
         },
         )
         .unwrap_or_else(|note| note),
-        "cursor" => listed(
+        Some(CatalogSource::CursorList) => listed(
             query_listing(harness, vec!["--list-models".into()], &settings.adapters, project),
             "--list-models",
             &mut truncated,
@@ -521,7 +518,8 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
         },
         )
         .unwrap_or_else(|note| note),
-        name if settings.adapters.contains_key(name) => {
+        None => {
+            let name = harness;
             let custom = &settings.adapters[name];
             const NOTE: &str =
                 "Custom adapters can provide models_args returning one native model ID per line.";
@@ -544,10 +542,9 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
                 None => NOTE.into(),
             }
         }
-        "gemini" | "aider" | "goose" | "copilot" => {
+        Some(CatalogSource::Manual) => {
             "Use your harness's configured default, a saved selection, or enter a native model ID. This adapter does not probe account entitlements.".into()
         }
-        _ => anyhow::bail!("Unknown harness {harness}"),
     };
     if truncated {
         note.push_str(" Listing truncated: only its last 2 MiB were read.");

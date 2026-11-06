@@ -46,6 +46,39 @@ that can use a router provider (Codex, OpenCode, Aider, Goose, custom) also
 list each configured provider's `/models`, keeping context length and prices
 (`providers::ModelInfo`).
 
+## Adding a harness
+
+Every built-in harness is one `HarnessSpec` entry in `src/harness/builtins.rs`.
+The builder (`adapters::build`/`resume`), settings editor, catalog, doctor,
+provider routing, and sandbox state paths all read it. An entry declares:
+
+| Field | Meaning |
+| --- | --- |
+| `programs`, `identity` | Executable candidates; a shared name (Cursor's `agent`) is accepted only when its path or `--help` identifies it. |
+| `args` | Per-mode templates of `Part`s, in order: `Args(&[..])` literals (`{final_file}` expands), `Schema`, `Model`, `Provider`, `Effort`, `Extra` (permission settings, then extra arguments), `Prompt`, `ModelEnv`. |
+| `prompt` | Per mode: `Stdin`, `StdinArg("-")`, `Arg`, `Flag("-p")`, `AtFile`, `MessageFile(flag)`, `ReadAndLoad` (Aider's command file). |
+| `model`, `effort`, `efforts` | `Flag`/`Qualified` (provider/model)/`Mode`; effort `Flag`, `ConfigKv`, `ModelSuffix('#')`, or `None`, plus documented levels. |
+| `provider`, `routing` | How a native provider name is passed, and how a `[providers.NAME]` entry is injected: `OwnAccount`, `Registry`, `OpenAiEnv { .. }`, or the custom `CodexConfig`/`OpencodeJson` strategies. |
+| `output` | The parser (`OutputKind`). |
+| `session`, `resume` | `Assign { flag, .. }`, `Reported`, or `None`; resume prepends/appends/replaces with `{session}`. |
+| `structured` | Native schema flag, first supporting version, inline or file. |
+| `settings` | Permission/sandbox settings for the stage editor. |
+| `catalog`, `version_override`, `state_dirs`, `notes` | Model listing source, older-version arguments, sandbox-writable state paths, and notes. |
+
+So adding a harness is:
+
+1. One table entry. `model-router harnesses --spec NAME` shows the result.
+2. Parser fixtures under `tests/fixtures/harness-output/` (see below).
+3. Its cases in `tests/adapter_golden.rs` (`HARNESSES`, `SETTINGS`), then
+   `MODEL_ROUTER_UPDATE_GOLDEN=1 cargo test --test adapter_golden` to record
+   `tests/fixtures/adapter-golden/NAME.json`. Review the JSON: it is the exact
+   argv, environment, stdin, files, and parser for every mode and option.
+
+Doctor needs no list: it probes the flags of sample invocations built from the
+spec, and a unit test checks every flag the spec declares is probed. Only a new
+mechanism (not a new harness) needs Rust code: a new `Part`, `Prompt`, or
+`Routing` variant. Tools that fit the custom adapter fields need no code at all.
+
 ## Native structured output
 
 The handoff's primary channel, where the harness has one; the prompt's

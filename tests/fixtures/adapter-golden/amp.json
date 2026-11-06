@@ -1,0 +1,792 @@
+{
+  "unattended/default": {
+    "build": {
+      "program": "amp",
+      "args": [
+        "--execute",
+        "--stream-json"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--execute",
+        "--stream-json"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "amp",
+      "args": [
+        "threads",
+        "continue",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model": {
+    "build": {
+      "program": "amp",
+      "args": [
+        "--mode",
+        "m-1",
+        "--execute",
+        "--stream-json"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--mode",
+        "m-1",
+        "--execute",
+        "--stream-json"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "amp",
+      "args": [
+        "threads",
+        "continue",
+        "--mode",
+        "m-1",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/model+provider": {
+    "build": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "unattended/model+local-provider": {
+    "build": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "unattended/model+lmstudio": {
+    "build": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "unattended/model+effort": {
+    "build": {
+      "error": "amp has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp has no portable effort flag; use its native model/mode or explicit arguments instead"
+    }
+  },
+  "unattended/effort-only": {
+    "build": {
+      "error": "amp has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp has no portable effort flag; use its native model/mode or explicit arguments instead"
+    }
+  },
+  "unattended/model+provider+effort": {
+    "build": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "unattended/routed": {
+    "build": {
+      "error": "amp cannot use router provider proxy; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp cannot use router provider proxy; it only uses its own account"
+    }
+  },
+  "unattended/routed-keyless": {
+    "build": {
+      "error": "amp cannot use router provider local; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp cannot use router provider local; it only uses its own account"
+    }
+  },
+  "unattended/routed-preset": {
+    "build": {
+      "error": "amp cannot use router provider groq; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp cannot use router provider groq; it only uses its own account"
+    }
+  },
+  "unattended/routed+effort": {
+    "build": {
+      "error": "amp cannot use router provider proxy; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp cannot use router provider proxy; it only uses its own account"
+    }
+  },
+  "unattended/provider-without-model": {
+    "build": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "unattended/structured-off-old-version": {
+    "build": {
+      "error": "amp has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp has no portable effort flag; use its native model/mode or explicit arguments instead"
+    }
+  },
+  "unattended/old-version-routed": {
+    "build": {
+      "error": "amp cannot use router provider proxy; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp cannot use router provider proxy; it only uses its own account"
+    }
+  },
+  "unattended/old-version-default": {
+    "build": {
+      "program": "amp",
+      "args": [
+        "--execute",
+        "--stream-json"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--execute",
+        "--stream-json"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "amp",
+      "args": [
+        "threads",
+        "continue",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/extra-args": {
+    "build": {
+      "program": "amp",
+      "args": [
+        "--mode",
+        "m-1",
+        "--execute",
+        "--stream-json",
+        "--extra-flag",
+        "v"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--mode",
+        "m-1",
+        "--execute",
+        "--stream-json",
+        "--extra-flag",
+        "v"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "amp",
+      "args": [
+        "threads",
+        "continue",
+        "--mode",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/user-output-schema": {
+    "build": {
+      "program": "amp",
+      "args": [
+        "--mode",
+        "m-1",
+        "--execute",
+        "--stream-json",
+        "--output-schema",
+        "mine.json"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--mode",
+        "m-1",
+        "--execute",
+        "--stream-json",
+        "--output-schema",
+        "mine.json"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "amp",
+      "args": [
+        "threads",
+        "continue",
+        "--mode",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    }
+  },
+  "unattended/user-json-schema": {
+    "build": {
+      "program": "amp",
+      "args": [
+        "--mode",
+        "m-1",
+        "--execute",
+        "--stream-json",
+        "--json-schema={}"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--mode",
+        "m-1",
+        "--execute",
+        "--stream-json",
+        "--json-schema={}"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "amp",
+      "args": [
+        "threads",
+        "continue",
+        "--mode",
+        "m-1",
+        "--json-schema={}",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "unattended/unknown-setting": {
+    "build": {
+      "error": "amp has no stage setting nope"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp has no stage setting nope"
+    }
+  },
+  "interactive/default": {
+    "build": {
+      "program": "amp",
+      "args": [
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "amp",
+      "args": [
+        "threads",
+        "continue",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model": {
+    "build": {
+      "program": "amp",
+      "args": [
+        "--mode",
+        "m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--mode",
+        "m-1",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "amp",
+      "args": [
+        "threads",
+        "continue",
+        "--mode",
+        "m-1",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/model+provider": {
+    "build": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "interactive/model+local-provider": {
+    "build": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "interactive/model+lmstudio": {
+    "build": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "interactive/model+effort": {
+    "build": {
+      "error": "amp has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp has no portable effort flag; use its native model/mode or explicit arguments instead"
+    }
+  },
+  "interactive/effort-only": {
+    "build": {
+      "error": "amp has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp has no portable effort flag; use its native model/mode or explicit arguments instead"
+    }
+  },
+  "interactive/model+provider+effort": {
+    "build": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "interactive/routed": {
+    "build": {
+      "error": "amp cannot use router provider proxy; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp cannot use router provider proxy; it only uses its own account"
+    }
+  },
+  "interactive/routed-keyless": {
+    "build": {
+      "error": "amp cannot use router provider local; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp cannot use router provider local; it only uses its own account"
+    }
+  },
+  "interactive/routed-preset": {
+    "build": {
+      "error": "amp cannot use router provider groq; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp cannot use router provider groq; it only uses its own account"
+    }
+  },
+  "interactive/routed+effort": {
+    "build": {
+      "error": "amp cannot use router provider proxy; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp cannot use router provider proxy; it only uses its own account"
+    }
+  },
+  "interactive/provider-without-model": {
+    "build": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp uses its existing provider/auth configuration; leave the provider field empty"
+    }
+  },
+  "interactive/structured-off-old-version": {
+    "build": {
+      "error": "amp has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp has no portable effort flag; use its native model/mode or explicit arguments instead"
+    }
+  },
+  "interactive/old-version-routed": {
+    "build": {
+      "error": "amp cannot use router provider proxy; it only uses its own account"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp cannot use router provider proxy; it only uses its own account"
+    }
+  },
+  "interactive/old-version-default": {
+    "build": {
+      "program": "amp",
+      "args": [
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "amp",
+      "args": [
+        "threads",
+        "continue",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/extra-args": {
+    "build": {
+      "program": "amp",
+      "args": [
+        "--mode",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--mode",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "amp",
+      "args": [
+        "threads",
+        "continue",
+        "--mode",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/user-output-schema": {
+    "build": {
+      "program": "amp",
+      "args": [
+        "--mode",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--mode",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "amp",
+      "args": [
+        "threads",
+        "continue",
+        "--mode",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    }
+  },
+  "interactive/user-json-schema": {
+    "build": {
+      "program": "amp",
+      "args": [
+        "--mode",
+        "m-1",
+        "--json-schema={}",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--mode",
+        "m-1",
+        "--json-schema={}",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "amp",
+      "args": [
+        "threads",
+        "continue",
+        "--mode",
+        "m-1",
+        "--json-schema={}",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Amp",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
+  },
+  "interactive/unknown-setting": {
+    "build": {
+      "error": "amp has no stage setting nope"
+    },
+    "session": null,
+    "resumable": true,
+    "resume": {
+      "error": "amp has no stage setting nope"
+    }
+  }
+}

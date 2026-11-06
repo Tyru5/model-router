@@ -1,0 +1,1469 @@
+{
+  "unattended/default": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/model": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/model+provider": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "openrouter/m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "openrouter/m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/model+local-provider": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "ollama/m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "ollama/m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/model+lmstudio": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "lmstudio/m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "lmstudio/m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/model+effort": {
+    "build": {
+      "error": "aider has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/effort-only": {
+    "build": {
+      "error": "aider has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/model+provider+effort": {
+    "build": {
+      "error": "aider has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/routed": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "openai/m-1",
+        "--openai-api-base",
+        "http://localhost:4000/v1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "AIDER_OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "OPENAI_API_BASE",
+          {
+            "literal": "http://localhost:4000/v1"
+          }
+        ],
+        [
+          "OPENAI_API_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "openai/m-1",
+        "--openai-api-base",
+        "http://localhost:4000/v1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/routed-keyless": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "openai/m-1",
+        "--openai-api-base",
+        "http://localhost:8000",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "AIDER_OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "OPENAI_API_BASE",
+          {
+            "literal": "http://localhost:8000"
+          }
+        ],
+        [
+          "OPENAI_API_KEY",
+          {
+            "literal": "none"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "openai/m-1",
+        "--openai-api-base",
+        "http://localhost:8000",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/routed-preset": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "openai/m-1",
+        "--openai-api-base",
+        "https://api.groq.com/openai/v1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GROQ_API_KEY",
+          {
+            "var": "GROQ_API_KEY"
+          }
+        ],
+        [
+          "OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "AIDER_OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "OPENAI_API_BASE",
+          {
+            "literal": "https://api.groq.com/openai/v1"
+          }
+        ],
+        [
+          "OPENAI_API_KEY",
+          {
+            "var": "GROQ_API_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "openai/m-1",
+        "--openai-api-base",
+        "https://api.groq.com/openai/v1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/routed+effort": {
+    "build": {
+      "error": "aider has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/provider-without-model": {
+    "build": {
+      "error": "A provider override requires a model"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/structured-off-old-version": {
+    "build": {
+      "error": "aider has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/old-version-routed": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "openai/m-1",
+        "--openai-api-base",
+        "http://localhost:4000/v1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "AIDER_OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "OPENAI_API_BASE",
+          {
+            "literal": "http://localhost:4000/v1"
+          }
+        ],
+        [
+          "OPENAI_API_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "openai/m-1",
+        "--openai-api-base",
+        "http://localhost:4000/v1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/old-version-default": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/extra-args": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md",
+        "--extra-flag",
+        "v"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md",
+        "--extra-flag",
+        "v"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/user-output-schema": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md",
+        "--output-schema",
+        "mine.json"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md",
+        "--output-schema",
+        "mine.json"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/user-json-schema": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md",
+        "--json-schema={}"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md",
+        "--json-schema={}"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/unknown-setting": {
+    "build": {
+      "error": "aider has no stage setting nope"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/setting:confirmations=yes-always": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md",
+        "--yes-always"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md",
+        "--yes-always"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/setting:confirmations=": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--message-file",
+        "$TMP/prompt.md"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "unattended/setting:confirmations+invalid": {
+    "build": {
+      "error": "Invalid Confirmations for aider: not-a-choice"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/default": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/aider.commands",
+          "/code Complete the stage described in the attached model-router prompt file.\n"
+        ]
+      ],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/model": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/aider.commands",
+          "/code Complete the stage described in the attached model-router prompt file.\n"
+        ]
+      ],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/model+provider": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "openrouter/m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/aider.commands",
+          "/code Complete the stage described in the attached model-router prompt file.\n"
+        ]
+      ],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "openrouter/m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/model+local-provider": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "ollama/m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/aider.commands",
+          "/code Complete the stage described in the attached model-router prompt file.\n"
+        ]
+      ],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "ollama/m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/model+lmstudio": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "lmstudio/m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/aider.commands",
+          "/code Complete the stage described in the attached model-router prompt file.\n"
+        ]
+      ],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "lmstudio/m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/model+effort": {
+    "build": {
+      "error": "aider has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/effort-only": {
+    "build": {
+      "error": "aider has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/model+provider+effort": {
+    "build": {
+      "error": "aider has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/routed": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "openai/m-1",
+        "--openai-api-base",
+        "http://localhost:4000/v1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "AIDER_OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "OPENAI_API_BASE",
+          {
+            "literal": "http://localhost:4000/v1"
+          }
+        ],
+        [
+          "OPENAI_API_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [
+        [
+          "$TMP/attempt/aider.commands",
+          "/code Complete the stage described in the attached model-router prompt file.\n"
+        ]
+      ],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "openai/m-1",
+        "--openai-api-base",
+        "http://localhost:4000/v1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/routed-keyless": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "openai/m-1",
+        "--openai-api-base",
+        "http://localhost:8000",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "AIDER_OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "OPENAI_API_BASE",
+          {
+            "literal": "http://localhost:8000"
+          }
+        ],
+        [
+          "OPENAI_API_KEY",
+          {
+            "literal": "none"
+          }
+        ]
+      ],
+      "files": [
+        [
+          "$TMP/attempt/aider.commands",
+          "/code Complete the stage described in the attached model-router prompt file.\n"
+        ]
+      ],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "openai/m-1",
+        "--openai-api-base",
+        "http://localhost:8000",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/routed-preset": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "openai/m-1",
+        "--openai-api-base",
+        "https://api.groq.com/openai/v1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GROQ_API_KEY",
+          {
+            "var": "GROQ_API_KEY"
+          }
+        ],
+        [
+          "OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "AIDER_OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "OPENAI_API_BASE",
+          {
+            "literal": "https://api.groq.com/openai/v1"
+          }
+        ],
+        [
+          "OPENAI_API_KEY",
+          {
+            "var": "GROQ_API_KEY"
+          }
+        ]
+      ],
+      "files": [
+        [
+          "$TMP/attempt/aider.commands",
+          "/code Complete the stage described in the attached model-router prompt file.\n"
+        ]
+      ],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "openai/m-1",
+        "--openai-api-base",
+        "https://api.groq.com/openai/v1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/routed+effort": {
+    "build": {
+      "error": "aider has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/provider-without-model": {
+    "build": {
+      "error": "A provider override requires a model"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/structured-off-old-version": {
+    "build": {
+      "error": "aider has no portable effort flag; use its native model/mode or explicit arguments instead"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/old-version-routed": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "openai/m-1",
+        "--openai-api-base",
+        "http://localhost:4000/v1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "AIDER_OPENAI_",
+          "unset_prefix"
+        ],
+        [
+          "OPENAI_API_BASE",
+          {
+            "literal": "http://localhost:4000/v1"
+          }
+        ],
+        [
+          "OPENAI_API_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [
+        [
+          "$TMP/attempt/aider.commands",
+          "/code Complete the stage described in the attached model-router prompt file.\n"
+        ]
+      ],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "openai/m-1",
+        "--openai-api-base",
+        "http://localhost:4000/v1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/old-version-default": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/aider.commands",
+          "/code Complete the stage described in the attached model-router prompt file.\n"
+        ]
+      ],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/extra-args": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands",
+        "--extra-flag",
+        "v"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/aider.commands",
+          "/code Complete the stage described in the attached model-router prompt file.\n"
+        ]
+      ],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands",
+        "--extra-flag",
+        "v"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/user-output-schema": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands",
+        "--output-schema",
+        "mine.json"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/aider.commands",
+          "/code Complete the stage described in the attached model-router prompt file.\n"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands",
+        "--output-schema",
+        "mine.json"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/user-json-schema": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands",
+        "--json-schema={}"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/aider.commands",
+          "/code Complete the stage described in the attached model-router prompt file.\n"
+        ]
+      ],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands",
+        "--json-schema={}"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/unknown-setting": {
+    "build": {
+      "error": "aider has no stage setting nope"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/setting:confirmations=yes-always": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands",
+        "--yes-always"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/aider.commands",
+          "/code Complete the stage described in the attached model-router prompt file.\n"
+        ]
+      ],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands",
+        "--yes-always"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/setting:confirmations=": {
+    "build": {
+      "program": "aider",
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ],
+      "stdin": null,
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/aider.commands",
+          "/code Complete the stage described in the attached model-router prompt file.\n"
+        ]
+      ],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--read",
+        "$TMP/prompt.md",
+        "--load",
+        "$TMP/attempt/aider.commands"
+      ]
+    },
+    "resumable": false,
+    "resume": null
+  },
+  "interactive/setting:confirmations+invalid": {
+    "build": {
+      "error": "Invalid Confirmations for aider: not-a-choice"
+    },
+    "session": null,
+    "resumable": false,
+    "resume": null
+  }
+}
