@@ -152,6 +152,7 @@ The tab shows active runs (`2 Monitor ●2`). The header shows cost and
 | `a` | idle | Accept handoff and advance; accepts a `not_applicable` waiver; confirms a ship preview |
 | `c` | idle | Continue the run |
 | `y` | idle | Retry current stage |
+| `Y` | idle | Retry one failed fan-out candidate (pick from a list) |
 | `i` | idle | Retry interactively |
 | `m` | idle | Replace model and retry |
 | `e` | idle | Edit an interactive handoff summary |

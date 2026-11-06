@@ -114,7 +114,7 @@ rather than gates.
   `clean` removes the run (candidate worktrees with force: they are the
   router's own).
 - A crash marks running candidates failed, never retried silently.
-  `resume --retry-candidate STAGE/ID` (`Cmd::RetryCandidate`) reruns one
+  `resume --retry-candidate STAGE/ID` or Monitor `Y` (`Cmd::RetryCandidate`) reruns one
   stopped candidate of a stopped fan-out stage in a new round with the same
   base; the others keep their results. Retrying the stage reruns all.
 
