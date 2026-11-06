@@ -459,6 +459,20 @@ the Monitor and no dialog is open. Otherwise it waits, and `t` or `i` opens it
 when you are ready. A workflow
 whose first enabled stage is interactive opens the Monitor right away.
 
+### Drive it from other agents
+
+`model-router serve --mcp` is an MCP server on stdio; `serve --http
+127.0.0.1:PORT` is the same tools as a loopback JSON API with a bearer token
+and an SSE event stream. Agents can list workflows, preview, start, wait for,
+cancel, confirm, and retry runs, and read handoffs and reports. Server runs are
+unattended only.
+
+```sh
+claude mcp add model-router -- model-router serve --mcp -C /path/to/project
+```
+
+See [docs/serve.md](docs/serve.md) for tools, Codex setup, and the HTTP API.
+
 ### Detach and reattach an interactive session
 
 Press **Ctrl+B** inside a native harness to return to the Monitor without

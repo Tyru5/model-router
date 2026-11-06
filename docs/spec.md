@@ -145,6 +145,10 @@ API clients, automatic task classification, and embedded IDE control are exclude
 - CLI equivalents for initialization, validation, previews, execution, discovery,
   history (filters, JSON, sizes), rerun, compare, clean, and resume; all share
   the same execution engine.
+- Headless `serve`: MCP over stdio and a loopback, token-protected HTTP/SSE
+  API with the same engine. Server runs are unattended only; interactive
+  stages are refused unless the caller forces them unattended. Projects are
+  limited to allowed roots. See `docs/serve.md`.
 
 ## Acceptance checks
 
