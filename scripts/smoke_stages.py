@@ -29,7 +29,7 @@ def save(terminal, path):
 
 def main():
     with tempfile.TemporaryDirectory(prefix="router stage presets ") as name:
-        project = Path(name)
+        project = Path(name).resolve()
         path = project / ".model-router.toml"
         config = demo_config()
         path.write_text(config)

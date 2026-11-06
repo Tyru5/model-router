@@ -26,7 +26,7 @@ def save(terminal, path):
 
 def main():
     with tempfile.TemporaryDirectory(prefix="router harness settings ") as name:
-        project = Path(name)
+        project = Path(name).resolve()
         config = project / ".model-router.toml"
         config.write_text("""version = 1
 [[workflows]]

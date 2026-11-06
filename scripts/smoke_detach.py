@@ -210,7 +210,7 @@ def checkpoint(terminal, project):
 def round_trip(*, cli=False):
     label = "CLI" if cli else "TUI"
     with tempfile.TemporaryDirectory(prefix="router-detach-") as directory:
-        project = Path(directory)
+        project = Path(directory).resolve()
         workflow(project)
         terminal = Terminal(project, cli=cli)
         try:
@@ -270,7 +270,7 @@ def round_trip(*, cli=False):
 def detached_end(action, *, cli=False, controlling=True):
     label = "CLI" if cli else "TUI"
     with tempfile.TemporaryDirectory(prefix="router-detach-end-") as directory:
-        project = Path(directory)
+        project = Path(directory).resolve()
         workflow(project)
         terminal = Terminal(project, cli=cli, controlling=controlling)
         try:

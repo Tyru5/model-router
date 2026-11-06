@@ -58,7 +58,7 @@ def check_hangup(
     name, *, animate=False, controlling=True, active=False, interactive=False
 ):
     with tempfile.TemporaryDirectory(prefix="router-shutdown-") as directory:
-        project = Path(directory)
+        project = Path(directory).resolve()
         if active:
             active_workflow(project, interactive=interactive)
         terminal = Terminal(project, animate=animate, controlling=controlling)
@@ -122,7 +122,7 @@ def main():
     )
     for sig in (signal.SIGTERM, signal.SIGHUP):
         with tempfile.TemporaryDirectory(prefix="router-shutdown-signal-") as directory:
-            terminal = Terminal(Path(directory))
+            terminal = Terminal(Path(directory).resolve())
             try:
                 terminal.wait_for(
                     lambda: b"Workflow" in terminal.raw, "Initial screen did not render"

@@ -74,7 +74,7 @@ def main():
     base = f"http://127.0.0.1:{server.server_port}"
     try:
         with tempfile.TemporaryDirectory(prefix="router task import ") as name:
-            project = Path(name)
+            project = Path(name).resolve()
             config = demo_config()
             (project / ".model-router.toml").write_text(config)
             docs = project / "docs"

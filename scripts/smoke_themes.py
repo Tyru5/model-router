@@ -44,7 +44,7 @@ def choose(terminal, name):
 
 def main():
     with tempfile.TemporaryDirectory(prefix="router themes ") as name:
-        root = Path(name)
+        root = Path(name).resolve()
         project, other = root / "project", root / "other"
         config_home = root / "config-home"
         prefs = config_home / "model-router/appearance.json"

@@ -15,7 +15,9 @@ from smoke_common import ARTIFACTS, ROOT, Terminal, records
 
 def main():
     with tempfile.TemporaryDirectory(prefix="router repo picker ") as name:
-        project = Path(name)
+        # The router records canonical paths; macOS temp dirs sit behind the
+        # /var -> /private/var symlink.
+        project = Path(name).resolve()
         group = project / "workspaces"
         alpha = group / "alpha"
         beta = group / "beta 雪"

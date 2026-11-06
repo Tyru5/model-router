@@ -52,7 +52,7 @@ def wait_for_intro(terminal):
 
 def main():
     with tempfile.TemporaryDirectory(prefix="router startup ") as name:
-        project = Path(name)
+        project = Path(name).resolve()
         (project / ".model-router.toml").write_text(
             (ROOT / "examples/demo.toml").read_text()
         )

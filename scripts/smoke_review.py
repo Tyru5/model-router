@@ -103,7 +103,7 @@ harness = "summary"
 def main():
     require_binary()
     with tempfile.TemporaryDirectory(prefix="router review ") as name:
-        project = Path(name)
+        project = Path(name).resolve()
         stub_harnesses(project / "stub-bin")
         git(project, "init", "-q")
         git(project, "config", "user.email", "smoke@example.invalid")

@@ -21,7 +21,7 @@ from smoke_common import (
 def main():
     require_binary()
     with tempfile.TemporaryDirectory(prefix="router terminal test ") as name:
-        project = Path(name)
+        project = Path(name).resolve()
         path = project / ".model-router.toml"
         path.write_text(demo_config())
         terminal = Terminal(project)
