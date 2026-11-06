@@ -12,7 +12,7 @@ use super::{
     session::draw_notifications,
     task_importer::{ImportAction, TaskImporter},
     theme::{self, Palette, Theme},
-    widgets::{content, menu_key, popup},
+    widgets::{content, menu_key, popup, textarea},
     workflow_page::{StageEditor, StageRequest},
 };
 use crate::{
@@ -128,7 +128,8 @@ pub(super) enum Modal {
         scroll: u16,
         guide: bool,
     },
-    Loading(String),
+    /// Work in the background; Esc closes it and drops the result.
+    Loading(Loading),
     /// The results view's diff: files, hunks, search, and external tools.
     Diff(Box<DiffView>),
     /// A stage's handoff, with its changed files.
@@ -173,8 +174,8 @@ pub(super) enum Ask {
     },
     /// Unsaved workflow edits before exiting: [y] saves, [n] discards.
     SaveAndExit,
-    /// Close this editor without applying its changes; [Esc] returns to it.
-    DiscardDraft(Box<Modal>),
+    /// Close the editor below without applying its changes; [Esc] returns to it.
+    DiscardDraft,
 }
 impl Ask {
     pub(super) fn text(&self, app: &App) -> AskText {
@@ -230,7 +231,7 @@ impl Ask {
                     ("Esc", "cancel"),
                 ],
             ),
-            Self::DiscardDraft(_) => (
+            Self::DiscardDraft => (
                 "Discard changes?",
                 "This editor has changes that are not applied.".into(),
                 &[("y / Enter", "discard"), ("n / Esc", "keep editing")],
@@ -239,7 +240,77 @@ impl Ask {
     }
 }
 
+/// A dialog waiting on background work. Its result applies only while the
+/// dialog is still on top with the same ticket, so closing it cancels.
+pub(super) struct Loading {
+    pub(super) text: String,
+    pub(super) ticket: u64,
+}
+impl Loading {
+    pub(super) fn new(text: impl Into<String>) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            text: text.into(),
+            ticket: NEXT.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+/// What a key does to the dialog that received it.
+pub(super) enum DialogResult {
+    Stay,
+    Close,
+    /// Stay, with another dialog above.
+    Push(Modal),
+    /// Close, leaving another dialog in its place.
+    Replace(Modal),
+    /// Close, then have the app apply an effect.
+    Emit(Effect),
+}
+/// What the app does once a dialog has closed.
+pub(super) enum Effect {
+    /// Run a page or global action, as the command menu does.
+    Perform(ActionId),
+    /// Exit the router.
+    Exit,
+}
+
 impl Modal {
+    pub(super) fn input(title: &str, target: InputTarget, value: &str) -> Self {
+        Self::Input {
+            title: title.into(),
+            target,
+            text: textarea(value),
+        }
+    }
+    /// Whether Esc closes the dialog; others use Esc themselves.
+    fn closes_on_esc(&self) -> bool {
+        !matches!(
+            self,
+            Self::Repositories(_) | Self::Import(_) | Self::Diff(_)
+        )
+    }
+    /// Whether an editor holds changes Esc would lose.
+    fn changed(&self) -> bool {
+        match self {
+            Self::Stage { editor, .. } => editor.changed(),
+            Self::Harness(editor) => editor.changed(),
+            _ => false,
+        }
+    }
+    /// Shows a failed key's error in the dialogs that have room for it.
+    fn show_error(&mut self, error: &anyhow::Error) {
+        match self {
+            Self::Harness(editor) => editor.error = format!("{error:#}"),
+            Self::Diff(view) => view.note = storage::clean_terminal(&format!("{error:#}")),
+            Self::Picker { note, .. } => {
+                *note = storage::clean_terminal(&format!(
+                    "Could not apply selection: {error:#}\nEsc cancels."
+                ))
+            }
+            _ => {}
+        }
+    }
     pub(super) fn active_input(&mut self) -> Option<&mut InputField<'static>> {
         match self {
             Self::Input { text, .. } => Some(text),
@@ -254,8 +325,8 @@ impl Modal {
 }
 
 impl App {
-    /// Apply a picker choice; true means exit, for menu actions such as quit.
-    pub(super) fn pick(&mut self, choice: PickValue) -> Result<bool> {
+    /// Applies a picker choice; menu actions arrive as `Effect::Perform` instead.
+    pub(super) fn pick(&mut self, choice: PickValue) -> Result<()> {
         match choice {
             PickValue::Workflow(index) => {
                 self.editor.workflow = index;
@@ -301,7 +372,7 @@ impl App {
                 let mut stage = presets::STAGES[index].build();
                 stage.id = format!("{}-{}", stage.id, Stage::default().id);
                 let harness = stage.harness.clone();
-                self.ui.modal = Some(Modal::Stage {
+                self.ui.open(Modal::Stage {
                     editor: Box::new(StageEditor::new(
                         stage,
                         catalog::known_harnesses(&self.editor.settings),
@@ -321,20 +392,17 @@ impl App {
                 stage.effort.clear();
                 self.editor.dirty = true;
             }
-            PickValue::Model(model) => {
-                if let Some(mut editor) = self.model_editor.take() {
-                    editor.set_model(model);
-                    self.ui.modal = Some(Modal::Harness(editor));
-                } else if let Some((mut editor, insert_at)) = self.stage_editor.take() {
-                    editor.set_model(model);
-                    self.ui.modal = Some(Modal::Stage { editor, insert_at });
-                } else {
+            // The picker sits above the editor it was opened from, if any.
+            PickValue::Model(model) => match self.ui.dialog_mut() {
+                Some(Modal::Harness(editor)) => editor.set_model(model),
+                Some(Modal::Stage { editor, .. }) => editor.set_model(model),
+                _ => {
                     let stage = self.editor.stage_mut();
                     stage.model = model.id;
                     stage.provider = model.provider;
                     self.editor.dirty = true;
                 }
-            }
+            },
             PickValue::Theme(theme) => {
                 theme::save(
                     &self.ui.theme_path,
@@ -346,10 +414,12 @@ impl App {
                 self.ui.theme = theme;
                 self.ui.message = format!("Theme saved: {}. T changes it anytime.", theme.name());
             }
-            PickValue::Action(id) => return self.perform(id),
+            PickValue::Action(id) => {
+                self.perform(id)?;
+            }
             PickValue::Compare(choice) => self.show_comparison(&choice)?,
         }
-        Ok(false)
+        Ok(())
     }
     fn submit_input(&mut self, target: InputTarget, value: String) -> Result<()> {
         match target {
@@ -412,7 +482,7 @@ impl App {
                     ..self.ui.notifications.clone()
                 };
                 self.set_notifications(backends.clone())?;
-                self.ui.modal = Some(Modal::Notifications {
+                self.ui.open(Modal::Notifications {
                     backends,
                     selected: 3,
                     status: "Webhook URL saved.".into(),
@@ -421,30 +491,35 @@ impl App {
         }
         Ok(())
     }
-    /// Keys for an `Ask` dialog; true means exit.
-    fn ask_key(&mut self, ask: Box<Ask>, key: KeyEvent) -> Result<bool> {
+    /// Keys for an `Ask` dialog.
+    fn ask_key(&mut self, ask: &Ask, key: KeyEvent) -> Result<DialogResult> {
         let yes = matches!(key.code, Key::Char('y') | Key::Enter)
             && key.modifiers - Mods::SHIFT == Mods::NONE;
         let no = key.code == Key::Esc
             || (key.code == Key::Char('n') && key.modifiers - Mods::SHIFT == Mods::NONE);
         if !yes && !no {
-            self.ui.modal = Some(Modal::Ask(ask));
-            return Ok(false);
+            return Ok(DialogResult::Stay);
         }
-        match *ask {
+        let exit = |quit: bool| {
+            if quit {
+                DialogResult::Emit(Effect::Exit)
+            } else {
+                DialogResult::Close
+            }
+        };
+        match ask {
             Ask::SaveAndExit if yes => {
                 self.save(false)?;
-                return Ok(self.quit());
+                return Ok(exit(self.quit()));
             }
             Ask::SaveAndExit if key.code == Key::Char('n') => {
                 self.editor.dirty = false;
-                return Ok(self.quit());
+                return Ok(exit(self.quit()));
             }
-            Ask::DiscardDraft(editor) if !yes => self.ui.modal = Some(*editor),
             _ if !yes => {}
             Ask::CancelStage { run } => {
                 // The stage may have stopped while the question was open.
-                if let Some(slot) = self.running(&run) {
+                if let Some(slot) = self.running(run) {
                     slot.cancel.store(true, Ordering::Relaxed);
                     self.ui.message = "Stopping stage…".into();
                 } else {
@@ -453,14 +528,14 @@ impl App {
                 }
             }
             Ask::CancelRun { run } => {
-                self.ui.message = if self.session.cancel_run(&run) {
+                self.ui.message = if self.session.cancel_run(run) {
                     format!("Stopping the stage of {run}…")
                 } else {
                     format!("{run} is not running a stage; nothing was cancelled.")
                 };
             }
             Ask::TakeOver { run } => {
-                if let Some(slot) = self.running(&run) {
+                if let Some(slot) = self.running(run) {
                     slot.takeover = true;
                     slot.cancel.store(true, Ordering::Relaxed);
                     self.ui.message = "Stopping the unattended stage to open its session…".into();
@@ -470,6 +545,7 @@ impl App {
                 }
             }
             Ask::DeleteWorkflow { index } => {
+                let index = *index;
                 ensure!(
                     self.editor.settings.workflows.len() > 1
                         && index < self.editor.settings.workflows.len(),
@@ -483,9 +559,13 @@ impl App {
                 self.editor.dirty = true;
                 self.ui.message = format!("Deleted workflow “{name}” — [u] to undo.");
             }
-            Ask::SaveAndExit | Ask::DiscardDraft(_) => {}
+            // The editor under the question goes too.
+            Ask::DiscardDraft => {
+                self.ui.dialogs.pop();
+            }
+            Ask::SaveAndExit => {}
         }
-        Ok(false)
+        Ok(DialogResult::Close)
     }
     /// The focused run's slot when it is `id` and still has a worker.
     fn running(&mut self, id: &str) -> Option<&mut RunSlot> {
@@ -493,177 +573,198 @@ impl App {
             .focused_mut()
             .filter(|slot| slot.worker.is_some() && slot.run.id == id)
     }
+    /// Keys for the top dialog; true means exit.
     pub(super) fn modal_key(&mut self, key: KeyEvent) -> Result<bool> {
-        let Some(modal) = self.ui.modal.take() else {
+        let Some(mut dialog) = self.ui.dialogs.pop() else {
             return Ok(false);
         };
-        let modal = match modal {
-            Modal::Ask(ask) => return self.ask_key(ask, key),
-            Modal::Loading(_) if key.code == Key::Esc && self.cancel_switch() => {
-                return Ok(false);
+        let base = self.ui.dialogs.len();
+        let (outcome, error) = match self.dialog_key(&mut dialog, key) {
+            Ok(outcome) => (outcome, None),
+            Err(error) => {
+                dialog.show_error(&error);
+                (DialogResult::Stay, Some(error))
             }
-            other => other,
         };
-        let mut modal = modal;
-        if let Some(field) = modal.active_input() {
+        // A dialog that stays keeps its place under any its key opened.
+        let restore = |dialogs: &mut Vec<Modal>, dialog| {
+            dialogs.insert(base.min(dialogs.len()), dialog);
+        };
+        let mut exit = false;
+        match outcome {
+            DialogResult::Stay => restore(&mut self.ui.dialogs, dialog),
+            DialogResult::Close => {}
+            DialogResult::Push(next) => {
+                restore(&mut self.ui.dialogs, dialog);
+                self.ui.open(next);
+            }
+            DialogResult::Replace(next) => restore(&mut self.ui.dialogs, next),
+            // The dialog closes before its effect, so a menu action can open
+            // its own dialog and its errors reach the status line like a key's.
+            DialogResult::Emit(Effect::Perform(id)) => exit = self.perform(id)?,
+            DialogResult::Emit(Effect::Exit) => exit = true,
+        }
+        match error {
+            // Validation is shown in the harness draft, so it cannot leave a
+            // stale error behind the dialog once the field is corrected.
+            Some(_) if matches!(self.ui.dialog(), Some(Modal::Harness(_))) => Ok(exit),
+            Some(error) => Err(error),
+            None => Ok(exit),
+        }
+    }
+    /// What `key` does to `dialog`, which is off the stack meanwhile.
+    fn dialog_key(&mut self, dialog: &mut Modal, key: KeyEvent) -> Result<DialogResult> {
+        use DialogResult::{Close, Stay};
+        if let Modal::Ask(ask) = dialog {
+            return self.ask_key(ask, key);
+        }
+        // Vim's Normal mode takes keys first, Esc among them.
+        if let Some(field) = dialog.active_input() {
             field.set_vim(self.ui.vim_motions);
             if field.vim_key(key) {
-                self.ui.modal = Some(modal);
-                return Ok(false);
+                return Ok(Stay);
             }
         }
-        if key.code == Key::Esc
-            && !matches!(
-                modal,
-                Modal::Repositories(_) | Modal::Import(_) | Modal::Diff(_)
-            )
-        {
-            let changed = match &modal {
-                Modal::Stage { editor, .. } => editor.changed(),
-                Modal::Harness(editor) => editor.changed(),
-                _ => false,
-            };
-            if changed {
-                self.ui.modal = Some(Modal::Ask(Box::new(Ask::DiscardDraft(Box::new(modal)))));
-                return Ok(false);
-            }
-            self.catalog = None;
-            self.ui.modal = self.model_editor.take().map(Modal::Harness);
-            if let Some((editor, insert_at)) = self.stage_editor.take() {
-                self.ui.modal = Some(Modal::Stage { editor, insert_at });
-            }
-            return Ok(false);
+        let save = key.modifiers.contains(Mods::CONTROL) && key.code == Key::Char('s');
+        if key.code == Key::Esc && dialog.closes_on_esc() {
+            return Ok(if dialog.changed() {
+                DialogResult::Push(Modal::Ask(Box::new(Ask::DiscardDraft)))
+            } else {
+                Close
+            });
         }
-        if key.code == Key::F(7) && matches!(modal, Modal::Harness(_)) {
-            if let Modal::Harness(editor) = modal {
-                self.model_editor = Some(editor);
+        Ok(match dialog {
+            Modal::Input { target, text, .. } => {
+                if save {
+                    self.submit_input(*target, content(text))?;
+                    Close
+                } else {
+                    text.input(key);
+                    Stay
+                }
             }
-            self.model_picker();
-            return Ok(false);
-        }
-        let mut keep = true;
-        let mut exit = false;
-        let mut pick_model = false;
-        let mut refresh_catalog = None;
-        let mut open_project = None;
-        let result: Result<()> = (|| {
-            match &mut modal {
-                Modal::Input { target, text, .. } => {
-                    if key.modifiers.contains(Mods::CONTROL) && key.code == Key::Char('s') {
-                        self.submit_input(*target, content(text))?;
-                        keep = false;
-                    } else {
-                        text.input(key);
+            Modal::Stage { editor, insert_at } if save => {
+                let stage = editor.finish()?;
+                let mut candidate = self.editor.settings.clone();
+                let stages = &mut candidate.workflows[self.editor.workflow].stages;
+                match insert_at {
+                    Some(index) => stages.insert(*index, stage),
+                    None => stages[self.editor.selected] = stage,
+                }
+                candidate.validate()?;
+                self.editor.settings = candidate;
+                if let Some(index) = insert_at {
+                    self.editor.selected = *index;
+                    self.ui.message =
+                        "Stage added. [J]/[K] reorders; [Space] enables or disables it.".into();
+                }
+                self.editor.dirty = true;
+                Close
+            }
+            Modal::Stage { editor, .. } => {
+                match editor.key(key) {
+                    // The picker opens above the editor, which keeps the draft.
+                    StageRequest::PickModel => self.model_picker_for(editor.harness()),
+                    StageRequest::Catalog => {
+                        let harness = editor.harness();
+                        match self.catalogs.get(&harness) {
+                            Some(catalog) => editor.set_catalog(catalog.clone()),
+                            None => self.request_catalog(harness),
+                        }
+                    }
+                    StageRequest::None => {}
+                }
+                Stay
+            }
+            Modal::Harness(editor) if save => {
+                let stage = editor.finish()?;
+                let mut candidate = self.editor.settings.clone();
+                candidate.workflows[self.editor.workflow].stages[self.editor.selected] = stage;
+                candidate.validate()?;
+                self.editor.settings = candidate;
+                self.editor.dirty = true;
+                self.ui.message =
+                    "Harness settings applied to this stage. s saves; P previews the command."
+                        .into();
+                Close
+            }
+            Modal::Harness(editor) => {
+                if key.code == Key::F(7) {
+                    self.model_picker_for(editor.harness().to_owned());
+                } else {
+                    editor.key(key);
+                }
+                Stay
+            }
+            Modal::Repositories(picker) => match picker.key(key) {
+                Ok(PickerAction::Close) => Close,
+                // Opens in the background above the browser, which shows
+                // again if it fails.
+                Ok(PickerAction::Select(path)) => {
+                    self.begin_switch(path);
+                    Stay
+                }
+                Ok(PickerAction::Stay) => Stay,
+                Err(error) => {
+                    picker.error = format!("{error:#}");
+                    Stay
+                }
+            },
+            Modal::Import(importer) => match importer.key(key) {
+                ImportAction::Stay => Stay,
+                ImportAction::Close => Close,
+                ImportAction::Apply(task) => {
+                    self.editor.task = task;
+                    self.ui.message = "Task imported. t edits it; r starts the workflow.".into();
+                    Close
+                }
+            },
+            Modal::Text { scroll, body, .. } => {
+                // Scrolling stops at the last line.
+                let last =
+                    u16::try_from(body.lines().count().saturating_sub(1)).unwrap_or(u16::MAX);
+                match key.code {
+                    Key::Up | Key::Char('k') => *scroll = scroll.saturating_sub(1),
+                    Key::Down | Key::Char('j') => *scroll = scroll.saturating_add(1),
+                    Key::PageDown => *scroll = scroll.saturating_add(15),
+                    Key::PageUp => *scroll = scroll.saturating_sub(15),
+                    Key::Home => *scroll = 0,
+                    Key::End => *scroll = last,
+                    Key::Char('q') => return Ok(Close),
+                    _ => {}
+                }
+                *scroll = (*scroll).min(last);
+                Stay
+            }
+            Modal::Picker {
+                items,
+                selected,
+                filter,
+                ..
+            } => {
+                let matches = matching_choices(items, filter);
+                match menu_key(key) {
+                    Key::Up => *selected = selected.saturating_sub(1),
+                    Key::Down => *selected = (*selected + 1).min(matches.len().saturating_sub(1)),
+                    Key::Enter if !matches.is_empty() => {
+                        let value = matches[(*selected).min(matches.len() - 1)].value.clone();
+                        if let PickValue::Action(id) = value {
+                            return Ok(DialogResult::Emit(Effect::Perform(id)));
+                        }
+                        self.pick(value)?;
+                        return Ok(Close);
+                    }
+                    _ => {
+                        filter.input(key);
+                        *selected = 0;
                     }
                 }
-                Modal::Stage { editor, insert_at } => {
-                    if key.modifiers.contains(Mods::CONTROL) && key.code == Key::Char('s') {
-                        let stage = editor.finish()?;
-                        let mut candidate = self.editor.settings.clone();
-                        if let Some(index) = insert_at {
-                            candidate.workflows[self.editor.workflow]
-                                .stages
-                                .insert(*index, stage);
-                        } else {
-                            candidate.workflows[self.editor.workflow].stages
-                                [self.editor.selected] = stage;
-                        }
-                        candidate.validate()?;
-                        self.editor.settings = candidate;
-                        if let Some(index) = insert_at {
-                            self.editor.selected = *index;
-                            self.ui.message =
-                                "Stage added. [J]/[K] reorders; [Space] enables or disables it."
-                                    .into();
-                        }
-                        self.editor.dirty = true;
-                        keep = false;
-                    } else {
-                        match editor.key(key) {
-                            StageRequest::PickModel => pick_model = true,
-                            StageRequest::Catalog => refresh_catalog = Some(editor.harness()),
-                            StageRequest::None => {}
-                        }
-                    }
-                }
-                Modal::Harness(editor) => {
-                    if key.modifiers.contains(Mods::CONTROL) && key.code == Key::Char('s') {
-                        let stage = editor.finish()?;
-                        let mut candidate = self.editor.settings.clone();
-                        candidate.workflows[self.editor.workflow].stages[self.editor.selected] =
-                            stage;
-                        candidate.validate()?;
-                        self.editor.settings = candidate;
-                        self.editor.dirty = true;
-                        self.ui.message = "Harness settings applied to this stage. s saves; P previews the command.".into();
-                        keep = false;
-                    } else {
-                        editor.key(key);
-                    }
-                }
-                Modal::Repositories(picker) => match picker.key(key) {
-                    Ok(PickerAction::Close) => keep = false,
-                    Ok(PickerAction::Select(path)) => open_project = Some(path),
-                    Ok(PickerAction::Stay) => {}
-                    Err(error) => picker.error = format!("{error:#}"),
-                },
-                Modal::Import(importer) => match importer.key(key) {
-                    ImportAction::Stay => {}
-                    ImportAction::Close => keep = false,
-                    ImportAction::Apply(task) => {
-                        self.editor.task = task;
-                        self.ui.message =
-                            "Task imported. t edits it; r starts the workflow.".into();
-                        keep = false;
-                    }
-                },
-                Modal::Text { scroll, body, .. } => {
-                    // Scrolling stops at the last line.
-                    let last =
-                        u16::try_from(body.lines().count().saturating_sub(1)).unwrap_or(u16::MAX);
-                    match key.code {
-                        Key::Up | Key::Char('k') => *scroll = scroll.saturating_sub(1),
-                        Key::Down | Key::Char('j') => *scroll = scroll.saturating_add(1),
-                        Key::PageDown => *scroll = scroll.saturating_add(15),
-                        Key::PageUp => *scroll = scroll.saturating_sub(15),
-                        Key::Home => *scroll = 0,
-                        Key::End => *scroll = last,
-                        Key::Char('q') => keep = false,
-                        _ => {}
-                    }
-                    *scroll = (*scroll).min(last);
-                }
-                Modal::Picker {
-                    items,
-                    selected,
-                    filter,
-                    ..
-                } => {
-                    let matches = matching_choices(items, filter);
-                    match menu_key(key) {
-                        Key::Up => *selected = selected.saturating_sub(1),
-                        Key::Down => {
-                            *selected = (*selected + 1).min(matches.len().saturating_sub(1))
-                        }
-                        Key::Enter if !matches.is_empty() => {
-                            let value = matches[(*selected).min(matches.len() - 1)].value.clone();
-                            // The menu closes before its action runs, so the action can open
-                            // its own dialog and its errors reach the status line like a key's.
-                            if matches!(value, PickValue::Action(_)) {
-                                keep = false;
-                            }
-                            exit = self.pick(value)?;
-                            keep = false;
-                        }
-                        _ => {
-                            filter.input(key);
-                            *selected = 0;
-                        }
-                    }
-                }
-                Modal::Diff(view) => match view.key(key) {
+                Stay
+            }
+            Modal::Diff(view) => {
+                match view.key(key) {
                     DiffAction::Stay => {}
-                    DiffAction::Close => keep = false,
+                    DiffAction::Close => return Ok(Close),
                     DiffAction::Pager => {
                         self.ui.external =
                             Some(external::page_text(&super::diff_view::ansi(&view.patch))?)
@@ -680,70 +781,36 @@ impl App {
                             .map_err(|reason| anyhow::anyhow!("No difftool: {reason}"))?;
                         self.ui.external = Some(external::difftool(&self.run_dir()?, from, to)?);
                     }
-                },
-                Modal::Handoff(view) => match view.key(key) {
-                    HandoffAction::Stay => {}
-                    HandoffAction::Close => keep = false,
-                    HandoffAction::Edit(file) => {
-                        let dir = self.run_dir()?;
-                        self.ui.external = Some(external::edit(&dir.join(file), None, &dir)?);
-                    }
-                },
-                Modal::Loading(_) | Modal::Ask(_) => {}
-                Modal::Confirm(dialog) => keep = !self.confirm_key(dialog, key),
-                Modal::SessionRuns { selected } => keep = self.session_runs_key(selected, key),
-                Modal::Notifications {
-                    backends,
-                    selected,
-                    status,
-                } => keep = self.notifications_key(backends, selected, status, key)?,
+                }
+                Stay
             }
-            Ok(())
-        })();
-        if let Err(error) = &result {
-            if let Modal::Harness(editor) = &mut modal {
-                editor.error = format!("{error:#}");
+            Modal::Handoff(view) => match view.key(key) {
+                HandoffAction::Stay => Stay,
+                HandoffAction::Close => Close,
+                HandoffAction::Edit(file) => {
+                    let dir = self.run_dir()?;
+                    self.ui.external = Some(external::edit(&dir.join(file), None, &dir)?);
+                    Stay
+                }
+            },
+            Modal::Loading(_) | Modal::Ask(_) => Stay,
+            Modal::Confirm(dialog) => {
+                if self.confirm_key(dialog, key) {
+                    Close
+                } else {
+                    Stay
+                }
             }
-            if let Modal::Diff(view) = &mut modal {
-                view.note = storage::clean_terminal(&format!("{error:#}"));
-            }
-            if let Modal::Picker { note, .. } = &mut modal {
-                *note = storage::clean_terminal(&format!(
-                    "Could not apply selection: {error:#}\nEsc cancels."
-                ));
-            }
-        }
-        let modal = match (open_project, modal) {
-            (Some(path), Modal::Repositories(picker)) => {
-                self.begin_switch(path, picker);
-                return result.map(|()| exit);
-            }
-            (_, modal) => modal,
-        };
-        if pick_model {
-            if let Modal::Stage { editor, insert_at } = modal {
-                let harness = editor.harness();
-                self.stage_editor = Some((editor, insert_at));
-                self.model_picker_for(harness);
-                return Ok(false);
-            }
-        }
-        if keep {
-            self.ui.modal = Some(modal);
-        }
-        if let Some(harness) = refresh_catalog {
-            self.request_catalog(harness);
-        }
-        if matches!(self.ui.modal, Some(Modal::Harness(_))) {
-            // Validation is shown in the draft, so it cannot leave a stale
-            // error behind the dialog after the user corrects the field.
-            Ok(exit)
-        } else {
-            result.map(|()| exit)
-        }
+            Modal::SessionRuns { selected } => self.session_runs_key(selected, key),
+            Modal::Notifications {
+                backends,
+                selected,
+                status,
+            } => self.notifications_key(backends, selected, status, key)?,
+        })
     }
     pub(super) fn paste(&mut self, text: &str) {
-        match &mut self.ui.modal {
+        match self.ui.dialog_mut() {
             Some(Modal::Input { text: field, .. }) => {
                 field.insert_str(text);
             }
@@ -929,13 +996,13 @@ pub(super) fn draw_modal(
                 inner.inner(Margin::new(1, 0)),
             );
         }
-        Modal::Loading(message) => {
+        Modal::Loading(loading) => {
             const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let tick = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() / 80)
                 .unwrap_or(0) as usize;
-            let discovery = message.starts_with("Reading");
+            let discovery = loading.text.starts_with("Reading");
             let block = palette.modal(
                 if discovery {
                     "Model discovery"
@@ -954,7 +1021,7 @@ pub(super) fn draw_modal(
                             format!("{} ", SPIN[tick % SPIN.len()]),
                             Style::default().fg(palette.accent),
                         ),
-                        Span::raw(message.clone()),
+                        Span::raw(loading.text.clone()),
                     ]),
                     Line::styled(
                         if discovery {

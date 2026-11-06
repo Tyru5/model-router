@@ -127,7 +127,7 @@ mod tests {
         assert_eq!(app.editor.stage().harness, stage.harness);
         app.key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::SHIFT))
             .unwrap();
-        match &app.ui.modal {
+        match app.ui.dialog() {
             Some(Modal::Text { title, body, .. }) => {
                 assert!(title.starts_with("Routing stats"), "{title}");
                 assert!(body.contains("No finished stages recorded yet"), "{body}");

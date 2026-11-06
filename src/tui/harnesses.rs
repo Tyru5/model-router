@@ -513,15 +513,15 @@ mod tests {
         let mut app = app();
         press(&mut app, KeyCode::Char('4'));
         press(&mut app, KeyCode::Enter);
-        let Some(super::super::modal::Modal::Text { body, .. }) = &app.ui.modal else {
+        let Some(super::super::modal::Modal::Text { body, .. }) = app.ui.dialog() else {
             panic!("details did not open");
         };
         assert!(body.contains("Still checking"), "{body}");
-        app.ui.modal = None;
+        app.ui.dialogs.clear();
         wait(&mut app);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
-        let Some(super::super::modal::Modal::Text { title, body, .. }) = &app.ui.modal else {
+        let Some(super::super::modal::Modal::Text { title, body, .. }) = app.ui.dialog() else {
             panic!("details did not open");
         };
         assert_eq!(title, "opencode");

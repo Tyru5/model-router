@@ -204,7 +204,7 @@ impl App {
             }
             Ok(patch) => {
                 let view = super::diff_view::DiffView::new(patch.clone());
-                self.ui.modal = Some(super::modal::Modal::Diff(Box::new(view)));
+                self.ui.open(super::modal::Modal::Diff(Box::new(view)));
             }
             Err(error) => bail!("{error}"),
         }
@@ -736,13 +736,13 @@ mod tests {
         let mut app = app(sample());
         app.show_diff().unwrap();
         assert_eq!(app.ui.message, "Computing changes…");
-        assert!(app.ui.modal.is_none());
+        assert!(app.ui.dialog().is_none());
         app.slot_mut().changes = Some(tracked());
         app.show_diff().unwrap();
         assert!(
-            matches!(&app.ui.modal, Some(super::super::modal::Modal::Diff(view)) if view.patch.contains("+fresh line"))
+            matches!(app.ui.dialog(), Some(super::super::modal::Modal::Diff(view)) if view.patch.contains("+fresh line"))
         );
-        app.ui.modal = None;
+        app.ui.dialogs.clear();
         app.toggle_results().unwrap();
         assert!(!app.results_shown());
         assert!(screen(&mut app, 80, 24).contains("Output"));

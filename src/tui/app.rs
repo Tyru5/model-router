@@ -1,18 +1,16 @@
 use super::{
     actions::{self, ActionId, Scope},
     editor::Editor,
-    harness_editor::HarnessEditor,
     harnesses::{HarnessesPage, draw_harnesses},
     history::{RunsPage, draw_history},
-    modal::{Ask, Choice, InputTarget, Modal, PickValue, draw_modal},
+    modal::{Ask, Choice, InputTarget, Loading, Modal, PickValue, draw_modal},
     monitor::draw_run,
-    path_picker::PathPicker,
     run_slot::{RunSlot, Worker},
     session::{Session, draw_session_runs, notice_text},
     theme::{self, Palette, Theme},
     ui::Ui,
     widgets::{dim, rows_for, short_path, textarea},
-    workflow_page::{StageEditor, draw_workflow},
+    workflow_page::draw_workflow,
 };
 use crate::{
     catalog::{self, Catalog},
@@ -55,12 +53,9 @@ pub(super) struct App {
     pub(super) signal: Arc<AtomicBool>,
     /// Saved-run stats behind the stage hint and the Stats dialog.
     pub(super) route_stats: super::stats_page::StatsCache,
-    pub(super) catalog: Option<Receiver<std::result::Result<Catalog, String>>>,
-    pub(super) model_editor: Option<Box<HarnessEditor>>,
-    /// Stage editor parked while its model picker is open.
-    pub(super) stage_editor: Option<(Box<StageEditor>, Option<usize>)>,
-    /// Harness whose catalog is being read.
-    pub(super) catalog_harness: String,
+    /// A catalog being read for the model picker: the ticket of its Loading
+    /// dialog, and the harness.
+    pub(super) catalog: Option<(u64, String, CatalogRead)>,
     /// Catalogs read so far, by harness; they supply effort levels to editors.
     pub(super) catalogs: BTreeMap<String, Catalog>,
     /// A catalog being read for an editor, without a picker.
@@ -75,8 +70,8 @@ pub(super) struct App {
     pub(super) generation: u64,
     /// A run being created (worktree, snapshot) before it starts.
     pub(super) starting: Option<Job<std::result::Result<Started, String>>>,
-    /// A project being opened, with the browser to return to on failure.
-    project_job: Option<(ProjectJob, Box<PathPicker>)>,
+    /// A project being opened, with the ticket of its Loading dialog.
+    project_job: Option<(u64, ProjectJob)>,
 }
 
 /// Work on a background thread, tagged with the project generation it serves.
@@ -118,6 +113,7 @@ impl<T: Send + 'static> Job<T> {
 }
 
 type ProjectJob = Job<std::result::Result<Opened, String>>;
+pub(super) type CatalogRead = Receiver<std::result::Result<Catalog, String>>;
 /// A created run, ready for its driver.
 pub(super) struct Started {
     run: Run,
@@ -143,6 +139,9 @@ impl App {
     pub(super) fn slot_mut(&mut self) -> &mut RunSlot {
         self.session.focused_mut().expect("a focused run")
     }
+    pub(super) fn project_job_pending(&self) -> bool {
+        self.project_job.is_some()
+    }
 }
 /// How often the header re-reads Git status, and Runs re-reads active runs.
 const REPO_EVERY: Duration = Duration::from_secs(5);
@@ -165,9 +164,6 @@ impl App {
             signal: cancel,
             route_stats: Default::default(),
             catalog: None,
-            model_editor: None,
-            stage_editor: None,
-            catalog_harness: String::new(),
             catalogs: BTreeMap::new(),
             prefetch: None,
             prefetch_queue: VecDeque::new(),
@@ -180,7 +176,7 @@ impl App {
         }
     }
     pub(super) fn choose_theme(&mut self) {
-        self.ui.modal = Some(Modal::Picker {
+        self.ui.open(Modal::Picker {
             title: "Choose theme · live preview".into(),
             items: Theme::ALL
                 .into_iter()
@@ -210,14 +206,10 @@ impl App {
         });
     }
     pub(super) fn input(&mut self, title: &str, target: InputTarget, value: &str) {
-        self.ui.modal = Some(Modal::Input {
-            title: title.into(),
-            target,
-            text: textarea(value),
-        });
+        self.ui.open(Modal::input(title, target, value));
     }
     pub(super) fn text(&mut self, title: &str, body: String) {
-        self.ui.modal = Some(Modal::Text {
+        self.ui.open(Modal::Text {
             title: title.into(),
             body: storage::clean_terminal(&body),
             scroll: 0,
@@ -313,7 +305,7 @@ impl App {
         Ok(session)
     }
     pub(super) fn poll(&mut self) -> Result<bool> {
-        match &mut self.ui.modal {
+        match self.ui.dialog_mut() {
             Some(Modal::Import(importer)) => self.ui.redraw |= importer.poll(),
             Some(Modal::Repositories(picker)) => self.ui.redraw |= picker.poll(),
             _ => {}
@@ -356,31 +348,14 @@ impl App {
                 }
             }
         }
-        if let Some(receiver) = &self.catalog {
+        if let Some((ticket, harness, receiver)) = &self.catalog {
             if let Ok(result) = receiver.try_recv() {
+                let (ticket, harness) = (*ticket, harness.clone());
                 self.catalog = None;
                 self.ui.redraw = true;
-                match result {
-                    Ok(catalog) => {
-                        let harness = self.catalog_harness.clone();
-                        self.catalogs.insert(harness.clone(), catalog.clone());
-                        self.push_catalog(&harness);
-                        self.show_catalog(catalog);
-                    }
-                    Err(error) => {
-                        self.ui.message =
-                            format!("{error}. Enter a model ID manually in harness settings [c].");
-                        self.ui.alert = self.ui.message.clone();
-                        self.ui.modal = self.model_editor.take().map(|mut editor| {
-                            editor.error = self.ui.message.clone();
-                            Modal::Harness(editor)
-                        });
-                        if let Some((editor, insert_at)) = self.stage_editor.take() {
-                            self.ui
-                                .error(format!("{error}. Type a model ID with [i] instead."));
-                            self.ui.modal = Some(Modal::Stage { editor, insert_at });
-                        }
-                    }
+                // A closed picker drops what it was waiting for.
+                if self.ui.take_loading(ticket) {
+                    self.show_catalog_result(harness, result);
                 }
             }
         }
@@ -430,21 +405,19 @@ impl App {
                 }
             }
         }
-        if let Some((job, _)) = &self.project_job {
+        if let Some((ticket, job)) = &self.project_job {
             let got = job.get();
             if !matches!(got, Got::Pending) {
-                let (_, mut picker) = self.project_job.take().expect("project job");
+                let ticket = *ticket;
+                self.project_job = None;
                 self.ui.redraw = true;
                 let opened = match got {
                     Got::Ready(result) => result.map_err(anyhow::Error::msg),
                     _ => Err(anyhow::anyhow!("Opening the project stopped unexpectedly")),
                 };
-                if let Err(error) = opened.and_then(|opened| self.open_project(opened)) {
-                    // Back to the browser, which shows why.
-                    picker.error = format!("{error:#}");
-                    self.ui.modal = Some(Modal::Repositories(picker));
-                } else if matches!(self.ui.modal, Some(Modal::Loading(_))) {
-                    self.ui.modal = None;
+                // Esc closed the wait and went back to the browser.
+                if self.ui.take_loading(ticket) {
+                    self.project_opened(opened);
                 }
             }
         }
@@ -622,7 +595,36 @@ impl App {
             }
         }
     }
-    fn show_catalog(&mut self, catalog: Catalog) {
+    /// Shows a catalog read for the model picker: the picker on success; on
+    /// failure, the reason, in the editor the picker was opened from.
+    fn show_catalog_result(
+        &mut self,
+        harness: String,
+        result: std::result::Result<Catalog, String>,
+    ) {
+        match result {
+            Ok(catalog) => {
+                self.catalogs.insert(harness.clone(), catalog.clone());
+                self.push_catalog(&harness);
+                self.show_catalog(&harness, catalog);
+            }
+            Err(error) => match self.ui.dialog_mut() {
+                Some(Modal::Stage { .. }) => self
+                    .ui
+                    .error(format!("{error}. Type a model ID with [i] instead.")),
+                Some(Modal::Harness(editor)) => {
+                    let message =
+                        format!("{error}. Enter a model ID manually in harness settings [c].");
+                    editor.error = message.clone();
+                    self.ui.error(message);
+                }
+                _ => self.ui.error(format!(
+                    "{error}. Enter a model ID manually in harness settings [c]."
+                )),
+            },
+        }
+    }
+    fn show_catalog(&mut self, harness: &str, catalog: Catalog) {
         let items = catalog
             .models
             .into_iter()
@@ -646,36 +648,29 @@ impl App {
                 value: PickValue::Model(model),
             })
             .collect();
-        self.ui.modal = Some(Modal::Picker {
-            title: format!("{} selections · type to filter", self.catalog_harness),
+        self.ui.open(Modal::Picker {
+            title: format!("{harness} selections · type to filter"),
             items,
             selected: 0,
             filter: textarea(""),
             note: catalog.note,
         });
     }
-    /// Hands a cached catalog to the open or parked editors for `harness`.
+    /// Hands a cached catalog to the open editors for `harness`, including
+    /// any under a picker.
     fn push_catalog(&mut self, harness: &str) {
-        let Some(catalog) = self.catalogs.get(harness).cloned() else {
+        let Some(catalog) = self.catalogs.get(harness) else {
             return;
         };
-        match &mut self.ui.modal {
-            Some(Modal::Harness(editor)) if editor.harness() == harness => {
-                editor.set_catalog(catalog.clone());
-            }
-            Some(Modal::Stage { editor, .. }) if editor.harness() == harness => {
-                editor.set_catalog(catalog.clone());
-            }
-            _ => {}
-        }
-        if let Some(editor) = &mut self.model_editor {
-            if editor.harness() == harness {
-                editor.set_catalog(catalog.clone());
-            }
-        }
-        if let Some((editor, _)) = &mut self.stage_editor {
-            if editor.harness() == harness {
-                editor.set_catalog(catalog);
+        for dialog in &mut self.ui.dialogs {
+            match dialog {
+                Modal::Harness(editor) if editor.harness() == harness => {
+                    editor.set_catalog(catalog.clone());
+                }
+                Modal::Stage { editor, .. } if editor.harness() == harness => {
+                    editor.set_catalog(catalog.clone());
+                }
+                _ => {}
             }
         }
     }
@@ -705,22 +700,18 @@ impl App {
             }),
         ));
     }
-    pub(super) fn model_picker(&mut self) {
-        self.model_picker_for(self.editor.stage().harness.clone());
-    }
+    /// Opens the model picker for `harness` above the open dialogs.
     pub(super) fn model_picker_for(&mut self, harness: String) {
-        self.catalog_harness = harness.clone();
         if let Some(catalog) = self.catalogs.get(&harness).cloned() {
-            self.show_catalog(catalog);
+            self.show_catalog(&harness, catalog);
             return;
         }
         let settings = self.editor.settings.clone();
         let project = self.project.clone();
         let (sender, receiver) = mpsc::channel();
-        self.catalog = Some(receiver);
-        self.ui.modal = Some(Modal::Loading(format!(
-            "Reading {harness} model selections…"
-        )));
+        let loading = Loading::new(format!("Reading {harness} model selections…"));
+        self.catalog = Some((loading.ticket, harness.clone(), receiver));
+        self.ui.open(Modal::Loading(loading));
         thread::spawn(move || {
             let _ = sender.send(
                 catalog::discover(&harness, &settings, &project).map_err(|e| format!("{e:#}")),
@@ -733,22 +724,28 @@ impl App {
         let opened = read_project(path).map_err(anyhow::Error::msg)?;
         self.open_project(opened)
     }
-    /// Opens `path` in the background, returning to `picker` if it fails.
-    pub(super) fn begin_switch(&mut self, path: PathBuf, picker: Box<PathPicker>) {
+    /// Opens `path` in the background, above the repository browser.
+    pub(super) fn begin_switch(&mut self, path: PathBuf) {
+        let loading = Loading::new("Opening project…");
         self.project_job = Some((
+            loading.ticket,
             Job::spawn(self.generation, move || read_project(path)),
-            picker,
         ));
-        self.ui.modal = Some(Modal::Loading("Opening project…".into()));
+        self.ui.open(Modal::Loading(loading));
     }
-    /// Stops opening a project; the browser comes back.
-    pub(super) fn cancel_switch(&mut self) -> bool {
-        match self.project_job.take() {
-            Some((_, picker)) => {
-                self.ui.modal = Some(Modal::Repositories(picker));
-                true
+    /// Shows the project read in the background and closes the browser, or
+    /// returns to the browser, which shows why it could not open.
+    fn project_opened(&mut self, opened: Result<Opened>) {
+        match opened.and_then(|opened| self.open_project(opened)) {
+            Ok(()) => {
+                if matches!(self.ui.dialog(), Some(Modal::Repositories(_))) {
+                    self.ui.dialogs.pop();
+                }
             }
-            None => false,
+            Err(error) => match self.ui.dialog_mut() {
+                Some(Modal::Repositories(picker)) => picker.error = format!("{error:#}"),
+                _ => self.ui.error(format!("{error:#}")),
+            },
         }
     }
     /// Shows `opened`. Runs of this session keep going in their own projects;
@@ -804,7 +801,7 @@ impl App {
         if key.code == KeyCode::F(8) && key.modifiers.is_empty() {
             return self.perform_global(ActionId::ToggleVim);
         }
-        if self.ui.modal.is_some() {
+        if !self.ui.dialogs.is_empty() {
             return self.modal_key(key);
         }
         if self.runs_filtering() {
@@ -863,7 +860,7 @@ impl App {
                 )?;
                 self.ui.vim_motions = enabled;
                 self.runs.set_vim(enabled);
-                if let Some(field) = self.ui.modal.as_mut().and_then(Modal::active_input) {
+                if let Some(field) = self.ui.dialog_mut().and_then(Modal::active_input) {
                     field.set_vim(enabled);
                 }
                 self.ui.message = if enabled {
@@ -872,14 +869,12 @@ impl App {
                     "Vim motions disabled for all projects. F8 enables."
                 }.into();
             }
-            ActionId::Help => {
-                self.ui.modal = Some(Modal::Text {
-                    title: "Keyboard guide".into(),
-                    body: actions::guide(),
-                    scroll: 0,
-                    guide: true,
-                })
-            }
+            ActionId::Help => self.ui.open(Modal::Text {
+                title: "Keyboard guide".into(),
+                body: actions::guide(),
+                scroll: 0,
+                guide: true,
+            }),
             ActionId::Commands => self.command_menu(),
             ActionId::SessionRuns => self.session_runs(),
             ActionId::NextNeedsInput => self.jump_to_input(),
@@ -899,7 +894,7 @@ impl App {
     /// there are none.
     fn ask_to_save(&mut self) -> Option<()> {
         self.editor.dirty.then(|| {
-            self.ui.modal = Some(Modal::Ask(Box::new(Ask::SaveAndExit)));
+            self.ui.open(Modal::Ask(Box::new(Ask::SaveAndExit)));
         })
     }
     /// Exits now, or once active runs have stopped; true means exit now.
@@ -926,9 +921,9 @@ impl App {
     }
     /// Whether something on screen animates, so frames come faster.
     pub(super) fn animating(&self) -> bool {
-        matches!(self.ui.modal, Some(Modal::Loading(_)))
+        matches!(self.ui.dialog(), Some(Modal::Loading(_)))
             || self.starting.is_some()
-            || matches!(&self.ui.modal, Some(Modal::Import(importer)) if importer.busy())
+            || matches!(self.ui.dialog(), Some(Modal::Import(importer)) if importer.busy())
     }
     /// Whether the focused interactive stage may take the terminal now. An
     /// open dialog keeps it waiting, and the status line says how to open it.
@@ -936,7 +931,7 @@ impl App {
         if !std::mem::take(&mut self.session.launch_interactive) {
             return false;
         }
-        if self.ui.modal.is_some() {
+        if !self.ui.dialogs.is_empty() {
             self.ui.message =
                 "Interactive stage ready — press [t] on the Monitor to open it.".into();
             return false;
@@ -955,7 +950,7 @@ impl App {
                 value: PickValue::Action(entry.id),
             })
             .collect();
-        self.ui.modal = Some(Modal::Picker {
+        self.ui.open(Modal::Picker {
             title: format!("Commands · {}", self.ui.page.name()),
             items,
             selected: 0,
@@ -1127,13 +1122,15 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
             .wrap(Wrap { trim: false }),
         chunks[4],
     );
-    let ask = match &app.ui.modal {
+    // Only the top dialog shows; those below come back as it closes.
+    let ask = match app.ui.dialog() {
         Some(Modal::Ask(ask)) => Some(ask.text(app)),
         _ => None,
     };
-    if let Some(modal) = &mut app.ui.modal {
+    let vim = app.ui.vim_motions;
+    if let Some(modal) = app.ui.dialog_mut() {
         if let Some(field) = modal.active_input() {
-            field.set_vim(app.ui.vim_motions);
+            field.set_vim(vim);
         }
         // The theme picker previews live, so keep the page behind it legible.
         let previewing_theme = matches!(

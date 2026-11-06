@@ -3,7 +3,7 @@
 //! and the notifications dialog (`F9`).
 use super::{
     app::{App, Page},
-    modal::{Ask, InputTarget, Modal},
+    modal::{Ask, DialogResult, InputTarget, Modal},
     run_slot::RunSlot,
     theme::{self, Palette},
     widgets::{elapsed, menu_key, popup},
@@ -278,7 +278,7 @@ impl App {
         }
     }
     pub(super) fn session_runs(&mut self) {
-        self.ui.modal = Some(Modal::SessionRuns {
+        self.ui.open(Modal::SessionRuns {
             selected: if self.session.runs.is_empty() {
                 0
             } else {
@@ -286,8 +286,8 @@ impl App {
             },
         });
     }
-    /// Keys for the session runs dialog; false closes it.
-    pub(super) fn session_runs_key(&mut self, selected: &mut usize, key: KeyEvent) -> bool {
+    /// Keys for the session runs dialog.
+    pub(super) fn session_runs_key(&mut self, selected: &mut usize, key: KeyEvent) -> DialogResult {
         let total = self.session.runs.len();
         match menu_key(key) {
             Key::Up | Key::Char('k') => *selected = selected.saturating_sub(1),
@@ -296,31 +296,30 @@ impl App {
                 self.session.focus(*selected);
                 self.ui.page = Page::Monitor;
                 self.ui.message = self.focus_message();
-                return false;
+                return DialogResult::Close;
             }
             Key::Char('n') => {
                 self.jump_to_input();
-                return false;
+                return DialogResult::Close;
             }
             Key::Char('C') => {
                 let Some(slot) = self.session.runs.get(*selected) else {
-                    return true;
+                    return DialogResult::Stay;
                 };
                 let run = &slot.run;
                 if slot.worker.is_some() {
-                    self.ui.modal = Some(Modal::Ask(Box::new(Ask::CancelRun {
+                    return DialogResult::Replace(Modal::Ask(Box::new(Ask::CancelRun {
                         run: run.id.clone(),
                     })));
-                    return false;
                 }
                 self.ui.message = format!("{} is not running a stage; nothing to cancel.", run.id);
             }
             _ => {}
         }
-        true
+        DialogResult::Stay
     }
     pub(super) fn notifications(&mut self) {
-        self.ui.modal = Some(Modal::Notifications {
+        self.ui.open(Modal::Notifications {
             backends: self.ui.notifications.clone(),
             selected: 0,
             status: String::new(),
@@ -337,14 +336,14 @@ impl App {
         self.ui.notifications = backends;
         Ok(())
     }
-    /// Keys for the notifications dialog; false closes it.
+    /// Keys for the notifications dialog.
     pub(super) fn notifications_key(
         &mut self,
         backends: &mut Backends,
         selected: &mut usize,
         status: &mut String,
         key: KeyEvent,
-    ) -> Result<bool> {
+    ) -> Result<DialogResult> {
         match menu_key(key) {
             Key::Up | Key::Char('k') => *selected = selected.saturating_sub(1),
             Key::Down | Key::Char('j') => *selected = (*selected + 1).min(NOTIFY_ROWS - 1),
@@ -361,20 +360,19 @@ impl App {
                     *backends = changed;
                     *status = "Saved for every project.".into();
                 }
+                // Saving the URL reopens this dialog.
                 3 => {
-                    let url = backends.webhook_url.clone();
-                    self.input(
+                    return Ok(DialogResult::Replace(Modal::input(
                         "Webhook URL (ntfy-style: the body is the message, Title header the title)",
                         InputTarget::NotifyUrl,
-                        &url,
-                    );
-                    return Ok(false);
+                        &backends.webhook_url,
+                    )));
                 }
                 _ => *status = notify::global().deliver(&NotifyEvent::test()).summary(),
             },
             _ => {}
         }
-        Ok(true)
+        Ok(DialogResult::Stay)
     }
 }
 

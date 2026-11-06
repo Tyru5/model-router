@@ -659,13 +659,13 @@ impl App {
                 &self.editor.task.clone(),
             ),
             ActionId::Repositories => {
-                self.ui.modal = Some(Modal::Repositories(Box::new(PathPicker::new(
+                self.ui.open(Modal::Repositories(Box::new(PathPicker::new(
                     &self.project,
                     storage::recent_projects(),
                 )?)));
             }
             ActionId::ImportTask => {
-                self.ui.modal = Some(Modal::Import(Box::new(TaskImporter::new(
+                self.ui.open(Modal::Import(Box::new(TaskImporter::new(
                     &self.project,
                     &self.editor.task,
                 )?)));
@@ -695,7 +695,7 @@ impl App {
                             value: PickValue::WorkflowPreset(index),
                         }),
                 );
-                self.ui.modal = Some(Modal::Picker {
+                self.ui.open(Modal::Picker {
                     title: "Choose workflow".into(),
                     items,
                     selected: self.editor.workflow,
@@ -739,7 +739,7 @@ impl App {
                         value: PickValue::Harness(name),
                     })
                     .collect();
-                self.ui.modal = Some(Modal::Picker {
+                self.ui.open(Modal::Picker {
                     title: "Harness for selected stage".into(),
                     items,
                     selected: 0,
@@ -749,7 +749,7 @@ impl App {
                 });
             }
             ActionId::EditStage => {
-                self.ui.modal = Some(Modal::Stage {
+                self.ui.open(Modal::Stage {
                     editor: Box::new(StageEditor::new(
                         self.editor.stage().clone(),
                         catalog::known_harnesses(&self.editor.settings),
@@ -759,16 +759,16 @@ impl App {
                 self.request_catalog(self.editor.stage().harness.clone());
             }
             ActionId::HarnessSettings => {
-                self.ui.modal = Some(Modal::Harness(Box::new(HarnessEditor::new(
+                self.ui.open(Modal::Harness(Box::new(HarnessEditor::new(
                     self.editor.stage().clone(),
                     self.editor.settings.providers.clone(),
                 ))));
                 self.request_catalog(self.editor.stage().harness.clone());
             }
-            ActionId::Models => self.model_picker(),
+            ActionId::Models => self.model_picker_for(self.editor.stage().harness.clone()),
             ActionId::AddStage => {
                 ensure!(count < 64, "A workflow can contain at most 64 stages");
-                self.ui.modal = Some(Modal::Picker {
+                self.ui.open(Modal::Picker {
                     title: "Add stage from preset".into(),
                     items: presets::STAGES
                         .iter()
@@ -812,7 +812,7 @@ impl App {
                     self.editor.settings.workflows.len() > 1,
                     "Keep at least one workflow"
                 );
-                self.ui.modal = Some(Modal::Ask(Box::new(Ask::DeleteWorkflow {
+                self.ui.open(Modal::Ask(Box::new(Ask::DeleteWorkflow {
                     index: self.editor.workflow,
                 })));
             }

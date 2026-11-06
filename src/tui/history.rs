@@ -213,7 +213,7 @@ impl App {
                     .and_then(|entry| self.load_run(&entry))
                 {
                     let worktree = source.worktree;
-                    self.ui.modal = Some(Modal::Confirm(Box::new(Confirm {
+                    self.ui.open(Modal::Confirm(Box::new(Confirm {
                         kind: Kind::Rerun {
                             source: Box::new(source),
                             worktree,
@@ -235,7 +235,7 @@ impl App {
                 if let Some(entry) = self.runs.selected_entry() {
                     let id = entry.id().to_owned();
                     let plan = self.cleanup_plan(&id, false)?;
-                    self.ui.modal = Some(Modal::Confirm(Box::new(Confirm {
+                    self.ui.open(Modal::Confirm(Box::new(Confirm {
                         kind: Kind::Cleanup {
                             id,
                             plan,
@@ -344,7 +344,7 @@ impl App {
             self.ui.message = "No stage in this run has two attempts to compare.".into();
             return;
         }
-        self.ui.modal = Some(Modal::Picker {
+        self.ui.open(Modal::Picker {
             title: format!("Compare attempts · {}", run.id),
             items,
             selected: 0,
@@ -953,7 +953,7 @@ mod tests {
         settle(&mut app);
         assert!(app.session.run().is_none());
         assert_eq!(app.ui.page, Page::Runs);
-        match &app.ui.modal {
+        match app.ui.dialog() {
             Some(Modal::Text { title, body, .. }) => {
                 assert_eq!(title, "Damaged run record");
                 assert!(body.contains(&broken.display().to_string()), "{body}");
@@ -962,7 +962,7 @@ mod tests {
         }
         app.key(key(Key::Esc)).unwrap();
         press(&mut app, "n");
-        assert!(matches!(&app.ui.modal, Some(Modal::Text { .. })));
+        assert!(matches!(app.ui.dialog(), Some(Modal::Text { .. })));
     }
 
     #[test]
@@ -973,18 +973,18 @@ mod tests {
         assert_eq!(drive(&mut source), Action::Complete);
         let mut app = app(project.path(), settings);
         press(&mut app, "3n");
-        assert!(matches!(&app.ui.modal, Some(Modal::Confirm(_))));
+        assert!(matches!(app.ui.dialog(), Some(Modal::Confirm(_))));
         assert!(shows(&mut app, "Rerun as a new run"));
         assert!(shows(&mut app, "research · mock / test-model · unattended"));
         assert!(shows(&mut app, "Port the parser"));
         assert!(shows(&mut app, "not the current template"));
         app.key(key(Key::Esc)).unwrap();
-        assert!(app.ui.modal.is_none() && !app.session.running() && app.session.run().is_none());
+        assert!(app.ui.dialog().is_none() && !app.session.running() && app.session.run().is_none());
         assert_eq!(run_dirs(project.path()), 1);
 
         press(&mut app, "n");
         app.key(key(Key::Enter)).unwrap();
-        assert!(app.ui.modal.is_none());
+        assert!(app.ui.dialog().is_none());
         assert!(
             app.starting.is_some(),
             "The run is created in the background"
@@ -1016,7 +1016,7 @@ mod tests {
         assert_eq!(drive(&mut once), Action::Complete);
         let mut app = app(project.path(), settings);
         press(&mut app, "3c");
-        assert!(app.ui.modal.is_none());
+        assert!(app.ui.dialog().is_none());
         assert!(
             app.ui.message.contains("two attempts"),
             "{}",
@@ -1025,7 +1025,7 @@ mod tests {
         press(&mut app, "j");
         assert_eq!(app.runs.selected_entry().unwrap().id(), retried.id);
         press(&mut app, "c");
-        match &app.ui.modal {
+        match app.ui.dialog() {
             Some(Modal::Picker { items, .. }) => {
                 assert_eq!(items[0].label, "research · attempt 1 vs 2");
             }
@@ -1033,7 +1033,7 @@ mod tests {
         }
         app.key(key(Key::Enter)).unwrap();
         settle(&mut app);
-        match &app.ui.modal {
+        match app.ui.dialog() {
             Some(Modal::Text { title, body, .. }) => {
                 assert_eq!(title, "Compare · research");
                 assert!(body.contains("failed → complete"), "{body}");
@@ -1053,18 +1053,18 @@ mod tests {
         press(&mut app, "3j");
         assert_eq!(app.runs.selected_entry().unwrap().id(), run.id);
         press(&mut app, "D");
-        assert!(matches!(&app.ui.modal, Some(Modal::Confirm(_))));
+        assert!(matches!(app.ui.dialog(), Some(Modal::Confirm(_))));
         assert!(shows(&mut app, "Would remove 1 run"));
         assert!(shows(
             &mut app,
             &format!(".model-router/handoffs/{}", run.id)
         ));
         app.key(key(Key::Esc)).unwrap();
-        assert!(app.ui.modal.is_none());
+        assert!(app.ui.dialog().is_none());
         assert!(run.directory.exists());
 
         press(&mut app, "Dy");
-        assert!(app.ui.modal.is_none());
+        assert!(app.ui.dialog().is_none());
         assert!(!run.directory.exists() && kept.directory.exists());
         assert!(app.ui.message.starts_with(&format!("Removed {}", run.id)));
         assert_eq!(app.runs.entries.len(), 1);

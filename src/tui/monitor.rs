@@ -31,7 +31,7 @@ impl App {
         match id {
             ActionId::CancelStage => {
                 let run = self.session.run().context("No run selected")?;
-                self.ui.modal = Some(Modal::Ask(Box::new(Ask::CancelStage {
+                self.ui.open(Modal::Ask(Box::new(Ask::CancelStage {
                     run: run.id.clone(),
                 })));
             }
@@ -62,7 +62,7 @@ impl App {
                         stage.mode == Mode::Unattended,
                         "This stage is already interactive"
                     );
-                    self.ui.modal = Some(Modal::Ask(Box::new(Ask::TakeOver {
+                    self.ui.open(Modal::Ask(Box::new(Ask::TakeOver {
                         run: run.id.clone(),
                     })));
                 } else {
@@ -140,7 +140,7 @@ impl App {
                             .stages
                             .get(index)
                             .map_or_else(String::new, |s| s.name.clone());
-                        self.ui.modal = Some(Modal::Handoff(Box::new(HandoffView::new(
+                        self.ui.open(Modal::Handoff(Box::new(HandoffView::new(
                             handoff.clone(),
                             stage,
                         ))));

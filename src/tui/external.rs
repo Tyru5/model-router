@@ -62,7 +62,7 @@ impl super::app::App {
                 self.ui.alert.clone()
             }
         };
-        if let Some(super::modal::Modal::Diff(view)) = &mut self.ui.modal {
+        if let Some(super::modal::Modal::Diff(view)) = self.ui.dialog_mut() {
             view.note = crate::storage::clean_terminal(&message);
         }
         self.ui.message = message;
