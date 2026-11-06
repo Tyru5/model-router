@@ -29,6 +29,18 @@ pub(super) struct HarnessChecks {
     /// Tests swap in a stub so no harness runs.
     pub(super) probe: Probe,
 }
+/// The Harnesses page: doctor results and the selected row.
+#[derive(Default)]
+pub(super) struct HarnessesPage {
+    pub(super) selected: usize,
+    pub(super) checks: HarnessChecks,
+}
+
+impl Default for HarnessChecks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl HarnessChecks {
     pub(super) fn new() -> Self {
         Self {
@@ -95,37 +107,52 @@ fn missing(report: &Report) -> Vec<&str> {
     flags
 }
 
-impl App {
+impl HarnessesPage {
     /// Harness names in display order: the last results, or the configured
     /// harnesses until the first check finishes.
-    fn harness_names(&self) -> Vec<String> {
-        if self.harness_checks.reports.is_empty() {
-            catalog::known_harnesses(&self.settings)
+    pub(super) fn names(&self, settings: &Settings) -> Vec<String> {
+        if self.checks.reports.is_empty() {
+            catalog::known_harnesses(settings)
         } else {
-            self.harness_checks
+            self.checks
                 .reports
                 .iter()
                 .map(|r| r.harness.clone())
                 .collect()
         }
     }
+}
+
+impl App {
     pub(super) fn perform_harnesses(&mut self, id: ActionId) -> Result<()> {
         match id {
             ActionId::NextHarness => {
-                self.harness_selected =
-                    (self.harness_selected + 1).min(self.harness_names().len().saturating_sub(1))
+                self.harnesses.selected = (self.harnesses.selected + 1).min(
+                    self.harnesses
+                        .names(&self.editor.settings)
+                        .len()
+                        .saturating_sub(1),
+                )
             }
             ActionId::PreviousHarness => {
-                self.harness_selected = self.harness_selected.saturating_sub(1)
+                self.harnesses.selected = self.harnesses.selected.saturating_sub(1)
             }
             ActionId::HarnessDetails => {
-                let Some(harness) = self.harness_names().get(self.harness_selected).cloned() else {
+                let Some(harness) = self
+                    .harnesses
+                    .names(&self.editor.settings)
+                    .get(self.harnesses.selected)
+                    .cloned()
+                else {
                     return Ok(());
                 };
-                let body = details(&harness, self.harness_checks.report(&harness));
+                let body = details(&harness, self.harnesses.checks.report(&harness));
                 self.text(&harness, body);
             }
-            ActionId::RefreshHarnesses => self.harness_checks.start(&self.settings, &self.project),
+            ActionId::RefreshHarnesses => self
+                .harnesses
+                .checks
+                .start(&self.editor.settings, &self.project),
             other => bail!("{other:?} is not a Harnesses action"),
         }
         Ok(())
@@ -207,9 +234,9 @@ fn clip(text: &str, width: usize) -> String {
 }
 
 pub(super) fn draw_harnesses(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
-    let checks = &app.harness_checks;
+    let checks = &app.harnesses.checks;
     let wide = area.width >= 110;
-    let names = app.harness_names();
+    let names = app.harnesses.names(&app.editor.settings);
     let name_width = names.iter().map(|n| n.chars().count()).max().unwrap_or(7);
     let name_width = name_width.clamp(7, 14);
     let version_width = if area.width >= 140 { 22 } else { 10 };
@@ -321,7 +348,7 @@ pub(super) fn draw_harnesses(frame: &mut Frame<'_>, app: &App, area: Rect, palet
             .highlight_spacing(HighlightSpacing::Always)
             .row_highlight_style(palette.selected_style()),
         area,
-        &mut TableState::default().with_selected(Some(app.harness_selected)),
+        &mut TableState::default().with_selected(Some(app.harnesses.selected)),
     );
 }
 
@@ -395,7 +422,7 @@ mod tests {
             PathBuf::from("/tmp/config"),
             Arc::new(AtomicBool::new(false)),
         );
-        app.harness_checks.probe = stub;
+        app.harnesses.checks.probe = stub;
         app
     }
 
@@ -405,7 +432,7 @@ mod tests {
 
     fn wait(app: &mut App) {
         let start = Instant::now();
-        while app.harness_checks.checking() {
+        while app.harnesses.checks.checking() {
             assert!(
                 start.elapsed() < Duration::from_secs(5),
                 "check never finished"
@@ -441,16 +468,16 @@ mod tests {
     #[test]
     fn page_checks_in_background_and_shows_doctor_columns() {
         let mut app = app();
-        let palette = app.palette();
+        let palette = app.ui.palette();
         press(&mut app, KeyCode::Char('4'));
-        assert!(app.harness_checks.checking());
+        assert!(app.harnesses.checks.checking());
         let (text, _) = render(&mut app, 80, "checking…");
         assert!(
             text.contains("codex") && text.contains("checking…"),
             "{text}"
         );
         wait(&mut app);
-        assert_eq!(app.harness_checks.reports.len(), 3);
+        assert_eq!(app.harnesses.checks.reports.len(), 3);
 
         let (text, color) = render(&mut app, 80, "missing: --variant");
         assert_eq!(color, Some(palette.warn), "{text}");
@@ -473,12 +500,12 @@ mod tests {
         );
 
         // Refresh keeps old rows until fresh results arrive.
-        app.harness_checks.reports.truncate(1);
+        app.harnesses.checks.reports.truncate(1);
         press(&mut app, KeyCode::Char('r'));
-        assert!(app.harness_checks.checking());
-        assert_eq!(app.harness_checks.reports.len(), 1);
+        assert!(app.harnesses.checks.checking());
+        assert_eq!(app.harnesses.checks.reports.len(), 1);
         wait(&mut app);
-        assert_eq!(app.harness_checks.reports.len(), 3);
+        assert_eq!(app.harnesses.checks.reports.len(), 3);
     }
 
     #[test]
@@ -486,15 +513,15 @@ mod tests {
         let mut app = app();
         press(&mut app, KeyCode::Char('4'));
         press(&mut app, KeyCode::Enter);
-        let Some(super::super::modal::Modal::Text { body, .. }) = &app.modal else {
+        let Some(super::super::modal::Modal::Text { body, .. }) = &app.ui.modal else {
             panic!("details did not open");
         };
         assert!(body.contains("Still checking"), "{body}");
-        app.modal = None;
+        app.ui.modal = None;
         wait(&mut app);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
-        let Some(super::super::modal::Modal::Text { title, body, .. }) = &app.modal else {
+        let Some(super::super::modal::Modal::Text { title, body, .. }) = &app.ui.modal else {
             panic!("details did not open");
         };
         assert_eq!(title, "opencode");
@@ -516,7 +543,7 @@ mod tests {
     #[test]
     fn workflow_warns_only_from_cached_results() {
         let mut app = app();
-        app.stage_mut().harness = "opencode".into();
+        app.editor.stage_mut().harness = "opencode".into();
         let warning = "⚠ opencode 2.0.22 lacks --variant, --interactive; see Harnesses [4]";
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(260, 40)).unwrap();
@@ -534,12 +561,12 @@ mod tests {
         };
         assert!(!draw(&mut app).contains("lacks"));
         assert!(
-            !app.harness_checks.checking(),
+            !app.harnesses.checks.checking(),
             "Workflow must not run doctor"
         );
-        app.harness_checks.reports = stub(&app.settings, &app.project);
+        app.harnesses.checks.reports = stub(&app.editor.settings, &app.project);
         assert!(draw(&mut app).contains(warning));
-        app.stage_mut().harness = "codex".into();
+        app.editor.stage_mut().harness = "codex".into();
         assert!(!draw(&mut app).contains("lacks"));
     }
 }

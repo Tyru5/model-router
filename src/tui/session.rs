@@ -22,6 +22,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState, Wrap},
 };
+use std::collections::VecDeque;
 
 /// Notices kept for the history dialog.
 pub(super) const NOTICES: usize = 50;
@@ -40,6 +41,14 @@ pub(super) struct Session {
     pub(super) runs: Vec<RunSlot>,
     /// Index of the focused run; meaningless while `runs` is empty.
     pub(super) focus: usize,
+    /// What runs of this session reported, newest last; `!` lists them.
+    pub(super) notices: VecDeque<Notice>,
+    /// Notices since the list was last opened.
+    pub(super) unseen_notices: usize,
+    /// The focused run's interactive stage gets the terminal on the next frame.
+    pub(super) launch_interactive: bool,
+    /// Exit once the active runs have stopped.
+    pub(super) quit_after_stop: bool,
 }
 
 impl Session {
@@ -174,37 +183,42 @@ pub(super) fn notice_text(run: &Run, result: &std::result::Result<Action, String
 impl App {
     /// Adds a notice and shows it on the status line.
     pub(super) fn push_notice(&mut self, text: String, alert: bool) {
-        if self.notices.len() == NOTICES {
-            self.notices.pop_front();
+        if self.session.notices.len() == NOTICES {
+            self.session.notices.pop_front();
         }
-        self.notices.push_back(Notice {
+        self.session.notices.push_back(Notice {
             at: chrono::Local::now(),
             text: text.clone(),
             alert,
         });
-        self.unseen_notices += 1;
+        self.session.unseen_notices += 1;
         if alert {
-            self.alert = text.clone();
+            self.ui.alert = text.clone();
         }
-        self.message = text;
-        self.redraw = true;
+        self.ui.message = text;
+        self.ui.redraw = true;
     }
     /// How many notices arrived beside the one on the status line.
     pub(super) fn more_notices(&self) -> usize {
-        let newest = self.notices.back().is_some_and(|n| n.text == self.message);
+        let newest = self
+            .session
+            .notices
+            .back()
+            .is_some_and(|n| n.text == self.ui.message);
         if newest {
-            self.unseen_notices.saturating_sub(1)
+            self.session.unseen_notices.saturating_sub(1)
         } else {
             0
         }
     }
     pub(super) fn show_notices(&mut self) {
-        self.unseen_notices = 0;
-        let body = if self.notices.is_empty() {
+        self.session.unseen_notices = 0;
+        let body = if self.session.notices.is_empty() {
             "No notices yet. Runs of this session add one when they stop, need input, or finish."
                 .to_owned()
         } else {
-            self.notices
+            self.session
+                .notices
                 .iter()
                 .rev()
                 .map(|n| {
@@ -230,12 +244,12 @@ impl App {
             .map(|step| (start + step) % total.max(1))
             .find(|index| runs[*index].needs_input())
         else {
-            self.message = "No run of this session needs input.".into();
+            self.ui.message = "No run of this session needs input.".into();
             return;
         };
         self.session.focus(index);
-        self.page = Page::Monitor;
-        self.message = self.focus_message();
+        self.ui.page = Page::Monitor;
+        self.ui.message = self.focus_message();
     }
     /// The status line after focusing a run from the list.
     fn focus_message(&self) -> String {
@@ -264,7 +278,7 @@ impl App {
         }
     }
     pub(super) fn session_runs(&mut self) {
-        self.modal = Some(Modal::SessionRuns {
+        self.ui.modal = Some(Modal::SessionRuns {
             selected: if self.session.runs.is_empty() {
                 0
             } else {
@@ -280,8 +294,8 @@ impl App {
             Key::Down | Key::Char('j') => *selected = (*selected + 1).min(total.saturating_sub(1)),
             Key::Enter if *selected < total => {
                 self.session.focus(*selected);
-                self.page = Page::Monitor;
-                self.message = self.focus_message();
+                self.ui.page = Page::Monitor;
+                self.ui.message = self.focus_message();
                 return false;
             }
             Key::Char('n') => {
@@ -294,20 +308,20 @@ impl App {
                 };
                 let run = &slot.run;
                 if slot.worker.is_some() {
-                    self.modal = Some(Modal::Ask(Box::new(Ask::CancelRun {
+                    self.ui.modal = Some(Modal::Ask(Box::new(Ask::CancelRun {
                         run: run.id.clone(),
                     })));
                     return false;
                 }
-                self.message = format!("{} is not running a stage; nothing to cancel.", run.id);
+                self.ui.message = format!("{} is not running a stage; nothing to cancel.", run.id);
             }
             _ => {}
         }
         true
     }
     pub(super) fn notifications(&mut self) {
-        self.modal = Some(Modal::Notifications {
-            backends: self.notifications.clone(),
+        self.ui.modal = Some(Modal::Notifications {
+            backends: self.ui.notifications.clone(),
             selected: 0,
             status: String::new(),
         });
@@ -316,11 +330,11 @@ impl App {
     pub(super) fn set_notifications(&mut self, backends: Backends) -> Result<()> {
         let preferences = theme::Preferences {
             notifications: backends.clone(),
-            ..self.preferences()
+            ..self.ui.preferences()
         };
-        theme::save(&self.theme_path, &preferences)?;
+        theme::save(&self.ui.theme_path, &preferences)?;
         notify::global().set_backends(backends.clone());
-        self.notifications = backends;
+        self.ui.notifications = backends;
         Ok(())
     }
     /// Keys for the notifications dialog; false closes it.
@@ -361,13 +375,6 @@ impl App {
             _ => {}
         }
         Ok(true)
-    }
-    pub(super) fn preferences(&self) -> theme::Preferences {
-        theme::Preferences {
-            theme: self.theme,
-            vim_motions: self.vim_motions,
-            notifications: self.notifications.clone(),
-        }
     }
 }
 

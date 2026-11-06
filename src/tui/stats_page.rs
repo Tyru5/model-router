@@ -96,9 +96,9 @@ mod tests {
             project.path().join("config.toml"),
             Arc::new(AtomicBool::new(false)),
         );
-        app.theme_path = project.path().join("appearance.json");
-        app.harness_checks.probe = |_, _| vec![];
-        let stage = app.stage().clone();
+        app.ui.theme_path = project.path().join("appearance.json");
+        app.harnesses.checks.probe = |_, _| vec![];
+        let stage = app.editor.stage().clone();
         assert_eq!(app.stats_hint(&stage), None);
         let mut all = samples(&stage.harness, &stage.model, 1, 5);
         all.extend(samples("claude", "opus", 5, 5));
@@ -124,10 +124,10 @@ mod tests {
             .collect();
         assert!(screen.contains("History: claude/opus"), "{screen}");
         // Advice never changes the stage.
-        assert_eq!(app.stage().harness, stage.harness);
+        assert_eq!(app.editor.stage().harness, stage.harness);
         app.key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::SHIFT))
             .unwrap();
-        match &app.modal {
+        match &app.ui.modal {
             Some(Modal::Text { title, body, .. }) => {
                 assert!(title.starts_with("Routing stats"), "{title}");
                 assert!(body.contains("No finished stages recorded yet"), "{body}");

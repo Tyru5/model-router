@@ -58,15 +58,15 @@ impl super::app::App {
         let message = match result {
             Ok(message) => message,
             Err(error) => {
-                self.alert = format!("{error:#}");
-                self.alert.clone()
+                self.ui.alert = format!("{error:#}");
+                self.ui.alert.clone()
             }
         };
-        if let Some(super::modal::Modal::Diff(view)) = &mut self.modal {
+        if let Some(super::modal::Modal::Diff(view)) = &mut self.ui.modal {
             view.note = crate::storage::clean_terminal(&message);
         }
-        self.message = message;
-        self.redraw = true;
+        self.ui.message = message;
+        self.ui.redraw = true;
     }
 }
 

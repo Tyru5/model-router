@@ -629,43 +629,50 @@ fn duration(seconds: u64) -> String {
 
 impl App {
     pub(super) fn perform_workflow(&mut self, id: ActionId) -> Result<()> {
-        let count = self.settings.workflows[self.workflow].stages.len();
+        let count = self.editor.settings.workflows[self.editor.workflow]
+            .stages
+            .len();
         match id {
-            ActionId::NextStage => self.selected = (self.selected + 1).min(count.saturating_sub(1)),
-            ActionId::PreviousStage => self.selected = self.selected.saturating_sub(1),
+            ActionId::NextStage => {
+                self.editor.selected = (self.editor.selected + 1).min(count.saturating_sub(1))
+            }
+            ActionId::PreviousStage => {
+                self.editor.selected = self.editor.selected.saturating_sub(1)
+            }
             ActionId::ToggleStage => {
-                let stage = self.stage_mut();
+                let stage = self.editor.stage_mut();
                 stage.enabled = !stage.enabled;
-                self.dirty = true;
+                self.editor.dirty = true;
             }
             ActionId::ToggleMode => {
-                let stage = self.stage_mut();
+                let stage = self.editor.stage_mut();
                 stage.mode = if stage.mode == Mode::Interactive {
                     Mode::Unattended
                 } else {
                     Mode::Interactive
                 };
-                self.dirty = true;
+                self.editor.dirty = true;
             }
             ActionId::EditTask => self.input(
                 "Task · [Ctrl+S] applies · [Enter] adds a line",
                 InputTarget::Task,
-                &self.task.clone(),
+                &self.editor.task.clone(),
             ),
             ActionId::Repositories => {
-                self.modal = Some(Modal::Repositories(Box::new(PathPicker::new(
+                self.ui.modal = Some(Modal::Repositories(Box::new(PathPicker::new(
                     &self.project,
                     storage::recent_projects(),
                 )?)));
             }
             ActionId::ImportTask => {
-                self.modal = Some(Modal::Import(Box::new(TaskImporter::new(
+                self.ui.modal = Some(Modal::Import(Box::new(TaskImporter::new(
                     &self.project,
-                    &self.task,
+                    &self.editor.task,
                 )?)));
             }
             ActionId::ChooseWorkflow => {
                 let mut items: Vec<_> = self
+                    .editor
                     .settings
                     .workflows
                     .iter()
@@ -688,10 +695,10 @@ impl App {
                             value: PickValue::WorkflowPreset(index),
                         }),
                 );
-                self.modal = Some(Modal::Picker {
+                self.ui.modal = Some(Modal::Picker {
                     title: "Choose workflow".into(),
                     items,
-                    selected: self.workflow,
+                    selected: self.editor.workflow,
                     filter: textarea(""),
                     note: "Presets add an editable workflow. Reviews start disabled, as does ship; existing workflows are kept."
                         .into(),
@@ -700,17 +707,19 @@ impl App {
             ActionId::RenameWorkflow => self.input(
                 "Rename workflow",
                 InputTarget::RenameWorkflow,
-                &self.settings.workflows[self.workflow].name.clone(),
+                &self.editor.settings.workflows[self.editor.workflow]
+                    .name
+                    .clone(),
             ),
             ActionId::RepairLimit => self.input(
                 "Maximum automatic repair passes (0 disables repairs)",
                 InputTarget::RepairLimit,
-                &self.settings.workflows[self.workflow]
+                &self.editor.settings.workflows[self.editor.workflow]
                     .max_repair_passes
                     .to_string(),
             ),
             ActionId::PickHarness => {
-                let items = catalog::known_harnesses(&self.settings)
+                let items = catalog::known_harnesses(&self.editor.settings)
                     .into_iter()
                     .map(|name| Choice {
                         label: format!(
@@ -718,7 +727,7 @@ impl App {
                             name,
                             if adapters::executable(&adapters::program(
                                 &name,
-                                &self.settings.adapters
+                                &self.editor.settings.adapters
                             ))
                             .is_some()
                             {
@@ -730,7 +739,7 @@ impl App {
                         value: PickValue::Harness(name),
                     })
                     .collect();
-                self.modal = Some(Modal::Picker {
+                self.ui.modal = Some(Modal::Picker {
                     title: "Harness for selected stage".into(),
                     items,
                     selected: 0,
@@ -740,26 +749,26 @@ impl App {
                 });
             }
             ActionId::EditStage => {
-                self.modal = Some(Modal::Stage {
+                self.ui.modal = Some(Modal::Stage {
                     editor: Box::new(StageEditor::new(
-                        self.stage().clone(),
-                        catalog::known_harnesses(&self.settings),
+                        self.editor.stage().clone(),
+                        catalog::known_harnesses(&self.editor.settings),
                     )),
                     insert_at: None,
                 });
-                self.request_catalog(self.stage().harness.clone());
+                self.request_catalog(self.editor.stage().harness.clone());
             }
             ActionId::HarnessSettings => {
-                self.modal = Some(Modal::Harness(Box::new(HarnessEditor::new(
-                    self.stage().clone(),
-                    self.settings.providers.clone(),
+                self.ui.modal = Some(Modal::Harness(Box::new(HarnessEditor::new(
+                    self.editor.stage().clone(),
+                    self.editor.settings.providers.clone(),
                 ))));
-                self.request_catalog(self.stage().harness.clone());
+                self.request_catalog(self.editor.stage().harness.clone());
             }
             ActionId::Models => self.model_picker(),
             ActionId::AddStage => {
                 ensure!(count < 64, "A workflow can contain at most 64 stages");
-                self.modal = Some(Modal::Picker {
+                self.ui.modal = Some(Modal::Picker {
                     title: "Add stage from preset".into(),
                     items: presets::STAGES
                         .iter()
@@ -778,64 +787,64 @@ impl App {
             }
             ActionId::DuplicateStage => {
                 ensure!(count < 64, "A workflow can contain at most 64 stages");
-                let mut copy = self.stage().clone();
+                let mut copy = self.editor.stage().clone();
                 copy.id = Stage::default().id;
                 copy.name.push_str(" copy");
-                self.settings.workflows[self.workflow]
+                self.editor.settings.workflows[self.editor.workflow]
                     .stages
-                    .insert(self.selected + 1, copy);
-                self.selected += 1;
-                self.dirty = true;
+                    .insert(self.editor.selected + 1, copy);
+                self.editor.selected += 1;
+                self.editor.dirty = true;
             }
             ActionId::RemoveStage => {
                 ensure!(count > 1, "Keep at least one stage");
-                let name = self.stage().name.clone();
-                self.remember(format!("stage “{name}”"));
-                self.settings.workflows[self.workflow]
+                let name = self.editor.stage().name.clone();
+                self.editor.remember(format!("stage “{name}”"));
+                self.editor.settings.workflows[self.editor.workflow]
                     .stages
-                    .remove(self.selected);
-                self.selected = self.selected.min(count - 2);
-                self.dirty = true;
-                self.message = format!("Removed stage “{name}” — [u] to undo.");
+                    .remove(self.editor.selected);
+                self.editor.selected = self.editor.selected.min(count - 2);
+                self.editor.dirty = true;
+                self.ui.message = format!("Removed stage “{name}” — [u] to undo.");
             }
             ActionId::DeleteWorkflow => {
                 ensure!(
-                    self.settings.workflows.len() > 1,
+                    self.editor.settings.workflows.len() > 1,
                     "Keep at least one workflow"
                 );
-                self.modal = Some(Modal::Ask(Box::new(Ask::DeleteWorkflow {
-                    index: self.workflow,
+                self.ui.modal = Some(Modal::Ask(Box::new(Ask::DeleteWorkflow {
+                    index: self.editor.workflow,
                 })));
             }
-            ActionId::Undo => self.undo(),
+            ActionId::Undo => self.ui.message = self.editor.restore(),
             ActionId::MoveStageUp => {
-                if self.selected > 0 {
-                    self.settings.workflows[self.workflow]
+                if self.editor.selected > 0 {
+                    self.editor.settings.workflows[self.editor.workflow]
                         .stages
-                        .swap(self.selected, self.selected - 1);
-                    self.selected -= 1;
-                    self.dirty = true;
+                        .swap(self.editor.selected, self.editor.selected - 1);
+                    self.editor.selected -= 1;
+                    self.editor.dirty = true;
                 }
             }
             ActionId::MoveStageDown => {
-                if self.selected + 1 < count {
-                    self.settings.workflows[self.workflow]
+                if self.editor.selected + 1 < count {
+                    self.editor.settings.workflows[self.editor.workflow]
                         .stages
-                        .swap(self.selected, self.selected + 1);
-                    self.selected += 1;
-                    self.dirty = true;
+                        .swap(self.editor.selected, self.editor.selected + 1);
+                    self.editor.selected += 1;
+                    self.editor.dirty = true;
                 }
             }
-            ActionId::ToggleWorktree => self.worktree = !self.worktree,
+            ActionId::ToggleWorktree => self.editor.worktree = !self.editor.worktree,
             ActionId::Save => self.save(false)?,
             ActionId::SaveGlobal => self.save(true)?,
             ActionId::Preview => self.text(
                 "Launch preview · no model is started",
                 engine::preview(
-                    &self.settings,
-                    &self.settings.workflows[self.workflow],
+                    &self.editor.settings,
+                    &self.editor.settings.workflows[self.editor.workflow],
                     &self.project,
-                    &self.task,
+                    &self.editor.task,
                 )?,
             ),
             ActionId::Run => {
@@ -843,17 +852,17 @@ impl App {
                 // run starts in the background; the editor stays usable.
                 let (project, settings, task) = (
                     self.project.clone(),
-                    self.settings.clone(),
-                    self.task.clone(),
+                    self.editor.settings.clone(),
+                    self.editor.task.clone(),
                 );
-                let workflow = settings.workflows[self.workflow].clone();
+                let workflow = settings.workflows[self.editor.workflow].clone();
                 crate::config::validate_task(&task)?;
                 self.start_run(
                     move |placement| {
                         Run::create_at(&project, &settings, &workflow, task, placement)
                     },
-                    self.worktree,
-                    Some(self.task.clone()),
+                    self.editor.worktree,
+                    Some(self.editor.task.clone()),
                     None,
                 )?;
             }
@@ -871,13 +880,13 @@ pub(super) fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palett
         Constraint::Min(5),
     ])
     .split(area);
-    let workflow = &app.settings.workflows[app.workflow];
+    let workflow = &app.editor.settings.workflows[app.editor.workflow];
     let enabled = workflow.stages.iter().filter(|s| s.enabled).count();
     let mut heading = vec![Span::styled(
         workflow.name.clone(),
         Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
     )];
-    if app.dirty {
+    if app.editor.dirty {
         heading.push(Span::styled(
             "  ● unsaved",
             Style::default().fg(palette.warn),
@@ -887,7 +896,7 @@ pub(super) fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palett
         format!(
             "   {enabled}/{} stages  ·  {}  ·  repairs ≤ {}",
             workflow.stages.len(),
-            if app.worktree {
+            if app.editor.worktree {
                 "isolated worktree"
             } else {
                 "current directory"
@@ -908,7 +917,7 @@ pub(super) fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palett
         frame.render_widget(Paragraph::new(actions).right_aligned(), chunks[0]);
     }
     frame.render_widget(Paragraph::new(heading), chunks[0]);
-    let task = if app.task.is_empty() {
+    let task = if app.editor.task.is_empty() {
         Paragraph::new(Line::styled(
             "No task yet. Press [t] to write one, or [f] to import a file, URL, or GitHub issue.",
             Style::default()
@@ -916,7 +925,8 @@ pub(super) fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palett
                 .add_modifier(Modifier::ITALIC),
         ))
     } else {
-        Paragraph::new(storage::clean_terminal(&app.task)).style(Style::default().fg(palette.fg))
+        Paragraph::new(storage::clean_terminal(&app.editor.task))
+            .style(Style::default().fg(palette.fg))
     };
     frame.render_widget(
         task.wrap(Wrap { trim: false })
@@ -994,18 +1004,18 @@ pub(super) fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palett
     frame.render_stateful_widget(
         table,
         cols[0],
-        &mut TableState::default().with_selected(Some(app.selected)),
+        &mut TableState::default().with_selected(Some(app.editor.selected)),
     );
     if cols[1].width > 0 {
-        let stage = app.stage();
-        let warning = app.harness_checks.warning(&stage.harness);
+        let stage = app.editor.stage();
+        let warning = app.harnesses.checks.warning(&stage.harness);
         let effort = app
             .catalogs
             .get(&stage.harness)
             .and_then(|c| c.efforts_for(&stage.model, &stage.provider))
             .map(|efforts| effort_note(stage, &efforts));
         let hint = app.stats_hint(stage);
-        let sandbox = stage.effective_sandbox(&app.settings.workflows[app.workflow]);
+        let sandbox = stage.effective_sandbox(&app.editor.settings.workflows[app.editor.workflow]);
         let notes = StageNotes {
             sandbox,
             warning,

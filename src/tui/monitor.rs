@@ -31,20 +31,20 @@ impl App {
         match id {
             ActionId::CancelStage => {
                 let run = self.session.run().context("No run selected")?;
-                self.modal = Some(Modal::Ask(Box::new(Ask::CancelStage {
+                self.ui.modal = Some(Modal::Ask(Box::new(Ask::CancelStage {
                     run: run.id.clone(),
                 })));
             }
             ActionId::TakeOver => {
                 let slot = self.session.focused().context("No run selected")?;
                 if slot.terminal().is_some() {
-                    self.launch_interactive = true;
+                    self.session.launch_interactive = true;
                     return Ok(());
                 }
                 let run = &slot.run;
                 // A stage waiting for its terminal opens as it is.
                 if slot.worker.is_none() && run.status == Status::Interactive {
-                    self.launch_interactive = true;
+                    self.session.launch_interactive = true;
                     return Ok(());
                 }
                 let stage = run
@@ -62,7 +62,7 @@ impl App {
                         stage.mode == Mode::Unattended,
                         "This stage is already interactive"
                     );
-                    self.modal = Some(Modal::Ask(Box::new(Ask::TakeOver {
+                    self.ui.modal = Some(Modal::Ask(Box::new(Ask::TakeOver {
                         run: run.id.clone(),
                     })));
                 } else {
@@ -70,14 +70,14 @@ impl App {
                         .run_mut()
                         .context("No run")?
                         .command(Cmd::TakeOver)?;
-                    self.launch_interactive = true;
+                    self.session.launch_interactive = true;
                 }
             }
             ActionId::PreviousSessionRun => self.session.cycle_focus(false),
             ActionId::NextSessionRun => self.session.cycle_focus(true),
             ActionId::CloseRun => {
                 self.session.dismiss()?;
-                self.message = "Run closed here; Runs [3] reopens it.".into();
+                self.ui.message = "Run closed here; Runs [3] reopens it.".into();
             }
             ActionId::ScrollUp if self.results_shown() => self.view(|slot| {
                 for scroll in &mut slot.results_scroll {
@@ -109,13 +109,13 @@ impl App {
             ActionId::FollowOutput => {
                 let message = self.session.focused_mut().and_then(RunSlot::toggle_follow);
                 if let Some(message) = message {
-                    self.message = message;
+                    self.ui.message = message;
                 }
             }
             ActionId::FindOutput => self.view(RunSlot::start_output_search),
             ActionId::OpenLog => {
                 let path = self.focused_log().context("No attempt has output yet")?;
-                self.external = Some(super::external::page_file(&path)?);
+                self.ui.external = Some(super::external::page_file(&path)?);
             }
             ActionId::Diff => self.show_diff()?,
             ActionId::ToggleResults => self.toggle_results()?,
@@ -140,7 +140,7 @@ impl App {
                             .stages
                             .get(index)
                             .map_or_else(String::new, |s| s.name.clone());
-                        self.modal = Some(Modal::Handoff(Box::new(HandoffView::new(
+                        self.ui.modal = Some(Modal::Handoff(Box::new(HandoffView::new(
                             handoff.clone(),
                             stage,
                         ))));
@@ -188,7 +188,7 @@ impl App {
                 let run = self.session.run_mut().context("No run")?;
                 // A stage already waiting for the terminal opens as it is.
                 if run.status == Status::Interactive {
-                    self.launch_interactive = true;
+                    self.session.launch_interactive = true;
                 } else {
                     run.command(Cmd::Retry {
                         interactive: true,
@@ -228,7 +228,7 @@ impl App {
                     &summary,
                 );
             }
-            ActionId::BackToWorkflow => self.page = Page::Workflow,
+            ActionId::BackToWorkflow => self.ui.page = Page::Workflow,
             other => bail!("{other:?} is not a monitor action"),
         }
         Ok(())
@@ -250,7 +250,7 @@ impl App {
             .focused_mut()
             .and_then(|slot| slot.output_search_key(key));
         if let Some(Some(message)) = &handled {
-            self.message = message.clone();
+            self.ui.message = message.clone();
         }
         handled.is_some()
     }
@@ -620,7 +620,7 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
         // The panel's own inner width: borders and padding included.
         let width = output_block.inner(cols[0]).width as usize;
         // Wrapped lines are kept until the log, width, or theme changes.
-        let key = (width, slot.log_version, app.displayed_theme());
+        let key = (width, slot.log_version, app.ui.displayed_theme());
         let mut cache = slot.cache.borrow_mut();
         let lines = match &cache.output {
             Some((cached, lines)) if *cached == key => lines.clone(),

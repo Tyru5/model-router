@@ -165,7 +165,7 @@ impl App {
             .focused_mut()
             .and_then(RunSlot::poll_completion);
         if let Some(message) = message {
-            self.message = message;
+            self.ui.message = message;
         }
     }
 
@@ -195,16 +195,16 @@ impl App {
     pub(super) fn show_diff(&mut self) -> Result<()> {
         let slot = self.finished_slot("The diff is available when the run finishes")?;
         let Some(patch) = slot.loaded().map(|loaded| loaded.patch.clone()) else {
-            self.message = "Computing changes…".into();
+            self.ui.message = "Computing changes…".into();
             return Ok(());
         };
         match &patch {
             Ok(patch) if patch.trim().is_empty() => {
-                self.message = "No files changed during this run.".into()
+                self.ui.message = "No files changed during this run.".into()
             }
             Ok(patch) => {
                 let view = super::diff_view::DiffView::new(patch.clone());
-                self.modal = Some(super::modal::Modal::Diff(Box::new(view)));
+                self.ui.modal = Some(super::modal::Modal::Diff(Box::new(view)));
             }
             Err(error) => bail!("{error}"),
         }
@@ -592,7 +592,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         );
         app.session.adopt(run);
-        app.page = Page::Monitor;
+        app.ui.page = Page::Monitor;
         app
     }
 
@@ -735,14 +735,14 @@ mod tests {
     fn diff_and_output_toggle_use_the_loaded_changes() {
         let mut app = app(sample());
         app.show_diff().unwrap();
-        assert_eq!(app.message, "Computing changes…");
-        assert!(app.modal.is_none());
+        assert_eq!(app.ui.message, "Computing changes…");
+        assert!(app.ui.modal.is_none());
         app.slot_mut().changes = Some(tracked());
         app.show_diff().unwrap();
         assert!(
-            matches!(&app.modal, Some(super::super::modal::Modal::Diff(view)) if view.patch.contains("+fresh line"))
+            matches!(&app.ui.modal, Some(super::super::modal::Modal::Diff(view)) if view.patch.contains("+fresh line"))
         );
-        app.modal = None;
+        app.ui.modal = None;
         app.toggle_results().unwrap();
         assert!(!app.results_shown());
         assert!(screen(&mut app, 80, 24).contains("Output"));
@@ -804,7 +804,7 @@ mod tests {
         let mut app = app(run);
         app.poll_completion();
         assert_eq!(
-            app.message,
+            app.ui.message,
             "The test stage reported verification is not applicable: Docs only. [a] accepts without checks; [y] retries."
         );
         assert!(
@@ -812,9 +812,9 @@ mod tests {
             "Unfinished runs compute no changes"
         );
         // Announced once per checkpoint, so later messages stay visible.
-        app.message = "Other".into();
+        app.ui.message = "Other".into();
         app.poll_completion();
-        assert_eq!(app.message, "Other");
+        assert_eq!(app.ui.message, "Other");
         assert!(!app.results_shown());
         for (width, height) in [(80, 24), (120, 36)] {
             let text = screen(&mut app, width, height);

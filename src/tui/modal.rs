@@ -205,11 +205,13 @@ impl Ask {
                 "Delete workflow",
                 format!(
                     "Delete workflow “{}” and its {} stages? [u] undoes until you leave the project.",
-                    app.settings
+                    app.editor
+                        .settings
                         .workflows
                         .get(*index)
                         .map_or("", |w| w.name.as_str()),
-                    app.settings
+                    app.editor
+                        .settings
                         .workflows
                         .get(*index)
                         .map_or(0, |w| w.stages.len())
@@ -220,7 +222,7 @@ impl Ask {
                 "Save changes?",
                 format!(
                     "Workflow edits are not saved to {}.",
-                    app.config_path.display()
+                    app.editor.config_path.display()
                 ),
                 &[
                     ("y / Enter", "save and exit"),
@@ -256,8 +258,8 @@ impl App {
     pub(super) fn pick(&mut self, choice: PickValue) -> Result<bool> {
         match choice {
             PickValue::Workflow(index) => {
-                self.workflow = index;
-                self.selected = 0;
+                self.editor.workflow = index;
+                self.editor.selected = 0;
             }
             PickValue::NewWorkflow => self.input(
                 "Name the new workflow (copies current stages)",
@@ -269,6 +271,7 @@ impl App {
                 let base = workflow.name.clone();
                 let mut suffix = 2;
                 while self
+                    .editor
                     .settings
                     .workflows
                     .iter()
@@ -277,35 +280,38 @@ impl App {
                     workflow.name = format!("{base} ({suffix})");
                     suffix += 1;
                 }
-                let mut candidate = self.settings.clone();
+                let mut candidate = self.editor.settings.clone();
                 candidate.workflows.push(workflow);
                 candidate.validate()?;
-                self.settings = candidate;
-                self.workflow = self.settings.workflows.len() - 1;
-                self.selected = 0;
-                self.dirty = true;
-                self.message =
+                self.editor.settings = candidate;
+                self.editor.workflow = self.editor.settings.workflows.len() - 1;
+                self.editor.selected = 0;
+                self.editor.dirty = true;
+                self.ui.message =
                     "Workflow preset added. e edits each stage; reviews start disabled.".into();
             }
             PickValue::StagePreset(index) => {
                 ensure!(
-                    self.settings.workflows[self.workflow].stages.len() < 64,
+                    self.editor.settings.workflows[self.editor.workflow]
+                        .stages
+                        .len()
+                        < 64,
                     "A workflow can contain at most 64 stages"
                 );
                 let mut stage = presets::STAGES[index].build();
                 stage.id = format!("{}-{}", stage.id, Stage::default().id);
                 let harness = stage.harness.clone();
-                self.modal = Some(Modal::Stage {
+                self.ui.modal = Some(Modal::Stage {
                     editor: Box::new(StageEditor::new(
                         stage,
-                        catalog::known_harnesses(&self.settings),
+                        catalog::known_harnesses(&self.editor.settings),
                     )),
-                    insert_at: Some(self.selected + 1),
+                    insert_at: Some(self.editor.selected + 1),
                 });
                 self.request_catalog(harness);
             }
             PickValue::Harness(harness) => {
-                let stage = self.stage_mut();
+                let stage = self.editor.stage_mut();
                 if stage.harness != harness {
                     stage.harness_settings.clear();
                 }
@@ -313,32 +319,32 @@ impl App {
                 stage.model.clear();
                 stage.provider.clear();
                 stage.effort.clear();
-                self.dirty = true;
+                self.editor.dirty = true;
             }
             PickValue::Model(model) => {
                 if let Some(mut editor) = self.model_editor.take() {
                     editor.set_model(model);
-                    self.modal = Some(Modal::Harness(editor));
+                    self.ui.modal = Some(Modal::Harness(editor));
                 } else if let Some((mut editor, insert_at)) = self.stage_editor.take() {
                     editor.set_model(model);
-                    self.modal = Some(Modal::Stage { editor, insert_at });
+                    self.ui.modal = Some(Modal::Stage { editor, insert_at });
                 } else {
-                    let stage = self.stage_mut();
+                    let stage = self.editor.stage_mut();
                     stage.model = model.id;
                     stage.provider = model.provider;
-                    self.dirty = true;
+                    self.editor.dirty = true;
                 }
             }
             PickValue::Theme(theme) => {
                 theme::save(
-                    &self.theme_path,
+                    &self.ui.theme_path,
                     &theme::Preferences {
                         theme,
-                        ..self.preferences()
+                        ..self.ui.preferences()
                     },
                 )?;
-                self.theme = theme;
-                self.message = format!("Theme saved: {}. T changes it anytime.", theme.name());
+                self.ui.theme = theme;
+                self.ui.message = format!("Theme saved: {}. T changes it anytime.", theme.name());
             }
             PickValue::Action(id) => return self.perform(id),
             PickValue::Compare(choice) => self.show_comparison(&choice)?,
@@ -349,25 +355,30 @@ impl App {
         match target {
             InputTarget::Task => {
                 config::validate_task(&value)?;
-                self.task = value;
+                self.editor.task = value;
             }
             InputTarget::NewWorkflow | InputTarget::RenameWorkflow => {
                 let value = value.trim();
                 ensure!(!value.is_empty(), "Workflow name is required");
                 ensure!(
-                    !self.settings.workflows.iter().any(|w| w.name == value),
+                    !self
+                        .editor
+                        .settings
+                        .workflows
+                        .iter()
+                        .any(|w| w.name == value),
                     "That workflow name already exists"
                 );
                 if matches!(target, InputTarget::NewWorkflow) {
-                    let mut copy = self.settings.workflows[self.workflow].clone();
+                    let mut copy = self.editor.settings.workflows[self.editor.workflow].clone();
                     copy.name = value.into();
-                    self.settings.workflows.push(copy);
-                    self.workflow = self.settings.workflows.len() - 1;
-                    self.selected = 0;
+                    self.editor.settings.workflows.push(copy);
+                    self.editor.workflow = self.editor.settings.workflows.len() - 1;
+                    self.editor.selected = 0;
                 } else {
-                    self.settings.workflows[self.workflow].name = value.into();
+                    self.editor.settings.workflows[self.editor.workflow].name = value.into();
                 }
-                self.dirty = true;
+                self.editor.dirty = true;
             }
             InputTarget::RetryModel => {
                 self.session
@@ -380,11 +391,11 @@ impl App {
                 self.start_driver()?;
             }
             InputTarget::RepairLimit => {
-                self.settings.workflows[self.workflow].max_repair_passes = value
+                self.editor.settings.workflows[self.editor.workflow].max_repair_passes = value
                     .trim()
                     .parse()
                     .context("Enter a nonnegative integer")?;
-                self.dirty = true;
+                self.editor.dirty = true;
             }
             InputTarget::Handoff => {
                 engine::edit_handoff(self.session.run_mut().context("No run")?, value)?
@@ -396,12 +407,12 @@ impl App {
                     "The webhook URL must start with https:// or http://"
                 );
                 let backends = notify::Backends {
-                    webhook: self.notifications.webhook || !url.is_empty(),
+                    webhook: self.ui.notifications.webhook || !url.is_empty(),
                     webhook_url: url,
-                    ..self.notifications.clone()
+                    ..self.ui.notifications.clone()
                 };
                 self.set_notifications(backends.clone())?;
-                self.modal = Some(Modal::Notifications {
+                self.ui.modal = Some(Modal::Notifications {
                     backends,
                     selected: 3,
                     status: "Webhook URL saved.".into(),
@@ -417,7 +428,7 @@ impl App {
         let no = key.code == Key::Esc
             || (key.code == Key::Char('n') && key.modifiers - Mods::SHIFT == Mods::NONE);
         if !yes && !no {
-            self.modal = Some(Modal::Ask(ask));
+            self.ui.modal = Some(Modal::Ask(ask));
             return Ok(false);
         }
         match *ask {
@@ -426,22 +437,23 @@ impl App {
                 return Ok(self.quit());
             }
             Ask::SaveAndExit if key.code == Key::Char('n') => {
-                self.dirty = false;
+                self.editor.dirty = false;
                 return Ok(self.quit());
             }
-            Ask::DiscardDraft(editor) if !yes => self.modal = Some(*editor),
+            Ask::DiscardDraft(editor) if !yes => self.ui.modal = Some(*editor),
             _ if !yes => {}
             Ask::CancelStage { run } => {
                 // The stage may have stopped while the question was open.
                 if let Some(slot) = self.running(&run) {
                     slot.cancel.store(true, Ordering::Relaxed);
-                    self.message = "Stopping stage…".into();
+                    self.ui.message = "Stopping stage…".into();
                 } else {
-                    self.message = format!("{run} is not running a stage; nothing was cancelled.");
+                    self.ui.message =
+                        format!("{run} is not running a stage; nothing was cancelled.");
                 }
             }
             Ask::CancelRun { run } => {
-                self.message = if self.session.cancel_run(&run) {
+                self.ui.message = if self.session.cancel_run(&run) {
                     format!("Stopping the stage of {run}…")
                 } else {
                     format!("{run} is not running a stage; nothing was cancelled.")
@@ -451,24 +463,25 @@ impl App {
                 if let Some(slot) = self.running(&run) {
                     slot.takeover = true;
                     slot.cancel.store(true, Ordering::Relaxed);
-                    self.message = "Stopping the unattended stage to open its session…".into();
+                    self.ui.message = "Stopping the unattended stage to open its session…".into();
                 } else {
-                    self.message =
+                    self.ui.message =
                         format!("{run}'s stage already stopped; [t] reopens its session.");
                 }
             }
             Ask::DeleteWorkflow { index } => {
                 ensure!(
-                    self.settings.workflows.len() > 1 && index < self.settings.workflows.len(),
+                    self.editor.settings.workflows.len() > 1
+                        && index < self.editor.settings.workflows.len(),
                     "Keep at least one workflow"
                 );
-                let name = self.settings.workflows[index].name.clone();
-                self.remember(format!("workflow “{name}”"));
-                self.settings.workflows.remove(index);
-                self.workflow = 0;
-                self.selected = 0;
-                self.dirty = true;
-                self.message = format!("Deleted workflow “{name}” — [u] to undo.");
+                let name = self.editor.settings.workflows[index].name.clone();
+                self.editor.remember(format!("workflow “{name}”"));
+                self.editor.settings.workflows.remove(index);
+                self.editor.workflow = 0;
+                self.editor.selected = 0;
+                self.editor.dirty = true;
+                self.ui.message = format!("Deleted workflow “{name}” — [u] to undo.");
             }
             Ask::SaveAndExit | Ask::DiscardDraft(_) => {}
         }
@@ -481,7 +494,7 @@ impl App {
             .filter(|slot| slot.worker.is_some() && slot.run.id == id)
     }
     pub(super) fn modal_key(&mut self, key: KeyEvent) -> Result<bool> {
-        let Some(modal) = self.modal.take() else {
+        let Some(modal) = self.ui.modal.take() else {
             return Ok(false);
         };
         let modal = match modal {
@@ -493,9 +506,9 @@ impl App {
         };
         let mut modal = modal;
         if let Some(field) = modal.active_input() {
-            field.set_vim(self.vim_motions);
+            field.set_vim(self.ui.vim_motions);
             if field.vim_key(key) {
-                self.modal = Some(modal);
+                self.ui.modal = Some(modal);
                 return Ok(false);
             }
         }
@@ -511,13 +524,13 @@ impl App {
                 _ => false,
             };
             if changed {
-                self.modal = Some(Modal::Ask(Box::new(Ask::DiscardDraft(Box::new(modal)))));
+                self.ui.modal = Some(Modal::Ask(Box::new(Ask::DiscardDraft(Box::new(modal)))));
                 return Ok(false);
             }
             self.catalog = None;
-            self.modal = self.model_editor.take().map(Modal::Harness);
+            self.ui.modal = self.model_editor.take().map(Modal::Harness);
             if let Some((editor, insert_at)) = self.stage_editor.take() {
-                self.modal = Some(Modal::Stage { editor, insert_at });
+                self.ui.modal = Some(Modal::Stage { editor, insert_at });
             }
             return Ok(false);
         }
@@ -546,23 +559,24 @@ impl App {
                 Modal::Stage { editor, insert_at } => {
                     if key.modifiers.contains(Mods::CONTROL) && key.code == Key::Char('s') {
                         let stage = editor.finish()?;
-                        let mut candidate = self.settings.clone();
+                        let mut candidate = self.editor.settings.clone();
                         if let Some(index) = insert_at {
-                            candidate.workflows[self.workflow]
+                            candidate.workflows[self.editor.workflow]
                                 .stages
                                 .insert(*index, stage);
                         } else {
-                            candidate.workflows[self.workflow].stages[self.selected] = stage;
+                            candidate.workflows[self.editor.workflow].stages
+                                [self.editor.selected] = stage;
                         }
                         candidate.validate()?;
-                        self.settings = candidate;
+                        self.editor.settings = candidate;
                         if let Some(index) = insert_at {
-                            self.selected = *index;
-                            self.message =
+                            self.editor.selected = *index;
+                            self.ui.message =
                                 "Stage added. [J]/[K] reorders; [Space] enables or disables it."
                                     .into();
                         }
-                        self.dirty = true;
+                        self.editor.dirty = true;
                         keep = false;
                     } else {
                         match editor.key(key) {
@@ -575,12 +589,13 @@ impl App {
                 Modal::Harness(editor) => {
                     if key.modifiers.contains(Mods::CONTROL) && key.code == Key::Char('s') {
                         let stage = editor.finish()?;
-                        let mut candidate = self.settings.clone();
-                        candidate.workflows[self.workflow].stages[self.selected] = stage;
+                        let mut candidate = self.editor.settings.clone();
+                        candidate.workflows[self.editor.workflow].stages[self.editor.selected] =
+                            stage;
                         candidate.validate()?;
-                        self.settings = candidate;
-                        self.dirty = true;
-                        self.message = "Harness settings applied to this stage. s saves; P previews the command.".into();
+                        self.editor.settings = candidate;
+                        self.editor.dirty = true;
+                        self.ui.message = "Harness settings applied to this stage. s saves; P previews the command.".into();
                         keep = false;
                     } else {
                         editor.key(key);
@@ -596,8 +611,9 @@ impl App {
                     ImportAction::Stay => {}
                     ImportAction::Close => keep = false,
                     ImportAction::Apply(task) => {
-                        self.task = task;
-                        self.message = "Task imported. t edits it; r starts the workflow.".into();
+                        self.editor.task = task;
+                        self.ui.message =
+                            "Task imported. t edits it; r starts the workflow.".into();
                         keep = false;
                     }
                 },
@@ -649,20 +665,20 @@ impl App {
                     DiffAction::Stay => {}
                     DiffAction::Close => keep = false,
                     DiffAction::Pager => {
-                        self.external =
+                        self.ui.external =
                             Some(external::page_text(&super::diff_view::ansi(&view.patch))?)
                     }
                     DiffAction::Editor(path, line) => {
                         // Git names files from the top of the repository.
                         let root = super::completion::repo_root(&self.run_dir()?);
-                        self.external = Some(external::edit(&root.join(path), line, &root)?);
+                        self.ui.external = Some(external::edit(&root.join(path), line, &root)?);
                     }
                     DiffAction::Difftool => {
                         let run = self.session.run().context("No run")?;
                         let (from, to) = run
                             .change_range()
                             .map_err(|reason| anyhow::anyhow!("No difftool: {reason}"))?;
-                        self.external = Some(external::difftool(&self.run_dir()?, from, to)?);
+                        self.ui.external = Some(external::difftool(&self.run_dir()?, from, to)?);
                     }
                 },
                 Modal::Handoff(view) => match view.key(key) {
@@ -670,7 +686,7 @@ impl App {
                     HandoffAction::Close => keep = false,
                     HandoffAction::Edit(file) => {
                         let dir = self.run_dir()?;
-                        self.external = Some(external::edit(&dir.join(file), None, &dir)?);
+                        self.ui.external = Some(external::edit(&dir.join(file), None, &dir)?);
                     }
                 },
                 Modal::Loading(_) | Modal::Ask(_) => {}
@@ -713,12 +729,12 @@ impl App {
             }
         }
         if keep {
-            self.modal = Some(modal);
+            self.ui.modal = Some(modal);
         }
         if let Some(harness) = refresh_catalog {
             self.request_catalog(harness);
         }
-        if matches!(self.modal, Some(Modal::Harness(_))) {
+        if matches!(self.ui.modal, Some(Modal::Harness(_))) {
             // Validation is shown in the draft, so it cannot leave a stale
             // error behind the dialog after the user corrects the field.
             Ok(exit)
@@ -727,7 +743,7 @@ impl App {
         }
     }
     pub(super) fn paste(&mut self, text: &str) {
-        match &mut self.modal {
+        match &mut self.ui.modal {
             Some(Modal::Input { text: field, .. }) => {
                 field.insert_str(text);
             }
