@@ -86,8 +86,9 @@ saved as cancelled can be retried later from the server, CLI, or TUI.
 - Each project's configuration is read on every call, so harness commands
   come from that project's `.model-router.toml` (or the global config).
   `--config` applies to the server's own project only.
-- Project trust hook: `serve::ensure_trusted` is called for every project. It
-  currently accepts every allowed project (TODO until a trust model lands).
+- Every project must pass [project trust](safety.md#project-trust): a call
+  naming a project whose `.model-router.toml` has untrusted sections fails
+  until you run `model-router -C DIR trust`.
 - MCP: stdout carries JSON-RPC only; diagnostics go to stderr.
 
 ## HTTP API
