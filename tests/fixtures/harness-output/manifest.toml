@@ -578,3 +578,81 @@ native = true
 handoff_summary = "Claude: README.md matches the build"
 role = "review"
 verdict = "pass"
+
+[[fixture]]
+file = "pi/captured-success.jsonl"
+harness = "pi"
+kind = "Pi"
+format = "json"
+version = "1.5.0"
+scenario = "captured-success"
+provenance = "captured"
+source = "scripts/capture_harness_output.py, 2026-11-07, harness default model"
+sanitization = "Replaced prompt echoes 3, paths 628, IDs 5; user project instructions and skill list in system sections omitted"
+text_contains = ["Captured pi fixture"]
+handoff_summary = "Captured pi fixture"
+
+[[fixture]]
+file = "omp/captured-success.jsonl"
+harness = "omp"
+kind = "Pi"
+format = "json"
+version = "18.18.0"
+scenario = "captured-success"
+provenance = "captured"
+source = "scripts/capture_harness_output.py, 2026-11-07, harness default model"
+sanitization = "Replaced prompt echoes 3, paths 4, IDs 5, emails 1"
+text_contains = ["Captured omp fixture"]
+handoff_summary = "Captured omp fixture"
+
+[[fixture]]
+file = "opencode/captured-success.jsonl"
+harness = "opencode"
+kind = "OpenCode"
+format = "json"
+version = "2.2.6"
+scenario = "captured-success"
+provenance = "captured"
+source = "scripts/capture_harness_output.py, 2026-11-07, harness default model"
+sanitization = "Replaced IDs 12"
+text_contains = ["Captured opencode fixture"]
+handoff_summary = "Captured opencode fixture"
+
+[[fixture]]
+file = "amp/captured-success.jsonl"
+harness = "amp"
+kind = "Amp"
+format = "stream-json"
+version = "0.0.1794081633-g6e983f"
+scenario = "captured-success"
+provenance = "captured"
+source = "scripts/capture_harness_output.py, 2026-11-07, harness default model"
+sanitization = "Replaced prompt echoes 1, paths 1, IDs 8"
+text_contains = ["Captured amp fixture"]
+handoff_summary = "Captured amp fixture"
+
+[[fixture]]
+file = "claude/captured-success.jsonl"
+harness = "claude"
+kind = "Claude"
+format = "stream-json"
+version = "2.1.319"
+scenario = "captured-success"
+provenance = "captured"
+source = "scripts/capture_harness_output.py, 2026-11-07, model haiku"
+sanitization = "Replaced paths 22, IDs 54; init skills, slash commands, plugins, MCP servers, and agents emptied"
+text_contains = ["Captured claude fixture"]
+handoff_summary = "Captured claude fixture"
+
+[[fixture]]
+file = "cursor/captured-success.jsonl"
+harness = "cursor"
+kind = "Cursor"
+format = "stream-json"
+version = "2026.11.05-86047df"
+scenario = "captured-success"
+provenance = "captured"
+source = "scripts/capture_harness_output.py, 2026-11-07, model auto"
+sanitization = "Replaced prompt echoes 1, paths 1, IDs 10"
+text_contains = ["Captured cursor fixture"]
+handoff_summary = "Captured cursor fixture"

@@ -1,0 +1,9 @@
+{"type":"system","subtype":"init","apiKeySource":"login","cwd":"/workspace/project","session_id":"00000000-0000-4000-8000-000000000001","model":"Auto","permissionMode":"default"}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<router prompt omitted>"}]},"session_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"thinking","subtype":"delta","text":"I","session_id":"00000000-0000-4000-8000-000000000001","timestamp_ms":1794094425994}
+{"type":"thinking","subtype":"delta","text":" will reply with the","session_id":"00000000-0000-4000-8000-000000000001","timestamp_ms":1794094426009}
+{"type":"thinking","subtype":"delta","text":" exact handoff block","session_id":"00000000-0000-4000-8000-000000000001","timestamp_ms":1794094426024}
+{"type":"thinking","subtype":"delta","text":".","session_id":"00000000-0000-4000-8000-000000000001","timestamp_ms":1794094426039}
+{"type":"thinking","subtype":"completed","session_id":"00000000-0000-4000-8000-000000000001","timestamp_ms":1794094427428}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"<router-handoff>\n{\"summary\": \"Captured cursor fixture\", \"verdict\": \"complete\", \"findings\": [], \"decisions\": [], \"files_changed\": [], \"tests\": [], \"unresolved\": []}\n</router-handoff>"}]},"session_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"result","subtype":"success","duration_ms":4011,"duration_api_ms":4011,"is_error":false,"result":"<router-handoff>\n{\"summary\": \"Captured cursor fixture\", \"verdict\": \"complete\", \"findings\": [], \"decisions\": [], \"files_changed\": [], \"tests\": [], \"unresolved\": []}\n</router-handoff>","session_id":"00000000-0000-4000-8000-000000000001","request_id":"00000000-0000-4000-8000-000000000002","usage":{"inputTokens":16349,"outputTokens":217,"cacheReadTokens":4352,"cacheWriteTokens":0,"reasoningTokens":164}}

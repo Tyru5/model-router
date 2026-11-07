@@ -186,9 +186,11 @@ source, and sanitization notes. The format must match what the adapter passes
 Cursor `json`); each required scenario needs a fixture in the adapter's
 format. `captured` fixtures are sanitized real output.
 `schema-derived` fixtures are built from event shapes in installed sources,
-schemas, or official documentation. All fixtures but
-`codex/structured-output.jsonl` (one Codex request with the strict handoff
-schema, 2026-11-05) are schema-derived. `tests/harness_output.rs` runs `handoff::normalize`, and
+schemas, or official documentation. Captured fixtures: the omp set,
+`codex/structured-output.jsonl` (strict handoff schema, 2026-11-05), and one
+`captured-success` each for Claude, Pi, omp, Cursor, OpenCode, and Amp at
+their 2026-11-07 versions. Doctor only says `tested` for an exact version
+match, so re-capture after a harness update. `tests/harness_output.rs` runs `handoff::normalize`, and
 `handoff::parse` for handoffs, on each fixture and checks the declared text,
 errors, and permission denials; `native = true` fixtures were launched with the
 output schema and must yield a handoff from it. Scenarios cover success, reported errors,

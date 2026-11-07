@@ -146,25 +146,26 @@ Local screen captures:
 - `../.model-router/qa/harness-settings-codex-65x20.png`
 
 All execution tests use offline fixtures; none send paid inference requests.
-Per-adapter coverage, checked on 2026-10-04:
+Per-adapter coverage, checked on 2026-11-07:
 
 | Adapter | Command contract test | Parser fixtures | `doctor` on this machine | Live authenticated run |
 | --- | --- | --- | --- | --- |
-| Codex | Both modes, native settings | 4 schema-derived, 0 captured | 0.160.0, tested, ok | Unverified |
-| Claude Code | Both modes, native settings | 5 schema-derived, 0 captured | 2.1.289, tested, ok | Unverified |
-| Pi | Both modes | 5 schema-derived, 0 captured | 1.0.2, tested, ok | Unverified |
-| Cursor Agent | Both modes, native settings | 3 schema-derived, 0 captured | 2026.10.01-e373342, tested, ok | Unverified |
+| Codex | Both modes, native settings | 4 schema-derived, 1 captured | 0.167.0, tested, ok | Captured 2026-11-05 |
+| Claude Code | Both modes, native settings | 12 schema-derived, 1 captured | 2.1.319, tested, ok | Captured 2026-11-07 |
+| Pi | Both modes | 5 schema-derived, 1 captured | 1.5.0, tested, ok | Captured 2026-11-07 |
+| Oh My Pi | Both modes | 4 captured | 18.18.0, tested, ok | Captured 2026-11-07 |
+| Cursor Agent | Both modes, native settings | 5 schema-derived, 1 captured | 2026.11.05-86047df, tested, ok | Captured 2026-11-07 |
 | Gemini CLI | Both modes, native settings | 3 schema-derived (source and docs), 0 captured | Not installed | Unverified |
-| OpenCode | Both modes | 3 schema-derived, 0 captured | 2.0.22, tested; missing `--variant`, `--interactive` (interactive) | Unverified |
+| OpenCode | Both modes | 4 schema-derived, 1 captured | 2.2.6, tested, ok | Captured 2026-11-07 |
 | Aider | Both modes | 1 schema-derived transcript, 0 captured | Not installed | Unverified |
 | Goose | Both modes | 1 schema-derived transcript, 0 captured | Not installed | Unverified |
-| Amp | Both modes, mode flag | 3 schema-derived (docs), 0 captured | 0.0.1791134020-gd49eb2, tested, ok | Unverified |
+| Amp | Both modes, mode flag | 4 schema-derived (docs), 1 captured | 0.0.1794081633-g6e983f, tested, ok | Captured 2026-11-07 |
 | GitHub Copilot CLI | Both modes | 1 schema-derived transcript, 0 captured | Not installed | Unverified |
 
 Command contracts: `adapter_contracts_keep_prompt_and_models_literal` builds
 both modes for every adapter, `tests/harness_settings.rs` covers native
 settings, and `amp_uses_mode_not_model` covers Amp's mode flag. Parser fixtures
-come from installed sources or official documentation ([details](adapters.md#parser-fixtures));
-none are captured yet. `doctor` compares the router's flags with installed help
+come from installed sources, official documentation, or sanitized real output
+from `scripts/capture_harness_output.py` ([details](adapters.md#parser-fixtures)). `doctor` compares the router's flags with installed help
 and never checks authentication. macOS is a target platform and has not been
 executed in this Linux environment.
