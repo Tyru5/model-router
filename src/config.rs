@@ -605,6 +605,12 @@ pub struct Settings {
     /// Sections an untrusted project config had ignored; restored on save.
     #[serde(skip)]
     pub ignored: Option<Box<crate::trust::Ignored>>,
+    /// Explicit approval source selected by the caller. Never accepted from TOML.
+    #[serde(skip)]
+    pub explicit_config: Option<PathBuf>,
+    /// Approval policy of the config originally loaded, before local edits.
+    #[serde(skip)]
+    pub loaded_approval: Option<String>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -616,6 +622,8 @@ impl Default for Settings {
             pricing: BTreeMap::new(),
             warnings: vec![],
             ignored: None,
+            explicit_config: None,
+            loaded_approval: None,
         }
     }
 }
@@ -1084,7 +1092,9 @@ pub fn load_config(project: &Path, explicit: Option<&Path>) -> Result<Loaded> {
         }
         None => Settings::default(),
     };
+    settings.explicit_config = explicit.map(Path::to_path_buf);
     settings.validate()?;
+    settings.loaded_approval = Some(crate::trust::settings_approval(&settings));
     let effort = settings.effort_warnings();
     settings.warnings.extend(effort);
     let trust = match origin {

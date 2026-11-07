@@ -244,6 +244,15 @@ fn write_store(store: &Store) -> Result<()> {
     crate::storage::atomic_write(&path, serde_json::to_string_pretty(store)?.as_bytes())
 }
 
+fn approval_lock() -> Result<crate::storage::FileLock> {
+    let directory = config::config_dir();
+    fs::create_dir_all(&directory)?;
+    crate::storage::lock_wait(
+        &directory.join("trust.lock"),
+        std::time::Duration::from_secs(2),
+    )
+}
+
 fn key(project: &Path) -> String {
     fs::canonicalize(project)
         .unwrap_or_else(|_| project.to_path_buf())
@@ -274,6 +283,7 @@ pub fn check(project: &Path, settings: &Settings) -> Trust {
 }
 
 pub fn approve(review: &Review) -> Result<()> {
+    let _lock = approval_lock()?;
     let mut store = read_store().unwrap_or_default();
     store.projects.insert(
         key(&review.project),
@@ -285,14 +295,137 @@ pub fn approve(review: &Review) -> Result<()> {
     write_store(&store)
 }
 
+fn run_approvals(project: &Path) -> PathBuf {
+    config::config_dir()
+        .join("run-approvals")
+        .join(digest(&[key(project)]))
+}
+
+fn snapshot_items(settings: &Settings) -> Vec<String> {
+    let mut items = dangerous(settings);
+    for workflow in &settings.workflows {
+        for stage in &workflow.stages {
+            items.push(format!(
+                "execution policy in {} / {}: harness {}; sandbox {}; network {}; native settings {:?}; candidate harnesses {:?}",
+                workflow.name,
+                stage.id,
+                stage.harness,
+                stage.effective_sandbox(workflow).label(),
+                stage.sandbox_network,
+                stage.harness_settings,
+                stage.fan_out.as_ref().map(|fan| fan
+                    .candidates.iter().map(|candidate| &candidate.harness).collect::<Vec<_>>()),
+            ));
+        }
+    }
+    items
+}
+
+fn run_items(run: &crate::engine::Run) -> Vec<String> {
+    snapshot_items(&Settings {
+        workflows: vec![run.workflow.clone()],
+        adapters: run.adapters.clone(),
+        providers: run.providers.clone(),
+        ..Settings::default()
+    })
+}
+
+pub fn settings_approval(settings: &Settings) -> String {
+    digest(&snapshot_items(&restore(settings)))
+}
+
+/// Settings constructed by an API caller are already authorized. Loaded
+/// settings must still have their original approval source, even if a TUI
+/// has since edited its working copy.
+pub fn authorize_settings(project: &Path, settings: &Settings) -> Result<()> {
+    if let Some(expected) = &settings.loaded_approval {
+        let current = config::load_config(project, settings.explicit_config.as_deref())?;
+        anyhow::ensure!(
+            (current.trust == Trust::Trusted || settings.ignored.is_some())
+                && current.settings.loaded_approval.as_ref() == Some(expected),
+            "Loaded config approval was revoked or changed. Reload the config and review its executable settings before starting another run"
+        );
+    }
+    Ok(())
+}
+
+/// Creation receives authorized settings, including global and explicit configs.
+/// Keep approval outside workspace-controlled run.json, bound to its contents.
+pub fn approve_run(
+    run: &crate::engine::Run,
+    settings: &Settings,
+    source: Option<&crate::engine::Run>,
+) -> Result<()> {
+    let _lock = approval_lock()?;
+    // Worktree creation and snapshotting may have taken time. Coordinate the
+    // final source check and receipt write with revocation, not just creation's
+    // initial check, so a revoked in-flight creation cannot mint a new receipt.
+    authorize_settings(&run.project, settings)?;
+    if let Some(source) = source {
+        authorize_run_locked(source, settings.explicit_config.as_deref())?;
+    }
+    write_run_approval(run)
+}
+
+fn write_run_approval(run: &crate::engine::Run) -> Result<()> {
+    let items = run_items(run);
+    if items.is_empty() {
+        return Ok(());
+    }
+    let directory = run_approvals(&run.project);
+    fs::create_dir_all(&directory)?;
+    crate::storage::atomic_write(&directory.join(&run.id), digest(&items).as_bytes())
+}
+
+/// Replays must authorize the snapshot, not merely the current project TOML.
+pub fn authorize_run(run: &crate::engine::Run) -> Result<()> {
+    authorize_run_config(run, None)
+}
+
+/// An explicit config is the user's selected approval source, including for
+/// legacy runs. Read it afresh rather than trusting cached TUI/server settings.
+pub fn authorize_run_config(run: &crate::engine::Run, explicit: Option<&Path>) -> Result<()> {
+    let _lock = approval_lock()?;
+    authorize_run_locked(run, explicit)
+}
+
+fn authorize_run_locked(run: &crate::engine::Run, explicit: Option<&Path>) -> Result<()> {
+    let items = run_items(run);
+    if items.is_empty()
+        || fs::read_to_string(run_approvals(&run.project).join(&run.id))
+            .is_ok_and(|approved| approved == digest(&items))
+    {
+        return Ok(());
+    }
+    // Older records have no receipt. They may use only executable settings
+    // and policies still present in today's trusted configuration. This also allows a
+    // revoked snapshot to run again after its configuration is reapproved.
+    let loaded = config::load_config(&run.project, explicit)?;
+    if loaded.trust == Trust::Trusted {
+        let approved = snapshot_items(&loaded.settings);
+        if items.iter().all(|item| approved.contains(item)) {
+            return write_run_approval(run);
+        }
+    }
+    anyhow::bail!(
+        "Saved run executable settings are untrusted or changed. Review the saved workflow, adapters, and providers; restore and trust the matching config before replaying"
+    )
+}
+
 /// Removes the project's entry; true when one existed.
 pub fn revoke(project: &Path) -> Result<bool> {
+    let _lock = approval_lock()?;
     let mut store = read_store()?;
     let removed = store.projects.remove(&key(project)).is_some();
     if removed {
         write_store(&store)?;
     }
-    Ok(removed)
+    let approvals = run_approvals(project);
+    let had_runs = approvals.exists();
+    if had_runs {
+        fs::remove_dir_all(approvals)?;
+    }
+    Ok(removed || had_runs)
 }
 
 /// Dangerous values removed by `ignore`, put back when the settings are saved,

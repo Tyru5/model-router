@@ -671,6 +671,7 @@ fn main_result() -> Result<()> {
             budget_tokens,
         }) => {
             let mut run = engine::load(&project, &id)?;
+            engine::authorize_replay(&mut run, cli.config.as_deref(), |_| {})?;
             if let Some(target) = retry_candidate {
                 let (stage, candidate) = target
                     .split_once('/')

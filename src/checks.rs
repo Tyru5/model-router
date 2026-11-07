@@ -46,6 +46,7 @@ pub fn run(
     workspace: &Path,
     attempt: &Path,
     cancel: &AtomicBool,
+    mut record_group: impl FnMut(Option<u32>) -> Result<()>,
     mut output: impl FnMut(String),
 ) -> Result<(Vec<CheckResult>, bool)> {
     let mut results = Vec::new();
@@ -71,12 +72,14 @@ pub fn run(
         };
         let started_at = Utc::now();
         let mut line_start = true;
-        let outcome = process::capture(
+        let outcome = process::capture_with(
             &invocation,
             workspace,
             &directory,
             Duration::from_secs(check.timeout_seconds),
             cancel,
+            None,
+            |pgid| record_group(Some(pgid)),
             |err, text| {
                 line_start = text.ends_with('\n');
                 output(format!(
@@ -86,6 +89,7 @@ pub fn run(
                 ))
             },
         );
+        record_group(None)?;
         let (status, exit_code, error) = match outcome {
             Ok(o) if o.cancelled => {
                 cancelled = true;

@@ -536,8 +536,10 @@ fn get_report(server: &Server, a: RunArgs) -> Result<Value> {
 /// Reloads after the engine's last save and refuses runs this server or
 /// another process is driving.
 fn idle_run(server: &Server, project: Option<&str>, id: &str) -> Result<Run> {
-    let (run, info) = load(server, project, id)?;
+    let (mut run, info) = load(server, project, id)?;
     ensure!(!info.active, "Run {id} is running; wait for it first");
+    let settings = server.settings(&run.project)?;
+    engine::authorize_replay(&mut run, settings.explicit_config.as_deref(), |_| {})?;
     Ok(run)
 }
 

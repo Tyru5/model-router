@@ -58,7 +58,12 @@ impl Editor {
         } else {
             self.config_path.clone()
         };
+        let saves_source = path == self.config_path
+            || (self.settings.explicit_config.is_none() && !self.config_path.is_file());
         self.settings.save(&path)?;
+        if saves_source {
+            self.settings.loaded_approval = Some(crate::trust::settings_approval(&self.settings));
+        }
         self.dirty = false;
         Ok(path)
     }

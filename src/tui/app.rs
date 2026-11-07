@@ -210,13 +210,16 @@ impl App {
         let slot = self.session.focused_mut().context("No run selected")?;
         ensure!(slot.worker.is_none(), "A stage is still running");
         let mut run = slot.run.clone();
+        let explicit = self.editor.settings.explicit_config.clone();
         slot.cancel.store(false, Ordering::Relaxed);
         let cancel = slot.cancel.clone();
         slot.worker = Some(Worker::spawn(
             None,
             |_| true,
             move |emit| {
-                let action = engine::drive(&mut run, &cancel, emit).map_err(|e| format!("{e:#}"));
+                let action = engine::authorize_replay(&mut run, explicit.as_deref(), &mut *emit)
+                    .and_then(|()| engine::drive(&mut run, &cancel, emit))
+                    .map_err(|e| format!("{e:#}"));
                 (run, action)
             },
         ));
@@ -234,6 +237,7 @@ impl App {
             run.status == Status::Interactive,
             "No interactive stage is ready"
         );
+        let explicit = self.editor.settings.explicit_config.clone();
         let (cols, rows) = crossterm::terminal::size()?;
         let session = process::InteractiveSession::new(cols, rows);
         let terminal = session.clone();
@@ -246,7 +250,8 @@ impl App {
             Some(session.clone()),
             failures,
             move |emit| {
-                let result = engine::run_interactive(&mut run, &cancel, &terminal, emit)
+                let result = engine::authorize_replay(&mut run, explicit.as_deref(), &mut *emit)
+                    .and_then(|()| engine::run_interactive(&mut run, &cancel, &terminal, emit))
                     .map(|()| {
                         if run.status == Status::AwaitingConfirmation {
                             Action::Confirm

@@ -14,6 +14,68 @@ use std::{
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/harness-output");
 
+#[test]
+fn unattended_raw_and_malformed_output_is_cleaned_but_logs_stay_raw() {
+    use model_router::config::CustomOutput;
+    for kind in [
+        CustomOutput::Text,
+        CustomOutput::GeminiJson,
+        CustomOutput::ClaudeStream,
+        CustomOutput::CodexJsonl,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            adapters: BTreeMap::from([("probe".into(), CustomAdapter {
+                command: "python3".into(),
+                args: vec!["-c".into(), "print('plain \\x1b]0;terminal-title\\x07visible\\x08'); print('{malformed \\x1b[31mred\\x1b[0m')".into()],
+                output: Some(kind),
+                ..CustomAdapter::default()
+            })]),
+            workflows: vec![model_router::config::Workflow::new("Output safety", vec![
+                Stage { id: "probe".into(), harness: "probe".into(), role: Role::Implementation, ..Stage::default() },
+                Stage { id: "summary".into(), role: Role::Summary, enabled: false, ..Stage::default() },
+            ])],
+            ..Settings::default()
+        };
+        let config = dir.path().join("explicit.toml");
+        settings.save(&config).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_model-router"))
+            .arg("-C")
+            .arg(dir.path())
+            .arg("--config")
+            .arg(&config)
+            .args(["run", "--task", "Display untrusted output"])
+            .env("MODEL_ROUTER_CONFIG_DIR", dir.path().join("config-home"))
+            .output()
+            .unwrap();
+        // Non-review stages may accept unstructured output as a handoff.
+        // The display and the raw logs must be safe regardless of that result.
+        let display = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            display.contains("plain visible") && display.contains("{malformed red"),
+            "{kind:?}: {display}"
+        );
+        assert!(
+            !display
+                .chars()
+                .any(|c| matches!(c, '\x1b' | '\x07' | '\x08')),
+            "{kind:?}: {display:?}"
+        );
+        let run = std::fs::read_dir(dir.path().join(".model-router/runs"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let saved: model_router::engine::Run =
+            model_router::storage::read_json(&run.join("run.json")).unwrap();
+        let raw =
+            fs::read_to_string(saved.stages[0].attempts[0].directory.join("stdout.log")).unwrap();
+        assert!(raw.contains("\x1b]0;terminal-title\x07visible\x08"));
+        assert!(raw.contains("{malformed \x1b[31mred\x1b[0m"));
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {

@@ -420,6 +420,53 @@ fn http(addr: &str, method: &str, path: &str, token: Option<&str>, body: &str) -
 }
 
 #[test]
+fn server_recovery_refuses_tampered_saved_commands() {
+    let dir = project();
+    let mut mcp = Mcp::spawn(dir.path(), &[]);
+    initialize(&mut mcp);
+    let started = mcp.call("start_run", json!({"task": "Replay safety", "overrides": [{"stage": "research", "model": "fail-once"}]}));
+    let id = started["run_id"].as_str().unwrap();
+    let failed = mcp.call("wait_run", json!({"run_id": id, "timeout_seconds": 60}));
+    assert_eq!(failed["status"], "failed");
+    let path = dir
+        .path()
+        .join(".model-router/runs")
+        .join(id)
+        .join("run.json");
+    let original = std::fs::read(&path).unwrap();
+    let mut saved: Value = serde_json::from_slice(&original).unwrap();
+    let marker = dir.path().join("unapproved-server-command");
+    saved["adapters"]["mock"]["command"] = json!("touch");
+    saved["adapters"]["mock"]["args"] = json!([marker]);
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let refused = mcp.error("retry_stage", json!({"run_id": id}));
+    assert!(
+        refused.contains("Saved run executable settings are untrusted"),
+        "{refused}"
+    );
+    assert!(!marker.exists());
+    std::fs::write(&path, original).unwrap();
+    let trust = |action| {
+        Command::new(env!("CARGO_BIN_EXE_model-router"))
+            .arg("-C")
+            .arg(dir.path())
+            .args(["trust", action])
+            .env("MODEL_ROUTER_CONFIG_DIR", dir.path().join("config-home"))
+            .output()
+            .unwrap()
+    };
+    assert!(trust("--revoke").status.success());
+    assert!(
+        mcp.error("retry_stage", json!({"run_id": id}))
+            .contains("Untrusted project config")
+    );
+    assert!(trust("--yes").status.success());
+    mcp.call("retry_stage", json!({"run_id": id}));
+    let done = mcp.call("wait_run", json!({"run_id": id, "timeout_seconds": 60}));
+    assert_eq!(done["status"], "complete", "{done}");
+}
+
+#[test]
 fn http_api_requires_its_token_and_streams_events() {
     let dir = project();
     let token = "test-token-123";
@@ -456,9 +503,45 @@ fn http_api_requires_its_token_and_streams_events() {
     assert_eq!(code, 401);
     let (code, _) = http(&addr, "GET", "/tools", Some("wrong"), "");
     assert_eq!(code, 401);
+    // Authentication must not wait for a declared body that never arrives.
+    let mut missing_body = TcpStream::connect(&addr).unwrap();
+    missing_body
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    missing_body
+        .write_all(b"POST /tools/list_workflows HTTP/1.1\r\nContent-Length: 100\r\n\r\n")
+        .unwrap();
+    let mut denied = String::new();
+    missing_body.read_to_string(&mut denied).unwrap();
+    assert!(denied.starts_with("HTTP/1.1 401"), "{denied}");
+
+    let mut slow = Vec::new();
+    for _ in 0..31 {
+        let mut stream = TcpStream::connect(&addr).unwrap();
+        stream
+            .write_all(b"GET /tools HTTP/1.1\r\nX-Slow: ")
+            .unwrap();
+        slow.push(stream);
+    }
+    // The last admitted slot is still usable by an authenticated client.
     let (code, body) = http(&addr, "GET", "/tools", Some(token), "");
     assert_eq!(code, 200);
     assert!(body.contains("start_run"));
+    std::thread::sleep(Duration::from_millis(100));
+    slow.push(TcpStream::connect(&addr).unwrap());
+    let mut excess = TcpStream::connect(&addr).unwrap();
+    excess
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut byte = [0];
+    match excess.read(&mut byte) {
+        Ok(0) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        result => panic!("overload must close without holding another worker: {result:?}"),
+    }
+    drop(slow);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(http(&addr, "GET", "/tools", Some(token), "").0, 200);
     let (code, body) = http(&addr, "POST", "/tools/list_workflows", Some(token), "");
     assert_eq!(code, 200, "{body}");
     let value: Value = serde_json::from_str(&body).unwrap();

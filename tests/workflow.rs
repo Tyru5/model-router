@@ -656,7 +656,10 @@ fn background_children_end_with_a_harness_that_exits_normally() {
         Duration::from_secs(10),
         &AtomicBool::new(false),
         None,
-        |pgid| group = Some(pgid),
+        |pgid| {
+            group = Some(pgid);
+            Ok(())
+        },
         |_, _| {},
     )
     .unwrap();
@@ -706,6 +709,211 @@ fn drive_stops_a_harness_group_left_by_a_dead_router() {
     assert!(run.stages[0].attempts[0].process_group.is_none());
     thread::sleep(Duration::from_millis(100));
     assert!(!running(pid), "orphaned harness child still running");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn retry_after_router_crash_stops_check_descendants_before_rerunning() {
+    check_crash_recovery(false, false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_fan_out_retry_after_router_crash_stops_candidate_check_descendants() {
+    check_crash_recovery(true, false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn revoked_replay_still_stops_crashed_check_descendants_without_relaunching() {
+    check_crash_recovery(false, true);
+}
+
+#[cfg(target_os = "linux")]
+fn check_crash_recovery(fan_out: bool, revoked: bool) {
+    use std::process::{Child, Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    if fan_out && common::repository(dir.path()).is_none() {
+        return;
+    }
+    let marker = dir.path().join("check-child.json");
+    let mut implementation = stage("implementation", Role::Implementation);
+    if fan_out {
+        implementation.fan_out = Some(model_router::config::FanOut {
+            candidates: ["test-model", "fail"]
+                .into_iter()
+                .map(|model| model_router::config::Candidate {
+                    harness: "mock".into(),
+                    provider: "implementation".into(),
+                    model: model.into(),
+                    ..Default::default()
+                })
+                .collect(),
+            judge: "auto".into(),
+        });
+    }
+    implementation.checks.push(model_router::config::Check {
+        command: vec!["python3".into(), "-c".into(), r#"
+import json, os, pathlib, subprocess, sys, time
+marker = pathlib.Path(sys.argv[1])
+if marker.exists():
+    pid = json.loads(marker.read_text())['pid']
+    stat = pathlib.Path('/proc/%s/stat' % pid)
+    assert not stat.exists() or stat.read_text().split()[2] == 'Z', 'old check child is still running'
+else:
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+    marker.write_text(json.dumps({'pid': child.pid, 'pgid': os.getpgrp()}))
+    time.sleep(60)
+"#.into(), marker.display().to_string()],
+        ..model_router::config::Check::default()
+    });
+    let workflow = common::workflow(vec![implementation]);
+    common::settings(&workflow)
+        .save(&dir.path().join(".model-router.toml"))
+        .unwrap();
+    let router = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_model-router"));
+        command
+            .arg("-C")
+            .arg(dir.path())
+            .env("MODEL_ROUTER_CONFIG_DIR", dir.path().join("config-home"));
+        command
+    };
+    assert!(
+        router()
+            .args(["trust", "--yes"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    struct Cleanup {
+        router: Child,
+        group: Option<u32>,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = self.router.kill();
+            let _ = self.router.wait();
+            if let Some(group) = self.group {
+                process::end_group(group, Duration::from_millis(100), || {});
+            }
+        }
+    }
+    let mut cleanup = Cleanup {
+        router: router()
+            .args(["run", "--task", "Check crash recovery"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        group: None,
+    };
+    let started = Instant::now();
+    let child: serde_json::Value = loop {
+        if let Ok(bytes) = fs::read(&marker) {
+            if let Ok(child) = serde_json::from_slice(&bytes) {
+                break child;
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "check did not start"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    let pgid = child["pgid"].as_u64().unwrap() as u32;
+    let pid = child["pid"].as_i64().unwrap() as i32;
+    cleanup.group = Some(pgid);
+    let directory = fs::read_dir(dir.path().join(".model-router/runs"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let id = directory.file_name().unwrap().to_str().unwrap();
+    let saved = engine::load(dir.path(), id).unwrap();
+    let attempt = if fan_out {
+        &saved.stages[0].fan_out.as_ref().unwrap().candidates[0].attempts[0]
+    } else {
+        &saved.stages[0].attempts[0]
+    };
+    assert_eq!(attempt.process_group, Some(pgid));
+    cleanup.router.kill().unwrap();
+    cleanup.router.wait().unwrap();
+    assert!(
+        running(pid),
+        "probe descendant must survive the router crash"
+    );
+    if fan_out {
+        // Full retries currently reuse candidate worktree names. Remove only
+        // these disposable worktrees to isolate crash recovery from that bug;
+        // the surviving process group must still be stopped by the router.
+        for candidate in &saved.stages[0].fan_out.as_ref().unwrap().candidates {
+            for attempt in &candidate.attempts {
+                if let Some(worktree) = &attempt.worktree {
+                    let removed = Command::new("git")
+                        .current_dir(dir.path())
+                        .args([
+                            "-c",
+                            "core.hooksPath=/dev/null",
+                            "worktree",
+                            "remove",
+                            "--force",
+                        ])
+                        .arg(worktree)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        removed.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&removed.stderr)
+                    );
+                }
+            }
+        }
+        assert!(running(pid));
+    }
+    if revoked {
+        assert!(
+            router()
+                .args(["trust", "--revoke"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    let retry = router().args(["resume", id, "--retry"]).output().unwrap();
+    assert!(!running(pid), "old check child survived recovery");
+    if revoked {
+        assert!(!retry.status.success());
+        assert!(
+            String::from_utf8_lossy(&retry.stderr)
+                .contains("Saved run executable settings are untrusted")
+        );
+        let saved = engine::load(dir.path(), id).unwrap();
+        assert_eq!(
+            saved.stages[0].attempts.len(),
+            1,
+            "revocation must prevent a new launch"
+        );
+        assert_eq!(saved.stages[0].attempts[0].process_group, None);
+        return;
+    }
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let saved = engine::load(dir.path(), id).unwrap();
+    assert_eq!(saved.status, Status::Complete);
+    assert!(
+        saved.stages[0]
+            .attempts
+            .iter()
+            .all(|a| a.process_group.is_none())
+    );
 }
 
 #[test]

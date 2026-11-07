@@ -1601,6 +1601,34 @@ fn interactive_terminal_waits_while_a_dialog_is_open() {
 }
 
 #[test]
+fn interactive_worker_failure_before_launch_finishes_its_terminal() {
+    let session = crate::process::InteractiveSession::new(80, 24);
+    let mut slot = super::run_slot::RunSlot::new(sample_run("refused"));
+    slot.worker = Some(Worker::spawn(
+        Some(session.clone()),
+        |_| false,
+        |_| (sample_run("refused"), Err("Replay approval refused".into())),
+    ));
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(result) = slot.poll().1 {
+            assert_eq!(result, Err("Replay approval refused".into()));
+            break;
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // A finished session returns before touching the host terminal, rather
+    // than attaching the person to a blank session with no running harness.
+    assert_eq!(
+        session
+            .attach(&AtomicBool::new(false), &AtomicBool::new(false))
+            .unwrap(),
+        crate::process::AttachOutcome::Finished
+    );
+}
+
+#[test]
 fn text_dialog_scrolling_stops_at_the_last_line() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());

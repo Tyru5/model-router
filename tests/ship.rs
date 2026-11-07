@@ -389,6 +389,13 @@ fn files_changed_before_and_during_the_run_block_unless_included() {
         model: None,
     })
     .unwrap();
+    // Disabling confirmation changes dangerous settings. The embedding caller
+    // explicitly approves the edited snapshot before it may execute again.
+    assert!(
+        model_router::engine::drive(&mut run, &std::sync::atomic::AtomicBool::new(false), |_| {})
+            .is_err()
+    );
+    model_router::trust::approve_run(&run, &Settings::default(), None).unwrap();
     assert_eq!(drive(&mut run), Action::Complete);
     assert_eq!(committed_files(dir, "HEAD"), ["other.txt", "src/new.txt"]);
     let plan: ship::Plan = serde_json::from_slice(

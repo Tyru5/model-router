@@ -286,17 +286,19 @@ pub fn rerun_at(
     placement: Placement,
 ) -> Result<Run> {
     let source = engine::load(project, id)?;
+    crate::trust::authorize_run_config(&source, settings.explicit_config.as_deref())?;
     let settings = Settings {
         adapters: source.adapters.clone(),
         providers: source.providers.clone(),
         ..settings.clone()
     };
-    let mut run = Run::create_at(
+    let mut run = Run::create_at_from(
         project,
         &settings,
         &source.workflow,
         source.task.clone(),
         placement,
+        Some(&source),
     )?;
     run.rerun_of = Some(source.id);
     run.persist()?;

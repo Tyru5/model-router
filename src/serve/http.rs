@@ -13,15 +13,25 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::RecvTimeoutError,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const KEEPALIVE: Duration = Duration::from_secs(15);
+const MAX_CONNECTIONS: usize = 32;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct ConnectionSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// A random bearer token (from the OS RNG via UUID v4).
 pub fn new_token() -> String {
@@ -38,17 +48,29 @@ pub fn serve(listener: TcpListener, server: Arc<Server>, token: String, stop: Ar
         return;
     }
     let token = Arc::new(token);
+    let active = Arc::new(AtomicUsize::new(0));
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
+                // Only this accept loop increments the count. Refuse overload
+                // without creating a worker or waiting for the client to read.
+                if active.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+                    drop(stream);
+                    continue;
+                }
+                active.fetch_add(1, Ordering::Relaxed);
+                let slot = ConnectionSlot(active.clone());
                 let (server, token) = (server.clone(), token.clone());
-                std::thread::spawn(move || {
+                if let Err(error) = std::thread::Builder::new().spawn(move || {
+                    let _slot = slot;
                     if let Err(error) = connection(stream, &server, &token) {
                         if error.kind() != io::ErrorKind::BrokenPipe {
                             super::log(format!("HTTP connection: {error}"));
                         }
                     }
-                });
+                }) {
+                    super::log(format!("HTTP worker: {error}"));
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(50));
@@ -73,8 +95,31 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_owned())
 }
 
-fn read_request(stream: &TcpStream) -> io::Result<Request> {
-    let mut reader = BufReader::new(stream.take((MAX_HEADER_BYTES + MAX_BODY_BYTES) as u64));
+struct RequestReader<'a> {
+    stream: &'a TcpStream,
+    deadline: Instant,
+}
+
+impl Read for RequestReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Request deadline exceeded",
+            ));
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(buffer)
+    }
+}
+
+fn read_request(stream: &TcpStream, token: &str, timeout: Duration) -> io::Result<Request> {
+    let source = RequestReader {
+        stream,
+        deadline: Instant::now() + timeout,
+    };
+    let mut reader = BufReader::new(source.take((MAX_HEADER_BYTES + MAX_BODY_BYTES) as u64));
     let mut line = String::new();
     let mut header_bytes = reader.read_line(&mut line)?;
     let mut parts = line.split_whitespace();
@@ -119,6 +164,10 @@ fn read_request(stream: &TcpStream) -> io::Result<Request> {
     if length > MAX_BODY_BYTES {
         return Err(invalid("Body too large"));
     }
+    // Never wait for an unauthenticated client's declared body.
+    if !authorized(&request, token) {
+        return Ok(request);
+    }
     request.body.resize(length, 0);
     reader.read_exact(&mut request.body)?;
     Ok(request)
@@ -162,10 +211,9 @@ fn respond(stream: &mut TcpStream, code: u16, body: &Value) -> io::Result<()> {
 
 fn connection(mut stream: TcpStream, server: &Server, token: &str) -> io::Result<()> {
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     // A client that stops reading an event stream must not pin its thread.
     stream.set_write_timeout(Some(Duration::from_secs(60)))?;
-    let request = match read_request(&stream) {
+    let request = match read_request(&stream, token, REQUEST_TIMEOUT) {
         Ok(request) => request,
         Err(error) => return respond(&mut stream, 400, &json!({"error": error.to_string()})),
     };
@@ -289,6 +337,37 @@ fn events(mut stream: TcpStream, server: &Server, id: &str, query: &str) -> io::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trickled_requests_have_an_absolute_deadline() {
+        for prefix in [
+            "GET /tools HTTP/1.1\r\nX-Slow: ",
+            "POST /tools/list_workflows HTTP/1.1\r\nAuthorization: Bearer token\r\nContent-Length: 100\r\n\r\n",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            client.write_all(prefix.as_bytes()).unwrap();
+            let writer = std::thread::spawn(move || {
+                for _ in 0..40 {
+                    if client.write_all(b"x").is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+            let started = Instant::now();
+            let result = read_request(&stream, "token", Duration::from_millis(120));
+            let error = result.err().expect("trickling must not renew the deadline");
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ));
+            assert!(started.elapsed() < Duration::from_millis(600));
+            drop(stream);
+            writer.join().unwrap();
+        }
+    }
 
     #[test]
     fn token_comparison_and_query_decoding() {

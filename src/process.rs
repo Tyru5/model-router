@@ -210,7 +210,7 @@ pub fn capture(
     cancel: &AtomicBool,
     on_output: impl FnMut(bool, &str),
 ) -> Result<Outcome> {
-    capture_with(inv, cwd, dir, timeout, cancel, None, |_| {}, on_output)
+    capture_with(inv, cwd, dir, timeout, cancel, None, |_| Ok(()), on_output)
 }
 
 /// The program and arguments to launch: `inv`'s, inside `sandbox` if any.
@@ -231,7 +231,7 @@ pub fn capture_with(
     timeout: Duration,
     cancel: &AtomicBool,
     sandbox: Option<&Plan>,
-    on_spawn: impl FnOnce(u32),
+    on_spawn: impl FnOnce(u32) -> Result<()>,
     mut on_output: impl FnMut(bool, &str),
 ) -> Result<Outcome> {
     let mut stdout_log = File::create(dir.join("stdout.log"))?;
@@ -265,7 +265,7 @@ pub fn capture_with(
             .spawn()
             .with_context(|| format!("Launch {}", inv.program))?,
     };
-    on_spawn(child.child.id());
+    on_spawn(child.child.id())?;
     let mut stdout = child.child.stdout.take().context("No stdout pipe")?;
     let mut stderr = child.child.stderr.take().context("No stderr pipe")?;
     let mut stdin = child.child.stdin.take();

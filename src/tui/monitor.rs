@@ -168,6 +168,11 @@ impl App {
                 self.start_driver()?
             }
             ActionId::Advance => {
+                engine::authorize_replay(
+                    self.session.run_mut().context("No run")?,
+                    self.editor.settings.explicit_config.as_deref(),
+                    |_| {},
+                )?;
                 self.session
                     .run_mut()
                     .context("No run")?

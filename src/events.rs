@@ -93,10 +93,10 @@ pub fn describe(line: &str, kind: OutputKind) -> Vec<String> {
         return vec![];
     }
     if kind == OutputKind::Text || kind == OutputKind::Gemini || !trimmed.starts_with('{') {
-        return vec![line.to_owned()];
+        return vec![storage::clean_terminal(line)];
     }
     let Ok(event) = serde_json::from_str::<Value>(trimmed) else {
-        return vec![line.to_owned()];
+        return vec![storage::clean_terminal(line)];
     };
     let lines = match kind {
         OutputKind::Codex => codex(&event),

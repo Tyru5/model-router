@@ -306,6 +306,9 @@ pub struct Run {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, Provider>,
     pub stages: Vec<StageState>,
+    /// Groups from discarded fan-out rounds, awaiting cleanup under both locks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    orphan_groups: Vec<u32>,
     pub cursor: usize,
     pub repair_passes: u32,
     /// Repair passes the user allowed beyond the workflow's limit.
@@ -420,7 +423,19 @@ impl Run {
         task: String,
         placement: Placement,
     ) -> Result<Self> {
+        Self::create_at_from(project, settings, workflow, task, placement, None)
+    }
+
+    pub(crate) fn create_at_from(
+        project: &Path,
+        settings: &Settings,
+        workflow: &Workflow,
+        task: String,
+        placement: Placement,
+        source: Option<&Run>,
+    ) -> Result<Self> {
         crate::config::validate_task(&task)?;
+        crate::trust::authorize_settings(project, settings)?;
         let snapshot = Settings {
             workflows: vec![workflow.clone()],
             ..settings.clone()
@@ -530,6 +545,7 @@ impl Run {
                     fan_out: None,
                 })
                 .collect(),
+            orphan_groups: vec![],
             cursor: 0,
             repair_passes: 0,
             extra_repair_passes: 0,
@@ -542,6 +558,7 @@ impl Run {
             hold: None,
             view: None,
         };
+        crate::trust::approve_run(&run, settings, source)?;
         run.persist()?;
         Ok(run)
     }
@@ -822,10 +839,10 @@ impl Run {
                 Status::Skipped
             };
             self.set(Target::Stage(i), to, actor, reason)?;
+            self.clear_fan_out(i);
             let state = &mut self.stages[i];
             state.handoff = None;
             state.waiver = None;
-            state.fan_out = None;
         }
         // A graph's dependents may come earlier in the list.
         if self.graph() {
@@ -836,13 +853,25 @@ impl Run {
                     Status::Skipped
                 };
                 self.set(Target::Stage(i), to, actor, reason)?;
+                self.clear_fan_out(i);
                 let state = &mut self.stages[i];
                 state.handoff = None;
                 state.waiver = None;
-                state.fan_out = None;
             }
         }
         Ok(())
+    }
+
+    fn clear_fan_out(&mut self, stage: usize) {
+        if let Some(round) = self.stages[stage].fan_out.take() {
+            self.orphan_groups.extend(
+                round
+                    .candidates
+                    .into_iter()
+                    .flat_map(|candidate| candidate.attempts)
+                    .filter_map(|attempt| attempt.process_group),
+            );
+        }
     }
 
     /// Whether the workflow is a dependency graph; see `graph`.
@@ -929,6 +958,7 @@ impl Run {
             "No handoff awaits confirmation"
         );
         if self.workflow.stages[self.cursor].role == Role::Ship {
+            crate::trust::authorize_run(self)?;
             return crate::ship::confirm(self);
         }
         if let Some(reason) = self.pending_waiver().map(str::to_owned) {
@@ -1276,6 +1306,7 @@ pub fn load(project: &Path, id: &str) -> Result<Run> {
     ensure!(
         run.version == 1
             && run.id == id
+            && fs::canonicalize(&run.project)? == fs::canonicalize(project)?
             && run.stages.len() == run.workflow.stages.len()
             && run.cursor <= run.stages.len(),
         "Invalid or unsupported run record"
@@ -1822,11 +1853,20 @@ fn run_checks(
     if configured.is_empty() {
         return Ok(true);
     }
+    let workspace = run.workspace.clone();
     let (results, cancelled) = checks::run(
         &configured,
-        &run.workspace,
+        &workspace,
         &prepared.directory,
         cancel,
+        |pgid| {
+            run.stages[index]
+                .attempts
+                .last_mut()
+                .context("No attempt")?
+                .process_group = pgid;
+            run.persist()
+        },
         |text| emit(Event::Output(text)),
     )?;
     if let Some(attempt) = run.stages[index].attempts.last_mut() {
@@ -1941,7 +1981,10 @@ fn execute_stage(
             timeout,
             cancel,
             prepared.sandbox.as_ref(),
-            |pgid| record(run, pgid),
+            |pgid| {
+                record(run, pgid);
+                Ok(())
+            },
             |err, text| {
                 if err {
                     emit(Event::Output(format!(
@@ -2299,6 +2342,14 @@ impl Run {
                 cwd,
                 &prepared.directory,
                 cancel,
+                |pgid| {
+                    self.candidate_mut(index, c)
+                        .attempts
+                        .last_mut()
+                        .context("No attempt")?
+                        .process_group = pgid;
+                    self.persist()
+                },
                 |text| emit(Event::Output(text)),
             )?;
             if let Some(attempt) = self.candidate_mut(index, c).attempts.last_mut() {
@@ -3038,6 +3089,7 @@ fn schedule(
                                 sandbox.as_ref(),
                                 |pgid| {
                                     let _ = tx.send(Message::Spawned(job, pgid));
+                                    Ok(())
                                 },
                                 |err, text| {
                                     let _ = tx.send(Message::Output(job, err, text.to_owned()));
@@ -3298,7 +3350,7 @@ fn lock_run(run: &Run) -> Result<(storage::FileLock, storage::FileLock)> {
 /// both locks means no live router owns them. Process group IDs are not
 /// reused while any member lives; a stale ID whose group is gone is ignored.
 fn stop_orphans(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
-    let mut changed = false;
+    let mut groups = std::mem::take(&mut run.orphan_groups);
     for state in &mut run.stages {
         let candidates = state
             .fan_out
@@ -3306,22 +3358,36 @@ fn stop_orphans(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
             .flat_map(|f| &mut f.candidates)
             .flat_map(|c| &mut c.attempts);
         for attempt in state.attempts.iter_mut().chain(candidates) {
-            let Some(pgid) = attempt.process_group.take() else {
-                continue;
-            };
-            changed = true;
-            if process::group_alive(pgid) {
-                emit(Event::Output(format!(
-                    "Stopping process group {pgid} left running by an interrupted execution\n"
-                )));
-                process::end_group(pgid, process::GRACE, || {});
+            if let Some(pgid) = attempt.process_group.take() {
+                groups.push(pgid);
             }
         }
     }
-    if changed {
+    for &pgid in &groups {
+        if process::group_alive(pgid) {
+            emit(Event::Output(format!(
+                "Stopping process group {pgid} left running by an interrupted execution\n"
+            )));
+            process::end_group(pgid, process::GRACE, || {});
+        }
+    }
+    if !groups.is_empty() {
         run.persist()?;
     }
     Ok(())
+}
+
+/// Clean up an interrupted execution before checking replay approval. Recovery
+/// must stop surviving work even when revocation refuses another launch.
+pub fn authorize_replay(
+    run: &mut Run,
+    explicit: Option<&Path>,
+    mut emit: impl FnMut(Event),
+) -> Result<()> {
+    let (_lock, _workspace_lock) = lock_run(run)?;
+    run.check_revision()?;
+    stop_orphans(run, &mut emit)?;
+    crate::trust::authorize_run_config(run, explicit)
 }
 
 /// Drive until completion, failure, or a terminal/confirmation is required.
@@ -3329,6 +3395,7 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
     let (_lock, _workspace_lock) = lock_run(run)?;
     run.check_revision()?;
     stop_orphans(run, &mut emit)?;
+    crate::trust::authorize_run(run)?;
     if run.graph() {
         return drive_graph(run, cancel, &mut emit);
     }
@@ -3442,6 +3509,7 @@ pub fn run_interactive(
     let (_lock, _workspace_lock) = lock_run(run)?;
     run.check_revision()?;
     stop_orphans(run, &mut emit)?;
+    crate::trust::authorize_run(run)?;
     execute_stage(run, cancel, Some(session), &mut emit)?;
     if matches!(
         run.status,

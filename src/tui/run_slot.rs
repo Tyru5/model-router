@@ -73,8 +73,12 @@ impl Worker {
     ) -> Self {
         let inbox = Shared::default();
         let shared = inbox.clone();
+        let session = terminal.clone();
         let thread = thread::spawn(move || {
             let (run, result) = work(&mut |event| lock(&shared).push(event));
+            if let Some(session) = session {
+                session.finish();
+            }
             if notify(&result) {
                 notify::notify_outcome(&run, &result);
             }
