@@ -136,6 +136,8 @@ mod tests {
                 usage: None,
                 checks_passed: 0,
                 checks_total: 0,
+                verified: None,
+                cost_usd: None,
             })
             .collect()
     }

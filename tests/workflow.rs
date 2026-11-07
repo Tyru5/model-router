@@ -1002,3 +1002,64 @@ fn repair_limit_can_be_extended_explicitly() {
     assert_eq!(count(dir.path(), "implementation"), 4);
     assert!(resumed.allow_repair().is_err());
 }
+
+#[test]
+fn handoff_inspector_matches_the_real_prompt_and_reports_losses() {
+    use model_router::engine::Kept;
+    let (_dir, _, mut run) = common::fixture(vec![
+        common::stage("research", Role::Research),
+        common::stage("verify", Role::Test),
+    ]);
+    // Verify reports no evidence and blocks after its first attempt.
+    assert_eq!(
+        common::drive(&mut run),
+        model_router::engine::Action::Stopped
+    );
+    let long = "decision text ".repeat(100);
+    let handoff = run.stages[0].handoff.as_mut().unwrap();
+    handoff.decisions = vec![long.clone(); 60];
+    handoff.unresolved = (0..80)
+        .map(|i| format!("open question {i} {long}"))
+        .collect();
+    handoff.files_changed = (0..300).map(|i| format!("src/f{i}.rs")).collect();
+    run.persist().unwrap();
+    run.retry(false, None).unwrap();
+
+    let inspection = engine::inspect_handoffs(&run, None).unwrap();
+    assert_eq!(inspection.stage, "verify");
+    let view = &inspection.handoffs[0];
+    assert!(
+        view.sent && view.bytes <= engine::PRIOR_EACH + 200,
+        "{}",
+        view.bytes
+    );
+    let field = |name: &str| view.fields.iter().find(|f| f.field == name).unwrap();
+    // Whole fields are not listed: the short summary arrived intact.
+    assert!(view.fields.iter().all(|f| f.field != "summary"));
+    for name in ["decisions", "unresolved"] {
+        let f = field(name);
+        assert_ne!(f.kept, Kept::Whole, "{name}");
+        if let Some((total, shown)) = f.items {
+            assert!(shown < total, "{name}: {shown} of {total}");
+        }
+    }
+    assert!(
+        view.warnings
+            .iter()
+            .any(|w| w.starts_with("decisions lost"))
+    );
+    assert!(
+        view.warnings
+            .iter()
+            .any(|w| w.starts_with("unresolved items lost"))
+    );
+    let text = inspection.text();
+    assert!(text.contains("warning: decisions lost"), "{text}");
+
+    // The next attempt's prompt is exactly what the inspector showed.
+    common::drive(&mut run);
+    let attempt = run.stages[1].attempts.last().unwrap();
+    assert_eq!(attempt.number, 2);
+    let sent = fs::read_to_string(attempt.directory.join("prompt.md")).unwrap();
+    assert_eq!(sent, inspection.prompt);
+}

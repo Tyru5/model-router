@@ -92,6 +92,85 @@ pub fn tree_with(workspace: &Path, index: &Path, run: &str) -> Option<String> {
     Some(tree)
 }
 
+/// The working tree as a Git tree ID now, through a throwaway index and
+/// without a ref: for comparing against saved snapshots. Writes only Git
+/// objects. Ok(None) outside Git.
+pub fn current_tree(workspace: &Path) -> Result<Option<String>> {
+    let scratch = tempfile::tempdir().context("Create a scratch index directory")?;
+    capture(workspace, &scratch.path().join("index"))
+}
+
+/// Whether `tree` names a tree object in `dir`'s repository.
+pub fn exists(dir: &Path, tree: &str) -> bool {
+    git(dir, None, &["cat-file", "-e", &format!("{tree}^{{tree}}")]).is_ok()
+}
+
+/// Makes the files of a fresh checkout `workspace` match snapshot `tree`
+/// exactly, as uncommitted changes against its HEAD: the index, HEAD, and
+/// refs stay as they are. Fails, saying why, when the result differs from
+/// `tree` (e.g. attribute filters rewrote files).
+pub fn materialize(workspace: &Path, tree: &str) -> Result<()> {
+    let head = git(
+        workspace,
+        None,
+        &["rev-parse", "--verify", "--quiet", "HEAD^{tree}"],
+    )
+    .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
+    .context("The checkout has no HEAD commit")?;
+    if head != tree {
+        let scratch = tempfile::tempdir().context("Create a scratch directory")?;
+        let patch = scratch.path().join("snapshot.patch");
+        let file = fs::File::create(&patch)?;
+        let status = Command::new("git")
+            .args([
+                "--no-pager",
+                "diff",
+                "--binary",
+                "--full-index",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                // Whatever diff.noprefix or diff.*Prefix say, `git apply` expects these.
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                &head,
+                tree,
+            ])
+            .current_dir(workspace)
+            .stdin(Stdio::null())
+            .stdout(file)
+            .stderr(Stdio::null())
+            .status()
+            .context("Start Git")?;
+        ensure!(status.success(), "git diff {head} {tree} failed");
+        let patch = patch.to_str().context("Scratch path must be UTF-8")?;
+        git(
+            workspace,
+            None,
+            &["apply", "--binary", "--whitespace=nowarn", patch],
+        )?;
+    }
+    let now = current_tree(workspace)?.context("The checkout is not a Git repository")?;
+    ensure!(
+        now == tree,
+        "The checkout does not reproduce snapshot {tree} exactly (got {now}); Git attributes or filters may rewrite files"
+    );
+    Ok(())
+}
+
+/// Keeps existing tree `tree` under run `run`'s refs, so cleaning another
+/// run cannot prune it. False when `tree` is not in the repository.
+pub fn keep(dir: &Path, run: &str, tree: &str) -> bool {
+    exists(dir, tree)
+        && git(
+            dir,
+            None,
+            &["update-ref", &format!("{}/{tree}", namespace(run)), tree],
+        )
+        .is_ok()
+}
+
 /// The ref keeping fan-out base commit `name` of run `run`.
 pub fn base_ref(run: &str, name: &str) -> String {
     format!("{}/base/{name}", namespace(run))

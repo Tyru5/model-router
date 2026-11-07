@@ -213,3 +213,78 @@ fn stats_command_prints_ranked_tables_and_json() {
     let (ok, text) = cli(dir.path(), &settings, &["stats", "--role", "nonsense"]);
     assert!(!ok && text.contains("expected one of"), "{text}");
 }
+
+#[test]
+fn samples_record_router_verification_and_stats_shortlists_it() {
+    let check = |code: &str| model_router::config::Check {
+        command: vec!["python3".into(), "-c".into(), code.into()],
+        ..Default::default()
+    };
+    let (dir, mut settings, mut run) = fixture(vec![
+        stage("implement", Role::Implementation),
+        stage("notes", Role::Custom),
+    ]);
+    assert_eq!(drive(&mut run), Action::Complete);
+    // No router checks ran: no evidence either way.
+    assert_eq!(
+        find(&stats::samples(&run), &run.id, "implement").verified,
+        None
+    );
+    settings.workflows[0].stages[0].checks = vec![check("pass")];
+    let good = run_with_model(dir.path(), &settings, "good");
+    assert_eq!(
+        find(&stats::samples(&good), &good.id, "implement").verified,
+        Some(true)
+    );
+    settings.workflows[0].stages[0].checks = vec![check("raise SystemExit(1)")];
+    let bad = run_with_model(dir.path(), &settings, "bad");
+    let samples = stats::samples(&bad);
+    let sample = find(&samples, &bad.id, "implement");
+    assert_eq!(sample.verified, Some(false));
+    // The mock reports no usage: cost stays unknown, never zero.
+    assert_eq!(sample.cost_usd, None);
+    // A harness that fails before its checks run is a failure, not a gap.
+    let crashed = run_with_model(dir.path(), &settings, "fail");
+    let samples = stats::samples(&crashed);
+    let sample = find(&samples, &crashed.id, "implement");
+    assert!(
+        sample.attempts > 0 && sample.verified == Some(false),
+        "{sample:?}"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_model-router"))
+        .arg("-C")
+        .arg(dir.path())
+        .args(["stats", "--role", "implementation", "--min-pass", "0.9"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains("1. implementation mock/good · checks 1/1 (100%) · cost unknown"),
+        "{text}"
+    );
+    assert!(
+        text.contains("only 1 verified sample(s): anecdotal"),
+        "{text}"
+    );
+    assert!(
+        text.contains("mock/bad: router checks passed 0/1 (0%), below 90%"),
+        "{text}"
+    );
+    assert!(
+        text.contains("mock/fail: router checks passed 0/1 (0%), below 90%"),
+        "{text}"
+    );
+    assert!(
+        text.contains("mock/test-model: no required router checks ran"),
+        "{text}"
+    );
+    let rejected = Command::new(env!("CARGO_BIN_EXE_model-router"))
+        .arg("-C")
+        .arg(dir.path())
+        .args(["stats", "--min-pass", "90"])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+}

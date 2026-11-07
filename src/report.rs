@@ -1,6 +1,7 @@
 //! Completion summaries: what a run changed, checked, left unresolved, and
 //! spent. `build_with` and `render` are pure; `build` also reads pricing
-//! files and saved ship results (never the network); `changes` and `diff` run Git.
+//! files and saved ship results (never the network); `changes`, `diff`, and
+//! `receipts` run Git.
 use crate::{
     config::{Budget, Role},
     cost::{self, CostTotal, Pricing},
@@ -43,6 +44,9 @@ pub struct RunReport {
     /// Ships of this run: by ship stages, then `model-router ship`. Read
     /// from each ship's ship.json.
     pub shipped: Vec<crate::ship::Outcome>,
+    /// The saved run and stage checkpoint this run was forked from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork_of: Option<crate::engine::Fork>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,6 +71,9 @@ pub struct StageReport {
     /// A best-of-N stage's candidates and choice.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fan_out: Option<FanOutReport>,
+    /// A fork reused this stage's handoff from its source run without running it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub inherited: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -170,6 +177,216 @@ pub enum Changes {
     Unavailable {
         reason: String,
     },
+}
+
+/// What backs a stage's verification, from its latest attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Basis {
+    /// Every required router check ran and passed.
+    RouterChecks,
+    /// A required router check failed, timed out, or did not run.
+    RouterChecksFailed,
+    /// No required router check; the model reported a passing required test.
+    SelfReportedOnly,
+    /// No required router check; the user accepted a not-applicable reason.
+    Waived,
+    None,
+}
+
+/// Whether the workspace still holds the code a stage's router checks tested.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Freshness {
+    /// The workspace matches the tested snapshot.
+    Current,
+    /// Files changed since the checks ran; the evidence no longer covers them.
+    Stale { changed: Vec<String> },
+    /// The snapshot or the workspace cannot be compared.
+    Unavailable { reason: String },
+}
+
+/// A stage's verification receipt: which router checks ran against which
+/// Git snapshot, and whether the code has changed since. It confirms the
+/// checks ran and passed against that snapshot, not that they are adequate.
+#[derive(Debug, Clone, Serialize)]
+pub struct Receipt {
+    pub stage: String,
+    pub role: Role,
+    /// The latest attempt's number.
+    pub attempt: usize,
+    pub basis: Basis,
+    pub required_passed: usize,
+    pub required_total: usize,
+    /// Required tests the model reported passing; the router ran none of them.
+    pub model_reported_passed: usize,
+    /// The tree the router checks tested; None without one.
+    pub snapshot: Option<String>,
+    /// None when no router check ran.
+    pub freshness: Option<Freshness>,
+}
+
+/// Receipts for stages whose latest attempt ran router checks, and for test
+/// stages. Compares each tested snapshot with the workspace now, so it runs
+/// Git (writing only objects).
+pub fn receipts(run: &Run) -> Vec<Receipt> {
+    let dir = git_dir(run);
+    let mut current: Option<std::result::Result<String, String>> = None;
+    let mut now = || {
+        current
+            .get_or_insert_with(|| {
+                if !run.workspace.is_dir() {
+                    return Err(format!(
+                        "the workspace {} no longer exists",
+                        run.workspace.display()
+                    ));
+                }
+                match snapshot::current_tree(&run.workspace) {
+                    Ok(Some(tree)) => Ok(tree),
+                    Ok(None) => Err("not a Git repository".into()),
+                    Err(error) => Err(format!("{error:#}")),
+                }
+            })
+            .clone()
+    };
+    let mut out = vec![];
+    for (stage, state) in run.workflow.stages.iter().zip(&run.stages) {
+        let Some(last) = state.attempts.last() else {
+            continue;
+        };
+        if last.checks.is_empty() && stage.role != Role::Test {
+            continue;
+        }
+        let required: Vec<_> = last.checks.iter().filter(|c| c.required).collect();
+        let required_passed = required
+            .iter()
+            .filter(|c| c.status == TestStatus::Passed)
+            .count();
+        let model_reported_passed = state.handoff.as_ref().map_or(0, |h| {
+            h.tests
+                .iter()
+                .filter(|t| t.required && t.status == TestStatus::Passed)
+                .count()
+        });
+        let basis = if !required.is_empty() && required_passed == required.len() {
+            Basis::RouterChecks
+        } else if !required.is_empty() {
+            Basis::RouterChecksFailed
+        } else if state.waiver.is_some() {
+            Basis::Waived
+        } else if model_reported_passed > 0 {
+            Basis::SelfReportedOnly
+        } else {
+            Basis::None
+        };
+        let freshness = (!last.checks.is_empty()).then(|| match &last.checks_tree {
+            None if !snapshot::is_repository(dir) => Freshness::Unavailable {
+                reason: "not a Git repository".into(),
+            },
+            None => Freshness::Unavailable {
+                reason: "no snapshot was recorded for these checks (Git failed, or the run predates receipts)".into(),
+            },
+            Some(tree) if !snapshot::exists(dir, tree) => Freshness::Unavailable {
+                reason: format!(
+                    "snapshot {} is no longer in the repository (run cleaned or pruned)",
+                    short(tree)
+                ),
+            },
+            Some(tree) => match now() {
+                Err(reason) => Freshness::Unavailable { reason },
+                Ok(now) if now == *tree => Freshness::Current,
+                Ok(now) => match snapshot::changes(dir, tree, &now) {
+                    Ok(files) => Freshness::Stale {
+                        changed: files.into_iter().map(|f| f.path).collect(),
+                    },
+                    Err(error) => Freshness::Unavailable {
+                        reason: format!("{error:#}"),
+                    },
+                },
+            },
+        });
+        out.push(Receipt {
+            stage: stage.name.clone(),
+            role: stage.role,
+            attempt: last.number,
+            basis,
+            required_passed,
+            required_total: required.len(),
+            model_reported_passed,
+            snapshot: last.checks_tree.clone(),
+            freshness,
+        });
+    }
+    out
+}
+
+fn short(tree: &str) -> &str {
+    tree.get(..10).unwrap_or(tree)
+}
+
+/// One line per receipt, under a heading; empty without receipts.
+pub fn render_receipts(receipts: &[Receipt]) -> String {
+    if receipts.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from("Verification receipts:\n");
+    for receipt in receipts {
+        let fresh = matches!(receipt.freshness, None | Some(Freshness::Current));
+        let glyph = match receipt.basis {
+            Basis::RouterChecks if fresh => "✓",
+            Basis::RouterChecks => "!",
+            Basis::RouterChecksFailed => "✗",
+            Basis::SelfReportedOnly | Basis::Waived | Basis::None => "•",
+        };
+        let basis = match receipt.basis {
+            Basis::RouterChecks | Basis::RouterChecksFailed => format!(
+                "router checks {}/{} required passed",
+                receipt.required_passed, receipt.required_total
+            ),
+            Basis::SelfReportedOnly => format!(
+                "self-reported only: {} passing required test(s) claimed by the model, none run by the router",
+                receipt.model_reported_passed
+            ),
+            Basis::Waived => {
+                "no required router check; verification waived as not applicable".into()
+            }
+            Basis::None => "no passing required check".into(),
+        };
+        let _ = write!(
+            text,
+            "  {glyph} {} (attempt {}): {basis}",
+            receipt.stage, receipt.attempt
+        );
+        if let Some(tree) = &receipt.snapshot {
+            let _ = write!(text, " at snapshot {}", short(tree));
+        }
+        match &receipt.freshness {
+            None => {}
+            Some(Freshness::Current) => text.push_str(" · current: the workspace still matches"),
+            Some(Freshness::Stale { changed }) => {
+                let _ = write!(
+                    text,
+                    " · stale: {} changed since the checks ran ({}{})",
+                    count(changed.len(), "file", "files"),
+                    changed
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if changed.len() > 5 { ", …" } else { "" }
+                );
+            }
+            Some(Freshness::Unavailable { reason }) => {
+                let _ = write!(text, " · freshness unknown: {reason}");
+            }
+        }
+        text.push('\n');
+    }
+    text.push_str(
+        "  A receipt shows the router ran these checks against that snapshot, not that they are adequate.\n",
+    );
+    text
 }
 
 /// `build_with` the project's pricing.
@@ -397,6 +614,7 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
             waiver: waiver.map(|w| w.reason.clone()),
             handoff_source: last.and_then(|a| a.handoff_source),
             fan_out,
+            inherited: state.inherited.is_some(),
         });
     }
     // Stable, so each kind keeps stage order.
@@ -450,6 +668,7 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
             .find_map(|(_, state)| state.handoff.as_ref())
             .map(|handoff| handoff.summary.trim().to_owned()),
         shipped: crate::ship::outcomes(run),
+        fork_of: run.fork_of.clone(),
     }
 }
 
@@ -742,6 +961,20 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
         );
     }
     text.push('\n');
+    if let Some(fork) = &report.fork_of {
+        let _ = writeln!(
+            text,
+            "Forked from: {} at stage {} (attempt {}, snapshot {}){}",
+            fork.run,
+            fork.stage,
+            fork.attempt,
+            short(&fork.snapshot),
+            fork.model
+                .as_deref()
+                .map(|m| format!(" with model {m}"))
+                .unwrap_or_default()
+        );
+    }
     if let Some(error) = &report.error {
         let _ = writeln!(text, "Error: {error}");
     }
@@ -817,6 +1050,9 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
         .unwrap_or(0);
     for stage in &report.stages {
         let _ = write!(text, "  {:<width$}  {}", stage.name, stage.status.label());
+        if stage.inherited {
+            text.push_str(" · handoff reused from the fork's source run");
+        }
         if stage.attempts > 0 {
             let _ = write!(
                 text,

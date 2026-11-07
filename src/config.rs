@@ -144,6 +144,10 @@ pub struct Stage {
     /// Commands the router runs after the harness succeeds, independent of its handoff.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<Check>,
+    /// Test stages only: model-reported passes never satisfy the gate; the
+    /// stage needs a passing required router check (or an explicit waiver).
+    #[serde(skip_serializing_if = "is_false")]
+    pub require_router_checks: bool,
     /// Router sandbox for this stage; unset inherits the workflow's `sandbox_default`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<Sandbox>,
@@ -171,6 +175,9 @@ pub struct Stage {
 }
 fn is_true(value: &bool) -> bool {
     *value
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 fn is_refuse(value: &SandboxFallback) -> bool {
     *value == SandboxFallback::Refuse
@@ -275,6 +282,7 @@ impl Default for Stage {
             timeout_seconds: 3600,
             repair_target: String::new(),
             checks: vec![],
+            require_router_checks: false,
             sandbox: None,
             sandbox_writable: vec![],
             sandbox_network: true,
@@ -905,6 +913,13 @@ impl Settings {
                         stage.name
                     );
                 }
+                // Without a required check (none configured, or ignored while
+                // the project is untrusted) the stage fails closed and blocks.
+                ensure!(
+                    !stage.require_router_checks || stage.role == Role::Test,
+                    "Only test stages can set require_router_checks ({})",
+                    stage.name
+                );
                 if stage.enabled && !stage.repair_target.is_empty() {
                     ensure!(
                         stage.role == Role::Review,

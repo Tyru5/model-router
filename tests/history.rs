@@ -447,3 +447,201 @@ fn cli_clean_previews_then_removes() {
     assert!(out.contains("Removed 1 run"), "{out}");
     assert!(!run.directory.exists() && newest.directory.exists());
 }
+
+/// Implement writes made.txt; verify runs a passing required router check.
+fn forkable(dir: &Path) -> Option<(Settings, Run)> {
+    common::repository(dir)?;
+    let mut implement = stage("implementation", Role::Implementation);
+    implement.extra_args = vec!["--write-file".into(), "made.txt".into()];
+    let mut verify = stage("verify", Role::Test);
+    verify.checks = vec![model_router::config::Check {
+        command: vec!["python3".into(), "-c".into(), "pass".into()],
+        ..Default::default()
+    }];
+    let workflow = common::workflow(vec![implement, verify]);
+    let settings = common::settings(&workflow);
+    let mut run = common::create(dir, &settings, &workflow);
+    assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+    Some((settings, run))
+}
+
+#[test]
+fn fork_continues_from_a_stage_checkpoint_in_its_own_worktree() {
+    let dir = common::tempdir();
+    let Some((settings, source)) = forkable(dir.path()) else {
+        return;
+    };
+    let made = fs::read_to_string(dir.path().join("made.txt")).unwrap();
+    // Edits after the source run must not leak into the fork.
+    fs::write(dir.path().join("made.txt"), "edited after the run\n").unwrap();
+    let before = fs::read(
+        storage::run_dir(dir.path(), &source.id)
+            .unwrap()
+            .join("run.json"),
+    )
+    .unwrap();
+    // A user who diffs without a/ b/ prefixes can still fork.
+    assert!(
+        Command::new("git")
+            .args(["config", "diff.noprefix", "true"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let mut fork = history::fork(
+        dir.path(),
+        &settings,
+        &source.id,
+        "verify",
+        Some("other".into()),
+    )
+    .unwrap();
+    assert_ne!(fork.id, source.id);
+    assert!(fork.worktree && fork.workspace != source.workspace);
+    let origin = fork.fork_of.clone().unwrap();
+    assert_eq!(
+        (origin.run.as_str(), origin.stage.as_str(), origin.attempt),
+        (source.id.as_str(), "verify", 1)
+    );
+    assert_eq!(
+        origin.snapshot,
+        source.stages[1].attempts[0].tree_before.clone().unwrap()
+    );
+    assert_eq!(origin.model.as_deref(), Some("other"));
+    // The worktree holds the checkpoint: implement's output and the
+    // uncommitted draft the source started with.
+    assert_eq!(
+        fs::read_to_string(fork.workspace.join("made.txt")).unwrap(),
+        made
+    );
+    assert!(fork.workspace.join("draft.txt").is_file());
+    // Upstream is reused, not rerun; the continuation uses the new model.
+    assert_eq!(fork.cursor, 1);
+    assert_eq!(fork.stages[0].status, Status::Complete);
+    assert!(fork.stages[0].attempts.is_empty() && fork.stages[0].inherited.is_some());
+    assert_eq!(
+        fork.stages[0].handoff.as_ref().unwrap().summary,
+        source.stages[0].handoff.as_ref().unwrap().summary
+    );
+    assert_eq!(fork.workflow.stages[1].model, "other");
+    assert_eq!(drive(&mut fork), Action::Complete, "{:?}", fork.error);
+    assert_eq!(common::count(&fork.workspace, "implementation"), 0);
+    assert_eq!(common::count(&fork.workspace, "verify"), 1);
+    let prompt =
+        fs::read_to_string(fork.workspace.join(".model-router/mock/verify.prompt")).unwrap();
+    assert!(prompt.contains("PRIOR STAGE: implementation"), "{prompt}");
+    let argv =
+        fs::read_to_string(fork.workspace.join(".model-router/mock/verify.argv.json")).unwrap();
+    assert!(argv.contains("\"other\""), "{argv}");
+    // Changes, and so what `ship` commits, include the inherited upstream
+    // work, measured from where the source run started (the draft predates it).
+    match model_router::report::changes(&fork) {
+        model_router::report::Changes::Tracked { files } => {
+            let paths: Vec<_> = files.iter().map(|f| f.path.as_str()).collect();
+            assert_eq!(paths, ["made.txt"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    // A fork of the fork still points at the original artifacts.
+    let again = history::fork(dir.path(), &settings, &fork.id, "verify", None).unwrap();
+    assert_eq!(again.stages[0].inherited, fork.stages[0].inherited);
+    assert_eq!(again.baseline, fork.baseline);
+    // The source run, its record, and the user's checkout are untouched.
+    assert_eq!(
+        fs::read(
+            storage::run_dir(dir.path(), &source.id)
+                .unwrap()
+                .join("run.json")
+        )
+        .unwrap(),
+        before
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("made.txt")).unwrap(),
+        "edited after the run\n"
+    );
+    assert_eq!(common::count(dir.path(), "verify"), 1);
+    let rendered = model_router::report::render(&model_router::report::build(&fork), None);
+    assert!(
+        rendered.contains(&format!("Forked from: {} at stage verify", source.id)),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("handoff reused from the fork's source run"),
+        "{rendered}"
+    );
+    // compare --source works across a fork.
+    let comparison = history::compare_rerun(&source, &fork, "verify").unwrap();
+    assert!(comparison.text().contains("other"));
+}
+
+#[test]
+fn fork_refuses_missing_snapshots_and_incompatible_histories() {
+    let dir = common::tempdir();
+    let Some((settings, source)) = forkable(dir.path()) else {
+        return;
+    };
+    let error = |stage: &str| {
+        history::fork(dir.path(), &settings, &source.id, stage, None)
+            .unwrap_err()
+            .to_string()
+    };
+    assert!(error("nope").contains("has no stage nope"));
+
+    // Implement finished after verify started: verify's snapshot does not
+    // hold the handoff the fork would reuse.
+    let path = storage::run_dir(dir.path(), &source.id)
+        .unwrap()
+        .join("run.json");
+    let saved = fs::read(&path).unwrap();
+    let mut changed = engine::load(dir.path(), &source.id).unwrap();
+    let late = changed.stages[1].attempts[0].started_at + chrono::Duration::seconds(5);
+    changed.stages[0].attempts[0].finished_at = Some(late);
+    changed.persist().unwrap();
+    assert!(
+        error("verify").contains("ran again after every attempt"),
+        "{}",
+        error("verify")
+    );
+    fs::write(&path, &saved).unwrap();
+
+    // An upstream stage that did not complete has no handoff to reuse.
+    let mut blocked = engine::load(dir.path(), &source.id).unwrap();
+    blocked.stages[0].status = Status::Blocked;
+    blocked.persist().unwrap();
+    assert!(error("verify").contains("Upstream stage implementation is blocked"));
+    fs::write(&path, &saved).unwrap();
+
+    // Once the snapshot is pruned, nothing is created.
+    model_router::snapshot::forget(dir.path(), &source.id);
+    assert!(
+        Command::new("git")
+            .args(["gc", "-q", "--prune=now"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let runs = history::list(dir.path()).unwrap().len();
+    assert!(
+        error("verify").contains("no longer in the repository"),
+        "{}",
+        error("verify")
+    );
+    assert_eq!(history::list(dir.path()).unwrap().len(), runs);
+}
+
+#[test]
+fn fork_outside_git_explains_the_missing_snapshot() {
+    let (dir, settings, mut run) = fixture(vec![
+        stage("research", Role::Research),
+        stage("implementation", Role::Implementation),
+    ]);
+    assert_eq!(drive(&mut run), Action::Complete);
+    let error = history::fork(dir.path(), &settings, &run.id, "implementation", None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("has no workspace snapshot"), "{error}");
+}

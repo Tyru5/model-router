@@ -305,6 +305,174 @@ pub fn rerun_at(
     Ok(run)
 }
 
+/// Starts a new run in its own Git worktree from a saved run's checkpoint at
+/// the start of stage `stage_id`: the worktree's files are exactly the
+/// snapshot taken when that stage first started after its upstream stages
+/// finished, the upstream handoffs are reused without running them again,
+/// and the run continues at that stage, optionally with `model`. The saved
+/// run, its workspace, and the user's checkout are unchanged; nothing is
+/// merged or shipped.
+pub fn fork(
+    project: &Path,
+    settings: &Settings,
+    id: &str,
+    stage_id: &str,
+    model: Option<String>,
+) -> Result<Run> {
+    let source = engine::load(project, id)?;
+    // A fork replays the source's executable settings, as a rerun does.
+    crate::trust::authorize_run_config(&source, settings.explicit_config.as_deref())?;
+    let index = source
+        .workflow
+        .stages
+        .iter()
+        .position(|s| s.id == stage_id)
+        .with_context(|| format!("Run {id} has no stage {stage_id}"))?;
+    let stage = &source.workflow.stages[index];
+    ensure!(stage.enabled, "Stage {stage_id} is disabled in run {id}");
+    ensure!(
+        stage.role != crate::config::Role::Ship,
+        "Ship stages run in the router; ship the fork instead (model-router ship)"
+    );
+    if model.is_some() {
+        ensure!(
+            stage.fan_out.is_none(),
+            "Fan-out stage {stage_id} has candidate models; fork without --model"
+        );
+    }
+    let order = source.order();
+    let upstream: Vec<usize> = (0..source.stages.len())
+        .filter(|&i| order.precedes(i, index))
+        .collect();
+    for &i in &upstream {
+        let state = &source.stages[i];
+        let name = &source.workflow.stages[i].name;
+        ensure!(
+            state.status == Status::Skipped
+                || (state.status == Status::Complete && state.handoff.is_some()),
+            "Upstream stage {name} is {} in run {id}; a fork reuses only completed upstream handoffs",
+            state.status.label()
+        );
+    }
+    // The checkpoint: the stage's first attempt after every upstream attempt
+    // ended. Later retries started from files earlier attempts had changed.
+    let upstream_end = upstream
+        .iter()
+        .flat_map(|&i| &source.stages[i].attempts)
+        .filter_map(|a| a.finished_at)
+        .max();
+    let attempts = &source.stages[index].attempts;
+    ensure!(
+        !attempts.is_empty(),
+        "Stage {stage_id} never started in run {id}, so no checkpoint was saved for it"
+    );
+    let boundary = attempts
+        .iter()
+        .find(|a| upstream_end.is_none_or(|end| a.started_at >= end))
+        .with_context(|| {
+            format!(
+                "An upstream stage ran again after every attempt of {stage_id} started (e.g. a review repair), so no saved snapshot of {stage_id} matches the upstream handoffs"
+            )
+        })?;
+    let tree = boundary.tree_before.clone().with_context(|| {
+        format!(
+            "Attempt {} of {stage_id} has no workspace snapshot (not a Git repository, or Git failed)",
+            boundary.number
+        )
+    })?;
+    ensure!(
+        crate::snapshot::exists(project, &tree),
+        "Snapshot {tree} of {stage_id} is no longer in the repository (the run was cleaned or its refs removed)"
+    );
+    // Other stages that changed files before the checkpoint would rerun on
+    // top of their own changes.
+    for (i, state) in source.stages.iter().enumerate() {
+        if i == index || upstream.contains(&i) {
+            continue;
+        }
+        let changed = state.attempts.iter().any(|a| {
+            a.finished_at.is_some_and(|end| end <= boundary.started_at)
+                && a.tree_after.is_some()
+                && a.tree_after != a.tree_before
+        });
+        ensure!(
+            !changed,
+            "Stage {} is not upstream of {stage_id} but changed files before its checkpoint; fork from a stage that runs after it",
+            source.workflow.stages[i].name
+        );
+    }
+    let mut workflow = source.workflow.clone();
+    if let Some(model) = &model {
+        workflow.stages[index].model = model.clone();
+    }
+    let settings = Settings {
+        adapters: source.adapters.clone(),
+        providers: source.providers.clone(),
+        ..settings.clone()
+    };
+    let mut run = Run::create_at_from(
+        project,
+        &settings,
+        &workflow,
+        source.task.clone(),
+        Placement::WorktreeFromHead,
+        Some(&source),
+    )?;
+    run.fork_of = Some(engine::Fork {
+        run: source.id.clone(),
+        stage: stage_id.into(),
+        attempt: boundary.number,
+        snapshot: tree.clone(),
+        model,
+    });
+    if let Err(error) = crate::snapshot::materialize(&run.workspace, &tree) {
+        let message = format!(
+            "Could not reproduce the checkpoint in the fork's worktree {}: {error:#}",
+            run.workspace.display()
+        );
+        run.transition(engine::Transition::new(
+            crate::transitions::Target::Run,
+            Status::Failed,
+            crate::transitions::Actor::Engine,
+            message.clone(),
+        ))?;
+        run.error = Some(message.clone());
+        run.persist()?;
+        anyhow::bail!("{message}. The fork {} was saved as failed", run.id);
+    }
+    // Changes, and what `ship` commits, are measured from where the source
+    // run started, so the inherited upstream work is part of the fork's;
+    // the checkpoint when that snapshot is gone.
+    run.baseline = source
+        .baseline
+        .clone()
+        .filter(|tree| crate::snapshot::keep(&run.workspace, &run.id, tree))
+        .or_else(|| crate::snapshot::tree(&run.workspace, &run.directory));
+    for &i in &upstream {
+        let from = &source.stages[i];
+        if from.status != Status::Complete {
+            continue;
+        }
+        let state = &mut run.stages[i];
+        state.status = Status::Complete;
+        state.handoff = from.handoff.clone();
+        state.waiver = from.waiver.clone();
+        // A fork of a fork points at the original attempt.
+        state.inherited = from
+            .attempts
+            .last()
+            .map(|a| a.directory.clone())
+            .or_else(|| from.inherited.clone());
+    }
+    run.cursor = run
+        .stages
+        .iter()
+        .position(|s| !matches!(s.status, Status::Complete | Status::Skipped))
+        .unwrap_or(run.stages.len());
+    run.persist()?;
+    Ok(run)
+}
+
 /// One attempt in a comparison, with the handoff it saved.
 #[derive(Debug, Clone)]
 pub struct Side {
@@ -341,8 +509,8 @@ pub fn compare(run: &Run, stage: usize, a: usize, b: usize) -> Result<Comparison
 /// Compares a stage's last attempt in a rerun's source with its last in the rerun.
 pub fn compare_rerun(source: &Run, rerun: &Run, stage_id: &str) -> Result<Comparison> {
     ensure!(
-        rerun.rerun_of.as_deref() == Some(source.id.as_str()),
-        "Run {} is not a rerun of {}",
+        source_of(rerun) == Some(source.id.as_str()),
+        "Run {} is not a rerun or fork of {}",
         rerun.id,
         source.id
     );
@@ -369,6 +537,13 @@ pub fn compare_rerun(source: &Run, rerun: &Run, stage_id: &str) -> Result<Compar
         a: last(source, "source")?.1,
         b,
     })
+}
+
+/// The run a rerun or fork came from.
+pub fn source_of(run: &Run) -> Option<&str> {
+    run.rerun_of
+        .as_deref()
+        .or(run.fork_of.as_ref().map(|f| f.run.as_str()))
 }
 
 /// The stage with two or more attempts that ran most recently.

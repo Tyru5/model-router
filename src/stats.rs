@@ -23,7 +23,8 @@ use std::{
 pub const MIN_SAMPLES: usize = 5;
 /// How much higher a suggestion's clean-success rate must be.
 pub const MIN_GAIN: f64 = 0.15;
-const CACHE_VERSION: u32 = 1;
+// 2: samples record router-check verification and known cost.
+const CACHE_VERSION: u32 = 2;
 
 /// One stage of one saved run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -55,6 +56,15 @@ pub struct Sample {
     pub usage: Option<Usage>,
     pub checks_passed: u32,
     pub checks_total: u32,
+    /// For a stage with required router checks: whether it completed with
+    /// all of them passing in its last attempt (a failure before they ran
+    /// counts as false). None when the stage has no required router check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+    /// Estimated cost of every attempt (reported, else priced); None when
+    /// any attempt's cost is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 /// The samples of a run. Stages still running, and stages that never ran,
@@ -114,6 +124,7 @@ pub fn samples(run: &Run) -> Vec<Sample> {
                 && (requested[i] > 0 || run.stages[i].status == Status::Complete)
         })
     };
+    let pricing = crate::cost::Pricing::load(&run.project);
     let mut out = vec![];
     for (index, (stage, state)) in stages.iter().zip(&run.stages).enumerate() {
         let Some(last) = state.attempts.last() else {
@@ -159,6 +170,21 @@ pub fn samples(run: &Run) -> Vec<Sample> {
                 }
             }
         }
+        // A stage with required router checks is evidence either way: a pass
+        // needs it completed with every configured required check passing,
+        // so a failure before the checks ran counts against it.
+        let configured = stage.checks.iter().filter(|c| c.required).count();
+        let verified = (configured > 0).then(|| {
+            let required: Vec<_> = last.checks.iter().filter(|c| c.required).collect();
+            completed
+                && required.len() == configured
+                && required.iter().all(|c| c.status == TestStatus::Passed)
+        });
+        let cost_usd = state
+            .attempts
+            .iter()
+            .map(|a| crate::cost::attempt_estimate(run, index, a, &pricing).usd)
+            .sum::<Option<f64>>();
         let first_pass = match stage.role {
             Role::Review => state.attempts.first().map(|first| {
                 first.status == Status::Complete && !repairing.contains(&(index, first.number))
@@ -188,6 +214,8 @@ pub fn samples(run: &Run) -> Vec<Sample> {
             usage,
             checks_passed,
             checks_total,
+            verified,
+            cost_usd,
         });
     }
     out
@@ -299,6 +327,13 @@ pub struct Metrics {
     pub usage: Usage,
     pub checks_passed: u32,
     pub checks_total: u32,
+    /// Samples whose last attempt ran required router checks, and those
+    /// where all of them passed.
+    pub verified: usize,
+    pub verified_passed: usize,
+    /// Samples with a known cost, and their summed cost.
+    pub cost_known: usize,
+    pub cost_usd: f64,
 }
 impl Metrics {
     pub fn success_rate(&self) -> f64 {
@@ -498,6 +533,14 @@ pub fn aggregate(samples: &[Sample]) -> Vec<Metrics> {
         }
         m.checks_passed += s.checks_passed;
         m.checks_total += s.checks_total;
+        if let Some(pass) = s.verified {
+            m.verified += 1;
+            m.verified_passed += usize::from(pass);
+        }
+        if let Some(cost) = s.cost_usd {
+            m.cost_known += 1;
+            m.cost_usd += cost;
+        }
     }
     let mut metrics: Vec<_> = groups
         .into_iter()
@@ -579,6 +622,207 @@ pub fn suggest(stats: &Stats, role: Role, harness: &str, model: &str) -> Option<
         .next()
 }
 
+/// One assignment's cost-quality evidence: from `stats` metrics or a bench
+/// variant's cells.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Tradeoff {
+    /// "claude/opus", or a bench variant's label.
+    pub assignment: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<Role>,
+    pub samples: usize,
+    /// Samples with required router checks, and those where all passed.
+    pub verified: usize,
+    pub passed: usize,
+    /// Samples with a known cost, and their summed cost.
+    pub cost_known: usize,
+    pub cost_usd: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub median_seconds: Option<i64>,
+}
+impl Tradeoff {
+    /// Router-check pass rate over verified samples; None without any.
+    pub fn pass_rate(&self) -> Option<f64> {
+        (self.verified > 0).then(|| ratio(self.passed, self.verified))
+    }
+    /// Mean known cost per sample; None without any known.
+    pub fn mean_cost(&self) -> Option<f64> {
+        (self.cost_known > 0).then(|| self.cost_usd / self.cost_known as f64)
+    }
+}
+impl From<&Metrics> for Tradeoff {
+    fn from(m: &Metrics) -> Self {
+        Self {
+            assignment: m.assignment(),
+            role: Some(m.role),
+            samples: m.samples,
+            verified: m.verified,
+            passed: m.verified_passed,
+            cost_known: m.cost_known,
+            cost_usd: m.cost_usd,
+            median_seconds: m.median_seconds,
+        }
+    }
+}
+
+/// A shortlisted assignment and what weakens its evidence.
+#[derive(Debug, Clone, Serialize)]
+pub struct Pick {
+    #[serde(flatten)]
+    pub tradeoff: Tradeoff,
+    pub pass_rate: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mean_cost_usd: Option<f64>,
+    /// Fewer than `MIN_SAMPLES` verified samples: anecdotal, ranked last.
+    pub sparse: bool,
+    pub warnings: Vec<String>,
+}
+
+/// Advisory: assignments whose router-check pass rate meets `threshold`,
+/// cheapest known mean cost first, then fastest median; sparse evidence
+/// after well-sampled. Never changes a workflow.
+#[derive(Debug, Clone, Serialize)]
+pub struct Shortlist {
+    pub threshold: f64,
+    pub picks: Vec<Pick>,
+    /// Assignments left out, and why.
+    pub excluded: Vec<(String, String)>,
+}
+
+pub fn shortlist(rows: &[Tradeoff], threshold: f64) -> Shortlist {
+    let mut picks = vec![];
+    let mut excluded = vec![];
+    for row in rows {
+        let label = match row.role {
+            Some(role) => format!("{} {}", role.label(), row.assignment),
+            None => row.assignment.clone(),
+        };
+        let Some(rate) = row.pass_rate() else {
+            excluded.push((
+                label,
+                "no required router checks ran: no evidence, not ranked".into(),
+            ));
+            continue;
+        };
+        if rate < threshold {
+            excluded.push((
+                label,
+                format!(
+                    "router checks passed {}/{} ({}), below {}",
+                    row.passed,
+                    row.verified,
+                    percent(rate),
+                    percent(threshold)
+                ),
+            ));
+            continue;
+        }
+        let sparse = row.verified < MIN_SAMPLES;
+        let mut warnings = vec![];
+        if sparse {
+            warnings.push(format!(
+                "only {} verified sample(s): anecdotal, not proven",
+                row.verified
+            ));
+        }
+        if row.verified < row.samples {
+            warnings.push(format!(
+                "router checks ran in {} of {} samples; the rest are unverified",
+                row.verified, row.samples
+            ));
+        }
+        if row.cost_known < row.samples {
+            warnings.push(format!(
+                "cost known for {} of {} samples",
+                row.cost_known, row.samples
+            ));
+        }
+        picks.push(Pick {
+            pass_rate: rate,
+            mean_cost_usd: row.mean_cost(),
+            sparse,
+            warnings,
+            tradeoff: row.clone(),
+        });
+    }
+    picks.sort_by(|a, b| {
+        let role = |p: &Pick| {
+            p.tradeoff
+                .role
+                .and_then(|r| Role::ALL.iter().position(|x| *x == r))
+        };
+        role(a)
+            .cmp(&role(b))
+            .then(a.sparse.cmp(&b.sparse))
+            // Known costs first, cheapest first.
+            .then(match (a.mean_cost_usd, b.mean_cost_usd) {
+                (Some(x), Some(y)) => x.total_cmp(&y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+            .then(
+                match (a.tradeoff.median_seconds, b.tradeoff.median_seconds) {
+                    (Some(x), Some(y)) => x.cmp(&y),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                },
+            )
+            .then(b.pass_rate.total_cmp(&a.pass_rate))
+            .then(a.tradeoff.assignment.cmp(&b.tradeoff.assignment))
+    });
+    Shortlist {
+        threshold,
+        picks,
+        excluded,
+    }
+}
+
+impl Shortlist {
+    pub fn text(&self) -> String {
+        let mut text = format!(
+            "Shortlist: router-check pass rate ≥ {}, cheapest known cost then fastest\n",
+            percent(self.threshold)
+        );
+        if self.picks.is_empty() {
+            text.push_str("  No assignment meets the threshold.\n");
+        }
+        for (rank, pick) in self.picks.iter().enumerate() {
+            let t = &pick.tradeoff;
+            text.push_str(&format!(
+                "  {}. {}{} · checks {}/{} ({}) · {} · median {} · n={}{}\n",
+                rank + 1,
+                t.role
+                    .map_or_else(String::new, |r| format!("{} ", r.label())),
+                t.assignment,
+                t.passed,
+                t.verified,
+                percent(pick.pass_rate),
+                pick.mean_cost_usd
+                    .map_or("cost unknown".into(), |c| format!(
+                        "~{}/sample",
+                        report::dollars(c)
+                    )),
+                t.median_seconds.map_or("-".into(), report::duration),
+                t.samples,
+                if pick.sparse { " *" } else { "" }
+            ));
+            for warning in &pick.warnings {
+                text.push_str(&format!("       warning: {warning}\n"));
+            }
+        }
+        if !self.excluded.is_empty() {
+            text.push_str("  Not shortlisted:\n");
+            for (label, reason) in &self.excluded {
+                text.push_str(&format!("    {label}: {reason}\n"));
+            }
+        }
+        text.push_str("  Advisory only: the router never changes or substitutes a stage's model. A pass rate shows the configured required router checks passed, not that they are adequate; * marks sparse evidence.\n");
+        text
+    }
+}
+
 /// The project, and with `all` every recent project, without duplicates.
 pub fn projects(project: &Path, all: bool) -> Vec<PathBuf> {
     let mut list = vec![project.to_path_buf()];
@@ -616,6 +860,8 @@ mod tests {
             usage: None,
             checks_passed: 0,
             checks_total: 0,
+            verified: None,
+            cost_usd: None,
         }
     }
     fn stats(samples: &[Sample]) -> Stats {
@@ -675,6 +921,93 @@ mod tests {
         assert_eq!(
             suggest(&stats(&all), Role::Implementation, "codex", "gpt"),
             None
+        );
+    }
+
+    fn row(
+        name: &str,
+        samples: usize,
+        verified: usize,
+        passed: usize,
+        cost: Option<f64>,
+    ) -> Tradeoff {
+        Tradeoff {
+            assignment: name.into(),
+            role: Some(Role::Implementation),
+            samples,
+            verified,
+            passed,
+            cost_known: if cost.is_some() { samples } else { 0 },
+            cost_usd: cost.unwrap_or(0.0) * samples as f64,
+            median_seconds: Some(60),
+        }
+    }
+
+    #[test]
+    fn shortlist_ranks_by_known_cost_among_those_meeting_the_threshold() {
+        let rows = [
+            // Cheapest, but fails the threshold.
+            row("cheap/bad", 10, 10, 5, Some(0.10)),
+            row("pricey/good", 10, 10, 10, Some(2.00)),
+            row("mid/good", 10, 10, 9, Some(0.50)),
+            // Meets it but on sparse evidence: ranked after well-sampled picks.
+            row("tiny/lucky", 2, 2, 2, Some(0.01)),
+            // Never verified by router checks: excluded, however it ran.
+            row("unchecked", 20, 0, 0, Some(0.01)),
+            // Unknown cost ranks after known costs.
+            row("unpriced/good", 10, 10, 10, None),
+        ];
+        let list = shortlist(&rows, 0.8);
+        let order: Vec<_> = list
+            .picks
+            .iter()
+            .map(|p| p.tradeoff.assignment.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            ["mid/good", "pricey/good", "unpriced/good", "tiny/lucky"]
+        );
+        let tiny = &list.picks[3];
+        assert!(tiny.sparse && tiny.warnings[0].contains("anecdotal"));
+        assert!(
+            list.picks[2]
+                .warnings
+                .iter()
+                .any(|w| w == "cost known for 0 of 10 samples")
+        );
+        let excluded: Vec<_> = list
+            .excluded
+            .iter()
+            .map(|(l, r)| format!("{l}: {r}"))
+            .collect();
+        assert!(
+            excluded
+                .iter()
+                .any(|e| e.contains("cheap/bad") && e.contains("5/10 (50%), below 80%"))
+        );
+        assert!(
+            excluded
+                .iter()
+                .any(|e| e.contains("unchecked") && e.contains("no evidence"))
+        );
+        let text = list.text();
+        assert!(
+            text.contains("1. implementation mid/good · checks 9/10 (90%) · ~$0.50/sample"),
+            "{text}"
+        );
+        assert!(text.contains("never changes or substitutes"), "{text}");
+    }
+
+    #[test]
+    fn partially_verified_rows_warn_and_rate_only_verified_samples() {
+        let list = shortlist(&[row("half", 10, 5, 5, Some(1.0))], 1.0);
+        let pick = &list.picks[0];
+        assert_eq!(pick.pass_rate, 1.0);
+        assert!(!pick.sparse);
+        assert!(
+            pick.warnings
+                .iter()
+                .any(|w| w.contains("router checks ran in 5 of 10"))
         );
     }
 

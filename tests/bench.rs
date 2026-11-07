@@ -141,7 +141,11 @@ fn interactive_stages_are_refused_unless_allowed() {
 
 #[test]
 fn runs_every_cell_in_its_own_worktree_and_saves_a_summary() {
-    let (project, settings) = project();
+    let (project, mut settings) = project();
+    settings.workflows[0].stages[0].checks = vec![model_router::config::Check {
+        command: vec!["python3".into(), "-c".into(), "pass".into()],
+        ..Default::default()
+    }];
     let files = tempfile::tempdir().unwrap();
     fs::write(files.path().join("task.md"), "Do the thing").unwrap();
     let path = bench_file(files.path(), MATRIX);
@@ -199,6 +203,20 @@ fn runs_every_cell_in_its_own_worktree_and_saves_a_summary() {
     );
     assert!(table.contains("| implement=mock/fail | 0/2 |"), "{table}");
     assert!(table.contains("Simulated authentication"), "{table}");
+    // The shortlist ranks variants by router-check evidence.
+    let list = bench::shortlist(&results, 0.8);
+    assert_eq!(list.picks.len(), 1);
+    let pick = &list.picks[0];
+    assert_eq!(pick.tradeoff.assignment, "implement=mock/test-model");
+    assert_eq!((pick.tradeoff.passed, pick.tradeoff.verified), (2, 2));
+    assert!(pick.sparse && pick.mean_cost_usd.is_none());
+    // The failing harness never reached its checks: a failure, not a gap.
+    assert_eq!(list.excluded[0].0, "implement=mock/fail");
+    assert!(
+        list.excluded[0].1.contains("0/2 (0%), below 80%"),
+        "{:?}",
+        list.excluded
+    );
     // A second save in the same second never overwrites the first.
     let (again, _) = bench::save(project.path(), &results).unwrap();
     assert_ne!(again, json);
@@ -275,8 +293,20 @@ fn bench_command_dry_runs_and_runs() {
     assert!(text.contains("Dry run: nothing started."), "{text}");
     assert!(!project.path().join(".model-router/runs").exists());
 
-    let (ok, text) = cli(project.path(), &settings, &["bench", file, "--jobs", "1"]);
+    let (ok, text) = cli(
+        project.path(),
+        &settings,
+        &["bench", file, "--jobs", "1", "--min-pass", "0.5"],
+    );
     assert!(ok, "{text}");
+    assert!(
+        text.contains("Shortlist: router-check pass rate ≥ 50%"),
+        "{text}"
+    );
+    assert!(
+        text.contains("implement=mock/test-model: no required router checks ran"),
+        "{text}"
+    );
     assert!(
         text.contains("| implement=mock/test-model | 1/1 |"),
         "{text}"

@@ -460,3 +460,143 @@ fn cli_requires_explicit_advance_for_not_applicable_verification() {
     assert_eq!(run.stages[0].waiver.as_ref().unwrap().reason, "Docs only");
     assert_eq!(count(dir.path(), "handoff"), 1);
 }
+
+#[test]
+fn require_router_checks_ignores_model_reported_passes() {
+    // The model claims a passing required test; the router ran nothing.
+    let mut strict = verify(&["--test-status", "passed"]);
+    strict.require_router_checks = true;
+    let (dir, _, mut run) = fixture(vec![strict, stage("handoff", Role::Custom)]);
+    assert_eq!(drive(&mut run), Action::Stopped);
+    assert_eq!(run.status, Status::Blocked);
+    let error = run.error.as_deref().unwrap();
+    assert!(
+        error.contains("require_router_checks") && error.contains("model-reported passes"),
+        "{error}"
+    );
+    assert_eq!(count(dir.path(), "handoff"), 0);
+
+    // An actual required router pass satisfies it.
+    let mut strict = verify(&["--test-status", "passed"]);
+    strict.require_router_checks = true;
+    strict.checks = vec![python("pass", true)];
+    let (dir, _, mut run) = fixture(vec![strict, stage("handoff", Role::Custom)]);
+    assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+    assert_eq!(count(dir.path(), "handoff"), 1);
+
+    // An explicit not-applicable waiver still applies.
+    let mut strict = verify(&["--not-applicable", "Docs only"]);
+    strict.require_router_checks = true;
+    let (_dir, _, mut run) = fixture(vec![strict]);
+    assert_eq!(drive(&mut run), Action::Confirm);
+    assert_eq!(run.pending_waiver(), Some("Docs only"));
+}
+
+#[test]
+fn require_router_checks_is_for_test_stages_only() {
+    let mut implement = stage("implementation", Role::Implementation);
+    implement.require_router_checks = true;
+    let workflow = common::workflow(vec![implement]);
+    let error = common::settings(&workflow).validate().unwrap_err();
+    assert!(error.to_string().contains("Only test stages"), "{error}");
+}
+
+fn receipt(run: &engine::Run, stage: &str) -> model_router::report::Receipt {
+    model_router::report::receipts(run)
+        .into_iter()
+        .find(|r| r.stage == stage)
+        .unwrap()
+}
+
+#[test]
+fn receipts_bind_router_checks_to_the_tested_snapshot() {
+    use model_router::report::{Basis, Freshness};
+    let dir = common::tempdir();
+    if common::repository(dir.path()).is_none() {
+        return;
+    }
+    let mut implement = stage("implementation", Role::Implementation);
+    implement.extra_args = vec!["--write-file".into(), "made.txt".into()];
+    let mut checked = verify(&[]);
+    checked.checks = vec![python("pass", true)];
+    let claimed = Stage {
+        id: "claimed".into(),
+        name: "claimed".into(),
+        extra_args: vec!["--test-status".into(), "passed".into()],
+        ..stage("claimed", Role::Test)
+    };
+    let workflow = common::workflow(vec![implement, checked, claimed]);
+    let settings = common::settings(&workflow);
+    let mut run = common::create(dir.path(), &settings, &workflow);
+    assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+
+    let tested = run.stages[1].attempts[0].checks_tree.clone().unwrap();
+    let verified = receipt(&run, "verify");
+    assert_eq!(verified.basis, Basis::RouterChecks);
+    assert_eq!((verified.required_passed, verified.required_total), (1, 1));
+    assert_eq!(verified.snapshot.as_deref(), Some(tested.as_str()));
+    assert_eq!(verified.freshness, Some(Freshness::Current));
+    // A model claim with no router check is labelled, not trusted.
+    let claimed = receipt(&run, "claimed");
+    assert_eq!(claimed.basis, Basis::SelfReportedOnly);
+    assert_eq!(claimed.model_reported_passed, 1);
+    assert_eq!(claimed.freshness, None);
+    // The run's own implementation stage has no checks: no receipt.
+    assert!(
+        model_router::report::receipts(&run)
+            .iter()
+            .all(|r| r.stage != "implementation")
+    );
+
+    // Editing code after the checks makes the receipt stale, naming files.
+    let made = dir.path().join("made.txt");
+    let original = fs::read_to_string(&made).unwrap();
+    fs::write(&made, "edited later\n").unwrap();
+    match receipt(&run, "verify").freshness {
+        Some(Freshness::Stale { changed }) => assert_eq!(changed, ["made.txt"]),
+        other => panic!("expected stale, got {other:?}"),
+    }
+    let text = model_router::report::render_receipts(&model_router::report::receipts(&run));
+    assert!(
+        text.contains("stale: 1 file changed since the checks ran (made.txt)"),
+        "{text}"
+    );
+    assert!(text.contains("self-reported only"), "{text}");
+    assert!(text.contains("not that they are adequate"), "{text}");
+    // Freshness compares content, not time: reverting makes it current again.
+    fs::write(&made, original).unwrap();
+    assert_eq!(receipt(&run, "verify").freshness, Some(Freshness::Current));
+
+    // Once the run's snapshot refs are gone and Git prunes, it is unavailable.
+    model_router::snapshot::forget(dir.path(), &run.id);
+    let gc = Command::new("git")
+        .args(["gc", "-q", "--prune=now"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(gc.success());
+    match receipt(&run, "verify").freshness {
+        Some(Freshness::Unavailable { reason }) => {
+            assert!(reason.contains("no longer in the repository"), "{reason}")
+        }
+        other => panic!("expected unavailable, got {other:?}"),
+    }
+}
+
+#[test]
+fn receipts_outside_git_say_freshness_is_unavailable() {
+    use model_router::report::{Basis, Freshness};
+    let mut checked = verify(&[]);
+    checked.checks = vec![python("pass", true)];
+    let (_dir, _, mut run) = fixture(vec![checked]);
+    assert_eq!(drive(&mut run), Action::Complete);
+    let receipt = receipt(&run, "verify");
+    assert_eq!(receipt.basis, Basis::RouterChecks);
+    assert_eq!(receipt.snapshot, None);
+    assert_eq!(
+        receipt.freshness,
+        Some(Freshness::Unavailable {
+            reason: "not a Git repository".into()
+        })
+    );
+}

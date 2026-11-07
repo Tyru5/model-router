@@ -192,6 +192,11 @@ Plain text is accepted, labelled unstructured, except for review and test
 stages. Interactive review/test stages must write the handoff file. Reports
 show each handoff's source.
 
+Prior handoffs are bounded (14,000 bytes in total, at most 5,000 each): long
+strings and lists are cut, then whole fields omitted. `handoffs RUN_ID`
+shows exactly what a stage receives and warns when decisions, unresolved
+items, or findings were lost.
+
 ## Reviews and repairs
 
 Reviews are optional and start disabled. An enabled review needs `pass` or
@@ -236,6 +241,23 @@ checks = [
 - TUI **Router checks** field: one command per line, shell-quoted but never
   run by a shell; a leading `?` marks it optional. A line whose command and
   required flag are unchanged keeps its `timeout_seconds`; new lines get 600.
+
+### Requiring router checks
+
+`require_router_checks = true` on a test stage makes model-reported passes
+not count: the stage advances only when a required router check passed, or
+when you accept a `not_applicable` waiver. Without a required check (none
+configured, or checks ignored in an untrusted project) the stage blocks.
+Off by default.
+
+### Receipts and freshness
+
+The router snapshots the workspace (a Git tree) just before running a
+stage's checks and saves it as the attempt's `checks_tree`. `report` shows a
+receipt per checked stage: whether the code still matches that snapshot or
+has changed since (stale, with files). A receipt confirms execution against a
+snapshot, not test adequacy. Outside Git, freshness is unavailable. See
+[`report`](automation.md#report-id).
 
 ### Not applicable
 

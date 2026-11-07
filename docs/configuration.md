@@ -94,6 +94,7 @@ version = 2
 | `timeout_seconds` | `3600` | Attempt timeout. |
 | `repair_target` | `""` | Review only: implementation stage ID to repair. Empty = nearest enabled upstream. |
 | `checks` | `[]` | Router-run checks, below. Needs trust in a project config. |
+| `require_router_checks` | `false` | Test stages only: only a passing required router check (or an accepted waiver) satisfies the gate; model-reported passes do not. |
 | `sandbox` | unset | Overrides `sandbox_default` (same values). |
 | `sandbox_writable` | `[]` | Extra writable paths (absolute or `~/`). |
 | `sandbox_network` | `true` | `false` cuts the sandboxed harness off the network. |

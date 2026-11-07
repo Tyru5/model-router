@@ -113,9 +113,11 @@ model-router resume RUN_ID --retry           # --advance, --model ID, --interact
 model-router history --status failed,blocked
 model-router report RUN_ID --diff
 model-router rerun RUN_ID
+model-router fork RUN_ID --stage implement --model opus  # isolated, from a checkpoint
+model-router handoffs RUN_ID --stage review   # what a stage receives, and losses
 model-router ship RUN_ID --draft-pr
 model-router cost --since 7d
-model-router stats --role implementation
+model-router stats --role implementation --min-pass 0.8
 model-router bench examples/bench.toml --dry-run
 model-router init --preset bug-fix
 model-router validate

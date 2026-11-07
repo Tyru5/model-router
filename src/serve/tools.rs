@@ -526,6 +526,7 @@ fn get_report(server: &Server, a: RunArgs) -> Result<Value> {
     let summary = report::summary(&built);
     let mut value = serde_json::to_value(&built)?;
     value["changes"] = serde_json::to_value(report::changes(&run))?;
+    value["receipts"] = serde_json::to_value(report::receipts(&run))?;
     value["summary"] = json!(summary);
     value["artifacts"] = json!(run.directory);
     value["workspace"] = json!(run.workspace);

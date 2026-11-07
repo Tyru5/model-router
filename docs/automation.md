@@ -64,6 +64,38 @@ current template). The original is unchanged.
 | `--unattended` | Run every stage unattended. |
 | `--notify` | As for `run`. |
 
+### `fork ID --stage STAGE`
+
+New isolated run that continues a saved run from the checkpoint at the start
+of `STAGE`. The fork gets its own worktree (from `HEAD`, then set to the
+saved snapshot exactly), reuses the source's completed upstream handoffs
+without running them, and runs `STAGE` and everything after it. Unlike
+`resume --retry`, which keeps the files the last attempt changed, and
+`rerun`, which repeats the whole workflow, a fork starts from saved files.
+The source run, its workspace, and your checkout are unchanged. Nothing is
+merged or shipped: inspect the fork's worktree, then `ship` it yourself. The
+fork's changes, and what `ship` commits, are measured from where the source
+run started, so they include the inherited upstream work (from the
+checkpoint if the source's starting snapshot is gone).
+
+| Option | Meaning |
+| --- | --- |
+| `--model MODEL` | Run `STAGE` with this model (not for fan-out stages). Later stages keep theirs. |
+| `--unattended` | Run every stage unattended. |
+| `--no-run` | Create the fork and print its ID; start it with `resume`. |
+| `--notify` | As for `run`. |
+
+The checkpoint is `STAGE`'s first attempt that started after every upstream
+attempt finished, and its `tree_before` snapshot. The fork refuses, creating
+nothing, when: the stage never started; an upstream stage is not complete;
+an upstream stage ran again after every attempt of `STAGE` started (a review
+repair), so no snapshot matches the handoffs; a non-upstream stage changed
+files before the checkpoint; the run has no snapshot (not Git) or it was
+cleaned or pruned. If Git cannot reproduce the snapshot exactly (e.g.
+attribute filters), the fork is saved as failed and says why. `report`
+shows `Forked from:` and marks reused handoffs; `compare --source` compares
+across a fork.
+
 ### `ship ID`
 
 Commit a completed run's changes on a new branch after a preview, using the
@@ -100,6 +132,32 @@ for stopped runs too.
 | `--diff` | Print the patch of changes made during the run. |
 | `--transitions` | Include the status timeline (`transitions.jsonl`): every run, stage, and attempt change with time, cause (engine, user, recovery), and reason. |
 
+The text and `--json` reports include **verification receipts** (`receipts`)
+for each stage whose latest attempt ran router checks, and for each test
+stage: the basis (`router_checks`, `router_checks_failed`,
+`self_reported_only`, `waived`, `none`), required router checks passed, model-
+reported passing tests, the Git tree the checks ran against (`snapshot`), and
+`freshness`: `current` (the workspace still matches), `stale` with the changed
+files, or `unavailable` with a reason (not Git, no snapshot recorded, snapshot
+pruned, workspace gone). Freshness compares content, so reverting an edit
+makes it current again. A receipt confirms the configured checks ran against
+that snapshot; it says nothing about whether they are adequate.
+
+### `handoffs ID`
+
+What a stage receives of upstream handoffs, from the same code that builds
+its prompt: bytes sent of each handoff's budget (14,000 bytes in total, at
+most 5,000 each, nearest stage first), each field that was shortened or
+omitted with item counts, and warnings when decisions, unresolved items, or
+findings were lost. Upstream stages that contributed nothing are listed with
+why. Reads only; no model call.
+
+| Option | Meaning |
+| --- | --- |
+| `--stage STAGE` | Stage ID. Default: the run's current stage. |
+| `--prompt` | Also print the exact prompt the stage would receive now. |
+| `--json` | JSON, including the prompt. |
+
 ### `compare ID`
 
 Model, mode, status, exit code, duration, router checks, and handoff
@@ -109,7 +167,7 @@ differences between two attempts of a stage.
 | --- | --- |
 | `--stage STAGE` | Stage ID. Default: the stage retried most recently. |
 | `--attempts A B` | Attempt numbers. Default: the stage's last two. |
-| `--source` | Compare the stage's last attempt with the rerun source's last attempt. |
+| `--source` | Compare the stage's last attempt with the rerun or fork source's last attempt. |
 
 ### `clean`
 
@@ -147,6 +205,24 @@ records are counted and skipped. Cached in `.model-router/stats-cache.json`.
 | `--role ROLE` | `research`, `planning`, `implementation`, `review`, `test`, `summary`, `custom`. |
 | `--json` | JSON. |
 | `--all-projects` | Include every recent project. |
+| `--min-pass RATE` | Add a cost-quality shortlist (below). `RATE` is 0–1. |
+
+### Cost-quality shortlist
+
+`stats --min-pass 0.8` (and `bench --min-pass`) lists assignments that
+passed in at least that fraction of their verified samples, cheapest known
+mean cost per sample first, then fastest
+median duration. Each pick shows checks passed/verified, cost, median, and
+sample count. A sample is verified when its stage has required router
+checks, and passes when the stage completed with every one of them passing;
+a stage that failed before its checks ran counts as a failure. Warnings
+flag fewer than five verified samples (marked `*` and ranked after
+well-sampled picks), samples without router checks, and samples with
+unknown cost (unknown cost ranks after known). Assignments without required
+router checks are left out as having no evidence; model-reported tests
+never count. Advisory only: the
+router never changes or substitutes a stage's model. `--json` adds
+`shortlist`.
 
 The TUI's `I` shows the same table. When a role has an assignment with ≥ 5
 samples, a success rate 15 points higher, and no more repairs or retries, the
@@ -164,6 +240,7 @@ through the normal engine, and appears in history and stats.
 | `--jobs N` | Runs at a time (default 1). |
 | `--dry-run` | Show the matrix only. |
 | `--allow-interactive` | Run interactive stages unattended instead of refusing. |
+| `--min-pass RATE` | Add the [cost-quality shortlist](#cost-quality-shortlist) over variants (also appended to the `.md`). A cell is verified when the workflow has required router checks, and passes when the run completed with all of them passing. |
 
 ```toml
 workflow = "Feature development"   # default: the first

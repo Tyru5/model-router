@@ -160,6 +160,27 @@ enum Commands {
         #[arg(long)]
         notify: bool,
     },
+    /// Start an isolated run from a saved run's checkpoint at the start of a
+    /// stage, reusing its completed upstream handoffs. The original run and
+    /// workspace are unchanged; nothing is merged or shipped.
+    Fork {
+        id: String,
+        /// The stage to continue from.
+        #[arg(long)]
+        stage: String,
+        /// Run that stage with this model instead of the saved one.
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        unattended: bool,
+        /// Create the fork and print its ID without running it.
+        #[arg(long)]
+        no_run: bool,
+        /// Notify (bell/OSC, desktop, webhook per saved preferences) when the
+        /// run needs input, stops, or completes. Also MODEL_ROUTER_NOTIFY=1.
+        #[arg(long)]
+        notify: bool,
+    },
     /// Compare two attempts of a stage, or a rerun's stage with its source's.
     Compare {
         id: String,
@@ -172,6 +193,19 @@ enum Commands {
         /// Compare the stage's last attempt with the rerun source's last attempt.
         #[arg(long)]
         source: bool,
+    },
+    /// Show what a stage receives of upstream handoffs: which fields were
+    /// shortened or omitted, and lost decisions or findings. No model call.
+    Handoffs {
+        id: String,
+        /// Stage ID. Default: the run's current stage.
+        #[arg(long)]
+        stage: Option<String>,
+        /// Also print the exact prompt the stage would receive now.
+        #[arg(long, conflicts_with = "json")]
+        prompt: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Preview removing saved runs and their artifacts; --yes removes them.
     Clean {
@@ -220,6 +254,11 @@ enum Commands {
         /// Include every recent project, not only this one.
         #[arg(long)]
         all_projects: bool,
+        /// Add an advisory cost-quality shortlist: assignments whose
+        /// required router checks passed at least this fraction of the time
+        /// (0–1), cheapest known cost then fastest first.
+        #[arg(long, value_name = "RATE", value_parser = parse_rate)]
+        min_pass: Option<f64>,
     },
     /// Run tasks under a matrix of stage assignments, each unattended in its
     /// own Git worktree, and summarize the outcomes.
@@ -235,6 +274,10 @@ enum Commands {
         /// Run the workflow's interactive stages unattended instead of refusing.
         #[arg(long)]
         allow_interactive: bool,
+        /// Add an advisory shortlist of variants whose required router checks
+        /// passed at least this fraction of the time (0–1), cheapest first.
+        #[arg(long, value_name = "RATE", value_parser = parse_rate)]
+        min_pass: Option<f64>,
     },
     /// List model/mode selections without sending an inference request.
     Models { harness: String },
@@ -427,6 +470,7 @@ fn main_result() -> Result<()> {
             } else if json {
                 let mut value = serde_json::to_value(report::build(&run))?;
                 value["changes"] = serde_json::to_value(report::changes(&run))?;
+                value["receipts"] = serde_json::to_value(report::receipts(&run))?;
                 if let Some(timeline) = &timeline {
                     value["transitions"] = serde_json::to_value(timeline)?;
                 }
@@ -444,6 +488,7 @@ fn main_result() -> Result<()> {
                     "{}",
                     report::render(&report::build(&run), Some(&report::changes(&run)))
                 );
+                print_receipts(&run);
             }
         }
         Some(Commands::Preview { workflow, task }) => println!(
@@ -473,12 +518,14 @@ fn main_result() -> Result<()> {
             role,
             json,
             all_projects,
-        }) => stats_command(&project, role, json, all_projects)?,
+            min_pass,
+        }) => stats_command(&project, role, json, all_projects, min_pass)?,
         Some(Commands::Bench {
             file,
             jobs,
             dry_run,
             allow_interactive,
+            min_pass,
         }) => bench_command(
             &project,
             &settings,
@@ -488,6 +535,7 @@ fn main_result() -> Result<()> {
                 allow_interactive,
             },
             dry_run,
+            min_pass,
             &cancel,
         )?,
         Some(Commands::Harnesses { spec }) => harnesses_command(&settings, spec.as_deref())?,
@@ -740,6 +788,41 @@ fn main_result() -> Result<()> {
             );
             cli_drive(&mut run, &cancel, notify::cli_enabled(notify))?;
         }
+        Some(Commands::Fork {
+            id,
+            stage,
+            model,
+            unattended,
+            no_run,
+            notify,
+        }) => {
+            let mut run = history::fork(&project, &settings, &id, &stage, model)?;
+            if unattended {
+                for stage in &mut run.workflow.stages {
+                    stage.mode = Mode::Unattended;
+                }
+                run.persist()?;
+            }
+            let fork = run.fork_of.as_ref().expect("fork records its source");
+            println!(
+                "Run: {}\nFork of: {id} at stage {} (attempt {} snapshot {})\nWorktree: {}\nArtifacts: {}",
+                run.id,
+                fork.stage,
+                fork.attempt,
+                &fork.snapshot[..fork.snapshot.len().min(10)],
+                run.workspace.display(),
+                run.directory.display()
+            );
+            if no_run {
+                println!(
+                    "Not started. Run it with: model-router -C {} resume {}",
+                    shell_words::quote(&project.display().to_string()),
+                    run.id
+                );
+            } else {
+                cli_drive(&mut run, &cancel, notify::cli_enabled(notify))?;
+            }
+        }
         Some(Commands::Compare {
             id,
             stage,
@@ -763,7 +846,7 @@ fn main_result() -> Result<()> {
                     .context("No stage in this run has two attempts to compare")?,
             };
             let comparison = if source {
-                let origin = run.rerun_of.as_deref().context("This run is not a rerun")?;
+                let origin = history::source_of(&run).context("This run is not a rerun or fork")?;
                 let origin = engine::load(&project, origin)?;
                 history::compare_rerun(&origin, &run, &run.workflow.stages[index].id)?
             } else {
@@ -783,6 +866,23 @@ fn main_result() -> Result<()> {
                 history::compare(&run, index, a, b)?
             };
             print!("{}", comparison.text());
+        }
+        Some(Commands::Handoffs {
+            id,
+            stage,
+            prompt,
+            json,
+        }) => {
+            let run = engine::load(&project, &id)?;
+            let inspection = engine::inspect_handoffs(&run, stage.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&inspection)?);
+            } else {
+                print!("{}", inspection.text());
+                if prompt {
+                    println!("\n----- prompt -----\n{}", inspection.prompt);
+                }
+            }
         }
         Some(Commands::Clean {
             older_than,
@@ -859,6 +959,14 @@ fn ship_command(project: &Path, id: &str, push: bool, draft_pr: bool, yes: bool)
     Ok(())
 }
 
+/// The run's verification receipts, after a blank line; nothing without any.
+fn print_receipts(run: &Run) {
+    let text = model_router::report::render_receipts(&model_router::report::receipts(run));
+    if !text.is_empty() {
+        print!("\n{text}");
+    }
+}
+
 fn parse_role(text: &str) -> std::result::Result<Role, String> {
     Role::ALL
         .into_iter()
@@ -869,9 +977,33 @@ fn parse_role(text: &str) -> std::result::Result<Role, String> {
         })
 }
 
-fn stats_command(project: &Path, role: Option<Role>, json: bool, all: bool) -> Result<()> {
+fn parse_rate(text: &str) -> std::result::Result<f64, String> {
+    let rate: f64 = text.parse().map_err(|_| "expected a number".to_owned())?;
+    if (0.0..=1.0).contains(&rate) {
+        Ok(rate)
+    } else {
+        Err("expected a fraction from 0 to 1, e.g. 0.8".into())
+    }
+}
+
+fn stats_command(
+    project: &Path,
+    role: Option<Role>,
+    json: bool,
+    all: bool,
+    min_pass: Option<f64>,
+) -> Result<()> {
     use model_router::stats::{self, Stats};
     let stats = Stats::collect(&stats::projects(project, all));
+    let shortlist = min_pass.map(|threshold| {
+        let rows: Vec<stats::Tradeoff> = stats
+            .metrics
+            .iter()
+            .filter(|m| role.is_none_or(|r| m.role == r))
+            .map(stats::Tradeoff::from)
+            .collect();
+        stats::shortlist(&rows, threshold)
+    });
     if json {
         let mut value = serde_json::to_value(&stats)?;
         if let Some(role) = role {
@@ -883,9 +1015,15 @@ fn stats_command(project: &Path, role: Option<Role>, json: bool, all: bool) -> R
                     .collect::<Vec<_>>(),
             )?;
         }
+        if let Some(shortlist) = &shortlist {
+            value["shortlist"] = serde_json::to_value(shortlist)?;
+        }
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         print!("{}", stats.table(role));
+        if let Some(shortlist) = &shortlist {
+            print!("\n{}", shortlist.text());
+        }
     }
     Ok(())
 }
@@ -896,6 +1034,7 @@ fn bench_command(
     file: &Path,
     options: &model_router::bench::Options,
     dry_run: bool,
+    min_pass: Option<f64>,
     cancel: &AtomicBool,
 ) -> Result<()> {
     use model_router::bench;
@@ -911,6 +1050,12 @@ fn bench_command(
     })?;
     let (json, markdown) = bench::save(project, &results)?;
     println!("{}", bench::markdown(&results));
+    if let Some(threshold) = min_pass {
+        let text = bench::shortlist(&results, threshold).text();
+        println!("{text}");
+        let mut file = std::fs::OpenOptions::new().append(true).open(&markdown)?;
+        write!(file, "\n```text\n{text}```\n")?;
+    }
     println!("Saved {}\nSaved {}", json.display(), markdown.display());
     ensure!(
         !cancel.load(Ordering::Relaxed),
@@ -1048,6 +1193,7 @@ fn cli_drive(run: &mut Run, cancel: &AtomicBool, notify: bool) -> Result<()> {
                     "\n{}",
                     report::render(&report::build(run), Some(&report::changes(run)))
                 );
+                print_receipts(run);
                 return Ok(());
             }
             Action::Stopped => {

@@ -9,6 +9,17 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Added
 
+- Verification receipts: router checks record the Git tree they tested;
+  `report` (text and JSON) shows whether the workspace still matches it or
+  has changed since, and separates router passes from self-reported ones.
+  Opt-in `require_router_checks` for test stages.
+- `handoffs RUN_ID`: what a stage receives of upstream handoffs, which
+  fields were shortened or omitted, and lost decisions or findings.
+- `fork RUN_ID --stage STAGE [--model M]`: an isolated run from a stage's
+  saved snapshot, reusing completed upstream handoffs.
+- `stats --min-pass` and `bench --min-pass`: an advisory cost-quality
+  shortlist of assignments meeting a router-check pass rate.
+
 - Release builds for Linux (x86_64/aarch64, static musl) and macOS
   (x86_64/aarch64) via cargo-dist, with a shell installer, Homebrew formula,
   checksums, and an `mr` alias; `scripts/build.sh` and `just` recipes.

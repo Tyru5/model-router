@@ -911,6 +911,7 @@ pub fn execute(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
         checks: vec![],
         tree_before: tree.clone(),
         tree_after: tree,
+        checks_tree: None,
         usage: None,
         session: None,
         process_group: None,

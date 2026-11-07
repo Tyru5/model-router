@@ -344,6 +344,13 @@ pub struct CellResult {
     pub retries: usize,
     pub seconds: i64,
     pub usage: Usage,
+    /// When the workflow configures required router checks: whether the run
+    /// completed with every one passing. None when it configures none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+    /// Estimated cost of the run; None when any attempt's cost is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -364,6 +371,8 @@ impl CellResult {
             retries: 0,
             seconds: 0,
             usage: Usage::default(),
+            verified: None,
+            cost_usd: None,
             error,
         }
     }
@@ -371,8 +380,14 @@ impl CellResult {
         let summary = report::build(run);
         // Router checks and model-reported tests of each stage's final attempt.
         let (mut passed, mut total) = (0, 0);
+        let mut all_required_passed = true;
         for state in &run.stages {
             if let Some(attempt) = state.attempts.last() {
+                all_required_passed &= attempt
+                    .checks
+                    .iter()
+                    .filter(|c| c.required)
+                    .all(|c| c.status == TestStatus::Passed);
                 total += attempt.checks.len();
                 passed += attempt
                     .checks
@@ -381,6 +396,15 @@ impl CellResult {
                     .count();
             }
         }
+        // Evidence when the workflow configures a required router check; a
+        // pass needs the run to complete with every required check passing,
+        // so a stage that failed before its checks counts against it.
+        let configured = run
+            .workflow
+            .stages
+            .iter()
+            .any(|s| s.enabled && s.checks.iter().any(|c| c.required));
+        let verified = configured.then_some(run.status == Status::Complete && all_required_passed);
         Self {
             run: Some(run.id.clone()),
             workspace: Some(run.workspace.clone()),
@@ -392,6 +416,8 @@ impl CellResult {
             retries: summary.retries,
             seconds: summary.wall_seconds,
             usage: summary.usage.sum,
+            verified,
+            cost_usd: (summary.usage.cost.unknown == 0).then_some(summary.usage.cost.usd),
             error: run.error.as_deref().map(crate::history::excerpt),
             ..Self::new(cell, variant, "", None)
         }
@@ -633,6 +659,40 @@ pub fn markdown(results: &Results) -> String {
         }
     }
     text
+}
+
+/// The advisory cost-quality shortlist over variants: those whose cells'
+/// required router checks all passed at least `threshold` of the time.
+/// Cells that never started count as samples without evidence.
+pub fn shortlist(results: &Results, threshold: f64) -> crate::stats::Shortlist {
+    let rows: Vec<_> = results
+        .variants
+        .iter()
+        .map(|variant| {
+            let cells: Vec<_> = results
+                .results
+                .iter()
+                .filter(|r| r.variant == variant.label)
+                .collect();
+            let mut durations: Vec<_> = cells
+                .iter()
+                .filter(|r| r.run.is_some())
+                .map(|r| r.seconds)
+                .collect();
+            durations.sort_unstable();
+            crate::stats::Tradeoff {
+                assignment: variant.label.clone(),
+                role: None,
+                samples: cells.len(),
+                verified: cells.iter().filter(|r| r.verified.is_some()).count(),
+                passed: cells.iter().filter(|r| r.verified == Some(true)).count(),
+                cost_known: cells.iter().filter(|r| r.cost_usd.is_some()).count(),
+                cost_usd: cells.iter().filter_map(|r| r.cost_usd).sum(),
+                median_seconds: crate::stats::median(&durations),
+            }
+        })
+        .collect();
+    crate::stats::shortlist(&rows, threshold)
 }
 
 fn tokens(usage: &Usage) -> String {

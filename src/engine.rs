@@ -180,6 +180,11 @@ pub struct Attempt {
     pub tree_before: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tree_after: Option<String>,
+    /// The workspace Git tree the router's checks ran against, taken just
+    /// before they started: what `checks` are a receipt for. None without
+    /// checks, outside Git, or in runs saved before receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks_tree: Option<String>,
     /// Tokens and cost the harness reported; None when it reported none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<handoff::Usage>,
@@ -212,6 +217,10 @@ pub struct StageState {
     /// A fan-out stage's candidates and choice; None for other stages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fan_out: Option<FanOutState>,
+    /// In a fork, the source run's attempt directory whose handoff this
+    /// stage reused without running; see `history::fork`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited: Option<PathBuf>,
 }
 
 /// One round of a best-of-N stage: where candidates started, each
@@ -301,6 +310,9 @@ pub struct Run {
     /// The saved run this one reran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerun_of: Option<String>,
+    /// The saved run and stage checkpoint this run was forked from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_of: Option<Fork>,
     pub workflow: Workflow,
     pub adapters: BTreeMap<String, CustomAdapter>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -336,6 +348,19 @@ pub struct Run {
     /// The fan-out candidate whose prompt `prompt` renders.
     #[serde(skip)]
     view: Option<usize>,
+}
+
+/// Where a fork started: the source run, the stage it continues from, that
+/// stage's attempt whose starting snapshot it reproduces, and the snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fork {
+    pub run: String,
+    pub stage: String,
+    pub attempt: usize,
+    pub snapshot: String,
+    /// The continuation's model, when it replaced the stage's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Run-level outcomes deferred while several stages run; see `Run::settle`.
@@ -527,6 +552,7 @@ impl Run {
             worktree,
             task,
             rerun_of: None,
+            fork_of: None,
             workflow: workflow.clone(),
             adapters: settings.adapters.clone(),
             providers: settings.providers.clone(),
@@ -543,6 +569,7 @@ impl Run {
                     handoff: None,
                     waiver: None,
                     fan_out: None,
+                    inherited: None,
                 })
                 .collect(),
             orphan_groups: vec![],
@@ -843,6 +870,7 @@ impl Run {
             let state = &mut self.stages[i];
             state.handoff = None;
             state.waiver = None;
+            state.inherited = None;
         }
         // A graph's dependents may come earlier in the list.
         if self.graph() {
@@ -857,6 +885,7 @@ impl Run {
                 let state = &mut self.stages[i];
                 state.handoff = None;
                 state.waiver = None;
+                state.inherited = None;
             }
         }
         Ok(())
@@ -1134,16 +1163,24 @@ impl Run {
             {
                 return Ok(Decision::Block("Test stage reports incomplete verification; inspect its findings and required checks before retrying".into()));
             }
-            if handoff.has_passing_required_check()
-                || checks
-                    .iter()
-                    .any(|c| c.required && c.status == TestStatus::Passed)
-                || state.waiver.is_some()
-            {
+            let router_pass = checks
+                .iter()
+                .any(|c| c.required && c.status == TestStatus::Passed);
+            // `require_router_checks`: the model's own report is not evidence.
+            let model_pass = !stage.require_router_checks && handoff.has_passing_required_check();
+            if router_pass || model_pass || state.waiver.is_some() {
                 return Ok(Decision::Advance);
             }
             return Ok(match handoff.not_applicable_reason() {
                 Some(_) => Decision::AwaitWaiver,
+                None if stage.require_router_checks => Decision::Block(format!(
+                    "Test stage requires a passing required router check (require_router_checks); {}. Add or fix the stage's required checks and retry, or have it report not_applicable with a reason, which requires your explicit acceptance",
+                    if handoff.has_passing_required_check() {
+                        "model-reported passes do not count"
+                    } else {
+                        "none passed"
+                    }
+                )),
                 None => Decision::Block("Test stage reported no passing required check. Retry it with evidence, or have it report not_applicable with a reason, which requires your explicit acceptance".into()),
             });
         }
@@ -1350,6 +1387,12 @@ pub fn history(project: &Path) -> Result<Vec<Run>> {
 }
 
 pub fn prompt(run: &Run, handoff_path: &Path, schema_path: &Path) -> String {
+    prompt_parts(run, handoff_path, schema_path).0
+}
+
+/// The prompt, and what it carried of each upstream handoff. The handoff
+/// inspector reads the second part, so it reports exactly what `prompt` sends.
+fn prompt_parts(run: &Run, handoff_path: &Path, schema_path: &Path) -> (String, Vec<HandoffView>) {
     let stage = &run.workflow.stages[run.cursor];
     let mut text = format!(
         "You are completing stage {:?} (role: {}) in a multi-stage workflow.\n\nORIGINAL USER TASK\n{}\n\nSTAGE INSTRUCTIONS\n{}\n\nWORKING DIRECTORY\n{}\n\nFollow the project's own instructions. Do not commit, merge, or push unless the original task explicitly requests it. Do not change router configuration, run state, or other stages' artifacts.\n",
@@ -1359,7 +1402,8 @@ pub fn prompt(run: &Run, handoff_path: &Path, schema_path: &Path) -> String {
         stage.instructions,
         run.workspace.display()
     );
-    let mut remaining = 14000;
+    let mut views = vec![];
+    let mut remaining = PRIOR_BUDGET;
     // Stages this one runs after; in a list, every earlier stage.
     let order = run.order();
     for (index, state) in run
@@ -1369,27 +1413,43 @@ pub fn prompt(run: &Run, handoff_path: &Path, schema_path: &Path) -> String {
         .rev()
         .filter(|(index, _)| order.precedes(*index, run.cursor))
     {
-        if state.status == Status::Complete {
-            if let Some(handoff) = &state.handoff {
-                let directory = state
-                    .attempts
-                    .last()
-                    .map(|a| a.directory.clone())
-                    .unwrap_or_default();
-                let excerpt = handoff_excerpt(
-                    handoff,
-                    remaining.min(5000),
-                    &directory.join("handoff.json"),
-                );
-                remaining = remaining.saturating_sub(excerpt.len());
-                text.push_str(&format!(
-                    "\nPRIOR STAGE: {}\n{}\nFull artifacts: {}\n",
-                    run.workflow.stages[index].name,
-                    excerpt,
-                    directory.display()
+        let name = run.workflow.stages[index].name.clone();
+        let handoff = match (&state.handoff, state.status) {
+            (Some(handoff), Status::Complete) => handoff,
+            (_, status) => {
+                views.push(HandoffView::missing(
+                    name,
+                    if status == Status::Complete {
+                        "complete without a handoff".into()
+                    } else {
+                        format!("not complete ({})", status.label())
+                    },
                 ));
+                continue;
             }
-        }
+        };
+        let directory = state
+            .attempts
+            .last()
+            .map(|a| a.directory.clone())
+            .or_else(|| state.inherited.clone())
+            .unwrap_or_default();
+        let budget = remaining.min(PRIOR_EACH);
+        let (excerpt, sent) = handoff_excerpt(handoff, budget, &directory.join("handoff.json"));
+        remaining = remaining.saturating_sub(excerpt.len());
+        views.push(HandoffView::compare(
+            name.clone(),
+            handoff,
+            &sent,
+            budget,
+            excerpt.len(),
+        ));
+        text.push_str(&format!(
+            "\nPRIOR STAGE: {}\n{}\nFull artifacts: {}\n",
+            name,
+            excerpt,
+            directory.display()
+        ));
     }
     // Only the repaired stages and the review that asked see its request.
     let feedback = run.repair_feedback.as_ref().filter(|_| {
@@ -1418,21 +1478,256 @@ pub fn prompt(run: &Run, handoff_path: &Path, schema_path: &Path) -> String {
     }
     text.push_str(&fan_out_context(run));
     text.push_str(&handoff::contract(stage.role, handoff_path, schema_path));
-    text
+    (text, views)
+}
+
+/// Bytes of prior handoffs one prompt carries in total, and per handoff.
+pub const PRIOR_BUDGET: usize = 14000;
+pub const PRIOR_EACH: usize = 5000;
+
+/// How much of one handoff field reached the downstream prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kept {
+    Whole,
+    /// Strings cut or list items dropped.
+    Shortened,
+    /// Replaced by "omitted".
+    Omitted,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FieldView {
+    pub field: String,
+    pub kept: Kept,
+    /// List items in the handoff and in the prompt; None for non-lists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<(usize, usize)>,
+}
+
+/// What a downstream stage receives of one upstream handoff.
+#[derive(Debug, Clone, Serialize)]
+pub struct HandoffView {
+    pub stage: String,
+    /// False when the stage contributed no handoff; see `reason`.
+    pub sent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Bytes allowed for this handoff and bytes sent.
+    pub budget: usize,
+    pub bytes: usize,
+    /// Fields that differ from the saved handoff; whole ones are left out.
+    pub fields: Vec<FieldView>,
+    /// Lost decisions, unresolved items, or findings.
+    pub warnings: Vec<String>,
+}
+impl HandoffView {
+    fn missing(stage: String, reason: String) -> Self {
+        Self {
+            stage,
+            sent: false,
+            reason: Some(reason),
+            budget: 0,
+            bytes: 0,
+            fields: vec![],
+            warnings: vec![],
+        }
+    }
+    fn compare(
+        stage: String,
+        handoff: &Handoff,
+        sent: &serde_json::Value,
+        budget: usize,
+        bytes: usize,
+    ) -> Self {
+        use serde_json::Value;
+        let original = serde_json::to_value(handoff).unwrap_or(Value::Null);
+        let mut fields = vec![];
+        let mut warnings = vec![];
+        for (key, value) in original.as_object().into_iter().flatten() {
+            let after = &sent[key.as_str()];
+            if after == value {
+                continue;
+            }
+            let omitted = after.as_str() == Some("omitted") && value.as_str() != Some("omitted");
+            let kept = if omitted {
+                Kept::Omitted
+            } else {
+                Kept::Shortened
+            };
+            let items = value.as_array().map(|list| {
+                // `shorten` appends "… N more" after the items it kept.
+                let after = after.as_array().map_or(&[][..], Vec::as_slice);
+                let dropped = after
+                    .last()
+                    .and_then(Value::as_str)
+                    .and_then(|t| t.strip_prefix("… ")?.strip_suffix(" more")?.parse().ok())
+                    .filter(|n: &usize| after.len() - 1 + n == list.len());
+                let shown = if dropped.is_some() {
+                    after.len() - 1
+                } else {
+                    after.len()
+                };
+                (list.len(), shown)
+            });
+            let lost = match (kept, items) {
+                (Kept::Omitted, Some((n, _))) => format!("all {n} omitted"),
+                (_, Some((n, shown))) if shown < n => format!("{} of {n} dropped", n - shown),
+                _ => "text shortened".into(),
+            };
+            match key.as_str() {
+                "decisions" => warnings.push(format!("decisions lost: {lost}")),
+                "unresolved" => warnings.push(format!("unresolved items lost: {lost}")),
+                "findings" => {
+                    let blocking = handoff
+                        .findings
+                        .iter()
+                        .filter(|f| f.severity == handoff::Severity::Blocking)
+                        .count();
+                    warnings.push(format!(
+                        "findings lost: {lost}{}",
+                        if blocking > 0 {
+                            format!(" ({blocking} blocking in the handoff)")
+                        } else {
+                            String::new()
+                        }
+                    ));
+                }
+                _ => {}
+            }
+            fields.push(FieldView {
+                field: key.clone(),
+                kept,
+                items,
+            });
+        }
+        Self {
+            stage,
+            sent: true,
+            reason: None,
+            budget,
+            bytes,
+            fields,
+            warnings,
+        }
+    }
+}
+
+/// What stage `index` would receive if it started now: its exact prompt and
+/// what each upstream handoff lost on the way. Reads only; no model call.
+#[derive(Debug, Clone, Serialize)]
+pub struct Inspection {
+    pub stage: String,
+    pub handoffs: Vec<HandoffView>,
+    pub prompt: String,
+}
+
+pub fn inspect_handoffs(run: &Run, stage_id: Option<&str>) -> Result<Inspection> {
+    let index = match stage_id {
+        Some(id) => run
+            .workflow
+            .stages
+            .iter()
+            .position(|s| s.id == id)
+            .with_context(|| format!("Run {} has no stage {id}", run.id))?,
+        None => {
+            ensure!(
+                run.cursor < run.stages.len(),
+                "This run is complete; name a stage with --stage"
+            );
+            run.cursor
+        }
+    };
+    let mut view = run.clone();
+    view.cursor = index;
+    view.view = None;
+    let stage = &run.workflow.stages[index];
+    // The paths the next attempt would get; nothing is created.
+    let number = run.stages[index].attempts.len() + 1;
+    let handoff = run
+        .workspace
+        .join(".model-router/handoffs")
+        .join(&run.id)
+        .join(format!("{}-{number:03}.json", stage.id));
+    let schema = run
+        .directory
+        .join(format!("{:02}-{}", index + 1, stage.id))
+        .join(format!("attempt-{number:03}"))
+        .join(handoff::SCHEMA_FILE);
+    let (prompt, handoffs) = prompt_parts(&view, &handoff, &schema);
+    Ok(Inspection {
+        stage: stage.name.clone(),
+        handoffs,
+        prompt,
+    })
+}
+
+impl Inspection {
+    pub fn text(&self) -> String {
+        let mut out = format!("Handoffs into {}:\n", self.stage);
+        if self.handoffs.is_empty() {
+            out.push_str("  none: no upstream stage\n");
+        }
+        for view in &self.handoffs {
+            if !view.sent {
+                out.push_str(&format!(
+                    "  - {}: not sent ({})\n",
+                    view.stage,
+                    view.reason.as_deref().unwrap_or("")
+                ));
+                continue;
+            }
+            out.push_str(&format!(
+                "  {} {}: {} of {} bytes{}\n",
+                if view.warnings.is_empty() { "✓" } else { "!" },
+                view.stage,
+                view.bytes,
+                view.budget,
+                if view.fields.is_empty() {
+                    ", whole"
+                } else {
+                    ""
+                }
+            ));
+            for field in &view.fields {
+                out.push_str(&format!(
+                    "      {} {}{}\n",
+                    match field.kept {
+                        Kept::Whole => "whole",
+                        Kept::Shortened => "shortened",
+                        Kept::Omitted => "omitted",
+                    },
+                    field.field,
+                    field
+                        .items
+                        .map(|(n, shown)| format!(" ({shown} of {n} items)"))
+                        .unwrap_or_default()
+                ));
+            }
+            for warning in &view.warnings {
+                out.push_str(&format!("      warning: {warning}\n"));
+            }
+        }
+        out.push_str(&format!(
+            "Budget: {PRIOR_BUDGET} bytes of prior handoffs, at most {PRIOR_EACH} each, nearest stage first. Full handoffs stay in each attempt's handoff.json.\n"
+        ));
+        out
+    }
 }
 
 /// A handoff as pretty JSON of at most about `max` bytes that stays valid
 /// JSON: long strings are shortened and long lists cut, then whole fields
 /// dropped, least important first, rather than cutting the text mid-object.
-fn handoff_excerpt(handoff: &Handoff, max: usize, full: &Path) -> String {
+/// Also returns the JSON value as sent.
+fn handoff_excerpt(handoff: &Handoff, max: usize, full: &Path) -> (String, serde_json::Value) {
     let Ok(mut value) = serde_json::to_value(handoff) else {
-        return String::new();
+        return (String::new(), serde_json::Value::Null);
     };
     let render =
         |value: &serde_json::Value| serde_json::to_string_pretty(value).unwrap_or_default();
     let mut json = render(&value);
     if json.len() <= max {
-        return json;
+        return (json, value);
     }
     for (chars, items) in [(1000, 40), (400, 20), (160, 10), (60, 5)] {
         shorten(&mut value, chars, items);
@@ -1458,7 +1753,10 @@ fn handoff_excerpt(handoff: &Handoff, max: usize, full: &Path) -> String {
             json = render(&value);
         }
     }
-    format!("{json}\n[truncated; full artifact at {}]", full.display())
+    (
+        format!("{json}\n[truncated; full artifact at {}]", full.display()),
+        value,
+    )
 }
 
 /// Cuts every string to `chars` characters and every list to `items` items,
@@ -1582,6 +1880,7 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
         checks: vec![],
         tree_before: snapshot::tree(&run.workspace, &run.directory),
         tree_after: None,
+        checks_tree: None,
         usage: None,
         session,
         process_group: None,
@@ -1854,6 +2153,11 @@ fn run_checks(
         return Ok(true);
     }
     let workspace = run.workspace.clone();
+    // The receipt: exactly what the checks are about to test.
+    let tested = snapshot::tree(&workspace, &run.directory);
+    if let Some(attempt) = run.stages[index].attempts.last_mut() {
+        attempt.checks_tree = tested;
+    }
     let (results, cancelled) = checks::run(
         &configured,
         &workspace,
@@ -2133,6 +2437,7 @@ impl Run {
             checks: vec![],
             tree_before: Some(base),
             tree_after: None,
+            checks_tree: None,
             usage: None,
             session: None,
             process_group: None,
@@ -2247,6 +2552,7 @@ impl Run {
             checks: vec![],
             tree_before: Some(base),
             tree_after: None,
+            checks_tree: None,
             usage: None,
             session,
             process_group: None,
@@ -3739,7 +4045,7 @@ mod tests {
         }))
         .unwrap();
         let full = Path::new("/runs/x/handoff.json");
-        let excerpt = handoff_excerpt(&handoff, 5000, full);
+        let (excerpt, _) = handoff_excerpt(&handoff, 5000, full);
         let (json, note) = excerpt.rsplit_once('\n').unwrap();
         assert_eq!(note, "[truncated; full artifact at /runs/x/handoff.json]");
         assert!(json.len() <= 5000, "{}", json.len());
@@ -3749,7 +4055,7 @@ mod tests {
         // A small handoff is shown whole, without a note.
         let small: Handoff =
             serde_json::from_str(r#"{"summary":"Done","verdict":"complete"}"#).unwrap();
-        let whole = handoff_excerpt(&small, 5000, full);
+        let (whole, _) = handoff_excerpt(&small, 5000, full);
         assert!(serde_json::from_str::<serde_json::Value>(&whole).is_ok());
     }
 
