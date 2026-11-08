@@ -915,6 +915,7 @@ pub fn execute(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
         usage: None,
         session: None,
         process_group: None,
+        terminal: None,
         handoff_source: None,
         worktree: None,
     });

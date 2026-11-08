@@ -33,8 +33,9 @@ Execute a workflow and persist its state and artifacts.
 
 Use one of `--task`, `--task-file`, `--task-url`. An untrusted project config
 is refused ([trust](safety.md#project-trust)). Interactive stages open their
-native terminal; `Ctrl+B` detaches to a waiting view (`t` reattach, `c`/`q`
-stop). Checkpoints prompt at the terminal (`a` accepts).
+native terminal; `Ctrl+B` detaches to a waiting view (`t` reattach, `d` leave
+it running in the background and exit, `c`/`q` stop). `resume ID` reattaches
+to a stage left running. Checkpoints prompt at the terminal (`a` accepts).
 
 ### `resume ID`
 

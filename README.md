@@ -47,6 +47,7 @@ cd /path/to/project && mr
 3. Check the stages; `e` edits one, `m` picks its model, `Space` toggles it.
 4. `r` runs. The Monitor (`2`) shows live output.
 5. Interactive stages open the harness's terminal; exit it, then `a` advances.
+   `Ctrl+B` detaches; quitting `mr` can leave it running for the next `mr`.
 6. Read the review summary; `d` opens the diff.
 
 The default workflow:

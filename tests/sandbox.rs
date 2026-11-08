@@ -172,6 +172,8 @@ fn interactive_harnesses_keep_their_terminal_inside_the_sandbox() {
         files: vec![],
         assign: None,
     };
+    // This test binary cannot act as the terminal host; the router can.
+    process::host::use_program(env!("CARGO_BIN_EXE_model-router").into());
     let session = InteractiveSession::new(100, 30);
     let cancel = AtomicBool::new(false);
     let outcome = thread::scope(|scope| {
@@ -191,7 +193,8 @@ fn interactive_harnesses_keep_their_terminal_inside_the_sandbox() {
             &cancel,
             &session,
             Some(&plan),
-            |_| {},
+            &[],
+            |_, _| {},
         )
         .unwrap()
     });

@@ -234,18 +234,20 @@ impl App {
         ensure!(slot.worker.is_none(), "A stage is still running");
         let mut run = slot.run.clone();
         ensure!(
-            run.status == Status::Interactive,
+            run.status == Status::Interactive || engine::detached_terminal(&run).is_some(),
             "No interactive stage is ready"
         );
         let explicit = self.editor.settings.explicit_config.clone();
-        let (cols, rows) = crossterm::terminal::size()?;
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((100, 30));
         let session = process::InteractiveSession::new(cols, rows);
         let terminal = session.clone();
         slot.cancel.store(false, Ordering::Relaxed);
         let cancel = slot.cancel.clone();
-        // The user ends an interactive stage themselves, so only failures notify.
-        let failures =
-            |result: &std::result::Result<Action, String>| !matches!(result, Ok(Action::Confirm));
+        // The user ends an interactive stage themselves, so only failures
+        // notify; a harness left running in the background has not ended.
+        let failures = |result: &std::result::Result<Action, String>| {
+            !matches!(result, Ok(Action::Confirm | Action::Interactive))
+        };
         slot.worker = Some(Worker::spawn(
             Some(session.clone()),
             failures,
@@ -253,7 +255,9 @@ impl App {
                 let result = engine::authorize_replay(&mut run, explicit.as_deref(), &mut *emit)
                     .and_then(|()| engine::run_interactive(&mut run, &cancel, &terminal, emit))
                     .map(|()| {
-                        if run.status == Status::AwaitingConfirmation {
+                        if terminal.released() {
+                            Action::Interactive
+                        } else if run.status == Status::AwaitingConfirmation {
                             Action::Confirm
                         } else {
                             Action::Stopped
@@ -264,6 +268,53 @@ impl App {
             },
         ));
         Ok(session)
+    }
+    /// Reconnects the focused run to its interactive harness when that
+    /// outlived an earlier mr, without taking the screen; [t] then attaches.
+    pub(super) fn reattach_detached(&mut self) {
+        let detached = self.session.focused().is_some_and(|slot| {
+            slot.worker.is_none() && engine::detached_terminal(&slot.run).is_some()
+        });
+        if !detached {
+            return;
+        }
+        self.ui.message = match self.interactive_terminal() {
+            Ok(_) => "This interactive stage kept running after an earlier mr exited. [t] attaches; [C] stops it.".into(),
+            Err(error) => format!("{error:#}"),
+        };
+    }
+    /// Adopts this project's runs whose interactive harness kept running
+    /// after the mr that started it exited, and reconnects to them.
+    pub(super) fn adopt_detached(&mut self) {
+        let Ok(entries) = crate::history::list(&self.project) else {
+            return;
+        };
+        let mut found = 0;
+        for entry in entries {
+            let crate::history::Entry::Summary(summary) = entry else {
+                continue;
+            };
+            if summary.status != Status::Running || self.session.focus_run(&summary.id) {
+                continue;
+            }
+            let Ok(run) = engine::load(&self.project, &summary.id) else {
+                continue;
+            };
+            if engine::detached_terminal(&run).is_none() {
+                continue;
+            }
+            self.session.adopt(run);
+            self.reattach_detached();
+            found += 1;
+        }
+        if found > 1 {
+            self.ui.message = format!(
+                "{found} interactive stages kept running after an earlier mr exited. [L] lists them; [t] attaches."
+            );
+        }
+        if found > 0 {
+            self.ui.page = Page::Monitor;
+        }
     }
     /// Applies background results and run progress, and starts timed
     /// refreshes; true means exit now.
@@ -641,7 +692,16 @@ impl App {
         })
     }
     /// Exits now, or once active runs have stopped; true means exit now.
+    /// Asks first whether running interactive harnesses keep running.
     pub(super) fn quit(&mut self) -> bool {
+        if self.session.live_terminals() > 0 {
+            self.ui.open(Modal::Ask(Box::new(Ask::LeaveRunning)));
+            return false;
+        }
+        self.stop_and_quit()
+    }
+    /// Exits now, or once active runs have stopped; true means exit now.
+    pub(super) fn stop_and_quit(&mut self) -> bool {
         if !self.session.any_active() {
             return true;
         }

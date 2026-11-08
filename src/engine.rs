@@ -197,6 +197,11 @@ pub struct Attempt {
     /// so the next `drive` can stop the orphaned group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_group: Option<u32>,
+    /// The socket of an interactive harness's terminal host. Its host
+    /// outlives mr, so while the attempt runs a later mr reattaches here
+    /// instead of treating the attempt as interrupted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<PathBuf>,
     /// Where the accepted handoff came from; None before it was read and in
     /// runs saved before this was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1884,6 +1889,7 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
         usage: None,
         session,
         process_group: None,
+        terminal: None,
         handoff_source: None,
         worktree: None,
     });
@@ -2265,15 +2271,26 @@ fn execute_stage(
         let _ = run.persist();
     };
     let result = if let Some(session) = interactive {
-        process::interactive(
+        let locks = lock_paths(run)?;
+        let result = process::interactive(
             &prepared.invocation,
             &workspace,
             &prepared.directory,
             cancel,
             session,
             prepared.sandbox.as_ref(),
-            |pgid| record(run, pgid),
-        )
+            &locks,
+            |pgid, socket| {
+                if let Some(attempt) = run.stages[index].attempts.last_mut() {
+                    attempt.terminal = Some(socket.to_path_buf());
+                }
+                record(run, pgid);
+            },
+        );
+        if left_running(run, &result, emit)? {
+            return Ok(());
+        }
+        result
     } else {
         // Events become readable lines; stdout.log keeps them raw.
         let mut formatter = events::Formatter::new(prepared.invocation.kind);
@@ -2306,6 +2323,156 @@ fn execute_stage(
         result
     };
     conclude(run, &prepared, result, cancel, emit)
+}
+
+/// True when the interactive harness was released to its terminal host and
+/// keeps running: the attempt stays running for a later mr to reattach.
+fn left_running(
+    run: &mut Run,
+    result: &Result<process::Outcome>,
+    emit: &mut impl FnMut(Event),
+) -> Result<bool> {
+    if !matches!(result, Ok(outcome) if outcome.released) {
+        return Ok(false);
+    }
+    run.persist()?;
+    emit(Event::Output(format!(
+        "{} keeps running in the background; mr reattaches to it\n",
+        run.current_name()
+    )));
+    emit(Event::State(Box::new(run.clone())));
+    Ok(true)
+}
+
+/// The terminal host socket of the current stage's interactive harness when
+/// it outlived the mr that started it, to reattach to: the attempt is still
+/// running and its host is listening or recorded how the harness ended.
+pub fn detached_terminal(run: &Run) -> Option<PathBuf> {
+    if run.status != Status::Running {
+        return None;
+    }
+    let stage = run.workflow.stages.get(run.cursor)?;
+    if stage.mode != Mode::Interactive || stage.fan_out.is_some() {
+        return None;
+    }
+    let attempt = run.stages.get(run.cursor)?.attempts.last()?;
+    let socket = attempt.terminal.as_ref()?;
+    (attempt.status == Status::Running
+        && (socket.exists() || process::recorded_exit(&attempt.directory).is_some()))
+    .then(|| socket.clone())
+}
+
+/// The locks `drive` takes, in order; a terminal host holds them while no
+/// mr is attached.
+fn lock_paths(run: &Run) -> Result<Vec<PathBuf>> {
+    Ok(vec![
+        run.directory.join("run.lock"),
+        storage::metadata_dir(&run.workspace)?.join("workspace.lock"),
+    ])
+}
+
+/// Rebuilds what finishing the running attempt needs, without launching or
+/// recording anything; for an attempt whose harness outlived its mr.
+fn reprepare(run: &Run) -> Result<Prepared> {
+    let index = run.cursor;
+    let stage = &run.workflow.stages[index];
+    let attempt = run.stages[index].attempts.last().context("No attempt")?;
+    let directory = attempt.directory.clone();
+    let prompt_file = directory.join("prompt.md");
+    let text = fs::read_to_string(&prompt_file)
+        .with_context(|| format!("Read {}", prompt_file.display()))?;
+    let paths = ContextPaths {
+        workspace: &run.workspace,
+        attempt_dir: &directory,
+        prompt_file: &prompt_file,
+        handoff_file: &attempt.handoff_file,
+    };
+    let invocation = adapters::build(stage, &run.adapters, &run.providers, &text, &paths)?;
+    Ok(Prepared {
+        invocation,
+        sandbox: None,
+        directory,
+        handoff_file: attempt.handoff_file.clone(),
+    })
+}
+
+/// Reconnects to the current stage's harness in its terminal host, or reads
+/// how it ended while no mr was attached, and finishes the stage.
+fn reattach_stage(
+    run: &mut Run,
+    socket: &Path,
+    cancel: &AtomicBool,
+    session: &process::InteractiveSession,
+    emit: &mut impl FnMut(Event),
+) -> Result<()> {
+    let index = run.cursor;
+    let directory = run.stages[index]
+        .attempts
+        .last()
+        .context("No attempt")?
+        .directory
+        .clone();
+    // Attach first: the host then lets go of the locks taken next.
+    let terminal = process::Terminal::connect(socket);
+    let (_lock, _workspace_lock) = lock_run(run)?;
+    run.check_revision()?;
+    stop_orphans(run, emit)?;
+    let result = match terminal {
+        Ok(terminal) => {
+            if let Some(attempt) = run.stages[index].attempts.last_mut() {
+                attempt.process_group = Some(terminal.pid());
+            }
+            emit(Event::Output(format!(
+                "Reattached to {} in its terminal\n",
+                run.current_name()
+            )));
+            process::reconnect(terminal, &directory, cancel, session)
+        }
+        Err(error) => {
+            session.finish();
+            match process::recorded_exit(&directory) {
+                Some(outcome) => Ok(outcome),
+                None => {
+                    // Its host died without recording an exit: stop whatever
+                    // it left, and forget the dead socket.
+                    if let Some(pgid) = run.stages[index]
+                        .attempts
+                        .last()
+                        .and_then(|a| a.process_group)
+                    {
+                        process::end_group(pgid, process::GRACE, || {});
+                    }
+                    let _ = fs::remove_file(socket);
+                    Err(error.context("The harness terminal from an earlier mr is gone"))
+                }
+            }
+        }
+    };
+    if left_running(run, &result, emit)? {
+        return Ok(());
+    }
+    let prepared = match reprepare(run) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            run.stop(
+                Status::Failed,
+                format!("Could not finish the reattached stage: {error:#}"),
+                Actor::Engine,
+                true,
+            )?;
+            run.persist()?;
+            emit(Event::State(Box::new(run.clone())));
+            return Ok(());
+        }
+    };
+    conclude(run, &prepared, result, cancel, emit)?;
+    if matches!(
+        run.status,
+        Status::Failed | Status::Blocked | Status::Cancelled
+    ) {
+        save_changes(run);
+    }
+    Ok(())
 }
 
 const INTERRUPTED: &str =
@@ -2441,6 +2608,7 @@ impl Run {
             usage: None,
             session: None,
             process_group: None,
+            terminal: None,
             handoff_source: None,
             worktree: None,
         });
@@ -2556,6 +2724,7 @@ impl Run {
             usage: None,
             session,
             process_group: None,
+            terminal: None,
             handoff_source: None,
             worktree: Some(worktree),
         });
@@ -3657,13 +3826,28 @@ fn lock_run(run: &Run) -> Result<(storage::FileLock, storage::FileLock)> {
 /// reused while any member lives; a stale ID whose group is gone is ignored.
 fn stop_orphans(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
     let mut groups = std::mem::take(&mut run.orphan_groups);
-    for state in &mut run.stages {
+    // A harness in its own terminal host is not orphaned: mr reattaches.
+    let detached = detached_terminal(run).map(|_| run.cursor);
+    for (index, state) in run.stages.iter_mut().enumerate() {
+        let kept = state
+            .attempts
+            .len()
+            .checked_sub(1)
+            .filter(|_| detached == Some(index));
         let candidates = state
             .fan_out
             .iter_mut()
             .flat_map(|f| &mut f.candidates)
             .flat_map(|c| &mut c.attempts);
-        for attempt in state.attempts.iter_mut().chain(candidates) {
+        for (number, attempt) in state.attempts.iter_mut().enumerate() {
+            if Some(number) == kept {
+                continue;
+            }
+            if let Some(pgid) = attempt.process_group.take() {
+                groups.push(pgid);
+            }
+        }
+        for attempt in candidates {
             if let Some(pgid) = attempt.process_group.take() {
                 groups.push(pgid);
             }
@@ -3690,6 +3874,10 @@ pub fn authorize_replay(
     explicit: Option<&Path>,
     mut emit: impl FnMut(Event),
 ) -> Result<()> {
+    // Its terminal host holds the locks; reattaching launches nothing.
+    if detached_terminal(run).is_some() {
+        return Ok(());
+    }
     let (_lock, _workspace_lock) = lock_run(run)?;
     run.check_revision()?;
     stop_orphans(run, &mut emit)?;
@@ -3698,6 +3886,12 @@ pub fn authorize_replay(
 
 /// Drive until completion, failure, or a terminal/confirmation is required.
 pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) -> Result<Action> {
+    // An interactive harness outlived the mr that started it: reattach
+    // (`run_interactive`). Its terminal host holds the locks meanwhile.
+    if detached_terminal(run).is_some() {
+        emit(Event::State(Box::new(run.clone())));
+        return Ok(Action::Interactive);
+    }
     let (_lock, _workspace_lock) = lock_run(run)?;
     run.check_revision()?;
     stop_orphans(run, &mut emit)?;
@@ -3794,7 +3988,8 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
     }
 }
 
-/// Own the stage on a worker; its foreground terminal can attach independently.
+/// Own the stage on a worker; its foreground terminal can attach
+/// independently. Reattaches when the stage's harness outlived an earlier mr.
 pub fn run_interactive(
     run: &mut Run,
     cancel: &AtomicBool,
@@ -3808,6 +4003,9 @@ pub fn run_interactive(
         }
     }
     let _session = FinishSession(session);
+    if let Some(socket) = detached_terminal(run) {
+        return reattach_stage(run, &socket, cancel, session, &mut emit);
+    }
     ensure!(
         run.status == Status::Interactive,
         "No interactive stage is ready"
@@ -4062,6 +4260,73 @@ mod tests {
     const NOT_APPLICABLE: &str = r#"{"summary":"Docs only","verdict":"complete","tests":[],"not_applicable":"No code changed"}"#;
 
     /// Finishes an interactive attempt as if its harness wrote `handoff` and exited 0.
+    #[test]
+    fn a_harness_that_exited_while_no_mr_was_attached_finishes_its_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            workflows: vec![Workflow::new(
+                "Interactive",
+                vec![Stage {
+                    id: "implement".into(),
+                    harness: "mock".into(),
+                    mode: Mode::Interactive,
+                    ..Stage::default()
+                }],
+            )],
+            adapters: BTreeMap::from([(
+                "mock".into(),
+                CustomAdapter {
+                    command: "python3".into(),
+                    interactive_args: Some(vec![]),
+                    ..CustomAdapter::default()
+                },
+            )]),
+            ..Settings::default()
+        };
+        let mut run = Run::create(
+            dir.path(),
+            &settings,
+            &settings.workflows[0],
+            "Task".into(),
+            false,
+        )
+        .unwrap();
+        // As left by an mr that released the stage and exited; its terminal
+        // host then recorded the harness's exit and went away.
+        let prepared = prepare(&mut run).unwrap();
+        fs::write(prepared.directory.join("stdout.log"), "transcript").unwrap();
+        fs::write(
+            &prepared.handoff_file,
+            r#"{"summary":"Done while away","verdict":"complete"}"#,
+        )
+        .unwrap();
+        fs::write(
+            prepared.directory.join("terminal-exit.json"),
+            r#"{"code":0,"cancelled":false}"#,
+        )
+        .unwrap();
+        run.stages[0].attempts[0].terminal = Some(dir.path().join("gone.sock"));
+        run.persist().unwrap();
+        let mut run = load(dir.path(), &run.id).unwrap();
+        assert!(detached_terminal(&run).is_some());
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            drive(&mut run, &cancel, |_| {}).unwrap(),
+            Action::Interactive
+        );
+        authorize_replay(&mut run, None, |_| {}).unwrap();
+        let session = process::InteractiveSession::new(80, 24);
+        run_interactive(&mut run, &cancel, &session, |_| {}).unwrap();
+        assert_eq!(run.status, Status::AwaitingConfirmation);
+        assert_eq!(run.stages[0].attempts.len(), 1);
+        assert_eq!(run.stages[0].attempts[0].exit_code, Some(0));
+        assert_eq!(
+            run.stages[0].handoff.as_ref().unwrap().summary,
+            "Done while away"
+        );
+        assert!(detached_terminal(&run).is_none());
+    }
+
     fn interactive(stage: Stage, handoff: Option<&str>) -> (tempfile::TempDir, Run) {
         let dir = tempfile::tempdir().unwrap();
         let next = Stage {
@@ -4111,6 +4376,7 @@ mod tests {
             code: Some(0),
             cancelled: false,
             timed_out: false,
+            released: false,
         };
         finish(
             &mut run,

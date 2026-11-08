@@ -24,6 +24,10 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   saved snapshot, reusing completed upstream handoffs.
 - `stats --min-pass` and `bench --min-pass`: an advisory cost-quality
   shortlist of assignments meeting a router-check pass rate.
+- Interactive stages can outlive `mr`: each harness runs in its own terminal
+  host process. Quitting asks whether to leave it running (TUI `q`, CLI `d`);
+  the next `mr` (or `resume ID`) reattaches with the screen intact, or
+  finishes the stage if the harness exited meanwhile.
 
 - Release builds for Linux (x86_64/aarch64, static musl) and macOS
   (x86_64/aarch64) via cargo-dist, with a shell installer, Homebrew formula,

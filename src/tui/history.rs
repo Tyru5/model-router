@@ -204,6 +204,7 @@ impl App {
                     self.ui.page = Page::Monitor;
                     self.ui.message =
                         "Saved run loaded. c continues; y retries; t reopens its session; i retries interactively.".into();
+                    self.reattach_detached();
                 }
             }
             ActionId::Rerun => {

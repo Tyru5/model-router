@@ -172,6 +172,7 @@ pub fn run(
         return Ok(());
     }
     let _ = storage::remember_project(&app.project);
+    app.adopt_detached();
     let mut drawn = Instant::now();
     'run: loop {
         if app.signal.load(Ordering::Relaxed) {
@@ -256,6 +257,17 @@ pub fn run(
                 }
             }
         }
+    }
+    drop(screen);
+    if !app.session.left_running.is_empty() {
+        println!("Still running in the background:");
+        for line in &app.session.left_running {
+            println!("  {line}");
+        }
+        println!(
+            "Run mr in {} to reattach.",
+            shell_words::quote(&app.project.display().to_string())
+        );
     }
     Ok(())
 }

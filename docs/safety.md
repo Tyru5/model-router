@@ -123,13 +123,18 @@ addresses, unless the URL you typed names such a host.
 - Each harness and router-run check runs in its own process group. When it
   ends, normally or not, the group gets SIGTERM, then SIGKILL after five
   seconds. Dev servers and watchers do not outlive the stage.
-- On Linux, an unattended harness gets SIGTERM if `mr` dies; an interactive
-  one gets SIGHUP from its closed terminal.
+- On Linux, an unattended harness gets SIGTERM if `mr` dies. An interactive
+  one lives in its terminal host, so it survives a crashed `mr`; the next `mr`
+  reattaches to it. If the host itself dies, its closed PTY hangs the harness
+  up, and the next `mr` stops whatever is left.
 - Each attempt records its active harness or check process group; after a
   crash, the next `resume` stops any surviving group first. Discarding a fan-out
   round for a full retry retains its groups until recovery stops them.
-- Quitting the TUI (`q`) stops active runs; detached sessions live only as long
-  as the `mr` process.
+- Quitting the TUI (`q`) stops active runs. A running interactive stage stops
+  too unless you choose to leave it running: its harness lives in a terminal
+  host process (own session, private socket under `$XDG_RUNTIME_DIR` or the
+  temp directory, mode 0700) that holds the run and workspace locks until an
+  `mr` reattaches or the harness exits. Recovery skips its process group.
 - Runs are serialized per checkout by `workspace.lock`; run state writes are
   atomic.
 

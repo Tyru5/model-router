@@ -293,10 +293,11 @@ def detached_end(action, *, cli=False, controlling=True):
             elif action == "hangup":
                 terminal.hangup()
             else:
-                # The TUI cancels with [C] and a confirmation; the CLI with c.
-                terminal.send(
-                    "Cy" if not cli and action == "c" else action, settle=None
-                )
+                # The TUI cancels with [C] and a confirmation, and its q asks
+                # whether to leave the stage running ([n] stops it); the CLI
+                # takes c or q.
+                keys = {"c": "Cy", "q": "qn"}[action] if not cli else action
+                terminal.send(keys, settle=None)
                 terminal.wait_for(
                     lambda: record(project).get("status") == "cancelled",
                     "Detached cancellation did not persist",
@@ -315,9 +316,84 @@ def detached_end(action, *, cli=False, controlling=True):
             cleanup(terminal, project)
 
 
+def leave_running(*, cli=False):
+    """Quit mr with the stage running, then reattach from a new mr."""
+    label = "CLI" if cli else "TUI"
+    with tempfile.TemporaryDirectory(prefix="router-leave-") as directory:
+        project = Path(directory).resolve()
+        workflow(project)
+        terminal = Terminal(project, cli=cli)
+        later = None
+        try:
+            start(terminal, project, cli=cli)
+            original_pid = state(project)["pid"]
+            detach(terminal, project, cli=cli)
+            if cli:
+                terminal.send(b"d", settle=None)
+                terminal.wait_for_text("keeps running in the background")
+            else:
+                terminal.send(b"q")
+                terminal.wait_for_text("Leave running?")
+                terminal.send(b"y", settle=None)
+            terminal.exit()
+            if not cli:
+                assert "Still running in the background" in terminal.text()
+            # mr is gone; the harness is not, and keeps making progress.
+            before = state(project)
+            wait_until(
+                lambda: state(project)["ticks"] >= before["ticks"] + 5,
+                "Harness stopped when mr exited",
+            )
+            assert state(project)["pid"] == original_pid and alive(original_pid)
+            run = record(project)
+            assert run["status"] == "running", run["status"]
+            attempt = run["stages"][0]["attempts"][-1]
+            assert attempt.get("terminal"), "No terminal host recorded"
+            args = ["--no-animation"] + (["resume", run["id"]] if cli else [])
+            later = smoke_common.Terminal(
+                project,
+                args,
+                env={"MODEL_ROUTER_NO_ANIMATION": "1"},
+                config=False,
+            )
+            if not cli:
+                later.wait_for_text("kept running after an earlier mr exited")
+                later.send(b"t", settle=None)
+            later.wait_for_text(
+                "DETACH SCREEN SENTINEL", message="Reattach did not replay the screen"
+            )
+            later.send(b"back\r", settle=None)
+            later.wait_for(
+                lambda: state(project)["inputs"] == ["back"],
+                "Input did not reach the harness after reattaching",
+            )
+            assert state(project)["pid"] == original_pid
+            later.send(b"/exit\r", settle=None)
+            checkpoint(later, project)
+            later.wait_for(
+                lambda: (
+                    "Save and stop" in later.text()
+                    if cli
+                    else "MODEL ROUTER" in later.text()
+                ),
+                "Router was not restored after harness exit",
+            )
+            later.send(b"q\r" if cli else b"q")
+            later.exit()
+            print(
+                f"PASS: {label} leave running, mr exit, reattach from a new mr, /exit",
+                flush=True,
+            )
+        finally:
+            cleanup(terminal, project)
+            if later is not None:
+                cleanup(later, project)
+
+
 def main():
     require_binary()
     for cli in (False, True):
+        leave_running(cli=cli)
         round_trip(cli=cli)
         for action in ("complete", "c", "q"):
             detached_end(action, cli=cli)

@@ -148,7 +148,8 @@ Leaving the harness returns to the checkpoint; the session stays saved.
 Cancelling sends SIGTERM and waits five seconds before SIGKILL so harnesses can
 save (omp only saves on clean exit). Gemini, Copilot, Goose, Aider, and custom
 adapters without `resume_args` cannot reopen after exit; use `i`. Live detached
-sessions can always be reattached.
+sessions can always be reattached, including ones left running after `mr`
+exited ([tui](tui.md#interactive-sessions)).
 
 ## Doctor
 

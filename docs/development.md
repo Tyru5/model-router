@@ -38,7 +38,7 @@ sleeping.
 | `smoke_themes` | All 14 themes, cancellation, restart, repo switching, invalid preferences |
 | `smoke_harness_settings` | Per-stage isolation, permission arguments, conflicts, model browsing, persistence |
 | `smoke_startup` | Animation, skip/bypass, resize, interrupt cleanup; records `.model-router/qa/startup.gif` |
-| `smoke_detach` | Detach and reattach of interactive sessions |
+| `smoke_detach` | Detach and reattach of interactive sessions, including leaving one running after `mr` exits and reattaching from a new `mr` |
 | `smoke_review` | Diff view: file list, hunk/file jumps, search, `$PAGER`/`$VISUAL` hand-offs |
 | `smoke_shutdown` | Shutdown and terminal loss |
 

@@ -212,8 +212,17 @@ Native harness terminals get keys and paste forwarded.
 
 A new interactive stage takes the screen only while its run is shown and no
 dialog is open; otherwise `t` or `i` opens it. A workflow whose first enabled
-stage is interactive opens the Monitor immediately. Detached sessions live as
-long as this `mr` process.
+stage is interactive opens the Monitor immediately.
+
+**Leaving a stage running.** Each interactive harness runs in its own small
+terminal host process, so it can outlive `mr`. Quitting (`q`) while one runs
+asks first: `y`/`Enter` leaves it running in the background, `n` stops it,
+`Esc` stays. The next `mr` in that project reconnects to it, opens the Monitor,
+and `t` attaches with the screen as the harness left it. While no `mr` is
+attached, the host holds the checkout's locks, so another run goes to its own
+worktree. If the harness exits meanwhile, the next `mr` finishes the stage from
+how it exited. One `mr` attaches at a time. `Ctrl+C`, `SIGTERM` and a closed
+terminal still stop running stages.
 
 **Takeover.** `t` on an unattended stage stops it (after `y`) and reopens the
 same session in the native terminal, history included. Works for Claude Code,

@@ -341,7 +341,7 @@ const ACTIONS: &[Entry] = {
         act(ToggleVim, Global, key(KeyCode::F(8)), "Vim motions", "Toggle optional Vim motions in input fields (saved for all projects)")
             .more(&["Inputs start in Insert mode; Esc enters Normal mode; Esc again cancels", "Normal: h/j/k/l, w/b/e, 0/^/$, gg/G; i/a/I/A resume typing"]),
         act(Help, Global, ch('?'), "help", "Keyboard guide").footer_in(&[Workflow, MonitorIdle, Harnesses]),
-        act(Quit, Global, ch('q'), "quit", "Exit, asking to save unsaved workflow edits (stops active work first)")
+        act(Quit, Global, ch('q'), "quit", "Exit, asking to save unsaved workflow edits and whether to leave interactive stages running (stops other work first)")
             .footer_in(&[Workflow, MonitorRunning, Runs, Harnesses]),
         act(Commands, Global, ch(':'), "commands", "Command menu: search this view's actions")
             .footer_in(&[MonitorRunning, Runs, Harnesses]),
@@ -360,6 +360,7 @@ const GUIDE_NOTES: &str = "INTERACTIVE HARNESS
 \tNative terminal keys and paste are forwarded.
 \tExit the harness to inspect its handoff; /exit quits, not detaches.
 Ctrl+B\tDetach to Monitor; the session keeps running. [t] reattaches.
+\t[q] can leave it running after mr exits; the next mr reattaches.
 Ctrl+]\tStop a stuck stage
 
 SELECTION MENUS

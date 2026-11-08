@@ -49,6 +49,9 @@ pub(super) struct Session {
     pub(super) launch_interactive: bool,
     /// Exit once the active runs have stopped.
     pub(super) quit_after_stop: bool,
+    /// Interactive stages left running in the background on exit, to list
+    /// after the TUI closes.
+    pub(super) left_running: Vec<String>,
 }
 
 impl Session {
@@ -79,8 +82,30 @@ impl Session {
     pub(super) fn any_active(&self) -> bool {
         self.runs.iter().any(|slot| slot.worker.is_some())
     }
+    /// Runs whose interactive harness is running now.
+    pub(super) fn live_terminals(&self) -> usize {
+        self.runs
+            .iter()
+            .filter(|slot| slot.terminal().is_some_and(|t| t.live()))
+            .count()
+    }
+    /// Lets go of every running interactive harness without stopping it:
+    /// each keeps running in its terminal host for a later mr.
+    pub(super) fn release_terminals(&mut self) {
+        for slot in &self.runs {
+            if let Some(terminal) = slot.terminal().filter(|t| t.live()) {
+                terminal.release();
+                self.left_running
+                    .push(format!("{} · {}", slot.run.id, slot.run.current_name()));
+            }
+        }
+    }
     pub(super) fn cancel_all(&self) {
         for slot in &self.runs {
+            // A released harness keeps running; cancelling would stop it.
+            if slot.terminal().is_some_and(|t| t.released()) {
+                continue;
+            }
             if slot.worker.is_some() {
                 slot.cancel
                     .store(true, std::sync::atomic::Ordering::Relaxed);

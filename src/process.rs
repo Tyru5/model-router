@@ -1,13 +1,17 @@
 //! Unix process supervision. No command is evaluated by a shell.
+pub mod host;
+
 use crate::{adapters::Invocation, sandbox::Plan};
 use anyhow::{Context, Result, ensure};
-use portable_pty::{CommandBuilder, PtySize};
 use std::{
     collections::VecDeque,
     fs::File,
     io::{self, IsTerminal, Read, Write},
-    os::{fd::AsRawFd, unix::process::CommandExt},
-    path::Path,
+    os::{
+        fd::AsRawFd,
+        unix::{net::UnixStream, process::CommandExt},
+    },
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex, MutexGuard,
@@ -22,6 +26,9 @@ pub struct Outcome {
     pub code: Option<i32>,
     pub cancelled: bool,
     pub timed_out: bool,
+    /// An interactive harness left running in its terminal host for a
+    /// later mr; it has not ended.
+    pub released: bool,
 }
 impl Outcome {
     pub fn success(&self) -> bool {
@@ -379,6 +386,7 @@ pub fn capture_with(
         code: status.code(),
         cancelled,
         timed_out,
+        released: false,
     })
 }
 
@@ -415,6 +423,8 @@ struct SessionState {
     started: bool,
     finished: bool,
     cancelled: bool,
+    /// Leave the harness running in its host when this mr lets go.
+    released: bool,
 }
 
 fn bounded_size(cols: u16, rows: u16) -> (u16, u16) {
@@ -423,6 +433,25 @@ fn bounded_size(cols: u16, rows: u16) -> (u16, u16) {
 }
 
 impl SessionState {
+    fn new(cols: u16, rows: u16) -> Self {
+        let size = bounded_size(cols, rows);
+        Self {
+            modes: NativeModes::default(),
+            queries: Vec::new(),
+            parser: vt100::Parser::new(size.1, size.0, 0),
+            primary_screen: None,
+            size,
+            input: VecDeque::new(),
+            output: Vec::new(),
+            attached: false,
+            redraw: true,
+            started: false,
+            finished: false,
+            cancelled: false,
+            released: false,
+        }
+    }
+
     fn resize(&mut self, cols: u16, rows: u16) {
         let size = bounded_size(cols, rows);
         if self.size != size {
@@ -509,22 +538,8 @@ impl SessionState {
 
 impl InteractiveSession {
     pub fn new(cols: u16, rows: u16) -> Self {
-        let size = bounded_size(cols, rows);
         Self {
-            shared: Arc::new(Mutex::new(SessionState {
-                modes: NativeModes::default(),
-                queries: Vec::new(),
-                parser: vt100::Parser::new(size.1, size.0, 0),
-                primary_screen: None,
-                size,
-                input: VecDeque::new(),
-                output: Vec::new(),
-                attached: false,
-                redraw: true,
-                started: false,
-                finished: false,
-                cancelled: false,
-            })),
+            shared: Arc::new(Mutex::new(SessionState::new(cols, rows))),
         }
     }
 
@@ -538,6 +553,26 @@ impl InteractiveSession {
     /// Calling this for a running supervisor also stops and reaps its child.
     pub fn finish(&self) {
         self.state().finished = true;
+    }
+
+    /// Lets go of a running harness without stopping it: its terminal host
+    /// keeps it, and a later mr reattaches. No effect once it has ended.
+    pub fn release(&self) {
+        let mut state = self.state();
+        if state.started && !state.finished {
+            state.released = true;
+        }
+    }
+
+    /// Whether `release` let go of a running harness.
+    pub fn released(&self) -> bool {
+        self.state().released
+    }
+
+    /// Whether a harness runs in this session now.
+    pub fn live(&self) -> bool {
+        let state = self.state();
+        state.started && !state.finished
     }
 
     /// The only part of the session allowed to access the host terminal.
@@ -1160,8 +1195,12 @@ impl Drop for PtyChild {
     }
 }
 
-/// Supervise a PTY without accessing the host terminal. Output keeps draining
-/// and being logged while detached; the foreground alone calls `attach`.
+/// Launches `inv` in its own terminal host (see `host`) and supervises it
+/// from here without accessing the host terminal: output keeps draining and
+/// being logged while detached; the foreground alone calls `attach`.
+/// `on_start` receives the harness's process group and the host's socket
+/// once it runs, so the caller can record them for recovery and reattachment.
+#[allow(clippy::too_many_arguments)]
 pub fn interactive(
     inv: &Invocation,
     cwd: &Path,
@@ -1169,196 +1208,264 @@ pub fn interactive(
     cancel: &AtomicBool,
     session: &InteractiveSession,
     sandbox: Option<&Plan>,
-    on_spawn: impl FnOnce(u32),
+    locks: &[PathBuf],
+    on_start: impl FnOnce(u32, &Path),
 ) -> Result<Outcome> {
-    let mut size = {
-        let mut state = session.state();
-        ensure!(
-            !state.started && !state.finished,
-            "Interactive session has already ended or started"
-        );
-        state.started = true;
-        if cancel.load(Ordering::Relaxed) || state.cancelled {
-            state.finished = true;
-            return Ok(Outcome {
-                code: None,
-                cancelled: true,
-                timed_out: false,
-            });
-        }
-        state.size
+    let (cols, rows) = match begin(session, cancel)? {
+        Ok(size) => size,
+        Err(outcome) => return Ok(outcome),
     };
     let _finish = SessionFinish(session);
-    let pair = portable_pty::native_pty_system().openpty(PtySize {
-        rows: size.1,
-        cols: size.0,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
     let (program, args) = launch(inv, sandbox);
-    let mut cmd = CommandBuilder::new(&program);
-    cmd.args(&args);
-    for name in inv.removed() {
-        cmd.env_remove(name);
-    }
-    for (name, value) in inv.environment()? {
-        cmd.env(name, value);
-    }
+    let env = inv.environment()?;
     inv.write_files()?;
-    cmd.cwd(cwd);
-    let mut transcript = File::create(dir.join("stdout.log"))?;
     let mut stderr_log = File::create(dir.join("stderr.log"))?;
-    if let Some(warning) = sandbox.and_then(|plan| plan.warning.as_deref()) {
+    let warning = sandbox.and_then(|plan| plan.warning.clone());
+    if let Some(warning) = &warning {
         writeln!(stderr_log, "{warning}")?;
-        session.state().output(format!("{warning}\r\n").as_bytes());
     }
-    let fd = pair
-        .master
-        .as_raw_fd()
-        .context("PTY has no file descriptor")?;
-    nonblocking(fd)?;
-    let mut reader = pair.master.try_clone_reader()?;
-    let mut writer = pair.master.take_writer()?;
-    let spawned = pair.slave.spawn_command(cmd)?;
-    let pid = spawned.process_id();
-    let mut child = PtyChild {
-        child: spawned,
-        pid,
+    let socket = host::socket_path()?;
+    let spec = host::Spec {
+        program,
+        args,
+        cwd: cwd.to_path_buf(),
+        dir: dir.to_path_buf(),
+        env,
+        removed: inv
+            .removed()
+            .into_iter()
+            .filter_map(|name| name.into_string().ok())
+            .collect(),
+        cols,
+        rows,
+        socket: socket.clone(),
+        locks: locks.to_vec(),
+        warning,
     };
-    if let Some(pid) = pid {
-        on_spawn(pid);
+    let pid = host::spawn(&spec)?;
+    on_start(pid, &socket);
+    let terminal = match Terminal::connect(&socket) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            // Never leave a harness nobody can reach.
+            end_group(pid, GRACE, || {});
+            return Err(error);
+        }
+    };
+    terminal.supervise(dir, cancel, session)
+}
+
+/// Reconnects `session` to a harness whose host outlived an earlier mr.
+pub fn reconnect(
+    terminal: Terminal,
+    dir: &Path,
+    cancel: &AtomicBool,
+    session: &InteractiveSession,
+) -> Result<Outcome> {
+    if let Err(outcome) = begin(session, cancel)? {
+        // Stop it as if attached, rather than abandoning it.
+        let terminal = terminal;
+        let mut out = Vec::new();
+        host::frame(host::tag::STOP, &[], &mut out);
+        let mut stream = terminal.stream;
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.write_all(&out);
+        return Ok(outcome);
     }
-    drop(pair.slave);
-    let mut decoder = OutputDecoder::default();
-    let mut bytes = [0u8; 8192];
-    let mut cancelled = false;
-    let mut eof = false;
-    let status = loop {
-        {
-            let mut state = session.state();
-            cancelled |= cancel.load(Ordering::Relaxed) || state.cancelled || state.finished;
-            if cancelled {
-                cancel.store(true, Ordering::Relaxed);
-                break None;
+    let _finish = SessionFinish(session);
+    terminal.supervise(dir, cancel, session)
+}
+
+/// How the harness of an attempt ended while no mr was connected, if its
+/// host recorded it.
+pub fn recorded_exit(dir: &Path) -> Option<Outcome> {
+    host::recorded(dir).map(|exit| Outcome {
+        code: exit.code,
+        cancelled: exit.cancelled,
+        timed_out: false,
+        released: false,
+    })
+}
+
+/// Marks the session started; the error is the outcome when it was
+/// cancelled before anything ran.
+fn begin(
+    session: &InteractiveSession,
+    cancel: &AtomicBool,
+) -> Result<std::result::Result<(u16, u16), Outcome>> {
+    let mut state = session.state();
+    ensure!(
+        !state.started && !state.finished,
+        "Interactive session has already ended or started"
+    );
+    state.started = true;
+    if cancel.load(Ordering::Relaxed) || state.cancelled {
+        state.finished = true;
+        return Ok(Err(Outcome {
+            code: None,
+            cancelled: true,
+            timed_out: false,
+            released: false,
+        }));
+    }
+    Ok(Ok(state.size))
+}
+
+/// A connection to a terminal host that has accepted it as its client.
+pub struct Terminal {
+    stream: UnixStream,
+    pid: u32,
+}
+
+impl Terminal {
+    /// Connects and attaches. Refused while another mr is attached. Once
+    /// this returns, the host has let go of the run's locks for the caller.
+    pub fn connect(socket: &Path) -> Result<Self> {
+        // An mr that just let go may not have been seen leaving yet.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match Self::attach(socket)? {
+                Some(terminal) => return Ok(terminal),
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+                None => anyhow::bail!(
+                    "This harness terminal is attached to another router. Detach or quit there first"
+                ),
             }
-            if state.size != size {
-                size = state.size;
-                pair.master.resize(PtySize {
-                    cols: size.0,
-                    rows: size.1,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })?;
-            }
-            if !state.input.is_empty() {
-                let (front, _) = state.input.as_slices();
-                match writer.write(front) {
-                    Ok(n) => {
-                        state.input.drain(..n);
-                    }
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                        ) => {}
-                    Err(e)
-                        if e.kind() == io::ErrorKind::BrokenPipe
-                            || e.raw_os_error() == Some(libc::EIO) =>
-                    {
-                        state.input.clear();
-                    }
-                    Err(e) => return Err(e.into()),
+        }
+    }
+
+    /// One attach attempt; None when the host is busy with another mr.
+    fn attach(socket: &Path) -> Result<Option<Self>> {
+        let mut stream = UnixStream::connect(socket)
+            .with_context(|| format!("Connect to the harness terminal {}", socket.display()))?;
+        let mut out = Vec::new();
+        host::frame(host::tag::ATTACH, &[], &mut out);
+        stream.write_all(&out)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut header = [0u8; 5];
+        stream
+            .read_exact(&mut header)
+            .context("The harness terminal did not answer")?;
+        let length = u32::from_be_bytes(header[1..].try_into()?) as usize;
+        let mut payload = vec![0u8; length.min(64)];
+        stream.read_exact(&mut payload)?;
+        let pid = match header[0] {
+            host::tag::SPAWNED if length == 4 => u32::from_be_bytes(payload[..4].try_into()?),
+            host::tag::BUSY => return Ok(None),
+            _ => anyhow::bail!("The harness terminal answered unexpectedly"),
+        };
+        stream.set_read_timeout(None)?;
+        stream.set_nonblocking(true)?;
+        Ok(Some(Self { stream, pid }))
+    }
+
+    /// The harness's process group.
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    fn supervise(
+        mut self,
+        dir: &Path,
+        cancel: &AtomicBool,
+        session: &InteractiveSession,
+    ) -> Result<Outcome> {
+        let pgid = self.pid;
+        let mut frames = host::Frames::default();
+        let mut decoder = OutputDecoder::default();
+        let mut out = Vec::new();
+        let mut written = 0;
+        let mut size = None;
+        let mut cancelled = false;
+        let mut stopped: Option<Instant> = None;
+        loop {
+            {
+                let mut state = session.state();
+                if state.released && stopped.is_none() {
+                    // Dropping the connection leaves the harness to its host.
+                    return Ok(Outcome {
+                        code: None,
+                        cancelled: false,
+                        timed_out: false,
+                        released: true,
+                    });
+                }
+                cancelled |= cancel.load(Ordering::Relaxed) || state.cancelled || state.finished;
+                if cancelled && stopped.is_none() {
+                    cancel.store(true, Ordering::Relaxed);
+                    host::frame(host::tag::STOP, &[], &mut out);
+                    stopped = Some(Instant::now());
+                }
+                if size != Some(state.size) {
+                    size = Some(state.size);
+                    let (cols, rows) = state.size;
+                    let mut payload = cols.to_be_bytes().to_vec();
+                    payload.extend_from_slice(&rows.to_be_bytes());
+                    host::frame(host::tag::RESIZE, &payload, &mut out);
+                }
+                if !state.input.is_empty() && out.len() < INPUT_LIMIT {
+                    let input: Vec<u8> = state.input.drain(..).collect();
+                    host::frame(host::tag::INPUT, &input, &mut out);
                 }
             }
-        }
-        drain_pty(
-            &mut reader,
-            &mut transcript,
-            &mut decoder,
-            session,
-            &mut bytes,
-            &mut eof,
-        )?;
-        if let Some(status) = child.child.try_wait()? {
-            break Some(status);
-        }
-        if eof {
-            thread::sleep(Duration::from_millis(40));
-        } else {
+            let open = host::flush(&mut self.stream, &mut out, &mut written)
+                && frames.fill(&mut self.stream);
+            while let Some((tag, payload)) = frames.next()? {
+                match tag {
+                    host::tag::OUTPUT => {
+                        let mut state = session.state();
+                        decoder.process(&payload, |frame| state.output(frame));
+                    }
+                    host::tag::EXIT => {
+                        let exit: host::Exit = serde_json::from_slice(&payload)?;
+                        session.finish();
+                        return Ok(Outcome {
+                            code: exit.code,
+                            cancelled: cancelled || exit.cancelled,
+                            timed_out: false,
+                            released: false,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            if !open {
+                session.finish();
+                if let Some(mut outcome) = recorded_exit(dir) {
+                    outcome.cancelled |= cancelled;
+                    return Ok(outcome);
+                }
+                // The host died: its closed PTY hangs the harness up; make sure.
+                end_group(pgid, GRACE, || {});
+                anyhow::bail!("The harness terminal host stopped unexpectedly");
+            }
+            if stopped.is_some_and(|at| at.elapsed() > GRACE * 2) {
+                // The host did not end it in time; do it here.
+                kill_group(pgid);
+                session.finish();
+                return Ok(Outcome {
+                    code: None,
+                    cancelled: true,
+                    timed_out: false,
+                    released: false,
+                });
+            }
             let mut poll = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
+                fd: self.stream.as_raw_fd(),
+                events: libc::POLLIN | if out.is_empty() { 0 } else { libc::POLLOUT },
                 revents: 0,
             };
-            let result = unsafe { libc::poll(&mut poll, 1, 40) };
-            if result < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error.into());
-                }
-            }
+            // SAFETY: the descriptor is borrowed; poll is one initialized pollfd.
+            unsafe { libc::poll(&mut poll, 1, 40) };
         }
-    };
-    let status = match status {
-        Some(status) => status,
-        // Ask first, as for unattended stages: omp only saves a session it
-        // can resume when it exits cleanly. Keep draining so a harness
-        // blocked on a full PTY can still exit.
-        None => {
-            if let Some(pid) = pid {
-                signal_group(pid, libc::SIGTERM);
-            }
-            let deadline = Instant::now() + GRACE;
-            loop {
-                drain_pty(
-                    &mut reader,
-                    &mut transcript,
-                    &mut decoder,
-                    session,
-                    &mut bytes,
-                    &mut eof,
-                )?;
-                if let Some(status) = child.child.try_wait()? {
-                    if let Some(pid) = pid {
-                        kill_group(pid);
-                    }
-                    break status;
-                }
-                if Instant::now() >= deadline {
-                    if let Some(pid) = pid {
-                        kill_group(pid);
-                    }
-                    let _ = child.child.kill();
-                    break child.child.wait()?;
-                }
-                thread::sleep(Duration::from_millis(25));
-            }
-        }
-    };
-    drain_pty(
-        &mut reader,
-        &mut transcript,
-        &mut decoder,
-        session,
-        &mut bytes,
-        &mut eof,
-    )?;
-    // No descendant is allowed to outlive mr's owned harness session.
-    drop(child);
-    session.finish();
-    transcript.sync_all()?;
-    Ok(Outcome {
-        code: Some(status.exit_code() as i32),
-        cancelled,
-        timed_out: false,
-    })
+    }
 }
 
 fn drain_pty(
     reader: &mut impl Read,
     transcript: &mut File,
     decoder: &mut OutputDecoder,
-    session: &InteractiveSession,
+    emit: &mut impl FnMut(&[u8]),
     bytes: &mut [u8; 8192],
     eof: &mut bool,
 ) -> Result<()> {
@@ -1371,8 +1478,7 @@ fn drain_pty(
             }
             Ok(n) => {
                 transcript.write_all(&bytes[..n])?;
-                let mut state = session.state();
-                decoder.process(&bytes[..n], |frame| state.output(frame));
+                decoder.process(&bytes[..n], &mut *emit);
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) if e.raw_os_error() == Some(libc::EIO) => {
@@ -1493,7 +1599,8 @@ mod tests {
                 &cancel,
                 &session,
                 None,
-                |_| {},
+                &[],
+                |_, _| {},
             )
             .unwrap()
         });
@@ -1502,6 +1609,118 @@ mod tests {
             dir.path().join("saved").exists(),
             "SIGKILL before a clean exit"
         );
+    }
+
+    fn shell(dir: &Path, script: &str) -> Invocation {
+        Invocation {
+            program: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            stdin: None,
+            kind: crate::adapters::OutputKind::Text,
+            final_file: dir.join("unused"),
+            env: vec![],
+            files: vec![],
+            assign: None,
+        }
+    }
+
+    fn wait_for(what: impl Fn() -> bool) {
+        let start = Instant::now();
+        while !what() {
+            assert!(start.elapsed() < Duration::from_secs(10), "timed out");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Starts `script`, waits for it to write `ready`, and releases it.
+    fn release(dir: &Path, script: &str) -> PathBuf {
+        let inv = shell(dir, script);
+        let session = InteractiveSession::new(80, 24);
+        let cancel = AtomicBool::new(false);
+        let lock = dir.join("run.lock");
+        let mut socket = PathBuf::new();
+        let outcome = thread::scope(|scope| {
+            scope.spawn(|| {
+                wait_for(|| dir.join("ready").exists());
+                session.release();
+            });
+            interactive(
+                &inv,
+                dir,
+                dir,
+                &cancel,
+                &session,
+                None,
+                std::slice::from_ref(&lock),
+                |_, path| socket = path.to_path_buf(),
+            )
+            .unwrap()
+        });
+        assert!(outcome.released, "{outcome:?}");
+        socket
+    }
+
+    #[test]
+    fn a_released_harness_keeps_running_and_reconnects() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = release(
+            dir.path(),
+            "echo ready > ready; read line; echo \"$line\" > got; exit 3",
+        );
+        // Detached, the host holds the run's lock; attaching hands it over.
+        let lock = dir.path().join("run.lock");
+        wait_for(|| crate::storage::is_locked(&lock));
+        let terminal = Terminal::connect(&socket).unwrap();
+        wait_for(|| !crate::storage::is_locked(&lock));
+        // One router at a time.
+        let busy = Terminal::connect(&socket).err().unwrap();
+        assert!(format!("{busy:#}").contains("another router"), "{busy:#}");
+        let session = InteractiveSession::new(80, 24);
+        session.state().input.extend(b"hello\r");
+        let cancel = AtomicBool::new(false);
+        let outcome = reconnect(terminal, dir.path(), &cancel, &session).unwrap();
+        assert_eq!(outcome.code, Some(3));
+        assert!(!outcome.cancelled && !outcome.released);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("got"))
+                .unwrap()
+                .trim(),
+            "hello"
+        );
+        assert!(!socket.exists(), "the host removes its socket");
+    }
+
+    #[test]
+    fn a_harness_that_exits_while_detached_records_how() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = release(
+            dir.path(),
+            "echo ready > ready; while [ ! -e go ]; do sleep 0.05; done; exit 7",
+        );
+        std::fs::write(dir.path().join("go"), "").unwrap();
+        wait_for(|| !socket.exists());
+        assert!(Terminal::connect(&socket).is_err());
+        let outcome = recorded_exit(dir.path()).unwrap();
+        assert_eq!(outcome.code, Some(7));
+        assert!(!outcome.cancelled);
+        // The host let go of the lock when it exited.
+        assert!(!crate::storage::is_locked(&dir.path().join("run.lock")));
+    }
+
+    #[test]
+    fn cancelling_a_reconnected_harness_stops_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = release(
+            dir.path(),
+            "trap 'echo saved > saved; exit 0' TERM; echo ready > ready; while :; do sleep 0.05; done",
+        );
+        let terminal = Terminal::connect(&socket).unwrap();
+        let session = InteractiveSession::new(80, 24);
+        let cancel = AtomicBool::new(true);
+        let outcome = reconnect(terminal, dir.path(), &cancel, &session).unwrap();
+        assert!(outcome.cancelled);
+        wait_for(|| dir.path().join("saved").exists());
+        wait_for(|| !socket.exists());
     }
 
     #[test]

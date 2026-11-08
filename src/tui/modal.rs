@@ -179,6 +179,9 @@ pub(super) enum Ask {
     },
     /// Unsaved workflow edits before exiting: [y] saves, [n] discards.
     SaveAndExit,
+    /// Interactive harnesses still running on exit: [y] leaves them running
+    /// in the background, [n] stops them.
+    LeaveRunning,
     /// Close the editor below without applying its changes; [Esc] returns to it.
     DiscardDraft,
 }
@@ -236,6 +239,26 @@ impl Ask {
                     ("Esc", "cancel"),
                 ],
             ),
+            Self::LeaveRunning => {
+                let count = app.session.live_terminals();
+                (
+                    "Leave running?",
+                    format!(
+                        "{} keep{} running in the background after mr exits. Run mr in this project to reattach.",
+                        if count == 1 {
+                            "An interactive stage".to_owned()
+                        } else {
+                            format!("{count} interactive stages")
+                        },
+                        if count == 1 { "s" } else { "" }
+                    ),
+                    &[
+                        ("y / Enter", "leave running and exit"),
+                        ("n", "stop and exit"),
+                        ("Esc", "cancel"),
+                    ],
+                )
+            }
             Self::DiscardDraft => (
                 "Discard changes?",
                 "This editor has changes that are not applied.".into(),
@@ -531,6 +554,13 @@ impl App {
                 self.editor.dirty = false;
                 return Ok(exit(self.quit()));
             }
+            Ask::LeaveRunning if yes => {
+                self.session.release_terminals();
+                return Ok(exit(self.stop_and_quit()));
+            }
+            Ask::LeaveRunning if key.code == Key::Char('n') => {
+                return Ok(exit(self.stop_and_quit()));
+            }
             _ if !yes => {}
             Ask::CancelStage { run } => {
                 // The stage may have stopped while the question was open.
@@ -578,7 +608,7 @@ impl App {
             Ask::DiscardDraft => {
                 self.ui.dialogs.pop();
             }
-            Ask::SaveAndExit => {}
+            Ask::SaveAndExit | Ask::LeaveRunning => {}
         }
         Ok(DialogResult::Close)
     }
