@@ -15,6 +15,7 @@ categories = ["command-line-utilities", "development-tools"]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 # The default Unix reader spins on EOF after a PTY closes, starving shutdown.
 # This backend breaks its read loop on EOF and preserves the poll timeout.
 crossterm = { version = "0.28", features = ["use-dev-tty"] }

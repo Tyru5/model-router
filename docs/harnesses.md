@@ -154,7 +154,10 @@ sessions can always be reattached.
 
 `model-router doctor [--json] [--strict]` checks each harness's executable,
 version, and the flags the router passes, using only `--version` and
-`--help`. It reports the sandbox backend too. It cannot check logins.
+`--help`. It reports the sandbox backend, and whether `git` and `gh` are on
+the path with their versions (`git` serves worktrees, snapshots, diffs, and
+ship; `gh` serves GitHub task imports and `ship --draft-pr`). It cannot check
+logins.
 `--strict` fails when an installed harness lacks a flag. The Harnesses page
 (`4`) runs the same checks; the stage panel then warns about missing flags.
 Details: [adapters.md](adapters.md#compatibility-checks).

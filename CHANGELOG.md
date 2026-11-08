@@ -9,6 +9,11 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Added
 
+- `completions SHELL [--bin NAME]`: shell completion scripts for bash, zsh,
+  fish, elvish, and PowerShell, for `model-router` or the `mr` alias.
+- `doctor` reports whether `git` and `gh` are installed, their versions, and
+  which features need them.
+- `docs/related.md`: comparable open-source tools and ideas worth borrowing.
 - Verification receipts: router checks record the Git tree they tested;
   `report` (text and JSON) shows whether the workspace still matches it or
   has changed since, and separates router passes from self-reported ones.

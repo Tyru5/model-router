@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail, ensure};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use model_router::{
     catalog,
     config::{self, Mode, Role, Settings},
@@ -53,6 +53,14 @@ enum Commands {
     },
     /// List built-in stage and workflow presets without starting a harness.
     Presets,
+    /// Print a shell completion script for model-router (or the mr alias).
+    Completions {
+        /// Shell to generate for.
+        shell: clap_complete::Shell,
+        /// Command name the script completes; use `mr` for the alias.
+        #[arg(long, default_value = "model-router", value_name = "NAME")]
+        bin: String,
+    },
     /// Validate the workflow file without starting any harness.
     Validate,
     /// Summarize a saved run: changes, checks, unresolved items, time, usage.
@@ -316,6 +324,11 @@ enum Commands {
 }
 
 fn main() {
+    // An interactive harness's terminal host (see `process::host`), never
+    // typed by people, so it bypasses argument parsing and project setup.
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == process::host::ARG) {
+        process::host::main();
+    }
     if let Err(error) = main_result() {
         // Terminal loss can close stderr too; reporting it must not panic.
         let _ = writeln!(io::stderr(), "Error: {error:#}");
@@ -339,6 +352,24 @@ fn main_result() -> Result<()> {
     })?;
     if matches!(&cli.command, Some(Commands::Presets)) {
         print!("{}", presets::listing());
+        return Ok(());
+    }
+    if let Some(Commands::Completions { shell, bin }) = &cli.command {
+        ensure!(
+            !bin.is_empty()
+                && bin
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)),
+            "--bin must be a plain command name, got {bin:?}"
+        );
+        let mut command = Cli::command();
+        let mut script = Vec::new();
+        clap_complete::generate(*shell, &mut command, bin.as_str(), &mut script);
+        // `completions zsh | head` closes the pipe early; that is not an error.
+        match io::stdout().lock().write_all(&script) {
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {}
+            result => result.context("writing the completion script")?,
+        }
         return Ok(());
     }
     if let Some(Commands::Init {
@@ -434,7 +465,11 @@ fn main_result() -> Result<()> {
             )?;
         }
         Some(
-            Commands::Init { .. } | Commands::Presets | Commands::Trust { .. } | Commands::Serve(_),
+            Commands::Init { .. }
+            | Commands::Presets
+            | Commands::Completions { .. }
+            | Commands::Trust { .. }
+            | Commands::Serve(_),
         ) => {
             unreachable!()
         }
@@ -507,6 +542,7 @@ fn main_result() -> Result<()> {
             } else {
                 print!("{}", doctor::table(&reports));
                 println!("\n{}", doctor::sandbox_line());
+                println!("{}", doctor::tools_line(&doctor::inspect_tools(&project)));
                 println!("\n{}", doctor::AUTH_NOTE);
             }
             ensure!(
@@ -1208,7 +1244,15 @@ fn cli_drive(run: &mut Run, cancel: &AtomicBool, notify: bool) -> Result<()> {
                         run.id
                     );
                 }
-                cli_interactive(run, cancel)?;
+                if cli_interactive(run, cancel)? {
+                    println!(
+                        "{} keeps running in the background. Reattach with: model-router -C {} resume {}",
+                        run.current_name(),
+                        shell_words::quote(&run.project.display().to_string()),
+                        run.id
+                    );
+                    return Ok(());
+                }
             }
             Action::Confirm if run.workflow.stages[run.cursor].role == Role::Ship => {
                 // The preview was printed as stage output.
@@ -1294,7 +1338,8 @@ fn cli_drive(run: &mut Run, cancel: &AtomicBool, notify: bool) -> Result<()> {
     }
 }
 
-fn cli_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
+/// True when the harness was left running in the background (`d`).
+fn cli_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<bool> {
     use process::{AttachOutcome, InteractiveSession};
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((100, 30));
@@ -1320,7 +1365,7 @@ fn cli_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
             if !finished {
                 write!(
                     io::stdout(),
-                    "\r\nHarness still running. [t] Reattach  [c] Cancel  [q] Stop\r\n"
+                    "\r\nHarness still running. [t] Reattach  [d] Leave running in the background  [c] Cancel  [q] Stop\r\n"
                 )?;
                 io::stdout().flush()?;
             }
@@ -1372,6 +1417,10 @@ fn cli_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
                     cancel.store(true, Ordering::Relaxed);
                     write!(io::stdout(), "\r\nStopping the stage...\r\n")?;
                     io::stdout().flush()?;
+                } else if keys.contains(&b'd') && !finished && !cancel.load(Ordering::Relaxed) {
+                    session.release();
+                    write!(io::stdout(), "\r\nLeaving the harness running...\r\n")?;
+                    io::stdout().flush()?;
                 } else if keys.contains(&b't') && !finished && !cancel.load(Ordering::Relaxed) {
                     crossterm::terminal::disable_raw_mode()?;
                     finished = matches!(session.attach(cancel, cancel)?, AttachOutcome::Finished);
@@ -1379,7 +1428,7 @@ fn cli_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
                     if !finished {
                         write!(
                             io::stdout(),
-                            "\r\nHarness still running. [t] Reattach  [c] Cancel  [q] Stop\r\n"
+                            "\r\nHarness still running. [t] Reattach  [d] Leave running in the background  [c] Cancel  [q] Stop\r\n"
                         )?;
                         io::stdout().flush()?;
                     }
@@ -1397,7 +1446,7 @@ fn cli_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
             .join()
             .map_err(|_| anyhow::anyhow!("Interactive worker panicked"))?;
         foreground?;
-        result
+        result.map(|()| session.released())
     })
 }
 

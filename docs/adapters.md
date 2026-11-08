@@ -147,6 +147,9 @@ codex     installed  0.160.0  schema-derived  ok            ~/.local/bin/codex
 omp       installed  18.6.3   tested          ok            ~/.local/bin/omp
 gemini    missing    -        -               not checked   gemini
 
+Sandbox: bwrap available at /usr/bin/bwrap (bubblewrap 0.9.0)
+Tools: git 2.43.0 at /usr/bin/git; gh missing (needed for GitHub task imports, ship --draft-pr)
+
 Authentication is not checked: that needs a model request. Log in through each harness.
 ```
 

@@ -522,6 +522,65 @@ pub fn sandbox_line() -> String {
     crate::sandbox::doctor_line()
 }
 
+/// External tools the router itself runs, and which features need them.
+pub const TOOLS: [(&str, &str); 2] = [
+    ("git", "worktrees, snapshots, diffs, ship"),
+    ("gh", "GitHub task imports, ship --draft-pr"),
+];
+
+/// One tool the router runs: where it is and its version, or what cannot
+/// work without it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Tool {
+    pub program: &'static str,
+    pub needed_for: &'static str,
+    pub path: Option<PathBuf>,
+    pub version: Option<String>,
+}
+
+/// `git` and `gh` on this host, found as harness executables are.
+pub fn inspect_tools(project: &Path) -> Vec<Tool> {
+    TOOLS
+        .iter()
+        .map(|&(program, needed_for)| {
+            let path = adapters::executable_at(program, project);
+            let version = path.as_ref().and_then(|_| {
+                let (ok, text) =
+                    probe(program, &["--version".into()], project, VERSION_TIMEOUT).ok()?;
+                let line = first_line(&text)?;
+                let version = version_tokens(&line).next().map(str::to_owned);
+                ok.then(|| version.unwrap_or(line))
+            });
+            Tool {
+                program,
+                needed_for,
+                path,
+                version,
+            }
+        })
+        .collect()
+}
+
+/// One line for `doctor`: `Tools: git 2.43.0 at /usr/bin/git; gh missing (...)`.
+pub fn tools_line(tools: &[Tool]) -> String {
+    let parts: Vec<String> = tools
+        .iter()
+        .map(|tool| match &tool.path {
+            Some(path) => format!(
+                "{}{} at {}",
+                tool.program,
+                tool.version
+                    .as_deref()
+                    .map(|v| format!(" {v}"))
+                    .unwrap_or_default(),
+                path.display()
+            ),
+            None => format!("{} missing (needed for {})", tool.program, tool.needed_for),
+        })
+        .collect();
+    format!("Tools: {}", parts.join("; "))
+}
+
 /// The `doctor` table: one row per harness.
 pub fn table(reports: &[Report]) -> String {
     let header = [
@@ -752,6 +811,42 @@ mod tests {
         ];
         assert_eq!(summary(&split, true), "missing: --model; 1 unknown");
         assert_eq!(summary(&split[2..], true), "unknown: help unavailable");
+    }
+
+    #[test]
+    fn tools_line_shows_versions_and_what_a_missing_tool_blocks() {
+        let tools = vec![
+            Tool {
+                program: "git",
+                needed_for: "worktrees",
+                path: Some(PathBuf::from("/usr/bin/git")),
+                version: Some("2.43.0".into()),
+            },
+            Tool {
+                program: "gh",
+                needed_for: "GitHub task imports, ship --draft-pr",
+                path: None,
+                version: None,
+            },
+        ];
+        assert_eq!(
+            tools_line(&tools),
+            "Tools: git 2.43.0 at /usr/bin/git; gh missing (needed for GitHub task imports, ship --draft-pr)"
+        );
+        let found = inspect_tools(Path::new("."));
+        assert_eq!(
+            found.iter().map(|t| t.program).collect::<Vec<_>>(),
+            vec!["git", "gh"]
+        );
+        // Tests run inside a Git checkout, so git is present with a version.
+        let git = &found[0];
+        assert!(git.path.is_some(), "{git:?}");
+        assert!(
+            git.version
+                .as_deref()
+                .is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit())),
+            "{git:?}"
+        );
     }
 
     #[test]

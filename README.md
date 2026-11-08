@@ -32,7 +32,9 @@ cargo install --path . --locked     # or: scripts/build.sh (also symlinks mr)
 ```
 
 Install and log in to the harnesses you want separately; `model-router doctor`
-checks what it finds.
+checks what it finds. `model-router completions zsh` (or `bash`, `fish`,
+`elvish`, `powershell`; `--bin mr` for the alias) prints a shell completion
+script.
 
 ## 60-second quickstart
 
@@ -123,6 +125,7 @@ model-router init --preset bug-fix
 model-router validate
 model-router trust
 model-router doctor
+model-router completions zsh --bin mr
 model-router serve --mcp
 ```
 
@@ -156,4 +159,5 @@ project/global templates. Reference: [docs/configuration.md](docs/configuration.
 - [Documentation index](docs/index.md)
 - [Changelog](CHANGELOG.md)
 - [Development, tests, CI](docs/development.md)
+- [Related tools and ideas to borrow](docs/related.md)
 - [Build specification](docs/spec.md) · [Design decisions](docs/design-interview.md)

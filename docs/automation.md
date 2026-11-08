@@ -278,6 +278,14 @@ and `.md` (success, checks, repairs, duration, usage per variant and run).
 | `providers [NAME]` | Router providers, or `NAME`'s `/models` (one listing request) | |
 | `trust` | Trust this project's dangerous config sections | `--yes`, `--revoke` |
 | `doctor` | Harness executables, versions, flags; sandbox backend | `--json`, `--strict` |
+| `completions SHELL` | Completion script for `bash`, `zsh`, `fish`, `elvish`, or `powershell`; works outside a project | `--bin NAME` (default `model-router`; `mr` for the alias) |
+
+```sh
+model-router completions zsh > ~/.zfunc/_model-router        # then: fpath+=~/.zfunc; compinit
+model-router completions zsh --bin mr > ~/.zfunc/_mr
+model-router completions bash > ~/.local/share/bash-completion/completions/model-router
+model-router completions fish > ~/.config/fish/completions/model-router.fish
+```
 
 ## Serve
 
