@@ -134,7 +134,11 @@ addresses, unless the URL you typed names such a host.
   too unless you choose to leave it running: its harness lives in a terminal
   host process (own session, private socket under `$XDG_RUNTIME_DIR` or the
   temp directory, mode 0700) that holds the run and workspace locks until an
-  `mr` reattaches or the harness exits. Recovery skips its process group.
+  `mr` reattaches or the harness exits. The locks pass between `mr` and the
+  host as open file descriptors over the socket, so no other run can take the
+  checkout in between. If an attached `mr` dies, though, the host takes the
+  locks back by path, and another run can take the checkout at that moment.
+  Recovery skips its process group.
 - Runs are serialized per checkout by `workspace.lock`; run state writes are
   atomic.
 

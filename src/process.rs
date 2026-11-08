@@ -1,7 +1,7 @@
 //! Unix process supervision. No command is evaluated by a shell.
 pub mod host;
 
-use crate::{adapters::Invocation, sandbox::Plan};
+use crate::{adapters::Invocation, sandbox::Plan, storage::FileLock};
 use anyhow::{Context, Result, ensure};
 use std::{
     collections::VecDeque,
@@ -425,6 +425,15 @@ struct SessionState {
     cancelled: bool,
     /// Leave the harness running in its host when this mr lets go.
     released: bool,
+    /// The released connection, kept open until the caller saved the run
+    /// and hands the locks over with `InteractiveSession::hand_over`.
+    parked: Option<Parked>,
+}
+
+/// A released session's connection to its host and the frames it still owes.
+struct Parked {
+    terminal: Terminal,
+    pending: Vec<u8>,
 }
 
 fn bounded_size(cols: u16, rows: u16) -> (u16, u16) {
@@ -449,6 +458,7 @@ impl SessionState {
             finished: false,
             cancelled: false,
             released: false,
+            parked: None,
         }
     }
 
@@ -561,6 +571,17 @@ impl InteractiveSession {
         let mut state = self.state();
         if state.started && !state.finished {
             state.released = true;
+        }
+    }
+
+    /// Closes a released session's connection to its terminal host, handing
+    /// `held` (the run's locks, in the host's order) over with it so they are
+    /// never free. Call after the last save of the run: the host may give the
+    /// locks to another mr at once. Does nothing for a session not released.
+    pub fn hand_over(&self, held: &[&FileLock]) {
+        let parked = self.state().parked.take();
+        if let Some(parked) = parked {
+            parked.terminal.hand_over(&parked.pending, held);
         }
     }
 
@@ -1200,6 +1221,8 @@ impl Drop for PtyChild {
 /// being logged while detached; the foreground alone calls `attach`.
 /// `on_start` receives the harness's process group and the host's socket
 /// once it runs, so the caller can record them for recovery and reattachment.
+/// `locks` are the caller's lock paths, which the host takes by path only if
+/// a released session's caller vanished before `InteractiveSession::hand_over`.
 #[allow(clippy::too_many_arguments)]
 pub fn interactive(
     inv: &Invocation,
@@ -1314,12 +1337,15 @@ fn begin(
 /// A connection to a terminal host that has accepted it as its client.
 pub struct Terminal {
     stream: UnixStream,
+    frames: host::Frames,
     pid: u32,
+    locks: Vec<FileLock>,
 }
 
 impl Terminal {
     /// Connects and attaches. Refused while another mr is attached. Once
-    /// this returns, the host has let go of the run's locks for the caller.
+    /// this returns, the host has let go of the run's locks; it hands them
+    /// over (`take_locks`) if it held them.
     pub fn connect(socket: &Path) -> Result<Self> {
         // An mr that just let go may not have been seen leaving yet.
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1340,23 +1366,74 @@ impl Terminal {
             .with_context(|| format!("Connect to the harness terminal {}", socket.display()))?;
         let mut out = Vec::new();
         host::frame(host::tag::ATTACH, &[], &mut out);
-        stream.write_all(&out)?;
+        // Before asking: macOS refuses options on a socket the host has
+        // already answered (busy) and closed.
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        let mut header = [0u8; 5];
-        stream
-            .read_exact(&mut header)
-            .context("The harness terminal did not answer")?;
-        let length = u32::from_be_bytes(header[1..].try_into()?) as usize;
-        let mut payload = vec![0u8; length.min(64)];
-        stream.read_exact(&mut payload)?;
-        let pid = match header[0] {
-            host::tag::SPAWNED if length == 4 => u32::from_be_bytes(payload[..4].try_into()?),
+        stream.write_all(&out)?;
+        // Read with the descriptors the answer carries; output may follow it.
+        let mut frames = host::Frames::default();
+        let (tag, payload) = loop {
+            if let Some(frame) = frames.next()? {
+                break frame;
+            }
+            match frames.read(&stream) {
+                Ok(0) => anyhow::bail!("The harness terminal did not answer"),
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e).context("The harness terminal did not answer"),
+            }
+        };
+        let locks: Vec<_> = frames
+            .take_fds()
+            .into_iter()
+            .map(FileLock::from_fd)
+            .collect();
+        let pid = match tag {
+            host::tag::SPAWNED if payload.len() == 4 => u32::from_be_bytes(payload[..].try_into()?),
             host::tag::BUSY => return Ok(None),
             _ => anyhow::bail!("The harness terminal answered unexpectedly"),
         };
         stream.set_read_timeout(None)?;
         stream.set_nonblocking(true)?;
-        Ok(Some(Self { stream, pid }))
+        Ok(Some(Self {
+            stream,
+            frames,
+            pid,
+            locks,
+        }))
+    }
+
+    /// The run's locks the host held while detached, in its order; empty
+    /// when it held none.
+    pub fn take_locks(&mut self) -> Vec<FileLock> {
+        std::mem::take(&mut self.locks)
+    }
+
+    /// Hands `locks` to the host before the connection closes, so they are
+    /// never free; pending frames go first, as one cut short would corrupt
+    /// the stream. Without this the host takes them by path, after a gap.
+    pub fn hand_over(&self, pending: &[u8], locks: &[&FileLock]) {
+        if locks.is_empty() {
+            return;
+        }
+        let mut stream = &self.stream;
+        let ready = stream.set_nonblocking(false).is_ok()
+            && stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .is_ok()
+            && stream.write_all(pending).is_ok();
+        if !ready {
+            return;
+        }
+        let mut out = Vec::new();
+        host::frame(host::tag::LOCKS, &[], &mut out);
+        let fds: Vec<_> = locks.iter().map(|lock| lock.fd().as_raw_fd()).collect();
+        if let Ok(n @ 1..) = host::send(stream, &out, &fds) {
+            for lock in locks {
+                lock.hand_over();
+            }
+            let _ = stream.write_all(&out[n..]);
+        }
     }
 
     /// The harness's process group.
@@ -1371,7 +1448,7 @@ impl Terminal {
         session: &InteractiveSession,
     ) -> Result<Outcome> {
         let pgid = self.pid;
-        let mut frames = host::Frames::default();
+        let mut frames = std::mem::take(&mut self.frames);
         let mut decoder = OutputDecoder::default();
         let mut out = Vec::new();
         let mut written = 0;
@@ -1382,7 +1459,12 @@ impl Terminal {
             {
                 let mut state = session.state();
                 if state.released && stopped.is_none() {
-                    // Dropping the connection leaves the harness to its host.
+                    // Closing the connection leaves the harness to its host;
+                    // the caller does that once it saved the run.
+                    state.parked = Some(Parked {
+                        pending: out[written..].to_vec(),
+                        terminal: self,
+                    });
                     return Ok(Outcome {
                         code: None,
                         cancelled: false,
@@ -1408,8 +1490,10 @@ impl Terminal {
                     host::frame(host::tag::INPUT, &input, &mut out);
                 }
             }
-            let open = host::flush(&mut self.stream, &mut out, &mut written)
-                && frames.fill(&mut self.stream);
+            let open =
+                host::flush(&mut self.stream, &mut out, &mut written) && frames.fill(&self.stream);
+            // The host sends descriptors only with its answer to attaching.
+            drop(frames.take_fds());
             while let Some((tag, payload)) = frames.next()? {
                 match tag {
                     host::tag::OUTPUT => {
@@ -1632,31 +1716,91 @@ mod tests {
         }
     }
 
-    /// Starts `script`, waits for it to write `ready`, and releases it.
-    fn release(dir: &Path, script: &str) -> PathBuf {
+    /// Runs `during` while another thread checks that the lock at `path`
+    /// is held throughout.
+    fn never_free<T>(path: &Path, during: impl FnOnce() -> T) -> T {
+        struct Done<'a>(&'a AtomicBool);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let done = AtomicBool::new(false);
+        let started = AtomicBool::new(false);
+        thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                let mut checks = 0u64;
+                loop {
+                    let free = !crate::storage::is_locked(path);
+                    started.store(true, Ordering::Relaxed);
+                    if free {
+                        return Err(checks);
+                    }
+                    checks += 1;
+                    if done.load(Ordering::Relaxed) {
+                        return Ok(checks);
+                    }
+                }
+            });
+            // A busy machine may not schedule the watcher until `during` is
+            // over; it must have looked at least once before it starts.
+            while !started.load(Ordering::Relaxed) {
+                thread::yield_now();
+            }
+            let value = {
+                let _done = Done(&done);
+                during()
+            };
+            match watcher.join().unwrap() {
+                Ok(checks) => assert!(checks > 0, "the lock was never checked"),
+                Err(checks) => panic!("the lock was free after {checks} checks"),
+            }
+            value
+        })
+    }
+
+    /// Starts `script` holding the run's lock as mr does, waits for it to
+    /// write `ready`, and releases it, handing the lock to the host over the
+    /// socket or, as a vanished mr, letting the host take it by path.
+    fn release(dir: &Path, script: &str, hand_over: bool) -> PathBuf {
         let inv = shell(dir, script);
         let session = InteractiveSession::new(80, 24);
         let cancel = AtomicBool::new(false);
         let lock = dir.join("run.lock");
+        let held = crate::storage::lock(&lock).unwrap();
         let mut socket = PathBuf::new();
-        let outcome = thread::scope(|scope| {
-            scope.spawn(|| {
-                wait_for(|| dir.join("ready").exists());
-                session.release();
+        let run = || {
+            let handed = [&held];
+            let outcome = thread::scope(|scope| {
+                scope.spawn(|| {
+                    wait_for(|| dir.join("ready").exists());
+                    session.release();
+                });
+                interactive(
+                    &inv,
+                    dir,
+                    dir,
+                    &cancel,
+                    &session,
+                    None,
+                    std::slice::from_ref(&lock),
+                    |_, path| socket = path.to_path_buf(),
+                )
+                .unwrap()
             });
-            interactive(
-                &inv,
-                dir,
-                dir,
-                &cancel,
-                &session,
-                None,
-                std::slice::from_ref(&lock),
-                |_, path| socket = path.to_path_buf(),
-            )
-            .unwrap()
-        });
-        assert!(outcome.released, "{outcome:?}");
+            assert!(outcome.released, "{outcome:?}");
+            session.hand_over(if hand_over { &handed } else { &[] });
+            // As mr exits. A lock it handed over stays with the host.
+            drop(held);
+            // Longer than the host's retry interval, so a gap would show.
+            thread::sleep(Duration::from_millis(200));
+        };
+        if hand_over {
+            never_free(&lock, run);
+        } else {
+            run();
+            wait_for(|| crate::storage::is_locked(&lock));
+        }
         socket
     }
 
@@ -1666,11 +1810,19 @@ mod tests {
         let socket = release(
             dir.path(),
             "echo ready > ready; read line; echo \"$line\" > got; exit 3",
+            true,
         );
         // Detached, the host holds the run's lock; attaching hands it over.
         let lock = dir.path().join("run.lock");
-        wait_for(|| crate::storage::is_locked(&lock));
-        let terminal = Terminal::connect(&socket).unwrap();
+        let mut terminal = never_free(&lock, || Terminal::connect(&socket).unwrap());
+        let taken = terminal.take_locks();
+        assert_eq!(taken.len(), 1);
+        never_free(&lock, || thread::sleep(Duration::from_millis(100)));
+        // The host kept no copy: closing the caller's frees it.
+        for lock in &taken {
+            lock.hand_over();
+        }
+        drop(taken);
         wait_for(|| !crate::storage::is_locked(&lock));
         // One router at a time.
         let busy = Terminal::connect(&socket).err().unwrap();
@@ -1696,6 +1848,7 @@ mod tests {
         let socket = release(
             dir.path(),
             "echo ready > ready; while [ ! -e go ]; do sleep 0.05; done; exit 7",
+            true,
         );
         std::fs::write(dir.path().join("go"), "").unwrap();
         wait_for(|| !socket.exists());
@@ -1708,11 +1861,101 @@ mod tests {
     }
 
     #[test]
+    fn a_reconnected_harness_hands_the_lock_back_when_released_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = release(
+            dir.path(),
+            "echo ready > ready; while [ ! -e go ]; do sleep 0.05; done; exit 0",
+            true,
+        );
+        let lock = dir.path().join("run.lock");
+        never_free(&lock, || {
+            let mut terminal = Terminal::connect(&socket).unwrap();
+            let held = terminal.take_locks();
+            assert_eq!(held.len(), 1);
+            let session = InteractiveSession::new(80, 24);
+            let cancel = AtomicBool::new(false);
+            let outcome = thread::scope(|scope| {
+                scope.spawn(|| {
+                    wait_for(|| session.live());
+                    session.release();
+                });
+                reconnect(terminal, dir.path(), &cancel, &session).unwrap()
+            });
+            assert!(outcome.released, "{outcome:?}");
+            // Until the caller saved the run and hands over, the connection
+            // stays: no other router can take the session or its locks.
+            let busy = Terminal::connect(&socket).err().unwrap();
+            assert!(format!("{busy:#}").contains("another router"), "{busy:#}");
+            session.hand_over(&[&held[0]]);
+            drop(held);
+            thread::sleep(Duration::from_millis(200));
+        });
+        std::fs::write(dir.path().join("go"), "").unwrap();
+        wait_for(|| !socket.exists());
+        wait_for(|| !crate::storage::is_locked(&lock));
+    }
+
+    #[test]
+    fn an_attached_router_that_gives_up_hands_the_lock_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = release(
+            dir.path(),
+            "echo ready > ready; while [ ! -e go ]; do sleep 0.05; done; exit 0",
+            true,
+        );
+        let lock = dir.path().join("run.lock");
+        // As when reattaching fails before the harness is reconnected.
+        never_free(&lock, || {
+            let mut terminal = Terminal::connect(&socket).unwrap();
+            let held = terminal.take_locks();
+            terminal.hand_over(&[], &[&held[0]]);
+            drop(held);
+            drop(terminal);
+            thread::sleep(Duration::from_millis(200));
+        });
+        // The host kept them, and still hands them over to the next router.
+        let mut terminal = Terminal::connect(&socket).unwrap();
+        assert_eq!(terminal.take_locks().len(), 1);
+        std::fs::write(dir.path().join("go"), "").unwrap();
+        let session = InteractiveSession::new(80, 24);
+        let cancel = AtomicBool::new(false);
+        let outcome = reconnect(terminal, dir.path(), &cancel, &session).unwrap();
+        assert_eq!(outcome.code, Some(0));
+    }
+
+    #[test]
+    fn a_host_takes_the_lock_of_an_mr_that_vanished() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = release(
+            dir.path(),
+            "echo ready > ready; while [ ! -e go ]; do sleep 0.05; done; exit 0",
+            false,
+        );
+        // Taken by path, it is still handed over on attach, and is a lock on
+        // that file and no other.
+        let mut terminal = Terminal::connect(&socket).unwrap();
+        let locks = terminal.take_locks();
+        assert_eq!(locks.len(), 1);
+        assert!(locks[0].is(&dir.path().join("run.lock")));
+        std::fs::write(dir.path().join("other.lock"), "").unwrap();
+        assert!(!locks[0].is(&dir.path().join("other.lock")));
+        assert!(!locks[0].is(&dir.path().join("missing.lock")));
+        drop(locks);
+        std::fs::write(dir.path().join("go"), "").unwrap();
+        let session = InteractiveSession::new(80, 24);
+        let cancel = AtomicBool::new(false);
+        let outcome = reconnect(terminal, dir.path(), &cancel, &session).unwrap();
+        assert_eq!(outcome.code, Some(0));
+    }
+
+    #[test]
     fn cancelling_a_reconnected_harness_stops_it() {
         let dir = tempfile::tempdir().unwrap();
         let socket = release(
             dir.path(),
             "trap 'echo saved > saved; exit 0' TERM; echo ready > ready; while :; do sleep 0.05; done",
+            true,
         );
         let terminal = Terminal::connect(&socket).unwrap();
         let session = InteractiveSession::new(80, 24);

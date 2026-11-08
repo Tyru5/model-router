@@ -3,10 +3,12 @@
 //! socket, so quitting mr leaves the harness running and a later mr
 //! reattaches with the screen intact. One mr is attached at a time. While
 //! none is, the host holds the run and workspace locks, so no other run
-//! takes the checkout; an attaching mr takes them over.
+//! takes the checkout. The locks change hands as file descriptors sent over
+//! the socket (flock locks belong to the open file, which stays open in
+//! flight), so they are never free in between.
 use super::{
-    GRACE, INPUT_LIMIT, OutputDecoder, PtyChild, SessionState, drain_pty, kill_group, nonblocking,
-    signal_group,
+    FileLock, GRACE, INPUT_LIMIT, OutputDecoder, PtyChild, SessionState, drain_pty, kill_group,
+    nonblocking, signal_group,
 };
 use anyhow::{Context, Result, bail, ensure};
 use portable_pty::{CommandBuilder, PtySize};
@@ -15,9 +17,9 @@ use std::{
     fs::{self, File},
     io::{self, BufRead, BufReader, Read, Write},
     os::{
-        fd::AsRawFd,
+        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::{
-            fs::{MetadataExt, PermissionsExt},
+            fs::{DirBuilderExt, MetadataExt, PermissionsExt},
             net::{UnixListener, UnixStream},
             process::CommandExt,
         },
@@ -49,7 +51,8 @@ pub(super) struct Spec {
     pub cols: u16,
     pub rows: u16,
     pub socket: PathBuf,
-    /// Held while no mr is connected, in this order.
+    /// Held while no mr is connected, in this order. An mr hands them over
+    /// when it lets go; the host takes them by path only when one vanished.
     pub locks: Vec<PathBuf>,
     pub warning: Option<String>,
 }
@@ -60,14 +63,16 @@ pub(super) struct Exit {
     pub cancelled: bool,
 }
 
-/// Frame tags. Client to host: attach, input, resize, stop. Host to client:
-/// the harness's process ID (attach accepted), busy (another mr is attached),
-/// output, exit.
+/// Frame tags. Client to host: attach, input, resize, stop, locks (the
+/// client's lock descriptors, sent as it lets go). Host to client: the
+/// harness's process ID (attach accepted, carrying the host's lock
+/// descriptors if it held them), busy (another mr is attached), output, exit.
 pub(super) mod tag {
     pub const ATTACH: u8 = b'a';
     pub const INPUT: u8 = b'i';
     pub const RESIZE: u8 = b'r';
     pub const STOP: u8 = b's';
+    pub const LOCKS: u8 = b'l';
     pub const OUTPUT: u8 = b'o';
     pub const SPAWNED: u8 = b'p';
     pub const BUSY: u8 = b'b';
@@ -84,21 +89,29 @@ pub(super) fn frame(tag: u8, payload: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(payload);
 }
 
-/// Splits a byte stream into frames.
+/// Splits a byte stream into frames, keeping the descriptors it carries.
 #[derive(Default)]
 pub(super) struct Frames {
     buffer: Vec<u8>,
+    fds: Vec<OwnedFd>,
 }
 impl Frames {
+    /// One read; 0 at end of stream.
+    pub fn read(&mut self, stream: &UnixStream) -> io::Result<usize> {
+        let mut bytes = [0u8; 16 * 1024];
+        let n = recv(stream, &mut bytes, &mut self.fds)?;
+        self.buffer.extend_from_slice(&bytes[..n]);
+        // Only one frame carries descriptors; never pile up a peer's extras.
+        self.fds.truncate(MAX_FDS);
+        Ok(n)
+    }
     /// Reads what is available without blocking. False at end of stream or
     /// on an error that ends the connection.
-    pub fn fill(&mut self, stream: &mut UnixStream) -> bool {
-        let mut bytes = [0u8; 16 * 1024];
+    pub fn fill(&mut self, stream: &UnixStream) -> bool {
         loop {
-            match stream.read(&mut bytes) {
+            match self.read(stream) {
                 Ok(0) => return false,
-                Ok(n) => {
-                    self.buffer.extend_from_slice(&bytes[..n]);
+                Ok(_) => {
                     if self.buffer.len() > 4 * FRAME_LIMIT {
                         return true;
                     }
@@ -123,6 +136,134 @@ impl Frames {
         self.buffer.drain(..5 + length);
         Ok(Some((tag, payload)))
     }
+    /// The descriptors received so far, in order; the frame that carried
+    /// them has been read once it is returned by `next`.
+    pub fn take_fds(&mut self) -> Vec<OwnedFd> {
+        std::mem::take(&mut self.fds)
+    }
+}
+
+/// More descriptors than any frame carries.
+const MAX_FDS: usize = 4;
+#[cfg(target_os = "linux")]
+const SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+#[cfg(not(target_os = "linux"))]
+const SEND_FLAGS: libc::c_int = 0;
+
+/// Writes the start of `bytes` with `fds` attached (SCM_RIGHTS); how much
+/// was written. The descriptors went along if and only if that is above 0.
+pub(super) fn send(stream: &UnixStream, bytes: &[u8], fds: &[RawFd]) -> io::Result<usize> {
+    let size = std::mem::size_of_val(fds) as libc::c_uint;
+    // SAFETY: CMSG_SPACE only computes a size.
+    let space = unsafe { libc::CMSG_SPACE(size) } as usize;
+    // u64 elements align the header for both Linux and macOS layouts.
+    let mut control = vec![0u64; space.div_ceil(8)];
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_ptr() as *mut libc::c_void,
+        iov_len: bytes.len(),
+    };
+    // SAFETY: msghdr is plain data; zero is valid for every field.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    if !fds.is_empty() {
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = space as _;
+        // SAFETY: the control buffer is aligned and CMSG_SPACE(size) long, so
+        // its first header and `size` data bytes fit.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(size) as _;
+            std::ptr::copy_nonoverlapping(
+                fds.as_ptr().cast::<u8>(),
+                libc::CMSG_DATA(cmsg),
+                size as usize,
+            );
+        }
+    }
+    loop {
+        // SAFETY: msg and the buffers it points to outlive the call.
+        let n = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, SEND_FLAGS) };
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// Reads into `bytes`, appending any descriptors received to `fds`.
+fn recv(stream: &UnixStream, bytes: &mut [u8], fds: &mut Vec<OwnedFd>) -> io::Result<usize> {
+    let mut control = [0u64; 16];
+    // SAFETY: CMSG_SPACE only computes a size.
+    let space = unsafe { libc::CMSG_SPACE((MAX_FDS * size_of::<RawFd>()) as libc::c_uint) };
+    debug_assert!(space as usize <= size_of_val(&control));
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_mut_ptr().cast(),
+        iov_len: bytes.len(),
+    };
+    // SAFETY: msghdr is plain data; zero is valid for every field.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = space as _;
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = 0;
+    let n = loop {
+        // SAFETY: msg and the buffers it points to outlive the call.
+        let n = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, flags) };
+        if n >= 0 {
+            break n as usize;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    };
+    let mut received = Vec::new();
+    // SAFETY: recvmsg filled msg_controllen bytes of headers; each
+    // SCM_RIGHTS payload, up to what was delivered, is descriptors this
+    // process now owns. A truncated header can claim more (macOS keeps the
+    // sender's length), so payloads are bounded by the delivered bytes.
+    unsafe {
+        let end = msg
+            .msg_control
+            .cast::<u8>()
+            .add(msg.msg_controllen as usize);
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let data = libc::CMSG_DATA(cmsg);
+                let claimed =
+                    ((*cmsg).cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
+                let delivered = (end as usize).saturating_sub(data as usize);
+                let data = data.cast::<RawFd>();
+                for index in 0..claimed.min(delivered) / size_of::<RawFd>() {
+                    let fd = OwnedFd::from_raw_fd(data.add(index).read_unaligned());
+                    // Never let a later child inherit a lock. macOS has no
+                    // MSG_CMSG_CLOEXEC, so a child another thread spawns
+                    // between recvmsg and here could still inherit it; it
+                    // then holds the lock until it exits if mr dies first.
+                    #[cfg(not(target_os = "linux"))]
+                    libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+                    received.push(fd);
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+    }
+    // Cut short, they are not the set the peer meant: close them all.
+    if msg.msg_flags & libc::MSG_CTRUNC == 0 {
+        fds.extend(received);
+    }
+    Ok(n)
 }
 
 /// Writes `out[*written..]` without blocking. False when the peer is gone.
@@ -143,7 +284,7 @@ pub(super) fn flush(stream: &mut UnixStream, out: &mut Vec<u8>, written: &mut us
 
 /// A private directory for sockets. Socket paths are limited to about 100
 /// bytes, so they cannot live in the run directory.
-fn socket_dir() -> Result<PathBuf> {
+pub(crate) fn socket_dir() -> Result<PathBuf> {
     // SAFETY: getuid cannot fail.
     let uid = unsafe { libc::getuid() };
     let dir = match std::env::var_os("XDG_RUNTIME_DIR")
@@ -153,25 +294,80 @@ fn socket_dir() -> Result<PathBuf> {
         Some(runtime) => runtime.join("model-router"),
         None => std::env::temp_dir().join(format!("model-router-{uid}")),
     };
-    match fs::create_dir(&dir) {
+    // Created private, so a concurrent mr never sees it with umask bits.
+    match fs::DirBuilder::new().mode(0o700).create(&dir) {
+        // The umask may have taken owner bits too.
         Ok(()) => fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?,
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e).with_context(|| format!("Create {}", dir.display())),
     }
     // The socket accepts keystrokes for an agent: refuse a directory another
     // user could have planted or can read.
-    let meta = fs::symlink_metadata(&dir)?;
     ensure!(
-        meta.is_dir() && meta.uid() == uid && meta.mode() & 0o077 == 0,
+        is_private_dir(&dir),
         "{} must be a private directory owned by you",
         dir.display()
     );
     Ok(dir)
 }
 
-pub(super) fn socket_path() -> Result<PathBuf> {
+/// A real directory, not a link, owned by this user and closed to others.
+pub fn is_private_dir(dir: &Path) -> bool {
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    fs::symlink_metadata(dir)
+        .is_ok_and(|meta| meta.is_dir() && meta.uid() == uid && meta.mode() & 0o077 == 0)
+}
+
+pub(crate) fn socket_path() -> Result<PathBuf> {
     let id = uuid::Uuid::new_v4().simple().to_string();
     Ok(socket_dir()?.join(format!("{}.sock", &id[..16])))
+}
+
+/// The directories `socket_dir` uses here, or would use with no
+/// `XDG_RUNTIME_DIR`, the usual one, or the default temporary directory: an
+/// earlier mr may have had another environment. One that had another
+/// `TMPDIR` or a custom `XDG_RUNTIME_DIR` used a directory not listed here.
+/// Sandboxed stages must not reach any of them (see `sandbox::plan_with`).
+pub fn socket_dirs() -> Vec<PathBuf> {
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let mut dirs = vec![
+        std::env::temp_dir().join(format!("model-router-{uid}")),
+        PathBuf::from(format!("/tmp/model-router-{uid}")),
+        PathBuf::from(format!("/run/user/{uid}/model-router")),
+    ];
+    dirs.extend(
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .map(|runtime| runtime.join("model-router")),
+    );
+    dirs
+}
+
+/// Whether `path` has the shape of a socket from `socket_path`, in one of the
+/// socket directories `socket_dir` uses: an earlier mr may have had another
+/// `XDG_RUNTIME_DIR` than this one, or none. A dead socket is removed and a
+/// live one is sent keystrokes, so a saved run must not name any other file;
+/// a directory that still exists must be private and owned by this user.
+pub fn is_socket_path(path: &Path) -> bool {
+    let named = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|name| name.strip_suffix(".sock"))
+        .is_some_and(|id| {
+            id.len() == 16
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        });
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    named
+        && socket_dirs().iter().any(|dir| dir == parent)
+        && (fs::symlink_metadata(parent).is_err() || is_private_dir(parent))
 }
 
 static PROGRAM: OnceLock<PathBuf> = OnceLock::new();
@@ -286,6 +482,26 @@ struct Client {
     written: usize,
 }
 
+/// Takes the locks a client handed over as it let go, in order.
+fn receive(frames: &mut Frames, locks: &mut Vec<FileLock>, count: usize) {
+    let fds = frames.take_fds();
+    if locks.is_empty() && fds.len() == count {
+        *locks = fds.into_iter().map(FileLock::from_fd).collect();
+    }
+}
+
+/// Lets go of a client, first taking locks it handed over that are still
+/// unread: dropping the connection would close them and free the locks. A
+/// write to an mr that has just closed fails even with its frames queued.
+fn part(mut gone: Client, locks: &mut Vec<FileLock>, count: usize) {
+    gone.frames.fill(&gone.stream);
+    while let Ok(Some((tag, _))) = gone.frames.next() {
+        if tag == tag::LOCKS {
+            receive(&mut gone.frames, locks, count);
+        }
+    }
+}
+
 /// Binds the socket, launches the harness, reports it through `ready`, and
 /// supervises it until it exits.
 fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
@@ -358,13 +574,13 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
     let mut eof = false;
     let mut client: Option<Client> = None;
     let mut pending: Vec<(UnixStream, Frames)> = Vec::new();
-    let mut locks: Vec<crate::storage::FileLock> = Vec::new();
+    let mut locks: Vec<FileLock> = Vec::new();
     let mut stopping: Option<Instant> = None;
     let status = loop {
         // The attached mr first, so one that just let go is gone before a
         // new one asks to attach.
         if let Some(active) = &mut client {
-            let mut open = active.frames.fill(&mut active.stream);
+            let mut open = active.frames.fill(&active.stream);
             loop {
                 match active.frames.next() {
                     Ok(Some((tag::INPUT, payload))) => {
@@ -384,6 +600,9 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
                             stopping = Some(Instant::now() + GRACE);
                         }
                     }
+                    Ok(Some((tag::LOCKS, _))) => {
+                        receive(&mut active.frames, &mut locks, spec.locks.len());
+                    }
                     Ok(Some(_)) => {}
                     Ok(None) => break,
                     Err(_) => {
@@ -400,7 +619,9 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
                 }
             }
             if !open || !flush(&mut active.stream, &mut active.out, &mut active.written) {
-                client = None;
+                if let Some(gone) = client.take() {
+                    part(gone, &mut locks, spec.locks.len());
+                }
                 state.attached = false;
                 state.output.clear();
             }
@@ -430,11 +651,8 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
                 let _ = frames.next();
                 let mut out = Vec::new();
                 // The attached mr may have let go since it was last read.
-                if client
-                    .as_mut()
-                    .is_some_and(|active| !active.frames.fill(&mut active.stream))
-                {
-                    client = None;
+                if let Some(gone) = client.take_if(|active| !active.frames.fill(&active.stream)) {
+                    part(gone, &mut locks, spec.locks.len());
                     state.attached = false;
                     state.output.clear();
                 }
@@ -445,17 +663,32 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
                     continue;
                 }
                 frame(tag::SPAWNED, &pid.to_be_bytes(), &mut out);
+                // A client never sends descriptors before attaching.
+                drop(frames.take_fds());
+                let mut written = 0;
+                if !locks.is_empty() {
+                    // The attached mr takes the locks over, sent with the reply.
+                    let fds: Vec<_> = locks.iter().map(|lock| lock.fd().as_raw_fd()).collect();
+                    match send(&stream, &out, &fds) {
+                        Ok(n) if n > 0 => {
+                            for lock in locks.drain(..) {
+                                lock.hand_over();
+                            }
+                            written = n;
+                        }
+                        // Keep them; that mr sees its connection close.
+                        _ => continue,
+                    }
+                }
                 client = Some(Client {
                     stream,
                     frames,
                     out,
-                    written: 0,
+                    written,
                 });
                 state.attached = true;
                 state.redraw = true;
                 state.output.clear();
-                // The attached mr takes the locks over.
-                locks.clear();
             } else if !open
                 || frames
                     .buffer
@@ -468,7 +701,8 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
             }
         }
         if client.is_none() && locks.is_empty() && !spec.locks.is_empty() {
-            // All or none, in mr's order; retried until the last mr lets go.
+            // Only after an mr vanished without handing its locks over. All
+            // or none, in mr's order; retried until that mr's locks are free.
             let taken: Result<Vec<_>> =
                 spec.locks.iter().map(|p| crate::storage::lock(p)).collect();
             if let Ok(taken) = taken {
@@ -564,6 +798,8 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
         cancelled: stopping.is_some(),
     };
     crate::storage::write_json(&spec.dir.join(EXIT_FILE), &exit)?;
+    // Let go before the socket goes, so an mr that sees it gone can lock.
+    drop(locks);
     // Nobody can attach to a finished harness; the record says how it ended.
     let _ = fs::remove_file(&spec.socket);
     if let Some(mut active) = client.take() {
@@ -594,6 +830,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn more_descriptors_than_a_frame_holds_are_all_refused() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let file = tempfile::tempfile().unwrap();
+        let fds = vec![file.as_raw_fd(); 10];
+        let mut out = Vec::new();
+        frame(tag::LOCKS, &[], &mut out);
+        assert!(send(&a, &out, &fds).unwrap() > 0);
+        let mut frames = Frames::default();
+        assert!(frames.read(&b).unwrap() > 0);
+        // Cut short by the kernel, they are never a valid handover; macOS
+        // also reports the full length, past what it delivered.
+        assert!(frames.take_fds().is_empty());
+        assert_eq!(frames.next().unwrap().unwrap().0, tag::LOCKS);
+    }
+
+    #[test]
     fn frames_split_across_reads_reassemble() {
         let mut out = Vec::new();
         frame(tag::INPUT, b"hello", &mut out);
@@ -621,6 +873,29 @@ mod tests {
             .buffer
             .extend_from_slice(&((FRAME_LIMIT + 1) as u32).to_be_bytes());
         assert!(frames.next().is_err());
+    }
+
+    #[test]
+    fn only_sockets_in_a_socket_directory_are_recognized() {
+        let socket = socket_path().unwrap();
+        assert!(is_socket_path(&socket));
+        // The same shape anywhere else, e.g. in a workspace a stage writes.
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("model-router");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!is_socket_path(
+            &elsewhere.join(socket.file_name().unwrap())
+        ));
+        assert!(!is_socket_path(&socket.with_file_name("notes.txt")));
+        // A link at a socket directory's name is not one, wherever it leads:
+        // the sandbox hides socket directories, and must not hide its target.
+        assert!(is_private_dir(&elsewhere));
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        assert!(!is_private_dir(&link));
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!is_private_dir(&elsewhere));
     }
 
     #[test]

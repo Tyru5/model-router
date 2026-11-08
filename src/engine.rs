@@ -2252,10 +2252,12 @@ fn conclude(
     Ok(())
 }
 
+/// An interactive stage gets its session and the run's held locks, which go
+/// to its terminal host if the stage is left running.
 fn execute_stage(
     run: &mut Run,
     cancel: &AtomicBool,
-    interactive: Option<&process::InteractiveSession>,
+    interactive: Option<(&process::InteractiveSession, &[&storage::FileLock])>,
     emit: &mut impl FnMut(Event),
 ) -> Result<()> {
     let index = run.cursor;
@@ -2270,7 +2272,7 @@ fn execute_stage(
         }
         let _ = run.persist();
     };
-    let result = if let Some(session) = interactive {
+    let result = if let Some((session, held)) = interactive {
         let locks = lock_paths(run)?;
         let result = process::interactive(
             &prepared.invocation,
@@ -2287,7 +2289,7 @@ fn execute_stage(
                 record(run, pgid);
             },
         );
-        if left_running(run, &result, emit)? {
+        if left_running(run, &result, session, held, emit)? {
             return Ok(());
         }
         result
@@ -2327,15 +2329,22 @@ fn execute_stage(
 
 /// True when the interactive harness was released to its terminal host and
 /// keeps running: the attempt stays running for a later mr to reattach.
+/// The run is saved before its locks go to the terminal host with the
+/// connection: the host may hand them to another mr at once, and this one
+/// must not write the run after that.
 fn left_running(
     run: &mut Run,
     result: &Result<process::Outcome>,
+    session: &process::InteractiveSession,
+    held: &[&storage::FileLock],
     emit: &mut impl FnMut(Event),
 ) -> Result<bool> {
     if !matches!(result, Ok(outcome) if outcome.released) {
         return Ok(false);
     }
-    run.persist()?;
+    let saved = run.persist();
+    session.hand_over(held);
+    saved?;
     emit(Event::Output(format!(
         "{} keeps running in the background; mr reattaches to it\n",
         run.current_name()
@@ -2356,7 +2365,13 @@ pub fn detached_terminal(run: &Run) -> Option<PathBuf> {
         return None;
     }
     let attempt = run.stages.get(run.cursor)?.attempts.last()?;
-    let socket = attempt.terminal.as_ref()?;
+    // run.json names the socket, which is sent keystrokes, or removed once
+    // its host is gone: anything but a terminal host's socket (or one from a
+    // socket directory this mr does not use) leaves the attempt interrupted.
+    let socket = attempt
+        .terminal
+        .as_ref()
+        .filter(|socket| process::host::is_socket_path(socket))?;
     (attempt.status == Status::Running
         && (socket.exists() || process::recorded_exit(&attempt.directory).is_some()))
     .then(|| socket.clone())
@@ -2412,11 +2427,46 @@ fn reattach_stage(
         .context("No attempt")?
         .directory
         .clone();
-    // Attach first: the host then lets go of the locks taken next.
-    let terminal = process::Terminal::connect(socket);
-    let (_lock, _workspace_lock) = lock_run(run)?;
-    run.check_revision()?;
-    stop_orphans(run, emit)?;
+    // Attach first: the host hands over the locks it held, so they are never
+    // free. One that held none (it ended, or its mr vanished moments ago)
+    // has let go of them by now.
+    let expected = lock_paths(run)?;
+    let mut terminal = process::Terminal::connect(socket);
+    let handed = match &mut terminal {
+        Ok(terminal) => terminal.take_locks(),
+        Err(_) => Vec::new(),
+    };
+    // run.json names the socket: a host that hands over some other run's
+    // locks gets them back, and its harness is not this stage's.
+    let ours = handed.len() == expected.len()
+        && handed
+            .iter()
+            .zip(&expected)
+            .all(|(lock, path)| lock.is(path));
+    if !handed.is_empty() && !ours {
+        if let Ok(terminal) = &terminal {
+            terminal.hand_over(&[], &handed.iter().collect::<Vec<_>>());
+        }
+        bail!(
+            "The recorded terminal {} belongs to another run; this run's record is invalid",
+            socket.display()
+        );
+    }
+    let locks: [storage::FileLock; 2] = match handed.try_into() {
+        Ok(locks) => locks,
+        Err(_) => {
+            let (run_lock, workspace_lock) = lock_run(run)?;
+            [run_lock, workspace_lock]
+        }
+    };
+    // Until the harness is reconnected, a failure gives the locks back to
+    // its host instead of freeing them while it still runs.
+    if let Err(error) = run.check_revision().and_then(|()| stop_orphans(run, emit)) {
+        if let Ok(terminal) = &terminal {
+            terminal.hand_over(&[], &locks.each_ref());
+        }
+        return Err(error);
+    }
     let result = match terminal {
         Ok(terminal) => {
             if let Some(attempt) = run.stages[index].attempts.last_mut() {
@@ -2442,15 +2492,23 @@ fn reattach_stage(
                     {
                         process::end_group(pgid, process::GRACE, || {});
                     }
-                    let _ = fs::remove_file(socket);
+                    // Only ever a socket: run.json names this path.
+                    if fs::symlink_metadata(socket)
+                        .is_ok_and(|m| std::os::unix::fs::FileTypeExt::is_socket(&m.file_type()))
+                    {
+                        let _ = fs::remove_file(socket);
+                    }
                     Err(error.context("The harness terminal from an earlier mr is gone"))
                 }
             }
         }
     };
-    if left_running(run, &result, emit)? {
+    if left_running(run, &result, session, &locks.each_ref(), emit)? {
         return Ok(());
     }
+    // The harness ran under an earlier approval, so watching, stopping, or
+    // letting it end needs none; its checks run only with one now (see
+    // `run_checks`).
     let prepared = match reprepare(run) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -4000,6 +4058,9 @@ pub fn run_interactive(
     impl Drop for FinishSession<'_> {
         fn drop(&mut self) {
             self.0.finish();
+            // A released connection an error left open: close it; the host
+            // takes the locks by path once they are free.
+            self.0.hand_over(&[]);
         }
     }
     let _session = FinishSession(session);
@@ -4010,11 +4071,16 @@ pub fn run_interactive(
         run.status == Status::Interactive,
         "No interactive stage is ready"
     );
-    let (_lock, _workspace_lock) = lock_run(run)?;
+    let (lock, workspace_lock) = lock_run(run)?;
     run.check_revision()?;
     stop_orphans(run, &mut emit)?;
     crate::trust::authorize_run(run)?;
-    execute_stage(run, cancel, Some(session), &mut emit)?;
+    execute_stage(
+        run,
+        cancel,
+        Some((session, &[&lock, &workspace_lock])),
+        &mut emit,
+    )?;
     if matches!(
         run.status,
         Status::Failed | Status::Blocked | Status::Cancelled
@@ -4305,7 +4371,7 @@ mod tests {
             r#"{"code":0,"cancelled":false}"#,
         )
         .unwrap();
-        run.stages[0].attempts[0].terminal = Some(dir.path().join("gone.sock"));
+        run.stages[0].attempts[0].terminal = Some(process::host::socket_path().unwrap());
         run.persist().unwrap();
         let mut run = load(dir.path(), &run.id).unwrap();
         assert!(detached_terminal(&run).is_some());

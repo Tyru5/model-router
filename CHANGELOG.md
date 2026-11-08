@@ -101,6 +101,11 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 - Shutdown when the terminal disconnects.
 - macOS picker tests and process checks; smoke-test resize race and flaky
   sleeps.
+- The terminal host's socket directory is created private in one step; a
+  second `mr` starting at the same time no longer refuses it.
+- The run and workspace locks pass between `mr` and a terminal host as file
+  descriptors, so they are no longer free while a stage is left running or
+  reattached (only if an attached `mr` dies, until the host takes them back).
 
 ### Security
 

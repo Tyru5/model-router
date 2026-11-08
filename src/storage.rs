@@ -47,13 +47,50 @@ pub fn metadata_dir(project: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
-pub struct FileLock(File);
+/// The second field is set once the lock was handed to another process.
+pub struct FileLock(File, std::sync::atomic::AtomicBool);
 
 impl Drop for FileLock {
     fn drop(&mut self) {
+        // Unlocking would release the copy handed to another process too.
+        if self.1.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         // Closing alone can leave the lock held by a descriptor inherited by
         // another thread's child process until it execs. Release it explicitly.
         let _ = FileExt::unlock(&self.0);
+    }
+}
+
+/// flock locks belong to the open file description, so a descriptor sent to
+/// another process (see `process::host`) carries the lock with it, never free.
+#[cfg(unix)]
+impl FileLock {
+    /// The descriptor holding the lock, to send while this side still owns it.
+    pub fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.0.as_fd()
+    }
+
+    /// A lock received from the process that held it.
+    pub fn from_fd(fd: std::os::fd::OwnedFd) -> Self {
+        Self(File::from(fd), Default::default())
+    }
+
+    /// Records that `fd` was sent to another process, which now holds the
+    /// lock: dropping then only closes this descriptor.
+    pub fn hand_over(&self) {
+        self.1.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether this is a lock on the file at `path`, as for a lock received
+    /// from another process.
+    pub fn is(&self, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        match (self.0.metadata(), fs::metadata(path)) {
+            (Ok(held), Ok(file)) => held.dev() == file.dev() && held.ino() == file.ino(),
+            _ => false,
+        }
     }
 }
 
@@ -66,7 +103,7 @@ pub fn lock(path: &Path) -> Result<FileLock> {
         .open(path)?;
     file.try_lock_exclusive()
         .with_context(|| format!("Another router process is using {}", path.display()))?;
-    Ok(FileLock(file))
+    Ok(FileLock(file, Default::default()))
 }
 
 /// `lock`, retrying for up to `wait` while another holder (often a brief
