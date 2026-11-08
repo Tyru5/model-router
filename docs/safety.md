@@ -98,8 +98,26 @@ sandbox_fallback = "warn"       # default "refuse"
 | Mode | Writable |
 | --- | --- |
 | `read-only` | Attempt directory, run's handoff directory, a private `/tmp`, harness state (`~/.<harness>`, `~/.config/<harness>`, `~/.local/share/<harness>`, `~/.cache`, `~/.local/state`, `~/.claude.json` for Claude), `sandbox_writable`. Everything is readable. |
-| `workspace-write` | The above plus the workspace and, for linked worktrees, their Git directories. |
+| `workspace-write` | The above plus the workspace and, for linked worktrees, their Git directories, except the workspace's `.model-router` directory (run records, other runs), which stays read-only apart from the attempt and handoff directories; a stage refuses to start when that directory is a symbolic link, which it could replace. |
 | `by-role` | `read-only` for research, planning, review, summary; `workspace-write` otherwise. |
+
+In every mode a stage can write inside its attempt and handoff directories but
+cannot remove or replace them, and a stage refuses to start when either is a
+symbolic link: later stages are granted the same directories. The router's own
+files there, such as check logs and candidate patches, replace whatever the
+stage left at their names rather than writing through a link. This assumes
+nothing from the stage still runs: a process it detached into its own session
+outlives the harness (the sandbox has no process namespace), keeps the stage's
+write access, and could race those writes.
+
+A stage cannot reach a terminal host (see below), whose harness runs outside
+the sandbox, through the usual socket directories: `$XDG_RUNTIME_DIR/model-router`,
+`/run/user/<uid>/model-router`, `/tmp/model-router-<uid>`, and the temp
+directory's `model-router-<uid>`. bubblewrap hides them; Seatbelt denies
+connecting to or writing in them, and renaming the directories above them.
+An `mr` that ran with another `TMPDIR` or a custom `XDG_RUNTIME_DIR` put its
+sockets elsewhere, which stay reachable, as does a socket directory first
+created after the stage started.
 
 - Linux: [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`).
   macOS: `sandbox-exec` with a generated profile.

@@ -60,6 +60,15 @@ pub struct Plan {
     /// Read-only paths re-exposed under the private `/tmp`.
     #[serde(skip)]
     readable: Vec<PathBuf>,
+    /// The attempt and handoff directories: writable inside, but never
+    /// removed or replaced, since later stages are granted them again.
+    /// Bubblewrap's bind mounts already pin them.
+    #[serde(skip)]
+    pinned: Vec<PathBuf>,
+    /// Terminal-host socket directories, hidden last: a stage that reached
+    /// another run's host could type into a harness outside its sandbox.
+    #[serde(skip)]
+    hidden: Vec<PathBuf>,
 }
 
 /// Paths of one attempt.
@@ -204,7 +213,21 @@ pub fn plan_with(
         ),
     };
     let private_tmp = backend == Some(Backend::Bubblewrap);
-    let mut writable = vec![canonical(paths.attempt_dir), canonical(paths.handoff_dir)];
+    // A link here, left by an earlier stage, would grant wherever it leads.
+    // Nothing is granted when no backend sandboxes the stage.
+    for dir in [paths.attempt_dir, paths.handoff_dir]
+        .into_iter()
+        .filter(|_| backend.is_some())
+    {
+        ensure!(
+            !fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()),
+            "Stage {} cannot be sandboxed: {} is a symbolic link, so an earlier stage may have replaced it",
+            stage.id,
+            dir.display()
+        );
+    }
+    let pinned = vec![canonical(paths.attempt_dir), canonical(paths.handoff_dir)];
+    let mut writable = pinned.clone();
     let mut readable = vec![canonical(paths.workspace)];
     let git = git_dirs(paths.workspace);
     if mode == Sandbox::WorkspaceWrite {
@@ -263,13 +286,44 @@ pub fn plan_with(
             .cloned()
             .collect()
     } else {
-        vec![]
+        // The router's own state (run.json, other runs, worktrees) is not the
+        // harness's to edit: a rewritten run record would steer later replays.
+        // The attempt and handoff directories inside it stay writable.
+        // A link there could be replaced from inside the writable workspace,
+        // whatever protects its target, so it is refused.
+        let link = paths.workspace.join(".model-router");
+        ensure!(
+            backend.is_none()
+                || !fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()),
+            "Stage {} cannot use the workspace-write sandbox while {} is a symbolic link: the stage could replace it. Make it a directory, or use a worktree run; while Git does not ignore the link, fan-out candidates and forks check it out too, so add `/.model-router` to .git/info/exclude (and untrack it if it is committed)",
+            stage.id,
+            link.display()
+        );
+        let metadata = canonical(&link);
+        if metadata.is_dir() {
+            vec![metadata]
+        } else {
+            vec![]
+        }
     };
     tidy(&mut protected);
     // Only paths hidden by the private /tmp need re-exposing.
     readable
         .retain(|p| private_tmp && p.starts_with("/tmp") && !all.iter().any(|w| p.starts_with(w)));
     tidy(&mut readable);
+    // Create this mr's socket directory now, so a host started after the
+    // stage cannot appear in it. Those under a private /tmp are hidden too:
+    // `sandbox_writable` or a harness's directory can re-expose the real one.
+    // Only real private directories hold sockets: a link planted at one of
+    // these names (even by an earlier stage) must not hide where it leads.
+    let _ = crate::process::host::socket_dir();
+    let mut hidden: Vec<PathBuf> = crate::process::host::socket_dirs()
+        .iter()
+        .filter(|_| backend.is_some())
+        .filter(|dir| crate::process::host::is_private_dir(dir))
+        .filter_map(|dir| Some(canonical(dir.parent()?).join(dir.file_name()?)))
+        .collect();
+    tidy(&mut hidden);
     Ok(Some(Plan {
         mode,
         backend,
@@ -281,6 +335,8 @@ pub fn plan_with(
         warning,
         protected,
         readable,
+        pinned,
+        hidden,
     }))
 }
 
@@ -424,6 +480,10 @@ impl Plan {
             let path = path.display().to_string();
             args.extend([flag.to_owned(), path.clone(), path]);
         }
+        // After every bind, so none of them exposes these again.
+        for path in &self.hidden {
+            args.extend(["--tmpfs".into(), path.display().to_string()]);
+        }
         args.extend(["--die-with-parent".into(), "--".into()]);
         args
     }
@@ -465,6 +525,32 @@ impl Plan {
                 }
                 text.push_str(")\n");
             }
+        }
+        // `subpath` also matches the directory itself, which could then be
+        // removed and replaced with a link.
+        text.push_str("(deny file-write*");
+        for path in &self.pinned {
+            text.push_str(&format!(
+                "\n    (literal {})",
+                sbpl_string(&path.display().to_string())
+            ));
+        }
+        text.push_str(")\n");
+        for path in &self.hidden {
+            text.push_str(&format!(
+                "(deny file-write* network-outbound (subpath {}))\n",
+                sbpl_string(&path.display().to_string())
+            ));
+            // Seatbelt matches paths, so renaming a writable ancestor (such
+            // as $TMPDIR) would give the sockets paths no rule names.
+            text.push_str("(deny file-write*");
+            for ancestor in path.ancestors().skip(1).filter(|a| a.parent().is_some()) {
+                text.push_str(&format!(
+                    "\n    (literal {})",
+                    sbpl_string(&ancestor.display().to_string())
+                ));
+            }
+            text.push_str(")\n");
         }
         if !self.network {
             text.push_str("(deny network*)\n");
@@ -826,7 +912,8 @@ mod tests {
         let attempt = at("--bind", &d.attempt);
         assert!(root < workspace && workspace < attempt, "{args:?}");
 
-        // Workspace-write has nothing to protect.
+        // Workspace-write protects only the router's state, re-allowing the
+        // attempt and handoff directories inside it.
         let stage = Stage {
             sandbox: Some(Sandbox::WorkspaceWrite),
             ..stage
@@ -834,7 +921,125 @@ mod tests {
         let plan = plan_for(&d, &stage, Sandbox::Off, bwrap())
             .unwrap()
             .unwrap();
-        assert!(plan.protected.is_empty());
+        let metadata = d.workspace.join(".model-router");
+        assert_eq!(plan.protected, vec![metadata.clone()]);
+        let args = plan.bwrap_args();
+        let at = |flag: &str, path: &Path| {
+            let path = path.display().to_string();
+            args.windows(3)
+                .position(|w| w[0] == flag && w[1] == path && w[2] == path)
+                .unwrap_or_else(|| panic!("{flag} {path} missing: {args:?}"))
+        };
+        let workspace = at("--bind", &d.workspace);
+        let protected = at("--ro-bind", &metadata);
+        assert!(workspace < protected, "{args:?}");
+        assert!(protected < at("--bind", &d.attempt), "{args:?}");
+        assert!(protected < at("--bind", &d.handoff), "{args:?}");
+    }
+
+    #[test]
+    fn a_symlinked_metadata_directory_refuses_workspace_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let workspace = root.join("work");
+        let target = root.join("elsewhere/meta");
+        let attempt = target.join("runs/r/01-a/attempt-001");
+        let handoff = target.join("handoffs/r");
+        for dir in [&workspace, &attempt, &handoff] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        std::os::unix::fs::symlink(&target, workspace.join(".model-router")).unwrap();
+        let stage = Stage {
+            sandbox: Some(Sandbox::WorkspaceWrite),
+            ..Stage::default()
+        };
+        let plan = plan_with(
+            &workflow(Sandbox::Off),
+            &stage,
+            &Paths {
+                workspace: &workspace,
+                attempt_dir: &workspace.join(".model-router/runs/r/01-a/attempt-001"),
+                handoff_dir: &workspace.join(".model-router/handoffs/r"),
+                program: "sh",
+            },
+            bwrap(),
+            None,
+        )
+        .expect_err("the link could be swapped from inside the workspace");
+        assert!(format!("{plan:#}").contains("symbolic link"), "{plan:#}");
+        // Unsandboxed by `sandbox_fallback = "warn"`, it runs as before.
+        let fallback = Stage {
+            sandbox_fallback: SandboxFallback::Warn,
+            ..stage
+        };
+        let plan = plan_with(
+            &workflow(Sandbox::Off),
+            &fallback,
+            &Paths {
+                workspace: &workspace,
+                attempt_dir: &workspace.join(".model-router/runs/r/01-a/attempt-001"),
+                handoff_dir: &workspace.join(".model-router/handoffs/r"),
+                program: "sh",
+            },
+            Err("no backend".into()),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(plan.backend, None);
+    }
+
+    #[test]
+    fn a_handoff_directory_replaced_by_a_link_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let workspace = root.join("work");
+        let attempt = workspace.join(".model-router/runs/r/01-a/attempt-002");
+        let handoff = workspace.join(".model-router/handoffs/r");
+        fs::create_dir_all(&attempt).unwrap();
+        fs::create_dir_all(handoff.parent().unwrap()).unwrap();
+        // As an earlier stage could leave it, pointing at the run's records.
+        std::os::unix::fs::symlink(workspace.join(".model-router/runs/r"), &handoff).unwrap();
+        for mode in [Sandbox::ReadOnly, Sandbox::WorkspaceWrite] {
+            let stage = Stage {
+                sandbox: Some(mode),
+                ..Stage::default()
+            };
+            let error = plan_with(
+                &workflow(Sandbox::Off),
+                &stage,
+                &Paths {
+                    workspace: &workspace,
+                    attempt_dir: &attempt,
+                    handoff_dir: &handoff,
+                    program: "sh",
+                },
+                bwrap(),
+                None,
+            )
+            .expect_err("the link would grant the run's records");
+            assert!(format!("{error:#}").contains("symbolic link"), "{error:#}");
+            // Nothing to protect when the stage runs unsandboxed anyway.
+            let fallback = Stage {
+                sandbox_fallback: SandboxFallback::Warn,
+                ..stage
+            };
+            let plan = plan_with(
+                &workflow(Sandbox::Off),
+                &fallback,
+                &Paths {
+                    workspace: &workspace,
+                    attempt_dir: &attempt,
+                    handoff_dir: &handoff,
+                    program: "sh",
+                },
+                Err("no backend".into()),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(plan.backend, None);
+        }
     }
 
     #[test]
@@ -873,5 +1078,67 @@ mod tests {
         assert_eq!(argv[0], "-p");
         assert_eq!(argv[1], profile);
         assert_eq!(&argv[2..], ["claude", "-p"]);
+    }
+
+    #[test]
+    fn stages_cannot_reach_terminal_host_sockets() {
+        // Another run's host accepts keystrokes for a harness outside the
+        // sandbox, so every existing socket directory is denied or hidden.
+        let d = dirs();
+        let stage = Stage {
+            sandbox: Some(Sandbox::ReadOnly),
+            ..Stage::default()
+        };
+        let seatbelt = Ok((Backend::SandboxExec, PathBuf::from("/usr/bin/sandbox-exec")));
+        let plan = plan_for(&d, &stage, Sandbox::Off, seatbelt)
+            .unwrap()
+            .unwrap();
+        let mine = canonical(&crate::process::host::socket_dir().unwrap());
+        let deny = format!(
+            "(deny file-write* network-outbound (subpath {}))",
+            sbpl_string(&mine.display().to_string())
+        );
+        let profile = plan.profile();
+        assert!(profile.contains(&deny), "{profile}");
+        let parent = mine.parent().unwrap().display().to_string();
+        let pinned = format!("(literal {})", sbpl_string(&parent));
+        assert!(
+            profile[profile.find(&deny).unwrap()..].contains(&pinned),
+            "a writable parent could be renamed: {profile}"
+        );
+        // Under a private /tmp too, which later binds can re-expose.
+        let plan = plan_for(&d, &stage, Sandbox::Off, bwrap())
+            .unwrap()
+            .unwrap();
+        assert!(plan.hidden.contains(&mine), "{:?}", plan.hidden);
+        // bubblewrap, end to end, with a socket directory a private /tmp
+        // would not hide.
+        let Ok((Backend::Bubblewrap, program)) = detect() else {
+            return;
+        };
+        let mut plan = plan_for(&d, &stage, Sandbox::Off, Ok((Backend::Bubblewrap, program)))
+            .unwrap()
+            .unwrap();
+        plan.private_tmp = false;
+        let sockets = d.root.join("sockets");
+        fs::create_dir(&sockets).unwrap();
+        let socket = sockets.join("0123456789abcdef.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let connect = |plan: &Plan| {
+            let script = format!(
+                "import socket; socket.socket(socket.AF_UNIX).connect({:?})",
+                socket.display().to_string()
+            );
+            let (program, args) = plan.wrap("python3", &["-c".into(), script]);
+            std::process::Command::new(program)
+                .args(args)
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(connect(&plan), "the probe itself must work");
+        plan.hidden = vec![sockets.clone()];
+        assert!(!connect(&plan), "a stage reached a terminal host's socket");
     }
 }

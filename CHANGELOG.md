@@ -137,6 +137,16 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   the stage fails once the harness ends, which it can still be stopped or
   watched to do.
 - A session ID that could pass as an option never reaches a harness.
+- `workspace-write` sandboxes keep the workspace's `.model-router` directory
+  read-only apart from the attempt and handoff directories, and refuse to
+  start when it is a symbolic link the stage could replace. A sandboxed
+  stage can write inside its attempt and handoff directories but not remove
+  or replace them, and a stage refuses to start when either is a link.
+- Sandboxed stages can no longer reach terminal-host sockets in the usual
+  socket directories, so they cannot attach to and type into another run's
+  interactive harness, which runs outside the sandbox, or take its locks.
+  An `mr` run with another `TMPDIR` or a custom `XDG_RUNTIME_DIR` puts its
+  sockets elsewhere; see the safety docs.
 - `serve --http` keeps connections whose headers have not authenticated in
   their own queue and cuts off the oldest once it has waited half a second,
   so idle sockets cannot lock out authenticated clients and a burst of

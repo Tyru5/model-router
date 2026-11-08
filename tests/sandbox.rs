@@ -20,14 +20,24 @@ use std::{
 /// Tries to write into the workspace, `/tmp`, and the handoff file; reports
 /// which succeeded in the handoff summary.
 const PROBE: &str = r#"
-import json, pathlib, sys
+import json, os, pathlib, sys
 def attempt(path):
     try:
         pathlib.Path(path).write_text("x")
         return "wrote"
     except OSError:
         return "blocked"
-summary = "workspace=" + attempt("escaped.txt") + " tmp=" + attempt("/tmp/probe.txt")
+def swap(path):
+    # Replacing its own handoff directory would let it pick what a later
+    # stage may write; put it back if that worked.
+    try:
+        os.rmdir(path)
+    except OSError:
+        return "blocked"
+    os.mkdir(path)
+    return "removed"
+summary = ("workspace=" + attempt("escaped.txt") + " meta=" + attempt(".model-router/tamper.txt")
+           + " tmp=" + attempt("/tmp/probe.txt") + " swap=" + swap(os.path.dirname(sys.argv[1])))
 handoff = {"summary": summary, "verdict": "complete", "findings": [], "decisions": [],
            "files_changed": [], "tests": [], "unresolved": []}
 pathlib.Path(sys.argv[1]).write_text(json.dumps(handoff))
@@ -93,7 +103,10 @@ fn read_only_blocks_workspace_writes_but_not_the_handoff() {
     let stage = &run.stages[0];
     assert_eq!(stage.status, Status::Complete, "{:?}", run.error);
     let summary = &stage.handoff.as_ref().unwrap().summary;
-    assert_eq!(summary, "workspace=blocked tmp=wrote");
+    assert_eq!(
+        summary,
+        "workspace=blocked meta=blocked tmp=wrote swap=blocked"
+    );
     assert!(!dir.path().join("escaped.txt").exists());
     assert!(stage.attempts[0].handoff_file.exists());
     let command: serde_json::Value = serde_json::from_slice(
@@ -130,7 +143,12 @@ fn workspace_write_allows_workspace_writes() {
     }
     let (dir, run) = run_probe(Sandbox::WorkspaceWrite);
     let summary = &run.stages[0].handoff.as_ref().unwrap().summary;
-    assert_eq!(summary, "workspace=wrote tmp=wrote");
+    // The router's run records are not the harness's to rewrite; its
+    // handoff inside them still was written.
+    assert_eq!(
+        summary,
+        "workspace=wrote meta=blocked tmp=wrote swap=blocked"
+    );
     assert!(dir.path().join("escaped.txt").exists());
 }
 
