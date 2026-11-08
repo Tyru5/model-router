@@ -810,6 +810,15 @@ pub fn parse(text: &str) -> Result<Settings> {
     Ok(settings)
 }
 
+/// Whether `id` can be a stage or fan-out candidate ID: nonempty letters,
+/// digits, '-' and '_'. IDs name directories and worktrees.
+pub fn is_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 impl Settings {
     pub fn validate(&self) -> Result<()> {
         ensure!(
@@ -849,11 +858,7 @@ impl Settings {
             let order = crate::graph::order(workflow);
             for (index, stage) in workflow.stages.iter().enumerate() {
                 ensure!(
-                    !stage.id.is_empty()
-                        && stage
-                            .id
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                    is_id(&stage.id),
                     "Stage IDs must contain only letters, digits, '-' and '_'"
                 );
                 ensure!(

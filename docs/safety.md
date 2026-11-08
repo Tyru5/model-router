@@ -42,11 +42,29 @@ Trust is a SHA-256 digest of those sections per project in
 Your global config and a `--config` file are always trusted.
 
 Saved runs are checked against the commands and permission policies they will
-actually execute before retry, rerun, or interactive recovery. New runs keep
+actually execute before retry, rerun, or interactive recovery; a harness that
+outlived its `mr` can still be reattached, stopped, or left to end, but its
+stage's checks run only while the run is approved. New runs keep
 an approval digest outside the workspace in `<config dir>/run-approvals/`,
 including runs created from global or explicit configs. Changing saved commands
 or effective sandbox, network, or native permission settings invalidates that
-approval. `trust --revoke` also removes the project's saved-run
+approval, and a config cannot reapprove a run whose digest no longer matches;
+to replay such a run anyway, review its run.json, run `trust --revoke`, and
+trust the matching config again. An update to model-router that changes how
+settings are assessed (for example, which harness settings escalate) can
+also stop older approvals from matching; they recover the same way.
+A saved run must also keep the workspace, run directory, and candidate
+worktree paths that follow from its project and ID, attempt and candidate
+patch paths inside that run's own directories (with no link inside them
+leading out),
+valid stage and
+fan-out candidate IDs (letters, digits, `-` and `_`), only the candidate IDs
+its workflow gives each stage, and Git object names as its snapshots. A running attempt's recorded terminal is reattached to only when it
+is a socket in the terminal host's private socket directory; otherwise the
+attempt counts as interrupted. A recorded or reported harness session ID
+that could pass as an option is never given to a harness. A run recorded
+through a link to its project is respelled to the project as it resolves now,
+so the link is never followed again. `trust --revoke` also removes the project's saved-run
 approvals. Older runs, or runs without an approval digest, can replay only when
 their executable settings and policies are still present in the current trusted
 config. To reapprove one, restore and trust the matching config, or explicitly

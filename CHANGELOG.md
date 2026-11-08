@@ -123,6 +123,19 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   reach loopback, link-local, or private addresses.
 - Provider `base_url` with credentials, query, or fragment is rejected;
   environment values are redacted in previews and records.
+- Saved runs must keep the workspace, run directory, and candidate worktree
+  paths that follow from their project and ID, attempt and candidate patch
+  paths inside the run's own directories, with no link there leading out, valid
+  stage and candidate IDs, only the fan-out candidate IDs their workflow
+  gives, and Git object names as snapshots; a running attempt's terminal is reattached to only when it is
+  a socket in the terminal host's socket directory, and a config can no
+  longer reapprove a run whose approval digest stopped matching or cannot be
+  read. A run recorded through a link to its project follows the project
+  as it resolves now, not the link.
+- Reattaching to an interactive stage whose harness outlived its `mr` runs
+  the stage's checks only while the saved run is still approved; otherwise
+  the stage fails once the harness ends, which it can still be stopped or
+  watched to do.
 - A session ID that could pass as an option never reaches a harness.
 - `serve --http` keeps connections whose headers have not authenticated in
   their own queue and cuts off the oldest once it has waited half a second,

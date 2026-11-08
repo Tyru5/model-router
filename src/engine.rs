@@ -1366,15 +1366,220 @@ fn set_aside_handoff(handoff_file: &Path, attempt_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The attempt paths a run records, which `load` respells and validates.
+fn recorded_paths(run: &mut Run) -> Vec<&mut PathBuf> {
+    let mut paths: Vec<&mut PathBuf> = run.resume.iter_mut().map(|r| &mut r.handoff_file).collect();
+    for state in &mut run.stages {
+        let mut attempts: Vec<&mut Attempt> = state.attempts.iter_mut().collect();
+        for candidate in state.fan_out.iter_mut().flat_map(|f| &mut f.candidates) {
+            attempts.extend(&mut candidate.attempts);
+            paths.extend(candidate.changes.as_mut().map(|changes| &mut changes.patch));
+        }
+        for attempt in attempts {
+            paths.extend([&mut attempt.directory, &mut attempt.handoff_file]);
+            paths.extend(&mut attempt.worktree);
+        }
+    }
+    paths
+}
+
 pub fn load(project: &Path, id: &str) -> Result<Run> {
-    let run: Run = storage::read_json(&storage::run_dir(project, id)?.join("run.json"))?;
+    let mut run: Run = storage::read_json(&storage::run_dir(project, id)?.join("run.json"))?;
+    let project = fs::canonicalize(project)?;
+    let no_parent = |path: &Path| {
+        !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    };
     ensure!(
         run.version == 1
             && run.id == id
-            && fs::canonicalize(&run.project)? == fs::canonicalize(project)?
+            && no_parent(&run.project)
+            && fs::canonicalize(&run.project)? == project
             && run.stages.len() == run.workflow.stages.len()
             && run.cursor <= run.stages.len(),
         "Invalid or unsupported run record"
+    );
+    // The record may spell the project through a link: the project moved
+    // behind one since, or a link (perhaps inside the project, where a stage
+    // can repoint it) was put there. From now on every path follows the
+    // project as it resolves today, never the link.
+    let spelled = std::mem::replace(&mut run.project, project.clone());
+    let respell = |path: &mut PathBuf| {
+        if let Ok(rest) = path.strip_prefix(&spelled) {
+            // `join("")` would add a trailing separator to the display.
+            *path = if rest.as_os_str().is_empty() {
+                project.clone()
+            } else {
+                project.join(rest)
+            };
+        }
+    };
+    respell(&mut run.workspace);
+    respell(&mut run.directory);
+    recorded_paths(&mut run).into_iter().for_each(respell);
+    // run.json is writable from inside a workspace-write sandbox, and the
+    // replay approval does not cover paths: where the run executes and
+    // keeps its artifacts must follow from the project and ID alone.
+    let base = project.join(".model-router");
+    let workspace = if run.worktree {
+        base.join("worktrees").join(id)
+    } else {
+        project.clone()
+    };
+    ensure!(
+        run.workspace == workspace && run.directory == base.join("runs").join(id),
+        "Invalid or unsupported run record: its workspace or directory is not where the project keeps run {id}"
+    );
+    // Snapshot names reach Git's command line: hex object names only, never
+    // an option such as `--output=<file>`.
+    let object = |name: &String| {
+        matches!(name.len(), 40 | 64) && name.bytes().all(|b| b.is_ascii_hexdigit())
+    };
+    let attempts = || {
+        run.stages.iter().flat_map(|state| {
+            state.attempts.iter().chain(
+                state
+                    .fan_out
+                    .iter()
+                    .flat_map(|f| &f.candidates)
+                    .flat_map(|c| &c.attempts),
+            )
+        })
+    };
+    ensure!(
+        run.baseline.iter().all(object)
+            && attempts().all(|a| {
+                [&a.tree_before, &a.tree_after, &a.checks_tree]
+                    .into_iter()
+                    .flatten()
+                    .all(object)
+            })
+            && run
+                .stages
+                .iter()
+                .filter_map(|state| state.fan_out.as_ref())
+                .all(|f| object(&f.base) && object(&f.base_commit)),
+        "Invalid or unsupported run record: a recorded snapshot is not a Git object name"
+    );
+    // Stage and candidate IDs name directories and worktrees, and candidate
+    // IDs are not part of the approval digest.
+    ensure!(
+        run.workflow.stages.iter().all(|stage| {
+            crate::config::is_id(&stage.id)
+                && stage
+                    .fan_out
+                    .as_ref()
+                    .is_none_or(|f| f.ids().iter().all(|id| crate::config::is_id(id)))
+        }),
+        "Invalid or unsupported run record: a stage or candidate ID is not a valid ID"
+    );
+    // Candidate IDs and attempt numbers name candidate directories and
+    // worktrees: they must be the stage's own, and each candidate attempt's
+    // worktree exactly where `launch_candidate` puts it.
+    let mut worktrees = vec![];
+    for (state, stage) in run.stages.iter().zip(&run.workflow.stages) {
+        ensure!(
+            state.attempts.iter().all(|a| a.worktree.is_none()),
+            "Invalid or unsupported run record: a stage attempt names a worktree"
+        );
+        let Some(fan_out) = &state.fan_out else {
+            continue;
+        };
+        ensure!(
+            stage
+                .fan_out
+                .as_ref()
+                .is_some_and(|f| f.ids().iter().eq(fan_out.candidates.iter().map(|c| &c.id))),
+            "Invalid or unsupported run record: stage {} has candidates its workflow does not",
+            stage.id
+        );
+        for candidate in &fan_out.candidates {
+            for (n, attempt) in candidate.attempts.iter().enumerate() {
+                let expected = base
+                    .join("candidates")
+                    .join(id)
+                    .join(&stage.id)
+                    .join(format!("{}-{:03}", candidate.id, n + 1));
+                ensure!(
+                    attempt.number == n + 1
+                        && attempt.worktree.as_ref().is_none_or(|w| *w == expected),
+                    "Invalid or unsupported run record: candidate {} has a misplaced attempt",
+                    candidate.id
+                );
+                worktrees.push(expected);
+            }
+        }
+    }
+    // Attempt paths are read, moved aside, and removed later; all of them
+    // live inside this run's own directories under the project's metadata
+    // directory (`runs/<id>/…`, `handoffs/<id>/…`, …), never another run's.
+    // Links may relocate the metadata directory or those directories, but
+    // none inside one may lead out.
+    let resolved = |path: &Path| {
+        path.ancestors().find_map(|known| {
+            Some(
+                fs::canonicalize(known)
+                    .ok()?
+                    .join(path.strip_prefix(known).ok()?),
+            )
+        })
+    };
+    let inside = |path: &Path| {
+        let Ok(rest) = path.strip_prefix(&base) else {
+            return false;
+        };
+        let parts: Vec<&std::ffi::OsStr> = rest.components().map(|c| c.as_os_str()).collect();
+        // Attempt directories sit at `runs/<id>/<stage>/<attempt>`, below the
+        // run's own records and locks; in a worktree or candidate checkout,
+        // only its metadata directory's handoffs belong to the run, and a
+        // candidate's checkout itself.
+        if parts.len() <= 2 || parts[1] != std::ffi::OsStr::new(id) {
+            return false;
+        }
+        let laid_out = match parts[0].to_str() {
+            Some("runs") => parts.len() >= 4,
+            Some("handoffs") => true,
+            Some("worktrees" | "candidates") => parts
+                .iter()
+                .position(|part| *part == ".model-router")
+                .map_or(worktrees.iter().any(|w| w == path), |at| {
+                    parts.get(at + 1).is_some_and(|next| *next == "handoffs")
+                }),
+            _ => false,
+        };
+        if !no_parent(path) || !laid_out {
+            return false;
+        }
+        let mut containers = vec![base.join(rest.components().take(2).collect::<PathBuf>())];
+        // A checkout's metadata directory may be a link to the project's
+        // (one Git does not ignore is checked out with it), so its handoffs
+        // land in this run's own handoff directory.
+        if matches!(parts[0].to_str(), Some("worktrees" | "candidates")) {
+            containers.push(base.join("handoffs").join(id));
+        }
+        // The last component is judged by name: a stage may leave a link at
+        // a file it can write, which is read, moved, or removed, never
+        // followed to write.
+        let Some(path) = path
+            .parent()
+            .and_then(resolved)
+            .zip(path.file_name())
+            .map(|(parent, name)| parent.join(name))
+        else {
+            return false;
+        };
+        containers
+            .iter()
+            .filter_map(|container| resolved(container))
+            .any(|container| path.starts_with(container))
+    };
+    ensure!(
+        recorded_paths(&mut run)
+            .into_iter()
+            .all(|path| inside(path)),
+        "Invalid or unsupported run record: a recorded path is outside {}",
+        base.display()
     );
     Ok(run)
 }
@@ -1819,6 +2024,9 @@ struct Prepared {
     sandbox: Option<crate::sandbox::Plan>,
     directory: PathBuf,
     handoff_file: PathBuf,
+    /// The harness ran under an earlier mr's approval (reattached), so the
+    /// stage's checks need the run to be approved now.
+    reattached: bool,
 }
 
 fn prepare(run: &mut Run) -> Result<Prepared> {
@@ -1947,6 +2155,7 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
         sandbox,
         directory,
         handoff_file,
+        reattached: false,
     })
 }
 
@@ -2184,6 +2393,17 @@ fn run_checks(
     let configured = run.workflow.stages[index].checks.clone();
     if configured.is_empty() {
         return Ok(true);
+    }
+    if prepared.reattached {
+        if let Err(error) = crate::trust::authorize_run(run) {
+            run.stop(
+                Status::Failed,
+                format!("The harness ended, but the stage's checks did not run: {error:#}"),
+                Actor::Engine,
+                true,
+            )?;
+            return Ok(false);
+        }
     }
     let workspace = run.workspace.clone();
     // The receipt: exactly what the checks are about to test.
@@ -2435,6 +2655,7 @@ fn reprepare(run: &Run) -> Result<Prepared> {
         sandbox: None,
         directory,
         handoff_file: attempt.handoff_file.clone(),
+        reattached: true,
     })
 }
 
@@ -2843,6 +3064,7 @@ impl Run {
                 sandbox,
                 directory,
                 handoff_file,
+                reattached: false,
             },
             cwd,
         ))
@@ -4042,8 +4264,12 @@ pub fn authorize_replay(
     explicit: Option<&Path>,
     mut emit: impl FnMut(Event),
 ) -> Result<()> {
-    // Its terminal host holds the locks; reattaching launches nothing.
+    // Its terminal host holds the locks. Reattaching needs no approval to
+    // show, stop, or end the harness, and checks it before running the
+    // stage's checks; this only lets a selected config approve a run that
+    // has no receipt yet.
     if detached_terminal(run).is_some() {
+        let _ = crate::trust::authorize_run_config(run, explicit);
         return Ok(());
     }
     let (_lock, _workspace_lock) = lock_run(run)?;
@@ -4649,6 +4875,102 @@ mod tests {
             "Done while away"
         );
         assert!(detached_terminal(&run).is_none());
+    }
+
+    #[test]
+    fn reattaching_refuses_saved_settings_changed_since_approval() {
+        // The host recorded the harness's exit, or died without doing so.
+        for exited in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let settings = Settings {
+                workflows: vec![Workflow::new(
+                    "Interactive",
+                    vec![Stage {
+                        id: "implement".into(),
+                        harness: "mock".into(),
+                        mode: Mode::Interactive,
+                        ..Stage::default()
+                    }],
+                )],
+                adapters: BTreeMap::from([(
+                    "mock".into(),
+                    CustomAdapter {
+                        command: "python3".into(),
+                        interactive_args: Some(vec![]),
+                        ..CustomAdapter::default()
+                    },
+                )]),
+                ..Settings::default()
+            };
+            let mut run = Run::create(
+                dir.path(),
+                &settings,
+                &settings.workflows[0],
+                "Task".into(),
+                false,
+            )
+            .unwrap();
+            let prepared = prepare(&mut run).unwrap();
+            fs::write(prepared.directory.join("stdout.log"), "transcript").unwrap();
+            fs::write(
+                &prepared.handoff_file,
+                r#"{"summary":"Done while away","verdict":"complete"}"#,
+            )
+            .unwrap();
+            if exited {
+                fs::write(
+                    prepared.directory.join("terminal-exit.json"),
+                    r#"{"code":0,"cancelled":false}"#,
+                )
+                .unwrap();
+            }
+            let socket = process::host::socket_path().unwrap();
+            if !exited {
+                // Its socket outlived it: nothing listens there now.
+                drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+            }
+            run.stages[0].attempts[0].terminal = Some(socket);
+            // run.json gained a check command nobody approved.
+            let marker = dir.path().join("ran");
+            run.workflow.stages[0].checks = vec![crate::config::Check {
+                command: vec!["touch".into(), marker.display().to_string()],
+                required: true,
+                ..Default::default()
+            }];
+            run.persist().unwrap();
+            let mut run = load(dir.path(), &run.id).unwrap();
+            assert!(detached_terminal(&run).is_some());
+            // Reattaching still finishes the harness, which ran under the
+            // earlier approval, but never runs the unapproved check.
+            authorize_replay(&mut run, None, |_| {}).unwrap();
+            let cancel = AtomicBool::new(false);
+            let session = process::InteractiveSession::new(80, 24);
+            run_interactive(&mut run, &cancel, &session, |_| {}).unwrap();
+            assert!(!marker.exists(), "an unapproved check ran");
+            assert_eq!(run.status, Status::Failed);
+            assert_eq!(run.stages[0].attempts[0].status, Status::Failed);
+            let error = run.error.clone().unwrap_or_default();
+            if exited {
+                assert!(
+                    error.contains("checks did not run") && error.contains("untrusted"),
+                    "{error}"
+                );
+                // The attempt's ending is still recorded, as for any stage.
+                let attempt = &run.stages[0].attempts[0];
+                assert_eq!(attempt.exit_code, Some(0), "{attempt:?}");
+                assert!(attempt.finished_at.is_some() && attempt.process_group.is_none());
+                assert_eq!(attempt.handoff_source, Some(HandoffSource::File));
+            } else {
+                // A harness that never finished had nothing to check: the
+                // failure is the lost terminal, not the approval.
+                assert!(
+                    error.contains("terminal from an earlier mr is gone")
+                        && !error.contains("untrusted"),
+                    "{error}"
+                );
+            }
+            assert!(detached_terminal(&run).is_none());
+        }
     }
 
     fn interactive(stage: Stage, handoff: Option<&str>) -> (tempfile::TempDir, Run) {

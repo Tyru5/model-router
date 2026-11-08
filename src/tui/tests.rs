@@ -1455,8 +1455,8 @@ fn shift_y_retries_one_failed_fan_out_candidate_of_the_stopped_stage() {
     });
     run.stages[0].fan_out = Some(
         serde_json::from_value(serde_json::json!({
-            "base": "tree",
-            "base_commit": "commit",
+            "base": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+            "base_commit": "0123456789abcdef0123456789abcdef01234567",
             "candidates": [
                 {"id": "c1", "harness": "no-such-harness", "model": "", "status": "complete",
                  "attempts": [], "handoff": null},
@@ -1472,6 +1472,19 @@ fn shift_y_retries_one_failed_fan_out_candidate_of_the_stopped_stage() {
     run.project = project.path().into();
     run.workspace = project.path().into();
     run.directory = crate::storage::run_dir(project.path(), &run.id).unwrap();
+    // Saved runs keep attempt paths in their own directory.
+    for (n, attempt) in run
+        .stages
+        .iter_mut()
+        .flat_map(|s| &mut s.attempts)
+        .enumerate()
+    {
+        attempt.directory = run
+            .directory
+            .join("01-implement")
+            .join(format!("attempt-{n:03}"));
+        attempt.handoff_file = attempt.directory.join("handoff.json");
+    }
     std::fs::create_dir_all(&run.directory).unwrap();
     run.persist().unwrap();
     app.session.adopt(run.clone());

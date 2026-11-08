@@ -383,6 +383,31 @@ fn a_candidates_snapshot_never_writes_through_a_link_in_its_attempt_directory() 
 }
 
 #[test]
+fn a_fan_out_run_with_linked_metadata_stays_loadable() {
+    // `.model-router` moved to another disk behind a link Git does not
+    // ignore, so candidate checkouts carry the link and their handoffs land
+    // in the run's own handoff directory.
+    let dir = tempdir();
+    if repository(dir.path()).is_none() {
+        return;
+    }
+    let elsewhere = tempdir();
+    std::os::unix::fs::symlink(elsewhere.path(), dir.path().join(".model-router")).unwrap();
+    let workflow = workflow(vec![fan_out(
+        &[("a", "test-model"), ("b", "test-model")],
+        "auto",
+    )]);
+    let mut run = create(dir.path(), &settings(&workflow), &workflow);
+    drive(&mut run);
+    assert!(
+        run.stages[0].fan_out.as_ref().unwrap().selection.is_some(),
+        "{:?}",
+        run.error
+    );
+    engine::load(dir.path(), &run.id).unwrap();
+}
+
+#[test]
 fn a_conflicting_winner_blocks_and_leaves_the_workspace_unchanged() {
     let judge = Stage {
         // The judge edits the file the candidates created, then picks one.

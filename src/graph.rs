@@ -175,10 +175,7 @@ pub fn validate(workflow: &Workflow) -> Result<()> {
         let ids = fan.ids();
         for (n, id) in ids.iter().enumerate() {
             ensure!(
-                !id.is_empty()
-                    && id
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                crate::config::is_id(id),
                 "Fan-out candidate IDs in {name} must contain only letters, digits, '-' and '_'"
             );
             ensure!(

@@ -308,7 +308,7 @@ fn saved_replay_cannot_weaken_the_effective_sandbox_or_network_policy() {
             "harness = \"mock\"",
             "harness = \"mock\"\nsandbox_network = false",
         );
-    fs::write(config, source).unwrap();
+    fs::write(&config, source).unwrap();
     let (id, path) = failed_run(dir.path());
     let original: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     for field in ["default", "stage", "network"] {
@@ -335,7 +335,258 @@ fn saved_replay_cannot_weaken_the_effective_sandbox_or_network_policy() {
             );
         }
     }
+    // Weakening the workspace's config to match does not reapprove the run:
+    // its approval digest exists and no longer matches.
+    let current = fs::read_to_string(&config).unwrap();
+    let weakened = current.replace("sandbox_default = \"read-only\"\n", "");
+    assert_ne!(weakened, current);
+    fs::write(&config, weakened).unwrap();
+    // Still trusted: the sandbox default is not one of its dangerous items.
+    assert!(!text(&router(dir.path(), &["validate"])).contains("Untrusted"));
+    let mut saved = original.clone();
+    saved["workflow"]["sandbox_default"] = "off".into();
+    fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let refused = router(dir.path(), &["resume", &id, "--retry"]);
+    assert!(
+        text(&refused).contains("changed since this run was approved")
+            && text(&refused).contains("trust --revoke"),
+        "{}",
+        text(&refused)
+    );
+    // Nor can the record move where the run executes.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let mut saved = original.clone();
+    saved["workspace"] = elsewhere.path().display().to_string().into();
+    fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let refused = router(dir.path(), &["resume", &id, "--retry"]);
+    assert!(
+        text(&refused).contains("Invalid or unsupported run record"),
+        "{}",
+        text(&refused)
+    );
+    assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+    // A terminal that is not a terminal host's socket is never connected to
+    // or removed: the attempt counts as interrupted.
+    let precious = elsewhere.path().join("precious.txt");
+    fs::write(&precious, "keep").unwrap();
+    let mut saved = original.clone();
+    saved["status"] = "running".into();
+    saved["stages"][0]["status"] = "running".into();
+    saved["stages"][0]["attempts"][0]["status"] = "running".into();
+    saved["stages"][0]["attempts"][0]["terminal"] = precious.display().to_string().into();
+    saved["workflow"]["stages"][0]["mode"] = "interactive".into();
+    fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let refused = router(dir.path(), &["resume", &id]);
+    assert!(
+        text(&refused).contains("previous execution was interrupted"),
+        "{}",
+        text(&refused)
+    );
+    assert_eq!(fs::read_to_string(&precious).unwrap(), "keep");
+    // A stage can leave a link at a file it may write, such as its handoff;
+    // that alone does not make the run unloadable.
+    fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+    let handoff = std::path::PathBuf::from(
+        original["stages"][0]["attempts"][0]["handoff_file"]
+            .as_str()
+            .unwrap(),
+    );
+    let _ = fs::remove_file(&handoff);
+    std::os::unix::fs::symlink(&precious, &handoff).unwrap();
+    model_router::engine::load(dir.path(), &id).unwrap();
+    fs::remove_file(&handoff).unwrap();
+    // Nor reach outside through a link planted in the run's directory, or
+    // name a candidate patch elsewhere.
+    let link = std::path::PathBuf::from(original["directory"].as_str().unwrap()).join("link");
+    std::os::unix::fs::symlink(elsewhere.path(), &link).unwrap();
+    let mut through_link = original.clone();
+    through_link["stages"][0]["attempts"][0]["handoff_file"] =
+        link.join("precious.txt").display().to_string().into();
+    let mut patch = original.clone();
+    patch["workflow"]["stages"][0]["fan_out"] =
+        serde_json::json!({"candidates": [{"id": "a", "harness": "mock"}]});
+    patch["stages"][0]["fan_out"] = serde_json::json!({
+        "base": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        "base_commit": "0123456789abcdef0123456789abcdef01234567",
+        "candidates": [{
+            "id": "a", "harness": "mock", "model": "", "status": "complete",
+            "attempts": [], "handoff": null,
+            "changes": {"files": [], "added": 0, "removed": 0,
+                "patch": precious.display().to_string()},
+        }],
+    });
+    // Nor name a file shared by all runs, or one in another run's directory.
+    let metadata = std::path::PathBuf::from(original["directory"].as_str().unwrap())
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut shared = original.clone();
+    shared["stages"][0]["attempts"][0]["handoff_file"] =
+        metadata.join("workspace.lock").display().to_string().into();
+    let mut other_run = original.clone();
+    other_run["stages"][0]["attempts"][0]["handoff_file"] = metadata
+        .join("runs/20260101-000000-00000000/run.json")
+        .display()
+        .to_string()
+        .into();
+    // Nor this run's own records and locks, or a worktree's lock.
+    let directory = std::path::PathBuf::from(original["directory"].as_str().unwrap());
+    let own: Vec<_> = [
+        directory.join("run.lock"),
+        directory.join("run.json"),
+        metadata
+            .join("worktrees")
+            .join(&id)
+            .join(".model-router/workspace.lock"),
+        metadata.join("elsewhere").join(&id).join("file.json"),
+        // A worktree's own files, and a candidate checkout no candidate
+        // attempt recorded.
+        metadata.join("worktrees").join(&id).join("src/main.rs"),
+        metadata
+            .join("candidates")
+            .join(&id)
+            .join("implement/a-001"),
+        metadata.clone(),
+    ]
+    .into_iter()
+    .map(|file| {
+        let mut saved = original.clone();
+        saved["stages"][0]["attempts"][0]["handoff_file"] = file.display().to_string().into();
+        saved
+    })
+    .collect();
+    for saved in [through_link, patch, shared, other_run]
+        .into_iter()
+        .chain(own)
+    {
+        fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let refused = router(dir.path(), &["resume", &id, "--retry"]);
+        assert!(
+            text(&refused).contains("a recorded path is outside"),
+            "{}",
+            text(&refused)
+        );
+    }
+    assert_eq!(fs::read_to_string(&precious).unwrap(), "keep");
     assert_eq!(runs(dir.path()), 1);
+}
+
+#[test]
+fn a_forged_record_cannot_pass_git_options_or_place_candidates() {
+    let dir = project();
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        )
+    };
+    git(&["init", "-q"]);
+    let (id, path) = failed_run(dir.path());
+    let original: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    // Git reads this snapshot name as an option that truncates a file.
+    let victim = dir.path().join("victim.txt");
+    fs::write(&victim, "keep").unwrap();
+    let mut option = original.clone();
+    option["baseline"] = format!("--output={}", victim.display()).into();
+    fs::write(&path, serde_json::to_vec(&option).unwrap()).unwrap();
+    let refused = router(dir.path(), &["report", &id]);
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+    assert!(
+        text(&refused).contains("not a Git object name"),
+        "{}",
+        text(&refused)
+    );
+    // A candidate ID names its directories and worktree, so it must be one
+    // the stage's workflow gives it.
+    let mut candidate = original.clone();
+    candidate["workflow"]["stages"][0]["fan_out"] =
+        serde_json::json!({"candidates": [{"id": "a", "harness": "mock"}]});
+    candidate["stages"][0]["fan_out"] = serde_json::json!({
+        "base": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        "base_commit": "0123456789abcdef0123456789abcdef01234567",
+        "candidates": [{
+            "id": "../../../../escape", "harness": "mock", "model": "",
+            "status": "pending", "attempts": [], "handoff": null,
+        }],
+    });
+    fs::write(&path, serde_json::to_vec(&candidate).unwrap()).unwrap();
+    let error = model_router::engine::load(dir.path(), &id).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("has candidates its workflow does not"),
+        "{error:#}"
+    );
+    // Nor may the workflow itself, whose candidate IDs no approval covers.
+    let mut workflow = original.clone();
+    workflow["workflow"]["stages"][0]["fan_out"] = serde_json::json!({"candidates": [
+        {"id": "../../../../escape", "harness": "mock"},
+        {"id": "b", "harness": "mock"},
+    ]});
+    fs::write(&path, serde_json::to_vec(&workflow).unwrap()).unwrap();
+    let error = model_router::engine::load(dir.path(), &id).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("candidate ID is not a valid ID"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn an_unreadable_approval_is_not_mistaken_for_a_missing_one() {
+    let dir = project();
+    let (id, _) = failed_run(dir.path());
+    let approvals = dir.path().join("config-home/run-approvals");
+    let receipt = fs::read_dir(&approvals)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join(&id);
+    use std::os::unix::fs::PermissionsExt;
+    let approved = fs::read(&receipt).unwrap();
+    fs::set_permissions(&receipt, fs::Permissions::from_mode(0o000)).unwrap();
+    let refused = router(dir.path(), &["resume", &id, "--retry"]);
+    assert!(!refused.status.success(), "{}", text(&refused));
+    assert!(text(&refused).contains("approval"), "{}", text(&refused));
+    // Not replaced by a fresh approval from the trusted config.
+    fs::set_permissions(&receipt, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(fs::read(&receipt).unwrap(), approved);
+}
+
+#[test]
+fn a_run_spelled_through_a_link_follows_the_project_not_the_link() {
+    let dir = project();
+    let (id, path) = failed_run(dir.path());
+    let real = fs::canonicalize(dir.path()).unwrap();
+    // A link inside the project, which a stage could repoint later.
+    std::os::unix::fs::symlink(".", real.join("link")).unwrap();
+    let linked = real.join("link");
+    let spelled = fs::read_to_string(&path).unwrap().replace(
+        &format!("\"{}", real.display()),
+        &format!("\"{}", linked.display()),
+    );
+    assert!(spelled.contains("/link/.model-router/runs/"));
+    fs::write(&path, spelled).unwrap();
+    let run = model_router::engine::load(dir.path(), &id).unwrap();
+    assert_eq!(run.project, real);
+    assert_eq!(
+        run.workspace.display().to_string(),
+        real.display().to_string()
+    );
+    assert_eq!(run.directory, real.join(".model-router/runs").join(&id));
+    let attempt = &run.stages[0].attempts[0];
+    assert!(attempt.directory.starts_with(&run.directory), "{attempt:?}");
+    assert!(
+        attempt
+            .handoff_file
+            .starts_with(real.join(".model-router/handoffs")),
+        "{attempt:?}"
+    );
 }
 
 #[test]

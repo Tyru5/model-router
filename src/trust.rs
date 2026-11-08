@@ -391,15 +391,31 @@ pub fn authorize_run_config(run: &crate::engine::Run, explicit: Option<&Path>) -
 
 fn authorize_run_locked(run: &crate::engine::Run, explicit: Option<&Path>) -> Result<()> {
     let items = run_items(run);
-    if items.is_empty()
-        || fs::read_to_string(run_approvals(&run.project).join(&run.id))
-            .is_ok_and(|approved| approved == digest(&items))
-    {
+    // Only a missing receipt means none was written; any other error must
+    // not open the fallback below.
+    let path = run_approvals(&run.project).join(&run.id);
+    let receipt = match fs::read_to_string(&path) {
+        Ok(receipt) => Some(receipt),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("Read run approval {}", path.display()));
+        }
+    };
+    if items.is_empty() || receipt.as_deref() == Some(digest(&items).as_str()) {
         return Ok(());
     }
     // Older records have no receipt. They may use only executable settings
     // and policies still present in today's trusted configuration. This also allows a
-    // revoked snapshot to run again after its configuration is reapproved.
+    // revoked snapshot (revocation deletes receipts) to run again after its
+    // configuration is reapproved. A receipt that no longer matches means
+    // run.json changed since approval (or an update changed how settings are
+    // assessed, e.g. which harness settings escalate); a workspace-controlled
+    // config cannot re-approve that.
+    if receipt.is_some() {
+        anyhow::bail!(
+            "Saved run executable settings are untrusted: they changed since this run was approved, or this version of model-router assesses them differently. Review the saved workflow, adapters, and providers in its run.json; to replay it anyway, run `trust --revoke`, then trust the matching config again"
+        )
+    }
     let loaded = config::load_config(&run.project, explicit)?;
     if loaded.trust == Trust::Trusted {
         let approved = snapshot_items(&loaded.settings);
@@ -777,5 +793,38 @@ mod tests {
         let options = |s: &Settings| s.workflows[0].stages.last().unwrap().ship.clone().unwrap();
         assert!(options(&ignored).confirm);
         assert!(!options(&restore(&ignored)).confirm);
+    }
+
+    #[test]
+    fn a_changed_run_is_refused_as_changed_whatever_the_config_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.adapters.insert(
+            "mock".into(),
+            CustomAdapter {
+                command: "python3".into(),
+                ..CustomAdapter::default()
+            },
+        );
+        settings.workflows[0].stages.truncate(1);
+        settings.workflows[0].stages[0].harness = "mock".into();
+        let mut run = crate::engine::Run::create(
+            dir.path(),
+            &settings,
+            &settings.workflows[0],
+            "Task".into(),
+            false,
+        )
+        .unwrap();
+        write_run_approval(&run).unwrap();
+        authorize_run(&run).unwrap();
+        run.workflow.stages[0].extra_args = vec!["--changed".into()];
+        // The config plays no part in this refusal, so a broken one must not hide it.
+        fs::write(dir.path().join(".model-router.toml"), "[[[ not toml").unwrap();
+        let error = format!("{:#}", authorize_run(&run).unwrap_err());
+        assert!(
+            error.contains("changed since this run was approved"),
+            "{error}"
+        );
     }
 }
