@@ -57,7 +57,23 @@ pub fn run(
             break;
         }
         let directory = attempt.join("checks").join(format!("{:02}", index + 1));
-        fs::create_dir_all(&directory)?;
+        // The stage could write the attempt directory: logs go only into
+        // real directories, never through a link it left at either name.
+        for dir in [attempt.join("checks"), directory.clone()] {
+            if fs::symlink_metadata(&dir).is_ok_and(|meta| !meta.is_dir()) {
+                fs::remove_file(&dir)?;
+            }
+            match fs::create_dir(&dir) {
+                Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e.into()),
+                _ => {}
+            }
+            // Something re-created a link meanwhile: refuse, never follow it.
+            anyhow::ensure!(
+                fs::symlink_metadata(&dir)?.is_dir(),
+                "{} is not a directory",
+                dir.display()
+            );
+        }
         let label = format!("[check {}/{}]", index + 1, checks.len());
         output(format!("\n{label} {}\n", shell_words::join(&check.command)));
         let invocation = Invocation {
@@ -130,4 +146,45 @@ pub fn run(
     }
     storage::write_json(&attempt.join("checks.json"), &results)?;
     Ok((results, cancelled))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_logs_never_write_through_links_the_stage_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempt = dir.path().join("attempt");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(attempt.join("checks/01")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let victim = outside.join("victim");
+        fs::write(&victim, "keep").unwrap();
+        // As a stage that could write its attempt directory might leave them.
+        std::os::unix::fs::symlink(&victim, attempt.join("checks/01/stdout.log")).unwrap();
+        std::os::unix::fs::symlink(&outside, attempt.join("checks/02")).unwrap();
+        let check = |text: &str| Check {
+            command: vec!["echo".into(), text.into()],
+            required: true,
+            ..Default::default()
+        };
+        let (results, cancelled) = run(
+            &[check("one"), check("two")],
+            dir.path(),
+            &attempt,
+            &AtomicBool::new(false),
+            |_| Ok(()),
+            |_| {},
+        )
+        .unwrap();
+        assert!(!cancelled);
+        assert!(results.iter().all(|r| r.status == TestStatus::Passed));
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
+        for (n, text) in [(1, "one"), (2, "two")] {
+            let log = attempt.join(format!("checks/{n:02}/stdout.log"));
+            assert_eq!(fs::read_to_string(&log).unwrap(), format!("{text}\n"));
+        }
+    }
 }

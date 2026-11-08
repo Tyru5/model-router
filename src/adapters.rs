@@ -4,7 +4,7 @@ use crate::harness::{
     SchemaDelivery, Session,
 };
 use crate::providers::{self, Provider};
-use crate::{handoff, harness_settings};
+use crate::{handoff, harness_settings, storage};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -151,9 +151,12 @@ impl Invocation {
             .collect()
     }
     /// Writes `files`; the process launcher calls this right before spawning.
+    /// They go in the attempt directory, where an earlier candidate round
+    /// may have left a link at the same name.
     pub fn write_files(&self) -> Result<()> {
         for (path, text) in &self.files {
-            fs::write(path, text).with_context(|| format!("Write {}", path.display()))?;
+            std::io::Write::write_all(&mut storage::create_fresh(path)?, text.as_bytes())
+                .with_context(|| format!("Write {}", path.display()))?;
         }
         Ok(())
     }
@@ -1152,6 +1155,28 @@ mod tests {
     }
     fn env<'a>(i: &'a Invocation, name: &str) -> Option<&'a EnvValue> {
         i.env.iter().find(|(n, _)| n == name).map(|(_, v)| v)
+    }
+
+    #[test]
+    fn launch_files_never_write_through_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "keep").unwrap();
+        let file = dir.path().join("output-schema.json");
+        std::os::unix::fs::symlink(&victim, &file).unwrap();
+        let invocation = Invocation {
+            program: "true".into(),
+            args: vec![],
+            stdin: None,
+            kind: OutputKind::Text,
+            final_file: dir.path().join("final"),
+            env: vec![],
+            files: vec![(file.clone(), "{}".into())],
+            assign: None,
+        };
+        invocation.write_files().unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "{}");
     }
 
     #[test]

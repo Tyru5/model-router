@@ -126,7 +126,8 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Writes the full binary patch from tree `from` to tree `to`.
 pub fn write_patch(dir: &Path, from: &str, to: &str, path: &Path) -> Result<()> {
-    let file = fs::File::create(path).with_context(|| format!("Create {}", path.display()))?;
+    // The candidate could write its attempt directory.
+    let file = storage::create_fresh(path)?;
     let status = Command::new("git")
         .args([
             "--no-pager",
@@ -211,9 +212,25 @@ fn restore(top: &Path, tree: &str, files: &[String], scratch: &Path) -> Result<(
         args.extend(keep.iter().map(|f| f.as_str()));
         git(top, Some(&index), &args)?;
     }
+    let root = fs::canonicalize(top)?;
     for file in gone {
         let path = top.join(file);
-        if fs::symlink_metadata(&path).is_ok() {
+        // The names come from the saved run. A tree's file is a plain path
+        // inside the repository that crosses no link (Git stores links as
+        // files), and never Git's or the router's own, which no tree diff
+        // names; anything else is left alone.
+        let name = Path::new(file);
+        let plain = name.components().all(|c| match c {
+            std::path::Component::Normal(part) => {
+                let part = part.to_string_lossy();
+                !part.eq_ignore_ascii_case(".git") && !part.eq_ignore_ascii_case(".model-router")
+            }
+            _ => false,
+        });
+        let dir = name.parent().unwrap_or(Path::new(""));
+        let inside =
+            plain && fs::canonicalize(top.join(dir)).is_ok_and(|parent| parent == root.join(dir));
+        if inside && fs::symlink_metadata(&path).is_ok() {
             fs::remove_file(&path).with_context(|| format!("Remove {}", path.display()))?;
         }
     }
@@ -227,4 +244,91 @@ pub fn stat(dir: &Path, from: &str, to: &str) -> Result<(Vec<String>, u64, u64)>
     let added = files.iter().filter_map(|f| f.added).sum();
     let removed = files.iter().filter_map(|f| f.removed).sum();
     Ok((files.into_iter().map(|f| f.path).collect(), added, removed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_patch_never_writes_through_a_link_the_candidate_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, None, &["init", "-q"]).unwrap();
+        fs::write(repo.join("a"), "one\n").unwrap();
+        let index = dir.path().join("index");
+        let tree = |index: &Path| {
+            git(&repo, Some(index), &["add", "-A"]).unwrap();
+            git(&repo, Some(index), &["write-tree"]).unwrap()
+        };
+        let from = tree(&index);
+        fs::write(repo.join("a"), "two\n").unwrap();
+        let to = tree(&index);
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "keep").unwrap();
+        let patch = dir.path().join("changes.diff");
+        std::os::unix::fs::symlink(&victim, &patch).unwrap();
+        write_patch(&repo, &from, &to, &patch).unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+        assert!(fs::read_to_string(&patch).unwrap().contains("+two"));
+    }
+
+    #[test]
+    fn a_conflict_removes_only_files_inside_the_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, None, &["init", "-q"]).unwrap();
+        let index = dir.path().join("index");
+        let tree = || {
+            git(&repo, Some(&index), &["add", "-A"]).unwrap();
+            git(&repo, Some(&index), &["write-tree"]).unwrap()
+        };
+        fs::write(repo.join("a"), "one\n").unwrap();
+        let from = tree();
+        fs::write(repo.join("a"), "two\n").unwrap();
+        let to = tree();
+        let patch = dir.path().join("changes.diff");
+        write_patch(&repo, &from, &to, &patch).unwrap();
+        // The workspace moved on, so the patch conflicts; a stage left a link
+        // to a directory elsewhere, which the saved file names go through.
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("victim"), "keep").unwrap();
+        fs::write(repo.join("a"), "three\n").unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("link")).unwrap();
+        let current = tree();
+        let scratch = dir.path().join("scratch");
+        for files in [
+            vec!["a".to_owned(), "link/victim".to_owned()],
+            vec![outside.join("victim").display().to_string()],
+        ] {
+            let _ = apply(&repo, &index, &current, &files, &patch, &scratch);
+            assert_eq!(fs::read_to_string(outside.join("victim")).unwrap(), "keep");
+        }
+        // Nor Git's or the router's own files inside it.
+        fs::create_dir(repo.join(".model-router")).unwrap();
+        fs::write(repo.join(".model-router/run.json"), "{}").unwrap();
+        // Also not through a link a stage left inside the repository.
+        std::os::unix::fs::symlink(".git", repo.join("g")).unwrap();
+        std::os::unix::fs::symlink(".model-router", repo.join("m")).unwrap();
+        let files = [
+            ".git/HEAD".to_owned(),
+            ".model-router/run.json".to_owned(),
+            "g/config".to_owned(),
+            "m/run.json".to_owned(),
+            ".MODEL-ROUTER/run.json".to_owned(),
+        ];
+        let _ = apply(&repo, &index, &current, &files, &patch, &scratch);
+        assert!(repo.join(".git/HEAD").is_file());
+        assert!(repo.join(".git/config").is_file());
+        assert!(repo.join(".model-router/run.json").is_file());
+        let files = ["a".to_owned(), "link/victim".to_owned()];
+        assert!(matches!(
+            apply(&repo, &index, &current, &files, &patch, &scratch).unwrap(),
+            Applied::Conflict(_)
+        ));
+        assert_eq!(fs::read_to_string(repo.join("a")).unwrap(), "three\n");
+    }
 }

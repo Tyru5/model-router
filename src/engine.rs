@@ -2538,6 +2538,13 @@ fn reattach_stage(
     Ok(())
 }
 
+/// A candidate attempt's private Git index for snapshots: beside its attempt
+/// directory, not in it, since the candidate could have left a link there
+/// that the router's Git would write through.
+fn candidate_index(prepared: &Prepared) -> PathBuf {
+    prepared.directory.with_extension("index")
+}
+
 const INTERRUPTED: &str =
     "A previous execution was interrupted. Inspect artifacts and retry explicitly";
 
@@ -2909,12 +2916,8 @@ impl Run {
             .context("No fan-out")?
             .base
             .clone();
-        let tree = snapshot::tree_with(
-            &worktree,
-            &prepared.directory.join("snapshot.index"),
-            &self.id,
-        )
-        .context("Snapshot the candidate's worktree")?;
+        let tree = snapshot::tree_with(&worktree, &candidate_index(prepared), &self.id)
+            .context("Snapshot the candidate's worktree")?;
         let patch = prepared.directory.join("changes.diff");
         fanout::write_patch(&worktree, &base, &tree, &patch)?;
         let (files, added, removed) = fanout::stat(&worktree, &base, &tree)?;

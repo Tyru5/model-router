@@ -320,6 +320,29 @@ fn a_judge_stage_chooses_candidate_two_and_dependents_wait_for_it() {
 }
 
 #[test]
+fn a_candidates_snapshot_never_writes_through_a_link_in_its_attempt_directory() {
+    let Some((_dir, mut run)) = git_run(vec![fan_out(
+        &[("a", "test-model"), ("b", "test-model")],
+        "auto",
+    )]) else {
+        return;
+    };
+    // As a candidate could leave it in the attempt directory it may write.
+    let outside = tempdir();
+    let victim = outside.path().join("victim");
+    let attempt = run.directory.join("01-implement/candidates/c1/attempt-001");
+    fs::create_dir_all(&attempt).unwrap();
+    std::os::unix::fs::symlink(&victim, attempt.join("snapshot.index")).unwrap();
+    drive(&mut run);
+    assert!(
+        run.stages[0].fan_out.as_ref().unwrap().selection.is_some(),
+        "{:?}",
+        run.error
+    );
+    assert!(!victim.exists(), "the router wrote through the link");
+}
+
+#[test]
 fn a_conflicting_winner_blocks_and_leaves_the_workspace_unchanged() {
     let judge = Stage {
         // The judge edits the file the candidates created, then picks one.

@@ -23,6 +23,21 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     File::open(parent)?.sync_all()?;
     Ok(())
 }
+/// Creates `path` as a new file, first removing whatever file or link is
+/// there, so it never writes through a link that a stage able to write the
+/// directory planted.
+pub fn create_fresh(path: &Path) -> Result<File> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("Replace {}", path.display())),
+    }
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("Create {}", path.display()))
+}
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     atomic_write(path, &serde_json::to_vec_pretty(value)?)
 }

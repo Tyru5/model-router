@@ -123,6 +123,11 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   so idle sockets cannot lock out authenticated clients and a burst of
   clients is not cut off before its headers are read.
 - Harness-reported errors are stripped of terminal escapes.
+- Check logs, fan-out candidate patches, and candidate snapshot indexes
+  never write through a link a stage left in its attempt directory (a
+  process the stage detached and left running can still race them), and
+  undoing a conflicting winner removes only plain files inside the
+  repository, never through a link and never Git's or the router's own.
 
 ## [0.1.0] - 2026-10-04
 

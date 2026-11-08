@@ -241,8 +241,9 @@ pub fn capture_with(
     on_spawn: impl FnOnce(u32) -> Result<()>,
     mut on_output: impl FnMut(bool, &str),
 ) -> Result<Outcome> {
-    let mut stdout_log = File::create(dir.join("stdout.log"))?;
-    let mut stderr_log = File::create(dir.join("stderr.log"))?;
+    // Check logs land in a directory the stage could write.
+    let mut stdout_log = crate::storage::create_fresh(&dir.join("stdout.log"))?;
+    let mut stderr_log = crate::storage::create_fresh(&dir.join("stderr.log"))?;
     if let Some(warning) = sandbox.and_then(|plan| plan.warning.as_deref()) {
         writeln!(stderr_log, "{warning}")?;
         on_output(true, &format!("{warning}\n"));
@@ -1242,7 +1243,7 @@ pub fn interactive(
     let (program, args) = launch(inv, sandbox);
     let env = inv.environment()?;
     inv.write_files()?;
-    let mut stderr_log = File::create(dir.join("stderr.log"))?;
+    let mut stderr_log = crate::storage::create_fresh(&dir.join("stderr.log"))?;
     let warning = sandbox.and_then(|plan| plan.warning.clone());
     if let Some(warning) = &warning {
         writeln!(stderr_log, "{warning}")?;
