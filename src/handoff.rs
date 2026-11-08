@@ -614,9 +614,11 @@ impl std::fmt::Display for ProtocolError {
         f.write_str(self)
     }
 }
+/// Decoded JSON text can hold real escape bytes, and a reported error is
+/// printed to the terminal.
 impl From<&str> for ProtocolError {
     fn from(message: &str) -> Self {
-        Self::Reported(message.into())
+        Self::Reported(storage::clean_terminal(message))
     }
 }
 
@@ -635,7 +637,7 @@ pub fn session_id(raw: &str) -> Option<String> {
             fields
                 .iter()
                 .find_map(|field| event.get(*field).and_then(Value::as_str))
-                .filter(|id| !id.is_empty())
+                .filter(|id| crate::adapters::is_session_id(id))
                 .map(str::to_owned)
         })
 }
@@ -673,13 +675,14 @@ pub fn normalize(raw: &str, kind: OutputKind) -> Normalized {
                 .flatten()
                 .filter_map(Value::as_str)
                 .collect();
-            result.error = Some(ProtocolError::Reported(
+            result.error = Some(ProtocolError::from(
                 event
                     .get("result")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
                     .or_else(|| (!errors.is_empty()).then(|| errors.join("\n")))
-                    .unwrap_or_else(|| "Harness reported an error".into()),
+                    .unwrap_or_else(|| "Harness reported an error".into())
+                    .as_str(),
             ));
         }
         if event
@@ -694,10 +697,10 @@ pub fn normalize(raw: &str, kind: OutputKind) -> Normalized {
             || kind_name == "turn.failed"
             || event.get("error").is_some_and(|v| !v.is_null());
         if failed {
-            result.error = Some(ProtocolError::Reported(storage::truncate(
-                &event.to_string(),
-                1500,
-            )));
+            // JSON text keeps DEL and C1 controls such as U+009B (CSI) raw.
+            result.error = Some(ProtocolError::from(
+                storage::truncate(&event.to_string(), 1500).as_str(),
+            ));
         }
         // Retries report errors (Claude `api_retry`, provider errors) before
         // the run succeeds; a later successful final event supersedes them.
@@ -1565,6 +1568,11 @@ mod tests {
             session_id("{\"type\":\"result\",\"session_id\":\"\"}"),
             None
         );
+        // Never a value the harness would read as one of its options.
+        assert_eq!(
+            session_id("{\"type\":\"result\",\"session_id\":\"--yolo\"}"),
+            None
+        );
     }
     #[test]
     fn review_cannot_pass_on_unstructured_output() {
@@ -2019,5 +2027,32 @@ mod tests {
             native_output(&plain, OutputKind::Codex, "{}").as_deref(),
             Some("{}")
         );
+    }
+
+    #[test]
+    fn reported_errors_cannot_carry_terminal_escapes() {
+        // JSON-escaped ESC and BEL decode to real control bytes.
+        for (line, kind) in [
+            (
+                r#"{"type":"result","is_error":true,"result":"quota \u001b]0;pwned\u0007\u001b[2Jexhausted"}"#,
+                OutputKind::Claude,
+            ),
+            (
+                r#"{"type":"message_end","message":{"role":"assistant","stopReason":"error","errorMessage":"quota \u001b]0;pwned\u0007\u001b[2Jexhausted"}}"#,
+                OutputKind::Pi,
+            ),
+            // Serialized JSON escapes only C0 controls; C1 CSI and DEL stay raw.
+            (
+                r#"{"type":"turn.failed","error":{"message":"quota \u009b2J\u007fexhausted"}}"#,
+                OutputKind::Codex,
+            ),
+        ] {
+            let error = normalize(line, kind).error.unwrap();
+            assert!(!error.chars().any(char::is_control), "{kind:?}: {error:?}");
+            assert!(
+                error.contains("quota") && error.contains("exhausted"),
+                "{error}"
+            );
+        }
     }
 }

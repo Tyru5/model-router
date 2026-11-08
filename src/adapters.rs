@@ -463,6 +463,17 @@ pub fn assign_session(invocation: &mut Invocation, _harness: &str) -> Option<Str
     Some(id)
 }
 
+/// Whether `id` can be a harness session ID. Session IDs come from run.json
+/// and harness logs and become their own argument: never an option.
+pub fn is_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 256
+        && !id.starts_with('-')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+}
+
 /// The native interactive command that resumes `session` with the stage's
 /// model and permission settings, where the harness accepts them on resume.
 pub fn resume(
@@ -472,6 +483,10 @@ pub fn resume(
     session: &str,
     paths: &ContextPaths<'_>,
 ) -> Result<Invocation> {
+    ensure!(
+        is_session_id(session),
+        "{session:?} is not a harness session ID"
+    );
     ensure!(
         resumable(&stage.harness, custom),
         "{} sessions cannot be resumed",
@@ -1234,6 +1249,17 @@ mod tests {
             ["threads", "continue", "--mode", "m", "s-1"]
         );
         assert_eq!(resumed("opencode").args, ["--session", "s-1"]);
+        // A recorded session is its own argument, so never an option.
+        assert!(
+            resume(
+                &stage("claude", Mode::Unattended),
+                &none,
+                &providers,
+                "--dangerously-skip-permissions",
+                &paths
+            )
+            .is_err()
+        );
 
         assert!(!resumable("gemini", &none));
         assert!(

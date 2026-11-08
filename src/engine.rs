@@ -818,6 +818,11 @@ impl Run {
                 handoff::session_id(&head)
             })
             .context("The harness did not report a session for this attempt; retry interactively with [i] instead")?;
+        // Checked before anything moves: run.json may name any session.
+        ensure!(
+            adapters::is_session_id(&session),
+            "The recorded session {session:?} is not a harness session ID; retry interactively with [i] instead"
+        );
         set_aside_handoff(&attempt.handoff_file, &attempt.directory)?;
         let reason = format!("Take over session {session}");
         self.resume = Some(Resume {
@@ -4237,6 +4242,13 @@ mod tests {
         assert_eq!(run.status, Status::AwaitingConfirmation);
         run.workflow.stages[0].harness = "claude".into();
         let previous = run.stages[0].attempts[0].clone();
+        // A recorded session that could pass as an option is refused before
+        // the handoff moves or the stage changes.
+        run.stages[0].attempts[0].session = Some("--yolo".into());
+        assert!(run.take_over().is_err());
+        assert!(previous.handoff_file.is_file());
+        assert_eq!(run.workflow.stages[0].mode, Mode::Interactive);
+        assert_eq!(run.status, Status::AwaitingConfirmation);
         run.stages[0].attempts[0].session = Some("s-1".into());
         run.take_over().unwrap();
         assert!(
