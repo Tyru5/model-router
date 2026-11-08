@@ -1042,6 +1042,27 @@ pub fn config_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("MODEL_ROUTER_CONFIG_DIR").filter(|d| !d.is_empty()) {
         return PathBuf::from(dir);
     }
+    // Unit tests never read or write the user's settings, approvals, or
+    // trust store.
+    #[cfg(test)]
+    {
+        static DIR: std::sync::Mutex<Option<tempfile::TempDir>> = std::sync::Mutex::new(None);
+        // Statics are never dropped, so remove the directory when the test
+        // binary exits.
+        extern "C" fn remove() {
+            if let Ok(mut dir) = DIR.lock() {
+                dir.take();
+            }
+        }
+        let mut dir = DIR.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if dir.is_none() {
+            *dir = Some(tempfile::tempdir().expect("a test config directory"));
+            // SAFETY: `remove` is a plain function that never unwinds.
+            unsafe { libc::atexit(remove) };
+        }
+        return dir.as_ref().unwrap().path().to_path_buf();
+    }
+    #[allow(unreachable_code)]
     directories::ProjectDirs::from("", "", "model-router")
         .map(|p| p.config_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from(".model-router-config"))
