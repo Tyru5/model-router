@@ -324,11 +324,6 @@ enum Commands {
 }
 
 fn main() {
-    // An interactive harness's terminal host (see `process::host`), never
-    // typed by people, so it bypasses argument parsing and project setup.
-    if std::env::args_os().nth(1).is_some_and(|arg| arg == process::host::ARG) {
-        process::host::main();
-    }
     if let Err(error) = main_result() {
         // Terminal loss can close stderr too; reporting it must not panic.
         let _ = writeln!(io::stderr(), "Error: {error:#}");
@@ -1244,15 +1239,7 @@ fn cli_drive(run: &mut Run, cancel: &AtomicBool, notify: bool) -> Result<()> {
                         run.id
                     );
                 }
-                if cli_interactive(run, cancel)? {
-                    println!(
-                        "{} keeps running in the background. Reattach with: model-router -C {} resume {}",
-                        run.current_name(),
-                        shell_words::quote(&run.project.display().to_string()),
-                        run.id
-                    );
-                    return Ok(());
-                }
+                cli_interactive(run, cancel)?;
             }
             Action::Confirm if run.workflow.stages[run.cursor].role == Role::Ship => {
                 // The preview was printed as stage output.
@@ -1338,8 +1325,7 @@ fn cli_drive(run: &mut Run, cancel: &AtomicBool, notify: bool) -> Result<()> {
     }
 }
 
-/// True when the harness was left running in the background (`d`).
-fn cli_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<bool> {
+fn cli_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
     use process::{AttachOutcome, InteractiveSession};
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((100, 30));
@@ -1365,7 +1351,7 @@ fn cli_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<bool> {
             if !finished {
                 write!(
                     io::stdout(),
-                    "\r\nHarness still running. [t] Reattach  [d] Leave running in the background  [c] Cancel  [q] Stop\r\n"
+                    "\r\nHarness still running. [t] Reattach  [c] Cancel  [q] Stop\r\n"
                 )?;
                 io::stdout().flush()?;
             }
@@ -1417,10 +1403,6 @@ fn cli_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<bool> {
                     cancel.store(true, Ordering::Relaxed);
                     write!(io::stdout(), "\r\nStopping the stage...\r\n")?;
                     io::stdout().flush()?;
-                } else if keys.contains(&b'd') && !finished && !cancel.load(Ordering::Relaxed) {
-                    session.release();
-                    write!(io::stdout(), "\r\nLeaving the harness running...\r\n")?;
-                    io::stdout().flush()?;
                 } else if keys.contains(&b't') && !finished && !cancel.load(Ordering::Relaxed) {
                     crossterm::terminal::disable_raw_mode()?;
                     finished = matches!(session.attach(cancel, cancel)?, AttachOutcome::Finished);
@@ -1428,7 +1410,7 @@ fn cli_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<bool> {
                     if !finished {
                         write!(
                             io::stdout(),
-                            "\r\nHarness still running. [t] Reattach  [d] Leave running in the background  [c] Cancel  [q] Stop\r\n"
+                            "\r\nHarness still running. [t] Reattach  [c] Cancel  [q] Stop\r\n"
                         )?;
                         io::stdout().flush()?;
                     }
@@ -1446,7 +1428,7 @@ fn cli_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<bool> {
             .join()
             .map_err(|_| anyhow::anyhow!("Interactive worker panicked"))?;
         foreground?;
-        result.map(|()| session.released())
+        result
     })
 }
 
