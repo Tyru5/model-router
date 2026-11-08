@@ -147,7 +147,14 @@ addresses, unless the URL you typed names such a host.
 `serve --http` binds loopback only unless `--allow-remote`, needs a bearer
 token, and only accepts projects under `--allow-root` paths. Server runs are
 unattended only and cannot confirm ship stages. See [serve.md](serve.md#safety).
-HTTP admits at most 32 connections, including event streams, and closes excess
-connections without creating workers. Request headers and bodies share a
-30-second absolute read deadline; authorization is checked before waiting for
-a request body.
+HTTP keeps connections that have not yet sent authenticated headers (at most
+16) apart from authenticated ones (at most 32, including event streams and
+requests still sending their body): when
+the pending queue is full, the oldest pending connection is cut off once it has
+waited half a second (newer arrivals wait in the listen backlog until then), so
+idle sockets cannot lock out a client that sends its headers promptly, and a
+burst of clients is not cut off before its headers are read. A connection
+leaves the pending queue as soon as its headers authenticate, so a body still
+on the way is never cut off. Request headers and bodies share a 10-second
+absolute read deadline; authorization is checked before waiting for a request
+body.

@@ -515,31 +515,96 @@ fn http_api_requires_its_token_and_streams_events() {
     missing_body.read_to_string(&mut denied).unwrap();
     assert!(denied.starts_with("HTTP/1.1 401"), "{denied}");
 
+    // Idle connections that never finish a request cannot lock out a
+    // client that sends one: past the pending limit the oldest are cut off.
+    // A client whose headers authenticated is no longer pending, even while
+    // its body is still on the way.
+    let mut sending = TcpStream::connect(&addr).unwrap();
+    sending
+        .write_all(
+            format!(
+                "POST /tools/list_workflows HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 2\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
     let mut slow = Vec::new();
-    for _ in 0..31 {
+    for _ in 0..40 {
         let mut stream = TcpStream::connect(&addr).unwrap();
         stream
             .write_all(b"GET /tools HTTP/1.1\r\nX-Slow: ")
             .unwrap();
         slow.push(stream);
     }
-    // The last admitted slot is still usable by an authenticated client.
+    std::thread::sleep(Duration::from_millis(100));
     let (code, body) = http(&addr, "GET", "/tools", Some(token), "");
     assert_eq!(code, 200);
     assert!(body.contains("start_run"));
-    std::thread::sleep(Duration::from_millis(100));
-    slow.push(TcpStream::connect(&addr).unwrap());
-    let mut excess = TcpStream::connect(&addr).unwrap();
-    excess
+    sending.write_all(b"{}").unwrap();
+    sending
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut answer = String::new();
+    sending.read_to_string(&mut answer).unwrap();
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    // The first idle connection was cut off without an answer.
+    slow[0]
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
     let mut byte = [0];
-    match excess.read(&mut byte) {
+    match slow[0].read(&mut byte) {
         Ok(0) => {}
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
-        result => panic!("overload must close without holding another worker: {result:?}"),
+        result => panic!("the oldest idle connection must be cut off: {result:?}"),
     }
     drop(slow);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(http(&addr, "GET", "/tools", Some(token), "").0, 200);
+    // Authenticated requests still sending their body hold one of the 32
+    // authenticated slots.
+    let mut bodies: Vec<TcpStream> = (0..32)
+        .map(|_| {
+            let mut stream = TcpStream::connect(&addr).unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "POST /tools/list_workflows HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 2\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            stream
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(http(&addr, "GET", "/tools", Some(token), "").0, 503);
+    // Refused at once, without waiting for the body it declared.
+    let mut refused = TcpStream::connect(&addr).unwrap();
+    refused
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    refused
+        .write_all(
+            format!(
+                "POST /tools/list_workflows HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 100\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let mut answer = String::new();
+    refused.read_to_string(&mut answer).unwrap();
+    assert!(answer.starts_with("HTTP/1.1 503"), "{answer}");
+    for stream in &mut bodies {
+        stream.write_all(b"{}").unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).unwrap();
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    }
+    drop(bodies);
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(http(&addr, "GET", "/tools", Some(token), "").0, 200);
     let (code, body) = http(&addr, "POST", "/tools/list_workflows", Some(token), "");

@@ -9,10 +9,12 @@ use super::{Server, runs::Message, tools};
 use percent_encoding::percent_decode_str;
 use serde_json::{Value, json};
 use std::{
+    cell::Cell,
+    collections::VecDeque,
     io::{self, BufRead, BufReader, Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{Shutdown, TcpListener, TcpStream},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::RecvTimeoutError,
     },
@@ -22,14 +24,79 @@ use std::{
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const KEEPALIVE: Duration = Duration::from_secs(15);
+/// Connections still sending their request, before any authentication.
+const MAX_PENDING: usize = 16;
+/// Authenticated requests and event streams.
 const MAX_CONNECTIONS: usize = 32;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a pending connection is safe from being cut off: long enough
+/// for its worker to read headers that arrived with it.
+const PENDING_GRACE: Duration = Duration::from_millis(500);
+
+/// Connections that have not yet sent authenticated headers. Anyone who can
+/// reach the port can open one and send nothing, so they never share a
+/// budget with authenticated clients, and when the queue is full the oldest
+/// is cut off rather than refusing the newcomer: idle sockets cannot lock
+/// out a client that sends its headers promptly. Only a connection pending
+/// longer than `PENDING_GRACE` is cut off; until then newcomers wait in the
+/// listen backlog, so a burst accepted faster than workers run is not cut
+/// off with its headers unread. A connection leaves the queue as soon as its
+/// headers authenticate, before its body is read.
+#[derive(Default)]
+struct Pending {
+    next: u64,
+    streams: VecDeque<(u64, Instant, TcpStream)>,
+}
+
+/// One connection's place in admission.
+struct Admission {
+    pending: Arc<Mutex<Pending>>,
+    id: u64,
+    active: Arc<AtomicUsize>,
+    /// Whether it was still queued when it first left.
+    left: Cell<Option<bool>>,
+}
+
+impl Admission {
+    /// Leaves the pending queue; false when this connection was cut off
+    /// for a newer one. Later calls repeat the first answer.
+    fn read(&self) -> bool {
+        if let Some(stayed) = self.left.get() {
+            return stayed;
+        }
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let before = pending.streams.len();
+        pending.streams.retain(|(id, _, _)| *id != self.id);
+        let stayed = pending.streams.len() < before;
+        self.left.set(Some(stayed));
+        stayed
+    }
+
+    /// An authenticated slot, or None when all are in use.
+    fn authenticated(&self) -> Option<ConnectionSlot> {
+        // A compare-exchange loop: `fetch_update` is deprecated on newer
+        // toolchains and its replacement is newer than the MSRV.
+        let mut n = self.active.load(Ordering::Acquire);
+        loop {
+            if n >= MAX_CONNECTIONS {
+                return None;
+            }
+            match self
+                .active
+                .compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(ConnectionSlot(self.active.clone())),
+                Err(current) => n = current,
+            }
+        }
+    }
+}
 
 struct ConnectionSlot(Arc<AtomicUsize>);
 
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -49,26 +116,58 @@ pub fn serve(listener: TcpListener, server: Arc<Server>, token: String, stop: Ar
     }
     let token = Arc::new(token);
     let active = Arc::new(AtomicUsize::new(0));
+    let pending = Arc::new(Mutex::new(Pending::default()));
     while !stop.load(Ordering::Relaxed) {
+        let wait = {
+            let queue = pending.lock().unwrap_or_else(|e| e.into_inner());
+            queue.streams.len() >= MAX_PENDING
+                && queue
+                    .streams
+                    .front()
+                    .is_some_and(|(_, at, _)| at.elapsed() < PENDING_GRACE)
+        };
+        if wait {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
         match listener.accept() {
             Ok((stream, _)) => {
-                // Only this accept loop increments the count. Refuse overload
-                // without creating a worker or waiting for the client to read.
-                if active.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
-                    drop(stream);
+                let Ok(handle) = stream.try_clone() else {
                     continue;
-                }
-                active.fetch_add(1, Ordering::Relaxed);
-                let slot = ConnectionSlot(active.clone());
+                };
+                // Workers are bounded by the queue: a cut-off connection's
+                // read fails at once and its worker ends.
+                let id = {
+                    let mut queue = pending.lock().unwrap_or_else(|e| e.into_inner());
+                    if queue.streams.len() >= MAX_PENDING {
+                        if let Some((_, _, oldest)) = queue.streams.pop_front() {
+                            let _ = oldest.shutdown(Shutdown::Both);
+                        }
+                    }
+                    queue.next += 1;
+                    let id = queue.next;
+                    queue.streams.push_back((id, Instant::now(), handle));
+                    id
+                };
+                let admission = Admission {
+                    pending: pending.clone(),
+                    id,
+                    active: active.clone(),
+                    left: Cell::new(None),
+                };
                 let (server, token) = (server.clone(), token.clone());
-                if let Err(error) = std::thread::Builder::new().spawn(move || {
-                    let _slot = slot;
-                    if let Err(error) = connection(stream, &server, &token) {
+                let spawned = std::thread::Builder::new().spawn(move || {
+                    if let Err(error) = connection(stream, &server, &token, &admission) {
                         if error.kind() != io::ErrorKind::BrokenPipe {
                             super::log(format!("HTTP connection: {error}"));
                         }
                     }
-                }) {
+                    // Also when setting up the connection failed early.
+                    admission.read();
+                });
+                if let Err(error) = spawned {
+                    let mut queue = pending.lock().unwrap_or_else(|e| e.into_inner());
+                    queue.streams.retain(|(queued, _, _)| *queued != id);
                     super::log(format!("HTTP worker: {error}"));
                 }
             }
@@ -114,7 +213,14 @@ impl Read for RequestReader<'_> {
     }
 }
 
-fn read_request(stream: &TcpStream, token: &str, timeout: Duration) -> io::Result<Request> {
+/// Calls `admit` once the headers authenticate, before reading the body;
+/// when it returns false (cut off, or no authenticated slot) reading stops.
+fn read_request(
+    stream: &TcpStream,
+    token: &str,
+    timeout: Duration,
+    admit: impl FnOnce() -> bool,
+) -> io::Result<Request> {
     let source = RequestReader {
         stream,
         deadline: Instant::now() + timeout,
@@ -168,6 +274,12 @@ fn read_request(stream: &TcpStream, token: &str, timeout: Duration) -> io::Resul
     if !authorized(&request, token) {
         return Ok(request);
     }
+    if !admit() {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "Not admitted",
+        ));
+    }
     request.body.resize(length, 0);
     reader.read_exact(&mut request.body)?;
     Ok(request)
@@ -193,6 +305,7 @@ fn respond(stream: &mut TcpStream, code: u16, body: &Value) -> io::Result<()> {
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let body = body.to_string();
@@ -209,12 +322,40 @@ fn respond(stream: &mut TcpStream, code: u16, body: &Value) -> io::Result<()> {
     stream.flush()
 }
 
-fn connection(mut stream: TcpStream, server: &Server, token: &str) -> io::Result<()> {
+fn connection(
+    mut stream: TcpStream,
+    server: &Server,
+    token: &str,
+    admission: &Admission,
+) -> io::Result<()> {
     stream.set_nonblocking(false)?;
     // A client that stops reading an event stream must not pin its thread.
     stream.set_write_timeout(Some(Duration::from_secs(60)))?;
-    let request = match read_request(&stream, token, REQUEST_TIMEOUT) {
+    // An authenticated slot covers reading the body too; without one, the
+    // body is never read.
+    let mut slot = None;
+    let mut full = false;
+    let request = read_request(&stream, token, REQUEST_TIMEOUT, || {
+        let queued = admission.read();
+        if queued {
+            slot = admission.authenticated();
+            full = slot.is_none();
+        }
+        slot.is_some()
+    });
+    if !admission.read() {
+        // Cut off for a newer connection; nobody is listening for an answer.
+        return Ok(());
+    }
+    let request = match request {
         Ok(request) => request,
+        Err(_) if full => {
+            return respond(
+                &mut stream,
+                503,
+                &json!({"error": "Too many authenticated connections"}),
+            );
+        }
         Err(error) => return respond(&mut stream, 400, &json!({"error": error.to_string()})),
     };
     if !authorized(&request, token) {
@@ -224,6 +365,13 @@ fn connection(mut stream: TcpStream, server: &Server, token: &str) -> io::Result
             &json!({"error": "Missing or wrong bearer token"}),
         );
     }
+    let Some(_slot) = slot else {
+        return respond(
+            &mut stream,
+            503,
+            &json!({"error": "Too many authenticated connections"}),
+        );
+    };
     let segments: Vec<&str> = request.path.trim_matches('/').split('/').collect();
     match (request.method.as_str(), segments.as_slice()) {
         ("GET", ["tools"]) => respond(&mut stream, 200, &json!({"tools": tools::list()})),
@@ -357,7 +505,7 @@ mod tests {
                 }
             });
             let started = Instant::now();
-            let result = read_request(&stream, "token", Duration::from_millis(120));
+            let result = read_request(&stream, "token", Duration::from_millis(120), || true);
             let error = result.err().expect("trickling must not renew the deadline");
             assert!(matches!(
                 error.kind(),

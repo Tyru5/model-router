@@ -117,6 +117,10 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   reach loopback, link-local, or private addresses.
 - Provider `base_url` with credentials, query, or fragment is rejected;
   environment values are redacted in previews and records.
+- `serve --http` keeps connections whose headers have not authenticated in
+  their own queue and cuts off the oldest once it has waited half a second,
+  so idle sockets cannot lock out authenticated clients and a burst of
+  clients is not cut off before its headers are read.
 
 ## [0.1.0] - 2026-10-04
 
