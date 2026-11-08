@@ -3487,6 +3487,59 @@ fn next_launch(run: &Run, only: Option<usize>) -> (Option<Launch>, Option<usize>
     (None, None)
 }
 
+/// Process groups scheduler workers started and the run has not recorded
+/// yet. Only the scheduler thread saves the run, and it can be busy running
+/// checks for a long time, so each worker writes its group here the moment
+/// it exists; a crash meanwhile still leaves it for `stop_orphans`.
+struct SpawnJournal {
+    path: PathBuf,
+    lock: std::sync::Mutex<()>,
+}
+impl SpawnJournal {
+    fn new(run: &Run) -> Self {
+        Self {
+            path: run.directory.join("spawned-groups"),
+            lock: std::sync::Mutex::new(()),
+        }
+    }
+    fn read(&self) -> Vec<u32> {
+        fs::read_to_string(&self.path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect()
+    }
+    fn add(&self, pgid: u32) -> Result<()> {
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        io::Write::write_all(&mut file, format!("{pgid}\n").as_bytes())?;
+        file.sync_data()?;
+        Ok(())
+    }
+    /// Forgets `pgid` once the run has saved it or the group has ended.
+    fn recorded(&self, pgid: u32) {
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let rest: Vec<String> = self
+            .read()
+            .into_iter()
+            .filter(|&g| g != pgid)
+            .map(|g| g.to_string())
+            .collect();
+        if rest.is_empty() {
+            let _ = fs::remove_file(&self.path);
+        } else {
+            let _ = storage::atomic_write(&self.path, format!("{}\n", rest.join("\n")).as_bytes());
+        }
+    }
+    /// Forgets every group, once they are stopped and the run is saved.
+    fn clear(&self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// Runs stages and candidates side by side until none can start and none
 /// runs, then settles the run. Each process has its own process group and
 /// logs; workers only supervise processes and report over a channel, so
@@ -3512,6 +3565,8 @@ fn schedule(
                 .iter()
                 .any(|s| s.status == Status::AwaitingConfirmation)
     };
+    let journal = SpawnJournal::new(run);
+    let journal = &journal;
     let result = thread::scope(|scope| -> Result<()> {
         let result = (|| -> Result<()> {
             let (tx, rx) = mpsc::channel::<Message>();
@@ -3620,6 +3675,7 @@ fn schedule(
                     let worker_cwd = cwd.clone();
                     let tx = tx.clone();
                     scope.spawn(move || {
+                        let spawned = std::cell::Cell::new(None);
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             process::capture_with(
                                 &invocation,
@@ -3629,6 +3685,11 @@ fn schedule(
                                 cancel,
                                 sandbox.as_ref(),
                                 |pgid| {
+                                    // Durable before this worker reports it;
+                                    // forgotten below even if writing it
+                                    // failed partway.
+                                    spawned.set(Some(pgid));
+                                    journal.add(pgid)?;
                                     let _ = tx.send(Message::Spawned(job, pgid));
                                     Ok(())
                                 },
@@ -3640,6 +3701,12 @@ fn schedule(
                         .unwrap_or_else(|_| {
                             Err(anyhow::anyhow!("The harness supervisor panicked"))
                         });
+                        // The group ended with the supervisor, so recovery
+                        // must not signal its ID, even if the run never
+                        // saved it or the scheduler stopped reading.
+                        if let Some(pgid) = spawned.get() {
+                            journal.recorded(pgid);
+                        }
                         let _ = tx.send(Message::Done(job, result));
                     });
                     flight.push((job, prepared, cwd));
@@ -3658,7 +3725,9 @@ fn schedule(
                         if let Some(attempt) = attempt {
                             attempt.process_group = Some(pgid);
                         }
-                        let _ = run.persist();
+                        if run.persist().is_ok() {
+                            journal.recorded(pgid);
+                        }
                     }
                     Message::Output(job, err, text) => {
                         let Some((label, formatter)) = formatters.get_mut(&job) else {
@@ -3919,6 +3988,9 @@ fn stop_orphans(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
             }
         }
     }
+    // Groups a scheduler worker started but the run never recorded.
+    let journal = SpawnJournal::new(run);
+    groups.extend(journal.read());
     for &pgid in &groups {
         if process::group_alive(pgid) {
             emit(Event::Output(format!(
@@ -3930,6 +4002,9 @@ fn stop_orphans(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
     if !groups.is_empty() {
         run.persist()?;
     }
+    // Only now: an mr that dies while stopping them leaves the journal for
+    // the next one, as run.json keeps the groups it recorded until saved.
+    journal.clear();
     Ok(())
 }
 
@@ -4338,6 +4413,123 @@ mod tests {
         assert!(serde_json::from_str::<serde_json::Value>(&whole).is_ok());
     }
 
+    #[test]
+    fn recovery_stops_groups_a_worker_journaled_but_the_run_never_saved() {
+        use std::os::unix::process::CommandExt;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            workflows: vec![Workflow::new(
+                "W",
+                vec![Stage {
+                    id: "implement".into(),
+                    harness: "mock".into(),
+                    ..Stage::default()
+                }],
+            )],
+            adapters: BTreeMap::from([(
+                "mock".into(),
+                CustomAdapter {
+                    command: "python3".into(),
+                    ..CustomAdapter::default()
+                },
+            )]),
+            ..Settings::default()
+        };
+        let mut run = Run::create(
+            dir.path(),
+            &settings,
+            &settings.workflows[0],
+            "Task".into(),
+            false,
+        )
+        .unwrap();
+        // A worker started this group, then mr died before saving the run.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let journal = SpawnJournal::new(&run);
+        journal.add(child.id()).unwrap();
+        // A recovery that cannot save the run keeps the journal for the next.
+        let summary = run.directory.join("summary.json");
+        fs::remove_file(&summary).unwrap();
+        fs::create_dir(&summary).unwrap();
+        fs::write(summary.join("blocker"), "").unwrap();
+        assert!(stop_orphans(&mut run, &mut |_| {}).is_err());
+        assert!(child.try_wait().unwrap().is_some(), "orphan still running");
+        assert_eq!(journal.read(), vec![child.id()]);
+        fs::remove_dir_all(&summary).unwrap();
+        stop_orphans(&mut run, &mut |_| {}).unwrap();
+        assert!(!run.directory.join("spawned-groups").exists());
+        // A group the run saved leaves the journal.
+        journal.add(7).unwrap();
+        journal.add(8).unwrap();
+        journal.recorded(7);
+        assert_eq!(journal.read(), vec![8]);
+    }
+
+    #[test]
+    fn a_worker_forgets_its_ended_group_even_when_the_run_could_not_save_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            workflows: vec![Workflow::new(
+                "W",
+                vec![
+                    Stage {
+                        id: "implement".into(),
+                        harness: "mock".into(),
+                        ..Stage::default()
+                    },
+                    // Makes the run a graph, which the scheduler drives.
+                    Stage {
+                        id: "review".into(),
+                        harness: "mock".into(),
+                        after: vec!["implement".into()],
+                        ..Stage::default()
+                    },
+                ],
+            )],
+            adapters: BTreeMap::from([(
+                "mock".into(),
+                CustomAdapter {
+                    command: "python3".into(),
+                    ..CustomAdapter::default()
+                },
+            )]),
+            ..Settings::default()
+        };
+        let mut run = Run::create(
+            dir.path(),
+            &settings,
+            &settings.workflows[0],
+            "Task".into(),
+            false,
+        )
+        .unwrap();
+        assert!(run.graph());
+        authorize_replay(&mut run, None, |_| {}).unwrap();
+        // Every save fails from the moment the harness is about to start.
+        let summary = run.directory.join("summary.json");
+        let cancel = AtomicBool::new(false);
+        let result = drive(&mut run, &cancel, |event| {
+            if let Event::Output(text) = event {
+                if text.contains("attempt 1") && summary.is_file() {
+                    fs::remove_file(&summary).unwrap();
+                    fs::create_dir(&summary).unwrap();
+                    fs::write(summary.join("blocker"), "").unwrap();
+                }
+            }
+        });
+        assert!(result.is_err(), "saving the finished attempt must fail");
+        assert!(summary.is_dir());
+        // The group ended with its worker, so a later recovery must not
+        // signal its ID, which another process may have reused.
+        assert_eq!(
+            fs::read_to_string(run.directory.join("spawned-groups")).unwrap_or_default(),
+            ""
+        );
+    }
     const NOT_APPLICABLE: &str = r#"{"summary":"Docs only","verdict":"complete","tests":[],"not_applicable":"No code changed"}"#;
 
     /// Finishes an interactive attempt as if its harness wrote `handoff` and exited 0.

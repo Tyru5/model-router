@@ -49,11 +49,21 @@ fn kill_group(pid: u32) {
     signal_group(pid, libc::SIGKILL);
 }
 
+/// `-pgid` for kill(2), for a value that can name a process group. IDs come
+/// from saved runs too: 0 or 1 would signal our own group or every process,
+/// and a value past `i32::MAX` would wrap and signal a single process.
+fn group_target(pgid: u32) -> Option<libc::pid_t> {
+    libc::pid_t::try_from(pgid)
+        .ok()
+        .filter(|&id| id > 1)
+        .map(|id| -id)
+}
+
 fn signal_group(pid: u32, signal: i32) {
-    // SAFETY: spawned children have a dedicated process group/session; never use 0.
-    if pid > 1 {
+    if let Some(target) = group_target(pid) {
+        // SAFETY: kill takes no pointers; the target is a whole group.
         unsafe {
-            libc::kill(-(pid as i32), signal);
+            libc::kill(target, signal);
         }
     }
 }
@@ -61,7 +71,7 @@ fn signal_group(pid: u32, signal: i32) {
 /// Whether any process, including a zombie, is still in group `pgid`.
 pub fn group_alive(pgid: u32) -> bool {
     // SAFETY: signal 0 only checks existence and permission.
-    pgid > 1 && unsafe { libc::kill(-(pgid as i32), 0) } == 0
+    group_target(pgid).is_some_and(|target| unsafe { libc::kill(target, 0) } == 0)
 }
 
 /// How long a cancelled or timed-out harness may take to save its session
@@ -1965,6 +1975,18 @@ mod tests {
         assert!(outcome.cancelled);
         wait_for(|| dir.path().join("saved").exists());
         wait_for(|| !socket.exists());
+    }
+
+    #[test]
+    fn only_real_process_group_ids_are_signalled() {
+        assert_eq!(group_target(0), None);
+        assert_eq!(group_target(1), None);
+        assert_eq!(group_target(4242), Some(-4242));
+        assert_eq!(group_target(i32::MAX as u32), Some(-i32::MAX));
+        // Would wrap to a negative ID, i.e. one process rather than a group.
+        assert_eq!(group_target(i32::MAX as u32 + 2), None);
+        assert_eq!(group_target(u32::MAX), None);
+        assert!(!group_alive(u32::MAX));
     }
 
     #[test]

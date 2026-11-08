@@ -127,8 +127,10 @@ addresses, unless the URL you typed names such a host.
   one lives in its terminal host, so it survives a crashed `mr`; the next `mr`
   reattaches to it. If the host itself dies, its closed PTY hangs the harness
   up, and the next `mr` stops whatever is left.
-- Each attempt records its active harness or check process group; after a
-  crash, the next `resume` stops any surviving group first. Discarding a fan-out
+- Each attempt records its active harness or check process group (parallel
+  workers first journal it in the run directory, so a crash while the
+  scheduler is busy still leaves it); after a crash, the next `resume` stops
+  any surviving group first. Discarding a fan-out
   round for a full retry retains its groups until recovery stops them.
 - Quitting the TUI (`q`) stops active runs. A running interactive stage stops
   too unless you choose to leave it running: its harness lives in a terminal

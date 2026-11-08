@@ -106,6 +106,8 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 - The run and workspace locks pass between `mr` and a terminal host as file
   descriptors, so they are no longer free while a stage is left running or
   reattached (only if an attached `mr` dies, until the host takes them back).
+- Process groups that parallel workers start are journaled at once, so a
+  crash while checks run still lets `resume` stop them.
 
 ### Security
 
@@ -122,7 +124,8 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   their own queue and cuts off the oldest once it has waited half a second,
   so idle sockets cannot lock out authenticated clients and a burst of
   clients is not cut off before its headers are read.
-- Harness-reported errors are stripped of terminal escapes.
+- Harness-reported errors are stripped of terminal escapes; recorded process
+  group IDs outside the valid range are never signalled.
 - Check logs, fan-out candidate patches, and candidate snapshot indexes
   never write through a link a stage left in its attempt directory (a
   process the stage detached and left running can still race them), and
