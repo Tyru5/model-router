@@ -122,9 +122,25 @@ def main():
             terminal.send("p")
             terminal.send(b"\x0c")
             terminal.send(f"\x1b[200~{other}\x1b[201~\r")
-            terminal.send("\r")
+            # Enter while the folder is still being read picks the old one,
+            # whose listing shows subfolders; this one has none.
             terminal.wait_for(
-                lambda: "Choose repository" not in terminal.text(),
+                lambda: (
+                    "Use this folder" in terminal.text()
+                    and "[folder]" not in terminal.text()
+                    and "Reading folder" not in terminal.text()
+                ),
+                "Direct path did not open the folder",
+            )
+            terminal.send("\r")
+            # The browser gives way to "Opening project…" first, which ignores
+            # keys until the project is open.
+            terminal.wait_for(
+                lambda: (
+                    "Choose repository" not in terminal.text()
+                    and "Opening project" not in terminal.text()
+                    and f"{other.name}  not a Git repository" in terminal.text()
+                ),
                 "Repository switch failed",
             )
             assert background(terminal) == "1b1e28", "Repository switch lost the theme"
