@@ -317,6 +317,46 @@ fn a_judge_stage_chooses_candidate_two_and_dependents_wait_for_it() {
             .iter()
             .any(|d| d.contains("Chosen by judge"))
     );
+    // A fork carries no candidates to judge: point at the fan-out instead.
+    let error =
+        model_router::history::fork(dir.path(), &settings(&run.workflow), &run.id, "judge", None)
+            .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("fork at implement instead"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn a_fan_out_receipt_reports_the_chosen_candidates_failed_checks() {
+    use model_router::report::{Basis, receipts};
+    let mut implement = fan_out(&[("a", "test-model"), ("b", "test-model")], "auto");
+    implement.checks = vec![Check {
+        command: vec!["python3".into(), "-c".into(), "raise SystemExit(1)".into()],
+        ..Check::default()
+    }];
+    let Some((_dir, mut run)) = git_run(vec![implement]) else {
+        return;
+    };
+    // Auto-pick still applies a candidate when every one fails its checks.
+    drive(&mut run);
+    assert!(run.stages[0].fan_out.as_ref().unwrap().selection.is_some());
+    // The stage's own attempt runs no checks; the receipt is the winner's.
+    let receipt = receipts(&run).remove(0);
+    assert_eq!(receipt.basis, Basis::RouterChecksFailed, "{receipt:?}");
+    assert_eq!((receipt.required_passed, receipt.required_total), (0, 1));
+    // It names the stage's attempt, and the winner's tested snapshot is what
+    // the workspace now holds.
+    assert_eq!(
+        receipt.attempt,
+        run.stages[0].attempts.last().unwrap().number
+    );
+    assert!(receipt.snapshot.is_some(), "{receipt:?}");
+    assert_eq!(
+        receipt.freshness,
+        Some(model_router::report::Freshness::Current),
+        "{receipt:?}"
+    );
 }
 
 #[test]

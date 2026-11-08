@@ -251,16 +251,20 @@ pub fn receipts(run: &Run) -> Vec<Receipt> {
     };
     let mut out = vec![];
     for (stage, state) in run.workflow.stages.iter().zip(&run.stages) {
-        let Some(last) = state.attempts.last() else {
+        // A fan-out stage's checks ran on its chosen candidate.
+        let Some(last) = state.checked() else {
             continue;
         };
         if last.checks.is_empty() && stage.role != Role::Test {
             continue;
         }
-        let required: Vec<_> = last.checks.iter().filter(|c| c.required).collect();
-        let required_passed = required
+        // Count what the stage configures, not what ran: a cancel can stop
+        // the checks part way through.
+        let configured = stage.checks.iter().filter(|c| c.required).count();
+        let required_passed = last
+            .checks
             .iter()
-            .filter(|c| c.status == TestStatus::Passed)
+            .filter(|c| c.required && c.status == TestStatus::Passed)
             .count();
         let model_reported_passed = state.handoff.as_ref().map_or(0, |h| {
             h.tests
@@ -268,9 +272,9 @@ pub fn receipts(run: &Run) -> Vec<Receipt> {
                 .filter(|t| t.required && t.status == TestStatus::Passed)
                 .count()
         });
-        let basis = if !required.is_empty() && required_passed == required.len() {
+        let basis = if configured > 0 && required_passed == configured {
             Basis::RouterChecks
-        } else if !required.is_empty() {
+        } else if configured > 0 {
             Basis::RouterChecksFailed
         } else if state.waiver.is_some() {
             Basis::Waived
@@ -308,10 +312,11 @@ pub fn receipts(run: &Run) -> Vec<Receipt> {
         out.push(Receipt {
             stage: stage.name.clone(),
             role: stage.role,
-            attempt: last.number,
+            // The stage's attempt, even when a candidate's checks stand for it.
+            attempt: state.attempts.last().map_or(last.number, |a| a.number),
             basis,
             required_passed,
-            required_total: required.len(),
+            required_total: configured,
             model_reported_passed,
             snapshot: last.checks_tree.clone(),
             freshness,

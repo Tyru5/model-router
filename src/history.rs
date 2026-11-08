@@ -334,6 +334,14 @@ pub fn fork(
         stage.role != crate::config::Role::Ship,
         "Ship stages run in the router; ship the fork instead (model-router ship)"
     );
+    // A judge needs the fan-out's candidates, and its checkpoint predates
+    // the winner being applied; a fork carries neither.
+    if let Some(fan_out) = crate::graph::judged_by(&source.workflow, index) {
+        let fan_out = &source.workflow.stages[fan_out].id;
+        return Err(anyhow!(
+            "Stage {stage_id} judges fan-out stage {fan_out}; fork at {fan_out} instead"
+        ));
+    }
     if model.is_some() {
         ensure!(
             stage.fan_out.is_none(),

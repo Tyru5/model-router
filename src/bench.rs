@@ -381,13 +381,21 @@ impl CellResult {
         // Router checks and model-reported tests of each stage's final attempt.
         let (mut passed, mut total) = (0, 0);
         let mut all_required_passed = true;
-        for state in &run.stages {
-            if let Some(attempt) = state.attempts.last() {
-                all_required_passed &= attempt
-                    .checks
-                    .iter()
-                    .filter(|c| c.required)
-                    .all(|c| c.status == TestStatus::Passed);
+        for (stage, state) in run.workflow.stages.iter().zip(&run.stages) {
+            let configured = stage.checks.iter().filter(|c| c.required).count();
+            // Every configured required check must have run and passed; a
+            // fan-out stage's checks are its chosen candidate's.
+            let attempt = state.checked();
+            let required: Vec<_> = attempt
+                .iter()
+                .flat_map(|a| &a.checks)
+                .filter(|c| c.required)
+                .collect();
+            all_required_passed &= !stage.enabled
+                || configured == 0
+                || (required.len() == configured
+                    && required.iter().all(|c| c.status == TestStatus::Passed));
+            if let Some(attempt) = attempt {
                 total += attempt.checks.len();
                 passed += attempt
                     .checks

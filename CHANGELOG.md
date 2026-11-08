@@ -106,6 +106,10 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 - The run and workspace locks pass between `mr` and a terminal host as file
   descriptors, so they are no longer free while a stage is left running or
   reattached (only if an attached `mr` dies, until the host takes them back).
+- `fork` refuses a stage that judges a fan-out, which could never finish.
+- Receipts and `bench --min-pass` use a fan-out stage's chosen candidate's
+  checks, and count configured required checks rather than those that ran.
+- `handoffs` counts list items lost to repeated shortening correctly.
 - Process groups that parallel workers start are journaled at once, so a
   crash while checks run still lets `resume` stop them.
 

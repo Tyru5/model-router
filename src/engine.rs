@@ -227,6 +227,24 @@ pub struct StageState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherited: Option<PathBuf>,
 }
+impl StageState {
+    /// The attempt whose router checks stand for the stage: the latest one,
+    /// or for a fan-out stage whose winner reached the workspace, that
+    /// candidate's latest one, since candidates run the checks and the
+    /// stage's own attempt runs none.
+    pub fn checked(&self) -> Option<&Attempt> {
+        let chosen = self.fan_out.as_ref().and_then(|fan_out| {
+            let selection = fan_out.selection.as_ref().filter(|s| s.applied)?;
+            fan_out
+                .candidates
+                .iter()
+                .find(|c| c.id == selection.candidate)?
+                .attempts
+                .last()
+        });
+        chosen.or_else(|| self.attempts.last())
+    }
+}
 
 /// One round of a best-of-N stage: where candidates started, each
 /// candidate, and which one reached the workspace.
@@ -1730,16 +1748,20 @@ impl Inspection {
 /// dropped, least important first, rather than cutting the text mid-object.
 /// Also returns the JSON value as sent.
 fn handoff_excerpt(handoff: &Handoff, max: usize, full: &Path) -> (String, serde_json::Value) {
-    let Ok(mut value) = serde_json::to_value(handoff) else {
+    let Ok(original) = serde_json::to_value(handoff) else {
         return (String::new(), serde_json::Value::Null);
     };
     let render =
         |value: &serde_json::Value| serde_json::to_string_pretty(value).unwrap_or_default();
-    let mut json = render(&value);
+    let mut json = render(&original);
     if json.len() <= max {
-        return (json, value);
+        return (json, original);
     }
+    let mut value = original.clone();
     for (chars, items) in [(1000, 40), (400, 20), (160, 10), (60, 5)] {
+        // Each pass starts from the original, so "… N more" counts what the
+        // list really lost rather than re-cutting an earlier pass's marker.
+        value = original.clone();
         shorten(&mut value, chars, items);
         json = render(&value);
         if json.len() <= max {
@@ -2882,6 +2904,11 @@ impl Run {
             );
         }
         if !candidate.checks.is_empty() {
+            // The receipt: what the checks are about to test, as for a stage.
+            let tested = snapshot::tree_with(&worktree, &candidate_index(prepared), &self.id);
+            if let Some(attempt) = self.candidate_mut(index, c).attempts.last_mut() {
+                attempt.checks_tree = tested;
+            }
             let (results, cancelled) = checks::run(
                 &candidate.checks,
                 cwd,
@@ -4530,6 +4557,30 @@ mod tests {
             ""
         );
     }
+
+    #[test]
+    fn a_second_shortening_pass_counts_what_the_list_really_lost() {
+        // Too big for the first pass (40 items), small enough for the second (20).
+        let handoff: Handoff = serde_json::from_value(serde_json::json!({
+            "summary": "s".repeat(900),
+            "verdict": "complete",
+            "decisions": (0..45).map(|i| format!("{i:02} {}", "d".repeat(300))).collect::<Vec<_>>(),
+        }))
+        .unwrap();
+        let (excerpt, sent) = handoff_excerpt(&handoff, 8000, Path::new("/h.json"));
+        let decisions = sent["decisions"].as_array().unwrap();
+        assert_eq!(decisions.len(), 21, "{excerpt}");
+        assert_eq!(decisions[20], "… 25 more");
+        let view = HandoffView::compare("implement".into(), &handoff, &sent, 8000, excerpt.len());
+        assert!(
+            view.warnings
+                .iter()
+                .any(|w| w == "decisions lost: 25 of 45 dropped"),
+            "{:?}",
+            view.warnings
+        );
+    }
+
     const NOT_APPLICABLE: &str = r#"{"summary":"Docs only","verdict":"complete","tests":[],"not_applicable":"No code changed"}"#;
 
     /// Finishes an interactive attempt as if its harness wrote `handoff` and exited 0.

@@ -599,4 +599,10 @@ fn receipts_outside_git_say_freshness_is_unavailable() {
             reason: "not a Git repository".into()
         })
     );
+    // A required check with no result (a cancel stopped the checks after
+    // the first) is not a pass of the ones that happened to run.
+    run.workflow.stages[0].checks.push(python("pass", true));
+    let partial = model_router::report::receipts(&run).remove(0);
+    assert_eq!(partial.basis, Basis::RouterChecksFailed);
+    assert_eq!((partial.required_passed, partial.required_total), (1, 2));
 }

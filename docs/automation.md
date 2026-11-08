@@ -88,7 +88,8 @@ checkpoint if the source's starting snapshot is gone).
 
 The checkpoint is `STAGE`'s first attempt that started after every upstream
 attempt finished, and its `tree_before` snapshot. The fork refuses, creating
-nothing, when: the stage never started; an upstream stage is not complete;
+nothing, when: the stage never started; the stage judges a fan-out (fork at
+the fan-out stage instead); an upstream stage is not complete;
 an upstream stage ran again after every attempt of `STAGE` started (a review
 repair), so no snapshot matches the handoffs; a non-upstream stage changed
 files before the checkpoint; the run has no snapshot (not Git) or it was
@@ -134,9 +135,10 @@ for stopped runs too.
 | `--transitions` | Include the status timeline (`transitions.jsonl`): every run, stage, and attempt change with time, cause (engine, user, recovery), and reason. |
 
 The text and `--json` reports include **verification receipts** (`receipts`)
-for each stage whose latest attempt ran router checks, and for each test
-stage: the basis (`router_checks`, `router_checks_failed`,
-`self_reported_only`, `waived`, `none`), required router checks passed, model-
+for each stage whose latest attempt ran router checks (for a fan-out stage,
+its chosen candidate's), and for each test stage: the basis (`router_checks`, `router_checks_failed`,
+`self_reported_only`, `waived`, `none`), required router checks passed out of
+those configured, model-
 reported passing tests, the Git tree the checks ran against (`snapshot`), and
 `freshness`: `current` (the workspace still matches), `stale` with the changed
 files, or `unavailable` with a reason (not Git, no snapshot recorded, snapshot
