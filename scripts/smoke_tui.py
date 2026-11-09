@@ -36,14 +36,34 @@ def main():
             )
             terminal.snapshot("workflow-80x24.txt")
             terminal.resize(120, 36)
+            # The Space menu reaches any action: g, then h shows Harnesses.
+            terminal.send(" ")
+            terminal.wait_for_text(
+                "Press a group letter", message="Space menu did not open"
+            )
+            terminal.send("gh")
+            terminal.wait_for_text(
+                " Harnesses ", message="Space g h did not go to Harnesses"
+            )
+            terminal.send("1")
+            # t edits the task in its panel; the stages stay in view.
             terminal.send("t")
             terminal.send(
                 "\x1b[200~Build a feature with 雪\nand preserve context between stages.\x1b[201~"
             )
+            terminal.wait_for(
+                lambda: (
+                    "[Ctrl+S] done" in terminal.text()
+                    and "Build a feature with 雪" in terminal.text()
+                    and "stage 1 of 4" in terminal.text()
+                ),
+                "Task did not open in its panel",
+            )
             terminal.send(b"\x13")
-            terminal.send("jjo")  # enable review
+            terminal.send("\x1b[C\x1b[Co")  # → → selects the review; o enables it
+            terminal.wait_for_text("stage 3 of 4", message="→ did not select stages")
             terminal.send("o")  # disable it again
-            terminal.send("kve")  # implementation: interactive, then edit
+            terminal.send("\x1b[Dve")  # ←: implementation; interactive, then edit
             terminal.send(b"\x01\x0b")  # beginning/end-of-line deletion in text editor
             terminal.send("Interactive implementation")
             terminal.send(b"\x13")
@@ -80,6 +100,14 @@ def main():
             terminal.wait_for_text(
                 "Inspect the handoff: [h]", message="TUI did not show the checkpoint"
             )
+            # The card under the feed names the stage and its keys.
+            terminal.wait_for(
+                lambda: (
+                    "◆ Interactive implementation needs you" in terminal.text()
+                    and "[a] accept" in terminal.text()
+                ),
+                "Needs-you card missing",
+            )
             terminal.snapshot("interactive-checkpoint.txt")
             terminal.send("h")
             terminal.wait_for(
@@ -102,6 +130,11 @@ def main():
             assert (
                 "research evidence"
                 in (project / ".model-router/mock/implementation.prompt").read_text()
+            )
+            # A finished run shows its brief, with what to do next pinned below.
+            terminal.wait_for(
+                lambda: "Next" in terminal.text() and "[d] diff" in terminal.text(),
+                "Brief did not show",
             )
             terminal.snapshot("completed.txt")
             # The sidebar lists the run under this session, not Saved.
@@ -151,7 +184,7 @@ mode = "interactive"
         finally:
             terminal.cleanup()
     print(
-        "PASS: real TUI editing, Unicode paste, 80x24 resize, optional review, PTY input, handoff checkpoint, completion, history, terminal restoration, and rejection of unrecorded review verdicts."
+        "PASS: Space menu, in-place task editing, stage strip selection, Unicode paste, 80x24 resize, optional review, PTY input, needs-you card, handoff checkpoint, brief, history, terminal restoration, and rejection of unrecorded review verdicts."
     )
     print(f"Artifacts: {ARTIFACTS}")
 

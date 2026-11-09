@@ -58,10 +58,12 @@ downstream stages. Preset configs roundtrip through TOML and initialization
 refuses to overwrite existing files. Cancelled stage drafts leave no new entry;
 repeated stages have distinct IDs and repeated workflows have distinct names.
 
-The terminal smoke test exercises editing/saving, stage toggles, Unicode paste,
-80×24 and 120×36 layouts, native interactive input, handoff inspection, explicit
-advancement, completion, run history, terminal restoration, and rejection of an
-interactive review verdict that was printed without a handoff file.
+The terminal smoke test exercises the `Space` menu, editing the task in its
+panel, selecting stages in the strip, saving, stage toggles, Unicode paste,
+80×24 and 120×36 layouts, native interactive input, the needs-you card, handoff
+inspection, explicit advancement, a finished run's brief, run history, terminal
+restoration, and rejection of an interactive review verdict that was printed
+without a handoff file.
 
 `scripts/smoke_repos.py` verifies repository browsing, type-to-filter, parent
 navigation, Unicode paths, recent projects surviving restart, workflow autosave,

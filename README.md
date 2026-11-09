@@ -90,6 +90,7 @@ Replace the Astra ID if your account differs. `w` adds presets such as
 | `1` `2` `3` / `Tab` | Workflow, Runs, Harnesses / next view |
 | `p` | Choose repository |
 | `t` / `f` | Edit task / import task |
+| `←→` | Select stage |
 | `e` / `c` / `m` | Edit stage / harness settings / pick model |
 | `o` | Enable or disable stage |
 | `a` / `x` / `J` `K` | Add / remove / move stage |
@@ -98,6 +99,7 @@ Replace the Astra ID if your account differs. `w` adds presets such as
 | `s` | Save project config |
 | `↑↓` / `Enter` (Runs) | Select a run / open a saved run |
 | `a` / `y` / `i` (Runs) | Advance / retry / retry interactively |
+| `o` (Runs) | A finished run's brief ↔ its output |
 | `t` / `Ctrl+B` | Open or take over a session / detach from it |
 | `d` / `h` (Runs) | Diff / inspect handoff |
 | `T` / `F8` / `F9` | Theme / Vim motions / notifications |

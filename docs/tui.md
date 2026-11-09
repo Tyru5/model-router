@@ -6,6 +6,15 @@ and `:` a searchable command menu of the current view's actions. All three, and
 the one-row footer, are built from the same action table as this page
 (`src/tui/actions.rs`).
 
+Three pages, on `1` `2` `3`:
+
+- **Workflow** sets up the next run: its task, a strip of its stages, and the
+  selected stage's settings. `r` starts it.
+- **Runs** lists this session's runs and saved ones beside the selected run:
+  a feed of its output while it runs, a card when it needs you, and a brief
+  once it has finished.
+- **Harnesses** lists the installed agent CLIs and their checks.
+
 Keys need their exact modifiers: `Ctrl+R` is not `r`. Shift is implied by
 capital letters (`T` = Shift+T).
 
