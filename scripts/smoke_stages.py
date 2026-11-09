@@ -128,7 +128,7 @@ def main():
             assert workflows[-1]["name"] == "Full feature (2)"
             terminal.resize(120, 36)
             terminal.wait_for(
-                lambda: "Selected stage" in terminal.text(),
+                lambda: terminal.find_line(r"stage \d+ of \d+") is not None,
                 "TUI did not redraw after resizing",
             )
             terminal.send("wOffline demo\r")

@@ -31,8 +31,8 @@ def main():
             terminal.snapshot("workflow-120x36.txt")
             terminal.resize(80, 24)
             terminal.wait_for_line(
-                r"\b3\s+Review \(optional\)",
-                message="Optional review stage row is hidden at 80x24",
+                r"○ Review \(optional\)",
+                message="Optional review stage is hidden from the strip at 80x24",
             )
             terminal.snapshot("workflow-80x24.txt")
             terminal.resize(120, 36)

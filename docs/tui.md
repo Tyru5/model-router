@@ -57,15 +57,21 @@ applies and `Esc` cancels (asking first if there are changes).
 
 ## Workflow (1)
 
+The page sets up the next run: the workflow it runs, the task, a strip of the
+workflow's stages, and the selected stage's settings below the strip. Narrow
+panes keep the selected stage's name and its neighbours' in the strip, then
+only its own, then count the stages past the edge (`+2`). A line at the bottom
+says how many stages are on, the repair limit, and where the run works.
+
 | Key | Action |
 | --- | --- |
 | `r` | Start the workflow (clears the task for the next run) |
-| `t` | Edit task (`Enter` adds a line, `Ctrl+S` applies) |
+| `t` | Edit the task in its panel (`Enter` adds a line, `Ctrl+S` applies, `Esc` cancels) |
 | `f` | Import task/spec ([below](#task-import)) |
 | `p` | Repository browser ([below](#repository-browser)) |
 | `w` | Select/clone a workflow or add a workflow preset |
 | `R` / `X` | Rename / delete workflow (`y` confirms) |
-| `↑` `↓` / `k` `j` | Select stage |
+| `←` `→` / `↑` `↓` / `k` `j` | Select stage |
 | `e` / `Enter` | Stage editor |
 | `c` | Harness settings for the stage ([below](#harness-settings)) |
 | `h` | Pick harness |
@@ -81,9 +87,9 @@ applies and `Esc` cancels (asking first if there are changes).
 | `P` | Preview commands (no model calls) |
 | `s` / `S` | Save project / global templates |
 
-The stage panel shows routing, sandbox, missing harness flags (after
-Harnesses has checked), and a dim history hint when stats favour another
-assignment.
+The stage's settings show its routing, sandbox, missing harness flags (after
+Harnesses has checked), instructions, checks, and a dim history hint when
+stats favour another assignment.
 
 ### Stage editor
 

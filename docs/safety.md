@@ -124,7 +124,7 @@ created after the stage started.
 - No working backend: the stage fails before launch unless
   `sandbox_fallback = "warn"`.
 - Interactive stages keep their terminal.
-- `doctor` reports the backend; `preview` and the stage panel show each
+- `doctor` reports the backend; `preview` and the stage details show each
   stage's mode; `command.json` records backend and writable paths.
 - Limits: harness state directories stay writable, so a harness can change its
   own settings. A project config replaces your global one, so set the sandbox

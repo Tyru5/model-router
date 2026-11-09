@@ -160,7 +160,7 @@ the path with their versions (`git` serves worktrees, snapshots, diffs, and
 ship; `gh` serves GitHub task imports and `ship --draft-pr`). It cannot check
 logins.
 `--strict` fails when an installed harness lacks a flag. The Harnesses page
-(`4`) runs the same checks; the stage panel then warns about missing flags.
+(`3`) runs the same checks; the stage details then warn about missing flags.
 Details: [adapters.md](adapters.md#compatibility-checks).
 
 ## Custom adapters

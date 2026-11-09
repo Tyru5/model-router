@@ -229,7 +229,7 @@ router never changes or substitutes a stage's model. `--json` adds
 
 The TUI's `I` shows the same table. When a role has an assignment with ≥ 5
 samples, a success rate 15 points higher, and no more repairs or retries, the
-stage panel shows a hint like `History: claude/opus succeeded 9/10 here vs
+stage details show a hint like `History: claude/opus succeeded 9/10 here vs
 4/8`. Advice only; nothing changes for you.
 
 ## Bench

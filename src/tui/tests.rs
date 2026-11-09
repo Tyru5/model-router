@@ -43,6 +43,51 @@ fn theme_app(project: &std::path::Path) -> App {
 }
 
 #[test]
+fn the_new_run_view_strips_stages_and_edits_the_task_in_place() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    let names: Vec<String> = app.editor.settings.workflows[0]
+        .stages
+        .iter()
+        .map(|s| s.name.clone())
+        .collect();
+    assert!(names.len() >= 3);
+    let screen = rows(&mut app, 80, 24).join("\n");
+    assert!(
+        screen.contains(&format!("stage 1 of {}", names.len())),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("Instructions"),
+        "details show at 80 columns\n{screen}"
+    );
+    // → selects the next stage; its neighbours keep their names in the strip.
+    app.key(key(Key::Right)).unwrap();
+    assert_eq!(app.editor.selected, 1);
+    let screen = rows(&mut app, 80, 24).join("\n");
+    assert!(
+        screen.contains(&format!("stage 2 of {}", names.len())),
+        "{screen}"
+    );
+    for name in &names[..3] {
+        assert!(screen.contains(name.as_str()), "lacks {name}\n{screen}");
+    }
+    app.key(key(Key::Left)).unwrap();
+    assert_eq!(app.editor.selected, 0);
+    // t edits the task in its own panel, with the page still in view.
+    app.key(key(Key::Char('t'))).unwrap();
+    app.paste("Fix the cache 雪");
+    let screen = rows(&mut app, 80, 24).join("\n");
+    assert!(screen.contains("Fix the cache 雪"), "{screen}");
+    assert!(screen.contains("[Ctrl+S] done"), "{screen}");
+    assert!(screen.contains("Stages"), "{screen}");
+    app.key(ctrl('s')).unwrap();
+    assert!(app.ui.dialog().is_none());
+    assert_eq!(app.editor.task, "Fix the cache 雪");
+    assert!(rows(&mut app, 80, 24).join("\n").contains("[t] edit"));
+}
+
+#[test]
 fn vim_opt_in_persists_without_changing_the_theme_or_project() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());

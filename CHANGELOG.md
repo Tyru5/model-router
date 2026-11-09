@@ -92,6 +92,9 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   place of the Progress, Output, and Handoff panels. A card under the feed
   says when the run waits on you and which keys answer it. A finished run
   shows its brief in one scrolling column with a Next bar of likely keys.
+- TUI: the Workflow page sets up a new run: the task panel on top, edited in
+  place with `t`, then a strip of the stages (`←→` selects) with the selected
+  stage's settings below it at every width.
 - TUI: enabling or disabling a stage moved from `Space` to `o`. The footer is
   one row, ending with `Space menu` and `? keys`.
 - README reduced to an entry point; detail moved to `docs/`.

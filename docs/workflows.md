@@ -154,7 +154,7 @@ after = ["implement"]   # also waits for the judge
 
 TUI: **Fan-out candidates** field, one per line
 `[id:] harness [model] [provider] [effort]`, plus a `judge = auto|ID` line.
-The Monitor lists candidates under their stage; ★ marks the choice.
+The run view lists candidates under the stage strip while they run, and its brief lists them afterwards; ★ marks the choice.
 
 ## Handoffs
 
@@ -262,7 +262,7 @@ snapshot, not test adequacy. Outside Git, freshness is unavailable. See
 ### Not applicable
 
 When no check can apply, a test stage may report
-`"not_applicable": "reason"`. The run waits; accept with `a` (Monitor),
+`"not_applicable": "reason"`. The run waits; accept with `a` (Runs page),
 `resume RUN_ID --advance`, or `a` at the CLI prompt. The waiver is saved on
 the stage; a retry or repair discards it.
 

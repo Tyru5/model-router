@@ -11,7 +11,7 @@ use super::{
     theme::{self, Palette, Theme},
     ui::Ui,
     widgets::{dim, rows_for, short_path, textarea},
-    workflow_page::draw_workflow,
+    workflow_page::{draw_workflow, editing_task},
 };
 use crate::{
     catalog,
@@ -921,11 +921,14 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         chunks[1].inner(Margin::new(1, 0)),
     );
     let body = chunks[2].inner(Margin::new(1, 0));
+    // The task editor opens in the Workflow page's task panel, not as a dialog.
+    let mut task_area = None;
     match app.ui.page {
-        Page::Workflow => draw_workflow(frame, app, body, palette),
+        Page::Workflow => task_area = Some(draw_workflow(frame, app, body, palette)),
         Page::Runs => draw_runs(frame, app, body, palette),
         Page::Harnesses => draw_harnesses(frame, app, body, palette),
     }
+    let inline = task_area.filter(|_| editing_task(app));
     if !app.ui.message.is_empty() {
         frame.render_widget(
             Paragraph::new(status).wrap(Wrap { trim: false }),
@@ -949,6 +952,19 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(modal) = app.ui.dialog_mut() {
         if let Some(field) = modal.active_input() {
             field.set_vim(vim);
+        }
+        if let (Some(area), Modal::Input { text, .. }) = (inline, &mut *modal) {
+            palette.style_textarea(text);
+            super::widgets::wrapped_textarea(frame, text, area, Block::default());
+            if let Some(hint) = text.mode_hint() {
+                frame.render_widget(
+                    Paragraph::new(format!(" {hint} "))
+                        .style(Style::default().fg(palette.accent).bg(palette.panel))
+                        .centered(),
+                    Rect::new(area.x, area.bottom(), area.width, 1),
+                );
+            }
+            return;
         }
         // The theme picker previews live, so keep the page behind it legible.
         let previewing_theme = matches!(

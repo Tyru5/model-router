@@ -7,7 +7,10 @@ use super::{
     path_picker::PathPicker,
     task_importer::TaskImporter,
     theme::Palette,
-    widgets::{content, focus_textarea, kv, or_default, textarea, wrapped_textarea},
+    widgets::{
+        StripStage, content, focus_textarea, kv, or_default, rows_for, stage_strip, textarea,
+        wrapped_textarea,
+    },
 };
 use crate::{
     adapters, catalog,
@@ -22,10 +25,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, Cell, HighlightSpacing, List, ListItem, ListState, Padding, Paragraph, Row, Table,
-        TableState, Wrap,
-    },
+    widgets::{Block, HighlightSpacing, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
 use tui_textarea::CursorMove;
 
@@ -874,159 +874,184 @@ impl App {
     }
 }
 
-pub(super) fn draw_workflow(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
-    let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(5),
-        Constraint::Min(5),
-    ])
-    .split(area);
+/// Whether the task is being edited in its panel on this page.
+pub(super) fn editing_task(app: &App) -> bool {
+    matches!(
+        app.ui.dialog(),
+        Some(Modal::Input {
+            target: InputTarget::Task,
+            ..
+        })
+    )
+}
+
+/// The next run: its workflow, task, a strip of its stages, and the
+/// selected stage's settings below. Returns the task panel's inner area,
+/// where the app draws the task editor while it is open.
+pub(super) fn draw_workflow(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    palette: Palette,
+) -> Rect {
     let workflow = &app.editor.settings.workflows[app.editor.workflow];
-    let enabled = workflow.stages.iter().filter(|s| s.enabled).count();
-    let mut heading = vec![Span::styled(
-        workflow.name.clone(),
-        Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
-    )];
+    let editing = editing_task(app);
+    let width = area.width.saturating_sub(4).max(1);
+    let task_text = storage::clean_terminal(&app.editor.task);
+    let task_rows: u16 = task_text
+        .lines()
+        .map(|line| rows_for(&Line::raw(line.to_owned()), width, u16::MAX))
+        .fold(0, u16::saturating_add)
+        .max(1);
+    // The task takes what it needs, up to a third of the page; the editor
+    // gets room to type.
+    let most = (area.height / 3).max(3);
+    let task_height = if editing {
+        (area.height * 2 / 5).max(5)
+    } else {
+        task_rows.min(most) + 2
+    };
+    let roomy = area.height >= 26;
+    let [heading, _, task, _, label, strip, rule, detail, summary] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(u16::from(roomy)),
+        Constraint::Length(task_height),
+        Constraint::Length(u16::from(roomy)),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    // Heading: what this page is, and which workflow it runs.
+    let mut right = vec![
+        Span::styled("Workflow  ", Style::default().fg(palette.muted)),
+        Span::styled(
+            workflow.name.clone(),
+            Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
+        ),
+    ];
     if app.editor.dirty {
-        heading.push(Span::styled(
+        right.push(Span::styled(
             "  ● unsaved",
             Style::default().fg(palette.warn),
         ));
     }
-    heading.push(Span::styled(
-        format!(
-            "   {enabled}/{} stages  ·  {}  ·  repairs ≤ {}",
-            workflow.stages.len(),
-            if app.editor.worktree {
-                "isolated worktree"
-            } else {
-                "current directory"
-            },
-            workflow.max_repair_passes
-        ),
-        Style::default().fg(palette.muted),
-    ));
-    let heading = Line::from(heading);
-    let actions = palette.hints(&[
-        ("w", "switch"),
-        ("R", "rename"),
-        ("g", "worktree"),
-        ("l", "repairs"),
-    ]);
-    let actions_width = actions.width() as u16;
-    if heading.width() as u16 + actions_width + 2 <= area.width {
-        frame.render_widget(Paragraph::new(actions).right_aligned(), chunks[0]);
-    }
-    frame.render_widget(Paragraph::new(heading), chunks[0]);
-    let task = if app.editor.task.is_empty() {
-        Paragraph::new(Line::styled(
-            "No task yet. Press [t] to write one, or [f] to import a file, URL, or GitHub issue.",
-            Style::default()
-                .fg(palette.muted)
-                .add_modifier(Modifier::ITALIC),
-        ))
-    } else {
-        Paragraph::new(storage::clean_terminal(&app.editor.task))
-            .style(Style::default().fg(palette.fg))
-    };
+    right.push(Span::raw("   "));
+    right.extend(palette.hints(&[("w", "switch")]).spans);
+    frame.render_widget(Paragraph::new(Line::from(right)).right_aligned(), heading);
     frame.render_widget(
-        task.wrap(Wrap { trim: false })
-            .block(palette.panel_with("Task", &[("t", "edit"), ("f", "import")])),
-        chunks[2],
+        Paragraph::new(Line::styled(
+            "New run",
+            Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
+        )),
+        heading,
     );
-    let cols = if area.width >= 100 {
-        Layout::horizontal([Constraint::Percentage(66), Constraint::Percentage(34)])
-            .split(chunks[3])
+
+    // Task.
+    let block = if editing {
+        palette
+            .panel_with("Task", &[("Ctrl+S", "done"), ("Esc", "cancel")])
+            .border_style(Style::default().fg(palette.accent))
     } else {
-        Layout::horizontal([Constraint::Percentage(100), Constraint::Length(0)]).split(chunks[3])
+        palette.panel_with("Task", &[("t", "edit"), ("f", "import")])
     };
-    let rows = workflow.stages.iter().enumerate().map(|(index, stage)| {
-        let on = stage.enabled;
-        let interactive = stage.mode == Mode::Interactive;
-        Row::new(vec![
-            Cell::from(if on { "●" } else { "○" }).style(Style::default().fg(if on {
+    let task_inner = block.inner(task);
+    if editing {
+        frame.render_widget(block, task);
+    } else {
+        let body = if task_text.is_empty() {
+            Paragraph::new(Line::styled(
+                "No task yet. Press [t] to write one, or [f] to import a file, URL, or GitHub issue.",
+                Style::default()
+                    .fg(palette.muted)
+                    .add_modifier(Modifier::ITALIC),
+            ))
+        } else {
+            Paragraph::new(task_text).style(Style::default().fg(palette.fg))
+        };
+        frame.render_widget(body.wrap(Wrap { trim: false }).block(block), task);
+    }
+
+    // Stages: a strip, then the selected one's settings.
+    let selected = app.editor.selected;
+    let count = workflow.stages.len();
+    frame.render_widget(
+        Paragraph::new(palette.hints(&[
+            ("←→", "stage"),
+            ("e", "edit"),
+            ("c", "harness"),
+            ("o", "on/off"),
+            ("a", "add"),
+        ]))
+        .right_aligned(),
+        label,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::styled("Stages", palette.header_style())),
+        label,
+    );
+    let stages: Vec<StripStage> = workflow
+        .stages
+        .iter()
+        .map(|stage| StripStage {
+            glyph: if stage.enabled { "●" } else { "○" },
+            color: if stage.enabled {
                 palette.accent
             } else {
                 palette.muted
-            })),
-            Cell::from(format!("{}", index + 1)).style(Style::default().fg(palette.muted)),
-            Cell::from(stage.name.clone()),
-            Cell::from(if stage.fan_out.is_some() {
-                "fan-out".into()
-            } else {
-                stage.harness.clone()
-            }),
-            if let Some(fan) = &stage.fan_out {
-                Cell::from(format!("{} candidates", fan.candidates.len()))
-            } else if stage.model.is_empty() {
-                Cell::from("default").style(Style::default().fg(palette.muted))
-            } else {
-                Cell::from(stage.model.clone())
             },
-            Cell::from(if interactive { "interactive" } else { "auto" }).style(
-                Style::default().fg(match (on, interactive) {
-                    (false, _) => palette.muted,
-                    (true, true) => palette.blue,
-                    (true, false) => palette.fg,
-                }),
-            ),
-        ])
-        .style(Style::default().fg(if on { palette.fg } else { palette.muted }))
-    });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(1),
-            Constraint::Length(2),
-            Constraint::Fill(4),
-            Constraint::Length(9),
-            Constraint::Fill(3),
-            Constraint::Length(11),
-        ],
-    )
-    .column_spacing(2)
-    .header(
-        Row::new(["", "#", "STAGE", "HARNESS", "MODEL", "EXECUTION"])
-            .style(palette.header_style())
-            .bottom_margin(1),
-    )
-    .block(palette.panel_with(
-        "Stages",
-        &[
-            ("c", "harness"),
-            ("e", "edit"),
-            ("a", "add"),
-            ("J/K", "move"),
-        ],
-    ))
-    .highlight_symbol("▌")
-    .highlight_spacing(HighlightSpacing::Always)
-    .row_highlight_style(palette.selected_style());
-    frame.render_stateful_widget(
-        table,
-        cols[0],
-        &mut TableState::default().with_selected(Some(app.editor.selected)),
+            name: stage.name.clone(),
+            on: stage.enabled,
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(stage_strip(&stages, selected, strip.width.into(), palette)),
+        strip,
     );
-    if cols[1].width > 0 {
-        let stage = app.editor.stage();
-        let warning = app.harnesses.checks.warning(&stage.harness);
-        let effort = app
-            .catalogs
-            .cached
-            .get(&stage.harness)
-            .and_then(|c| c.efforts_for(&stage.model, &stage.provider))
-            .map(|efforts| effort_note(stage, &efforts));
-        let hint = app.stats_hint(stage);
-        let sandbox = stage.effective_sandbox(&app.editor.settings.workflows[app.editor.workflow]);
-        let notes = StageNotes {
-            sandbox,
-            warning,
-            effort_note: effort,
-            hint,
-        };
-        draw_stage_detail(frame, stage, notes, cols[1], palette);
-    }
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "─".repeat(rule.width.into()),
+            Style::default().fg(palette.line),
+        )),
+        rule,
+    );
+    let stage = app.editor.stage();
+    let warning = app.harnesses.checks.warning(&stage.harness);
+    let effort = app
+        .catalogs
+        .cached
+        .get(&stage.harness)
+        .and_then(|c| c.efforts_for(&stage.model, &stage.provider))
+        .map(|efforts| effort_note(stage, &efforts));
+    let notes = StageNotes {
+        sandbox: stage.effective_sandbox(workflow),
+        warning,
+        effort_note: effort,
+        hint: app.stats_hint(stage),
+    };
+    draw_stage_detail(frame, stage, (selected + 1, count), notes, detail, palette);
+
+    // What the run will be.
+    let enabled = workflow.stages.iter().filter(|s| s.enabled).count();
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            format!(
+                "{enabled} of {count} stages on   ·   repairs up to {}   ·   {}",
+                workflow.max_repair_passes,
+                if app.editor.worktree {
+                    "isolated worktree"
+                } else {
+                    "current directory"
+                },
+            ),
+            Style::default().fg(palette.muted),
+        )),
+        summary,
+    );
+    task_inner
 }
 
 /// How the stage's effort compares with what its harness catalog lists.
@@ -1064,9 +1089,13 @@ struct StageNotes {
     hint: Option<String>,
 }
 
+/// The selected stage under the strip: its name, harness, model, and
+/// execution, then its settings (in two columns when wide), instructions,
+/// checks, and harness settings. `position` is its number and the count.
 fn draw_stage_detail(
     frame: &mut Frame<'_>,
     stage: &Stage,
+    position: (usize, usize),
     notes: StageNotes,
     area: Rect,
     palette: Palette,
@@ -1077,34 +1106,47 @@ fn draw_stage_detail(
         effort_note,
         hint,
     } = notes;
+    let muted = Style::default().fg(palette.muted);
+    let fg = Style::default().fg(palette.fg);
     let model = or_default(&stage.model, "harness default");
     let provider = or_default(&stage.provider, "harness default");
     let effort = or_default(&stage.effort, "harness default");
-    let mut lines = vec![
-        Line::styled(
+
+    let mut summary = vec![
+        Span::styled(
             stage.name.clone(),
             Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
         ),
-        Line::from(vec![
-            Span::styled(
-                format!("{}  ·  ", stage.role.label()),
-                Style::default().fg(palette.muted),
-            ),
-            if stage.enabled {
-                Span::styled("● enabled", Style::default().fg(palette.accent))
-            } else {
-                Span::styled("○ disabled", Style::default().fg(palette.muted))
-            },
-        ]),
-        Line::raw(""),
-        kv(palette, "Harness", &stage.harness, true),
+        Span::raw("   "),
     ];
-    if let Some(warning) = warning {
-        lines.push(Line::styled(warning, Style::default().fg(palette.warn)));
+    if let Some(fan) = &stage.fan_out {
+        summary.push(Span::styled(
+            format!("fan-out · {} candidates", fan.candidates.len()),
+            fg,
+        ));
+    } else {
+        summary.push(Span::styled(format!("{}  {}", stage.harness, model.0), fg));
     }
-    lines.extend([
+    summary.push(Span::styled(
+        format!("  {}", stage.mode.label()),
+        Style::default().fg(if stage.mode == Mode::Interactive {
+            palette.blue
+        } else {
+            palette.fg
+        }),
+    ));
+    if !stage.enabled {
+        summary.push(Span::styled("   ○ off", muted));
+    }
+    let title = Line::from(summary);
+    let place = Line::styled(format!("stage {} of {}", position.0, position.1), muted);
+
+    let mut facts = vec![kv(palette, "Role", stage.role.label(), true)];
+    if let Some(warning) = warning {
+        facts.push(Line::styled(warning, Style::default().fg(palette.warn)));
+    }
+    facts.extend([
         kv(palette, "Model", model.0, model.1),
-        kv(palette, "Execution", stage.mode.label(), true),
         kv(
             palette,
             "Sandbox",
@@ -1115,12 +1157,12 @@ fn draw_stage_detail(
         kv(palette, "Effort", effort.0, effort.1),
     ]);
     if let Some((note, listed)) = effort_note {
-        lines.push(Line::styled(
-            format!("         {note}"),
+        facts.push(Line::styled(
+            format!("           {note}"),
             Style::default().fg(if listed { palette.muted } else { palette.warn }),
         ));
     }
-    lines.extend([
+    facts.extend([
         kv(
             palette,
             "Timeout",
@@ -1130,43 +1172,36 @@ fn draw_stage_detail(
         kv(palette, "ID", &stage.id, true),
     ]);
     if !stage.after.is_empty() {
-        lines.push(kv(palette, "After", &stage.after.join(", "), true));
+        facts.push(kv(palette, "After", &stage.after.join(", "), true));
     }
     if let Some(fan) = &stage.fan_out {
-        lines.push(kv(
-            palette,
-            "Fan-out",
-            &format!("{} candidates · judge {}", fan.candidates.len(), fan.judge),
-            true,
-        ));
+        facts.push(kv(palette, "Judge", &fan.judge.to_string(), true));
         for (id, candidate) in fan.ids().iter().zip(&fan.candidates) {
-            lines.push(Line::styled(
+            facts.push(Line::styled(
                 format!(
-                    "         {id}: {} {}",
+                    "           {id}: {} {}",
                     candidate.harness,
                     or_default(&candidate.model, "default").0
                 ),
-                Style::default().fg(palette.fg),
+                fg,
             ));
         }
     }
-    lines.extend([
-        Line::raw(""),
-        Line::styled("Instructions", palette.header_style()),
-    ]);
-    lines.extend(
+
+    let mut more = vec![Line::styled("Instructions", palette.header_style())];
+    more.extend(
         storage::clean_terminal(&stage.instructions)
             .lines()
-            .map(|line| Line::styled(line.to_string(), Style::default().fg(palette.fg))),
+            .map(|line| Line::styled(line.to_string(), fg)),
     );
     if !stage.checks.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled("Router checks", palette.header_style()));
+        more.push(Line::raw(""));
+        more.push(Line::styled("Router checks", palette.header_style()));
         for check in &stage.checks {
-            lines.push(Line::from(vec![
+            more.push(Line::from(vec![
                 Span::styled(
                     storage::clean_terminal(&shell_words::join(&check.command)),
-                    Style::default().fg(palette.fg),
+                    fg,
                 ),
                 Span::styled(
                     format!(
@@ -1178,44 +1213,57 @@ fn draw_stage_detail(
                         },
                         duration(check.timeout_seconds)
                     ),
-                    Style::default().fg(palette.muted),
+                    muted,
                 ),
             ]));
         }
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled("Harness settings", palette.header_style()));
-    lines.extend(
+    more.push(Line::raw(""));
+    more.push(Line::styled("Harness settings", palette.header_style()));
+    more.extend(
         harness_settings::summary(stage)
             .lines()
-            .map(|line| Line::styled(line.to_string(), Style::default().fg(palette.fg))),
+            .map(|line| Line::styled(line.to_string(), fg)),
     );
-    lines.push(Line::raw(""));
+    more.push(Line::raw(""));
     if let Some(hint) = hint {
         // Advice from saved runs; the router never applies it.
-        lines.push(Line::styled(
-            hint,
-            Style::default()
-                .fg(palette.muted)
-                .add_modifier(Modifier::DIM),
-        ));
+        more.push(Line::styled(hint, muted.add_modifier(Modifier::DIM)));
     }
-    lines.push(Line::styled(
+    more.push(Line::styled(
         if stage.role == Role::Review {
             "Optional. [o] toggles it; blocking findings request repairs."
         } else {
-            "c configures this stage's harness."
+            "[c] configures this stage's harness; [e] edits everything else."
         },
-        Style::default()
-            .fg(palette.muted)
-            .add_modifier(Modifier::ITALIC),
+        muted.add_modifier(Modifier::ITALIC),
     ));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(palette.panel(" Selected stage ")),
-        area,
-    );
+
+    // Settings in two columns when wide, so instructions stay in view.
+    let columns = area.width >= 70;
+    let half = facts.len().div_ceil(2);
+    let fact_rows = if columns { half } else { facts.len() } as u16;
+    let [title_row, _, facts_area, _, more_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(fact_rows),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+    frame.render_widget(Paragraph::new(place).right_aligned(), title_row);
+    frame.render_widget(Paragraph::new(title), title_row);
+    if columns {
+        let right = facts.split_off(half);
+        let [left_area, right_area] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(facts_area);
+        frame.render_widget(Paragraph::new(facts), left_area);
+        frame.render_widget(Paragraph::new(right), right_area);
+    } else {
+        frame.render_widget(Paragraph::new(facts), facts_area);
+    }
+    frame.render_widget(Paragraph::new(more).wrap(Wrap { trim: false }), more_area);
 }
 
 #[cfg(test)]
@@ -1476,7 +1524,7 @@ mod tests {
                     effort_note: None,
                     hint: None,
                 };
-                draw_stage_detail(frame, stage, notes, frame.area(), palette)
+                draw_stage_detail(frame, stage, (1, 1), notes, frame.area(), palette)
             })
             .unwrap();
         let buffer = terminal.backend().buffer();

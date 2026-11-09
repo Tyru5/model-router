@@ -301,8 +301,8 @@ const ACTIONS: &[Entry] = {
         act(ChooseWorkflow, Workflow, ch('w'), "switch", "Select/clone workflow or add a preset").menu(WorkflowMenu, 'w'),
         act(RenameWorkflow, Workflow, ch('R'), "rename", "Rename workflow").menu(WorkflowMenu, 'r'),
         act(DeleteWorkflow, Workflow, ch('X'), "delete", "Delete workflow ([y] confirms; [u] undoes)").menu(WorkflowMenu, 'X'),
-        act(PreviousStage, Workflow, key(KeyCode::Up), "select", "Select previous stage").also(&[ch('k')]),
-        act(NextStage, Workflow, key(KeyCode::Down), "select", "Select next stage").also(&[ch('j')]),
+        act(PreviousStage, Workflow, key(KeyCode::Left), "stage", "Select previous stage").also(&[key(KeyCode::Up), ch('k')]).alias("←→"),
+        act(NextStage, Workflow, key(KeyCode::Right), "stage", "Select next stage").also(&[key(KeyCode::Down), ch('j')]).alias("←→"),
         act(EditStage, Workflow, ch('e'), "edit", "Edit selected stage").also(&[key(KeyCode::Enter)]).alias("e").footer().menu(Stage, 'e'),
         act(HarnessSettings, Workflow, ch('c'), "harness", "Configure selected harness (model, effort, execution, permissions)")
             .more(&[
