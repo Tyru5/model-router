@@ -203,6 +203,8 @@ pub(super) struct Entry {
     footer: Footer,
     /// Where the `Space` menu lists it: group, then the action's letter.
     menu: Option<(Group, char)>,
+    /// The scopes the menu lists it in; empty for every scope it applies to.
+    menu_only: &'static [Scope],
 }
 
 impl Entry {
@@ -239,6 +241,15 @@ impl Entry {
             ..self
         }
     }
+    /// Lists it in the `Space` menu only in `scopes`, e.g. a saved-run action
+    /// that its key merely explains elsewhere.
+    const fn menu_in(self, group: Group, letter: char, scopes: &'static [Scope]) -> Self {
+        Self {
+            menu: Some((group, letter)),
+            menu_only: scopes,
+            ..self
+        }
+    }
     const fn footer_in(self, scopes: &'static [Scope]) -> Self {
         Self {
             footer: Footer::Only(scopes),
@@ -265,6 +276,7 @@ const fn act(
         more: &[],
         footer: Footer::No,
         menu: None,
+        menu_only: &[],
     }
 }
 const fn ch(c: char) -> Binding {
@@ -359,13 +371,12 @@ const ACTIONS: &[Entry] = {
                 "Files left, hunks right: [ ] or n/p file; { } hunk; [/] search, n/N match; [w] wrap",
                 "[o] $PAGER; [e] $VISUAL/$EDITOR at the line in view; [D] git difftool --dir-diff (needs diff.tool)",
             ])
-            .footer()
             .menu(View, 'd'),
         act(ToggleResults, MonitorIdle, ch('o'), "output", "Switch a finished run between its brief and output log").menu(View, 'o'),
         // Runs: the sidebar, whatever it selects
         act(PreviousRun, Runs, key(KeyCode::Up), "runs", "Select the previous run in the sidebar").also(&[ch('k')]).alias("↑↓").footer(),
         act(NextRun, Runs, key(KeyCode::Down), "runs", "Select the next run in the sidebar").also(&[ch('j')]).alias("↑↓").footer(),
-        act(OpenRun, Runs, key(KeyCode::Enter), "open", "Open the selected saved run here (damaged: show its error)").footer_in(&[Runs]).menu(RunMenu, 'o'),
+        act(OpenRun, Runs, key(KeyCode::Enter), "open", "Open the selected saved run here (damaged: show its error)").footer_in(&[Runs]).menu_in(RunMenu, 'o', &[Runs]),
         act(RefreshRuns, Runs, ch('r'), "refresh", "Reload saved runs and sizes").menu(View, 'r'),
         act(FilterRuns, Runs, ch('F'), "filter", "Filter saved runs by ID, workflow, task, or status")
             .more(&["Type to filter; [Enter] keeps it; [Esc] clears it"])
@@ -374,7 +385,7 @@ const ACTIONS: &[Entry] = {
         act(CycleStatus, Runs, ch('s'), "status", "Cycle the saved runs shown: all, active, complete, failed/blocked, cancelled, damaged").footer_in(&[Runs]).menu(View, 's'),
         act(Rerun, Runs, ch('n'), "rerun", "Rerun the selected run as a new run from its saved snapshot (confirm first)").footer_in(&[Runs]).menu(RunMenu, 'n'),
         act(CompareAttempts, Runs, ch('='), "compare", "Compare two attempts of a stage of the selected run").menu(View, 'c'),
-        act(CleanUp, Runs, ch('D'), "clean", "Preview removing the selected saved run and its artifacts ([y] confirms)").menu(RunMenu, 'D'),
+        act(CleanUp, Runs, ch('D'), "clean", "Preview removing the selected saved run and its artifacts ([y] confirms)").menu_in(RunMenu, 'D', &[Runs]),
         // Harnesses
         act(PreviousHarness, Harnesses, key(KeyCode::Up), "select", "Select previous harness").also(&[ch('k')]).alias("↑↓").footer(),
         act(NextHarness, Harnesses, key(KeyCode::Down), "select", "Select next harness").also(&[ch('j')]).alias("↑↓").footer(),
@@ -453,9 +464,10 @@ pub(super) fn resolve(here: Scope, key: KeyEvent) -> Option<ActionId> {
         .map(|(id, _)| id)
 }
 
-/// Footer hints for a page's scope, as (key, label).
-pub(super) fn footer(here: Scope) -> Vec<(String, &'static str)> {
+/// Footer hints for a page's scope, as (key, label), less those in `skip`.
+pub(super) fn footer(here: Scope, skip: &[ActionId]) -> Vec<(String, &'static str)> {
     let mut hints: Vec<_> = available(here)
+        .filter(|entry| !skip.contains(&entry.id))
         .filter(|entry| match entry.footer {
             Footer::No => false,
             Footer::Yes => true,
@@ -472,11 +484,17 @@ pub(super) fn footer(here: Scope) -> Vec<(String, &'static str)> {
 
 /// The `Space` menu for `here`: each group with its actions as (letter,
 /// entry), in table order. Groups with nothing to do here are left out.
+/// Actions the `Space` menu and the `:` command menu list in `here`.
+pub(super) fn in_menu(here: Scope) -> impl Iterator<Item = &'static Entry> {
+    available(here)
+        .filter(move |entry| entry.menu_only.is_empty() || entry.menu_only.contains(&here))
+}
+
 pub(super) fn menu(here: Scope) -> Vec<(Group, Vec<(char, &'static Entry)>)> {
     Group::ALL
         .into_iter()
         .map(|group| {
-            let items: Vec<_> = available(here)
+            let items: Vec<_> = in_menu(here)
                 .filter_map(|entry| match entry.menu {
                     Some((g, letter)) if g == group => Some((letter, entry)),
                     _ => None,
@@ -490,7 +508,7 @@ pub(super) fn menu(here: Scope) -> Vec<(Group, Vec<(char, &'static Entry)>)> {
 
 /// The action at `letter` in `group` of the `Space` menu for `here`.
 pub(super) fn menu_action(here: Scope, group: Group, letter: char) -> Option<ActionId> {
-    available(here)
+    in_menu(here)
         .find(|entry| entry.menu == Some((group, letter)))
         .map(|entry| entry.id)
 }
@@ -662,6 +680,11 @@ mod tests {
             menu_action(Scope::MonitorIdle, Group::Run, 'a'),
             Some(ActionId::Advance)
         );
+        // Opening and removing a saved run are listed only beside one.
+        for (letter, id) in [('o', ActionId::OpenRun), ('D', ActionId::CleanUp)] {
+            assert_eq!(menu_action(Scope::Runs, Group::Run, letter), Some(id));
+            assert_eq!(menu_action(Scope::MonitorIdle, Group::Run, letter), None);
+        }
     }
 
     #[test]

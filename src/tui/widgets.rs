@@ -182,8 +182,8 @@ pub(super) struct StripStage {
 }
 /// Stages in order with arrows between them, `selected` highlighted. When
 /// every name does not fit in `width`, only the selected stage and its
-/// neighbours keep theirs, then only the selected one; stages still past the
-/// right edge become a `+N` count.
+/// neighbours keep theirs, then only the selected one. Stages that still do
+/// not fit become `+N` counts, first after the selected stage, then before it.
 pub(super) fn stage_strip(
     stages: &[StripStage],
     selected: usize,
@@ -191,10 +191,16 @@ pub(super) fn stage_strip(
     palette: Palette,
 ) -> Line<'static> {
     let selected = selected.min(stages.len().saturating_sub(1));
-    let line = |named: &dyn Fn(usize) -> bool, shown: usize| {
+    let line = |named: &dyn Fn(usize) -> bool, first: usize, shown: usize| {
         let mut spans = vec![];
-        for (index, stage) in stages.iter().enumerate().take(shown) {
-            if index > 0 {
+        if first > 0 {
+            spans.push(Span::styled(
+                format!("+{} ", first),
+                Style::default().fg(palette.muted),
+            ));
+        }
+        for (index, stage) in stages.iter().enumerate().take(shown).skip(first) {
+            if index > first {
                 let arrow = if stages[index - 1].on && stage.on {
                     "━▶"
                 } else {
@@ -235,17 +241,20 @@ pub(super) fn stage_strip(
         &|index: usize| index.abs_diff(selected) <= 1,
         &only,
     ] {
-        let fitted = line(named, all);
+        let fitted = line(named, 0, all);
         if fitted.width() <= width {
             return fitted;
         }
     }
-    // Still too wide: drop stages after the selected one from the end.
-    (selected + 1..all)
+    // Still too wide: drop stages after the selected one, then before it.
+    let last = (selected + 1).min(all);
+    (last..all)
         .rev()
-        .map(|shown| line(&only, shown))
+        .map(|shown| (0, shown))
+        .chain((1..last).map(|first| (first, last)))
+        .map(|(first, shown)| line(&only, first, shown))
         .find(|fitted| fitted.width() <= width)
-        .unwrap_or_else(|| line(&only, (selected + 1).min(all)))
+        .unwrap_or_else(|| line(&only, last.saturating_sub(1), last))
 }
 /// Home-relative path, trimmed from the left to fit `width` display
 /// columns; wide characters (CJK, emoji) take two.
@@ -459,5 +468,9 @@ mod tests {
         // Then stages after it give way to a count.
         assert_eq!(text(32), " ○ ━▶ ○ Implement ┄▶ ○ ┄▶ ○  +1");
         assert_eq!(text(25), " ○ ━▶ ○ Implement  +3");
+        // Selected near the end, stages before it give way too.
+        let last = |width| stage_strip(&stages, 4, width, palette).to_string();
+        assert_eq!(last(19), "+3  ○ ━▶ ○ Summary ");
+        assert_eq!(last(18), "+4  ○ Summary ");
     }
 }

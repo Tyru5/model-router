@@ -543,38 +543,55 @@ fn strip(slot: &RunSlot, width: u16, palette: Palette) -> Line<'static> {
 }
 
 /// One line per fan-out stage: its candidates, ★ marking the judge's choice.
-fn candidate_lines(run: &engine::Run, palette: Palette) -> Vec<Line<'static>> {
+/// Models are left out when the line is wider than `width`, so every
+/// candidate's harness and status show.
+fn candidate_lines(run: &engine::Run, width: u16, palette: Palette) -> Vec<Line<'static>> {
     let muted = Style::default().fg(palette.muted);
     run.stages
         .iter()
         .zip(&run.workflow.stages)
         .filter_map(|(state, stage)| Some((state.fan_out.as_ref()?, stage)))
         .map(|(fan, stage)| {
-            let chosen = fan.selection.as_ref().map(|s| s.candidate.as_str());
-            let mut spans = vec![Span::styled(format!("  {} fan-out ", stage.name), muted)];
-            for candidate in &fan.candidates {
-                let mark = if chosen == Some(candidate.id.as_str()) {
-                    "★"
-                } else {
-                    "↳"
-                };
-                let harness = if candidate.model.is_empty() {
-                    candidate.harness.clone()
-                } else {
-                    format!("{} {}", candidate.harness, candidate.model)
-                };
-                spans.push(Span::styled(
-                    format!("  {mark} {} · {harness} ", candidate.id),
-                    Style::default().fg(palette.fg),
-                ));
-                spans.push(Span::styled(
-                    Palette::status_glyph(candidate.status),
-                    Style::default().fg(palette.status_color(candidate.status)),
-                ));
+            let full = candidate_line(fan, stage, true, muted, palette);
+            if full.width() <= usize::from(width) {
+                full
+            } else {
+                candidate_line(fan, stage, false, muted, palette)
             }
-            Line::from(spans)
         })
         .collect()
+}
+
+fn candidate_line(
+    fan: &engine::FanOutState,
+    stage: &crate::config::Stage,
+    models: bool,
+    muted: Style,
+    palette: Palette,
+) -> Line<'static> {
+    let chosen = fan.selection.as_ref().map(|s| s.candidate.as_str());
+    let mut spans = vec![Span::styled(format!("  {} fan-out ", stage.name), muted)];
+    for candidate in &fan.candidates {
+        let mark = if chosen == Some(candidate.id.as_str()) {
+            "★"
+        } else {
+            "↳"
+        };
+        let harness = if candidate.model.is_empty() || !models {
+            candidate.harness.clone()
+        } else {
+            format!("{} {}", candidate.harness, candidate.model)
+        };
+        spans.push(Span::styled(
+            format!("  {mark} {} · {harness} ", candidate.id),
+            Style::default().fg(palette.fg),
+        ));
+        spans.push(Span::styled(
+            Palette::status_glyph(candidate.status),
+            Style::default().fg(palette.status_color(candidate.status)),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// A rule under the strip, ending in the run's ID.
@@ -608,7 +625,7 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
     let candidates = if results {
         vec![]
     } else {
-        candidate_lines(&slot.run, palette)
+        candidate_lines(&slot.run, area.width, palette)
     };
     let [head, strip_row, candidate_rows, rule_row, body] = Layout::vertical([
         Constraint::Length(1),
@@ -647,14 +664,17 @@ fn draw_feed(frame: &mut Frame<'_>, app: &App, slot: &RunSlot, area: Rect, palet
         )
     });
     let card = needs_card(slot, area.width.saturating_sub(4).into(), palette);
-    let card_height = card.as_ref().map_or(0, |(_, _, lines)| {
-        let inner = area.width.saturating_sub(4);
-        let rows: u16 = lines
+    let inner = area.width.saturating_sub(4);
+    let rows = |lines: &[Line<'_>]| -> u16 {
+        lines
             .iter()
             .map(|line| rows_for(line, inner, u16::MAX))
-            .fold(0, u16::saturating_add);
-        // The output keeps at least three rows.
-        (rows + 2).min(area.height.saturating_sub(3))
+            .fold(0, u16::saturating_add)
+    };
+    let card_height = card.as_ref().map_or(0, |card| {
+        // A blank row between the text and the keys; the output keeps at
+        // least three rows.
+        (rows(&card.body) + 1 + rows(&card.keys) + 2).min(area.height.saturating_sub(3))
     });
     let paused = !slot.log_view.follow;
     let search = slot.output_search_status();
@@ -723,31 +743,44 @@ fn draw_feed(frame: &mut Frame<'_>, app: &App, slot: &RunSlot, area: Rect, palet
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), notice_row);
     }
-    if let Some((title, color, lines)) = card {
+    if let Some(card) = card {
         let block = palette
             .panel(Span::styled(
-                format!(" {title} "),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
+                format!(" {} ", card.title),
+                Style::default().fg(card.color).add_modifier(Modifier::BOLD),
             ))
-            .border_style(Style::default().fg(color));
+            .border_style(Style::default().fg(card.color));
+        let inside = block.inner(card_row);
+        frame.render_widget(block, card_row);
+        // The keys keep their rows; a long summary or error is cut instead.
+        let key_rows = rows(&card.keys).min(inside.height);
+        let [text, keys] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(key_rows)]).areas(inside);
         frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .block(block),
-            card_row,
+            Paragraph::new(card.body).wrap(Wrap { trim: false }),
+            Rect {
+                height: text.height.saturating_sub(1),
+                ..text
+            },
         );
+        frame.render_widget(Paragraph::new(card.keys).wrap(Wrap { trim: false }), keys);
     }
+}
+
+/// What the run waits on: a title, its colour, what to know, and the keys
+/// that answer it, which stay in view when the text does not fit.
+struct Card {
+    title: String,
+    color: Color,
+    body: Vec<Line<'static>>,
+    keys: Vec<Line<'static>>,
 }
 
 /// The card under the feed while the run waits on the person: its title,
 /// colour, and lines, ending in the keys that answer it. None while the run
 /// drives itself or once it has finished. Keys past `width` are left to the
 /// Space menu.
-fn needs_card(
-    slot: &RunSlot,
-    width: usize,
-    palette: Palette,
-) -> Option<(String, Color, Vec<Line<'static>>)> {
+fn needs_card(slot: &RunSlot, width: usize, palette: Palette) -> Option<Card> {
     let run = &slot.run;
     if slot.worker.is_some() || finished(run) {
         return None;
@@ -758,13 +791,33 @@ fn needs_card(
     let more = Line::from(vec![
         Span::styled("More: ", muted),
         Span::styled(
-            "[Space] [r]",
+            "[Space]",
             Style::default()
                 .fg(palette.accent)
                 .add_modifier(Modifier::BOLD),
         ),
     ]);
     let mut lines = vec![];
+    let mut keys = vec![];
+    // Keys the engine refuses at this stage: fan-out stages have no session
+    // to reopen and run unattended; a review's verdict cannot be rewritten;
+    // a ship plan has no session and its preview is not what ships.
+    let current = run.workflow.stages.get(run.cursor);
+    let role = current.map(|s| s.role);
+    let fan_out = current.is_some_and(|s| s.fan_out.is_some());
+    let ship = role == Some(crate::config::Role::Ship);
+    let review = role == Some(crate::config::Role::Review);
+    // Harnesses without resume support have no session to reopen.
+    let resumable = current.is_some_and(|s| crate::adapters::resumable(&s.harness, &run.adapters));
+    let offered = |pairs: &[(&'static str, &'static str)]| -> Vec<(&'static str, &'static str)> {
+        pairs
+            .iter()
+            .copied()
+            .filter(|(key, _)| !((fan_out || ship) && matches!(*key, "t" | "i")))
+            .filter(|(key, _)| !((review || ship) && *key == "e"))
+            .filter(|(key, _)| resumable || *key != "t")
+            .collect()
+    };
     if let Some(error) = &run.error {
         lines.push(Line::styled(
             storage::clean_terminal(error),
@@ -781,8 +834,7 @@ fn needs_card(
             storage::clean_terminal(reason),
             fg.add_modifier(Modifier::BOLD),
         ));
-        lines.push(Line::raw(""));
-        lines.push(key_chips(
+        keys.push(key_chips(
             palette,
             &[
                 ("a", "accept without checks"),
@@ -791,11 +843,12 @@ fn needs_card(
             ],
             width,
         ));
-        return Some((
-            format!("◆ {stage}: verification not applicable"),
-            palette.warn,
-            lines,
-        ));
+        return Some(Card {
+            title: format!("◆ {stage}: verification not applicable"),
+            color: palette.warn,
+            body: lines,
+            keys,
+        });
     }
     let title = match run.status {
         Status::AwaitingConfirmation => {
@@ -805,10 +858,17 @@ fn needs_card(
                 .iter()
                 .zip(&run.stages)
                 .skip(run.cursor + 1)
-                .find(|(stage, state)| stage.enabled && state.status != Status::Skipped)
+                .find(|(stage, state)| {
+                    stage.enabled && !matches!(state.status, Status::Skipped | Status::Complete)
+                })
                 .map(|(stage, _)| stage.name.clone());
             lines.push(Line::styled(
                 match next {
+                    // A graph's stages start as their inputs finish, so the
+                    // next one is not simply the one after.
+                    _ if run.graph() => {
+                        "The stage handed off. Accept it to continue the run.".into()
+                    }
                     Some(next) => format!("The stage handed off. Accept it to continue to {next}."),
                     None => "The stage handed off. Accept it to finish the run.".into(),
                 },
@@ -818,19 +878,18 @@ fn needs_card(
             if let Some(handoff) = handoff {
                 lines.extend(handoff_lines(handoff, palette));
             }
-            lines.push(Line::raw(""));
-            lines.push(key_chips(
+            keys.push(key_chips(
                 palette,
-                &[
+                &offered(&[
                     ("a", "accept"),
                     ("t", "reopen session"),
                     ("y", "retry"),
                     ("e", "edit summary"),
                     ("h", "handoff"),
-                ],
+                ]),
                 width,
             ));
-            lines.push(more);
+            keys.push(more);
             format!("◆ {stage} needs you")
         }
         Status::Interactive => {
@@ -845,32 +904,45 @@ fn needs_card(
                 ),
                 fg,
             ));
-            lines.push(Line::raw(""));
-            lines.push(key_chips(
+            keys.push(key_chips(
                 palette,
                 &[("i", "open the terminal"), ("h", "handoff")],
                 width,
             ));
             format!("◆ {stage} is ready for you")
         }
-        // Stopped between or during stages, e.g. after a cancel.
+        // Left running by an earlier execution: continuing would fail it, so
+        // retrying leads.
+        Status::Running => {
+            lines.push(Line::styled(
+                "An earlier execution of this stage was interrupted. Retry it to pick up here.",
+                fg,
+            ));
+            keys.push(key_chips(
+                palette,
+                &offered(&[("y", "retry"), ("i", "interactive"), ("m", "model")]),
+                width,
+            ));
+            keys.push(more);
+            format!("◆ {stage} was interrupted")
+        }
+        // Stopped between stages before they ran.
         _ => {
             lines.push(Line::styled(
                 "The run stopped here; continuing picks up at this stage.",
                 fg,
             ));
-            lines.push(Line::raw(""));
-            lines.push(key_chips(
+            keys.push(key_chips(
                 palette,
-                &[
+                &offered(&[
                     ("c", "continue"),
                     ("y", "retry"),
                     ("i", "interactive"),
                     ("m", "model"),
-                ],
+                ]),
                 width,
             ));
-            lines.push(more);
+            keys.push(more);
             if run.cursor < run.workflow.stages.len() {
                 format!("◆ {stage} is paused")
             } else {
@@ -878,7 +950,12 @@ fn needs_card(
             }
         }
     };
-    Some((title, palette.warn, lines))
+    Some(Card {
+        title,
+        color: palette.warn,
+        body: lines,
+        keys,
+    })
 }
 
 /// What a handoff claims, in a line, then the start of its summary.

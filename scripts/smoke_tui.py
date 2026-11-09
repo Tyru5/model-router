@@ -43,7 +43,7 @@ def main():
             )
             terminal.send("gh")
             terminal.wait_for_text(
-                " Harnesses ", message="Space g h did not go to Harnesses"
+                "╭ Harnesses", message="Space g h did not go to Harnesses"
             )
             terminal.send("1")
             # t edits the task in its panel; the stages stay in view.
@@ -133,7 +133,10 @@ def main():
             )
             # A finished run shows its brief, with what to do next pinned below.
             terminal.wait_for(
-                lambda: "Next" in terminal.text() and "[d] diff" in terminal.text(),
+                lambda: (
+                    "Changed during this run" in terminal.text()
+                    and "[n] rerun" in terminal.text()
+                ),
                 "Brief did not show",
             )
             terminal.snapshot("completed.txt")
@@ -150,6 +153,16 @@ def main():
             terminal.wait_for(
                 lambda: "Run already open in this session" in terminal.text(),
                 "History did not focus the session's run",
+            )
+            # Closing moves it to Saved, which Enter opens again from disk.
+            terminal.send("x")
+            terminal.wait_for_text(
+                "Saved · 1", message="Closed run did not move to Saved"
+            )
+            terminal.send("\r")
+            terminal.wait_for_text(
+                "Saved run loaded. d shows its changes; n reruns it.",
+                message="Enter did not open the saved run",
             )
             terminal.send("q")
             terminal.exit()

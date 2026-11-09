@@ -71,7 +71,7 @@ impl HarnessChecks {
     pub(super) fn warning(&self, harness: &str) -> Option<String> {
         let report = self.report(harness).filter(|r| r.missing_flags())?;
         Some(format!(
-            "⚠ {} {} lacks {}; see Harnesses [4]",
+            "⚠ {} {} lacks {}; see Harnesses [3]",
             report.harness,
             report.version_label(),
             missing(report).join(", ")
@@ -528,7 +528,7 @@ mod tests {
     fn workflow_warns_only_from_cached_results() {
         let mut app = app();
         app.editor.stage_mut().harness = "opencode".into();
-        let warning = "⚠ opencode 2.0.22 lacks --variant, --interactive; see Harnesses [4]";
+        let warning = "⚠ opencode 2.0.22 lacks --variant, --interactive; see Harnesses [3]";
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(260, 40)).unwrap();
         let mut draw = |app: &mut App| {

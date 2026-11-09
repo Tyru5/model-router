@@ -1,5 +1,6 @@
 use super::{
     actions::{self, ActionId, Scope},
+    completion,
     editor::Editor,
     harnesses::{HarnessesPage, draw_harnesses},
     history::{RunsPage, draw_runs},
@@ -436,6 +437,8 @@ impl App {
         if interactive {
             self.show_run();
         } else {
+            // Runs opens on the new run, not a saved one selected earlier.
+            self.runs.on_saved = false;
             self.ui
                 .message
                 .push_str("Runs [2] follows it. Define the next task here.");
@@ -601,7 +604,8 @@ impl App {
         if self.runs_filtering() {
             return self.runs_filter_key(key);
         }
-        if self.monitoring() && self.output_search_key(key) {
+        // A search belongs to the feed; the brief's keys, such as [n], are its own.
+        if self.monitoring() && !self.results_shown() && self.output_search_key(key) {
             return Ok(false);
         }
         if let Some(id) = actions::resolve(self.scope(), key) {
@@ -748,7 +752,7 @@ impl App {
         true
     }
     fn command_menu(&mut self) {
-        let items = actions::available(self.scope())
+        let items = actions::in_menu(self.scope())
             .map(|entry| Choice {
                 label: format!(
                     "{:<15}{:<14}{}",
@@ -856,9 +860,59 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
     // One footer row: the view's hints left, as many as fit before the menu
     // and guide keys on the right.
-    let right = palette.hints(&[("Space", "menu"), ("?", "keys")]);
+    // While the task is edited in place, keys type text: the footer names
+    // the editor's keys instead of the page's.
+    // So do a feed search and the Runs filter while they are typed.
+    let searching = app.monitoring()
+        && !app.results_shown()
+        && app
+            .session
+            .focused()
+            .and_then(|slot| slot.log_search.as_ref())
+            .is_some_and(|search| search.typing);
+    let typing = editing_task(app) || searching || app.runs_filtering();
+    let right = if typing {
+        Line::default()
+    } else {
+        palette.hints(&[("Space", "menu"), ("?", "keys")])
+    };
     let room = usize::from(area.width).saturating_sub(right.width() + 4);
-    let hints = actions::footer(app.page_scope());
+    let field = |keys: &[(&str, &'static str)]| -> Vec<(String, &'static str)> {
+        keys.iter()
+            .map(|(key, label)| ((*key).to_owned(), *label))
+            .collect()
+    };
+    let hints = if editing_task(app) {
+        field(&[("Ctrl+S", "done"), ("Esc", "cancel"), ("Enter", "new line")])
+    } else if app.runs_filtering() {
+        field(&[("Enter", "keep"), ("Esc", "clear"), ("↑↓", "runs")])
+    } else if searching {
+        field(&[("Enter", "find"), ("Esc", "cancel")])
+    } else {
+        // Leave out keys the engine refuses for the selected run: only a
+        // handoff awaits acceptance; a finished, interrupted, or waiting run
+        // does not continue (an interrupted one must be retried, a waiting
+        // one accepted); a complete one has nothing to retry.
+        let mut skip = vec![];
+        if let Some(run) = app
+            .session
+            .run()
+            .filter(|_| app.page_scope() == Scope::MonitorIdle)
+        {
+            if run.status != Status::AwaitingConfirmation {
+                skip.push(ActionId::Advance);
+            }
+            if completion::finished(run)
+                || matches!(run.status, Status::Running | Status::AwaitingConfirmation)
+            {
+                skip.push(ActionId::Continue);
+            }
+            if run.status == Status::Complete {
+                skip.push(ActionId::Retry);
+            }
+        }
+        actions::footer(app.page_scope(), &skip)
+    };
     let mut keys: Vec<(&str, &str)> = vec![];
     for (key, label) in &hints {
         keys.push((key.as_str(), *label));

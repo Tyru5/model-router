@@ -302,8 +302,10 @@ impl RunSlot {
                     search.query.pop();
                 }
                 Key::Char(c) if plain => search.query.push(c),
-                // Ctrl+C and other shortcuts keep working while typing.
-                _ => return None,
+                // Ctrl+C and other shortcuts keep working while typing; other
+                // keys, such as the arrows that move between runs, wait.
+                _ if key.modifiers.intersects(Mods::CONTROL | Mods::ALT) => return None,
+                _ => {}
             }
             return Some(None);
         }

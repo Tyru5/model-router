@@ -109,7 +109,7 @@ def main():
             assert "Choose theme" in terminal.text()
             assert json.loads(prefs.read_text())["theme"] == "solarized-light"
             terminal.send(b"\x1b")
-            for page in "2341":
+            for page in "231":
                 terminal.send(page)
                 choose(terminal, "Poimandres")
                 terminal.send(b"\x1b")

@@ -8,7 +8,7 @@ use super::{
     task_importer::TaskImporter,
     theme::Palette,
     widgets::{
-        StripStage, content, focus_textarea, kv, or_default, rows_for, stage_strip, textarea,
+        StripStage, content, fit, focus_textarea, kv, or_default, rows_for, stage_strip, textarea,
         wrapped_textarea,
     },
 };
@@ -28,6 +28,7 @@ use ratatui::{
     widgets::{Block, HighlightSpacing, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
 use tui_textarea::CursorMove;
+use unicode_width::UnicodeWidthStr;
 
 const FIELDS: &[&str] = &[
     "Name",
@@ -874,6 +875,9 @@ impl App {
     }
 }
 
+const NO_TASK: &str =
+    "No task yet. Press [t] to write one, or [f] to import a file, URL, or GitHub issue.";
+
 /// Whether the task is being edited in its panel on this page.
 pub(super) fn editing_task(app: &App) -> bool {
     matches!(
@@ -898,11 +902,16 @@ pub(super) fn draw_workflow(
     let editing = editing_task(app);
     let width = area.width.saturating_sub(4).max(1);
     let task_text = storage::clean_terminal(&app.editor.task);
-    let task_rows: u16 = task_text
-        .lines()
-        .map(|line| rows_for(&Line::raw(line.to_owned()), width, u16::MAX))
-        .fold(0, u16::saturating_add)
-        .max(1);
+    // With no task, the hint takes the rows.
+    let task_rows: u16 = if task_text.is_empty() {
+        NO_TASK
+    } else {
+        &task_text
+    }
+    .lines()
+    .map(|line| rows_for(&Line::raw(line.to_owned()), width, u16::MAX))
+    .fold(0, u16::saturating_add)
+    .max(1);
     // The task takes what it needs, up to a third of the page; the editor
     // gets room to type.
     let most = (area.height / 3).max(3);
@@ -925,22 +934,29 @@ pub(super) fn draw_workflow(
     ])
     .areas(area);
 
-    // Heading: what this page is, and which workflow it runs.
-    let mut right = vec![
-        Span::styled("Workflow  ", Style::default().fg(palette.muted)),
-        Span::styled(
-            workflow.name.clone(),
-            Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
-        ),
-    ];
+    // Heading: what this page is, and which workflow it runs. A long name is
+    // cut so it never runs into the title.
+    let mut rest = vec![];
     if app.editor.dirty {
-        right.push(Span::styled(
+        rest.push(Span::styled(
             "  ● unsaved",
             Style::default().fg(palette.warn),
         ));
     }
-    right.push(Span::raw("   "));
-    right.extend(palette.hints(&[("w", "switch")]).spans);
+    rest.push(Span::raw("   "));
+    rest.extend(palette.hints(&[("w", "switch")]).spans);
+    let fixed = "New run  Workflow  ".width() + Line::from(rest.clone()).width();
+    let mut right = vec![
+        Span::styled("Workflow  ", Style::default().fg(palette.muted)),
+        Span::styled(
+            fit(
+                &workflow.name,
+                usize::from(heading.width).saturating_sub(fixed),
+            ),
+            Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    right.extend(rest);
     frame.render_widget(Paragraph::new(Line::from(right)).right_aligned(), heading);
     frame.render_widget(
         Paragraph::new(Line::styled(
@@ -964,7 +980,7 @@ pub(super) fn draw_workflow(
     } else {
         let body = if task_text.is_empty() {
             Paragraph::new(Line::styled(
-                "No task yet. Press [t] to write one, or [f] to import a file, URL, or GitHub issue.",
+                NO_TASK,
                 Style::default()
                     .fg(palette.muted)
                     .add_modifier(Modifier::ITALIC),
@@ -979,14 +995,7 @@ pub(super) fn draw_workflow(
     let selected = app.editor.selected;
     let count = workflow.stages.len();
     frame.render_widget(
-        Paragraph::new(palette.hints(&[
-            ("←→", "stage"),
-            ("e", "edit"),
-            ("c", "harness"),
-            ("o", "on/off"),
-            ("a", "add"),
-        ]))
-        .right_aligned(),
+        Paragraph::new(stage_hints(palette, label.width)).right_aligned(),
         label,
     );
     frame.render_widget(
@@ -1052,6 +1061,23 @@ pub(super) fn draw_workflow(
         summary,
     );
     task_inner
+}
+
+/// The stage keys beside the "Stages" label, as many as fit after it.
+fn stage_hints(palette: Palette, width: u16) -> Line<'static> {
+    let keys = [
+        ("←→", "stage"),
+        ("e", "edit"),
+        ("c", "harness"),
+        ("o", "on/off"),
+        ("a", "add"),
+    ];
+    let room = usize::from(width).saturating_sub("Stages".width() + 2);
+    (0..=keys.len())
+        .rev()
+        .map(|count| palette.hints(&keys[..count]))
+        .find(|line| line.width() <= room)
+        .unwrap_or_default()
 }
 
 /// How the stage's effort compares with what its harness catalog lists.
@@ -1141,10 +1167,9 @@ fn draw_stage_detail(
     let title = Line::from(summary);
     let place = Line::styled(format!("stage {} of {}", position.0, position.1), muted);
 
+    // Missing harness flags get their own row, wrapped, above the settings.
+    let warning = warning.map(|text| Line::styled(text, Style::default().fg(palette.warn)));
     let mut facts = vec![kv(palette, "Role", stage.role.label(), true)];
-    if let Some(warning) = warning {
-        facts.push(Line::styled(warning, Style::default().fg(palette.warn)));
-    }
     facts.extend([
         kv(palette, "Model", model.0, model.1),
         kv(
@@ -1239,20 +1264,44 @@ fn draw_stage_detail(
         muted.add_modifier(Modifier::ITALIC),
     ));
 
-    // Settings in two columns when wide, so instructions stay in view.
-    let columns = area.width >= 70;
+    // Settings in two columns when every one fits its half, so the
+    // instructions stay in view; otherwise one column that wraps.
+    let column = usize::from(area.width / 2).saturating_sub(1);
+    let columns = area.width >= 70 && facts.iter().all(|line| line.width() <= column);
     let half = facts.len().div_ceil(2);
-    let fact_rows = if columns { half } else { facts.len() } as u16;
-    let [title_row, _, facts_area, _, more_area] = Layout::vertical([
+    let fact_rows = if columns {
+        half as u16
+    } else {
+        facts
+            .iter()
+            .map(|line| rows_for(line, area.width, u16::MAX))
+            .fold(0, u16::saturating_add)
+    };
+    let warning_rows = warning
+        .as_ref()
+        .map_or(0, |line| rows_for(line, area.width, 3) + 1);
+    // Blank rows only when the settings all fit with them.
+    let gap = u16::from(area.height >= 1 + warning_rows + fact_rows + 3);
+    let [title_row, _, warning_area, facts_area, _, more_area] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(gap),
+        Constraint::Length(warning_rows),
         Constraint::Length(fact_rows),
-        Constraint::Length(1),
+        Constraint::Length(gap),
         Constraint::Min(0),
     ])
     .areas(area);
-    frame.render_widget(Paragraph::new(place).right_aligned(), title_row);
+    // The position gives way when the stage's name and model need the row.
+    if title.width() + place.width() + 2 <= usize::from(title_row.width) {
+        frame.render_widget(Paragraph::new(place).right_aligned(), title_row);
+    }
     frame.render_widget(Paragraph::new(title), title_row);
+    if let Some(warning) = warning {
+        frame.render_widget(
+            Paragraph::new(warning).wrap(Wrap { trim: false }),
+            warning_area,
+        );
+    }
     if columns {
         let right = facts.split_off(half);
         let [left_area, right_area] =
@@ -1261,7 +1310,7 @@ fn draw_stage_detail(
         frame.render_widget(Paragraph::new(facts), left_area);
         frame.render_widget(Paragraph::new(right), right_area);
     } else {
-        frame.render_widget(Paragraph::new(facts), facts_area);
+        frame.render_widget(Paragraph::new(facts).wrap(Wrap { trim: false }), facts_area);
     }
     frame.render_widget(Paragraph::new(more).wrap(Wrap { trim: false }), more_area);
 }
@@ -1551,6 +1600,38 @@ mod tests {
         editor.key(KeyEvent::from(Key::Left));
         assert_eq!(editor.finish().unwrap().sandbox, None);
         assert!(!editor.changed());
+    }
+
+    #[test]
+    fn long_settings_wrap_instead_of_running_into_the_next_column() {
+        let palette = super::super::theme::Theme::default().palette();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+        let stage = Stage {
+            model: "openrouter/anthropic/claude-sonnet-5-5-preview".into(),
+            ..Stage::default()
+        };
+        let warning = "⚠ opencode 2.0.22 lacks --variant, --interactive; see Harnesses [3]";
+        terminal
+            .draw(|frame| {
+                let notes = StageNotes {
+                    sandbox: Sandbox::Off,
+                    warning: Some(warning.into()),
+                    effort_note: None,
+                    hint: None,
+                };
+                draw_stage_detail(frame, &stage, (1, 1), notes, frame.area(), palette)
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..30)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect();
+        assert!(text.contains(warning), "{text}");
+        assert!(
+            text.contains("Model      openrouter/anthropic/claude-sonnet-5-5-preview"),
+            "{text}"
+        );
     }
 
     #[test]

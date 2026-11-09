@@ -143,8 +143,9 @@ impl RunSlot {
         if current {
             return message;
         }
-        // A newly finished run opens on its results.
-        self.show_output = false;
+        // A newly finished run opens on its brief, unless a search is being
+        // typed into its feed: the next keys still belong to the query.
+        self.show_output = self.log_search.as_ref().is_some_and(|s| s.typing);
         self.results_scroll = 0;
         self.changes_pending = Some(key.clone());
         let run = run.clone();
@@ -542,9 +543,14 @@ fn total_lines(report: &RunReport, palette: Palette) -> Vec<Line<'static>> {
     ]
 }
 
-/// What a finished run offers next, the likeliest first.
-fn next_keys(status: Status) -> &'static [(&'static str, &'static str)] {
-    if status == Status::Complete {
+/// What a finished run offers next, the likeliest first. A stopped fan-out
+/// stage cannot be retried interactively, nor can a ship stage, which never
+/// runs a harness.
+fn next_keys(run: &Run) -> Vec<(&'static str, &'static str)> {
+    let current = run.workflow.stages.get(run.cursor);
+    let fan_out = current.is_some_and(|s| s.fan_out.is_some());
+    let ship = current.is_some_and(|s| s.role == crate::config::Role::Ship);
+    let keys: &[(&str, &str)] = if run.status == Status::Complete {
         &[
             ("d", "diff"),
             ("o", "output"),
@@ -560,7 +566,11 @@ fn next_keys(status: Status) -> &'static [(&'static str, &'static str)] {
             ("d", "diff"),
             ("o", "output"),
         ]
-    }
+    };
+    keys.iter()
+        .copied()
+        .filter(|(key, _)| !((fan_out || ship) && *key == "i"))
+        .collect()
 }
 
 /// The finished run's brief in one scrolling column: its error, the review
@@ -588,7 +598,7 @@ pub(super) fn draw_completion(frame: &mut Frame<'_>, slot: &RunSlot, area: Rect,
     lines.push(Line::raw(""));
     lines.extend(total_lines(&report, palette));
 
-    let next = key_chips(palette, next_keys(report.status), area.width.into());
+    let next = key_chips(palette, &next_keys(&slot.run), area.width.into());
     let [body, bar] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(next_height(&next, area.width)),
@@ -655,6 +665,9 @@ mod tests {
             dir.join("model-router-test-config.toml"),
             Arc::new(AtomicBool::new(false)),
         );
+        // Runs of this session belong to the open project.
+        let mut run = run;
+        run.project = app.project.clone();
         app.session.adopt(run);
         app.ui.page = Page::Runs;
         app
@@ -727,6 +740,11 @@ mod tests {
         };
         let text = screen(&mut app, 120, 60);
         assert_eq!(lacks(&text, &lead).or(lacks(&text, &rest)), None);
+        // The footer offers no keys that do nothing on a finished run.
+        let footer = text.lines().last().unwrap();
+        for key in ["[a]", "[c]", "[y]"] {
+            assert!(!footer.contains(key), "{footer}");
+        }
         let text = screen(&mut app, 80, 24);
         assert_eq!(lacks(&text, &lead), None);
         // A short pane scrolls the brief to the rest, keeping the Next bar.
@@ -790,6 +808,11 @@ mod tests {
         assert!(text.contains("✗ Required check failed"), "{text}");
         assert!(text.contains("Error: Required check failed"), "{text}");
         assert!(text.contains("[y] retry   [i] interactive"), "{text}");
+        // A ship stage never runs a harness, so it has no interactive retry.
+        app.slot_mut().run.cursor = 0;
+        app.slot_mut().run.workflow.stages[0].role = crate::config::Role::Ship;
+        let shipped = screen(&mut app, 120, 36);
+        assert!(shipped.contains("[y] retry   [m] model"), "{shipped}");
         assert!(
             text.contains("unavailable (not a Git repository)"),
             "{text}"
@@ -903,6 +926,8 @@ mod tests {
         let mut run = sample();
         run.status = Status::AwaitingConfirmation;
         run.cursor = 0;
+        // Stages after the one waiting have not run yet.
+        run.stages[1].status = Status::Pending;
         let mut handoff =
             crate::handoff::Handoff::unstructured("Scoped the key.\nTwo\nThree\nFour".into());
         handoff.structured = true;
@@ -924,7 +949,7 @@ mod tests {
             "Scoped the key.",
             "… [h] shows the rest",
             "[a] accept   [t] reopen session",
-            "◆ Implement ━▶ ✓ Verify",
+            "◆ Implement ━▶ ○ Verify",
         ] {
             assert!(text.contains(expected), "lacks {expected:?}\n{text}");
         }
@@ -935,14 +960,104 @@ mod tests {
         for line in narrow.lines().filter(|line| line.starts_with(" │")) {
             let inner = line.trim_end().trim_end_matches('│').trim_end();
             assert!(
-                !inner.ends_with(']') || inner.ends_with("[Space] [r]"),
+                !inner.ends_with(']') || inner.ends_with("More: [Space]"),
                 "{narrow}"
             );
         }
+        // Diff waits for the run to finish, so the footer leaves it out.
+        let footer = text.lines().last().unwrap();
+        assert!(!footer.contains("[d] diff"), "{footer}");
+        // The command menu lists only what applies to a run of this session.
+        app.key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(':'),
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .unwrap();
+        let Some(super::super::modal::Modal::Picker { items, .. }) = app.ui.dialog() else {
+            panic!("command menu");
+        };
+        assert!(items.iter().any(|c| c.label.contains("Accept handoff")));
+        for absent in ["Open the selected saved run", "Preview removing"] {
+            assert!(!items.iter().any(|c| c.label.contains(absent)), "{absent}");
+        }
+        app.ui.dialogs.clear();
+        // A review's verdict cannot be rewritten, so its summary is not offered.
+        app.slot_mut().run.workflow.stages[0].role = crate::config::Role::Review;
+        let text = screen(&mut app, 120, 36);
+        assert!(text.contains("[a] accept"), "{text}");
+        assert!(!text.contains("[e] edit summary"), "{text}");
+        // Nor at a ship plan, which has no session to reopen.
+        app.slot_mut().run.workflow.stages[0].role = crate::config::Role::Ship;
+        let text = screen(&mut app, 120, 36);
+        assert!(
+            text.contains("[a] accept   [y] retry   [h] handoff"),
+            "{text}"
+        );
+        app.slot_mut().run.workflow.stages[0].role = crate::config::Role::Implementation;
+        // Nor for a harness that cannot resume a session.
+        app.slot_mut().run.workflow.stages[0].harness = "mock".into();
+        let text = screen(&mut app, 120, 36);
+        assert!(
+            text.contains("[a] accept   [y] retry   [e] edit summary"),
+            "{text}"
+        );
+        app.slot_mut().run.workflow.stages[0].harness = "claude".into();
+        // In a graph the next stage depends on what finishes, so none is named.
+        let first = app.slot().run.workflow.stages[0].id.clone();
+        app.slot_mut().run.workflow.stages[1].after = vec![first];
+        let text = screen(&mut app, 120, 36);
+        assert!(text.contains("Accept it to continue the run."), "{text}");
+        app.slot_mut().run.workflow.stages[1].after.clear();
+        // A run left running by an earlier execution leads with retry.
+        app.slot_mut().run.status = Status::Running;
+        let text = screen(&mut app, 120, 36);
+        assert!(text.contains("◆ Implement was interrupted"), "{text}");
+        assert!(text.contains("[y] retry   [i]"), "{text}");
+        app.slot_mut().run.status = Status::AwaitingConfirmation;
+        // A long summary is cut, never the keys under it.
+        app.slot_mut().run.stages[0]
+            .handoff
+            .as_mut()
+            .unwrap()
+            .summary = "word ".repeat(400);
+        let narrow = screen(&mut app, 80, 24);
+        assert!(narrow.contains("[a] accept"), "{narrow}");
+        assert!(narrow.contains("More: [Space]"), "{narrow}");
+        // A fan-out stage has no session to reopen.
+        app.slot_mut().run.workflow.stages[0].fan_out = Some(crate::config::FanOut {
+            candidates: vec![],
+            judge: "auto".into(),
+        });
+        let text = screen(&mut app, 120, 36);
+        assert!(text.contains("[a] accept   [y] retry"), "{text}");
+        assert!(!text.contains("[t] reopen"), "{text}");
         // Off stages are passed over in naming the next one.
         app.slot_mut().run.workflow.stages[1].enabled = false;
         let text = screen(&mut app, 120, 36);
         assert!(text.contains("Accept it to finish the run."), "{text}");
+    }
+
+    #[test]
+    fn a_search_left_from_the_live_run_does_not_take_the_briefs_keys() {
+        let mut app = app(sample());
+        app.slot_mut().log_search = Some(super::super::output_search::LogSearch {
+            query: "cache".into(),
+            typing: false,
+            current: 0,
+        });
+        assert!(app.results_shown());
+        app.key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('n'),
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        .unwrap();
+        assert!(
+            matches!(
+                app.ui.dialog(),
+                Some(super::super::modal::Modal::Confirm(_))
+            ),
+            "[n] reruns from the brief"
+        );
     }
 
     #[test]

@@ -131,6 +131,10 @@ impl RunsPage {
         .filter(|entry| !self.open.iter().any(|id| id == entry.id()))
         .collect()
     }
+    /// Whether a status or text filter hides any saved runs.
+    fn filtered(&self) -> bool {
+        self.status > 0 || !content(&self.filter).trim().is_empty()
+    }
     pub(super) fn selected_entry(&self) -> Option<Entry> {
         self.visible()
             .get(self.selected)
@@ -196,13 +200,24 @@ impl App {
         }
     }
     /// The selected run's record: this session's copy, or the saved one.
-    fn selected_run(&mut self) -> Option<Run> {
+    /// The selected run, to rerun or compare. Both read it from the open
+    /// project, so a run of this session started in another one is refused.
+    fn selected_run(&mut self) -> Result<Option<Run>> {
         if self.on_saved() {
-            let entry = self.runs.selected_entry()?;
-            self.load_run(&entry)
-        } else {
-            self.session.run().cloned()
+            let Some(entry) = self.runs.selected_entry() else {
+                return Ok(None);
+            };
+            return Ok(self.load_run(&entry));
         }
+        let run = self.session.run().cloned();
+        if let Some(run) = &run {
+            ensure!(
+                run.project == self.project,
+                "This run belongs to {}; open that project with [p] to rerun or compare it",
+                run.project.display()
+            );
+        }
+        Ok(run)
     }
     pub(super) fn perform_runs(&mut self, id: ActionId) -> Result<()> {
         let saved = self.runs.visible().len();
@@ -249,6 +264,22 @@ impl App {
                     .and_then(|entry| self.load_run(&entry))
                 {
                     let tail = saved_output(&run);
+                    // Only the keys that apply to a run in this state.
+                    let message = match run.status {
+                        Status::Complete => "Saved run loaded. d shows its changes; n reruns it.",
+                        // Continuing would fail it; see `engine::drive`.
+                        Status::Running => {
+                            "Saved run loaded. It was interrupted: y retries; i retries interactively."
+                        }
+                        Status::AwaitingConfirmation => {
+                            "Saved run loaded. h inspects the handoff; a accepts it; y retries."
+                        }
+                        Status::Failed | Status::Blocked | Status::Cancelled => {
+                            "Saved run loaded. y retries; t reopens its session; i retries interactively."
+                        }
+                        Status::Interactive => "Saved run loaded. i opens its terminal.",
+                        _ => "Saved run loaded. c continues; y retries; i retries interactively.",
+                    };
                     self.session.adopt(run);
                     if let Some(slot) = self.session.focused_mut() {
                         for line in tail {
@@ -257,13 +288,12 @@ impl App {
                     }
                     self.sync_runs();
                     self.show_run();
-                    self.ui.message =
-                        "Saved run loaded. c continues; y retries; t reopens its session; i retries interactively.".into();
+                    self.ui.message = message.into();
                     self.reattach_detached();
                 }
             }
             ActionId::Rerun => {
-                if let Some(source) = self.selected_run() {
+                if let Some(source) = self.selected_run()? {
                     let worktree = source.worktree;
                     self.ui.open(Modal::Confirm(Box::new(Confirm {
                         kind: Kind::Rerun {
@@ -275,7 +305,7 @@ impl App {
                 }
             }
             ActionId::CompareAttempts => {
-                if let Some(run) = self.selected_run() {
+                if let Some(run) = self.selected_run()? {
                     self.compare_picker(&run);
                 }
             }
@@ -669,7 +699,9 @@ fn rerun_lines(source: &Run, worktree: bool, palette: Palette) -> Vec<Line<'stat
 /// columns a run of this session takes the whole width; the sidebar returns
 /// once a saved run is selected.
 pub(super) fn draw_runs(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
-    if area.width < 98 && !app.on_saved() {
+    // Narrow panes give a session's run the width, except while the filter,
+    // which the sidebar holds, is being typed.
+    if area.width < 98 && !app.on_saved() && !app.runs.filtering {
         return draw_run(frame, app, area, palette);
     }
     let side = (area.width / 3).clamp(22, 34);
@@ -793,7 +825,8 @@ fn draw_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) 
                 status_glyph(run.status),
                 &title(&run.task, &run.workflow),
                 Span::styled(
-                    fit(&format!("{started} · {}", run.status.label()), width),
+                    // The status first, so a narrow sidebar cuts the date.
+                    fit(&format!("{} · {started}", run.status.label()), width),
                     muted,
                 ),
             ),
@@ -802,13 +835,14 @@ fn draw_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) 
                 item(
                     Span::styled("✗", red),
                     id,
-                    Span::styled(format!("{started} · damaged"), red),
+                    Span::styled(fit(&format!("damaged · {started}"), width), red),
                 )
             }
         });
     }
     if visible.is_empty() && !app.runs.loading {
-        let none = if app.runs.entries.is_empty() {
+        // Runs open in this session are listed above, not filtered out.
+        let none = if !app.runs.filtered() {
             "  none yet"
         } else {
             "  none match"
@@ -849,7 +883,7 @@ fn draw_filter(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
 /// What a saved run was, and what opening it here offers.
 fn draw_saved(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
     let Some(entry) = app.runs.selected_entry() else {
-        let (head, body) = if app.runs.entries.is_empty() {
+        let (head, body) = if !app.runs.filtered() {
             (
                 "No runs yet",
                 "Runs for this project are saved automatically. Write a task on Workflow [1], then [r] runs it.",
@@ -1094,6 +1128,8 @@ mod tests {
         assert!(!app.runs_filtering());
         assert_eq!(app.runs.visible()[0].id(), failed.id);
         assert!(shows(&mut app, "Saved · 1 “parser”"));
+        // The status leads, so a narrow sidebar cuts the date instead.
+        assert!(shows(&mut app, "failed · "));
         press(&mut app, "F");
         app.key(key(Key::Esc)).unwrap();
 

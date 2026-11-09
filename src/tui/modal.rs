@@ -707,7 +707,7 @@ impl App {
                 if let Some(index) = insert_at {
                     self.editor.selected = *index;
                     self.ui.message =
-                        "Stage added. [J]/[K] reorders; [Space] enables or disables it.".into();
+                        "Stage added. [J]/[K] reorders; [o] enables or disables it.".into();
                 }
                 self.editor.dirty = true;
                 Close
@@ -1156,14 +1156,66 @@ fn draw_menu(frame: &mut Frame<'_>, scope: Scope, group: Option<Group>, palette:
     let inner = block.inner(rect).inner(Margin::new(1, 0));
     frame.render_widget(block, rect);
     let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let strong = |color| Style::default().fg(color).add_modifier(Modifier::BOLD);
+    let quiet = Style::default().fg(palette.muted);
+    // Rows for actions under each group's name and a gap.
+    let rows = usize::from(body.height.saturating_sub(2)).max(1);
+    let item = |letter: char, label: &str, letter_style: Style, label_style: Style| {
+        Line::from(vec![
+            Span::styled(letter.to_string(), letter_style),
+            Span::styled(format!(" {label}"), label_style),
+        ])
+    };
+    // A chosen group too tall for the sheet takes all of it, in columns.
+    if let Some((g, items)) = groups
+        .iter()
+        .find(|(g, items)| group == Some(*g) && items.len() > rows)
+    {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    g.key().to_string(),
+                    strong(palette.on_accent()).bg(palette.accent),
+                ),
+                Span::styled(format!(" {}", g.name()), strong(palette.fg)),
+            ])),
+            body,
+        );
+        let chunks: Vec<_> = items.chunks(rows).collect();
+        let area = Rect {
+            y: body.y + 2,
+            height: body.height.saturating_sub(2),
+            ..body
+        };
+        let columns = Layout::horizontal(
+            chunks
+                .iter()
+                .map(|_| Constraint::Ratio(1, chunks.len() as u32)),
+        )
+        .split(area);
+        for (chunk, column) in chunks.iter().zip(columns.iter()) {
+            let lines: Vec<_> = chunk
+                .iter()
+                .map(|(letter, entry)| {
+                    item(
+                        *letter,
+                        entry.label,
+                        strong(palette.accent),
+                        Style::default().fg(palette.fg),
+                    )
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(lines), *column);
+        }
+        frame.render_widget(Paragraph::new(Line::styled(hint, quiet)), footer);
+        return;
+    }
     let columns = Layout::horizontal(
         groups
             .iter()
             .map(|_| Constraint::Ratio(1, groups.len().max(1) as u32)),
     )
     .split(body);
-    let strong = |color| Style::default().fg(color).add_modifier(Modifier::BOLD);
-    let quiet = Style::default().fg(palette.muted);
     for ((g, items), column) in groups.iter().zip(columns.iter()) {
         let chosen = group == Some(*g);
         let other = group.is_some() && !chosen;
@@ -1191,12 +1243,24 @@ fn draw_menu(frame: &mut Frame<'_>, scope: Scope, group: Option<Group>, palette:
             ]),
             Line::raw(""),
         ];
-        lines.extend(items.iter().map(|(letter, entry)| {
-            Line::from(vec![
-                Span::styled(letter.to_string(), letter_style),
-                Span::styled(format!(" {}", entry.label), label_style),
-            ])
-        }));
+        // A group too tall for the sheet counts what its letter shows.
+        let shown = if items.len() > rows {
+            rows - 1
+        } else {
+            items.len()
+        };
+        lines.extend(
+            items[..shown]
+                .iter()
+                .map(|(letter, entry)| item(*letter, entry.label, letter_style, label_style)),
+        );
+        // Only before a group is chosen does its letter open it.
+        if shown < items.len() && group.is_none() {
+            lines.push(Line::styled(
+                format!("+{} more: press {}", items.len() - shown, g.key()),
+                quiet,
+            ));
+        }
         frame.render_widget(Paragraph::new(lines), *column);
     }
     frame.render_widget(Paragraph::new(Line::styled(hint, quiet)), footer);

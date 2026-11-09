@@ -51,7 +51,9 @@ included), else the current directory. The walk stops at the Git root.
 | `Ctrl+C` | Cancel work, or exit |
 
 The footer shows the current view's most used keys, then `Space menu` and
-`? keys` on the right.
+`? keys` on the right. It leaves out keys the selected run does not accept, and
+while you type into a field (the task, a feed search, or the Runs filter) it
+shows that field's keys instead.
 
 ### Action menu
 
@@ -169,7 +171,7 @@ shows its title, a strip of its stages, and a feed of every stage's output
 in order; when it waits on you, a card under the feed says why and which keys
 answer it. Once it stops, it shows its [brief](#brief). A saved run shows a summary until `Enter` opens it here with its latest output.
 Below 100 columns a run of this session takes the whole width, and the
-sidebar comes back when a saved run is selected.
+sidebar comes back when a saved run is selected or while you type a filter.
 
 The tab counts active runs (`2 Runs ●2`). The header shows
 `◆ 2 need input [N]` while runs wait.
@@ -226,9 +228,10 @@ everything.
 
 The card's first key is the one the run expects: `a` accepts a handoff (or a
 `not_applicable` waiver), `i` opens an interactive stage's terminal, `c`
-continues a paused run. It shows the handoff's changed files, test results,
+continues a paused run, and `y` retries a stage an earlier execution left
+interrupted. It shows the handoff's changed files, test results,
 unresolved count, and the start of its summary; `h` shows all of it. Keys that
-do not fit stay in `Space` `r`.
+do not fit stay in the `Space` menu.
 
 ### Brief
 

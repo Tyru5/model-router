@@ -57,6 +57,10 @@ fn the_new_run_view_strips_stages_and_edits_the_task_in_place() {
         screen.contains(&format!("stage 1 of {}", names.len())),
         "{screen}"
     );
+    // At the minimum size the stage keys give way to the label.
+    let small = rows(&mut app, 65, 20);
+    let label = small.iter().find(|row| row.contains("Stages")).unwrap();
+    assert!(label.contains("Stages  "), "{label}");
     assert!(
         screen.contains("Instructions"),
         "details show at 80 columns\n{screen}"
@@ -81,6 +85,13 @@ fn the_new_run_view_strips_stages_and_edits_the_task_in_place() {
     assert!(screen.contains("Fix the cache 雪"), "{screen}");
     assert!(screen.contains("[Ctrl+S] done"), "{screen}");
     assert!(screen.contains("Stages"), "{screen}");
+    // Keys type text now, so the footer names the editor's keys.
+    let footer = rows(&mut app, 80, 24).pop().unwrap();
+    assert!(footer.contains("[Enter] new line"), "{footer}");
+    assert!(
+        !footer.contains("[r] run") && !footer.contains("menu"),
+        "{footer}"
+    );
     app.key(ctrl('s')).unwrap();
     assert!(app.ui.dialog().is_none());
     assert_eq!(app.editor.task, "Fix the cache 雪");
@@ -421,10 +432,10 @@ fn every_theme_reaches_pages_dialogs_and_text_inputs() {
         for (width, height) in [(120, 36), (80, 24)] {
             let mut terminal =
                 Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-            // `2 o o` revisits the Monitor with a finished run: results, the
-            // output log, then results again.
+            // Each page, the Space menu, then `2 o o` revisits Runs with a
+            // finished run: its brief, the output, then the brief again.
             for (step, action) in [
-                '1', '2', '3', '4', '1', 't', 'e', 'c', 'p', 'f', 'w', '?', 'T', ':', '2', 'o', 'o',
+                '1', '2', '3', '1', ' ', 't', 'e', 'c', 'p', 'f', 'w', '?', 'T', ':', '2', 'o', 'o',
             ]
             .into_iter()
             .enumerate()
@@ -434,6 +445,7 @@ fn every_theme_reaches_pages_dialogs_and_text_inputs() {
                     app.session.adopt(crate::report::tests::sample());
                 }
                 app.key(key(Key::Char(action))).unwrap();
+                assert!(action != ' ' || app.ui.dialog().is_some(), "no Space menu");
                 terminal.draw(|frame| draw(frame, &mut app)).unwrap();
                 let buffer = terminal.backend().buffer();
                 assert_eq!(buffer[(0, 0)].bg, palette.bg, "{theme:?} {action}");
@@ -1076,8 +1088,10 @@ fn command_menu_lists_only_actions_for_the_current_context() {
     app.key(key(Key::Enter)).unwrap();
     assert!(app.ui.dialog().is_none() && !app.slot().cancel.load(Ordering::Relaxed));
 
+    // Opening a saved run is listed only when one is selected, not beside
+    // a run of this session, where it could only say it is already open.
     app.ui.page = Page::Runs;
-    assert!(menu(&mut app).contains(&ActionId::OpenRun));
+    assert!(!menu(&mut app).contains(&ActionId::OpenRun));
     app.ui.page = Page::Harnesses;
     assert!(menu(&mut app).contains(&ActionId::HarnessDetails));
 }
@@ -1295,6 +1309,7 @@ fn running_app(project: &std::path::Path) -> App {
     let mut run = sample_run("live");
     run.status = Status::Running;
     run.cursor = 0;
+    run.project = app.project.clone();
     app.session.adopt(run);
     app.slot_mut().worker = Some(Worker::stub());
     app.ui.page = Page::Runs;
@@ -2269,6 +2284,195 @@ fn diff_dialog_hands_the_patch_and_files_to_external_programs() {
         "{launch:?}"
     );
     assert_eq!(launch.cwd.as_deref(), Some(project.path()));
+}
+
+#[test]
+fn a_search_still_being_typed_keeps_its_keys_when_the_run_finishes() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = running_app(project.path());
+    app.key(key(Key::Char('/'))).unwrap();
+    app.key(key(Key::Char('e'))).unwrap();
+    app.slot_mut().worker = None;
+    app.slot_mut().run.status = Status::Complete;
+    app.poll_completion();
+    // x would close the run from its brief; here it is part of the query.
+    app.key(key(Key::Char('x'))).unwrap();
+    assert_eq!(app.session.runs.len(), 1);
+    assert_eq!(app.slot().log_search.as_ref().unwrap().query, "ex");
+}
+
+#[test]
+fn arrows_typed_into_a_search_do_not_move_to_another_run() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = running_app(project.path());
+    app.session.adopt(sample_run("second"));
+    app.key(key(Key::Char('/'))).unwrap();
+    app.key(key(Key::Char('a'))).unwrap();
+    app.key(key(Key::Up)).unwrap();
+    // x would close the run the arrow moved to; here it goes into the query.
+    app.key(key(Key::Char('x'))).unwrap();
+    assert_eq!(app.session.runs.len(), 2);
+    assert_eq!(app.session.run().unwrap().id, "second");
+    assert_eq!(app.slot().log_search.as_ref().unwrap().query, "ax");
+    // Letters type into the query, so the footer names the search's keys.
+    let footer = rows(&mut app, 120, 36).pop().unwrap();
+    assert!(footer.contains("[Enter] find   [Esc] cancel"), "{footer}");
+    assert!(
+        !footer.contains("[h]") && !footer.contains("[Space]"),
+        "{footer}"
+    );
+}
+
+#[test]
+fn the_footer_offers_only_keys_the_selected_run_accepts() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    let mut run = sample_run("paused");
+    run.status = Status::Pending;
+    app.session.adopt(run);
+    app.ui.page = Page::Runs;
+    // A paused run continues, but has no handoff to accept.
+    let footer = rows(&mut app, 120, 36).pop().unwrap();
+    assert!(footer.contains("[c] continue   [y] retry"), "{footer}");
+    assert!(!footer.contains("[a]"), "{footer}");
+    // An interrupted one must be retried; continuing would fail it.
+    app.slot_mut().run.status = Status::Running;
+    let footer = rows(&mut app, 120, 36).pop().unwrap();
+    assert!(footer.contains("[y] retry"), "{footer}");
+    assert!(!footer.contains("[c]"), "{footer}");
+    app.slot_mut().run.status = Status::AwaitingConfirmation;
+    let footer = rows(&mut app, 120, 36).pop().unwrap();
+    // A waiting one moves on by accepting it, not by continuing.
+    assert!(footer.contains("[a] advance   [y] retry"), "{footer}");
+    assert!(!footer.contains("[c]"), "{footer}");
+}
+
+#[test]
+fn saved_runs_say_none_yet_when_only_this_sessions_runs_exist() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    app.ui.page = Page::Runs;
+    // A run of this session is saved too, but listed above, not under Saved.
+    let mut run = sample_run("live");
+    run.project = project.path().into();
+    run.directory = crate::storage::run_dir(project.path(), &run.id).unwrap();
+    std::fs::create_dir_all(&run.directory).unwrap();
+    run.persist().unwrap();
+    app.session.adopt(run);
+    let saved = crate::history::list(project.path()).unwrap();
+    assert_eq!(saved.len(), 1);
+    app.runs.show(saved, project.path());
+    app.sync_runs();
+    let screen = rows(&mut app, 120, 36).join("\n");
+    assert!(
+        screen.contains("none yet"),
+        "no filter hides anything\n{screen}"
+    );
+    // Nor does the pane beside it say a filter hides any.
+    app.runs.on_saved = true;
+    let screen = rows(&mut app, 120, 36).join("\n");
+    assert!(screen.contains("No runs yet"), "{screen}");
+}
+
+#[test]
+fn every_fan_out_candidate_shows_its_status_at_80_columns() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = running_app(project.path());
+    app.slot_mut().run.stages[0].fan_out = Some(
+        serde_json::from_value(serde_json::json!({
+            "base": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+            "base_commit": "0123456789abcdef0123456789abcdef01234567",
+            "candidates": [
+                {"id": "c1", "harness": "claude", "model": "sonnet", "status": "complete",
+                 "attempts": [], "handoff": null},
+                {"id": "c2", "harness": "codex", "model": "gpt-6-astra", "status": "running",
+                 "attempts": [], "handoff": null},
+                {"id": "c3", "harness": "opencode", "model": "openrouter/some-long-model",
+                 "status": "failed", "attempts": [], "handoff": null}
+            ]
+        }))
+        .unwrap(),
+    );
+    let screen = rows(&mut app, 80, 24);
+    let line = screen.iter().find(|row| row.contains("fan-out")).unwrap();
+    // Too wide with models, so they go and each status shows.
+    assert!(line.contains("c3 · opencode ✗"), "{line}");
+    assert!(!line.contains("sonnet"), "{line}");
+    let screen = rows(&mut app, 200, 24);
+    let line = screen.iter().find(|row| row.contains("fan-out")).unwrap();
+    assert!(line.contains("c1 · claude sonnet ✓"), "{line}");
+}
+
+#[test]
+fn a_run_started_in_another_project_is_not_rerun_from_this_one() {
+    let project = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    app.ui.page = Page::Runs;
+    let mut run = sample_run("elsewhere");
+    run.project = other.path().into();
+    app.session.adopt(run);
+    for action in [ActionId::Rerun, ActionId::CompareAttempts] {
+        let error = app.perform(action).unwrap_err().to_string();
+        assert!(error.contains("open that project with [p]"), "{error}");
+        assert!(app.ui.dialog().is_none());
+    }
+}
+
+#[test]
+fn the_empty_task_hint_is_shown_whole_at_80_columns() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    app.editor.task.clear();
+    let screen = rows(&mut app, 80, 24).join("\n");
+    assert!(screen.contains("GitHub issue."), "{screen}");
+}
+
+#[test]
+fn filtering_shows_the_sidebar_even_beside_a_narrow_session_run() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = running_app(project.path());
+    assert!(!rows(&mut app, 80, 24).join("\n").contains("This session"));
+    app.key(key(Key::Char('F'))).unwrap();
+    app.key(key(Key::Char('z'))).unwrap();
+    assert!(app.runs_filtering());
+    let screen = rows(&mut app, 80, 24).join("\n");
+    assert!(screen.contains("F z"), "the filter field shows\n{screen}");
+    assert!(screen.contains("[Enter] keep"), "{screen}");
+    // The footer names the filter's keys; letters type into it.
+    let footer = screen.lines().last().unwrap();
+    assert!(footer.contains("[Esc] clear"), "{footer}");
+    assert!(
+        !footer.contains("[s]") && !footer.contains("[Space]"),
+        "{footer}"
+    );
+}
+
+#[test]
+fn a_space_group_too_tall_for_the_sheet_still_lists_every_action() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = running_app(project.path());
+    app.slot_mut().worker = None;
+    app.session.adopt(sample_run("done"));
+    let view = super::actions::menu(super::actions::Scope::MonitorIdle)
+        .into_iter()
+        .find(|(group, _)| *group == super::actions::Group::View)
+        .map(|(_, items)| items)
+        .unwrap();
+    let last = view.last().unwrap().1.label;
+    app.key(key(Key::Char(' '))).unwrap();
+    let screen = rows(&mut app, 65, 20).join("\n");
+    assert!(screen.contains("more: press v"), "{screen}");
+    // Once another group is chosen, v is not a group key any more.
+    app.key(key(Key::Char('r'))).unwrap();
+    assert!(!rows(&mut app, 65, 20).join("\n").contains("more: press"));
+    app.key(key(Key::Backspace)).unwrap();
+    app.key(key(Key::Char('v'))).unwrap();
+    let screen = rows(&mut app, 65, 20).join("\n");
+    assert!(
+        screen.contains(&format!(" {last}")),
+        "lacks {last:?}\n{screen}"
+    );
 }
 
 #[test]
