@@ -149,7 +149,7 @@ after = ["implement"]   # also waits for the judge
   the patch and worktree paths.
 - Losing candidates stay on disk until `clean` removes the run.
 - One stopped candidate can be rerun alone:
-  `resume RUN_ID --retry-candidate implement/c2`, or `Y` on the Monitor.
+  `resume RUN_ID --retry-candidate implement/c2`, or `Y` on the Runs page.
 - Fan-out stages cannot be retried interactively or taken over.
 
 TUI: **Fan-out candidates** field, one per line

@@ -84,6 +84,10 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Changed
 
+- TUI: Monitor and Runs are one Runs page (`2`): a sidebar of this
+  session's runs and saved runs beside the selected one; Harnesses is `3`.
+  Its list keys moved where they collided: filter `F`, status `s`,
+  compare `=`; `n` reruns; `[`/`]` gave way to `↑↓`.
 - TUI: enabling or disabling a stage moved from `Space` to `o`. The footer is
   one row, ending with `Space menu` and `? keys`.
 - README reduced to an entry point; detail moved to `docs/`.

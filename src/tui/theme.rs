@@ -447,8 +447,8 @@ impl Palette {
         }
     }
 
-    pub fn status_span(self, status: Status) -> Span<'static> {
-        let glyph = match status {
+    pub fn status_glyph(status: Status) -> &'static str {
+        match status {
             Status::Complete => "✓",
             Status::Failed | Status::Blocked => "✗",
             Status::Cancelled => "⊘",
@@ -456,9 +456,12 @@ impl Palette {
             Status::AwaitingConfirmation => "◐",
             Status::Skipped => "–",
             Status::Pending => "○",
-        };
+        }
+    }
+
+    pub fn status_span(self, status: Status) -> Span<'static> {
         Span::styled(
-            format!("{glyph} {}", status.label()),
+            format!("{} {}", Self::status_glyph(status), status.label()),
             Style::default().fg(self.status_color(status)),
         )
     }

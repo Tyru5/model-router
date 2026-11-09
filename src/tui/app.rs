@@ -2,10 +2,9 @@ use super::{
     actions::{self, ActionId, Scope},
     editor::Editor,
     harnesses::{HarnessesPage, draw_harnesses},
-    history::{RunsPage, draw_history},
+    history::{RunsPage, draw_runs},
     modal::{Ask, Choice, InputTarget, Loading, Modal, PickValue, draw_modal},
     models::Catalogs,
-    monitor::draw_run,
     run_slot::{RunSlot, Worker},
     session::{Session, draw_session_runs, notice_text},
     tasks::{Msg, Tasks},
@@ -42,7 +41,7 @@ pub(super) struct App {
     pub(super) project: PathBuf,
     /// The Workflow page's workflow, task, and undo stack.
     pub(super) editor: Editor,
-    /// This session's runs; the Monitor shows the focused one.
+    /// This session's runs; the Runs page shows the focused one.
     pub(super) session: Session,
     pub(super) runs: RunsPage,
     pub(super) harnesses: HarnessesPage,
@@ -313,7 +312,7 @@ impl App {
             );
         }
         if found > 0 {
-            self.ui.page = Page::Monitor;
+            self.show_run();
         }
     }
     /// Applies background results and run progress, and starts timed
@@ -420,7 +419,7 @@ impl App {
                     " in a worktree ({h} is using the checkout)"
                 ))
             );
-            self.ui.page = Page::Monitor;
+            self.show_run();
             return Ok(());
         }
         // The run has its own snapshot; the editor is free for the next one.
@@ -435,11 +434,11 @@ impl App {
             None => format!("Started {id}. "),
         };
         if interactive {
-            self.ui.page = Page::Monitor;
+            self.show_run();
         } else {
             self.ui
                 .message
-                .push_str("Monitor [2] follows it. Define the next task here.");
+                .push_str("Runs [2] follows it. Define the next task here.");
         }
         Ok(())
     }
@@ -481,14 +480,14 @@ impl App {
         Ok(())
     }
     fn focused_stopped(&mut self, result: std::result::Result<Action, String>) {
-        // Every stop is kept in the notice history; on the Monitor, the
+        // Every stop is kept in the notice history; on the run, the
         // status line then says what to do next.
         if let Some(run) = self.session.run() {
             let alert = result.is_err() || result == Ok(Action::Stopped);
             self.push_notice(notice_text(run, &result), alert);
         }
-        // Away from the Monitor, a terminal never takes over the screen.
-        if self.ui.page != Page::Monitor {
+        // Away from the run, a terminal never takes over the screen.
+        if !self.monitoring() {
             return;
         }
         match result {
@@ -592,6 +591,7 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Ok(false);
         }
+        self.sync_runs();
         if key.code == KeyCode::F(8) && key.modifiers.is_empty() {
             return self.perform_global(ActionId::ToggleVim);
         }
@@ -601,7 +601,7 @@ impl App {
         if self.runs_filtering() {
             return self.runs_filter_key(key);
         }
-        if self.ui.page == Page::Monitor && self.output_search_key(key) {
+        if self.monitoring() && self.output_search_key(key) {
             return Ok(false);
         }
         if let Some(id) = actions::resolve(self.scope(), key) {
@@ -611,6 +611,7 @@ impl App {
     }
     /// Run an action exactly as its key does; true means exit.
     pub(super) fn perform(&mut self, id: ActionId) -> Result<bool> {
+        self.sync_runs();
         let entry = actions::entry(id).with_context(|| format!("{id:?} has no action entry"))?;
         // A command menu can outlive its context, e.g. when the run stops.
         if !entry.scope.covers(self.scope()) {
@@ -625,6 +626,8 @@ impl App {
             Scope::Runs => self.perform_runs(id)?,
             Scope::Harnesses => self.perform_harnesses(id)?,
         }
+        // Opening and closing runs moves them in and out of Saved.
+        self.sync_runs();
         Ok(false)
     }
     fn perform_global(&mut self, id: ActionId) -> Result<bool> {
@@ -681,7 +684,6 @@ impl App {
             ActionId::Stats => self.show_stats(),
             ActionId::NextView => self.show(self.ui.page.next()),
             ActionId::ShowWorkflow => self.show(Page::Workflow),
-            ActionId::ShowMonitor => self.show(Page::Monitor),
             ActionId::ShowRuns => self.show(Page::Runs),
             ActionId::ShowHarnesses => self.show(Page::Harnesses),
             other => bail!("{other:?} is not a global action"),
@@ -724,7 +726,7 @@ impl App {
                     .checks
                     .start(&self.editor.settings, &self.project, &self.tasks)
             }
-            Page::Workflow | Page::Monitor => {}
+            Page::Workflow => {}
         }
     }
     /// Whether something on screen animates, so frames come faster.
@@ -740,8 +742,7 @@ impl App {
             return false;
         }
         if !self.ui.dialogs.is_empty() {
-            self.ui.message =
-                "Interactive stage ready — press [t] on the Monitor to open it.".into();
+            self.ui.message = "Interactive stage ready — press [t] on Runs to open it.".into();
             return false;
         }
         true
@@ -766,13 +767,13 @@ impl App {
             note: "Actions available here. Type to filter by key, name, or description.".into(),
         });
     }
-    /// The page's scope; Monitor depends on whether a run is active.
+    /// The page's scope; on Runs it depends on what the sidebar selects.
     fn page_scope(&self) -> Scope {
         match self.ui.page {
             Page::Workflow => Scope::Workflow,
-            Page::Monitor if self.session.running() => Scope::MonitorRunning,
-            Page::Monitor => Scope::MonitorIdle,
-            Page::Runs => Scope::Runs,
+            Page::Runs if self.on_saved() => Scope::Runs,
+            Page::Runs if self.session.running() => Scope::MonitorRunning,
+            Page::Runs => Scope::MonitorIdle,
             Page::Harnesses => Scope::Harnesses,
         }
     }
@@ -783,20 +784,19 @@ impl App {
     }
 }
 
-/// The views, in tab order; [1]–[4] and Tab switch between them.
+/// The views, in tab order; [1]–[3] and Tab switch between them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Page {
     Workflow,
-    Monitor,
+    /// This session's runs and the saved ones, beside the selected run.
     Runs,
     Harnesses,
 }
 impl Page {
-    pub(super) const ALL: [Page; 4] = [Self::Workflow, Self::Monitor, Self::Runs, Self::Harnesses];
+    pub(super) const ALL: [Page; 3] = [Self::Workflow, Self::Runs, Self::Harnesses];
     pub(super) fn name(self) -> &'static str {
         match self {
             Self::Workflow => "Workflow",
-            Self::Monitor => "Monitor",
             Self::Runs => "Runs",
             Self::Harnesses => "Harnesses",
         }
@@ -825,6 +825,7 @@ fn read_project(path: PathBuf) -> std::result::Result<Opened, String> {
 }
 
 pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
+    app.sync_runs();
     let palette = app.ui.palette();
     let area = frame.area();
     frame.render_widget(
@@ -922,8 +923,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let body = chunks[2].inner(Margin::new(1, 0));
     match app.ui.page {
         Page::Workflow => draw_workflow(frame, app, body, palette),
-        Page::Monitor => draw_run(frame, app, body, palette),
-        Page::Runs => draw_history(frame, app, body, palette),
+        Page::Runs => draw_runs(frame, app, body, palette),
         Page::Harnesses => draw_harnesses(frame, app, body, palette),
     }
     if !app.ui.message.is_empty() {
@@ -978,7 +978,7 @@ fn header_lines(app: &App, palette: Palette, width: u16) -> Vec<Line<'static>> {
         ),
         Span::raw("  "),
     ];
-    // The Monitor tab counts runs still in progress, so they stay visible
+    // The Runs tab counts runs still in progress, so they stay visible
     // while the next workflow is being set up.
     let live = app
         .session
@@ -989,7 +989,7 @@ fn header_lines(app: &App, palette: Palette, width: u16) -> Vec<Line<'static>> {
     let mut tabs = Vec::new();
     for (index, page) in Page::ALL.into_iter().enumerate() {
         let name = page.name();
-        let count = if page == Page::Monitor && live > 0 {
+        let count = if page == Page::Runs && live > 0 {
             format!(" ●{live}")
         } else {
             String::new()

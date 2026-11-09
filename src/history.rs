@@ -888,7 +888,8 @@ pub fn cleanup_plan(project: &Path, criteria: &Criteria) -> Result<Plan> {
             continue;
         }
         if criteria.protect.iter().any(|p| p == id) {
-            plan.skipped.push((id.into(), "Open in the monitor".into()));
+            plan.skipped
+                .push((id.into(), "Open in this session".into()));
             continue;
         }
         // A missing lock file is free; checking must not create one.

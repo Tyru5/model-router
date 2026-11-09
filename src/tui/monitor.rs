@@ -1,6 +1,6 @@
 use super::{
     actions::ActionId,
-    app::{App, Page},
+    app::App,
     completion::{checks_cell, draw_completion},
     handoff_view::HandoffView,
     modal::{Ask, Choice, InputTarget, Modal, PickValue},
@@ -73,11 +73,11 @@ impl App {
                     self.session.launch_interactive = true;
                 }
             }
-            ActionId::PreviousSessionRun => self.session.cycle_focus(false),
-            ActionId::NextSessionRun => self.session.cycle_focus(true),
             ActionId::CloseRun => {
                 self.session.dismiss()?;
-                self.ui.message = "Run closed here; Runs [3] reopens it.".into();
+                self.runs.stale = true;
+                self.ui.message =
+                    "Run closed here; it moves to Saved, where [Enter] reopens it.".into();
             }
             ActionId::ScrollUp if self.results_shown() => self.view(|slot| {
                 for scroll in &mut slot.results_scroll {
@@ -267,7 +267,6 @@ impl App {
                     &summary,
                 );
             }
-            ActionId::BackToWorkflow => self.ui.page = Page::Workflow,
             other => bail!("{other:?} is not a monitor action"),
         }
         Ok(())
@@ -332,33 +331,6 @@ fn retryable_candidates(run: &engine::Run) -> Vec<(usize, &engine::CandidateStat
                 .map(move |candidate| (index, candidate))
         })
         .collect()
-}
-
-/// One line listing this session's runs when there is more than one;
-/// false when there is nothing to list.
-fn draw_session(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) -> bool {
-    if app.session.runs.len() < 2 {
-        return false;
-    }
-    let mut spans = vec![Span::styled("[ ] ", Style::default().fg(palette.accent))];
-    for (index, (slot, focused)) in app.session.slots().enumerate() {
-        let run = &slot.run;
-        let label = format!(
-            " {} {} · {} ",
-            index + 1,
-            run.workflow.name,
-            run.current_name()
-        );
-        spans.push(if focused {
-            Span::styled(label, palette.selected_style())
-        } else {
-            Span::styled(label, Style::default().fg(palette.muted))
-        });
-        spans.push(palette.status_span(run.status));
-        spans.push(Span::raw("  "));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    true
 }
 
 /// Output lines wrapped to `width` columns and coloured by what they show:
@@ -477,7 +449,7 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
             area,
             palette.panel(" Run monitor "),
             "No run selected",
-            "Start one from Workflow [r], or open a saved run from Runs [3].",
+            "Start one from Workflow [r], or open a saved run from the sidebar.",
         );
         return;
     };
@@ -498,12 +470,13 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
             Span::raw("   "),
             palette.status_span(run.status),
             Span::styled(
+                // The ID goes last: narrow panes clip it, not the cost.
                 format!(
-                    "   {}  ·  repairs {}/{}{}",
-                    run.id,
+                    "   repairs {}/{}{}  ·  {}",
                     run.repair_passes,
                     run.workflow.max_repair_passes,
-                    running_cost(slot)
+                    running_cost(slot),
+                    run.id,
                 ),
                 Style::default().fg(palette.muted),
             ),
@@ -518,9 +491,8 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
         ])),
         chunks[0],
     );
-    let listed = draw_session(frame, app, chunks[1], palette);
     if app.results_shown() {
-        let top = if listed { chunks[2].y } else { chunks[1].y };
+        let top = chunks[1].y;
         let rest = Rect {
             y: top,
             height: area.height.saturating_sub(top - area.y),

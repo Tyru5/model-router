@@ -1,4 +1,4 @@
-//! A run of this session: its driver thread, output log, and Monitor view state.
+//! A run of this session: its driver thread, output log, and view state.
 use super::{completion, output_search, theme::Theme};
 use crate::{
     engine::{self, Action, Event as RunEvent, Run, Status},
@@ -30,7 +30,7 @@ pub(super) struct Inbox {
 const PENDING_LINES: usize = 2000;
 /// A stage that stopped this recently cannot be continued by the same key.
 pub(super) const SETTLE: Duration = Duration::from_millis(600);
-/// Lines the Monitor keeps per run.
+/// Output lines kept per run.
 pub(super) const LOG_LINES: usize = 400;
 impl Inbox {
     fn push(&mut self, event: RunEvent) {
@@ -110,7 +110,7 @@ impl Worker {
     }
 }
 
-/// A run started or opened in this session, with its Monitor view state.
+/// A run started or opened in this session, with its view state.
 pub(super) struct RunSlot {
     pub(super) run: Run,
     pub(super) worker: Option<Worker>,

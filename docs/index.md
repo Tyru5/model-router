@@ -3,7 +3,7 @@
 | Doc | What it covers |
 | --- | --- |
 | [workflows.md](workflows.md) | Stages, roles, presets, graphs (`after`), best-of-N fan-out, handoffs, reviews and repairs, verification and checks, review summary, shipping, artifacts. |
-| [tui.md](tui.md) | Every key by page, stage and harness editors, repository browser, task import, Monitor, diff view, output search, sessions and takeover, notifications, themes, Vim motions. |
+| [tui.md](tui.md) | Every key by page, stage and harness editors, repository browser, task import, Runs, diff view, output search, sessions and takeover, notifications, themes, Vim motions. |
 | [harnesses.md](harnesses.md) | Built-in harnesses, model selection, providers (OpenRouter and others), permission settings, structured output, takeover, doctor, custom adapters. |
 | [configuration.md](configuration.md) | Every config field with defaults, file locations and precedence, v1→v2 migration, preferences and trust files, environment variables. |
 | [safety.md](safety.md) | Project trust, harness permissions, router sandbox, secrets and redaction, import network limits, process cleanup. |

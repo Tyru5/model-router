@@ -1,4 +1,4 @@
-//! The Monitor's handoff dialog (`h`): summary, findings by severity, tests
+//! The selected run's handoff dialog (`h`): summary, findings by severity, tests
 //! by status, and the changed files, which open in `$EDITOR`.
 use super::theme::Palette;
 use crate::{

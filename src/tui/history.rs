@@ -3,8 +3,9 @@ use super::{
     actions::ActionId,
     app::{App, Page},
     modal::{Choice, Modal, PickValue},
+    monitor::draw_run,
     theme::Palette,
-    widgets::{content, empty_state, kv, menu_key, textarea},
+    widgets::{content, empty_state, fit, kv, menu_key, textarea},
 };
 use crate::{
     adapters::OutputKind,
@@ -12,14 +13,14 @@ use crate::{
     history::{self, Criteria, Entry, Plan, StatusFilter},
     storage,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use crossterm::event::{KeyCode as Key, KeyEvent, KeyModifiers as Mods};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Cell, HighlightSpacing, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::{
     collections::HashMap,
@@ -43,12 +44,17 @@ const STATUSES: [(&str, &[StatusFilter]); 6] = [
     ("damaged", &[StatusFilter::Damaged]),
 ];
 
-/// The Runs page: saved runs of the project, filters, and selection.
+/// The Runs page: a sidebar of this session's runs, then the project's saved
+/// runs, beside the selected one. Session runs are selected by focusing them.
 pub(super) struct RunsPage {
     /// Saved runs as last read, newest first.
     pub(super) entries: Vec<Entry>,
     /// Index into the visible entries.
     pub(super) selected: usize,
+    /// The sidebar selects a saved run, not the focused run of this session.
+    pub(super) on_saved: bool,
+    /// IDs of this session's runs, which the saved list leaves out.
+    pub(super) open: Vec<String>,
     /// Saved runs are being read.
     pub(super) loading: bool,
     /// The list needs reading when the page is next shown.
@@ -68,6 +74,8 @@ impl Default for RunsPage {
         Self {
             entries: vec![],
             selected: 0,
+            on_saved: false,
+            open: vec![],
             loading: false,
             stale: true,
             loaded_at: None,
@@ -112,13 +120,16 @@ pub(super) struct Compare {
 }
 
 impl RunsPage {
-    /// Entries the filters show, newest first.
+    /// Saved entries the filters show, newest first, without this session's runs.
     pub(super) fn visible(&self) -> Vec<&Entry> {
         history::filter(
             &self.entries,
             STATUSES[self.status].1,
             &content(&self.filter),
         )
+        .into_iter()
+        .filter(|entry| !self.open.iter().any(|id| id == entry.id()))
+        .collect()
     }
     pub(super) fn selected_entry(&self) -> Option<Entry> {
         self.visible()
@@ -162,13 +173,61 @@ impl RunsPage {
 }
 
 impl App {
+    /// Whether the sidebar selects a saved run; always when this session has none.
+    pub(super) fn on_saved(&self) -> bool {
+        self.runs.on_saved || self.session.runs.is_empty()
+    }
+    /// Whether the focused run of this session is on screen.
+    pub(super) fn monitoring(&self) -> bool {
+        self.ui.page == Page::Runs && !self.on_saved()
+    }
+    /// Shows the focused run of this session on the Runs page.
+    pub(super) fn show_run(&mut self) {
+        self.ui.page = Page::Runs;
+        self.runs.on_saved = false;
+    }
+    /// Leaves this session's runs out of the saved list, keeping its selection.
+    pub(super) fn sync_runs(&mut self) {
+        let open: Vec<_> = self.session.runs.iter().map(|s| s.run.id.clone()).collect();
+        if open != self.runs.open {
+            let selected = self.runs.selected_id();
+            self.runs.open = open;
+            self.runs.reselect(selected);
+        }
+    }
+    /// The selected run's record: this session's copy, or the saved one.
+    fn selected_run(&mut self) -> Option<Run> {
+        if self.on_saved() {
+            let entry = self.runs.selected_entry()?;
+            self.load_run(&entry)
+        } else {
+            self.session.run().cloned()
+        }
+    }
     pub(super) fn perform_runs(&mut self, id: ActionId) -> Result<()> {
+        let saved = self.runs.visible().len();
         match id {
-            ActionId::NextRun => {
-                self.runs.selected =
-                    (self.runs.selected + 1).min(self.runs.visible().len().saturating_sub(1))
+            // One list: this session's runs, then saved ones.
+            ActionId::NextRun if self.on_saved() => {
+                self.runs.selected = (self.runs.selected + 1).min(saved.saturating_sub(1))
             }
-            ActionId::PreviousRun => self.runs.selected = self.runs.selected.saturating_sub(1),
+            ActionId::NextRun => {
+                if self.session.focus + 1 < self.session.runs.len() {
+                    self.session.focus += 1;
+                } else if saved > 0 {
+                    self.runs.on_saved = true;
+                    self.runs.selected = 0;
+                }
+            }
+            ActionId::PreviousRun if self.on_saved() => {
+                if self.runs.selected > 0 {
+                    self.runs.selected -= 1;
+                } else if !self.session.runs.is_empty() {
+                    self.runs.on_saved = false;
+                    self.session.focus = self.session.runs.len() - 1;
+                }
+            }
+            ActionId::PreviousRun => self.session.focus = self.session.focus.saturating_sub(1),
             ActionId::RefreshRuns => self.load_runs(),
             ActionId::FilterRuns => {
                 self.runs.filtering = true;
@@ -182,12 +241,7 @@ impl App {
             }
             ActionId::OpenRun => {
                 // A run of this session is already live; never load a stale copy.
-                let open = self
-                    .runs
-                    .selected_entry()
-                    .is_some_and(|entry| self.session.focus_run(entry.id()));
-                if open {
-                    self.ui.page = Page::Monitor;
+                if !self.on_saved() {
                     self.ui.message = "Run already open in this session.".into();
                 } else if let Some(run) = self
                     .runs
@@ -201,18 +255,15 @@ impl App {
                             slot.push_log(line);
                         }
                     }
-                    self.ui.page = Page::Monitor;
+                    self.sync_runs();
+                    self.show_run();
                     self.ui.message =
                         "Saved run loaded. c continues; y retries; t reopens its session; i retries interactively.".into();
                     self.reattach_detached();
                 }
             }
             ActionId::Rerun => {
-                if let Some(source) = self
-                    .runs
-                    .selected_entry()
-                    .and_then(|entry| self.load_run(&entry))
-                {
+                if let Some(source) = self.selected_run() {
                     let worktree = source.worktree;
                     self.ui.open(Modal::Confirm(Box::new(Confirm {
                         kind: Kind::Rerun {
@@ -224,15 +275,15 @@ impl App {
                 }
             }
             ActionId::CompareAttempts => {
-                if let Some(run) = self
-                    .runs
-                    .selected_entry()
-                    .and_then(|entry| self.load_run(&entry))
-                {
+                if let Some(run) = self.selected_run() {
                     self.compare_picker(&run);
                 }
             }
             ActionId::CleanUp => {
+                ensure!(
+                    self.on_saved(),
+                    "Close this run first ([x]); it then moves to Saved, where [D] removes it"
+                );
                 if let Some(entry) = self.runs.selected_entry() {
                     let id = entry.id().to_owned();
                     let plan = self.cleanup_plan(&id, false)?;
@@ -614,152 +665,283 @@ fn rerun_lines(source: &Run, worktree: bool, palette: Palette) -> Vec<Line<'stat
     lines
 }
 
-pub(super) fn draw_history(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
-    if app.runs.entries.is_empty() {
-        empty_state(
-            frame,
-            palette,
-            area,
-            palette.panel(" Saved runs "),
-            "No saved runs yet",
-            "Runs for this project are saved automatically. Start a workflow from Workflow [r].",
-        );
-        return;
+/// The Runs page: the sidebar, and the selected run beside it. Under 100
+/// columns a run of this session takes the whole width; the sidebar returns
+/// once a saved run is selected.
+pub(super) fn draw_runs(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
+    if area.width < 98 && !app.on_saved() {
+        return draw_run(frame, app, area, palette);
+    }
+    let side = (area.width / 3).clamp(22, 34);
+    let [sidebar, main] =
+        Layout::horizontal([Constraint::Length(side), Constraint::Min(1)]).areas(area);
+    draw_sidebar(frame, app, sidebar, palette);
+    let main = Rect {
+        x: main.x + 1,
+        width: main.width.saturating_sub(1),
+        ..main
+    };
+    if app.on_saved() {
+        draw_saved(frame, app, main, palette);
+    } else {
+        draw_run(frame, app, main, palette);
+    }
+}
+
+/// A sidebar title: the task's first line, else the workflow's name.
+fn title(task: &str, workflow: &str) -> String {
+    let line = history::excerpt(task);
+    if line.is_empty() {
+        workflow.to_owned()
+    } else {
+        line
+    }
+}
+
+/// This session's runs, then the saved ones, two lines each.
+fn draw_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
+    let block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(palette.line));
+    let mut inner = block.inner(area);
+    frame.render_widget(block, area);
+    if app.runs.filtering {
+        let [field, rest] =
+            Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(inner);
+        draw_filter(frame, app, field, palette);
+        inner = rest;
+    }
+    let width = usize::from(inner.width.saturating_sub(4));
+    let muted = Style::default().fg(palette.muted);
+    let heading = |text: String| ListItem::new(Line::styled(text, palette.header_style()));
+    let item = |glyph: Span<'static>, title: &str, sub: Span<'static>| {
+        ListItem::new(vec![
+            Line::from(vec![
+                glyph,
+                Span::raw(" "),
+                Span::styled(fit(title, width), Style::default().fg(palette.fg)),
+            ]),
+            Line::from(vec![Span::raw("  "), sub]),
+        ])
+    };
+    let status_glyph = |status| {
+        Span::styled(
+            Palette::status_glyph(status),
+            Style::default().fg(palette.status_color(status)),
+        )
+    };
+    let mut items = vec![];
+    let mut selected = None;
+    if !app.session.runs.is_empty() {
+        items.push(heading("This session".into()));
+        for (slot, focused) in app.session.slots() {
+            let run = &slot.run;
+            if focused && !app.on_saved() {
+                selected = Some(items.len());
+            }
+            let warn = Style::default().fg(palette.warn);
+            let (glyph, sub) = if slot.needs_input() {
+                (
+                    Span::styled("◆", warn),
+                    Span::styled(format!("needs you · {}", run.current_name()), warn),
+                )
+            } else if slot.in_progress() {
+                (
+                    status_glyph(run.status),
+                    Span::styled(
+                        format!("{} · {}", run.status.label(), run.current_name()),
+                        muted,
+                    ),
+                )
+            } else {
+                (
+                    status_glyph(run.status),
+                    Span::styled(
+                        format!("{} · {}", run.status.label(), run.workflow.name),
+                        muted,
+                    ),
+                )
+            };
+            let sub = Span::styled(fit(&sub.content, width), sub.style);
+            items.push(item(glyph, &title(&run.task, &run.workflow.name), sub));
+        }
+        items.push(ListItem::new(""));
     }
     let visible = app.runs.visible();
-    let mut title = String::from("Saved runs");
+    let mut head = if app.runs.loading && app.runs.entries.is_empty() {
+        "Saved · loading…".to_owned()
+    } else {
+        format!("Saved · {}", visible.len())
+    };
     if app.runs.status > 0 {
-        title.push_str(&format!(" · {}", STATUSES[app.runs.status].0));
+        head.push_str(&format!(" {}", STATUSES[app.runs.status].0));
     }
     let search = content(&app.runs.filter);
     if !search.trim().is_empty() && !app.runs.filtering {
-        title.push_str(&format!(
-            " · “{}”",
-            storage::truncate(search.trim(), 24)
-                .lines()
-                .next()
-                .unwrap_or("")
-        ));
+        head.push_str(&format!(" “{}”", fit(search.trim(), 12)));
     }
-    title.push_str(&format!(
-        " · {} of {} runs",
-        visible.len(),
-        app.runs.entries.len()
-    ));
-    let block = palette.panel_with(&title, &[("Enter", "open")]);
-    let outer = area;
-    let mut area = block.inner(outer);
-    frame.render_widget(block, outer);
-    if app.runs.filtering {
-        let rows = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),
-        ])
-        .split(area);
-        let hint = if let Some(mode) = app.runs.filter.mode_hint() {
-            Line::styled(mode, Style::default().fg(palette.accent))
-        } else {
-            palette.hints(&[("Enter", "keep"), ("Esc", "clear")])
-        };
-        let cols = Layout::horizontal([
-            Constraint::Length(2),
-            Constraint::Min(8),
-            Constraint::Length(hint.width() as u16 + 1),
-        ])
-        .split(rows[0]);
-        frame.render_widget(
-            Span::styled(
-                "/ ",
-                Style::default()
-                    .fg(palette.accent)
-                    .add_modifier(Modifier::BOLD),
+    items.push(heading(head));
+    for (index, entry) in visible.iter().enumerate() {
+        if app.on_saved() && index == app.runs.selected.min(visible.len() - 1) {
+            selected = Some(items.len());
+        }
+        let started = entry
+            .created_at()
+            .map_or_else(|| "–".into(), |time| time.format("%b %d %H:%M").to_string());
+        items.push(match entry {
+            Entry::Summary(run) => item(
+                status_glyph(run.status),
+                &title(&run.task, &run.workflow),
+                Span::styled(
+                    fit(&format!("{started} · {}", run.status.label()), width),
+                    muted,
+                ),
             ),
-            cols[0],
-        );
-        let mut field = app.runs.filter.clone();
-        palette.style_textarea(&mut field);
-        frame.render_widget(&field, cols[1]);
-        frame.render_widget(Paragraph::new(hint).right_aligned(), cols[2]);
-        area = rows[2];
+            Entry::Damaged { id, .. } => {
+                let red = Style::default().fg(palette.red);
+                item(
+                    Span::styled("✗", red),
+                    id,
+                    Span::styled(format!("{started} · damaged"), red),
+                )
+            }
+        });
     }
-    if visible.is_empty() {
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::styled(
-                    "No runs match",
-                    Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
-                ),
-                Line::styled(
-                    "[/] then [Esc] clears the filter; [f] changes the status filter.",
-                    Style::default().fg(palette.muted),
-                ),
-            ])
-            .centered()
-            .wrap(Wrap { trim: true }),
-            area,
-        );
-        return;
+    if visible.is_empty() && !app.runs.loading {
+        let none = if app.runs.entries.is_empty() {
+            "  none yet"
+        } else {
+            "  none match"
+        };
+        items.push(ListItem::new(Line::styled(none, muted)));
     }
-    let muted = Style::default().fg(palette.muted);
-    let rows: Vec<_> = {
-        let sizes = app.runs.sizes.lock().ok();
-        visible
-            .iter()
-            .map(|entry| {
-                let size = sizes
-                    .as_ref()
-                    .and_then(|sizes| sizes.get(entry.id()))
-                    .map_or_else(|| "…".into(), |bytes| history::human(*bytes));
-                let started = entry.created_at().map_or_else(
-                    || "–".into(),
-                    |time| time.format("%b %d  %H:%M").to_string(),
-                );
-                let (status, workflow, task) = match entry {
-                    Entry::Summary(run) => (
-                        Cell::from(palette.status_span(run.status)),
-                        Cell::from(run.workflow.clone()),
-                        Cell::from(run.task.clone()).style(muted),
-                    ),
-                    Entry::Damaged { id, error, .. } => (
-                        Cell::from(Span::styled("✗ damaged", Style::default().fg(palette.red))),
-                        Cell::from(id.clone()),
-                        Cell::from(storage::clean_terminal(error))
-                            .style(Style::default().fg(palette.red)),
-                    ),
-                };
-                Row::new([
-                    Cell::from(started).style(muted),
-                    status,
-                    Cell::from(size).style(muted),
-                    workflow,
-                    task,
-                ])
-            })
-            .collect()
-    };
     frame.render_stateful_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Length(14),
-                Constraint::Length(18),
-                Constraint::Length(9),
-                Constraint::Fill(1),
-                Constraint::Fill(2),
-            ],
-        )
-        .header(
-            Row::new(["STARTED", "STATUS", "SIZE", "WORKFLOW", "TASK"])
-                .style(palette.header_style())
-                .bottom_margin(1),
-        )
-        .highlight_symbol("▌")
-        .highlight_spacing(HighlightSpacing::Always)
-        .row_highlight_style(palette.selected_style()),
-        area,
-        &mut TableState::default().with_selected(Some(app.runs.selected.min(visible.len() - 1))),
+        List::new(items)
+            .highlight_symbol("▌")
+            .highlight_spacing(HighlightSpacing::Always)
+            .highlight_style(palette.selected_style()),
+        inner,
+        &mut ListState::default().with_selected(selected),
     );
+}
+
+/// The filter field above the sidebar while it has focus.
+fn draw_filter(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
+    let [field, hint] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+    let [label, input] =
+        Layout::horizontal([Constraint::Length(2), Constraint::Min(4)]).areas(field);
+    let accent = Style::default().fg(palette.accent);
+    frame.render_widget(
+        Span::styled("F ", accent.add_modifier(Modifier::BOLD)),
+        label,
+    );
+    let mut text = app.runs.filter.clone();
+    palette.style_textarea(&mut text);
+    frame.render_widget(&text, input);
+    let hint_line = match app.runs.filter.mode_hint() {
+        Some(mode) => Line::styled(mode, accent),
+        None => palette.hints(&[("Enter", "keep"), ("Esc", "clear")]),
+    };
+    frame.render_widget(Paragraph::new(hint_line), hint);
+}
+
+/// What a saved run was, and what opening it here offers.
+fn draw_saved(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
+    let Some(entry) = app.runs.selected_entry() else {
+        let (head, body) = if app.runs.entries.is_empty() {
+            (
+                "No runs yet",
+                "Runs for this project are saved automatically. Write a task on Workflow [1], then [r] runs it.",
+            )
+        } else {
+            (
+                "No saved runs match",
+                "[F] then [Esc] clears the filter; [s] changes which statuses show.",
+            )
+        };
+        empty_state(frame, palette, area, Block::default(), head, body);
+        return;
+    };
+    let size = app
+        .runs
+        .sizes
+        .lock()
+        .ok()
+        .and_then(|sizes| sizes.get(entry.id()).copied())
+        .map_or_else(|| "…".into(), history::human);
+    let started = entry.created_at().map_or_else(
+        || "–".into(),
+        |time| time.format("%b %d %Y  %H:%M").to_string(),
+    );
+    let fg = Style::default().fg(palette.fg);
+    let red = Style::default().fg(palette.red);
+    let mut lines = vec![];
+    match &entry {
+        Entry::Summary(run) => {
+            lines.push(Line::from(vec![
+                Span::styled(run.workflow.clone(), fg.add_modifier(Modifier::BOLD)),
+                Span::raw("   "),
+                palette.status_span(run.status),
+            ]));
+            lines.push(Line::raw(""));
+            lines.push(kv(palette, "Started", &started, true));
+            lines.push(kv(
+                palette,
+                "Stages",
+                &format!(
+                    "{} of {} complete · {} attempts",
+                    run.complete_stages, run.enabled_stages, run.attempts
+                ),
+                true,
+            ));
+            lines.push(kv(palette, "Size", &size, true));
+            lines.push(kv(
+                palette,
+                "Worktree",
+                if run.worktree { "yes" } else { "no" },
+                run.worktree,
+            ));
+            if let Some(source) = &run.rerun_of {
+                lines.push(kv(palette, "Rerun of", source, true));
+            }
+            lines.push(kv(palette, "ID", &run.id, true));
+            if let Some(error) = &run.error {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(storage::clean_terminal(error), red));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::styled("Task", palette.header_style()));
+            lines.push(Line::styled(run.task.clone(), fg));
+            lines.push(Line::raw(""));
+            lines.push(palette.hints(&[
+                ("Enter", "open here"),
+                ("n", "rerun"),
+                ("=", "compare attempts"),
+                ("D", "remove"),
+            ]));
+        }
+        Entry::Damaged { id, error, .. } => {
+            lines.push(Line::styled(
+                "Damaged run record",
+                red.add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(storage::clean_terminal(error), red));
+            lines.push(Line::raw(""));
+            lines.push(kv(palette, "Started", &started, true));
+            lines.push(kv(palette, "ID", id, true));
+            lines.push(kv(
+                palette,
+                "Path",
+                &entry.dir(&app.project).display().to_string(),
+                true,
+            ));
+            lines.push(Line::raw(""));
+            lines.push(palette.hints(&[("D", "preview removing it")]));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 #[cfg(test)]
@@ -890,34 +1072,34 @@ mod tests {
         create(project.path(), &settings, "Write the docs");
         fs::create_dir_all(project.path().join(".model-router/runs/broken")).unwrap();
         let mut app = app(project.path(), settings);
-        press(&mut app, "3");
+        press(&mut app, "2");
         assert_eq!(app.runs.entries.len(), 3);
         press(&mut app, "jjj");
         assert_eq!(app.runs.selected, 2);
-        assert!(shows(&mut app, "Saved runs · 3 of 3 runs"));
+        assert!(shows(&mut app, "Saved · 3"));
 
-        press(&mut app, "/docs");
+        press(&mut app, "Fdocs");
         assert!(app.runs_filtering());
         assert_eq!(app.runs.visible().len(), 1);
         assert_eq!(app.runs.selected, 0);
         // Action keys type into the field while it has focus.
         assert_eq!(app.ui.page, Page::Runs);
-        assert!(shows(&mut app, "1 of 3 runs"));
+        assert!(shows(&mut app, "Saved · 1"));
         app.key(key(Key::Esc)).unwrap();
         assert!(!app.runs_filtering());
         assert_eq!(app.runs.visible().len(), 3);
 
-        press(&mut app, "/parser");
+        press(&mut app, "Fparser");
         app.key(key(Key::Enter)).unwrap();
         assert!(!app.runs_filtering());
         assert_eq!(app.runs.visible()[0].id(), failed.id);
-        assert!(shows(&mut app, "“parser” · 1 of 3 runs"));
-        press(&mut app, "/");
+        assert!(shows(&mut app, "Saved · 1 “parser”"));
+        press(&mut app, "F");
         app.key(key(Key::Esc)).unwrap();
 
         let mut seen = vec![];
         for _ in 0..STATUSES.len() {
-            press(&mut app, "f");
+            press(&mut app, "s");
             let visible = app.runs.visible();
             assert!(app.runs.selected <= visible.len().saturating_sub(1));
             seen.push((STATUSES[app.runs.status].0, visible.len()));
@@ -933,9 +1115,44 @@ mod tests {
                 ("all", 3)
             ]
         );
-        press(&mut app, "ff");
-        assert!(shows(&mut app, "No runs match"));
-        assert!(shows(&mut app, "Saved runs · complete · 0 of 3 runs"));
+        press(&mut app, "ss");
+        assert!(shows(&mut app, "No saved runs match"));
+        assert!(shows(&mut app, "Saved · 0 complete"));
+    }
+
+    #[test]
+    fn sidebar_moves_from_session_runs_into_saved_ones() {
+        let project = tempfile::tempdir().unwrap();
+        let settings = settings("test-model");
+        let older = create(project.path(), &settings, "Older work");
+        let open = create(project.path(), &settings, "Open work");
+        let mut app = app(project.path(), settings);
+        app.session
+            .adopt(engine::load(project.path(), &open.id).unwrap());
+        press(&mut app, "2");
+        // The open run is selected, and Saved leaves it out.
+        assert!(!app.on_saved());
+        assert_eq!(app.runs.visible().len(), 1);
+        let text = screen(&mut app, 120, 30).join("\n");
+        assert!(
+            text.contains("This session") && text.contains("Saved · 1"),
+            "{text}"
+        );
+        press(&mut app, "j");
+        assert!(app.on_saved());
+        assert_eq!(app.runs.selected_entry().unwrap().id(), older.id);
+        assert!(shows(&mut app, "Older work"));
+        // At 80 columns the sidebar shows while a saved run is selected...
+        assert!(screen(&mut app, 80, 24).join("\n").contains("Saved · 1"));
+        press(&mut app, "k");
+        assert!(!app.on_saved());
+        assert_eq!(app.session.run().unwrap().id, open.id);
+        // ...and a run of this session gets the whole width.
+        assert!(!screen(&mut app, 80, 24).join("\n").contains("Saved · 1"));
+        // Closing it here moves it back to Saved.
+        press(&mut app, "x");
+        assert!(app.on_saved() && app.session.run().is_none());
+        assert_eq!(app.runs.visible().len(), 2);
     }
 
     #[test]
@@ -947,8 +1164,8 @@ mod tests {
         fs::create_dir_all(&broken).unwrap();
         fs::write(broken.join("run.json"), "{oops").unwrap();
         let mut app = app(project.path(), settings("test-model"));
-        press(&mut app, "3");
-        assert!(shows(&mut app, "✗ damaged"));
+        press(&mut app, "2");
+        assert!(shows(&mut app, "Damaged run record"));
         app.key(key(Key::Enter)).unwrap();
         settle(&mut app);
         assert!(app.session.run().is_none());
@@ -972,7 +1189,7 @@ mod tests {
         let mut source = create(project.path(), &settings, "Port the parser\nDetails");
         assert_eq!(drive(&mut source), Action::Complete);
         let mut app = app(project.path(), settings);
-        press(&mut app, "3n");
+        press(&mut app, "2n");
         assert!(matches!(app.ui.dialog(), Some(Modal::Confirm(_))));
         assert!(shows(&mut app, "Rerun as a new run"));
         assert!(shows(&mut app, "research · mock / test-model · unattended"));
@@ -988,7 +1205,7 @@ mod tests {
         assert!(app.starting, "The run is created in the background");
         settle(&mut app);
         assert!(app.session.running());
-        assert_eq!(app.ui.page, Page::Monitor);
+        assert_eq!(app.ui.page, Page::Runs);
         let deadline = Instant::now() + Duration::from_secs(20);
         while app.session.running() && Instant::now() < deadline {
             app.poll().unwrap();
@@ -1012,7 +1229,7 @@ mod tests {
         let mut once = create(project.path(), &settings, "Single attempt");
         assert_eq!(drive(&mut once), Action::Complete);
         let mut app = app(project.path(), settings);
-        press(&mut app, "3c");
+        press(&mut app, "2=");
         assert!(app.ui.dialog().is_none());
         assert!(
             app.ui.message.contains("two attempts"),
@@ -1021,7 +1238,7 @@ mod tests {
         );
         press(&mut app, "j");
         assert_eq!(app.runs.selected_entry().unwrap().id(), retried.id);
-        press(&mut app, "c");
+        press(&mut app, "=");
         match app.ui.dialog() {
             Some(Modal::Picker { items, .. }) => {
                 assert_eq!(items[0].label, "research · attempt 1 vs 2");
@@ -1047,7 +1264,7 @@ mod tests {
         assert_eq!(drive(&mut run), Action::Complete);
         let kept = create(project.path(), &settings, "Newer work");
         let mut app = app(project.path(), settings);
-        press(&mut app, "3j");
+        press(&mut app, "2j");
         assert_eq!(app.runs.selected_entry().unwrap().id(), run.id);
         press(&mut app, "D");
         assert!(matches!(app.ui.dialog(), Some(Modal::Confirm(_))));
@@ -1067,18 +1284,14 @@ mod tests {
         assert_eq!(app.runs.entries.len(), 1);
         assert_eq!(app.runs.selected, 0);
 
-        // The run open in the monitor stays.
+        // A run open in this session leaves Saved, and D refuses it.
         app.session
             .adopt(engine::load(project.path(), &kept.id).unwrap());
-        press(&mut app, "D");
-        app.key(key(Key::Enter)).unwrap();
-        settle(&mut app);
-        assert!(kept.directory.exists());
-        assert!(
-            app.ui.message.contains("Open in the monitor"),
-            "{}",
-            app.ui.message
-        );
+        app.show_run();
+        let error = app.key(key(Key::Char('D'))).unwrap_err().to_string();
+        assert!(error.contains("Close this run first"), "{error}");
+        assert!(app.ui.dialog().is_none() && kept.directory.exists());
+        assert!(app.runs.visible().is_empty());
     }
 
     #[test]
@@ -1092,7 +1305,7 @@ mod tests {
         log.push_str("\x1b[31mfinal line\x1b[0m\n");
         fs::write(attempt.directory.join("stdout.log"), log).unwrap();
         let mut app = app(project.path(), settings);
-        press(&mut app, "3");
+        press(&mut app, "2");
         app.key(key(Key::Enter)).unwrap();
         let logs: Vec<_> = app.slot().logs.iter().cloned().collect();
         assert_eq!(logs[0], "── research · attempt 1 · saved output ──");
@@ -1108,7 +1321,7 @@ mod tests {
         let settings = settings("test-model");
         let run = create(project.path(), &settings, "Sized");
         let mut app = app(project.path(), settings);
-        press(&mut app, "3");
+        press(&mut app, "2");
         let deadline = Instant::now() + Duration::from_secs(5);
         while app.runs.sizes.lock().unwrap().is_empty() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
@@ -1121,7 +1334,7 @@ mod tests {
         assert!(shows(&mut app, &history::human(bytes)));
         let lines = screen(&mut app, 80, 24);
         let footer = &lines[23];
-        assert!(footer.contains("[↑↓] select"), "{footer}");
+        assert!(footer.contains("[↑↓] runs"), "{footer}");
         assert!(footer.contains("[Space] menu"), "{footer}");
     }
 }

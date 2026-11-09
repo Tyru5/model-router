@@ -114,7 +114,7 @@ rather than gates.
   `clean` removes the run (candidate worktrees with force: they are the
   router's own).
 - A crash marks running candidates failed, never retried silently.
-  `resume --retry-candidate STAGE/ID` or Monitor `Y` (`Cmd::RetryCandidate`) reruns one
+  `resume --retry-candidate STAGE/ID` or `Y` on the Runs page (`Cmd::RetryCandidate`) reruns one
   stopped candidate of a stopped fan-out stage in a new round with the same
   base; the others keep their results. Retrying the stage reruns all.
 
@@ -279,7 +279,7 @@ API clients, automatic task classification, and embedded IDE control are exclude
   from user overrides, router-provider `/models` prices (cached at most daily;
   failures non-fatal), or a dated built-in estimate table, else unknown.
   Interactive Claude Code and Codex stages read tokens from their native
-  session logs, best effort. The Monitor header shows the running total;
+  session logs, best effort. The run header shows the running total;
   `cost` aggregates history by harness and model.
 - Optional workflow and stage budgets (`max_usd`, `max_tokens`). After each
   attempt, known cost or counted tokens over a cap block the run before its

@@ -61,7 +61,7 @@ def main():
                 lambda: "ready in its native terminal" in terminal.text(),
                 "Interactive stage was not announced",
             )
-            assert "1 Workflow" in terminal.text() and "Monitor ●1" in terminal.text()
+            assert "1 Workflow" in terminal.text() and "Runs ●1" in terminal.text()
             terminal.send("2")
             terminal.send("i", settle="quiet")
             terminal.wait_for(
@@ -104,17 +104,16 @@ def main():
                 in (project / ".model-router/mock/implementation.prompt").read_text()
             )
             terminal.snapshot("completed.txt")
-            terminal.send("3")
-            # Runs load in the background; wait for the row before opening it.
+            # The sidebar lists the run under this session, not Saved.
             terminal.wait_for(
                 lambda: (
-                    "complete" in terminal.text().split("Runs", 1)[-1]
-                    and "Loading" not in terminal.text()
+                    "This session" in terminal.text()
+                    and "complete · Offline demo" in terminal.text()
                 ),
-                "Runs page did not list the run",
+                "Runs sidebar did not list the session's run",
             )
             terminal.send("\r")
-            # The run is still in this session, so Runs focuses it.
+            # The run is still in this session, so Enter keeps it.
             terminal.wait_for(
                 lambda: "Run already open in this session" in terminal.text(),
                 "History did not focus the session's run",

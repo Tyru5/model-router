@@ -453,7 +453,7 @@ mod tests {
     fn page_checks_in_background_and_shows_doctor_columns() {
         let mut app = app();
         let palette = app.ui.palette();
-        press(&mut app, KeyCode::Char('4'));
+        press(&mut app, KeyCode::Char('3'));
         assert!(app.harnesses.checks.checking);
         let (text, _) = render(&mut app, 80, "checking…");
         assert!(
@@ -495,7 +495,7 @@ mod tests {
     #[test]
     fn details_list_capabilities_notes_and_auth() {
         let mut app = app();
-        press(&mut app, KeyCode::Char('4'));
+        press(&mut app, KeyCode::Char('3'));
         press(&mut app, KeyCode::Enter);
         let Some(super::super::modal::Modal::Text { body, .. }) = app.ui.dialog() else {
             panic!("details did not open");

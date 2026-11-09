@@ -1,6 +1,6 @@
 # Themes
 
-Press **T** (Shift+T) on Workflow, Monitor, Runs, or Harnesses to open the theme
+Press **T** (Shift+T) on Workflow, Runs, or Harnesses to open the theme
 picker. Type a name or `light` / `dark` to filter. Arrow keys and **Ctrl+N/P**
 preview the highlighted theme immediately, including the page behind the picker.
 **Enter** saves it. **Esc** discards the preview and restores the saved theme.

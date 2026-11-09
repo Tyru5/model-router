@@ -601,7 +601,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         );
         app.session.adopt(run);
-        app.ui.page = Page::Monitor;
+        app.ui.page = Page::Runs;
         app
     }
 

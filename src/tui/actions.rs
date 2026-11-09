@@ -50,8 +50,6 @@ pub(super) enum ActionId {
     // Monitor
     CancelStage,
     TakeOver,
-    PreviousSessionRun,
-    NextSessionRun,
     CloseRun,
     Advance,
     Continue,
@@ -70,7 +68,6 @@ pub(super) enum ActionId {
     OpenLog,
     Diff,
     ToggleResults,
-    BackToWorkflow,
     // Runs
     PreviousRun,
     NextRun,
@@ -90,7 +87,6 @@ pub(super) enum ActionId {
     Menu,
     NextView,
     ShowWorkflow,
-    ShowMonitor,
     ShowRuns,
     ShowHarnesses,
     Themes,
@@ -107,15 +103,18 @@ pub(super) enum ActionId {
 }
 
 /// Where an action applies. The app is always in one concrete scope: a page,
-/// with Monitor split by whether a run is active.
+/// with Runs split by what its sidebar selects: a saved run (`Runs`), or a
+/// run of this session that is driving (`MonitorRunning`) or idle
+/// (`MonitorIdle`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Scope {
     Global,
     Workflow,
-    /// Monitor, running or idle.
+    /// A run of this session is selected, running or idle.
     Monitor,
     MonitorRunning,
     MonitorIdle,
+    /// The Runs page, whatever its sidebar selects.
     Runs,
     Harnesses,
 }
@@ -123,15 +122,16 @@ pub(super) enum Scope {
 impl Scope {
     /// Whether actions in `self` apply in the concrete scope `here`.
     pub(super) fn covers(self, here: Scope) -> bool {
+        let monitoring = matches!(here, Self::MonitorRunning | Self::MonitorIdle);
         self == here
             || self == Self::Global
-            || (self == Self::Monitor && matches!(here, Self::MonitorRunning | Self::MonitorIdle))
+            || (matches!(self, Self::Monitor | Self::Runs) && monitoring)
     }
 
     fn heading(self) -> &'static str {
         match self {
             Self::Workflow => "WORKFLOW",
-            Self::Monitor | Self::MonitorRunning | Self::MonitorIdle => "MONITOR",
+            Self::Monitor | Self::MonitorRunning | Self::MonitorIdle => "SELECTED RUN",
             Self::Runs => "RUNS",
             Self::Harnesses => "HARNESSES",
             Self::Global => "EVERYWHERE",
@@ -330,9 +330,7 @@ const ACTIONS: &[Entry] = {
         act(TakeOver, Monitor, ch('t'), "terminal", "Attach to the live interactive terminal, or reopen the stage's saved session (an unattended stage stops first; [y] confirms)")
             .footer_in(&[MonitorRunning])
             .menu(RunMenu, 't'),
-        act(PreviousSessionRun, Monitor, ch('['), "runs", "Show the previous run of this session").alias("[ ]").footer_in(&[MonitorRunning]),
-        act(NextSessionRun, Monitor, ch(']'), "runs", "Show the next run of this session").alias("[ ]").footer_in(&[MonitorRunning]),
-        act(CloseRun, MonitorIdle, ch('x'), "close", "Close this run in the session; its files stay and Runs [3] reopens it").menu(RunMenu, 'x'),
+        act(CloseRun, MonitorIdle, ch('x'), "close", "Close this run in the session; its files stay and it moves to Saved").menu(RunMenu, 'x'),
         act(Advance, MonitorIdle, ch('a'), "advance", "Accept handoff and advance; also accepts a test stage's not-applicable waiver").footer().menu(RunMenu, 'a'),
         act(Continue, MonitorIdle, ch('c'), "continue", "Continue the run when idle (not in the moment a stage stops)").footer().menu(RunMenu, 'c'),
         act(Retry, MonitorIdle, ch('y'), "retry", "Explicitly retry current stage").footer().menu(RunMenu, 'y'),
@@ -364,20 +362,19 @@ const ACTIONS: &[Entry] = {
             .footer()
             .menu(View, 'd'),
         act(ToggleResults, MonitorIdle, ch('o'), "output", "Switch a finished run between results and output log").menu(View, 'o'),
-        act(BackToWorkflow, MonitorIdle, ch('n'), "workflow", "Return to workflow editor"),
-        // Runs
-        act(PreviousRun, Runs, key(KeyCode::Up), "select", "Select previous run").also(&[ch('k')]).alias("↑↓").footer(),
-        act(NextRun, Runs, key(KeyCode::Down), "select", "Select next run").also(&[ch('j')]).alias("↑↓").footer(),
-        act(OpenRun, Runs, key(KeyCode::Enter), "open", "Open selected run in the monitor (damaged: show its error)").footer().menu(RunMenu, 'o'),
+        // Runs: the sidebar, whatever it selects
+        act(PreviousRun, Runs, key(KeyCode::Up), "runs", "Select the previous run in the sidebar").also(&[ch('k')]).alias("↑↓").footer(),
+        act(NextRun, Runs, key(KeyCode::Down), "runs", "Select the next run in the sidebar").also(&[ch('j')]).alias("↑↓").footer(),
+        act(OpenRun, Runs, key(KeyCode::Enter), "open", "Open the selected saved run here (damaged: show its error)").footer_in(&[Runs]).menu(RunMenu, 'o'),
         act(RefreshRuns, Runs, ch('r'), "refresh", "Reload saved runs and sizes").menu(View, 'r'),
-        act(FilterRuns, Runs, ch('/'), "filter", "Filter by ID, workflow, task, or status")
+        act(FilterRuns, Runs, ch('F'), "filter", "Filter saved runs by ID, workflow, task, or status")
             .more(&["Type to filter; [Enter] keeps it; [Esc] clears it"])
-            .footer()
-            .menu(View, '/'),
-        act(CycleStatus, Runs, ch('f'), "status", "Cycle status: all, active, complete, failed/blocked, cancelled, damaged").footer().menu(View, 'f'),
-        act(Rerun, Runs, ch('n'), "rerun", "Rerun as a new run from the saved snapshot (confirm first)").footer().menu(RunMenu, 'n'),
-        act(CompareAttempts, Runs, ch('c'), "compare", "Compare two attempts of a stage").menu(View, 'c'),
-        act(CleanUp, Runs, ch('D'), "clean", "Preview removing the run and its artifacts ([y] confirms)").menu(RunMenu, 'D'),
+            .footer_in(&[Runs])
+            .menu(View, 'F'),
+        act(CycleStatus, Runs, ch('s'), "status", "Cycle the saved runs shown: all, active, complete, failed/blocked, cancelled, damaged").footer_in(&[Runs]).menu(View, 's'),
+        act(Rerun, Runs, ch('n'), "rerun", "Rerun the selected run as a new run from its saved snapshot (confirm first)").footer_in(&[Runs]).menu(RunMenu, 'n'),
+        act(CompareAttempts, Runs, ch('='), "compare", "Compare two attempts of a stage of the selected run").menu(View, 'c'),
+        act(CleanUp, Runs, ch('D'), "clean", "Preview removing the selected saved run and its artifacts ([y] confirms)").menu(RunMenu, 'D'),
         // Harnesses
         act(PreviousHarness, Harnesses, key(KeyCode::Up), "select", "Select previous harness").also(&[ch('k')]).alias("↑↓").footer(),
         act(NextHarness, Harnesses, key(KeyCode::Down), "select", "Select next harness").also(&[ch('j')]).alias("↑↓").footer(),
@@ -388,9 +385,8 @@ const ACTIONS: &[Entry] = {
             .more(&["[Backspace] returns to the groups; [Esc] closes"]),
         act(NextView, Global, key(KeyCode::Tab), "switch view", "Switch to the next view"),
         act(ShowWorkflow, Global, ch('1'), "workflow", "Show Workflow").menu(Go, 'w'),
-        act(ShowMonitor, Global, ch('2'), "monitor", "Show Monitor").menu(Go, 'm'),
-        act(ShowRuns, Global, ch('3'), "runs", "Show Runs (reloads saved runs)").menu(Go, 'r'),
-        act(ShowHarnesses, Global, ch('4'), "harnesses", "Show Harnesses").menu(Go, 'h'),
+        act(ShowRuns, Global, ch('2'), "runs", "Show Runs: this session's runs and saved ones (reloads saved runs)").menu(Go, 'r'),
+        act(ShowHarnesses, Global, ch('3'), "harnesses", "Show Harnesses").menu(Go, 'h'),
         act(Themes, Global, ch('T'), "themes", "Choose theme (type to filter; [↑↓] or [Ctrl+N/P] preview)")
             .more(&["[Enter] saves for all projects; [Esc] restores the current theme"])
             .menu(View, 'T'),
@@ -417,7 +413,7 @@ const ACTIONS: &[Entry] = {
 const GUIDE_NOTES: &str = "INTERACTIVE HARNESS
 \tNative terminal keys and paste are forwarded.
 \tExit the harness to inspect its handoff; /exit quits, not detaches.
-Ctrl+B\tDetach to Monitor; the session keeps running. [t] reattaches.
+Ctrl+B\tDetach to Runs; the session keeps running. [t] reattaches.
 \t[q] can leave it running after mr exits; the next mr reattaches.
 Ctrl+]\tStop a stuck stage
 
@@ -502,7 +498,13 @@ pub(super) fn menu_action(here: Scope, group: Group, letter: char) -> Option<Act
 /// The keyboard guide in `guide_text` format: every action under its page.
 pub(super) fn guide() -> String {
     let mut text = String::new();
-    for heading in ["WORKFLOW", "MONITOR", "RUNS", "HARNESSES", "EVERYWHERE"] {
+    for heading in [
+        "WORKFLOW",
+        "RUNS",
+        "SELECTED RUN",
+        "HARNESSES",
+        "EVERYWHERE",
+    ] {
         text.push_str(heading);
         text.push('\n');
         for entry in ACTIONS.iter().filter(|e| e.scope.heading() == heading) {

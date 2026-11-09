@@ -2,7 +2,7 @@
 //! the session runs dialog (`L`), jumping to a run that needs input (`N`),
 //! and the notifications dialog (`F9`).
 use super::{
-    app::{App, Page},
+    app::App,
     modal::{Ask, DialogResult, InputTarget, Modal},
     run_slot::RunSlot,
     theme::{self, Palette},
@@ -35,7 +35,7 @@ pub(super) struct Notice {
 }
 
 /// The runs started or opened in this session, in start order. Each keeps
-/// going while another is focused; the Monitor shows the focused one.
+/// going while another is focused; the Runs page shows the focused one.
 #[derive(Default)]
 pub(super) struct Session {
     pub(super) runs: Vec<RunSlot>,
@@ -122,18 +122,6 @@ impl Session {
         if index < self.runs.len() {
             self.focus = index;
         }
-    }
-    /// Focuses the next or previous run, wrapping.
-    pub(super) fn cycle_focus(&mut self, forward: bool) {
-        let total = self.runs.len();
-        if total < 2 {
-            return;
-        }
-        self.focus = if forward {
-            (self.focus + 1) % total
-        } else {
-            (self.focus + total - 1) % total
-        };
     }
     /// Focuses the slot holding run `id`; false when none does.
     pub(super) fn focus_run(&mut self, id: &str) -> bool {
@@ -260,7 +248,7 @@ impl App {
         self.text("Notices · newest first · [Esc] closes", body);
     }
     /// Focuses the next run (after the focused one, wrapping) that needs
-    /// input and shows it in the Monitor.
+    /// input and shows it on the Runs page.
     pub(super) fn jump_to_input(&mut self) {
         let runs = &self.session.runs;
         let total = runs.len();
@@ -273,7 +261,7 @@ impl App {
             return;
         };
         self.session.focus(index);
-        self.ui.page = Page::Monitor;
+        self.show_run();
         self.ui.message = self.focus_message();
     }
     /// The status line after focusing a run from the list.
@@ -319,7 +307,7 @@ impl App {
             Key::Down | Key::Char('j') => *selected = (*selected + 1).min(total.saturating_sub(1)),
             Key::Enter if *selected < total => {
                 self.session.focus(*selected);
-                self.ui.page = Page::Monitor;
+                self.show_run();
                 self.ui.message = self.focus_message();
                 return DialogResult::Close;
             }

@@ -132,7 +132,7 @@ validated handoff natively. Other harnesses write a handoff file or a
 
 ## Takeover
 
-`t` in the Monitor reopens a stage's session in the native terminal:
+`t` on the Runs page reopens a stage's session in the native terminal:
 
 | Harness | Session source | Reopened with |
 | --- | --- | --- |

@@ -45,7 +45,7 @@ cd /path/to/project && mr
 1. `p` picks a repository (or start `mr` inside one).
 2. `t` writes the task (`Ctrl+S` applies), or `f` imports a file, URL, or GitHub issue.
 3. Check the stages; `e` edits one, `m` picks its model, `o` turns it on or off.
-4. `r` runs. The Monitor (`2`) shows live output.
+4. `r` runs. Runs (`2`) shows live output beside a sidebar of runs.
 5. Interactive stages open the harness's terminal; exit it, then `a` advances.
    `Ctrl+B` detaches; quitting `mr` can leave it running for the next `mr`.
 6. Read the review summary; `d` opens the diff.
@@ -87,7 +87,7 @@ Replace the Astra ID if your account differs. `w` adds presets such as
 
 | Key | Action |
 | --- | --- |
-| `1` `2` `3` `4` / `Tab` | Workflow, Monitor, Runs, Harnesses / next view |
+| `1` `2` `3` / `Tab` | Workflow, Runs, Harnesses / next view |
 | `p` | Choose repository |
 | `t` / `f` | Edit task / import task |
 | `e` / `c` / `m` | Edit stage / harness settings / pick model |
@@ -96,9 +96,10 @@ Replace the Astra ID if your account differs. `w` adds presets such as
 | `w` | Switch workflow or add preset |
 | `r` | Run |
 | `s` | Save project config |
-| `a` / `y` / `i` (Monitor) | Advance / retry / retry interactively |
+| `↑↓` / `Enter` (Runs) | Select a run / open a saved run |
+| `a` / `y` / `i` (Runs) | Advance / retry / retry interactively |
 | `t` / `Ctrl+B` | Open or take over a session / detach from it |
-| `d` / `h` (Monitor) | Diff / inspect handoff |
+| `d` / `h` (Runs) | Diff / inspect handoff |
 | `T` / `F8` / `F9` | Theme / Vim motions / notifications |
 | `Space` | Action menu: a group letter, then an action letter |
 | `?` / `:` | Keyboard guide / command menu |

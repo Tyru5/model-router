@@ -109,7 +109,7 @@ fn vim_toggle_sits_below_header_options_on_the_right() {
                     .iter()
                     .map(|c| c.symbol())
                     .collect::<String>();
-                assert!(header.contains("4 Harnesses"), "{header}");
+                assert!(header.contains("3 Harnesses"), "{header}");
             }
         }
     }
@@ -273,7 +273,7 @@ fn vim_motions_reach_harness_path_import_and_filter_inputs() {
     }
     app.ui.dialogs.clear();
     app.ui.page = Page::Runs;
-    app.key(key(Key::Char('/'))).unwrap();
+    app.key(key(Key::Char('F'))).unwrap();
     app.paste("abc");
     app.key(key(Key::Esc)).unwrap();
     assert!(app.runs_filtering());
@@ -745,7 +745,7 @@ fn repository_line_follows_the_project() {
         .map(|c| c.symbol())
         .collect();
     assert!(
-        row.contains("4 Harnesses") && row.contains("⎇ repo"),
+        row.contains("3 Harnesses") && row.contains("⎇ repo"),
         "{row}"
     );
     assert!(row.trim_end().ends_with("repo"), "{row}");
@@ -894,7 +894,7 @@ fn command_menu_actions_match_their_keys() {
     for (id, code) in [
         (ActionId::ToggleStage, Key::Char('o')),
         (ActionId::NextView, Key::Tab),
-        (ActionId::ShowRuns, Key::Char('3')),
+        (ActionId::ShowRuns, Key::Char('2')),
         (ActionId::Themes, Key::Char('T')),
         (ActionId::Help, Key::Char('?')),
         (ActionId::Quit, Key::Char('q')),
@@ -997,12 +997,19 @@ fn command_menu_lists_only_actions_for_the_current_context() {
     assert!(workflow.contains(&ActionId::Run) && workflow.contains(&ActionId::Commands));
     assert!(!workflow.contains(&ActionId::CancelStage) && !workflow.contains(&ActionId::OpenRun));
 
-    app.ui.page = Page::Monitor;
+    // Runs without a run of this session: only the sidebar's actions.
+    app.ui.page = Page::Runs;
+    let saved = menu(&mut app);
+    assert!(saved.contains(&ActionId::OpenRun) && saved.contains(&ActionId::FilterRuns));
+    assert!(!saved.contains(&ActionId::Continue) && !saved.contains(&ActionId::Handoff));
+
+    // A selected run of this session adds its actions to the sidebar's.
+    app.session.adopt(sample_run("a"));
     let idle = menu(&mut app);
     assert!(idle.contains(&ActionId::Continue) && idle.contains(&ActionId::Handoff));
+    assert!(idle.contains(&ActionId::Rerun) && idle.contains(&ActionId::NextRun));
     assert!(!idle.contains(&ActionId::CancelStage) && !idle.contains(&ActionId::Run));
 
-    app.session.adopt(sample_run("a"));
     app.slot_mut().worker = Some(Worker::stub());
     let running = menu(&mut app);
     assert!(running.contains(&ActionId::CancelStage) && running.contains(&ActionId::Handoff));
@@ -1015,7 +1022,7 @@ fn command_menu_lists_only_actions_for_the_current_context() {
     assert!(!editing.contains(&ActionId::CancelStage));
 
     // A menu opened during a run does nothing once the run has stopped.
-    app.ui.page = Page::Monitor;
+    app.ui.page = Page::Runs;
     app.key(key(Key::Char(':'))).unwrap();
     app.slot_mut().worker = None;
     for c in "cancel stage".chars() {
@@ -1158,10 +1165,16 @@ fn session_runs_keep_their_order_as_focus_moves_and_runs_close() {
         app.session.adopt(sample_run(id));
     }
     assert_eq!(session(&app), "a b c*");
-    app.session.cycle_focus(true);
+    // The sidebar moves focus; with no saved runs it stops at the last.
+    app.ui.page = Page::Runs;
+    app.key(key(Key::Up)).unwrap();
+    app.key(key(Key::Char('k'))).unwrap();
     assert_eq!(session(&app), "a* b c");
-    app.session.cycle_focus(false);
+    app.key(key(Key::Down)).unwrap();
+    app.key(key(Key::Down)).unwrap();
+    app.key(key(Key::Char('j'))).unwrap();
     assert_eq!(session(&app), "a b c*");
+    assert!(!app.on_saved());
     assert!(app.session.focus_run("b") && !app.session.focus_run("missing"));
     assert_eq!(session(&app), "a b* c");
 
@@ -1239,7 +1252,7 @@ fn running_app(project: &std::path::Path) -> App {
     run.cursor = 0;
     app.session.adopt(run);
     app.slot_mut().worker = Some(Worker::stub());
-    app.ui.page = Page::Monitor;
+    app.ui.page = Page::Runs;
     app
 }
 
@@ -1490,7 +1503,7 @@ fn esc_while_opening_a_project_returns_to_the_browser_and_drops_the_result() {
 fn shift_y_retries_one_failed_fan_out_candidate_of_the_stopped_stage() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());
-    app.ui.page = Page::Monitor;
+    app.ui.page = Page::Runs;
     let mut run = crate::report::tests::sample();
     // No harness here exists, so the restarted driver cannot launch one.
     for stage in &mut run.workflow.stages {
@@ -1574,7 +1587,7 @@ fn shift_y_retries_one_failed_fan_out_candidate_of_the_stopped_stage() {
 
     // Nothing to retry: the stage itself is not stopped, or no candidate is.
     let mut app = theme_app(project.path());
-    app.ui.page = Page::Monitor;
+    app.ui.page = Page::Runs;
     app.session.adopt(crate::report::tests::sample());
     let error = app.perform(ActionId::RetryCandidate).unwrap_err();
     assert!(
@@ -1800,7 +1813,7 @@ fn mixed_session(project: &std::path::Path) -> App {
         }
     }
     app.session.focus_run("busy");
-    app.ui.page = Page::Monitor;
+    app.ui.page = Page::Runs;
     app
 }
 
@@ -1873,7 +1886,7 @@ fn session_runs_dialog_lists_runs_focuses_cancels_and_jumps_to_input() {
     app.ui.page = Page::Workflow;
     app.key(shift('N')).unwrap();
     assert_eq!(session(&app), "done review* busy term");
-    assert_eq!(app.ui.page, Page::Monitor);
+    assert_eq!(app.ui.page, Page::Runs);
     for slot in &mut app.session.runs {
         slot.run.status = Status::Complete;
     }
@@ -2089,7 +2102,7 @@ fn diff_app(project: &std::path::Path, theme: Theme) -> App {
     run.project = project.into();
     run.workspace = project.into();
     app.session.adopt(run);
-    app.ui.page = Page::Monitor;
+    app.ui.page = Page::Runs;
     app.ui
         .open(Modal::Diff(Box::new(super::diff_view::DiffView::new(
             REVIEW_PATCH.into(),
@@ -2167,7 +2180,7 @@ fn diff_dialog_keys_move_between_files_hunks_and_matches() {
     // Esc clears the search, then closes; the dialog's keys stay local.
     app.key(key(Key::Esc)).unwrap();
     assert!(matches!(app.ui.dialog(), Some(Modal::Diff(_))));
-    assert_eq!(app.ui.page, Page::Monitor);
+    assert_eq!(app.ui.page, Page::Runs);
     app.key(key(Key::Esc)).unwrap();
     assert!(app.ui.dialog().is_none());
 }
@@ -2305,14 +2318,14 @@ fn output_search_highlights_matches_and_owns_n_while_shown() {
     );
     app.key(key(Key::Char('n'))).unwrap();
     assert!(rows(&mut app, 80, 30).join("\n").contains("3/4"));
-    // Idle, `n` returns to the workflow, except while a search is shown.
+    // Idle, `n` reruns the run, except while a search is shown.
     app.slot_mut().worker = None;
     app.key(key(Key::Char('n'))).unwrap();
-    assert_eq!(app.ui.page, Page::Monitor);
+    assert!(app.ui.dialog().is_none());
     app.key(key(Key::Esc)).unwrap();
     assert!(app.slot().log_search.is_none());
     app.key(key(Key::Char('n'))).unwrap();
-    assert_eq!(app.ui.page, Page::Workflow);
+    assert!(matches!(app.ui.dialog(), Some(Modal::Confirm(_))));
 }
 
 #[test]

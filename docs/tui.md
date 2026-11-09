@@ -27,7 +27,7 @@ included), else the current directory. The walk stops at the Git root.
 | Key | Action |
 | --- | --- |
 | `Tab` | Next view |
-| `1` `2` `3` `4` | Workflow, Monitor, Runs (reloads), Harnesses |
+| `1` `2` `3` | Workflow, Runs (reloads saved runs), Harnesses |
 | `T` | Theme picker ([themes.md](themes.md)) |
 | `I` | Routing stats dialog |
 | `F8` | Toggle Vim motions |
@@ -125,7 +125,7 @@ values: [harnesses.md](harnesses.md#permission-settings).
 **Use this folder** selects the displayed directory, Git or not. It lists one
 level at a time and never clones. Switching saves the current workflow, loads
 the new project's config, and resets task and run view; active runs continue
-and stay in the Monitor.
+and stay on the Runs page.
 
 ### Task import
 
@@ -146,14 +146,37 @@ The preview is editable. `Tab` switches **Append to task** / **Replace task**
 task must fit in 32 KiB of UTF-8; nothing is truncated. A BOM is removed and
 line endings normalized. Runs save their own task copy.
 
-## Monitor (2)
+## Runs (2)
 
-The tab shows active runs (`2 Monitor ●2`). The header shows cost and
+A sidebar lists this session's runs, then the project's saved runs, newest
+first; the selected run fills the rest of the page. A run of this session
+shows live: its stages, output, and handoff, or its results once it stops. A
+saved run shows a summary until `Enter` opens it here with its latest output.
+Below 100 columns a run of this session takes the whole width, and the
+sidebar comes back when a saved run is selected.
+
+The tab counts active runs (`2 Runs ●2`). The header shows
 `◆ 2 need input [N]` while runs wait.
+
+### Sidebar
+
+| Key | Action |
+| --- | --- |
+| `↑↓` / `kj` | Select a run; this session's runs, then saved ones |
+| `Enter` | Open the saved run here with its latest output (damaged: error and path) |
+| `F` | Filter saved runs by ID, workflow, task, status (`Enter` keeps, `Esc` clears) |
+| `s` | Cycle saved runs shown: all, active, complete, failed/blocked, cancelled, damaged |
+| `n` | Rerun the selected run from its saved snapshot (confirm) |
+| `=` | Compare two attempts of a stage |
+| `D` | Preview removing a saved run (`y` confirms); close a session's run with `x` first |
+| `r` | Reload saved runs and sizes |
+
+The saved list loads in the background and refreshes while runs are active.
+
+### Selected run
 
 | Key | When | Action |
 | --- | --- | --- |
-| `[` / `]` | any | Previous / next run of this session |
 | `t` | any | Attach to the live interactive terminal, or reopen the saved session ([takeover](#interactive-sessions)); `y` confirms |
 | `h` | any | Inspect handoff/error: findings by severity, tests by status; `↑↓` + `e`/`Enter` open a changed file in `$EDITOR` |
 | `PgUp` / `PgDn` | any | Scroll output |
@@ -171,8 +194,7 @@ The tab shows active runs (`2 Monitor ●2`). The header shows cost and
 | `e` | idle | Edit an interactive handoff summary |
 | `d` | idle | [Diff view](#diff-view) |
 | `o` | idle | Results ↔ output log |
-| `x` | idle | Close the run here (files stay; Runs reopens it) |
-| `n` | idle | Back to Workflow |
+| `x` | idle | Close the run here (files stay; it moves to Saved) |
 
 Output lines: assistant text `●`, tool calls `⚙`/`$` with a one-line result
 `↳`, edits `✎`, reasoning `∴`, errors `✗`. Hook, delta, and bookkeeping events
@@ -218,19 +240,19 @@ Native harness terminals get keys and paste forwarded.
 
 | Key | Action |
 | --- | --- |
-| `Ctrl+B` | Detach to the Monitor; the process keeps running and recording |
-| `t` (Monitor) | Reattach, restoring screen and size |
+| `Ctrl+B` | Detach to the Runs page; the process keeps running and recording |
+| `t` (Runs) | Reattach, restoring screen and size |
 | `Ctrl+]` | Stop a stuck stage |
 | `/exit` or the harness's quit | Quit the harness (not detach); the router then inspects the handoff |
 
 A new interactive stage takes the screen only while its run is shown and no
 dialog is open; otherwise `t` or `i` opens it. A workflow whose first enabled
-stage is interactive opens the Monitor immediately.
+stage is interactive opens the Runs page immediately.
 
 **Leaving a stage running.** Each interactive harness runs in its own small
 terminal host process, so it can outlive `mr`. Quitting (`q`) while one runs
 asks first: `y`/`Enter` leaves it running in the background, `n` stops it,
-`Esc` stays. The next `mr` in that project reconnects to it, opens the Monitor,
+`Esc` stays. The next `mr` in that project reconnects to it, opens the Runs page,
 and `t` attaches with the screen as the harness left it. While no `mr` is
 attached, the host holds the checkout's locks, so another run goes to its own
 worktree. If the harness exits meanwhile, the next `mr` finishes the stage from
@@ -251,22 +273,7 @@ use `i`. Fan-out stages cannot be taken over. Details:
 stage (`y` confirms). The status line reports runs that stop, complete, or
 wait while you are elsewhere; `!` lists them.
 
-## Runs (3)
-
-| Key | Action |
-| --- | --- |
-| `↑↓` / `kj` | Select |
-| `Enter` | Open in the Monitor with its latest output (damaged: error and path) |
-| `/` | Filter by ID, workflow, task, status (`Enter` keeps, `Esc` clears) |
-| `f` | Cycle status: all, active, complete, failed/blocked, cancelled, damaged |
-| `n` | Rerun from the saved snapshot (confirm) |
-| `c` | Compare two attempts of a stage |
-| `D` | Preview removing the run (`y` confirms) |
-| `r` | Reload runs and sizes |
-
-The list loads in the background and refreshes while runs are active.
-
-## Harnesses (4)
+## Harnesses (3)
 
 Runs `doctor` checks in the background: version, tested status,
 capabilities. `↑↓`/`kj` select, `Enter` lists each flag and note, `r`

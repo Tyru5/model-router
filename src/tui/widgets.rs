@@ -113,6 +113,24 @@ pub(super) fn elapsed(seconds: i64) -> String {
         s => format!("{}h {:02}m", s / 3600, s % 3600 / 60),
     }
 }
+/// `text` cut to `width` display columns, ending in an ellipsis when cut;
+/// wide characters (CJK, emoji) take two.
+pub(super) fn fit(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_owned();
+    }
+    let mut room = width.saturating_sub(1);
+    let mut head = String::new();
+    for c in text.chars() {
+        let size = c.width().unwrap_or(0);
+        if size > room {
+            break;
+        }
+        room -= size;
+        head.push(c);
+    }
+    head + "…"
+}
 /// Home-relative path, trimmed from the left to fit `width` display
 /// columns; wide characters (CJK, emoji) take two.
 pub(super) fn short_path(path: &std::path::Path, width: usize) -> String {
