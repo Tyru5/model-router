@@ -361,7 +361,7 @@ const ACTIONS: &[Entry] = {
             ])
             .footer()
             .menu(View, 'd'),
-        act(ToggleResults, MonitorIdle, ch('o'), "output", "Switch a finished run between results and output log").menu(View, 'o'),
+        act(ToggleResults, MonitorIdle, ch('o'), "output", "Switch a finished run between its brief and output log").menu(View, 'o'),
         // Runs: the sidebar, whatever it selects
         act(PreviousRun, Runs, key(KeyCode::Up), "runs", "Select the previous run in the sidebar").also(&[ch('k')]).alias("↑↓").footer(),
         act(NextRun, Runs, key(KeyCode::Down), "runs", "Select the next run in the sidebar").also(&[ch('j')]).alias("↑↓").footer(),

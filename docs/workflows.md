@@ -279,7 +279,7 @@ handoff, and the actual Git changes, and writes a brief:
 - **Open questions**: decisions, limitations, follow-ups.
 - **Try it**: commands to exercise the change.
 
-It leads the Monitor's results, `report`, and the CLI completion output, and
+It leads a finished run's brief in the TUI, `report`, and the CLI completion output, and
 is saved as `.model-router/runs/RUN_ID/review.md`. Disable or delete it to
 opt out.
 

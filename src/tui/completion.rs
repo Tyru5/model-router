@@ -1,11 +1,12 @@
-//! The Monitor's results view for a finished run: what changed, which checks
-//! ran, what is unresolved, and what each stage took and spent. Git work runs
+//! The brief a finished run shows: what changed, which checks ran, what is
+//! unresolved, and what each stage took and spent. Git work runs
 //! on a background thread; the view shows "Computing changes…" until it lands.
 use super::{
     app::App,
     run_slot::RunSlot,
     tasks::{Msg, Tasks},
     theme::Palette,
+    widgets::{key_chips, pad, rows_for},
 };
 use crate::{
     engine::{Run, Status},
@@ -20,8 +21,9 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Cell, HighlightSpacing, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
+use unicode_width::UnicodeWidthStr;
 
 /// Changes and patch computed for one finished run state.
 pub(super) struct Loaded {
@@ -97,7 +99,7 @@ fn load(run: &Run) -> Loaded {
 }
 
 impl RunSlot {
-    /// Whether the Monitor shows results rather than the output log.
+    /// Whether the run shows its brief rather than the output feed.
     pub(super) fn results_shown(&self) -> bool {
         self.worker.is_none() && !self.show_output && finished(&self.run)
     }
@@ -143,7 +145,7 @@ impl RunSlot {
         }
         // A newly finished run opens on its results.
         self.show_output = false;
-        self.results_scroll = [0; 2];
+        self.results_scroll = 0;
         self.changes_pending = Some(key.clone());
         let run = run.clone();
         let id = run.id.clone();
@@ -161,7 +163,7 @@ impl RunSlot {
 }
 
 impl App {
-    /// Whether the Monitor shows the focused run's results.
+    /// Whether the focused run shows its brief.
     pub(super) fn results_shown(&self) -> bool {
         self.session.focused().is_some_and(RunSlot::results_shown)
     }
@@ -330,7 +332,16 @@ fn review_lines(report: &RunReport, palette: Palette) -> Vec<Line<'static>> {
     let Some(review) = &report.review else {
         return vec![];
     };
-    let mut lines = vec![Line::styled("Review summary", palette.header_style())];
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "Brief",
+            Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  from the review summary stage",
+            Style::default().fg(palette.muted),
+        ),
+    ])];
     for line in storage::clean_terminal(review).lines() {
         let heading = line.trim_start_matches('#');
         lines.push(if heading.len() < line.len() {
@@ -435,153 +446,197 @@ fn findings_lines(report: &RunReport, palette: Palette) -> Vec<Line<'static>> {
     lines
 }
 
-/// Header lines, stage table, then changes beside (or above) checks and
-/// unresolved items. `area` excludes the title row the Monitor draws.
-pub(super) fn draw_completion(frame: &mut Frame<'_>, slot: &RunSlot, area: Rect, palette: Palette) {
-    let report = cached_report(slot);
-    let summary = Line::styled(report::summary(&report), Style::default().fg(palette.fg));
-    let usage = Line::from(vec![
-        Span::styled("Usage ", palette.header_style()),
-        Span::styled(
-            report::usage_text(&report.usage),
-            Style::default().fg(if report.usage.reported == 0 {
-                palette.muted
-            } else {
-                palette.fg
-            }),
-        ),
-    ]);
-    let cost = Line::from(vec![
-        Span::styled("Cost ", palette.header_style()),
-        Span::styled(
-            report::cost_text(&report.usage.cost, &report.budget),
-            Style::default().fg(if report.usage.cost.known() {
-                palette.fg
-            } else {
-                palette.muted
-            }),
-        ),
-    ]);
-    let width = area.width.max(1);
-    let mut header = vec![summary, usage, cost];
-    if let Some(error) = &report.error {
-        header.push(Line::styled(
-            format!("Error: {}", storage::clean_terminal(error)),
-            Style::default().fg(palette.red),
-        ));
-    }
-    let header_rows = header
-        .iter()
-        .map(|line| super::widgets::rows_for(line, width, 2))
-        .sum();
-    let chunks = Layout::vertical([
-        Constraint::Length(header_rows),
-        Constraint::Length((report.stages.len() as u16 + 3).min(10)),
-        Constraint::Min(3),
-    ])
-    .split(area);
-    frame.render_widget(Paragraph::new(header).wrap(Wrap { trim: false }), chunks[0]);
+/// Stage rows under a heading: status, harness, attempts, active time,
+/// checks, and usage. Narrow panes leave out the harness.
+fn stage_lines(report: &RunReport, width: u16, palette: Palette) -> Vec<Line<'static>> {
     let name_width = report
         .stages
         .iter()
-        .map(|s| s.name.chars().count() as u16)
+        .map(|s| s.name.width())
         .max()
         .unwrap_or(0)
         .clamp(8, 24);
-    let rows = report.stages.iter().map(|stage| {
-        let muted = Style::default().fg(palette.muted);
+    let harness = |stage: &StageReport| {
+        if stage.model.is_empty() {
+            stage.harness.clone()
+        } else {
+            format!("{} {}", stage.harness, stage.model)
+        }
+    };
+    let harness_width = report
+        .stages
+        .iter()
+        .map(|s| harness(s).width())
+        .max()
+        .unwrap_or(0)
+        .clamp(7, 28);
+    let show_harness = usize::from(width) >= name_width + harness_width + 56;
+    let row = |cells: [String; 6]| {
+        let [name, harness, attempts, active, checks, usage] = cells;
+        let mut text = format!("{}  ", pad(&name, name_width + 2));
+        if show_harness {
+            text.push_str(&format!("{}  ", pad(&harness, harness_width)));
+        }
+        text.push_str(&format!(
+            "{}  {}  {}  {usage}",
+            pad(&attempts, 8),
+            pad(&active, 7),
+            pad(&checks, 6)
+        ));
+        text
+    };
+    let mut lines = vec![Line::styled(
+        row(["Stages", "HARNESS", "ATTEMPTS", "ACTIVE", "CHECKS", "USAGE"].map(String::from)),
+        palette.header_style(),
+    )];
+    for stage in &report.stages {
         let ran = stage.attempts > 0;
-        Row::new([
-            Cell::from(stage.name.clone()),
-            Cell::from(palette.status_span(stage.status)),
-            Cell::from(attempts_cell(stage)).style(muted),
-            Cell::from(if ran {
+        let text = row([
+            format!("  {}", stage.name),
+            harness(stage),
+            attempts_cell(stage),
+            if ran {
                 report::duration(stage.active_seconds)
             } else {
                 "–".into()
-            })
-            .style(muted),
-            Cell::from(checks_cell(stage.checks.iter().map(|c| c.status))).style(muted),
-            Cell::from(usage_cell(&stage.usage)).style(muted),
-        ])
-    });
-    frame.render_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Length(name_width),
-                Constraint::Length(12),
-                Constraint::Length(8),
-                Constraint::Length(8),
-                Constraint::Length(6),
-                Constraint::Fill(1),
-            ],
-        )
-        .column_spacing(2)
-        .header(
-            Row::new(["STAGE", "STATUS", "ATTEMPTS", "ACTIVE", "CHECKS", "USAGE"])
-                .style(palette.header_style()),
-        )
-        .block(palette.panel(" Stages "))
-        .highlight_spacing(HighlightSpacing::Never),
-        chunks[1],
-    );
-    let loaded = slot.loaded();
-    // The review brief leads: it is what the person reads first.
-    let mut changes = review_lines(&report, palette);
-    changes.extend(changes_lines(loaded, &report, palette));
-    let left = if report.review.is_some() {
-        "Review summary · Changes"
+            },
+            checks_cell(stage.checks.iter().map(|c| c.status)),
+            usage_cell(&stage.usage),
+        ]);
+        // The glyph replaces the indent, coloured by the stage's status.
+        let rest = text.chars().skip(1).collect::<String>();
+        lines.push(Line::from(vec![
+            Span::styled(
+                Palette::status_glyph(stage.status),
+                Style::default().fg(palette.status_color(stage.status)),
+            ),
+            Span::styled(
+                rest,
+                Style::default().fg(if ran { palette.fg } else { palette.muted }),
+            ),
+        ]));
+    }
+    lines
+}
+
+/// Wall and active time, attempts, usage, and cost for the whole run.
+fn total_lines(report: &RunReport, palette: Palette) -> Vec<Line<'static>> {
+    let value = |known: bool| Style::default().fg(if known { palette.fg } else { palette.muted });
+    vec![
+        Line::styled("Totals", palette.header_style()),
+        Line::styled(report::summary(report), Style::default().fg(palette.fg)),
+        Line::from(vec![
+            Span::styled("Usage ", palette.header_style()),
+            Span::styled(
+                report::usage_text(&report.usage),
+                value(report.usage.reported > 0),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Cost ", palette.header_style()),
+            Span::styled(
+                report::cost_text(&report.usage.cost, &report.budget),
+                value(report.usage.cost.known()),
+            ),
+        ]),
+    ]
+}
+
+/// What a finished run offers next, the likeliest first.
+fn next_keys(status: Status) -> &'static [(&'static str, &'static str)] {
+    if status == Status::Complete {
+        &[
+            ("d", "diff"),
+            ("o", "output"),
+            ("h", "handoff"),
+            ("n", "rerun"),
+            ("x", "close"),
+        ]
     } else {
-        "Changes"
-    };
-    let findings = findings_lines(&report, palette);
-    let mut limits = [0; 2];
-    let mut panel = |index: usize,
-                     title: &str,
-                     lines: Vec<Line<'static>>,
-                     keys: &[(&str, &str)],
-                     rect: Rect| {
-        // Rows the wrapped text takes, less what fits: how far it can scroll.
-        let inner = rect.width.saturating_sub(2);
-        let rows: u16 = lines
-            .iter()
-            .map(|line| super::widgets::rows_for(line, inner, u16::MAX))
-            .fold(0, u16::saturating_add);
-        limits[index] = rows.saturating_sub(rect.height.saturating_sub(2));
-        let scroll = slot.results_scroll[index].min(limits[index]);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((scroll, 0))
-                .block(palette.panel_with(title, keys)),
-            rect,
-        );
-    };
-    if chunks[2].width >= 110 {
-        let cols = Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
-            .split(chunks[2]);
-        panel(0, left, changes, &[("d", "diff"), ("o", "output")], cols[0]);
-        panel(
-            1,
-            "Checks · Unresolved",
-            findings,
-            &[("PgUp/PgDn", "scroll")],
-            cols[1],
-        );
-    } else {
-        let mut lines = changes;
+        &[
+            ("y", "retry"),
+            ("i", "interactive"),
+            ("m", "model"),
+            ("d", "diff"),
+            ("o", "output"),
+        ]
+    }
+}
+
+/// The finished run's brief in one scrolling column: its error, the review
+/// brief, what changed, checks and unresolved items, each stage, and the
+/// totals. What to do next stays pinned below.
+pub(super) fn draw_completion(frame: &mut Frame<'_>, slot: &RunSlot, area: Rect, palette: Palette) {
+    let report = cached_report(slot);
+    let mut lines = vec![];
+    if let Some(error) = &report.error {
+        lines.push(Line::styled(
+            format!("Error: {}", storage::clean_terminal(error)),
+            Style::default()
+                .fg(palette.red)
+                .add_modifier(Modifier::BOLD),
+        ));
         lines.push(Line::raw(""));
-        lines.extend(findings);
-        panel(
-            0,
-            "Results",
-            lines,
-            &[("d", "diff"), ("o", "output"), ("PgUp/PgDn", "scroll")],
-            chunks[2],
+    }
+    // The review brief leads: it is what the person reads first.
+    lines.extend(review_lines(&report, palette));
+    lines.extend(changes_lines(slot.loaded(), &report, palette));
+    lines.push(Line::raw(""));
+    lines.extend(findings_lines(&report, palette));
+    lines.push(Line::raw(""));
+    lines.extend(stage_lines(&report, area.width, palette));
+    lines.push(Line::raw(""));
+    lines.extend(total_lines(&report, palette));
+
+    let next = key_chips(palette, next_keys(report.status), area.width.into());
+    let [body, bar] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(next_height(&next, area.width)),
+    ])
+    .areas(area);
+    // Rows the wrapped text takes, less what fits: how far it can scroll.
+    let rows: u16 = lines
+        .iter()
+        .map(|line| rows_for(line, body.width, u16::MAX))
+        .fold(0, u16::saturating_add);
+    let limit = rows.saturating_sub(body.height);
+    slot.results_limit.set(limit);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((slot.results_scroll.min(limit), 0)),
+        body,
+    );
+    draw_next(frame, next, limit > 0, bar, palette);
+}
+
+/// Rows the Next bar takes: its rule, then its keys.
+pub(super) fn next_height(keys: &Line<'_>, width: u16) -> u16 {
+    rows_for(keys, width, 1) + 1
+}
+
+/// A rule titled Next over the keys for what a finished run offers;
+/// `scrolls` adds the scroll keys to the rule.
+pub(super) fn draw_next(
+    frame: &mut Frame<'_>,
+    keys: Line<'static>,
+    scrolls: bool,
+    area: Rect,
+    palette: Palette,
+) {
+    let mut block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(palette.line))
+        .title(Span::styled(" Next ", palette.header_style()));
+    if scrolls {
+        block = block.title(
+            Line::styled(" PgUp/PgDn scroll ", Style::default().fg(palette.muted)).right_aligned(),
         );
     }
-    slot.results_limit.set(limits);
+    frame.render_widget(
+        Paragraph::new(keys).wrap(Wrap { trim: false }).block(block),
+        area,
+    );
 }
 
 #[cfg(test)]
@@ -635,48 +690,50 @@ mod tests {
     }
 
     #[test]
-    fn finished_runs_show_results_at_both_sizes() {
+    fn finished_runs_show_their_brief_at_both_sizes() {
         let mut app = app(sample());
         assert!(app.results_shown());
         let text = screen(&mut app, 80, 24);
         assert!(text.contains("Computing changes…"), "{text}");
         app.slot_mut().changes = Some(tracked());
-        for (width, height) in [(80, 24), (120, 36)] {
-            let text = screen(&mut app, width, height);
-            for expected in [
-                "wall 2m 10s · active 1m 40s · 3 attempts · 1 retry",
-                "usage reported by 2 of 3",
-                "Cost $0.25 (reported) · cost unknown for 2 of 3 attempts",
-                "Changed during this run",
-                "1 file, +40 -5",
-                "M src/lib.rs  +40 -5",
-                "Implement",
-                "2 ↻1",
-                "1m 10s",
-                "–",
-            ] {
-                assert!(
-                    text.contains(expected),
-                    "{width}x{height} lacks {expected:?}\n{text}"
-                );
-            }
-            if width == 120 {
-                for expected in [
-                    "Checks performed",
-                    "✓ cargo test  required · router · Verify",
-                    "Unresolved",
-                    "! Implement: blocking finding: Data loss",
-                    "1/3 ✗",
-                    // The Monitor header's running total.
-                    "repairs 1/2  ·  cost $0.25+? reported",
-                ] {
-                    assert!(
-                        text.contains(expected),
-                        "{width}x{height} lacks {expected:?}\n{text}"
-                    );
-                }
-            }
-        }
+        // What changed and what was checked lead, under the header's totals.
+        let lead = [
+            "✓ complete  2m 10s  ·  cost $0.25+? reported  ·  repairs 1/2",
+            "✓ Implement ━▶ ✓ Verify ┄▶ – Review",
+            "Changed during this run",
+            "1 file, +40 -5",
+            "M src/lib.rs  +40 -5",
+            "Checks performed",
+            "✓ cargo test  required · router · Verify",
+            "[d] diff   [o] output",
+        ];
+        let rest = [
+            "Unresolved",
+            "! Implement: blocking finding: Data loss",
+            "Stages",
+            "✓ Implement",
+            "2 ↻1",
+            "1m 10s",
+            "1/3 ✗",
+            "wall 2m 10s · active 1m 40s · 3 attempts · 1 retry",
+            "usage reported by 2 of 3",
+            "Cost $0.25 (reported) · cost unknown for 2 of 3 attempts",
+        ];
+        let lacks = |text: &str, expected: &[&str]| {
+            expected
+                .iter()
+                .find(|e| !text.contains(*e))
+                .map(|e| format!("lacks {e:?}\n{text}"))
+        };
+        let text = screen(&mut app, 120, 60);
+        assert_eq!(lacks(&text, &lead).or(lacks(&text, &rest)), None);
+        let text = screen(&mut app, 80, 24);
+        assert_eq!(lacks(&text, &lead), None);
+        // A short pane scrolls the brief to the rest, keeping the Next bar.
+        app.slot_mut().results_scroll = u16::MAX;
+        let text = screen(&mut app, 80, 24);
+        assert_eq!(lacks(&text, &rest[2..]), None);
+        assert!(text.contains("[d] diff"), "{text}");
     }
 
     #[test]
@@ -709,7 +766,7 @@ mod tests {
         ] {
             assert!(text.contains(expected), "lacks {expected:?}\n{text}");
         }
-        // While it runs, the monitor lists candidates under their stage.
+        // While it runs, a line under the strip lists the candidates.
         run.status = Status::Running;
         let mut monitor = app(run);
         let text = screen(&mut monitor, 120, 40);
@@ -732,6 +789,7 @@ mod tests {
         assert!(text.contains("✗ failed"), "{text}");
         assert!(text.contains("✗ Required check failed"), "{text}");
         assert!(text.contains("Error: Required check failed"), "{text}");
+        assert!(text.contains("[y] retry   [i] interactive"), "{text}");
         assert!(
             text.contains("unavailable (not a Git repository)"),
             "{text}"
@@ -754,7 +812,7 @@ mod tests {
         app.ui.dialogs.clear();
         app.toggle_results().unwrap();
         assert!(!app.results_shown());
-        assert!(screen(&mut app, 80, 24).contains("Output"));
+        assert!(screen(&mut app, 80, 24).contains("[o] brief"));
         app.toggle_results().unwrap();
         assert!(app.results_shown());
         let mut running = sample();
@@ -827,10 +885,64 @@ mod tests {
         assert!(!app.results_shown());
         for (width, height) in [(80, 24), (120, 36)] {
             let text = screen(&mut app, width, height);
-            assert!(text.contains("Verification not applicable"), "{text}");
-            assert!(text.contains("[a] accepts without checks"), "{text}");
-            assert!(text.contains("CHECKS"), "{text}");
+            assert!(
+                text.contains("◆ Verify: verification not applicable"),
+                "{text}"
+            );
+            assert!(text.contains("Docs only"), "{text}");
+            assert!(text.contains("[a] accept without checks"), "{text}");
+            assert!(
+                text.contains("◆ Verify"),
+                "the strip marks the waiting stage"
+            );
         }
+    }
+
+    #[test]
+    fn a_handoff_waiting_on_the_person_shows_a_card_under_its_output() {
+        let mut run = sample();
+        run.status = Status::AwaitingConfirmation;
+        run.cursor = 0;
+        let mut handoff =
+            crate::handoff::Handoff::unstructured("Scoped the key.\nTwo\nThree\nFour".into());
+        handoff.structured = true;
+        handoff.files_changed = vec!["a.rs".into(), "b.rs".into()];
+        handoff.unresolved = vec!["Sweep stale keys?".into()];
+        run.stages[0].handoff = Some(handoff);
+        let mut app = app(run);
+        app.slot_mut()
+            .push_log("── Implement · attempt 2 · claude sonnet ──".into());
+        app.slot_mut().push_log("● Fixed it".into());
+        let text = screen(&mut app, 120, 36);
+        for expected in [
+            // Log headings become stage headings, the output under them indented.
+            "Implement  attempt 2  claude sonnet",
+            "  ● Fixed it",
+            "◆ Implement needs you",
+            "Accept it to continue to Verify.",
+            "2 files changed   1 unresolved",
+            "Scoped the key.",
+            "… [h] shows the rest",
+            "[a] accept   [t] reopen session",
+            "◆ Implement ━▶ ✓ Verify",
+        ] {
+            assert!(text.contains(expected), "lacks {expected:?}\n{text}");
+        }
+        assert!(!text.contains("Four"), "{text}");
+        // At 80 columns keys that do not fit are left out, never cut from their labels.
+        let narrow = screen(&mut app, 80, 24);
+        assert!(narrow.contains("[a] accept"), "{narrow}");
+        for line in narrow.lines().filter(|line| line.starts_with(" │")) {
+            let inner = line.trim_end().trim_end_matches('│').trim_end();
+            assert!(
+                !inner.ends_with(']') || inner.ends_with("[Space] [r]"),
+                "{narrow}"
+            );
+        }
+        // Off stages are passed over in naming the next one.
+        app.slot_mut().run.workflow.stages[1].enabled = false;
+        let text = screen(&mut app, 120, 36);
+        assert!(text.contains("Accept it to finish the run."), "{text}");
     }
 
     #[test]

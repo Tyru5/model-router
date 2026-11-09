@@ -36,7 +36,7 @@ In `<config dir>/pricing.toml` use `[models."my-model"]` with the same fields.
 
 ## Where it shows
 
-- Run header and results view: amounts with sources.
+- Run header and a finished run's brief: amounts with sources.
 - `model-router report RUN_ID` (`--json` for data).
 - `model-router cost [--since 7d] [--json]`: history summed by harness and
   model. `--since` accepts e.g. `12h`, `7d`, `2w`.

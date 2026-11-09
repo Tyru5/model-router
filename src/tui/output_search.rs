@@ -1,5 +1,5 @@
-//! Search shared by the diff view and the Monitor's output panel, and the
-//! output panel's follow/pause position.
+//! Search shared by the diff view and a run's output feed, and the feed's
+//! follow/pause position.
 //!
 //! While following, the panel shows the newest output. Scrolling up pauses
 //! it: the position is then kept as the log line at the top of the panel, so

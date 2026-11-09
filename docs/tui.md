@@ -150,8 +150,9 @@ line endings normalized. Runs save their own task copy.
 
 A sidebar lists this session's runs, then the project's saved runs, newest
 first; the selected run fills the rest of the page. A run of this session
-shows live: its stages, output, and handoff, or its results once it stops. A
-saved run shows a summary until `Enter` opens it here with its latest output.
+shows its title, a strip of its stages, and a feed of every stage's output
+in order; when it waits on you, a card under the feed says why and which keys
+answer it. Once it stops, it shows its [brief](#brief). A saved run shows a summary until `Enter` opens it here with its latest output.
 Below 100 columns a run of this session takes the whole width, and the
 sidebar comes back when a saved run is selected.
 
@@ -193,20 +194,36 @@ The saved list loads in the background and refreshes while runs are active.
 | `m` | idle | Replace model and retry |
 | `e` | idle | Edit an interactive handoff summary |
 | `d` | idle | [Diff view](#diff-view) |
-| `o` | idle | Results ↔ output log |
+| `o` | idle | Brief ↔ output feed |
 | `x` | idle | Close the run here (files stay; it moves to Saved) |
 
-Output lines: assistant text `●`, tool calls `⚙`/`$` with a one-line result
-`↳`, edits `✎`, reasoning `∴`, errors `✗`. Hook, delta, and bookkeeping events
-are hidden; `stdout.log` keeps everything.
+The strip marks each stage's status: `✓` complete, `●` running, `◆` waiting
+on you, `✗` failed, `–` skipped, `○` pending; off stages are faint. Narrow panes
+keep the current stage's name and its neighbours', then only its own, then
+count the stages past the edge (`+2`). While a fan-out stage runs, a line under
+the strip lists its candidates, ★ on the judge's choice.
 
-### Results
+In the feed, each stage attempt starts with its name, attempt, harness, and
+model; its output is indented under it. Output lines: assistant text `●`, tool
+calls `⚙`/`$` with a one-line result `↳`, edits `✎`, reasoning `∴`, errors
+`✗`. Hook, delta, and bookkeeping events are hidden; `stdout.log` keeps
+everything.
 
-When a run completes or stops: review summary brief, files changed during the
-run with line counts, checks (router or model, required or optional),
-unresolved findings, per-stage active time, attempts, retries, usage, and
-cost with its source. Fan-out candidates are listed under their stage, ★ on the
-winner.
+The card's first key is the one the run expects: `a` accepts a handoff (or a
+`not_applicable` waiver), `i` opens an interactive stage's terminal, `c`
+continues a paused run. It shows the handoff's changed files, test results,
+unresolved count, and the start of its summary; `h` shows all of it. Keys that
+do not fit stay in `Space` `r`.
+
+### Brief
+
+When a run completes or stops, one scrolling column (`PgUp`/`PgDn`): its error,
+the review summary brief, files changed during the run with line counts,
+checks (router or model, required or optional), unresolved findings, each
+fan-out's candidates (★ on the winner), each stage's harness, attempts,
+retries, active time, checks, and usage, then the totals and cost with its
+source. A Next bar stays below it with what to do next: `d` diff first for a
+complete run, `y` retry first for a stopped one.
 
 ### Output search
 

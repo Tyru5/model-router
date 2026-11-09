@@ -265,9 +265,10 @@ API clients, automatic task classification, and embedded IDE control are exclude
   and persistent recent projects. Recognizes Git directories and `.git` files
   for linked worktrees/submodules; non-Git folders can also be selected.
   Saves workflow edits and loads the selected project's configuration.
-- Run monitor with stage state (fan-out candidates indented under their
-  stage), elapsed time, check results, logs, cancellation, handoff view, and
-  explicit recovery actions. Finished runs show a results view:
+- Run view with a stage strip, one chronological feed of every stage's output,
+  a card that says when the run waits on the person and which keys answer it,
+  fan-out candidates, elapsed time, cancellation, handoff view, and explicit
+  recovery actions. Finished runs show a brief:
   files changed during the run (from private Git snapshots), checks by source,
   unresolved findings, per-stage time, retries, and harness-reported usage, with
   unavailable values labelled, plus each fan-out's candidates, judge decision,

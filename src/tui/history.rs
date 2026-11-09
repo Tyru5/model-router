@@ -688,8 +688,8 @@ pub(super) fn draw_runs(frame: &mut Frame<'_>, app: &App, area: Rect, palette: P
     }
 }
 
-/// A sidebar title: the task's first line, else the workflow's name.
-fn title(task: &str, workflow: &str) -> String {
+/// A run title: the task's first line, else the workflow's name.
+pub(super) fn title(task: &str, workflow: &str) -> String {
     let line = history::excerpt(task);
     if line.is_empty() {
         workflow.to_owned()

@@ -1,13 +1,13 @@
 use super::{
     actions::ActionId,
     app::App,
-    completion::{checks_cell, draw_completion},
+    completion::{draw_completion, draw_next, finished, next_height},
     handoff_view::HandoffView,
     modal::{Ask, Choice, InputTarget, Modal, PickValue},
     output_search::{Wrapped, visible_lines},
     run_slot::{RunSlot, SETTLE},
     theme::Palette,
-    widgets::{elapsed, empty_state, short_path, textarea},
+    widgets::{StripStage, elapsed, empty_state, fit, key_chips, rows_for, stage_strip, textarea},
 };
 use crate::{
     adapters,
@@ -19,12 +19,12 @@ use anyhow::{Context, Result, bail, ensure};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Cell, HighlightSpacing, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 use std::{collections::VecDeque, rc::Rc};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 impl App {
     pub(super) fn perform_monitor(&mut self, id: ActionId) -> Result<()> {
@@ -79,23 +79,20 @@ impl App {
                 self.ui.message =
                     "Run closed here; it moves to Saved, where [Enter] reopens it.".into();
             }
-            ActionId::ScrollUp if self.results_shown() => self.view(|slot| {
-                for scroll in &mut slot.results_scroll {
-                    *scroll = scroll.saturating_sub(5);
-                }
-            }),
-            // Each panel stops at its own end, so scrolling back moves both at once.
+            ActionId::ScrollUp if self.results_shown() => {
+                self.view(|slot| slot.results_scroll = slot.results_scroll.saturating_sub(5))
+            }
             ActionId::ScrollDown if self.results_shown() => self.view(|slot| {
-                let limit = slot.results_limit.get();
-                for (scroll, limit) in slot.results_scroll.iter_mut().zip(limit) {
-                    *scroll = scroll.saturating_add(5).min(limit);
-                }
+                slot.results_scroll = slot
+                    .results_scroll
+                    .saturating_add(5)
+                    .min(slot.results_limit.get())
             }),
             // Scrolling up pauses the output; reaching the end follows again.
             ActionId::ScrollUp => self.view(|slot| slot.scroll_output(-10)),
             ActionId::ScrollDown => self.view(|slot| slot.scroll_output(10)),
             ActionId::OutputTop if self.results_shown() => {
-                self.view(|slot| slot.results_scroll = [0; 2])
+                self.view(|slot| slot.results_scroll = 0)
             }
             ActionId::OutputBottom if self.results_shown() => {
                 self.view(|slot| slot.results_scroll = slot.results_limit.get())
@@ -334,8 +331,9 @@ fn retryable_candidates(run: &engine::Run) -> Vec<(usize, &engine::CandidateStat
 }
 
 /// Output lines wrapped to `width` columns and coloured by what they show:
-/// stage headers, assistant text, tool calls, results, and errors. `first`
-/// is the absolute number of the first log line.
+/// assistant text, tool calls, results, and errors, indented under a
+/// heading for each stage attempt. `first` is the absolute number of the
+/// first log line.
 pub(super) fn output_lines(
     logs: &VecDeque<String>,
     first: u64,
@@ -347,11 +345,17 @@ pub(super) fn output_lines(
     let mut starts = Vec::with_capacity(logs.len());
     let mut style = Style::default().fg(palette.muted);
     for log in logs {
-        style = if log.starts_with("── ") {
-            Style::default()
-                .fg(palette.accent)
-                .add_modifier(Modifier::BOLD)
-        } else if log.starts_with("● ") {
+        starts.push(lines.len());
+        if let Some(heading) = log.strip_prefix("── ") {
+            // A blank row sets each stage apart from the one before.
+            if !lines.is_empty() {
+                lines.push(Line::default());
+            }
+            lines.push(stage_heading(heading, width, palette));
+            style = Style::default().fg(palette.muted);
+            continue;
+        }
+        style = if log.starts_with("● ") {
             Style::default().fg(palette.fg)
         } else if log.starts_with("⚙ ") || log.starts_with("$ ") || log.starts_with("⌕ ") {
             Style::default().fg(palette.blue)
@@ -372,9 +376,8 @@ pub(super) fn output_lines(
         } else {
             Style::default().fg(palette.muted)
         };
-        starts.push(lines.len());
-        for row in wrap(log, width) {
-            lines.push(Line::styled(row, style));
+        for row in wrap(log, width - 2) {
+            lines.push(Line::styled(format!("  {row}"), style));
         }
     }
     Wrapped {
@@ -382,6 +385,26 @@ pub(super) fn output_lines(
         starts,
         first,
     }
+}
+
+/// A `── Implement · attempt 2 · claude sonnet ──` log line as a feed
+/// heading: the stage's name, then the rest faint.
+fn stage_heading(text: &str, width: usize, palette: Palette) -> Line<'static> {
+    let text = text.trim_end().trim_end_matches('─').trim_end();
+    let (name, meta) = text.split_once(" · ").unwrap_or((text, ""));
+    let name = fit(name, width);
+    let room = width.saturating_sub(name.width() + 2);
+    let mut spans = vec![Span::styled(
+        name,
+        Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
+    )];
+    if !meta.is_empty() && room >= 3 {
+        spans.push(Span::styled(
+            format!("  {}", fit(&meta.replace(" · ", "  "), room)),
+            Style::default().fg(palette.muted),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// `text` in rows of at most `width` display columns; wide characters
@@ -405,7 +428,7 @@ pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
-/// "  ·  ~$0.42 table of $5.00": spend so far, updated as each attempt
+/// "  ·  cost ~$0.42 table of $5.00": spend so far, updated as each attempt
 /// records its usage; empty before any attempt without a budget.
 fn running_cost(slot: &RunSlot) -> String {
     let report = super::completion::cached_report(slot);
@@ -430,213 +453,225 @@ fn running_cost(slot: &RunSlot) -> String {
     text
 }
 
-/// Stage rows plus fan-out candidate rows in the progress table.
-fn progress_rows(run: &engine::Run) -> usize {
-    run.stages.len()
-        + run
-            .stages
-            .iter()
-            .filter_map(|s| s.fan_out.as_ref())
-            .map(|f| f.candidates.len())
-            .sum::<usize>()
+/// Seconds from the run's start to its latest attempt's end, counting an
+/// attempt still running up to now.
+fn wall_seconds(run: &engine::Run) -> i64 {
+    let now = chrono::Utc::now();
+    let end = run
+        .stages
+        .iter()
+        .flat_map(|s| &s.attempts)
+        .map(|a| a.finished_at.unwrap_or(now))
+        .max()
+        .unwrap_or(run.updated_at);
+    (end - run.created_at).num_seconds().max(0)
 }
 
+/// The run's title left; its status, time, and spend right. A narrow pane
+/// cuts the title, not the status.
+fn header(slot: &RunSlot, width: u16, palette: Palette) -> Line<'static> {
+    let run = &slot.run;
+    let muted = Style::default().fg(palette.muted);
+    let mut right = vec![
+        palette.status_span(run.status),
+        Span::styled(
+            format!("  {}{}", elapsed(wall_seconds(run)), running_cost(slot)),
+            muted,
+        ),
+    ];
+    if run.repair_passes > 0 {
+        right.push(Span::styled(
+            format!(
+                "  ·  repairs {}/{}",
+                run.repair_passes, run.workflow.max_repair_passes
+            ),
+            muted,
+        ));
+    }
+    if slot.terminal().is_some() {
+        right.push(Span::styled(
+            "  ·  detached [t]",
+            Style::default().fg(palette.accent),
+        ));
+    }
+    let right = Line::from(right);
+    let width = usize::from(width);
+    let title = fit(
+        &super::history::title(&run.task, &run.workflow.name),
+        width.saturating_sub(right.width() + 2),
+    );
+    let gap = width.saturating_sub(title.width() + right.width()).max(1);
+    let mut spans = vec![
+        Span::styled(
+            title,
+            Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" ".repeat(gap)),
+    ];
+    spans.extend(right.spans);
+    Line::from(spans)
+}
+
+/// The run's stages in a strip, the current one highlighted; ◆ marks a
+/// stage waiting on the person.
+fn strip(slot: &RunSlot, width: u16, palette: Palette) -> Line<'static> {
+    let run = &slot.run;
+    let stages: Vec<StripStage> = run
+        .stages
+        .iter()
+        .zip(&run.workflow.stages)
+        .enumerate()
+        .map(|(index, (state, stage))| {
+            let waiting = index == run.cursor && slot.needs_input();
+            StripStage {
+                glyph: if waiting {
+                    "◆"
+                } else {
+                    Palette::status_glyph(state.status)
+                },
+                color: if waiting {
+                    palette.warn
+                } else {
+                    palette.status_color(state.status)
+                },
+                name: stage.name.clone(),
+                on: stage.enabled && state.status != Status::Skipped,
+            }
+        })
+        .collect();
+    stage_strip(&stages, run.cursor, width.into(), palette)
+}
+
+/// One line per fan-out stage: its candidates, ★ marking the judge's choice.
+fn candidate_lines(run: &engine::Run, palette: Palette) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(palette.muted);
+    run.stages
+        .iter()
+        .zip(&run.workflow.stages)
+        .filter_map(|(state, stage)| Some((state.fan_out.as_ref()?, stage)))
+        .map(|(fan, stage)| {
+            let chosen = fan.selection.as_ref().map(|s| s.candidate.as_str());
+            let mut spans = vec![Span::styled(format!("  {} fan-out ", stage.name), muted)];
+            for candidate in &fan.candidates {
+                let mark = if chosen == Some(candidate.id.as_str()) {
+                    "★"
+                } else {
+                    "↳"
+                };
+                let harness = if candidate.model.is_empty() {
+                    candidate.harness.clone()
+                } else {
+                    format!("{} {}", candidate.harness, candidate.model)
+                };
+                spans.push(Span::styled(
+                    format!("  {mark} {} · {harness} ", candidate.id),
+                    Style::default().fg(palette.fg),
+                ));
+                spans.push(Span::styled(
+                    Palette::status_glyph(candidate.status),
+                    Style::default().fg(palette.status_color(candidate.status)),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// A rule under the strip, ending in the run's ID.
+fn rule(id: &str, width: u16, palette: Palette) -> Line<'static> {
+    let label = format!(" {id} ");
+    let rest = usize::from(width).saturating_sub(label.width() + 1);
+    Line::from(vec![
+        Span::styled("─".repeat(rest), Style::default().fg(palette.line)),
+        Span::styled(label, Style::default().fg(palette.muted)),
+        Span::styled("─", Style::default().fg(palette.line)),
+    ])
+}
+
+/// The selected run of this session: its title, stage strip, and then the
+/// feed of its output (with a card when it waits on the person), or the
+/// brief once it has finished.
 pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
     let Some(slot) = app.session.focused() else {
         empty_state(
             frame,
             palette,
             area,
-            palette.panel(" Run monitor "),
+            palette.panel(" Run "),
             "No run selected",
             "Start one from Workflow [r], or open a saved run from the sidebar.",
         );
         return;
     };
-    let run = &slot.run;
-    let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length((progress_rows(run) as u16 + 3).min(10)),
-        Constraint::Min(3),
-    ])
-    .split(area);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                run.workflow.name.clone(),
-                Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("   "),
-            palette.status_span(run.status),
-            Span::styled(
-                // The ID goes last: narrow panes clip it, not the cost.
-                format!(
-                    "   repairs {}/{}{}  ·  {}",
-                    run.repair_passes,
-                    run.workflow.max_repair_passes,
-                    running_cost(slot),
-                    run.id,
-                ),
-                Style::default().fg(palette.muted),
-            ),
-            Span::styled(
-                if slot.terminal().is_some() {
-                    "   detached · [t] attach"
-                } else {
-                    ""
-                },
-                Style::default().fg(palette.accent),
-            ),
-        ])),
-        chunks[0],
-    );
-    if app.results_shown() {
-        let top = chunks[1].y;
-        let rest = Rect {
-            y: top,
-            height: area.height.saturating_sub(top - area.y),
-            ..area
-        };
-        draw_completion(frame, slot, rest, palette);
-        return;
-    }
-    let name_width = run
-        .workflow
-        .stages
-        .iter()
-        .map(|s| s.name.chars().count() as u16)
-        .chain(
-            run.stages
-                .iter()
-                .filter_map(|s| s.fan_out.as_ref())
-                .flat_map(|f| &f.candidates)
-                .map(|c| (c.id.len() + c.harness.len() + c.model.len() + 8) as u16),
-        )
-        .max()
-        .unwrap_or(0)
-        .clamp(16, 40);
-    let seconds = |attempt: Option<&engine::Attempt>| {
-        attempt.map(|a| {
-            (a.finished_at.unwrap_or_else(chrono::Utc::now) - a.started_at)
-                .num_seconds()
-                .max(0)
-        })
+    let results = app.results_shown();
+    // While it runs; the brief lists candidates once it has finished.
+    let candidates = if results {
+        vec![]
+    } else {
+        candidate_lines(&slot.run, palette)
     };
-    let mut rows = vec![];
-    // The cursor's row, counting the candidate rows above it.
-    let mut selected = 0;
-    for (index, (state, stage)) in run.stages.iter().zip(&run.workflow.stages).enumerate() {
-        if index == run.cursor.min(run.stages.len().saturating_sub(1)) {
-            selected = rows.len();
-        }
-        rows.push(Row::new([
-            Cell::from(stage.name.clone()),
-            Cell::from(palette.status_span(state.status)),
-            Cell::from(state.attempts.len().to_string()).style(Style::default().fg(palette.muted)),
-            Cell::from(checks_cell(
-                state
-                    .attempts
-                    .last()
-                    .into_iter()
-                    .flat_map(|a| a.checks.iter().map(|c| c.status)),
-            ))
-            .style(Style::default().fg(palette.muted)),
-            Cell::from(
-                seconds(state.attempts.last())
-                    .map(elapsed)
-                    .unwrap_or_else(|| "–".into()),
-            )
-            .style(Style::default().fg(palette.muted)),
-        ]));
-        // Fan-out candidates, indented under their stage; ★ marks the choice.
-        let Some(fan) = &state.fan_out else {
-            continue;
-        };
-        let chosen = fan.selection.as_ref().map(|s| s.candidate.as_str());
-        for candidate in &fan.candidates {
-            rows.push(Row::new([
-                Cell::from(format!(
-                    "  {} {} · {}",
-                    if chosen == Some(candidate.id.as_str()) {
-                        "★"
-                    } else {
-                        "↳"
-                    },
-                    candidate.id,
-                    if candidate.model.is_empty() {
-                        candidate.harness.clone()
-                    } else {
-                        format!("{} {}", candidate.harness, candidate.model)
-                    }
-                ))
-                .style(Style::default().fg(palette.muted)),
-                Cell::from(palette.status_span(candidate.status)),
-                Cell::from(candidate.attempts.len().to_string())
-                    .style(Style::default().fg(palette.muted)),
-                Cell::from(checks_cell(
-                    candidate
-                        .attempts
-                        .last()
-                        .into_iter()
-                        .flat_map(|a| a.checks.iter().map(|c| c.status)),
-                ))
-                .style(Style::default().fg(palette.muted)),
-                Cell::from(
-                    seconds(candidate.attempts.last())
-                        .map(elapsed)
-                        .unwrap_or_else(|| "–".into()),
-                )
-                .style(Style::default().fg(palette.muted)),
-            ]));
-        }
-    }
-    frame.render_stateful_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Length(name_width),
-                Constraint::Length(18),
-                Constraint::Length(8),
-                Constraint::Length(6),
-                Constraint::Fill(1),
-            ],
-        )
-        .column_spacing(3)
-        .header(
-            Row::new(["STAGE", "STATUS", "ATTEMPTS", "CHECKS", "ELAPSED"])
-                .style(palette.header_style()),
-        )
-        .block(palette.panel(" Progress "))
-        .highlight_symbol("▌")
-        .highlight_spacing(HighlightSpacing::Always)
-        .row_highlight_style(palette.selected_style()),
-        chunks[2],
-        &mut TableState::default().with_selected(Some(selected)),
+    let [head, strip_row, candidate_rows, rule_row, body] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(candidates.len().min(3) as u16),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .areas(area);
+    frame.render_widget(Paragraph::new(candidates), candidate_rows);
+    frame.render_widget(Paragraph::new(header(slot, head.width, palette)), head);
+    frame.render_widget(
+        Paragraph::new(strip(slot, strip_row.width, palette)),
+        strip_row,
     );
-    let cols = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(chunks[3]);
+    frame.render_widget(
+        Paragraph::new(rule(&slot.run.id, rule_row.width, palette)),
+        rule_row,
+    );
+    if results {
+        draw_completion(frame, slot, body, palette);
+    } else {
+        draw_feed(frame, app, slot, body, palette);
+    }
+}
+
+/// The output of every stage in order, a paused or search line under it,
+/// and the needs-you card at the bottom; a finished run's output keeps its
+/// Next bar instead.
+fn draw_feed(frame: &mut Frame<'_>, app: &App, slot: &RunSlot, area: Rect, palette: Palette) {
+    let done = (slot.worker.is_none() && finished(&slot.run)).then(|| {
+        key_chips(
+            palette,
+            &[("o", "brief"), ("d", "diff"), ("/", "search")],
+            area.width.into(),
+        )
+    });
+    let card = needs_card(slot, area.width.saturating_sub(4).into(), palette);
+    let card_height = card.as_ref().map_or(0, |(_, _, lines)| {
+        let inner = area.width.saturating_sub(4);
+        let rows: u16 = lines
+            .iter()
+            .map(|line| rows_for(line, inner, u16::MAX))
+            .fold(0, u16::saturating_add);
+        // The output keeps at least three rows.
+        (rows + 2).min(area.height.saturating_sub(3))
+    });
     let paused = !slot.log_view.follow;
-    let mut output_block = palette.panel_with(
-        if paused {
-            "Output · ▲ paused — End to follow"
-        } else {
-            "Output"
-        },
-        // The paused notice needs the room at narrow widths.
-        if paused {
-            &[]
-        } else {
-            &[("PgUp/PgDn", "scroll"), ("/", "search")]
-        },
-    );
-    if let Some(status) = slot.output_search_status() {
-        output_block = output_block.title_bottom(Line::styled(
-            format!(" {status} "),
-            Style::default().fg(palette.accent),
-        ));
+    let search = slot.output_search_status();
+    let notice = paused || search.is_some();
+    let bar_height = done
+        .as_ref()
+        .map_or(0, |keys| next_height(keys, area.width));
+    let [output, notice_row, card_row] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(u16::from(notice)),
+        Constraint::Length(card_height.max(bar_height)),
+    ])
+    .areas(area);
+    if let Some(keys) = done {
+        draw_next(frame, keys, false, card_row, palette);
     }
-    let visible = output_block.inner(cols[0]).height as usize;
+    let visible = usize::from(output.height);
     slot.log_visible.set(visible);
     if slot.logs.is_empty() {
         frame.render_widget(
@@ -644,13 +679,11 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
                 "Harness output appears here. Some harnesses emit their final response only when the stage finishes. Full logs are saved on disk.",
                 Style::default().fg(palette.muted).add_modifier(Modifier::ITALIC),
             ))
-            .wrap(Wrap { trim: false })
-            .block(output_block),
-            cols[0],
+            .wrap(Wrap { trim: false }),
+            output,
         );
     } else {
-        // The panel's own inner width: borders and padding included.
-        let width = output_block.inner(cols[0]).width as usize;
+        let width = usize::from(output.width);
         // Wrapped lines are kept until the log, width, or theme changes.
         let key = (width, slot.log_version, app.ui.displayed_theme());
         let mut cache = slot.cache.borrow_mut();
@@ -673,87 +706,237 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
                 visible,
                 slot.log_search.as_ref(),
                 palette,
-            ))
-            .block(output_block),
-            cols[0],
+            )),
+            output,
         );
     }
-    let handoff = run
-        .stages
-        .get(run.cursor.min(run.stages.len().saturating_sub(1)))
-        .and_then(|s| s.handoff.as_ref());
-    let summary: Vec<Line> = if let Some(error) = &run.error {
-        vec![
-            Line::styled(
-                "Error",
-                Style::default()
-                    .fg(palette.red)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Line::raw(""),
-            Line::styled(
-                storage::clean_terminal(error),
-                Style::default().fg(palette.red),
-            ),
-        ]
-    } else if let Some(reason) = run.pending_waiver() {
-        vec![
-            Line::styled(
-                "Verification not applicable",
-                Style::default()
-                    .fg(palette.warn)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Line::raw(""),
-            Line::raw("The test stage reported that no check applies:"),
-            Line::styled(
-                storage::clean_terminal(reason),
-                Style::default().fg(palette.fg),
-            ),
-            Line::raw(""),
-            Line::from(vec![
-                Span::styled("[a]", Style::default().fg(palette.accent)),
-                Span::raw(" accepts without checks   "),
-                Span::styled("[y]", Style::default().fg(palette.accent)),
-                Span::raw(" retries"),
-            ]),
-        ]
-    } else if let Some(h) = handoff {
-        let mut lines = vec![
-            Line::styled(
-                if h.structured {
-                    "Structured handoff"
-                } else {
-                    "Text handoff · inspect before advancing"
-                },
-                palette.header_style(),
-            ),
-            Line::raw(""),
-        ];
-        lines.extend(
-            storage::clean_terminal(&h.summary)
-                .lines()
-                .map(|line| Line::raw(line.to_string())),
+    if notice {
+        let mut spans = vec![];
+        if paused {
+            spans.push(Span::styled(
+                "▲ paused — End to follow   ",
+                Style::default().fg(palette.warn),
+            ));
+        }
+        if let Some(search) = search {
+            spans.push(Span::styled(search, Style::default().fg(palette.accent)));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), notice_row);
+    }
+    if let Some((title, color, lines)) = card {
+        let block = palette
+            .panel(Span::styled(
+                format!(" {title} "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ))
+            .border_style(Style::default().fg(color));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(block),
+            card_row,
         );
-        lines
-    } else {
-        vec![
-            Line::styled(
-                run.current_name().to_string(),
-                Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
-            ),
-            Line::raw(""),
-            Line::styled("Workspace", palette.header_style()),
-            Line::raw(short_path(&run.workspace, usize::MAX)),
-            Line::raw(""),
-            Line::styled("Artifacts", palette.header_style()),
-            Line::raw(short_path(&run.directory, usize::MAX)),
-        ]
+    }
+}
+
+/// The card under the feed while the run waits on the person: its title,
+/// colour, and lines, ending in the keys that answer it. None while the run
+/// drives itself or once it has finished. Keys past `width` are left to the
+/// Space menu.
+fn needs_card(
+    slot: &RunSlot,
+    width: usize,
+    palette: Palette,
+) -> Option<(String, Color, Vec<Line<'static>>)> {
+    let run = &slot.run;
+    if slot.worker.is_some() || finished(run) {
+        return None;
+    }
+    let stage = run.current_name().to_owned();
+    let fg = Style::default().fg(palette.fg);
+    let muted = Style::default().fg(palette.muted);
+    let more = Line::from(vec![
+        Span::styled("More: ", muted),
+        Span::styled(
+            "[Space] [r]",
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let mut lines = vec![];
+    if let Some(error) = &run.error {
+        lines.push(Line::styled(
+            storage::clean_terminal(error),
+            Style::default().fg(palette.red),
+        ));
+        lines.push(Line::raw(""));
+    }
+    if let Some(reason) = run.pending_waiver() {
+        lines.push(Line::styled(
+            "The test stage reported that no check applies:",
+            fg,
+        ));
+        lines.push(Line::styled(
+            storage::clean_terminal(reason),
+            fg.add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::raw(""));
+        lines.push(key_chips(
+            palette,
+            &[
+                ("a", "accept without checks"),
+                ("y", "retry"),
+                ("h", "handoff"),
+            ],
+            width,
+        ));
+        return Some((
+            format!("◆ {stage}: verification not applicable"),
+            palette.warn,
+            lines,
+        ));
+    }
+    let title = match run.status {
+        Status::AwaitingConfirmation => {
+            let next = run
+                .workflow
+                .stages
+                .iter()
+                .zip(&run.stages)
+                .skip(run.cursor + 1)
+                .find(|(stage, state)| stage.enabled && state.status != Status::Skipped)
+                .map(|(stage, _)| stage.name.clone());
+            lines.push(Line::styled(
+                match next {
+                    Some(next) => format!("The stage handed off. Accept it to continue to {next}."),
+                    None => "The stage handed off. Accept it to finish the run.".into(),
+                },
+                fg,
+            ));
+            let handoff = run.stages.get(run.cursor).and_then(|s| s.handoff.as_ref());
+            if let Some(handoff) = handoff {
+                lines.extend(handoff_lines(handoff, palette));
+            }
+            lines.push(Line::raw(""));
+            lines.push(key_chips(
+                palette,
+                &[
+                    ("a", "accept"),
+                    ("t", "reopen session"),
+                    ("y", "retry"),
+                    ("e", "edit summary"),
+                    ("h", "handoff"),
+                ],
+                width,
+            ));
+            lines.push(more);
+            format!("◆ {stage} needs you")
+        }
+        Status::Interactive => {
+            let harness = run
+                .workflow
+                .stages
+                .get(run.cursor)
+                .map_or("its harness", |s| s.harness.as_str());
+            lines.push(Line::styled(
+                format!(
+                    "This stage runs in {harness}'s own terminal. You drive it, then exit to hand off."
+                ),
+                fg,
+            ));
+            lines.push(Line::raw(""));
+            lines.push(key_chips(
+                palette,
+                &[("i", "open the terminal"), ("h", "handoff")],
+                width,
+            ));
+            format!("◆ {stage} is ready for you")
+        }
+        // Stopped between or during stages, e.g. after a cancel.
+        _ => {
+            lines.push(Line::styled(
+                "The run stopped here; continuing picks up at this stage.",
+                fg,
+            ));
+            lines.push(Line::raw(""));
+            lines.push(key_chips(
+                palette,
+                &[
+                    ("c", "continue"),
+                    ("y", "retry"),
+                    ("i", "interactive"),
+                    ("m", "model"),
+                ],
+                width,
+            ));
+            lines.push(more);
+            if run.cursor < run.workflow.stages.len() {
+                format!("◆ {stage} is paused")
+            } else {
+                "◆ Run is paused".into()
+            }
+        }
     };
-    frame.render_widget(
-        Paragraph::new(summary)
-            .wrap(Wrap { trim: false })
-            .block(palette.panel_with("Handoff", &[("h", "inspect")])),
-        cols[1],
-    );
+    Some((title, palette.warn, lines))
+}
+
+/// What a handoff claims, in a line, then the start of its summary.
+fn handoff_lines(handoff: &crate::handoff::Handoff, palette: Palette) -> Vec<Line<'static>> {
+    use crate::handoff::TestStatus;
+    let mut lines = vec![];
+    if !handoff.structured {
+        lines.push(Line::styled(
+            "Text handoff, not structured: inspect it before accepting.",
+            Style::default().fg(palette.warn),
+        ));
+    }
+    let mut facts: Vec<Span<'static>> = vec![];
+    let mut fact = |text: String, color| {
+        if !facts.is_empty() {
+            facts.push(Span::raw("   "));
+        }
+        facts.push(Span::styled(text, Style::default().fg(color)));
+    };
+    match handoff.files_changed.len() {
+        0 => {}
+        1 => fact("1 file changed".into(), palette.fg),
+        n => fact(format!("{n} files changed"), palette.fg),
+    }
+    let count = |status| handoff.tests.iter().filter(|t| t.status == status).count();
+    let (passed, failed) = (count(TestStatus::Passed), count(TestStatus::Failed));
+    if passed > 0 {
+        fact(format!("✓ {passed} passed"), palette.success);
+    }
+    if failed > 0 {
+        fact(format!("✗ {failed} failed"), palette.red);
+    }
+    if !handoff.unresolved.is_empty() {
+        fact(
+            format!("{} unresolved", handoff.unresolved.len()),
+            palette.warn,
+        );
+    }
+    if !facts.is_empty() {
+        lines.push(Line::from(facts));
+    }
+    let summary = storage::clean_terminal(&handoff.summary);
+    let mut text = summary.lines().filter(|line| !line.trim().is_empty());
+    let shown: Vec<_> = text.by_ref().take(3).collect();
+    if !shown.is_empty() {
+        lines.push(Line::raw(""));
+    }
+    for line in shown {
+        lines.push(Line::styled(
+            line.to_owned(),
+            Style::default().fg(palette.fg),
+        ));
+    }
+    if text.next().is_some() {
+        lines.push(Line::styled(
+            "… [h] shows the rest",
+            Style::default().fg(palette.muted),
+        ));
+    }
+    lines
 }

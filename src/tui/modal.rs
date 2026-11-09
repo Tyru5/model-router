@@ -198,14 +198,14 @@ impl Ask {
             Self::CancelStage { run } => (
                 "Cancel stage",
                 format!(
-                    "Stop the running stage of {run}? Its artifacts are kept; [y] in Monitor retries it."
+                    "Stop the running stage of {run}? Its artifacts are kept; [y] on the Runs page retries it."
                 ),
                 YES_NO,
             ),
             Self::CancelRun { run } => (
                 "Cancel run's stage",
                 format!(
-                    "Stop the running stage of {run}? Its artifacts are kept; [y] in its Monitor retries it."
+                    "Stop the running stage of {run}? Its artifacts are kept; [y] on the Runs page retries it."
                 ),
                 YES_NO,
             ),

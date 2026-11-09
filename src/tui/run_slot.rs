@@ -125,10 +125,10 @@ pub(super) struct RunSlot {
     pub(super) log_search: Option<output_search::LogSearch>,
     /// A finished run shows results unless the output log was chosen.
     pub(super) show_output: bool,
-    /// Scroll offsets of the results panels, each kept within its own panel.
-    pub(super) results_scroll: [u16; 2],
-    /// The furthest each results panel can scroll, as last drawn.
-    pub(super) results_limit: Cell<[u16; 2]>,
+    /// Scroll offset of the finished run's brief.
+    pub(super) results_scroll: u16,
+    /// The furthest the brief can scroll, as last drawn.
+    pub(super) results_limit: Cell<u16>,
     pub(super) changes: Option<completion::Loaded>,
     /// The key of the changes being computed.
     pub(super) changes_pending: Option<String>,
@@ -161,8 +161,8 @@ impl RunSlot {
             log_visible: Cell::new(0),
             log_search: None,
             show_output: false,
-            results_scroll: [0; 2],
-            results_limit: Cell::new([0; 2]),
+            results_scroll: 0,
+            results_limit: Cell::new(0),
             changes: None,
             changes_pending: None,
             waiver_shown: String::new(),

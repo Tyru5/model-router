@@ -5,7 +5,7 @@ use crossterm::event::{KeyCode as Key, KeyEvent, KeyModifiers as Mods};
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Paragraph, Wrap},
 };
@@ -130,6 +130,122 @@ pub(super) fn fit(text: &str, width: usize) -> String {
         head.push(c);
     }
     head + "…"
+}
+/// `text` fitted to exactly `width` display columns: cut, or padded with spaces.
+pub(super) fn pad(text: &str, width: usize) -> String {
+    let text = fit(text, width);
+    let room = width.saturating_sub(text.width());
+    text + &" ".repeat(room)
+}
+/// Key/label pairs as `[a] accept   [i] reopen`; the first key is filled,
+/// as the action the view expects next. Pairs past `width` are left out
+/// rather than wrapped; the first always shows.
+pub(super) fn key_chips(palette: Palette, keys: &[(&str, &str)], width: usize) -> Line<'static> {
+    let mut spans = Vec::with_capacity(keys.len() * 3);
+    let mut used = 0;
+    for (index, (key, label)) in keys.iter().enumerate() {
+        let size = super::theme::key_label(key).width() + 1 + label.width();
+        if index > 0 {
+            if used + 3 + size > width {
+                break;
+            }
+            used += 3;
+            spans.push(Span::raw("   "));
+        }
+        used += size;
+        let (key_style, label_style) = if index == 0 {
+            (
+                Style::default().fg(palette.on_accent()).bg(palette.accent),
+                Style::default().fg(palette.fg).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (
+                Style::default().fg(palette.accent),
+                Style::default().fg(palette.fg),
+            )
+        };
+        spans.push(Span::styled(
+            super::theme::key_label(key),
+            key_style.add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(format!(" {label}"), label_style));
+    }
+    Line::from(spans)
+}
+/// One stage in a stage strip.
+pub(super) struct StripStage {
+    pub(super) glyph: &'static str,
+    pub(super) color: Color,
+    pub(super) name: String,
+    /// Off stages, and the arrows into them, are drawn faint.
+    pub(super) on: bool,
+}
+/// Stages in order with arrows between them, `selected` highlighted. When
+/// every name does not fit in `width`, only the selected stage and its
+/// neighbours keep theirs, then only the selected one; stages still past the
+/// right edge become a `+N` count.
+pub(super) fn stage_strip(
+    stages: &[StripStage],
+    selected: usize,
+    width: usize,
+    palette: Palette,
+) -> Line<'static> {
+    let selected = selected.min(stages.len().saturating_sub(1));
+    let line = |named: &dyn Fn(usize) -> bool, shown: usize| {
+        let mut spans = vec![];
+        for (index, stage) in stages.iter().enumerate().take(shown) {
+            if index > 0 {
+                let arrow = if stages[index - 1].on && stage.on {
+                    "━▶"
+                } else {
+                    "┄▶"
+                };
+                spans.push(Span::styled(arrow, Style::default().fg(palette.line)));
+            }
+            let base = if index == selected {
+                palette.selected_style()
+            } else {
+                Style::default()
+            };
+            spans.push(Span::styled(
+                format!(" {} ", stage.glyph),
+                base.fg(stage.color),
+            ));
+            if named(index) {
+                let style = if index == selected {
+                    base
+                } else {
+                    base.fg(if stage.on { palette.fg } else { palette.muted })
+                };
+                spans.push(Span::styled(format!("{} ", stage.name), style));
+            }
+        }
+        if shown < stages.len() {
+            spans.push(Span::styled(
+                format!(" +{}", stages.len() - shown),
+                Style::default().fg(palette.muted),
+            ));
+        }
+        Line::from(spans)
+    };
+    let all = stages.len();
+    let only = |index: usize| index == selected;
+    for named in [
+        &(|_| true) as &dyn Fn(usize) -> bool,
+        &|index: usize| index.abs_diff(selected) <= 1,
+        &only,
+    ] {
+        let fitted = line(named, all);
+        if fitted.width() <= width {
+            return fitted;
+        }
+    }
+    // Still too wide: drop stages after the selected one from the end.
+    (selected + 1..all)
+        .rev()
+        .map(|shown| line(&only, shown))
+        .find(|fitted| fitted.width() <= width)
+        .unwrap_or_else(|| line(&only, (selected + 1).min(all)))
 }
 /// Home-relative path, trimmed from the left to fit `width` display
 /// columns; wide characters (CJK, emoji) take two.
@@ -311,5 +427,37 @@ mod tests {
             field.insert_char('!');
             assert_eq!(content(&field), format!("{value}!"));
         }
+    }
+
+    #[test]
+    fn stage_strip_drops_names_before_stages() {
+        let palette = super::super::theme::Theme::ModelRouter.palette();
+        let stages: Vec<StripStage> = ["Investigate", "Implement", "Review", "Test", "Summary"]
+            .into_iter()
+            .map(|name| StripStage {
+                glyph: "○",
+                color: palette.muted,
+                name: name.into(),
+                on: name != "Review",
+            })
+            .collect();
+        let text = |width| {
+            let line = stage_strip(&stages, 1, width, palette);
+            assert!(line.width() <= width, "{width}: {line}");
+            line.to_string()
+        };
+        assert_eq!(
+            text(120),
+            " ○ Investigate ━▶ ○ Implement ┄▶ ○ Review ┄▶ ○ Test ━▶ ○ Summary "
+        );
+        // The selected stage keeps its neighbours' names, then only its own.
+        assert_eq!(
+            text(52),
+            " ○ Investigate ━▶ ○ Implement ┄▶ ○ Review ┄▶ ○ ━▶ ○ "
+        );
+        assert_eq!(text(51), " ○ ━▶ ○ Implement ┄▶ ○ ┄▶ ○ ━▶ ○ ");
+        // Then stages after it give way to a count.
+        assert_eq!(text(32), " ○ ━▶ ○ Implement ┄▶ ○ ┄▶ ○  +1");
+        assert_eq!(text(25), " ○ ━▶ ○ Implement  +3");
     }
 }

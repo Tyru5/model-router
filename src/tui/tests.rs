@@ -1762,18 +1762,23 @@ fn monitor_results_and_dialogs_fit_the_minimum_size() {
     let screen = rows(&mut app, 65, 20).join("\n");
     assert!(screen.contains("✓ step 49 雪"), "{screen}");
     assert!(screen.contains("[C] cancel stage"), "{screen}");
-    // Finished: results, and the two panels scroll within their own lengths.
+    // Finished: the brief, which scrolls only as far as its end.
     app.slot_mut().worker = None;
     app.session.adopt(sample_run("done"));
     let screen = rows(&mut app, 65, 20).join("\n");
-    assert!(screen.contains("Results"), "{screen}");
+    assert!(
+        screen.contains("Next") && screen.contains("[d] diff"),
+        "{screen}"
+    );
     for _ in 0..50 {
         app.key(key(Key::PageDown)).unwrap();
     }
     let limit = app.slot().results_limit.get();
+    assert!(limit > 0);
     assert_eq!(app.slot().results_scroll, limit);
+    assert!(rows(&mut app, 65, 20).join("\n").contains("Totals"));
     app.key(key(Key::PageUp)).unwrap();
-    assert_eq!(app.slot().results_scroll[0], limit[0].saturating_sub(5));
+    assert_eq!(app.slot().results_scroll, limit.saturating_sub(5));
     for modal in [
         Modal::Ask(Box::new(Ask::CancelStage { run: "done".into() })),
         Modal::Loading(Loading::new("Opening project…")),
