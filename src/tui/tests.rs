@@ -892,7 +892,7 @@ fn dialog(app: &App) -> Option<&str> {
 fn command_menu_actions_match_their_keys() {
     let project = tempfile::tempdir().unwrap();
     for (id, code) in [
-        (ActionId::ToggleStage, Key::Char(' ')),
+        (ActionId::ToggleStage, Key::Char('o')),
         (ActionId::NextView, Key::Tab),
         (ActionId::ShowRuns, Key::Char('3')),
         (ActionId::Themes, Key::Char('T')),
@@ -934,6 +934,59 @@ fn command_menu_actions_match_their_keys() {
     }
     assert_eq!(app.key(key(Key::Enter)).unwrap_err().to_string(), pressed);
     assert!(app.ui.dialog().is_none());
+}
+
+#[test]
+fn space_menu_runs_actions_like_their_keys() {
+    let project = tempfile::tempdir().unwrap();
+    let mut pressed = theme_app(project.path());
+    pressed.key(key(Key::Char('o'))).unwrap();
+    let mut chosen = theme_app(project.path());
+    chosen.key(key(Key::Char(' '))).unwrap();
+    let sheet = rows(&mut chosen, 80, 24).join("\n");
+    assert!(
+        sheet.contains("Menu") && sheet.contains("s Stage"),
+        "{sheet}"
+    );
+    // A letter outside the group does nothing; Backspace returns to groups.
+    chosen.key(key(Key::Char('s'))).unwrap();
+    chosen.key(key(Key::Char('Z'))).unwrap();
+    assert!(
+        rows(&mut chosen, 80, 24)
+            .join("\n")
+            .contains("Menu · Stage")
+    );
+    chosen.key(key(Key::Backspace)).unwrap();
+    chosen.key(key(Key::Char('s'))).unwrap();
+    chosen.key(key(Key::Char('o'))).unwrap();
+    assert!(chosen.ui.dialog().is_none());
+    assert!(chosen.editor.dirty);
+    assert_eq!(
+        serde_json::to_value(&chosen.editor.settings).unwrap(),
+        serde_json::to_value(&pressed.editor.settings).unwrap()
+    );
+    // Space again or Esc closes without acting.
+    for close in [Key::Char(' '), Key::Esc] {
+        let mut app = theme_app(project.path());
+        app.key(key(Key::Char(' '))).unwrap();
+        app.key(key(close)).unwrap();
+        assert!(app.ui.dialog().is_none() && !app.editor.dirty);
+    }
+}
+
+#[test]
+fn footer_is_one_row_with_menu_and_guide_keys_on_the_right() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    for width in [80, 120] {
+        let screen = rows(&mut app, width, 24);
+        let last = screen.last().unwrap();
+        assert!(
+            last.trim_end().ends_with("[Space] menu   [?] keys"),
+            "{last}"
+        );
+        assert!(last.contains("[r] run"), "{last}");
+    }
 }
 
 #[test]
@@ -1324,7 +1377,7 @@ fn exit_asks_to_save_unsaved_edits_from_both_q_and_ctrl_c() {
     ] {
         let _ = std::fs::remove_file(&app.editor.config_path);
         let mut app = theme_app(project.path());
-        app.key(key(Key::Char(' '))).unwrap();
+        app.key(key(Key::Char('o'))).unwrap();
         assert!(app.editor.dirty);
         assert!(!app.key(exit).unwrap());
         assert!(

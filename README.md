@@ -44,7 +44,7 @@ cd /path/to/project && mr
 
 1. `p` picks a repository (or start `mr` inside one).
 2. `t` writes the task (`Ctrl+S` applies), or `f` imports a file, URL, or GitHub issue.
-3. Check the stages; `e` edits one, `m` picks its model, `Space` toggles it.
+3. Check the stages; `e` edits one, `m` picks its model, `o` turns it on or off.
 4. `r` runs. The Monitor (`2`) shows live output.
 5. Interactive stages open the harness's terminal; exit it, then `a` advances.
    `Ctrl+B` detaches; quitting `mr` can leave it running for the next `mr`.
@@ -91,7 +91,7 @@ Replace the Astra ID if your account differs. `w` adds presets such as
 | `p` | Choose repository |
 | `t` / `f` | Edit task / import task |
 | `e` / `c` / `m` | Edit stage / harness settings / pick model |
-| `Space` | Enable or disable stage |
+| `o` | Enable or disable stage |
 | `a` / `x` / `J` `K` | Add / remove / move stage |
 | `w` | Switch workflow or add preset |
 | `r` | Run |
@@ -100,6 +100,7 @@ Replace the Astra ID if your account differs. `w` adds presets such as
 | `t` / `Ctrl+B` | Open or take over a session / detach from it |
 | `d` / `h` (Monitor) | Diff / inspect handoff |
 | `T` / `F8` / `F9` | Theme / Vim motions / notifications |
+| `Space` | Action menu: a group letter, then an action letter |
 | `?` / `:` | Keyboard guide / command menu |
 | `q` / `Ctrl+C` | Quit / cancel |
 

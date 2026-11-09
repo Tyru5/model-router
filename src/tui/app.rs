@@ -670,6 +670,10 @@ impl App {
                 guide: true,
             }),
             ActionId::Commands => self.command_menu(),
+            ActionId::Menu => self.ui.open(Modal::Menu {
+                scope: self.scope(),
+                group: None,
+            }),
             ActionId::SessionRuns => self.session_runs(),
             ActionId::NextNeedsInput => self.jump_to_input(),
             ActionId::Notices => self.show_notices(),
@@ -849,11 +853,19 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         );
         return;
     }
+    // One footer row: the view's hints left, as many as fit before the menu
+    // and guide keys on the right.
+    let right = palette.hints(&[("Space", "menu"), ("?", "keys")]);
+    let room = usize::from(area.width).saturating_sub(right.width() + 4);
     let hints = actions::footer(app.page_scope());
-    let keys: Vec<_> = hints
-        .iter()
-        .map(|(key, label)| (key.as_str(), *label))
-        .collect();
+    let mut keys: Vec<(&str, &str)> = vec![];
+    for (key, label) in &hints {
+        keys.push((key.as_str(), *label));
+        if palette.hints(&keys).width() > room {
+            keys.pop();
+            break;
+        }
+    }
     let mut footer = palette.hints(&keys);
     footer.spans.insert(0, Span::raw(" "));
     let alert = !app.ui.message.is_empty() && app.ui.message == app.ui.alert;
@@ -886,7 +898,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Constraint::Length(1), // Vim toggle below the header, aligned right
         Constraint::Min(10),
         Constraint::Length(rows_for(&status, body_width, 2)),
-        Constraint::Length(rows_for(&footer, area.width, 2)),
+        Constraint::Length(1),
     ])
     .split(area);
     let header = chunks[0];
@@ -921,10 +933,12 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         );
     }
     frame.render_widget(
-        Paragraph::new(footer)
-            .style(Style::default().bg(palette.bg))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(footer).style(Style::default().bg(palette.bg)),
         chunks[4],
+    );
+    frame.render_widget(
+        Paragraph::new(right).right_aligned(),
+        chunks[4].inner(Margin::new(1, 0)),
     );
     // Only the top dialog shows; those below come back as it closes.
     let ask = match app.ui.dialog() {

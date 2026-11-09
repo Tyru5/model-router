@@ -9,6 +9,8 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Added
 
+- TUI action menu: `Space`, then a group letter (Run, Stage, Workflow, Go,
+  View) and an action letter, lists every action of the current view.
 - `completions SHELL [--bin NAME]`: shell completion scripts for bash, zsh,
   fish, elvish, and PowerShell, for `model-router` or the `mr` alias.
 - `doctor` reports whether `git` and `gh` are installed, their versions, and
@@ -82,6 +84,8 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Changed
 
+- TUI: enabling or disabling a stage moved from `Space` to `o`. The footer is
+  one row, ending with `Space menu` and `? keys`.
 - README reduced to an entry point; detail moved to `docs/`.
 - TUI split into focused modules; key hints use one format; keys and
   confirmations hardened.

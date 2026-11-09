@@ -1,9 +1,10 @@
 # TUI
 
 `model-router` (or `mr`) with no subcommand opens the TUI. Opening it starts no
-model. In the TUI, `?` shows the keyboard guide and `:` a searchable command
-menu of the current view's actions. Both are built from the same action table
-as this page (`src/tui/actions.rs`).
+model. In the TUI, `Space` opens the action menu, `?` shows the keyboard guide,
+and `:` a searchable command menu of the current view's actions. All three, and
+the one-row footer, are built from the same action table as this page
+(`src/tui/actions.rs`).
 
 Keys need their exact modifiers: `Ctrl+R` is not `r`. Shift is implied by
 capital letters (`T` = Shift+T).
@@ -34,10 +35,22 @@ included), else the current directory. The walk stops at the Git root.
 | `L` | This session's runs |
 | `N` | Jump to the next run needing input |
 | `!` | Notice history, newest first |
+| `Space` | [Action menu](#action-menu) |
 | `?` | Keyboard guide |
 | `:` | Command menu |
 | `q` | Quit; asks to save unsaved workflow edits (`y` save, `n` discard, `Esc` stay); stops active runs first |
 | `Ctrl+C` | Cancel work, or exit |
+
+The footer shows the current view's most used keys, then `Space menu` and
+`? keys` on the right.
+
+### Action menu
+
+`Space` lists the current view's actions in groups: **Run** (`r`), **Stage**
+(`s`), **Workflow** (`w`), **Go** (`g`), and **View** (`v`). Press the group
+letter, then the action letter: `Space s o` turns the selected stage on or off,
+`Space g h` shows Harnesses. `Backspace` returns to the groups; `Space` or
+`Esc` closes. Every action keeps its direct key too.
 
 In every selection menu, `Ctrl+N`/`Ctrl+P` = `↓`/`↑`. In editors, `Ctrl+S`
 applies and `Esc` cancels (asking first if there are changes).
@@ -57,7 +70,7 @@ applies and `Esc` cancels (asking first if there are changes).
 | `c` | Harness settings for the stage ([below](#harness-settings)) |
 | `h` | Pick harness |
 | `m` | Discover models |
-| `Space` | Enable/disable stage |
+| `o` | Enable/disable stage |
 | `v` | Toggle unattended/interactive |
 | `a` | Add stage preset (edit, `Ctrl+S` inserts after the selection) |
 | `d` / `x` | Duplicate / remove stage |

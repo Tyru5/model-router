@@ -1120,8 +1120,8 @@ mod tests {
         );
         assert!(shows(&mut app, &history::human(bytes)));
         let lines = screen(&mut app, 80, 24);
-        let footer = lines[22..].join("\n");
+        let footer = &lines[23];
         assert!(footer.contains("[↑↓] select"), "{footer}");
-        assert!(footer.contains("[:] commands"), "{footer}");
+        assert!(footer.contains("[Space] menu"), "{footer}");
     }
 }

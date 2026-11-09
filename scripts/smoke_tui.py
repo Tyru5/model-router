@@ -41,8 +41,8 @@ def main():
                 "\x1b[200~Build a feature with 雪\nand preserve context between stages.\x1b[201~"
             )
             terminal.send(b"\x13")
-            terminal.send("jj ")  # enable review
-            terminal.send(" ")  # disable it again
+            terminal.send("jjo")  # enable review
+            terminal.send("o")  # disable it again
             terminal.send("kve")  # implementation: interactive, then edit
             terminal.send(b"\x01\x0b")  # beginning/end-of-line deletion in text editor
             terminal.send("Interactive implementation")

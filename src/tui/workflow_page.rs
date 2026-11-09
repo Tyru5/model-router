@@ -1202,7 +1202,7 @@ fn draw_stage_detail(
     }
     lines.push(Line::styled(
         if stage.role == Role::Review {
-            "Optional. [Space] toggles it; blocking findings request repairs."
+            "Optional. [o] toggles it; blocking findings request repairs."
         } else {
             "c configures this stage's harness."
         },

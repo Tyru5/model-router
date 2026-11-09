@@ -64,7 +64,7 @@ def main():
                 lambda: "1 Workflow" in terminal.text(), "App did not start"
             )
             assert background(terminal) == "0d1421"
-            assert "[T] themes" in terminal.text()
+            assert "[Space] menu   [?] keys" in terminal.text()
             terminal.send("tKeep my task")
             terminal.send(b"\x13")
             terminal.send("T")

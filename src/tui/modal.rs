@@ -1,6 +1,6 @@
 use super::input::InputField;
 use super::{
-    actions::{self, ActionId},
+    actions::{self, ActionId, Group, Scope},
     app::App,
     diff_view::{DiffAction, DiffView},
     external,
@@ -24,7 +24,7 @@ use anyhow::{Context, Result, ensure};
 use crossterm::event::{KeyCode as Key, KeyEvent, KeyModifiers as Mods};
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Margin},
+    layout::{Constraint, Layout, Margin, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
@@ -145,6 +145,12 @@ pub(super) enum Modal {
     /// The session's runs; drawn by the app, which holds them.
     SessionRuns {
         selected: usize,
+    },
+    /// The `Space` menu for the view it opened on: groups, then the chosen
+    /// group's actions.
+    Menu {
+        scope: Scope,
+        group: Option<Group>,
     },
     /// Notification backends and a test button.
     Notifications {
@@ -838,6 +844,24 @@ impl App {
                     Stay
                 }
             },
+            Modal::Menu { scope, group } => match (key.code, *group) {
+                _ if key.modifiers.intersects(Mods::CONTROL | Mods::ALT) => Stay,
+                (Key::Char(' '), _) => Close,
+                (Key::Backspace, Some(_)) => {
+                    *group = None;
+                    Stay
+                }
+                (Key::Char(c), None) => {
+                    let groups = actions::menu(*scope);
+                    *group = Group::from_key(c).filter(|g| groups.iter().any(|(m, _)| m == g));
+                    Stay
+                }
+                (Key::Char(c), Some(g)) => match actions::menu_action(*scope, g, c) {
+                    Some(id) => DialogResult::Emit(Effect::Perform(id)),
+                    None => Stay,
+                },
+                _ => Stay,
+            },
             Modal::Loading(_) | Modal::Ask(_) => Stay,
             Modal::Confirm(dialog) => {
                 if self.confirm_key(dialog, key) {
@@ -879,6 +903,9 @@ pub(super) fn draw_modal(
     ask: Option<AskText>,
     palette: Palette,
 ) {
+    if let Modal::Menu { scope, group } = modal {
+        return draw_menu(frame, *scope, *group, palette);
+    }
     let (width, height) = match modal {
         Modal::Stage { .. } => (100, 35),
         // As large as the screen allows.
@@ -902,8 +929,8 @@ pub(super) fn draw_modal(
             selected,
             status,
         } => draw_notifications(frame, backends, *selected, status, palette),
-        // Drawn by the app, which holds the runs.
-        Modal::SessionRuns { .. } => {}
+        // Drawn by the app, which holds the runs; the menu returned above.
+        Modal::SessionRuns { .. } | Modal::Menu { .. } => {}
         Modal::Input { title, text, .. } => {
             palette.style_textarea(text);
             let block = palette.modal(title, &[]);
@@ -1092,6 +1119,87 @@ pub(super) fn draw_modal(
             );
         }
     }
+}
+
+/// The `Space` menu as a sheet above the footer, one column per group. Once a
+/// group is chosen, its actions take the accent and the others go quiet.
+fn draw_menu(frame: &mut Frame<'_>, scope: Scope, group: Option<Group>, palette: Palette) {
+    let groups = actions::menu(scope);
+    let tallest = groups
+        .iter()
+        .map(|(_, items)| items.len())
+        .max()
+        .unwrap_or(0);
+    let area = frame.area();
+    // Borders, group names, a gap, the actions, a gap, and the hint.
+    let height = (tallest as u16 + 6).min(area.height.saturating_sub(2));
+    let rect = Rect::new(
+        area.x,
+        area.bottom().saturating_sub(height + 1),
+        area.width,
+        height,
+    );
+    frame.render_widget(Clear, rect);
+    let (title, keys, hint): (String, &[(&str, &str)], _) = match group {
+        None => (
+            "Menu".into(),
+            &[("Esc", "close")],
+            "Press a group letter, then an action letter. Space closes.",
+        ),
+        Some(g) => (
+            format!("Menu · {}", g.name()),
+            &[("Backspace", "groups"), ("Esc", "close")],
+            "Press an action letter. Backspace returns to the groups.",
+        ),
+    };
+    let block = palette.modal(&title, keys);
+    let inner = block.inner(rect).inner(Margin::new(1, 0));
+    frame.render_widget(block, rect);
+    let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let columns = Layout::horizontal(
+        groups
+            .iter()
+            .map(|_| Constraint::Ratio(1, groups.len().max(1) as u32)),
+    )
+    .split(body);
+    let strong = |color| Style::default().fg(color).add_modifier(Modifier::BOLD);
+    let quiet = Style::default().fg(palette.muted);
+    for ((g, items), column) in groups.iter().zip(columns.iter()) {
+        let chosen = group == Some(*g);
+        let other = group.is_some() && !chosen;
+        let (key_style, name_style, letter_style, label_style) = if chosen {
+            (
+                strong(palette.on_accent()).bg(palette.accent),
+                strong(palette.fg),
+                strong(palette.accent),
+                Style::default().fg(palette.fg),
+            )
+        } else if other {
+            (quiet, quiet, quiet, quiet)
+        } else {
+            (
+                strong(palette.accent),
+                Style::default().fg(palette.fg),
+                quiet,
+                Style::default().fg(palette.fg),
+            )
+        };
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(g.key().to_string(), key_style),
+                Span::styled(format!(" {}", g.name()), name_style),
+            ]),
+            Line::raw(""),
+        ];
+        lines.extend(items.iter().map(|(letter, entry)| {
+            Line::from(vec![
+                Span::styled(letter.to_string(), letter_style),
+                Span::styled(format!(" {}", entry.label), label_style),
+            ])
+        }));
+        frame.render_widget(Paragraph::new(lines), *column);
+    }
+    frame.render_widget(Paragraph::new(Line::styled(hint, quiet)), footer);
 }
 
 /// Render the keyboard guide: CAPS lines are headings, `key\tdescription`

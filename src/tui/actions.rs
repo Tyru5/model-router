@@ -1,12 +1,13 @@
 //! Page-level actions: the one table behind key dispatch, footer hints, the
-//! keyboard guide (`?`), and the command menu (`:`).
+//! keyboard guide (`?`), the command menu (`:`), and the `Space` menu.
 //!
 //! To add an action:
 //! 1. Add an `ActionId` variant.
 //! 2. Add `act(id, scope, key, label, description)` to `ACTIONS` in its
 //!    scope's section. Chain `.also()` for more keys, `.more()` for extra
 //!    guide lines, and `.footer()` to show it in footers, which should fit two
-//!    rows at 80 columns.
+//!    rows at 80 columns. Chain `.menu(group, letter)` to list it in the
+//!    `Space` menu; motion keys (arrows, paging) stay out of it.
 //! 3. Handle the variant in its scope's perform function: `perform_workflow`
 //!    (workflow_page.rs), `perform_monitor` (monitor.rs), `perform_runs`
 //!    (history.rs), `perform_harnesses` (harnesses.rs), or `perform_global`
@@ -86,6 +87,7 @@ pub(super) enum ActionId {
     HarnessDetails,
     RefreshHarnesses,
     // Everywhere
+    Menu,
     NextView,
     ShowWorkflow,
     ShowMonitor,
@@ -137,6 +139,42 @@ impl Scope {
     }
 }
 
+/// A `Space` menu group: the key after `Space`, then an action letter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Group {
+    Run,
+    Stage,
+    Workflow,
+    Go,
+    View,
+}
+
+impl Group {
+    pub(super) const ALL: [Group; 5] =
+        [Self::Run, Self::Stage, Self::Workflow, Self::Go, Self::View];
+    pub(super) fn key(self) -> char {
+        match self {
+            Self::Run => 'r',
+            Self::Stage => 's',
+            Self::Workflow => 'w',
+            Self::Go => 'g',
+            Self::View => 'v',
+        }
+    }
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Run => "Run",
+            Self::Stage => "Stage",
+            Self::Workflow => "Workflow",
+            Self::Go => "Go",
+            Self::View => "View",
+        }
+    }
+    pub(super) fn from_key(key: char) -> Option<Self> {
+        Self::ALL.into_iter().find(|group| group.key() == key)
+    }
+}
+
 enum Footer {
     No,
     /// In every footer the action applies to.
@@ -163,6 +201,8 @@ pub(super) struct Entry {
     /// Guide lines under `help`.
     pub(super) more: &'static [&'static str],
     footer: Footer,
+    /// Where the `Space` menu lists it: group, then the action's letter.
+    menu: Option<(Group, char)>,
 }
 
 impl Entry {
@@ -193,6 +233,12 @@ impl Entry {
             ..self
         }
     }
+    const fn menu(self, group: Group, letter: char) -> Self {
+        Self {
+            menu: Some((group, letter)),
+            ..self
+        }
+    }
     const fn footer_in(self, scopes: &'static [Scope]) -> Self {
         Self {
             footer: Footer::Only(scopes),
@@ -218,6 +264,7 @@ const fn act(
         help,
         more: &[],
         footer: Footer::No,
+        menu: None,
     }
 }
 const fn ch(c: char) -> Binding {
@@ -231,126 +278,137 @@ const fn ctrl(c: char) -> Binding {
 }
 
 // Table order is guide, menu, and footer order; page actions precede global ones.
+// Footers are one row: the most important hints first, since narrow
+// terminals drop them from the end. `Space menu` and `? keys` close every row.
 #[rustfmt::skip]
 const ACTIONS: &[Entry] = {
     use ActionId::*;
     use Scope::*;
+    use Group::{Go, Run as RunMenu, Stage, View, Workflow as WorkflowMenu};
     &[
         // Workflow
-        act(Run, Workflow, ch('r'), "run", "Start workflow").footer(),
-        act(EditTask, Workflow, ch('t'), "task", "Edit task ([Ctrl+S] applies; [Enter] adds a line)").footer(),
+        act(Run, Workflow, ch('r'), "run", "Start workflow").footer().menu(RunMenu, 'r'),
+        act(EditTask, Workflow, ch('t'), "task", "Edit task ([Ctrl+S] applies; [Enter] adds a line)").footer().menu(WorkflowMenu, 't'),
         act(ImportTask, Workflow, ch('f'), "import", "Import task/spec: browse files; [Ctrl+U] opens URL import")
             .more(&["Preview and edit; [Tab] append/replace; [Ctrl+S] apply; [Esc] back"])
-            .footer(),
+            .menu(WorkflowMenu, 'f'),
         act(Repositories, Workflow, ch('p'), "repos", "Browse repositories (type to filter; [Tab] for recent)")
             .more(&[
                 "[Enter] selects a repo or opens a folder; [→] browses inside a repo",
                 "[←] goes to parent; [/], [~] or [Ctrl+L] enters a path; [Esc] cancels",
             ])
-            .footer(),
-        act(ChooseWorkflow, Workflow, ch('w'), "switch", "Select/clone workflow or add a preset"),
-        act(RenameWorkflow, Workflow, ch('R'), "rename", "Rename workflow"),
-        act(DeleteWorkflow, Workflow, ch('X'), "delete", "Delete workflow ([y] confirms; [u] undoes)"),
+            .menu(WorkflowMenu, 'p'),
+        act(ChooseWorkflow, Workflow, ch('w'), "switch", "Select/clone workflow or add a preset").menu(WorkflowMenu, 'w'),
+        act(RenameWorkflow, Workflow, ch('R'), "rename", "Rename workflow").menu(WorkflowMenu, 'r'),
+        act(DeleteWorkflow, Workflow, ch('X'), "delete", "Delete workflow ([y] confirms; [u] undoes)").menu(WorkflowMenu, 'X'),
         act(PreviousStage, Workflow, key(KeyCode::Up), "select", "Select previous stage").also(&[ch('k')]),
         act(NextStage, Workflow, key(KeyCode::Down), "select", "Select next stage").also(&[ch('j')]),
-        act(EditStage, Workflow, ch('e'), "edit", "Edit selected stage").also(&[key(KeyCode::Enter)]),
+        act(EditStage, Workflow, ch('e'), "edit", "Edit selected stage").also(&[key(KeyCode::Enter)]).alias("e").footer().menu(Stage, 'e'),
         act(HarnessSettings, Workflow, ch('c'), "harness", "Configure selected harness (model, effort, execution, permissions)")
             .more(&[
                 "[Tab] or [Ctrl+N/P] fields; [←/→] choices; [F7] models",
                 "[Ctrl+S] applies; [Esc] cancels; [s] on Workflow saves",
             ])
-            .footer(),
-        act(PickHarness, Workflow, ch('h'), "pick harness", "Pick harness"),
-        act(Models, Workflow, ch('m'), "models", "Discover models").footer(),
-        act(ToggleStage, Workflow, ch(' '), "toggle", "Enable/disable stage, including optional review").footer(),
-        act(ToggleMode, Workflow, ch('v'), "execution", "Toggle unattended/interactive"),
-        act(AddStage, Workflow, ch('a'), "add", "Add stage preset (edit, then [Ctrl+S] inserts; [Esc] cancels)"),
-        act(DuplicateStage, Workflow, ch('d'), "duplicate", "Duplicate stage"),
-        act(RemoveStage, Workflow, ch('x'), "remove", "Remove stage ([u] undoes)"),
-        act(Undo, Workflow, ch('u'), "undo", "Undo the last stage removal or workflow deletion"),
-        act(MoveStageDown, Workflow, ch('J'), "move down", "Move stage down"),
-        act(MoveStageUp, Workflow, ch('K'), "move up", "Move stage up"),
-        act(ToggleWorktree, Workflow, ch('g'), "worktree", "Toggle isolated Git worktree"),
-        act(RepairLimit, Workflow, ch('l'), "repairs", "Set automatic repair limit"),
-        act(Preview, Workflow, ch('P'), "preview", "Preview commands (no model calls)"),
-        act(Save, Workflow, ch('s'), "save", "Save project").footer(),
-        act(SaveGlobal, Workflow, ch('S'), "save global", "Save global templates"),
+            .menu(Stage, 'c'),
+        act(PickHarness, Workflow, ch('h'), "pick harness", "Pick harness").menu(Stage, 'h'),
+        act(Models, Workflow, ch('m'), "models", "Discover models").footer().menu(Stage, 'm'),
+        act(ToggleStage, Workflow, ch('o'), "on/off", "Enable/disable stage, including optional review").footer().menu(Stage, 'o'),
+        act(ToggleMode, Workflow, ch('v'), "execution", "Toggle unattended/interactive").menu(Stage, 'v'),
+        act(AddStage, Workflow, ch('a'), "add", "Add stage preset (edit, then [Ctrl+S] inserts; [Esc] cancels)").menu(Stage, 'a'),
+        act(DuplicateStage, Workflow, ch('d'), "duplicate", "Duplicate stage").menu(Stage, 'd'),
+        act(RemoveStage, Workflow, ch('x'), "remove", "Remove stage ([u] undoes)").menu(Stage, 'x'),
+        act(Undo, Workflow, ch('u'), "undo", "Undo the last stage removal or workflow deletion").menu(Stage, 'u'),
+        act(MoveStageDown, Workflow, ch('J'), "move down", "Move stage down").menu(Stage, 'j'),
+        act(MoveStageUp, Workflow, ch('K'), "move up", "Move stage up").menu(Stage, 'k'),
+        act(ToggleWorktree, Workflow, ch('g'), "worktree", "Toggle isolated Git worktree").menu(WorkflowMenu, 'g'),
+        act(RepairLimit, Workflow, ch('l'), "repairs", "Set automatic repair limit").menu(WorkflowMenu, 'l'),
+        act(Preview, Workflow, ch('P'), "preview", "Preview commands (no model calls)").menu(WorkflowMenu, 'P'),
+        act(Save, Workflow, ch('s'), "save", "Save project").footer().menu(WorkflowMenu, 's'),
+        act(SaveGlobal, Workflow, ch('S'), "save global", "Save global templates").menu(WorkflowMenu, 'S'),
         // Monitor: while running, while idle, or both
-        act(CancelStage, MonitorRunning, ch('C'), "cancel stage", "Cancel active stage ([y] confirms)").footer(),
+        act(CancelStage, MonitorRunning, ch('C'), "cancel stage", "Cancel active stage ([y] confirms)").footer().menu(RunMenu, 'c'),
         act(TakeOver, Monitor, ch('t'), "terminal", "Attach to the live interactive terminal, or reopen the stage's saved session (an unattended stage stops first; [y] confirms)")
-            .footer_in(&[MonitorRunning]),
+            .footer_in(&[MonitorRunning])
+            .menu(RunMenu, 't'),
         act(PreviousSessionRun, Monitor, ch('['), "runs", "Show the previous run of this session").alias("[ ]").footer_in(&[MonitorRunning]),
         act(NextSessionRun, Monitor, ch(']'), "runs", "Show the next run of this session").alias("[ ]").footer_in(&[MonitorRunning]),
-        act(CloseRun, MonitorIdle, ch('x'), "close", "Close this run in the session; its files stay and Runs [3] reopens it"),
-        act(Advance, MonitorIdle, ch('a'), "advance", "Accept handoff and advance; also accepts a test stage's not-applicable waiver").footer(),
-        act(Continue, MonitorIdle, ch('c'), "continue", "Continue the run when idle (not in the moment a stage stops)").footer(),
-        act(Retry, MonitorIdle, ch('y'), "retry", "Explicitly retry current stage").footer(),
-        act(RetryInteractive, MonitorIdle, ch('i'), "interactive", "Retry current stage interactively").footer(),
-        act(RetryCandidate, MonitorIdle, ch('Y'), "retry candidate", "Retry one failed fan-out candidate of the stopped stage; the others keep their results"),
-        act(ReplaceModel, MonitorIdle, ch('m'), "model", "Replace current model and retry").footer(),
+        act(CloseRun, MonitorIdle, ch('x'), "close", "Close this run in the session; its files stay and Runs [3] reopens it").menu(RunMenu, 'x'),
+        act(Advance, MonitorIdle, ch('a'), "advance", "Accept handoff and advance; also accepts a test stage's not-applicable waiver").footer().menu(RunMenu, 'a'),
+        act(Continue, MonitorIdle, ch('c'), "continue", "Continue the run when idle (not in the moment a stage stops)").footer().menu(RunMenu, 'c'),
+        act(Retry, MonitorIdle, ch('y'), "retry", "Explicitly retry current stage").footer().menu(RunMenu, 'y'),
+        act(RetryInteractive, MonitorIdle, ch('i'), "interactive", "Retry current stage interactively").menu(RunMenu, 'i'),
+        act(RetryCandidate, MonitorIdle, ch('Y'), "retry candidate", "Retry one failed fan-out candidate of the stopped stage; the others keep their results").menu(RunMenu, 'f'),
+        act(ReplaceModel, MonitorIdle, ch('m'), "model", "Replace current model and retry").menu(RunMenu, 'm'),
         act(Handoff, Monitor, ch('h'), "handoff", "Inspect handoff/error").footer()
-            .more(&["Findings by severity, tests by status; [↑↓] picks a changed file, [e]/[Enter] opens it in $EDITOR"]),
-        act(EditSummary, MonitorIdle, ch('e'), "summary", "Edit interactive handoff summary").footer(),
+            .more(&["Findings by severity, tests by status; [↑↓] picks a changed file, [e]/[Enter] opens it in $EDITOR"])
+            .menu(View, 'h'),
+        act(EditSummary, MonitorIdle, ch('e'), "summary", "Edit interactive handoff summary").menu(RunMenu, 'e'),
         act(ScrollUp, Monitor, key(KeyCode::PageUp), "scroll", "Scroll output up")
             .alias("PgUp/PgDn")
             .footer_in(&[MonitorRunning]),
         act(ScrollDown, Monitor, key(KeyCode::PageDown), "scroll", "Scroll output down")
             .alias("PgUp/PgDn")
             .footer_in(&[MonitorRunning]),
-        act(OutputTop, Monitor, key(KeyCode::Home), "top", "Jump to the oldest output (pauses following)"),
-        act(OutputBottom, Monitor, key(KeyCode::End), "end", "Jump to the newest output and follow it again"),
-        act(FollowOutput, Monitor, ch('f'), "follow", "Pause or resume following new output; scrolling up also pauses"),
+        act(OutputTop, Monitor, key(KeyCode::Home), "top", "Jump to the oldest output (pauses following)").menu(View, 't'),
+        act(OutputBottom, Monitor, key(KeyCode::End), "end", "Jump to the newest output and follow it again").menu(View, 'e'),
+        act(FollowOutput, Monitor, ch('f'), "follow", "Pause or resume following new output; scrolling up also pauses").menu(View, 'f'),
         act(FindOutput, Monitor, ch('/'), "search", "Search the output log; matches are highlighted")
-            .more(&["Type, then [Enter]; [n]/[N] next/previous match while a search is shown; [Esc] clears it"]),
-        act(OpenLog, Monitor, ch('O'), "open log", "Open the focused attempt's raw stdout.log in $PAGER (default less -R)"),
+            .more(&["Type, then [Enter]; [n]/[N] next/previous match while a search is shown; [Esc] clears it"])
+            .menu(View, '/'),
+        act(OpenLog, Monitor, ch('O'), "open log", "Open the focused attempt's raw stdout.log in $PAGER (default less -R)").menu(View, 'O'),
         act(Diff, MonitorIdle, ch('d'), "diff", "Show the diff of changes made during a finished run")
             .more(&[
                 "Files left, hunks right: [ ] or n/p file; { } hunk; [/] search, n/N match; [w] wrap",
                 "[o] $PAGER; [e] $VISUAL/$EDITOR at the line in view; [D] git difftool --dir-diff (needs diff.tool)",
-            ]),
-        act(ToggleResults, MonitorIdle, ch('o'), "output", "Switch a finished run between results and output log"),
-        act(BackToWorkflow, MonitorIdle, ch('n'), "workflow", "Return to workflow editor").footer(),
+            ])
+            .footer()
+            .menu(View, 'd'),
+        act(ToggleResults, MonitorIdle, ch('o'), "output", "Switch a finished run between results and output log").menu(View, 'o'),
+        act(BackToWorkflow, MonitorIdle, ch('n'), "workflow", "Return to workflow editor"),
         // Runs
         act(PreviousRun, Runs, key(KeyCode::Up), "select", "Select previous run").also(&[ch('k')]).alias("↑↓").footer(),
         act(NextRun, Runs, key(KeyCode::Down), "select", "Select next run").also(&[ch('j')]).alias("↑↓").footer(),
-        act(OpenRun, Runs, key(KeyCode::Enter), "open", "Open selected run in the monitor (damaged: show its error)").footer(),
-        act(RefreshRuns, Runs, ch('r'), "refresh", "Reload saved runs and sizes"),
+        act(OpenRun, Runs, key(KeyCode::Enter), "open", "Open selected run in the monitor (damaged: show its error)").footer().menu(RunMenu, 'o'),
+        act(RefreshRuns, Runs, ch('r'), "refresh", "Reload saved runs and sizes").menu(View, 'r'),
         act(FilterRuns, Runs, ch('/'), "filter", "Filter by ID, workflow, task, or status")
             .more(&["Type to filter; [Enter] keeps it; [Esc] clears it"])
-            .footer(),
-        act(CycleStatus, Runs, ch('f'), "status", "Cycle status: all, active, complete, failed/blocked, cancelled, damaged").footer(),
-        act(Rerun, Runs, ch('n'), "rerun", "Rerun as a new run from the saved snapshot (confirm first)").footer(),
-        act(CompareAttempts, Runs, ch('c'), "compare", "Compare two attempts of a stage").footer(),
-        act(CleanUp, Runs, ch('D'), "clean", "Preview removing the run and its artifacts ([y] confirms)").footer(),
+            .footer()
+            .menu(View, '/'),
+        act(CycleStatus, Runs, ch('f'), "status", "Cycle status: all, active, complete, failed/blocked, cancelled, damaged").footer().menu(View, 'f'),
+        act(Rerun, Runs, ch('n'), "rerun", "Rerun as a new run from the saved snapshot (confirm first)").footer().menu(RunMenu, 'n'),
+        act(CompareAttempts, Runs, ch('c'), "compare", "Compare two attempts of a stage").menu(View, 'c'),
+        act(CleanUp, Runs, ch('D'), "clean", "Preview removing the run and its artifacts ([y] confirms)").menu(RunMenu, 'D'),
         // Harnesses
         act(PreviousHarness, Harnesses, key(KeyCode::Up), "select", "Select previous harness").also(&[ch('k')]).alias("↑↓").footer(),
         act(NextHarness, Harnesses, key(KeyCode::Down), "select", "Select next harness").also(&[ch('j')]).alias("↑↓").footer(),
-        act(HarnessDetails, Harnesses, key(KeyCode::Enter), "details", "Show version, flag checks, and notes").footer(),
-        act(RefreshHarnesses, Harnesses, ch('r'), "refresh", "Run version and flag checks again").footer(),
+        act(HarnessDetails, Harnesses, key(KeyCode::Enter), "details", "Show version, flag checks, and notes").footer().menu(View, 'i'),
+        act(RefreshHarnesses, Harnesses, ch('r'), "refresh", "Run version and flag checks again").footer().menu(View, 'r'),
         // Everywhere
-        act(NextView, Global, key(KeyCode::Tab), "switch view", "Switch to the next view")
-            .footer_in(&[MonitorRunning, Runs, Harnesses]),
-        act(ShowWorkflow, Global, ch('1'), "workflow", "Show Workflow"),
-        act(ShowMonitor, Global, ch('2'), "monitor", "Show Monitor"),
-        act(ShowRuns, Global, ch('3'), "runs", "Show Runs (reloads saved runs)"),
-        act(ShowHarnesses, Global, ch('4'), "harnesses", "Show Harnesses"),
+        act(Menu, Global, ch(' '), "menu", "Action menu: press a group letter, then an action letter")
+            .more(&["[Backspace] returns to the groups; [Esc] closes"]),
+        act(NextView, Global, key(KeyCode::Tab), "switch view", "Switch to the next view"),
+        act(ShowWorkflow, Global, ch('1'), "workflow", "Show Workflow").menu(Go, 'w'),
+        act(ShowMonitor, Global, ch('2'), "monitor", "Show Monitor").menu(Go, 'm'),
+        act(ShowRuns, Global, ch('3'), "runs", "Show Runs (reloads saved runs)").menu(Go, 'r'),
+        act(ShowHarnesses, Global, ch('4'), "harnesses", "Show Harnesses").menu(Go, 'h'),
         act(Themes, Global, ch('T'), "themes", "Choose theme (type to filter; [↑↓] or [Ctrl+N/P] preview)")
             .more(&["[Enter] saves for all projects; [Esc] restores the current theme"])
-            .footer(),
-        act(Stats, Global, ch('I'), "stats", "Routing stats: outcomes per role, harness, and model from saved runs (suggestions only)"),
+            .menu(View, 'T'),
+        act(Stats, Global, ch('I'), "stats", "Routing stats: outcomes per role, harness, and model from saved runs (suggestions only)").menu(Go, 's'),
         act(ToggleVim, Global, key(KeyCode::F(8)), "Vim motions", "Toggle optional Vim motions in input fields (saved for all projects)")
-            .more(&["Inputs start in Insert mode; Esc enters Normal mode; Esc again cancels", "Normal: h/j/k/l, w/b/e, 0/^/$, gg/G; i/a/I/A resume typing"]),
-        act(Help, Global, ch('?'), "help", "Keyboard guide").footer_in(&[Workflow, MonitorIdle, Harnesses]),
-        act(Quit, Global, ch('q'), "quit", "Exit, asking to save unsaved workflow edits and whether to leave interactive stages running (stops other work first)")
-            .footer_in(&[Workflow, MonitorRunning, Runs, Harnesses]),
-        act(Commands, Global, ch(':'), "commands", "Command menu: search this view's actions")
-            .footer_in(&[MonitorRunning, Runs, Harnesses]),
+            .more(&["Inputs start in Insert mode; Esc enters Normal mode; Esc again cancels", "Normal: h/j/k/l, w/b/e, 0/^/$, gg/G; i/a/I/A resume typing"])
+            .menu(View, 'V'),
+        act(Help, Global, ch('?'), "keys", "Keyboard guide").menu(View, '?'),
+        act(Quit, Global, ch('q'), "quit", "Exit, asking to save unsaved workflow edits and whether to leave interactive stages running (stops other work first)").menu(Go, 'q'),
+        act(Commands, Global, ch(':'), "commands", "Command menu: search this view's actions").menu(View, ':'),
         act(SessionRuns, Global, ch('L'), "session runs", "List this session's runs: status, stage, elapsed, needs input")
-            .more(&["[Enter] focuses; [n] jumps to the next needing input; [C] cancels a run's stage ([y] confirms)"]),
-        act(NextNeedsInput, Global, ch('N'), "needs input", "Jump to the next run of this session that needs input"),
-        act(Notices, Global, ch('!'), "notices", "Notice history: what this session's runs reported, newest first"),
+            .more(&["[Enter] focuses; [n] jumps to the next needing input; [C] cancels a run's stage ([y] confirms)"])
+            .menu(Go, 'l'),
+        act(NextNeedsInput, Global, ch('N'), "needs input", "Jump to the next run of this session that needs input").menu(Go, 'n'),
+        act(Notices, Global, ch('!'), "notices", "Notice history: what this session's runs reported, newest first").menu(Go, '!'),
         act(Notifications, Global, key(KeyCode::F(9)), "notifications", "Notifications…: terminal, desktop, and webhook backends, with a test")
-            .more(&["Sent when a run needs input, stops blocked or failed, or completes (saved for all projects)"]),
+            .more(&["Sent when a run needs input, stops blocked or failed, or completes (saved for all projects)"])
+            .menu(View, 'N'),
         act(Interrupt, Global, ctrl('c'), "cancel/exit", "Cancel work, or exit (asks to save unsaved edits)"),
     ]
 };
@@ -414,6 +472,31 @@ pub(super) fn footer(here: Scope) -> Vec<(String, &'static str)> {
         .collect();
     hints.dedup();
     hints
+}
+
+/// The `Space` menu for `here`: each group with its actions as (letter,
+/// entry), in table order. Groups with nothing to do here are left out.
+pub(super) fn menu(here: Scope) -> Vec<(Group, Vec<(char, &'static Entry)>)> {
+    Group::ALL
+        .into_iter()
+        .map(|group| {
+            let items: Vec<_> = available(here)
+                .filter_map(|entry| match entry.menu {
+                    Some((g, letter)) if g == group => Some((letter, entry)),
+                    _ => None,
+                })
+                .collect();
+            (group, items)
+        })
+        .filter(|(_, items)| !items.is_empty())
+        .collect()
+}
+
+/// The action at `letter` in `group` of the `Space` menu for `here`.
+pub(super) fn menu_action(here: Scope, group: Group, letter: char) -> Option<ActionId> {
+    available(here)
+        .find(|entry| entry.menu == Some((group, letter)))
+        .map(|entry| entry.id)
 }
 
 /// The keyboard guide in `guide_text` format: every action under its page.
@@ -548,6 +631,34 @@ mod tests {
                 KeyModifiers::NONE
             ),
             None
+        );
+    }
+
+    #[test]
+    fn menu_letters_are_unique_in_each_group_and_reach_their_action() {
+        for here in EVERY_SCOPE {
+            for (group, items) in menu(here) {
+                for (index, (letter, entry)) in items.iter().enumerate() {
+                    assert!(
+                        items[index + 1..].iter().all(|(l, _)| l != letter),
+                        "{here:?}: Space {} {letter} is listed twice",
+                        group.key()
+                    );
+                    assert_eq!(menu_action(here, group, *letter), Some(entry.id));
+                }
+            }
+        }
+        // Each view's actions are reachable; a running stage cannot advance.
+        let workflow = menu(Scope::Workflow);
+        assert!(workflow.iter().any(|(g, _)| *g == Group::Stage));
+        assert_eq!(
+            menu_action(Scope::Workflow, Group::Stage, 'o'),
+            Some(ActionId::ToggleStage)
+        );
+        assert_eq!(menu_action(Scope::MonitorRunning, Group::Run, 'a'), None);
+        assert_eq!(
+            menu_action(Scope::MonitorIdle, Group::Run, 'a'),
+            Some(ActionId::Advance)
         );
     }
 
