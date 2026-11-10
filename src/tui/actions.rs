@@ -84,6 +84,8 @@ pub(super) enum ActionId {
     HarnessDetails,
     RefreshHarnesses,
     TestHarness,
+    MarkHarness,
+    MarkAllHarnesses,
     // Everywhere
     Menu,
     NextView,
@@ -390,12 +392,17 @@ const ACTIONS: &[Entry] = {
         // Harnesses
         act(PreviousHarness, Harnesses, key(KeyCode::Up), "select", "Select previous harness").also(&[ch('k')]).alias("↑↓").footer(),
         act(NextHarness, Harnesses, key(KeyCode::Down), "select", "Select next harness").also(&[ch('j')]).alias("↑↓").footer(),
-        act(HarnessDetails, Harnesses, key(KeyCode::Enter), "details", "Show version, flag checks, and notes").footer().menu(View, 'i'),
-        act(RefreshHarnesses, Harnesses, ch('r'), "refresh", "Run version and flag checks again").footer().menu(View, 'r'),
-        act(TestHarness, Harnesses, ch('t'), "test", "Test the selected harness with one real, possibly billed, request ([y] confirms)")
-            .more(&["Runs scripts/capture_harness_output.py; needs a model-router checkout as the project"])
+        act(TestHarness, Harnesses, ch('t'), "test", "Test the marked harnesses, else the selected one: one real, possibly billed, request each ([y] confirms)")
+            .more(&[
+                "Runs scripts/capture_harness_output.py in parallel; needs a model-router checkout as the project",
+                "Failed harnesses stay marked, so [t] retries them",
+            ])
             .footer()
             .menu(RunMenu, 't'),
+        act(MarkHarness, Harnesses, ch('x'), "mark", "Mark or unmark the selected harness for a batch test").footer().menu(RunMenu, 'x'),
+        act(MarkAllHarnesses, Harnesses, ch('a'), "mark all", "Mark every installed harness, or clear the marks when all are marked").menu(RunMenu, 'a'),
+        act(HarnessDetails, Harnesses, key(KeyCode::Enter), "details", "Show version, flag checks, and notes").footer().menu(View, 'i'),
+        act(RefreshHarnesses, Harnesses, ch('r'), "refresh", "Run version and flag checks again").footer().menu(View, 'r'),
         // Everywhere
         act(Menu, Global, ch(' '), "menu", "Action menu: press a group letter, then an action letter")
             .more(&["[Backspace] returns to the groups; [Esc] closes"]),

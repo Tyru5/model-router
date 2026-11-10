@@ -161,6 +161,9 @@ ship; `gh` serves GitHub task imports and `ship --draft-pr`). It cannot check
 logins.
 `--strict` fails when an installed harness lacks a flag. The Harnesses page
 (`3`) runs the same checks; the stage details then warn about missing flags.
+A version counts as `tested` when a captured parser fixture covers it, or
+when a live test from the Harnesses page passed in this project
+([tui.md](tui.md#live-tests)).
 Details: [adapters.md](adapters.md#compatibility-checks).
 
 ## Custom adapters

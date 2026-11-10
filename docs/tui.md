@@ -314,19 +314,35 @@ Runs `doctor` checks in the background: version, tested status,
 capabilities. `↑↓`/`kj` select, `Enter` lists each flag and note, `r`
 rechecks. See [harnesses.md](harnesses.md#doctor).
 
-`t` tests the selected harness live: after `y` confirms, it runs
-`scripts/capture_harness_output.py` in the background with the running `mr`
-as `--router`. That sends one real request, which the provider may bill. The
-panel title says `testing <harness>…`; the result opens with the command,
-exit status, and script output. The sanitized output and a one-entry
-`manifest.toml` go to `.model-router/harness-tests/<harness>-<time>/`. To keep
-it as a [parser fixture](adapters.md#parser-fixtures), copy the output file
-into `tests/fixtures/harness-output/<harness>/` (renaming it if the name is
-taken, and updating the entry's `file`) and append its `[[fixture]]` entry to
-the existing manifest. One test runs at a time per project; quitting or
-switching projects does not stop a running test, and its result is dropped.
-The footer shows `t` only when the project is a model-router checkout;
-elsewhere the key explains what it needs.
+### Live tests
+
+`x` marks the selected harness for a batch test, and `a` marks every
+installed harness (again: clears the marks). `t` tests the marked harnesses,
+or the selected one when none are marked. After `y` confirms, each test runs
+`scripts/capture_harness_output.py` in the background, in parallel, with the
+running `mr` as `--router`. Each sends one real request, which the provider
+may bill. The script covers built-in harnesses: custom adapters and missing
+harnesses cannot be marked, marking waits for the first check, and `t`
+unmarks any that a later check found missing.
+
+While tests run, the TESTED column says `testing…` and the panel title counts
+them. When the batch finishes, one dialog lists each harness's result, then
+each command, exit status, and script output. A failed harness shows
+`failed` and stays marked, so `t` retries it; a passed one is unmarked.
+
+A passing test saves the sanitized output and a one-entry `manifest.toml` in
+`.model-router/harness-tests/<harness>-<time>/`. Doctor reads these
+manifests, so the checks rerun and TESTED says `tested` for that version in
+this project. To keep the output as a
+[parser fixture](adapters.md#parser-fixtures), copy the output file into
+`tests/fixtures/harness-output/<harness>/` (renaming it if the name is taken,
+and updating the entry's `file`) and append its `[[fixture]]` entry to the
+existing manifest.
+
+One batch runs at a time per project; quitting or switching projects does not
+stop running tests, and their results are dropped. The footer shows `t` and
+`x` only when the project is a model-router checkout; elsewhere the keys
+explain what they need.
 
 ## Stats dialog
 

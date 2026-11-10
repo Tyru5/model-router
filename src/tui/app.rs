@@ -577,7 +577,7 @@ impl App {
         self.harnesses.selected = 0;
         self.harnesses.checks.clear();
         // A test of the old project still runs, but its result is dropped.
-        self.harnesses.tests.running = None;
+        self.harnesses.tests.reset();
         self.catalogs = Catalogs::default();
         self.editor.undo.clear();
         self.ui.page = Page::Workflow;
@@ -914,7 +914,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
             }
         }
         if app.page_scope() == Scope::Harnesses && !app.can_test_harnesses() {
-            skip.push(ActionId::TestHarness);
+            skip.extend([ActionId::TestHarness, ActionId::MarkHarness]);
         }
         actions::footer(app.page_scope(), &skip)
     };

@@ -163,10 +163,13 @@ Authentication is not checked: that needs a model request. Log in through each h
   or long alias; a flag mentioned in prose does not. A flag is `supported`,
   `missing`, or `unknown` (help unavailable). Missing means current help lacks
   it: the harness removed or hid it.
-- **Tested** means the detected version has captured parser fixtures (below).
+- **Tested** means the detected version has captured parser fixtures (below),
+  or a live test of that version passed in this project
+  ([tui.md](tui.md#live-tests)).
   A version whose fixtures are all schema-derived shows `schema-derived`
   instead; others show `untested`. JSON reports carry `version_tested` (any
-  fixture) and `version_captured`. Doctor's detected version is reused by
+  fixture) and `version_captured` (a captured fixture, or a live pass in this
+  project). Doctor's detected version is reused by
   adapters that change flags by version (OpenCode).
 - Custom adapters show `not declared`: they have no flag contract, so doctor
   does not run them.
@@ -218,5 +221,5 @@ sandbox, and Gemini plan approval. The task asks for a fixed handoff block. It
 sanitizes the attempt's `stdout.log` (prompt echoes, paths, user and host
 names, emails, IDs, and keys) into `<harness>/captured-success.<ext>` and
 appends a `captured` manifest entry with the adapter's format. Review both before committing.
-In the TUI, `t` on Harnesses runs the same script for the selected harness
-([tui.md](tui.md#harnesses-3)).
+In the TUI, `t` on Harnesses runs the same script for the marked harnesses,
+or the selected one ([tui.md](tui.md#live-tests)).

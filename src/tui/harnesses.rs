@@ -20,6 +20,7 @@ use ratatui::{
     widgets::{Cell, HighlightSpacing, Row, Table, TableState},
 };
 use std::{
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -41,21 +42,65 @@ pub(super) struct HarnessTest {
     /// Where the script saves the sanitized output and its manifest entry.
     pub(super) output: PathBuf,
 }
+/// How a finished test went.
+#[derive(Clone, Debug)]
+pub(super) struct TestOutcome {
+    pub(super) passed: bool,
+    /// The result dialog's body: command, exit status, output.
+    pub(super) report: String,
+}
 /// Runs a test; tests swap in a stub so no request is sent.
-pub(super) type TestRunner = fn(&HarnessTest) -> Result<String, String>;
+pub(super) type TestRunner = fn(&HarnessTest) -> Result<TestOutcome, String>;
 
-/// The live test started from the Harnesses page.
+/// A harness's live test this session, shown in the TESTED column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LiveTest {
+    Running,
+    Passed,
+    Failed,
+}
+
+/// Live tests started from the Harnesses page.
 pub(super) struct HarnessTests {
-    /// The harness under test; one test runs at a time.
-    pub(super) running: Option<String>,
+    /// Harnesses marked for the next batch.
+    pub(super) marked: BTreeSet<String>,
+    /// The latest test of each harness this session.
+    pub(super) states: BTreeMap<String, LiveTest>,
+    /// The running batch in start order, with each result once it arrives.
+    /// One batch runs at a time; its tests run in parallel.
+    pub(super) batch: Vec<(String, Option<Result<TestOutcome, String>>)>,
+    /// Identifies the running batch, so a result from an earlier one (e.g.
+    /// of another project) is dropped.
+    pub(super) batch_id: u64,
     pub(super) runner: TestRunner,
 }
 impl Default for HarnessTests {
     fn default() -> Self {
         Self {
-            running: None,
+            marked: BTreeSet::new(),
+            states: BTreeMap::new(),
+            batch: vec![],
+            batch_id: 0,
             runner: run_test,
         }
+    }
+}
+impl HarnessTests {
+    /// Harnesses of the batch still running.
+    pub(super) fn running(&self) -> Vec<&str> {
+        self.batch
+            .iter()
+            .filter(|(_, result)| result.is_none())
+            .map(|(harness, _)| harness.as_str())
+            .collect()
+    }
+    /// Forgets marks, states, and the batch, e.g. on a project switch; a
+    /// running test's result is dropped when it arrives.
+    pub(super) fn reset(&mut self) {
+        *self = Self {
+            runner: self.runner,
+            ..Self::default()
+        };
     }
 }
 
@@ -66,6 +111,9 @@ pub(super) struct HarnessChecks {
     pub(super) reports: Vec<Report>,
     /// A check is running.
     pub(super) checking: bool,
+    /// Check again when the running one finishes: it may have read the
+    /// project before a live test saved its manifest.
+    pub(super) again: bool,
     /// Tests swap in a stub so no harness runs.
     pub(super) probe: Probe,
 }
@@ -87,6 +135,7 @@ impl HarnessChecks {
         Self {
             reports: vec![],
             checking: false,
+            again: false,
             probe: doctor::inspect_all,
         }
     }
@@ -103,9 +152,18 @@ impl HarnessChecks {
             Msg::Checks,
         );
     }
+    /// Starts a check, or queues one after the running check.
+    pub(super) fn refresh(&mut self, settings: &Settings, project: &Path, tasks: &Tasks) {
+        if self.checking {
+            self.again = true;
+        } else {
+            self.start(settings, project, tasks);
+        }
+    }
     pub(super) fn clear(&mut self) {
         self.reports.clear();
         self.checking = false;
+        self.again = false;
     }
     pub(super) fn report(&self, harness: &str) -> Option<&Report> {
         self.reports.iter().find(|r| r.harness == harness)
@@ -172,7 +230,7 @@ impl HarnessTest {
 }
 
 /// Runs the script and reports its command, exit status, and output.
-fn run_test(test: &HarnessTest) -> Result<String, String> {
+fn run_test(test: &HarnessTest) -> Result<TestOutcome, String> {
     let argv = test.argv();
     let output = Command::new(&argv[0])
         .args(&argv[1..])
@@ -186,12 +244,11 @@ fn run_test(test: &HarnessTest) -> Result<String, String> {
         text.push('\n');
     }
     text.push_str(&stdout);
-    Ok(test_report(
-        test,
-        output.status.success(),
-        &output.status.to_string(),
-        &text,
-    ))
+    let passed = output.status.success();
+    Ok(TestOutcome {
+        passed,
+        report: test_report(test, passed, &output.status.to_string(), &text),
+    })
 }
 
 /// The result dialog's body.
@@ -248,20 +305,104 @@ impl App {
                     .checks
                     .start(&self.editor.settings, &self.project, &self.tasks)
             }
-            ActionId::TestHarness => {
+            ActionId::TestHarness | ActionId::MarkHarness | ActionId::MarkAllHarnesses
+                if !self.can_test_harnesses() =>
+            {
+                self.ui.message = format!(
+                    "Testing needs {TEST_SCRIPT}; open a model-router checkout as the project."
+                );
+            }
+            // Marks need check results: only then is "installed" known.
+            ActionId::MarkHarness | ActionId::MarkAllHarnesses
+                if self.harnesses.checks.reports.is_empty() =>
+            {
+                self.ui.message = if self.harnesses.checks.checking {
+                    "Wait for the harness check: marks need to know what is installed."
+                } else {
+                    "No check results to mark from; [r] rechecks."
+                }
+                .into();
+            }
+            ActionId::MarkHarness => {
                 let Some(harness) = self.harnesses.selected_name(&self.editor.settings) else {
                     return Ok(());
                 };
-                if let Some(running) = &self.harnesses.tests.running {
-                    self.ui.message = format!("Still testing {running}; one test runs at a time.");
-                } else if !self.can_test_harnesses() {
-                    self.ui.message = format!(
-                        "Testing needs {TEST_SCRIPT}; open a model-router checkout as the project."
-                    );
+                let marked = &mut self.harnesses.tests.marked;
+                if marked.remove(&harness) {
+                    self.ui.message = format!("Unmarked {harness}; {} marked.", marked.len());
+                } else if let Some(why) = self.untestable(&harness) {
+                    self.ui.message = why;
                 } else {
-                    self.ui
-                        .open(Modal::Ask(Box::new(Ask::TestHarness { harness })));
+                    let marked = &mut self.harnesses.tests.marked;
+                    marked.insert(harness.clone());
+                    self.ui.message = format!(
+                        "Marked {harness}; {} marked. [t] tests the marked harnesses.",
+                        marked.len()
+                    );
                 }
+            }
+            ActionId::MarkAllHarnesses => {
+                let testable: Vec<_> = self
+                    .harnesses
+                    .names(&self.editor.settings)
+                    .into_iter()
+                    .filter(|name| self.untestable(name).is_none())
+                    .collect();
+                let marked = &mut self.harnesses.tests.marked;
+                marked.retain(|name| testable.contains(name));
+                if testable.is_empty() {
+                    self.ui.message = "No installed built-in harnesses to mark.".into();
+                } else if testable.iter().all(|name| marked.contains(name)) {
+                    marked.clear();
+                    self.ui.message = "Cleared all marks.".into();
+                } else {
+                    marked.extend(testable);
+                    self.ui.message = format!(
+                        "Marked {} installed harnesses. [t] tests them.",
+                        marked.len()
+                    );
+                }
+            }
+            ActionId::TestHarness => {
+                let running = self.harnesses.tests.running();
+                if !running.is_empty() {
+                    self.ui.message = format!(
+                        "Still testing {}; one batch runs at a time.",
+                        running.join(", ")
+                    );
+                    return Ok(());
+                }
+                // The marked harnesses in display order, else the selected
+                // one. A check since marking may have found one missing.
+                let names = self.harnesses.names(&self.editor.settings);
+                let (mut harnesses, dropped): (Vec<_>, Vec<_>) = names
+                    .iter()
+                    .filter(|name| self.harnesses.tests.marked.contains(*name))
+                    .cloned()
+                    .partition(|name| self.untestable(name).is_none());
+                let marked = &mut self.harnesses.tests.marked;
+                marked.retain(|name| harnesses.contains(name));
+                if !dropped.is_empty() {
+                    self.ui.message = format!(
+                        "Unmarked {}: not installed or not built in.",
+                        dropped.join(", ")
+                    );
+                    if harnesses.is_empty() {
+                        return Ok(());
+                    }
+                }
+                if harnesses.is_empty() {
+                    let Some(harness) = self.harnesses.selected_name(&self.editor.settings) else {
+                        return Ok(());
+                    };
+                    if let Some(why) = self.untestable(&harness) {
+                        self.ui.message = why;
+                        return Ok(());
+                    }
+                    harnesses.push(harness);
+                }
+                self.ui
+                    .open(Modal::Ask(Box::new(Ask::TestHarness { harnesses })));
             }
             other => bail!("{other:?} is not a Harnesses action"),
         }
@@ -276,46 +417,185 @@ impl App {
     }
     /// Where a test of `harness` started now saves its output.
     pub(super) fn test_output(&self, harness: &str) -> PathBuf {
-        self.project
-            .join(".model-router/harness-tests")
-            .join(format!(
-                "{harness}-{}",
-                chrono::Local::now().format("%Y%m%d-%H%M%S")
-            ))
+        self.project.join(doctor::LIVE_TESTS).join(format!(
+            "{harness}-{}",
+            chrono::Local::now().format("%Y%m%d-%H%M%S")
+        ))
     }
-    /// Starts the confirmed live test of `harness` in the background.
-    pub(super) fn start_harness_test(&mut self, harness: String) -> Result<()> {
-        if self.harnesses.tests.running.is_some() {
+    /// Why `harness` cannot be tested: the script covers built-in
+    /// harnesses, and a checked one must be installed.
+    fn untestable(&self, harness: &str) -> Option<String> {
+        if crate::harness::get(harness).is_none() {
+            return Some(format!(
+                "{harness} is a custom adapter; the test script covers built-in harnesses."
+            ));
+        }
+        match self.harnesses.checks.report(harness) {
+            Some(report) if !report.installed() => Some(format!("{harness} is not installed.")),
+            _ => None,
+        }
+    }
+    /// Starts the confirmed batch: each harness's test runs in parallel in
+    /// the background.
+    pub(super) fn start_harness_tests(&mut self, harnesses: Vec<String>) -> Result<()> {
+        if !self.harnesses.tests.batch.is_empty() {
+            return Ok(());
+        }
+        // A check may have landed while the confirmation was open.
+        let (harnesses, dropped): (Vec<_>, Vec<_>) = harnesses
+            .into_iter()
+            .partition(|name| self.untestable(name).is_none());
+        let skipped = if dropped.is_empty() {
+            String::new()
+        } else {
+            let marked = &mut self.harnesses.tests.marked;
+            marked.retain(|name| !dropped.contains(name));
+            format!(
+                "Skipped {}: not installed or not built in.",
+                dropped.join(", ")
+            )
+        };
+        if harnesses.is_empty() {
+            self.ui.message = skipped;
             return Ok(());
         }
         let router = running_router()?;
-        let test = HarnessTest {
-            output: self.test_output(&harness),
-            harness: harness.clone(),
-            project: self.project.clone(),
-            router,
-        };
         let runner = self.harnesses.tests.runner;
-        self.harnesses.tests.running = Some(harness.clone());
-        self.ui.message =
-            format!("Testing {harness}: one real request; the result opens when it finishes.");
-        self.tasks.spawn(
-            "Harness test stopped unexpectedly",
-            move || runner(&test),
-            move |result| Msg::HarnessTest { harness, result },
-        );
+        let batch = super::tasks::ticket();
+        self.harnesses.tests.batch_id = batch;
+        for harness in &harnesses {
+            let test = HarnessTest {
+                output: self.test_output(harness),
+                harness: harness.clone(),
+                project: self.project.clone(),
+                router: router.clone(),
+            };
+            let tests = &mut self.harnesses.tests;
+            tests.states.insert(harness.clone(), LiveTest::Running);
+            tests.batch.push((harness.clone(), None));
+            let harness = harness.clone();
+            self.tasks.spawn(
+                "Harness test stopped unexpectedly",
+                move || runner(&test),
+                move |result| Msg::HarnessTest {
+                    batch,
+                    harness,
+                    result,
+                },
+            );
+        }
+        self.ui.message = match harnesses.len() {
+            1 => format!(
+                "Testing {}: one real request; the result opens when it finishes.",
+                harnesses[0]
+            ),
+            n => format!(
+                "Testing {n} harnesses: one real request each; results open when all finish."
+            ),
+        };
+        if !skipped.is_empty() {
+            self.ui.message = format!("{skipped} {}", self.ui.message);
+        }
         Ok(())
     }
-    pub(super) fn harness_tested(&mut self, harness: String, result: Result<String, String>) {
-        self.harnesses.tests.running = None;
-        match result {
-            Ok(body) => {
-                self.ui.message = format!("Test of {harness} finished.");
-                self.text(&format!("Test · {harness}"), body)
+    /// One test of the batch finished; the last one opens the results.
+    pub(super) fn harness_tested(
+        &mut self,
+        batch: u64,
+        harness: String,
+        result: Result<TestOutcome, String>,
+    ) {
+        let tests = &mut self.harnesses.tests;
+        if batch != tests.batch_id {
+            return;
+        }
+        let Some(slot) = tests
+            .batch
+            .iter_mut()
+            .find(|(name, result)| *name == harness && result.is_none())
+        else {
+            return;
+        };
+        let passed = matches!(&result, Ok(outcome) if outcome.passed);
+        slot.1 = Some(result);
+        tests.states.insert(
+            harness.clone(),
+            if passed {
+                LiveTest::Passed
+            } else {
+                LiveTest::Failed
+            },
+        );
+        let left = tests.running().len();
+        if left > 0 {
+            self.ui.message = format!(
+                "{harness} {}; {left} still testing.",
+                if passed { "passed" } else { "failed" }
+            );
+            return;
+        }
+        let batch = std::mem::take(&mut tests.batch);
+        let mut passes = 0;
+        for (name, result) in &batch {
+            // Failures are marked even if their marks were cleared meanwhile.
+            if matches!(result, Some(Ok(outcome)) if outcome.passed) {
+                passes += 1;
+                tests.marked.remove(name);
+            } else {
+                tests.marked.insert(name.clone());
             }
-            Err(error) => self.ui.error(error),
+        }
+        let fails = batch.len() - passes;
+        self.ui.message = match (batch.len(), fails) {
+            (1, 0) => format!("Test of {harness} passed."),
+            (1, _) => format!("Test of {harness} failed."),
+            (n, 0) => format!("All {n} harness tests passed."),
+            (n, fails) => format!("{fails} of {n} harness tests failed."),
+        };
+        let (title, body) = match batch.as_slice() {
+            [(name, Some(result))] => (format!("Test · {name}"), body_of(result)),
+            _ => ("Harness tests".to_owned(), summary(&batch, passes)),
+        };
+        self.text(&title, body);
+        // Passing tests saved manifests that doctor reads: refresh TESTED.
+        if passes > 0 {
+            self.harnesses
+                .checks
+                .refresh(&self.editor.settings, &self.project, &self.tasks);
         }
     }
+}
+
+fn body_of(result: &Result<TestOutcome, String>) -> String {
+    match result {
+        Ok(outcome) => outcome.report.clone(),
+        Err(error) => format!("✗ Could not run the test: {error}\n"),
+    }
+}
+
+/// The batch dialog: a line per harness, then each report.
+fn summary(batch: &[(String, Option<Result<TestOutcome, String>>)], passes: usize) -> String {
+    let fails = batch.len() - passes;
+    let mut text = format!("{passes} passed, {fails} failed.");
+    if fails > 0 {
+        text.push_str(" Failed harnesses stay marked; [t] retries them.");
+    }
+    text.push_str("\n\n");
+    let width = batch.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+    for (name, result) in batch {
+        let line = match result {
+            Some(Ok(outcome)) => outcome.report.lines().next().unwrap_or_default().to_owned(),
+            Some(Err(error)) => format!("✗ Could not run: {error}"),
+            None => "still running".into(),
+        };
+        text.push_str(&format!("{name:<width$}  {line}\n"));
+    }
+    for (name, result) in batch {
+        if let Some(result) = result {
+            text.push_str(&format!("\n── {name} ──\n{}", body_of(result)));
+        }
+    }
+    text
 }
 
 /// The running executable. On Linux a rebuild while `mr` runs leaves the
@@ -404,13 +684,23 @@ fn clip(text: &str, width: usize) -> String {
 
 pub(super) fn draw_harnesses(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
     let checks = &app.harnesses.checks;
+    let tests = &app.harnesses.tests;
+    // A mark column for batch tests, in a model-router checkout.
+    let marks = app.can_test_harnesses();
     let wide = area.width >= 110;
     let names = app.harnesses.names(&app.editor.settings);
     let name_width = names.iter().map(|n| n.chars().count()).max().unwrap_or(7);
     let name_width = name_width.clamp(7, 14);
     let version_width = if area.width >= 140 { 22 } else { 10 };
     // Borders, padding, highlight symbol, and column gaps.
-    let fixed = 4 + 1 + name_width + 11 + version_width + 8 + if wide { 5 } else { 4 };
+    let fixed = 4
+        + 1
+        + name_width
+        + 11
+        + version_width
+        + 8
+        + if wide { 5 } else { 4 }
+        + if marks { 4 } else { 0 };
     let rest = (area.width as usize).saturating_sub(fixed);
     let (caps_width, path_width) = if wide {
         let caps = rest.min(48);
@@ -419,24 +709,66 @@ pub(super) fn draw_harnesses(frame: &mut Frame<'_>, app: &App, area: Rect, palet
         (rest, 0)
     };
     let styled = |text: String, color: Color| Cell::from(text).style(Style::default().fg(color));
+    let mark = |name: &str| {
+        let marked = tests.marked.contains(name);
+        styled(
+            if marked { "[x]" } else { "[ ]" }.into(),
+            if marked {
+                palette.accent
+            } else {
+                palette.muted
+            },
+        )
+    };
     let rows = names.iter().map(|name| {
         let Some(r) = checks.report(name) else {
-            return Row::new([
-                Cell::from(clip(name, name_width)),
-                styled(
-                    if checks.checking {
-                        "checking…"
-                    } else {
-                        "not checked"
-                    }
-                    .into(),
-                    palette.muted,
-                ),
-            ]);
+            let mut cells = vec![];
+            if marks {
+                cells.push(mark(name));
+            }
+            return Row::new(
+                cells.into_iter().chain([
+                    Cell::from(clip(name, name_width)),
+                    styled(
+                        if checks.checking {
+                            "checking…"
+                        } else {
+                            "not checked"
+                        }
+                        .into(),
+                        palette.muted,
+                    ),
+                    Cell::from(""),
+                    match tests.states.get(name) {
+                        Some(LiveTest::Running) => styled("testing…".into(), palette.accent),
+                        Some(LiveTest::Failed) => styled("failed".into(), palette.red),
+                        Some(LiveTest::Passed) => styled("passed".into(), palette.success),
+                        None => Cell::from(""),
+                    },
+                ]),
+            );
         };
         let installed = r.installed();
         let version = r.version_label();
-        let mut cells = vec![
+        // This session's live test shows until a fresh check says `tested`.
+        let (tested, tested_color) = match tests.states.get(name) {
+            Some(LiveTest::Running) => ("testing…", palette.accent),
+            Some(LiveTest::Failed) => ("failed", palette.red),
+            Some(LiveTest::Passed) if r.tested_label() != "tested" => ("passed", palette.success),
+            _ => (
+                r.tested_label(),
+                match r.version_tested {
+                    Some(true) => palette.accent,
+                    Some(false) => palette.warn,
+                    None => palette.muted,
+                },
+            ),
+        };
+        let mut cells = vec![];
+        if marks {
+            cells.push(mark(name));
+        }
+        cells.extend([
             Cell::from(clip(name, name_width)),
             if installed {
                 styled("● installed".into(), palette.accent)
@@ -451,14 +783,7 @@ pub(super) fn draw_harnesses(frame: &mut Frame<'_>, app: &App, area: Rect, palet
                     palette.muted
                 },
             ),
-            styled(
-                r.tested_label().into(),
-                match r.version_tested {
-                    Some(true) => palette.accent,
-                    Some(false) => palette.warn,
-                    None => palette.muted,
-                },
-            ),
+            styled(tested.into(), tested_color),
             styled(
                 clip(&r.summary, caps_width),
                 if r.missing_flags() {
@@ -469,7 +794,7 @@ pub(super) fn draw_harnesses(frame: &mut Frame<'_>, app: &App, area: Rect, palet
                     palette.muted
                 },
             ),
-        ];
+        ]);
         if wide {
             cells.push(styled(
                 r.path.as_ref().map_or_else(
@@ -485,30 +810,33 @@ pub(super) fn draw_harnesses(frame: &mut Frame<'_>, app: &App, area: Rect, palet
             palette.muted
         }))
     });
-    let testing = app
-        .harnesses
-        .tests
-        .running
-        .as_ref()
-        .map(|harness| format!(" testing {harness}… "));
-    let note = if let Some(testing) = &testing {
-        testing.as_str()
-    } else if checks.checking {
-        " checking… "
-    } else {
-        " uses existing logins and provider settings "
+    let running = tests.running();
+    let note = match running.as_slice() {
+        [] if checks.checking => " checking… ".to_owned(),
+        [] if !tests.marked.is_empty() => {
+            format!(" {} marked · [t] tests them ", tests.marked.len())
+        }
+        [] => " uses existing logins and provider settings ".to_owned(),
+        [harness] => format!(" testing {harness}… "),
+        many => format!(" testing {} harnesses… ", many.len()),
     };
     let block = palette
         .panel(" Harnesses ")
         .title(Line::styled(note, Style::default().fg(palette.muted)).right_aligned());
-    let mut widths = vec![
+    let mut widths = vec![];
+    let mut header = vec![];
+    if marks {
+        widths.push(Constraint::Length(3));
+        header.push("");
+    }
+    widths.extend([
         Constraint::Length(name_width as u16),
         Constraint::Length(11),
         Constraint::Length(version_width as u16),
         Constraint::Length(8),
         Constraint::Length(caps_width as u16),
-    ];
-    let mut header = vec!["HARNESS", "STATUS", "VERSION", "TESTED", "CAPABILITIES"];
+    ]);
+    header.extend(["HARNESS", "STATUS", "VERSION", "TESTED", "CAPABILITIES"]);
     if wide {
         widths.push(Constraint::Fill(1));
         header.push("PATH");
@@ -539,7 +867,10 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::{
         path::PathBuf,
-        sync::{Arc, atomic::AtomicBool},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
         time::{Duration, Instant},
     };
 
@@ -717,8 +1048,262 @@ mod tests {
         assert_eq!(body.matches(AUTH_NOTE).count(), 1);
     }
 
-    fn stub_test(test: &HarnessTest) -> Result<String, String> {
-        Ok(test_report(test, true, "exit status: 0", "Saved fixture."))
+    /// opencode fails; others pass.
+    fn stub_test(test: &HarnessTest) -> Result<TestOutcome, String> {
+        let passed = test.harness != "opencode";
+        Ok(TestOutcome {
+            passed,
+            report: test_report(
+                test,
+                passed,
+                if passed {
+                    "exit status: 0"
+                } else {
+                    "exit status: 1"
+                },
+                "Saved fixture.",
+            ),
+        })
+    }
+
+    fn finish_batch(app: &mut App) {
+        let start = Instant::now();
+        while !app.harnesses.tests.batch.is_empty() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "tests never finished"
+            );
+            app.poll().unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The app on Harnesses, checked, in a model-router checkout.
+    fn checkout() -> (tempfile::TempDir, App) {
+        let project = tempfile::tempdir().unwrap();
+        let script = project.path().join(TEST_SCRIPT);
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, "").unwrap();
+        let mut app = App::new(
+            project.path().into(),
+            Settings::default(),
+            project.path().join("config.toml"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.ui.theme_path = project.path().join("appearance.json");
+        app.harnesses.checks.probe = stub;
+        app.harnesses.tests.runner = stub_test;
+        press(&mut app, KeyCode::Char('3'));
+        wait(&mut app);
+        (project, app)
+    }
+
+    #[test]
+    fn marked_harnesses_test_as_one_batch_and_failures_stay_marked() {
+        static PROBES: AtomicUsize = AtomicUsize::new(0);
+        let (_project, mut app) = checkout();
+        app.harnesses.checks.probe = |settings, project| {
+            PROBES.fetch_add(1, Ordering::SeqCst);
+            stub(settings, project)
+        };
+        // The test keys fit the footer at 80 columns.
+        let (text, _) = render(&mut app, 80, "[x] mark");
+        assert!(
+            text.contains("[t] test") && text.contains("[x] mark") && text.contains("[ ] codex"),
+            "{text}"
+        );
+
+        // gemini is not installed, so it cannot be marked.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.ui.message, "gemini is not installed.");
+        assert!(app.harnesses.tests.marked.is_empty());
+        // [a] marks every installed harness, then clears them.
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(
+            app.harnesses.tests.marked.iter().collect::<Vec<_>>(),
+            ["codex", "opencode"]
+        );
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.harnesses.tests.marked.is_empty());
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Char('x'));
+        let (text, _) = render(&mut app, 100, "marked");
+        assert!(
+            text.contains("[x] codex") && text.contains("2 marked · [t] tests them"),
+            "{text}"
+        );
+
+        // [t] tests the marks, not the selection, in display order.
+        press(&mut app, KeyCode::Char('t'));
+        let Some(Modal::Ask(ask)) = app.ui.dialog() else {
+            panic!("no confirmation");
+        };
+        let Ask::TestHarness { harnesses } = &**ask else {
+            panic!("wrong question");
+        };
+        assert_eq!(harnesses, &["codex", "opencode"]);
+        let (text, _) = render(&mut app, 100, "2 requests");
+        assert!(text.contains("2 requests"), "{text}");
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.harnesses.tests.running(), ["codex", "opencode"]);
+        let (text, _) = render(&mut app, 100, "testing 2");
+        assert!(
+            text.contains("testing 2 harnesses…") && text.contains("testing…"),
+            "{text}"
+        );
+        finish_batch(&mut app);
+        assert_eq!(app.ui.message, "1 of 2 harness tests failed.");
+        // Passing tests saved manifests: TESTED refreshes from doctor.
+        wait(&mut app);
+        assert_eq!(PROBES.load(Ordering::SeqCst), 1);
+        let Some(Modal::Text { title, body, .. }) = app.ui.dialog() else {
+            panic!("results did not open");
+        };
+        assert_eq!(title, "Harness tests");
+        for expected in [
+            "1 passed, 1 failed. Failed harnesses stay marked; [t] retries them.",
+            "codex     ✓ Passed: exit status: 0",
+            "opencode  ✗ Failed: exit status: 1",
+            "── codex ──",
+            "── opencode ──",
+        ] {
+            assert!(body.contains(expected), "{expected}\n{body}");
+        }
+        assert_eq!(
+            app.harnesses.tests.marked.iter().collect::<Vec<_>>(),
+            ["opencode"]
+        );
+        app.ui.dialogs.clear();
+        wait(&mut app);
+        let (text, color) = render(&mut app, 100, "failed");
+        assert_eq!(color, Some(app.ui.palette().red), "{text}");
+        // The stub check still calls codex's version schema-derived, so the
+        // live pass shows.
+        assert!(text.contains("passed"), "{text}");
+    }
+
+    #[test]
+    fn failures_stay_marked_even_if_marks_were_cleared_during_the_batch() {
+        let (_project, mut app) = checkout();
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Char('y'));
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.harnesses.tests.marked.is_empty());
+        finish_batch(&mut app);
+        assert_eq!(
+            app.harnesses.tests.marked.iter().collect::<Vec<_>>(),
+            ["opencode"]
+        );
+    }
+
+    #[test]
+    fn a_check_running_when_tests_pass_is_followed_by_another() {
+        static PROBES: AtomicUsize = AtomicUsize::new(0);
+        let (_project, mut app) = checkout();
+        app.harnesses.checks.probe = |settings, project| {
+            PROBES.fetch_add(1, Ordering::SeqCst);
+            stub(settings, project)
+        };
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Char('y'));
+        // A check that read the project before codex's manifest was saved.
+        app.harnesses.checks.checking = true;
+        finish_batch(&mut app);
+        assert!(app.harnesses.checks.again);
+        assert_eq!(PROBES.load(Ordering::SeqCst), 0);
+        let reports = stub(&app.editor.settings, &app.project);
+        app.update(app.tasks.generation(), Msg::Checks(Ok(reports)));
+        assert!(!app.harnesses.checks.again);
+        wait(&mut app);
+        assert_eq!(PROBES.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn marks_are_revalidated_and_stale_results_dropped() {
+        let (_project, mut app) = checkout();
+        // Marked before the check found gemini missing.
+        app.harnesses.tests.marked = ["codex", "gemini"].map(String::from).into();
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(
+            app.ui.message,
+            "Unmarked gemini: not installed or not built in."
+        );
+        assert!(matches!(
+            app.ui.dialog(),
+            Some(Modal::Ask(ask)) if matches!(&**ask, Ask::TestHarness { harnesses } if harnesses == &["codex"])
+        ));
+        // A check that lands while the question is open is applied on [y].
+        app.harnesses.checks.reports[0].path = None;
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.harnesses.tests.batch.is_empty());
+        assert!(app.harnesses.tests.marked.is_empty());
+        assert_eq!(
+            app.ui.message,
+            "Skipped codex: not installed or not built in."
+        );
+        app.harnesses.checks.reports = stub(&app.editor.settings, &app.project);
+        // When others remain, the skip stays in the message beside them.
+        app.harnesses.tests.marked = ["codex", "opencode"].map(String::from).into();
+        press(&mut app, KeyCode::Char('t'));
+        app.harnesses.checks.reports[0].path = None;
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.harnesses.tests.running(), ["opencode"]);
+        assert!(
+            app.ui
+                .message
+                .starts_with("Skipped codex: not installed or not built in. Testing opencode"),
+            "{}",
+            app.ui.message
+        );
+        finish_batch(&mut app);
+        app.ui.dialogs.clear();
+        app.harnesses.checks.reports = stub(&app.editor.settings, &app.project);
+
+        // [a] drops marks a check found stale.
+        app.harnesses.tests.marked = ["gemini"].map(String::from).into();
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(
+            app.harnesses.tests.marked.iter().collect::<Vec<_>>(),
+            ["codex", "opencode"]
+        );
+
+        // Marks wait for check results; without any, [r] is the way on.
+        app.harnesses.checks.reports.clear();
+        app.harnesses.tests.marked.clear();
+        for key in ['x', 'a'] {
+            press(&mut app, KeyCode::Char(key));
+            assert!(app.harnesses.tests.marked.is_empty());
+            assert_eq!(
+                app.ui.message,
+                "No check results to mark from; [r] rechecks."
+            );
+        }
+        app.harnesses.checks.checking = true;
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.ui.message.starts_with("Wait for the harness check"));
+        app.harnesses.checks.checking = false;
+
+        // A result from an earlier batch, e.g. of another project, is dropped.
+        app.harnesses.tests.batch = vec![("codex".into(), None)];
+        app.harnesses.tests.batch_id = 2;
+        let outcome = TestOutcome {
+            passed: true,
+            report: String::new(),
+        };
+        app.update(
+            app.tasks.generation(),
+            Msg::HarnessTest {
+                batch: 1,
+                harness: "codex".into(),
+                result: Ok(outcome),
+            },
+        );
+        assert_eq!(app.harnesses.tests.running(), ["codex"]);
     }
 
     #[test]
@@ -751,14 +1336,14 @@ mod tests {
         press(&mut app, KeyCode::Char('t'));
         assert!(matches!(
             app.ui.dialog(),
-            Some(Modal::Ask(ask)) if matches!(&**ask, Ask::TestHarness { harness } if harness == "codex")
+            Some(Modal::Ask(ask)) if matches!(&**ask, Ask::TestHarness { harnesses } if harnesses == &["codex"])
         ));
         press(&mut app, KeyCode::Char('n'));
-        assert!(app.ui.dialog().is_none() && app.harnesses.tests.running.is_none());
+        assert!(app.ui.dialog().is_none() && app.harnesses.tests.batch.is_empty());
 
         press(&mut app, KeyCode::Char('t'));
         press(&mut app, KeyCode::Char('y'));
-        assert_eq!(app.harnesses.tests.running.as_deref(), Some("codex"));
+        assert_eq!(app.harnesses.tests.running(), ["codex"]);
         assert!(
             render(&mut app, 100, "testing codex")
                 .0
@@ -773,16 +1358,8 @@ mod tests {
             "{}",
             app.ui.message
         );
-        let start = Instant::now();
-        while app.harnesses.tests.running.is_some() {
-            assert!(
-                start.elapsed() < Duration::from_secs(5),
-                "test never finished"
-            );
-            app.poll().unwrap();
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(app.ui.message, "Test of codex finished.");
+        finish_batch(&mut app);
+        assert_eq!(app.ui.message, "Test of codex passed.");
         let Some(Modal::Text { title, body, .. }) = app.ui.dialog() else {
             panic!("result did not open");
         };
@@ -817,7 +1394,9 @@ mod tests {
             router: PathBuf::from("/bin/true"),
             output: project.path().join("out"),
         };
-        let body = run_test(&test).unwrap();
+        let outcome = run_test(&test).unwrap();
+        assert!(!outcome.passed);
+        let body = outcome.report;
         assert!(body.starts_with("✗ Failed: exit status: 1"), "{body}");
         assert!(body.contains("to stderr\nto stdout"), "{body}");
         assert!(!body.contains("cargo test"), "{body}");

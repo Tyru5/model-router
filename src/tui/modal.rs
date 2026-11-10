@@ -190,9 +190,9 @@ pub(super) enum Ask {
     LeaveRunning,
     /// Close the editor below without applying its changes; [Esc] returns to it.
     DiscardDraft,
-    /// Send one real request through this harness with the test script.
+    /// Send one real request through each harness with the test script.
     TestHarness {
-        harness: String,
+        harnesses: Vec<String>,
     },
 }
 impl Ask {
@@ -274,11 +274,24 @@ impl Ask {
                 "This editor has changes that are not applied.".into(),
                 &[("y / Enter", "discard"), ("n / Esc", "keep editing")],
             ),
-            Self::TestHarness { harness } => (
-                "Test harness",
-                format!(
-                    "Send one real request through {harness} with its own login and default model? The provider may bill it. Output goes to .model-router/harness-tests/."
-                ),
+            Self::TestHarness { harnesses } => (
+                if harnesses.len() == 1 {
+                    "Test harness"
+                } else {
+                    "Test harnesses"
+                },
+                match harnesses.as_slice() {
+                    [harness] => format!(
+                        "Send one real request through {harness} with its own login and default model? The provider may bill it. Output goes to {}/.",
+                        crate::doctor::LIVE_TESTS
+                    ),
+                    many => format!(
+                        "Send one real request through each of {} ({} requests, in parallel) with their own logins and default models? Providers may bill them. Output goes to {}/.",
+                        many.join(", "),
+                        many.len(),
+                        crate::doctor::LIVE_TESTS
+                    ),
+                },
                 &[("y / Enter", "test"), ("n / Esc", "cancel")],
             ),
         }
@@ -625,7 +638,7 @@ impl App {
             Ask::DiscardDraft => {
                 self.ui.dialogs.pop();
             }
-            Ask::TestHarness { harness } => self.start_harness_test(harness.clone())?,
+            Ask::TestHarness { harnesses } => self.start_harness_tests(harnesses.clone())?,
             Ask::SaveAndExit | Ask::LeaveRunning => {}
         }
         Ok(DialogResult::Close)

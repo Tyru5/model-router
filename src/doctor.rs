@@ -19,6 +19,9 @@ use std::{
 pub const AUTH_NOTE: &str =
     "Authentication is not checked: that needs a model request. Log in through each harness.";
 const MANIFEST: &str = include_str!("../tests/fixtures/harness-output/manifest.toml");
+/// Where the TUI's live harness tests save output under a project. The test
+/// script writes a run's `manifest.toml` only after the run passes.
+pub const LIVE_TESTS: &str = ".model-router/harness-tests";
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Probes run in parallel, so this also bounds `inspect_all`.
 const HELP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -139,21 +142,10 @@ pub fn inspect(harness: &str, settings: &Settings, project: &Path) -> Report {
 fn check(report: &mut Report, project: &Path) {
     let fixtures: Vec<_> = manifest()
         .into_iter()
+        .chain(live_fixtures(project))
         .filter(|f| f.harness == report.harness)
         .collect();
-    for fixture in &fixtures {
-        if !report.tested_versions.contains(&fixture.version) {
-            report.tested_versions.push(fixture.version.clone());
-        }
-    }
-    let captured = fixtures
-        .iter()
-        .filter(|f| f.provenance == "captured")
-        .count();
-    report.notes.push(format!(
-        "Parser fixtures: {captured} captured, {} schema-derived.",
-        fixtures.len() - captured
-    ));
+    record_fixtures(report, &fixtures);
     let uses = flag_uses(&report.harness).unwrap_or_else(|error| {
         report
             .notes
@@ -211,28 +203,7 @@ fn check(report: &mut Report, project: &Path) {
             .notes
             .push(format!("{} not found on PATH.", report.program));
     }
-    let matches =
-        |fixture: &Fixture, line: &str| version_tokens(line).any(|token| token == fixture.version);
-    report.version_tested = report
-        .version
-        .as_deref()
-        .map(|line| fixtures.iter().any(|f| matches(f, line)));
-    report.version_captured = report.version.as_deref().is_some_and(|line| {
-        fixtures
-            .iter()
-            .any(|f| f.provenance == "captured" && matches(f, line))
-    });
-    if report.version_tested == Some(true) && !report.version_captured {
-        report
-            .notes
-            .push("Fixtures for this version are schema-derived, not captured output.".into());
-    }
-    if report.version_tested == Some(false) {
-        report.notes.push(format!(
-            "Detected version is not a parser-tested version ({}).",
-            report.tested_versions.join(", ")
-        ));
-    }
+    match_version(report, &fixtures);
     let capabilities: Vec<_> = uses
         .into_iter()
         .map(|u| {
@@ -509,12 +480,86 @@ struct Fixture {
     harness: String,
     version: String,
     provenance: String,
+    /// From a live test in the project, not the built-in manifest.
+    #[serde(skip)]
+    live: bool,
 }
 
 fn manifest() -> Vec<Fixture> {
     toml::from_str::<Manifest>(MANIFEST)
         .map(|m| m.fixture)
         .unwrap_or_default()
+}
+
+/// Lists the versions `fixtures` cover and counts the built-in ones.
+fn record_fixtures(report: &mut Report, fixtures: &[Fixture]) {
+    for fixture in fixtures {
+        if !report.tested_versions.contains(&fixture.version) {
+            report.tested_versions.push(fixture.version.clone());
+        }
+    }
+    let built_in: Vec<_> = fixtures.iter().filter(|f| !f.live).collect();
+    let captured = built_in
+        .iter()
+        .filter(|f| f.provenance == "captured")
+        .count();
+    report.notes.push(format!(
+        "Parser fixtures: {captured} captured, {} schema-derived.",
+        built_in.len() - captured
+    ));
+}
+
+/// Whether `fixtures` cover the detected version, and with captured output;
+/// a passing live test counts as captured.
+fn match_version(report: &mut Report, fixtures: &[Fixture]) {
+    let matches =
+        |fixture: &Fixture, line: &str| version_tokens(line).any(|token| token == fixture.version);
+    report.version_tested = report
+        .version
+        .as_deref()
+        .map(|line| fixtures.iter().any(|f| matches(f, line)));
+    report.version_captured = report.version.as_deref().is_some_and(|line| {
+        fixtures
+            .iter()
+            .any(|f| f.provenance == "captured" && matches(f, line))
+    });
+    let live = report
+        .version
+        .as_deref()
+        .is_some_and(|line| fixtures.iter().any(|f| f.live && matches(f, line)));
+    if live {
+        report.notes.push(format!(
+            "A live test of this version passed in this project ({LIVE_TESTS})."
+        ));
+    }
+    if report.version_tested == Some(true) && !report.version_captured {
+        report
+            .notes
+            .push("Fixtures for this version are schema-derived, not captured output.".into());
+    }
+    if report.version_tested == Some(false) {
+        report.notes.push(format!(
+            "Detected version is not a parser-tested version ({}).",
+            report.tested_versions.join(", ")
+        ));
+    }
+}
+
+/// Entries of the passing live tests saved under `project`; unreadable or
+/// malformed manifests are skipped.
+fn live_fixtures(project: &Path) -> Vec<Fixture> {
+    let Ok(runs) = std::fs::read_dir(project.join(LIVE_TESTS)) else {
+        return vec![];
+    };
+    runs.flatten()
+        .filter_map(|run| std::fs::read_to_string(run.path().join("manifest.toml")).ok())
+        .filter_map(|text| toml::from_str::<Manifest>(&text).ok())
+        .flat_map(|manifest| manifest.fixture)
+        .map(|fixture| Fixture {
+            live: true,
+            ..fixture
+        })
+        .collect()
 }
 
 /// Whether a router sandbox backend works here; see `sandbox`.
@@ -863,6 +908,79 @@ mod tests {
             first_line("\n\n  codex-cli 0.160.0 \nmore").as_deref(),
             Some("codex-cli 0.160.0")
         );
+    }
+
+    #[test]
+    fn live_tests_in_the_project_count_as_captured_fixtures() {
+        let project = tempfile::tempdir().unwrap();
+        assert!(live_fixtures(project.path()).is_empty());
+        let runs = project.path().join(LIVE_TESTS);
+        for (run, text) in [
+            (
+                "claude-1",
+                "[[fixture]]\nfile = \"claude/captured-success.jsonl\"\nharness = \"claude\"\nversion = \"9.9.9\"\nprovenance = \"captured\"\n",
+            ),
+            ("codex-1", "not toml ["),
+        ] {
+            std::fs::create_dir_all(runs.join(run)).unwrap();
+            std::fs::write(runs.join(run).join("manifest.toml"), text).unwrap();
+        }
+        // A failed run leaves no manifest.
+        std::fs::create_dir_all(runs.join("pi-1")).unwrap();
+        let live = live_fixtures(project.path());
+        assert_eq!(live.len(), 1);
+        assert!(live[0].live && live[0].harness == "claude" && live[0].version == "9.9.9");
+        assert!(manifest().iter().all(|f| !f.live));
+
+        // A live pass of the detected version makes it `tested`; the parser
+        // fixture count leaves it out.
+        let built_in = Fixture {
+            harness: "claude".into(),
+            version: "1.0.0".into(),
+            provenance: "schema-derived".into(),
+            live: false,
+        };
+        let coverage = |version: &str, fixtures: &[Fixture]| {
+            let mut report = Report {
+                harness: "claude".into(),
+                builtin: true,
+                program: "claude".into(),
+                path: None,
+                version: Some(format!("{version} (Claude Code)")),
+                tested_versions: vec![],
+                version_tested: None,
+                version_captured: false,
+                capabilities: None,
+                summary: "ok".into(),
+                notes: vec![],
+            };
+            record_fixtures(&mut report, fixtures);
+            match_version(&mut report, fixtures);
+            report
+        };
+        let both = [built_in, live.into_iter().next().unwrap()];
+        let report = coverage("9.9.9", &both);
+        assert_eq!(report.tested_label(), "tested");
+        assert!(report.version_captured);
+        assert_eq!(report.tested_versions, ["1.0.0", "9.9.9"]);
+        assert!(
+            report
+                .notes
+                .contains(&"Parser fixtures: 0 captured, 1 schema-derived.".into()),
+            "{:?}",
+            report.notes
+        );
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.starts_with("A live test of this version passed"))
+        );
+        // Another version stays untested; the built-in one is schema-derived.
+        assert_eq!(coverage("9.9.10", &both).tested_label(), "untested");
+        let report = coverage("1.0.0", &both);
+        assert_eq!(report.tested_label(), "schema-derived");
+        assert!(!report.notes.iter().any(|n| n.starts_with("A live test")));
     }
 
     #[test]

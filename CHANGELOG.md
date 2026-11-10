@@ -9,9 +9,12 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Added
 
-- TUI Harnesses `t`: test the selected harness live with
-  `scripts/capture_harness_output.py` (one real request, confirmed first) and
-  show the result; offered in a model-router checkout.
+- TUI Harnesses live tests: `x`/`a` mark harnesses, `t` tests the marked ones
+  (or the selected one) in parallel with `scripts/capture_harness_output.py`
+  (one real request each, confirmed first) and shows one result dialog;
+  failures stay marked for retry. Offered in a model-router checkout.
+- `doctor` counts passing live tests saved in the project
+  (`.model-router/harness-tests/`), so TESTED updates after one passes.
 - TUI action menu: `Space`, then a group letter (Run, Stage, Workflow, Go,
   View) and an action letter, lists every action of the current view.
 - `completions SHELL [--bin NAME]`: shell completion scripts for bash, zsh,

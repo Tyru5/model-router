@@ -62,8 +62,10 @@ pub(super) enum Msg {
     },
     /// A live harness test's report, from the Harnesses page.
     HarnessTest {
+        /// The batch that started it.
+        batch: u64,
         harness: String,
-        result: Result<String, String>,
+        result: Result<super::harnesses::TestOutcome, String>,
     },
     /// Routing stats of `project`; `ticket` is the Stats dialog's wait, if any.
     Stats {
@@ -212,6 +214,10 @@ impl App {
             Msg::Checks(result) => {
                 let checks = &mut self.harnesses.checks;
                 checks.checking = false;
+                if std::mem::take(&mut checks.again) {
+                    checks.start(&self.editor.settings, &self.project, &self.tasks);
+                }
+                let checks = &mut self.harnesses.checks;
                 match result {
                     Ok(reports) => {
                         checks.reports = reports;
@@ -275,7 +281,11 @@ impl App {
                 ticket,
                 result,
             } => self.stats_collected(project, ticket, result),
-            Msg::HarnessTest { harness, result } => self.harness_tested(harness, result),
+            Msg::HarnessTest {
+                batch,
+                harness,
+                result,
+            } => self.harness_tested(batch, harness, result),
         }
     }
 }
