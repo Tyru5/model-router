@@ -314,6 +314,20 @@ Runs `doctor` checks in the background: version, tested status,
 capabilities. `↑↓`/`kj` select, `Enter` lists each flag and note, `r`
 rechecks. See [harnesses.md](harnesses.md#doctor).
 
+`t` tests the selected harness live: after `y` confirms, it runs
+`scripts/capture_harness_output.py` in the background with the running `mr`
+as `--router`. That sends one real request, which the provider may bill. The
+panel title says `testing <harness>…`; the result opens with the command,
+exit status, and script output. The sanitized output and a one-entry
+`manifest.toml` go to `.model-router/harness-tests/<harness>-<time>/`. To keep
+it as a [parser fixture](adapters.md#parser-fixtures), copy the output file
+into `tests/fixtures/harness-output/<harness>/` (renaming it if the name is
+taken, and updating the entry's `file`) and append its `[[fixture]]` entry to
+the existing manifest. One test runs at a time per project; quitting or
+switching projects does not stop a running test, and its result is dropped.
+The footer shows `t` only when the project is a model-router checkout;
+elsewhere the key explains what it needs.
+
 ## Stats dialog
 
 `I` shows the `model-router stats` table for this project. See

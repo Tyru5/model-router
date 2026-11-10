@@ -83,6 +83,7 @@ pub(super) enum ActionId {
     NextHarness,
     HarnessDetails,
     RefreshHarnesses,
+    TestHarness,
     // Everywhere
     Menu,
     NextView,
@@ -391,6 +392,10 @@ const ACTIONS: &[Entry] = {
         act(NextHarness, Harnesses, key(KeyCode::Down), "select", "Select next harness").also(&[ch('j')]).alias("↑↓").footer(),
         act(HarnessDetails, Harnesses, key(KeyCode::Enter), "details", "Show version, flag checks, and notes").footer().menu(View, 'i'),
         act(RefreshHarnesses, Harnesses, ch('r'), "refresh", "Run version and flag checks again").footer().menu(View, 'r'),
+        act(TestHarness, Harnesses, ch('t'), "test", "Test the selected harness with one real, possibly billed, request ([y] confirms)")
+            .more(&["Runs scripts/capture_harness_output.py; needs a model-router checkout as the project"])
+            .footer()
+            .menu(RunMenu, 't'),
         // Everywhere
         act(Menu, Global, ch(' '), "menu", "Action menu: press a group letter, then an action letter")
             .more(&["[Backspace] returns to the groups; [Esc] closes"]),

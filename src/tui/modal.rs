@@ -190,6 +190,10 @@ pub(super) enum Ask {
     LeaveRunning,
     /// Close the editor below without applying its changes; [Esc] returns to it.
     DiscardDraft,
+    /// Send one real request through this harness with the test script.
+    TestHarness {
+        harness: String,
+    },
 }
 impl Ask {
     pub(super) fn text(&self, app: &App) -> AskText {
@@ -269,6 +273,13 @@ impl Ask {
                 "Discard changes?",
                 "This editor has changes that are not applied.".into(),
                 &[("y / Enter", "discard"), ("n / Esc", "keep editing")],
+            ),
+            Self::TestHarness { harness } => (
+                "Test harness",
+                format!(
+                    "Send one real request through {harness} with its own login and default model? The provider may bill it. Output goes to .model-router/harness-tests/."
+                ),
+                &[("y / Enter", "test"), ("n / Esc", "cancel")],
             ),
         }
     }
@@ -614,6 +625,7 @@ impl App {
             Ask::DiscardDraft => {
                 self.ui.dialogs.pop();
             }
+            Ask::TestHarness { harness } => self.start_harness_test(harness.clone())?,
             Ask::SaveAndExit | Ask::LeaveRunning => {}
         }
         Ok(DialogResult::Close)

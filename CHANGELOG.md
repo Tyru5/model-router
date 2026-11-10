@@ -9,6 +9,9 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Added
 
+- TUI Harnesses `t`: test the selected harness live with
+  `scripts/capture_harness_output.py` (one real request, confirmed first) and
+  show the result; offered in a model-router checkout.
 - TUI action menu: `Space`, then a group letter (Run, Stage, Workflow, Go,
   View) and an action letter, lists every action of the current view.
 - `completions SHELL [--bin NAME]`: shell completion scripts for bash, zsh,

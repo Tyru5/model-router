@@ -218,3 +218,5 @@ sandbox, and Gemini plan approval. The task asks for a fixed handoff block. It
 sanitizes the attempt's `stdout.log` (prompt echoes, paths, user and host
 names, emails, IDs, and keys) into `<harness>/captured-success.<ext>` and
 appends a `captured` manifest entry with the adapter's format. Review both before committing.
+In the TUI, `t` on Harnesses runs the same script for the selected harness
+([tui.md](tui.md#harnesses-3)).

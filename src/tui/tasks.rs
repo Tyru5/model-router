@@ -60,6 +60,11 @@ pub(super) enum Msg {
         ticket: u64,
         result: Result<String, String>,
     },
+    /// A live harness test's report, from the Harnesses page.
+    HarnessTest {
+        harness: String,
+        result: Result<String, String>,
+    },
     /// Routing stats of `project`; `ticket` is the Stats dialog's wait, if any.
     Stats {
         project: PathBuf,
@@ -270,6 +275,7 @@ impl App {
                 ticket,
                 result,
             } => self.stats_collected(project, ticket, result),
+            Msg::HarnessTest { harness, result } => self.harness_tested(harness, result),
         }
     }
 }
