@@ -17,6 +17,7 @@ use super::{
 use crate::{
     catalog,
     config::{self, Settings},
+    cost,
     engine::{self, Action, Placement, Run, Status},
     process, storage,
 };
@@ -896,11 +897,22 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         // does not continue (an interrupted one must be retried, a waiting
         // one accepted); a complete one has nothing to retry.
         let mut skip = vec![];
-        if let Some(run) = app
+        let run = app
             .session
             .run()
-            .filter(|_| app.page_scope() == Scope::MonitorIdle)
-        {
+            .filter(|_| app.page_scope() == Scope::MonitorIdle);
+        // Recovery keys show only for the stop they recover from. A run its
+        // budget stopped blocks again on retry until the cap is raised.
+        if !run.is_some_and(Run::repair_blocked) {
+            skip.push(ActionId::AllowRepair);
+        }
+        if !run.is_some_and(cost::usd_budget_blocked) {
+            skip.push(ActionId::RaiseBudget);
+        }
+        if run.is_some_and(cost::budget_blocked) {
+            skip.push(ActionId::Retry);
+        }
+        if let Some(run) = run {
             if run.status != Status::AwaitingConfirmation {
                 skip.push(ActionId::Advance);
             }

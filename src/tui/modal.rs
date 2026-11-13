@@ -43,6 +43,8 @@ pub(super) enum InputTarget {
     RepairLimit,
     Handoff,
     NotifyUrl,
+    /// A new USD cap for the focused run its budget stopped.
+    Budget,
 }
 #[derive(Clone)]
 pub(super) enum PickValue {
@@ -180,6 +182,21 @@ pub(super) enum Ask {
     TakeOver {
         run: String,
     },
+    /// One more review repair pass for this run, which used `passes` of
+    /// its `limit`.
+    AllowRepair {
+        run: String,
+        passes: u32,
+        limit: u32,
+    },
+    /// Raise this run's USD cap from `cap` to `usd` and continue; `spent`
+    /// is its spend so far, as text.
+    RaiseBudget {
+        run: String,
+        usd: f64,
+        cap: f64,
+        spent: String,
+    },
     DeleteWorkflow {
         index: usize,
     },
@@ -217,6 +234,28 @@ impl Ask {
                 "Take over stage",
                 format!(
                     "Stop the unattended stage of {run} and reopen its session in this terminal?"
+                ),
+                YES_NO,
+            ),
+            Self::AllowRepair { run, passes, limit } => (
+                "Allow repair",
+                format!(
+                    "The review of {run} still requests changes after {passes} repair pass{} (limit {limit}). Allow 1 more repair pass, sending its findings to the implementation stage?",
+                    if *passes == 1 { "" } else { "es" }
+                ),
+                YES_NO,
+            ),
+            Self::RaiseBudget {
+                run,
+                usd,
+                cap,
+                spent,
+            } => (
+                "Raise budget",
+                format!(
+                    "Raise the budget of {run} from {} to {} and continue? Spent so far: {spent}. Exceeded stage caps rise to the same amount.",
+                    crate::report::dollars(*cap),
+                    crate::report::dollars(*usd),
                 ),
                 YES_NO,
             ),
@@ -538,6 +577,7 @@ impl App {
             InputTarget::Handoff => {
                 engine::edit_handoff(self.session.run_mut().context("No run")?, value)?
             }
+            InputTarget::Budget => self.ask_raise_budget(&value)?,
             InputTarget::NotifyUrl => {
                 let url = value.trim().to_owned();
                 ensure!(
@@ -619,6 +659,26 @@ impl App {
                         format!("{run}'s stage already stopped; [t] reopens its session.");
                 }
             }
+            Ask::AllowRepair { run, .. } => {
+                let explicit = self.editor.settings.explicit_config.clone();
+                self.idle(run)?;
+                let slot = self.session.focused_mut().context("No run")?;
+                slot.authorize_replay(explicit.as_deref())?;
+                slot.run.command(engine::Cmd::AllowRepair)?;
+                self.start_driver()?;
+                self.ui.message = "Allowed 1 more repair pass; repairing…".into();
+            }
+            Ask::RaiseBudget { run, usd, .. } => {
+                self.idle(run)?.command(engine::Cmd::RaiseBudget {
+                    usd: Some(*usd),
+                    tokens: None,
+                })?;
+                self.start_driver()?;
+                self.ui.message = format!(
+                    "Budget raised to {}; continuing…",
+                    crate::report::dollars(*usd)
+                );
+            }
             Ask::DeleteWorkflow { index } => {
                 let index = *index;
                 ensure!(
@@ -642,6 +702,44 @@ impl App {
             Ask::SaveAndExit | Ask::LeaveRunning => {}
         }
         Ok(DialogResult::Close)
+    }
+    /// The focused run when it is `id` and no stage of it runs.
+    fn idle(&mut self, id: &str) -> Result<&mut engine::Run> {
+        let slot = self
+            .session
+            .focused_mut()
+            .filter(|slot| slot.run.id == id)
+            .with_context(|| format!("{id} is no longer selected; nothing changed"))?;
+        ensure!(slot.worker.is_none(), "A stage of {id} is running");
+        Ok(&mut slot.run)
+    }
+    /// Checks a new USD cap for the focused run its budget stopped, then
+    /// asks to apply it. The amount must exceed both the cap that stopped
+    /// the run and what it has spent, or the run would stop again at once.
+    fn ask_raise_budget(&mut self, value: &str) -> Result<()> {
+        let run = self.session.run().context("No run")?;
+        let (cap, spent) = crate::cost::raise_floor(run)?;
+        let usd: f64 = value
+            .trim()
+            .trim_start_matches('$')
+            .parse()
+            .ok()
+            .filter(|usd: &f64| usd.is_finite())
+            .context("Enter a USD amount, e.g. 10 or 2.50")?;
+        ensure!(
+            usd > cap && usd > spent.usd,
+            "Enter more than {}: the cap is {} and {} is spent",
+            crate::report::dollars(cap.max(spent.usd)),
+            crate::report::dollars(cap),
+            spent.amount()
+        );
+        self.ui.open(Modal::Ask(Box::new(Ask::RaiseBudget {
+            run: run.id.clone(),
+            usd,
+            cap,
+            spent: spent.text(),
+        })));
+        Ok(())
     }
     /// The focused run's slot when it is `id` and still has a worker.
     fn running(&mut self, id: &str) -> Option<&mut RunSlot> {

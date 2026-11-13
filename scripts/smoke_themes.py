@@ -34,6 +34,11 @@ def background(terminal):
     return terminal.screen.buffer[0][0].bg
 
 
+def expect_background(terminal, bg, message):
+    """Wait for the top-left cell's background: a frame may land before input is read."""
+    terminal.wait_for(lambda: background(terminal) == bg, message)
+
+
 def choose(terminal, name):
     terminal.send("T")
     terminal.wait_for(
@@ -69,26 +74,29 @@ def main():
             terminal.send(b"\x13")
             terminal.send("T")
             terminal.send(b"\x0e")
-            assert background(terminal) == "default", (
-                "Ctrl+N did not preview the next theme"
+            expect_background(
+                terminal, "default", "Ctrl+N did not preview the next theme"
             )
             terminal.send(b"\x10")
-            assert background(terminal) == "0d1421", (
-                "Ctrl+P did not preview the previous theme"
+            expect_background(
+                terminal, "0d1421", "Ctrl+P did not preview the previous theme"
             )
             terminal.send(b"\x1b[B")
             terminal.send(b"\x1b")
-            assert background(terminal) == "0d1421", "Esc did not restore the theme"
+            expect_background(terminal, "0d1421", "Esc did not restore the theme")
             assert not prefs.exists(), "Preview wrote preferences before Enter"
 
             for label, theme_id, bg in THEMES:
                 choose(terminal, label)
-                assert background(terminal) == bg, (
-                    f"{label} preview did not repaint the app"
+                expect_background(
+                    terminal, bg, f"{label} preview did not repaint the app"
                 )
-                assert (
-                    "[Ctrl+N/P] select" in terminal.text()
-                    and "[Enter] saves" in terminal.text()
+                terminal.wait_for(
+                    lambda: (
+                        "[Ctrl+N/P] select" in terminal.text()
+                        and "[Enter] saves" in terminal.text()
+                    ),
+                    f"{label} preview lost the picker keys",
                 )
                 terminal.send("\r")
                 assert "Choose theme" not in terminal.text()
@@ -100,8 +108,8 @@ def main():
                 assert background(terminal) == bg and "Keep my task" in terminal.text()
                 terminal.snapshot(f"theme-{theme_id}-80x24.txt")
                 terminal.send("f")
-                assert "Import task/spec" in terminal.text()
-                assert background(terminal) == bg
+                terminal.wait_for_text("Import task/spec")
+                expect_background(terminal, bg, f"{label} import dialog lost the theme")
                 terminal.send(b"\x1b")
 
             choose(terminal, "no-such-theme")
@@ -113,9 +121,7 @@ def main():
                 terminal.send(page)
                 choose(terminal, "Poimandres")
                 terminal.send(b"\x1b")
-                assert background(terminal) == "fdf6e3", (
-                    "Preview changed the saved theme"
-                )
+                expect_background(terminal, "fdf6e3", "Preview changed the saved theme")
 
             choose(terminal, "Poimandres")
             terminal.send("\r")

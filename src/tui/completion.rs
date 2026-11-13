@@ -545,12 +545,29 @@ fn total_lines(report: &RunReport, palette: Palette) -> Vec<Line<'static>> {
 
 /// What a finished run offers next, the likeliest first. A stopped fan-out
 /// stage cannot be retried interactively, nor can a ship stage, which never
-/// runs a harness.
+/// runs a harness. A run its repair limit stopped leads with another repair
+/// pass; one its budget stopped offers only a raise, as a retry would stop
+/// again on the same cap.
 fn next_keys(run: &Run) -> Vec<(&'static str, &'static str)> {
     let current = run.workflow.stages.get(run.cursor);
     let fan_out = current.is_some_and(|s| s.fan_out.is_some());
     let ship = current.is_some_and(|s| s.role == crate::config::Role::Ship);
-    let keys: &[(&str, &str)] = if run.status == Status::Complete {
+    let keys: &[(&str, &str)] = if crate::cost::budget_blocked(run) {
+        if crate::cost::usd_budget_blocked(run) {
+            &[("B", "raise budget"), ("d", "diff"), ("o", "output")]
+        } else {
+            &[("d", "diff"), ("o", "output")]
+        }
+    } else if run.repair_blocked() {
+        &[
+            ("R", "allow repair"),
+            ("y", "retry"),
+            ("i", "interactive"),
+            ("m", "model"),
+            ("d", "diff"),
+            ("o", "output"),
+        ]
+    } else if run.status == Status::Complete {
         &[
             ("d", "diff"),
             ("o", "output"),

@@ -7,6 +7,7 @@ use crate::{
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
+    panic::{self, AssertUnwindSafe},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -23,8 +24,12 @@ pub(super) struct Inbox {
     state: Option<Box<Run>>,
     output: VecDeque<String>,
     skipped: usize,
-    done: Option<(Box<Run>, std::result::Result<Action, String>)>,
+    /// The final run and result. No run means the worker panicked; the UI
+    /// then reloads the saved run (see `RunSlot::crashed`).
+    done: Option<(Option<Box<Run>>, Outcome)>,
 }
+/// How a worker's run ended.
+type Outcome = std::result::Result<Action, String>;
 /// Output lines a worker keeps while the UI is not reading, e.g. while
 /// another run's interactive session has the terminal.
 const PENDING_LINES: usize = 2000;
@@ -54,19 +59,22 @@ fn lock(shared: &Shared) -> std::sync::MutexGuard<'_, Inbox> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
+type Notify = fn(&Outcome) -> bool;
 pub(super) struct Worker {
     inbox: Shared,
     thread: Option<JoinHandle<()>>,
     terminal: Option<process::InteractiveSession>,
+    notify: Notify,
 }
 impl Worker {
     /// Runs `work` on a thread that reports through the returned worker.
     /// When the work ends, the user is notified of results `notify` accepts.
     /// Notifying from the worker thread reaches the user even while another
     /// run's interactive session has the screen.
+    /// A panic in `work` fails the run with the panic message.
     pub(super) fn spawn(
         terminal: Option<process::InteractiveSession>,
-        notify: fn(&std::result::Result<Action, String>) -> bool,
+        notify: Notify,
         work: impl FnOnce(&mut dyn FnMut(RunEvent)) -> (Run, std::result::Result<Action, String>)
         + Send
         + 'static,
@@ -75,19 +83,29 @@ impl Worker {
         let shared = inbox.clone();
         let session = terminal.clone();
         let thread = thread::spawn(move || {
-            let (run, result) = work(&mut |event| lock(&shared).push(event));
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                work(&mut |event| lock(&shared).push(event))
+            }));
             if let Some(session) = session {
                 session.finish();
             }
-            if notify(&result) {
-                notify::notify_outcome(&run, &result);
-            }
-            lock(&shared).done = Some((Box::new(run), result));
+            let done = match outcome {
+                Ok((run, result)) => {
+                    if notify(&result) {
+                        notify::notify_outcome(&run, &result);
+                    }
+                    (Some(Box::new(run)), result)
+                }
+                // The UI marks the run failed and notifies; it has the run.
+                Err(payload) => (None, Err(panicked(payload.as_ref()))),
+            };
+            lock(&shared).done = Some(done);
         });
         Self {
             inbox,
             thread: Some(thread),
             terminal,
+            notify,
         }
     }
 }
@@ -99,6 +117,7 @@ impl Worker {
             inbox: Shared::default(),
             thread: None,
             terminal: None,
+            notify: |_| false,
         }
     }
     /// What a worker thread would report.
@@ -106,8 +125,17 @@ impl Worker {
         lock(&self.inbox).push(event);
     }
     pub(super) fn finish(&self, run: Run, result: std::result::Result<Action, String>) {
-        lock(&self.inbox).done = Some((Box::new(run), result));
+        lock(&self.inbox).done = Some((Some(Box::new(run)), result));
     }
+}
+/// The message for a worker that panicked, with the panic's own text.
+fn panicked(payload: &(dyn std::any::Any + Send)) -> String {
+    let detail = payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".into());
+    format!("The run's driver panicked: {detail}. Inspect artifacts and retry explicitly")
 }
 
 /// A run started or opened in this session, with its view state.
@@ -185,6 +213,23 @@ impl RunSlot {
                     | Status::AwaitingConfirmation
             )
     }
+    /// `engine::authorize_replay` for this idle run, before a command changes
+    /// it; what recovery stopped or left running goes to the output log.
+    pub(super) fn authorize_replay(
+        &mut self,
+        explicit: Option<&std::path::Path>,
+    ) -> anyhow::Result<()> {
+        let mut notes = String::new();
+        let result = engine::authorize_replay(&mut self.run, explicit, |event| {
+            if let RunEvent::Output(text) = event {
+                notes.push_str(&text);
+            }
+        });
+        for line in notes.lines() {
+            self.push_log(storage::truncate(line, 1500));
+        }
+        result
+    }
     pub(super) fn push_log(&mut self, line: String) {
         self.logs.push_back(line);
         self.log_version += 1;
@@ -229,7 +274,10 @@ impl RunSlot {
         }
         let mut stopped = None;
         if let Some((run, result)) = done {
-            self.run = *run;
+            match run {
+                Some(run) => self.run = *run,
+                None => self.crashed(&result),
+            }
             if let Some(mut worker) = self.worker.take() {
                 if let Some(handle) = worker.thread.take() {
                     let _ = handle.join();
@@ -240,6 +288,43 @@ impl RunSlot {
             stopped = Some(self.settle(result));
         }
         (changed, stopped)
+    }
+    /// Fails the run whose worker panicked, in memory only: the record on
+    /// disk still says running, which the next drive recovers as interrupted.
+    /// The worker may have saved the run after the last state it reported
+    /// (a launch records its process group without one), so the saved run,
+    /// which its unwinding has unlocked by now, is the latest; the last
+    /// reported state only stands in when it cannot be read.
+    fn crashed(&mut self, result: &std::result::Result<Action, String>) {
+        let Err(message) = result else {
+            return;
+        };
+        if let Ok(saved) = engine::load(&self.run.project, &self.run.id) {
+            self.run = saved;
+        }
+        let running = self
+            .run
+            .stages
+            .get(self.run.cursor)
+            .and_then(|stage| stage.attempts.last())
+            .is_some_and(|attempt| attempt.status == Status::Running);
+        let failed = self.run.stop(
+            Status::Failed,
+            message.clone(),
+            crate::transitions::Actor::Engine,
+            running,
+        );
+        if failed.is_err() {
+            self.run.status = Status::Failed;
+            self.run.error = Some(message.clone());
+        }
+        let notify = self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| (worker.notify)(result));
+        if notify {
+            notify::notify_outcome(&self.run, result);
+        }
     }
     /// A takeover turns the cancelled stage into one waiting for the terminal.
     fn settle(

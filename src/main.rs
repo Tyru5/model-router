@@ -132,6 +132,11 @@ enum Commands {
         /// Set the run's token budget (and any exceeded stage cap) to N and continue.
         #[arg(long, value_name = "N")]
         budget_tokens: Option<u64>,
+        /// First forget the process groups recovery left running because it
+        /// could not prove they were this run's harnesses. They are not
+        /// signalled; check them before releasing.
+        #[arg(long)]
+        release_groups: bool,
     },
     /// Estimated spend over saved runs, by harness and model.
     Cost {
@@ -756,9 +761,28 @@ fn main_result() -> Result<()> {
             notify,
             budget_usd,
             budget_tokens,
+            release_groups,
         }) => {
             let mut run = engine::load(&project, &id)?;
-            engine::authorize_replay(&mut run, cli.config.as_deref(), |_| {})?;
+            if release_groups {
+                let released = engine::release_groups(&mut run)?;
+                if released.is_empty() {
+                    println!("Run {id} has no process groups to release");
+                }
+                for group in released {
+                    println!(
+                        "Released process group {} without signalling it; it no longer blocks run {id}",
+                        group.pgid
+                    );
+                }
+            }
+            // What recovery stopped or left running.
+            engine::authorize_replay(&mut run, cli.config.as_deref(), |event| {
+                if let Event::Output(text) = event {
+                    print!("{text}");
+                    let _ = io::stdout().flush();
+                }
+            })?;
             if let Some(target) = retry_candidate {
                 let (stage, candidate) = target
                     .split_once('/')
@@ -769,7 +793,10 @@ fn main_result() -> Result<()> {
                 })?;
             }
             if budget_usd.is_some() || budget_tokens.is_some() {
-                cost::raise_budget(&mut run, budget_usd, budget_tokens)?;
+                run.command(Cmd::RaiseBudget {
+                    usd: budget_usd,
+                    tokens: budget_tokens,
+                })?;
             }
             if advance {
                 run.command(Cmd::Confirm)?;

@@ -13,7 +13,7 @@ use crate::{
     providers::{self, ModelInfo, Provider},
     report, storage,
 };
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -571,6 +571,56 @@ pub fn budget_blocked(run: &Run) -> bool {
             .error
             .as_deref()
             .is_some_and(|e| e.starts_with(EXCEEDED))
+}
+
+/// Whether the run stopped on a USD cap, not a token cap: the amount in
+/// its error is in dollars. Reads no pricing files.
+pub fn usd_budget_blocked(run: &Run) -> bool {
+    budget_blocked(run)
+        && run.error.as_deref().is_some_and(|e| {
+            e[EXCEEDED.len()..]
+                .trim_start_matches(": ")
+                .trim_start_matches('~')
+                .starts_with('$')
+        })
+}
+
+/// For a run its budget stopped: the USD cap a raise must exceed, and the
+/// run's spend so far. Errors when the run is not stopped by a budget, or
+/// only a token cap stopped it.
+pub fn raise_floor(run: &Run) -> Result<(f64, CostTotal)> {
+    ensure!(
+        budget_blocked(run),
+        "Only a run stopped by its budget can raise it"
+    );
+    let pricing = Pricing::load(&run.project);
+    let cap = exceeded_usd_cap(run, &pricing).with_context(|| {
+        format!(
+            "A token cap stopped this run; raise it with: model-router -C {} resume {} --budget-tokens N",
+            run.project.display(),
+            run.id
+        )
+    })?;
+    Ok((cap, run_total(run, &pricing)))
+}
+
+/// The USD cap a raise must exceed: the run's cap, or the highest exceeded
+/// stage cap when larger. None unless a USD cap is exceeded.
+fn exceeded_usd_cap(run: &Run, pricing: &Pricing) -> Option<f64> {
+    let stages = stage_totals(run, pricing);
+    let mut total = CostTotal::default();
+    let mut exceeded = None::<f64>;
+    for (stage, spent) in run.workflow.stages.iter().zip(&stages) {
+        total.merge(spent);
+        if let Some(cap) = stage.budget.max_usd.filter(|&cap| spent.usd > cap) {
+            exceeded = Some(exceeded.map_or(cap, |e| e.max(cap)));
+        }
+    }
+    let run_cap = run.workflow.budget.max_usd;
+    if let Some(cap) = run_cap.filter(|&cap| total.usd > cap) {
+        exceeded = Some(exceeded.map_or(cap, |e| e.max(cap)));
+    }
+    exceeded.map(|cap| run_cap.map_or(cap, |run_cap| run_cap.max(cap)))
 }
 
 /// `resume --budget-usd/--budget-tokens`: sets the run's cap, and any stage

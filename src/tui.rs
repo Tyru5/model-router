@@ -127,6 +127,45 @@ impl Drop for Screen {
     }
 }
 
+/// Restores the terminal when the TUI thread panics, and puts the previous
+/// hook back when the TUI returns. Workers and tasks catch their own panics
+/// and report them in the TUI, which keeps the screen, so a panic on another
+/// thread leaves the terminal alone.
+struct PanicHook {
+    previous: Arc<PreviousHook>,
+}
+type PreviousHook = dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static;
+impl PanicHook {
+    fn install() -> Self {
+        let previous: Arc<PreviousHook> = Arc::from(std::panic::take_hook());
+        let chained = previous.clone();
+        let tui = std::thread::current().id();
+        std::panic::set_hook(Box::new(move |info| {
+            on_panic(tui, &|| {
+                let _ = terminal::disable_raw_mode();
+                let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+            });
+            chained(info);
+        }));
+        Self { previous }
+    }
+}
+impl Drop for PanicHook {
+    fn drop(&mut self) {
+        // Changing the hook while panicking aborts the process.
+        if !std::thread::panicking() {
+            let previous = self.previous.clone();
+            std::panic::set_hook(Box::new(move |info| previous(info)));
+        }
+    }
+}
+/// Runs `restore` only on the TUI thread.
+fn on_panic(tui: std::thread::ThreadId, restore: &dyn Fn()) {
+    if std::thread::current().id() == tui {
+        restore();
+    }
+}
+
 pub fn run(
     project: PathBuf,
     settings: Settings,
@@ -135,12 +174,7 @@ pub fn run(
     animate: bool,
     detected_from: Option<PathBuf>,
 ) -> Result<()> {
-    let old_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = terminal::disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
-        old_hook(info);
-    }));
+    let _hook = PanicHook::install();
     let mut app = App::new(project, settings, config_path, cancel);
     if let Some(cwd) = detected_from {
         app.ui.message = format!(
@@ -168,7 +202,10 @@ pub fn run(
         }
     }
     let mut screen = Screen::new()?;
-    if animate && !startup::play(&mut screen.terminal, &app.signal, app.ui.palette())? {
+    if animate
+        && startup::claim()
+        && !startup::play(&mut screen.terminal, &app.signal, app.ui.palette())?
+    {
         return Ok(());
     }
     let _ = storage::remember_project(&app.project);

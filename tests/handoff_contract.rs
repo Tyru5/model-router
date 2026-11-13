@@ -83,12 +83,12 @@ fn contract_is_at_least_a_fifth_shorter_for_every_starter_role() {
     let schema_path =
         Path::new("/project/.model-router/runs/run/01-research/attempt-001/handoff.schema.json");
     let legacy = legacy_contract(handoff_path).len();
-    for index in 0..workflow.stages.len() {
+    for (index, stage) in workflow.stages.iter().enumerate() {
         run.cursor = index;
         let prompt = engine::prompt(&run, handoff_path, schema_path);
         let (_, contract) = prompt.split_once("\nHANDOFF CONTRACT").unwrap();
         let contract = contract.len() + "\nHANDOFF CONTRACT".len();
-        let role = workflow.stages[index].role;
+        let role = stage.role;
         eprintln!("{role:?}: contract {contract} bytes, legacy {legacy}");
         assert!(
             contract * 5 <= legacy * 4,

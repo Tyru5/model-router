@@ -35,6 +35,7 @@ Other files in `<config dir>`:
 | `trust.json` | Per-project SHA-256 digest of trusted config sections. Written by `model-router trust` and the TUI prompt. |
 | `pricing.toml` | Your token prices, as `[models."ID"]` tables. See [cost.md](cost.md). |
 | `recent-projects.json` | Recent projects for the repository browser. |
+| `startup.json` | `version` that last played the startup animation. Delete it to see the animation again. |
 
 Project state lives under `<project>/.model-router/` (see
 [workflows.md](workflows.md#artifacts)).
@@ -259,6 +260,7 @@ harness = "codex"
 | `MODEL_ROUTER_SERVE_TOKEN` | Fixed bearer token for `serve --http`. |
 | `MODEL_ROUTER_HARNESS_VERSIONS` | Override detected versions, e.g. `opencode=1.4.0`. |
 | `MODEL_ROUTER_FRAME_MARKER=1`, `MODEL_ROUTER_FRAME_FILE` | Test hook: smoke tests wait on frames written to this file. |
+| `MODEL_ROUTER_GROUP` | Set by the router on every harness and check it launches: a random marker that crash recovery uses to recognise the process group. Not read from your environment. |
 | `NO_COLOR` | Disables TUI colours (crossterm). Harnesses are always launched with `NO_COLOR=1`. |
 | `TERM=dumb` | Skips the startup animation. |
 | `PAGER`, `VISUAL`, `EDITOR` | Log/diff pager (default `less -R`) and editor. Split like shell words; no shell. |

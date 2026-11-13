@@ -109,12 +109,11 @@ jobs:
     runs-on: ubuntu-latest
     # Advisories appear without code changes; report them, don't block merges.
     continue-on-error: true
-    permissions:
-      contents: read
-      checks: write
-      issues: write
     steps:
       - uses: actions/checkout@v7
-      - uses: rustsec/audit-check@v2.0.0
+      # rustsec/audit-check failed to update its own check run ("Not Found").
+      # Plain cargo-audit fails only on vulnerabilities and prints warnings.
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      - run: cargo audit

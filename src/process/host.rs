@@ -55,6 +55,11 @@ pub(super) struct Spec {
     /// when it lets go; the host takes them by path only when one vanished.
     pub locks: Vec<PathBuf>,
     pub warning: Option<String>,
+    /// Report the harness's start time with its PID (see `ready`). False
+    /// from an mr built before it could read one: on macOS an upgrade can
+    /// leave that mr starting this host from the replaced executable.
+    #[serde(default)]
+    pub report_started: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -389,8 +394,10 @@ fn program() -> Result<PathBuf> {
     return std::env::current_exe().context("Cannot locate the model-router executable");
 }
 
-/// Starts a host for `spec` and returns the harness's process ID once it runs.
-pub(super) fn spawn(spec: &Spec) -> Result<u32> {
+/// Starts a host for `spec` and returns the harness's process group once it
+/// runs: its ID (the leader's PID) and the leader's start time, which the
+/// host reads before it can reap the leader (see `ready`).
+pub(super) fn spawn(spec: &Spec) -> Result<(u32, Option<String>)> {
     #[cfg(test)]
     if PROGRAM.get().is_none() {
         return spawn_thread(spec);
@@ -427,12 +434,22 @@ pub(super) fn spawn(spec: &Spec) -> Result<u32> {
     ready(&line, &spec.dir)
 }
 
-fn ready(line: &str, dir: &Path) -> Result<u32> {
+/// Reads the host's one-line report: `ok PID STARTED` once the harness runs,
+/// where STARTED is `group::started` for it, read by the host before it can
+/// reap the harness and its PID be reused; `ok PID` when the host could not
+/// read it (the group is then identified by its marker alone); `error TEXT`
+/// when the harness did not start.
+fn ready(line: &str, dir: &Path) -> Result<(u32, Option<String>)> {
     let line = line.trim_end();
-    if let Some(pid) = line.strip_prefix("ok ") {
-        return pid
+    if let Some(rest) = line.strip_prefix("ok ") {
+        let (pid, started) = match rest.split_once(' ') {
+            Some((pid, started)) => (pid, Some(started.to_owned())),
+            None => (rest, None),
+        };
+        let pid = pid
             .parse()
-            .context("Terminal host reported a bad process ID");
+            .context("Terminal host reported a bad process ID")?;
+        return Ok((pid, started.filter(|s| !s.is_empty())));
     }
     if let Some(error) = line.strip_prefix("error ") {
         bail!("{error}");
@@ -444,7 +461,7 @@ fn ready(line: &str, dir: &Path) -> Result<u32> {
 }
 
 #[cfg(test)]
-fn spawn_thread(spec: &Spec) -> Result<u32> {
+fn spawn_thread(spec: &Spec) -> Result<(u32, Option<String>)> {
     let text = serde_json::to_string(spec)?;
     let dir = spec.dir.clone();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -502,6 +519,22 @@ fn part(mut gone: Client, locks: &mut Vec<FileLock>, count: usize) {
     }
 }
 
+/// Whether `buffer` starts with a whole attach request, and if so whether it
+/// asks for the harness's start time with its PID: payload `[1]`. An mr
+/// built before it could read one sends an empty payload, and a host built
+/// before then ignores the payload and answers with the PID alone.
+fn attach_request(buffer: &[u8]) -> Option<bool> {
+    if buffer.first() != Some(&tag::ATTACH) {
+        return None;
+    }
+    let len = u32::from_be_bytes(buffer.get(1..5)?.try_into().ok()?) as usize;
+    // Not one this host understands: answer it as an old mr's.
+    if len > 1 {
+        return Some(false);
+    }
+    (buffer.len() >= 5 + len).then(|| buffer.get(5) == Some(&1))
+}
+
 /// Binds the socket, launches the harness, reports it through `ready`, and
 /// supervises it until it exits.
 fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
@@ -549,9 +582,21 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
         let pid = spawned
             .process_id()
             .context("The harness has no process ID")?;
-        Ok((pair.master, fd, reader, writer, transcript, spawned, pid))
+        // Now, while the harness cannot have been reaped: this host reaps it,
+        // and once it has, its PID may name another process.
+        let leader = super::group::started(pid);
+        Ok((
+            pair.master,
+            fd,
+            reader,
+            writer,
+            transcript,
+            spawned,
+            pid,
+            leader,
+        ))
     })();
-    let (master, fd, mut reader, mut writer, mut transcript, spawned, pid) = match started {
+    let (master, fd, mut reader, mut writer, mut transcript, spawned, pid, leader) = match started {
         Ok(started) => started,
         Err(error) => {
             ready(format!("error {error:#}\n"));
@@ -562,7 +607,10 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
         child: spawned,
         pid: Some(pid),
     };
-    ready(format!("ok {pid}\n"));
+    ready(match (&leader, spec.report_started) {
+        (Some(leader), true) => format!("ok {pid} {leader}\n"),
+        _ => format!("ok {pid}\n"),
+    });
 
     let mut state = SessionState::new(spec.cols, spec.rows);
     if let Some(warning) = &spec.warning {
@@ -646,7 +694,7 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
         while index < pending.len() {
             let (stream, frames) = &mut pending[index];
             let open = frames.fill(stream);
-            if frames.buffer.first() == Some(&tag::ATTACH) && frames.buffer.len() >= 5 {
+            if let Some(report_started) = attach_request(&frames.buffer) {
                 let (mut stream, mut frames) = pending.remove(index);
                 let _ = frames.next();
                 let mut out = Vec::new();
@@ -662,7 +710,11 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
                     let _ = stream.write(&out);
                     continue;
                 }
-                frame(tag::SPAWNED, &pid.to_be_bytes(), &mut out);
+                let mut spawned = pid.to_be_bytes().to_vec();
+                if let (true, Some(leader)) = (report_started, &leader) {
+                    spawned.extend_from_slice(leader.as_bytes());
+                }
+                frame(tag::SPAWNED, &spawned, &mut out);
                 // A client never sends descriptors before attaching.
                 drop(frames.take_fds());
                 let mut written = 0;
@@ -898,10 +950,111 @@ mod tests {
         assert!(!is_private_dir(&elsewhere));
     }
 
+    fn spec(dir: &Path, script: &str) -> Spec {
+        Spec {
+            program: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            cwd: dir.to_path_buf(),
+            dir: dir.to_path_buf(),
+            env: vec![],
+            removed: vec![],
+            cols: 80,
+            rows: 24,
+            socket: socket_path().unwrap(),
+            locks: vec![],
+            warning: None,
+            report_started: true,
+        }
+    }
+
+    fn await_exit(dir: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !dir.join(EXIT_FILE).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the host never recorded the exit"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn the_host_reports_the_harness_start_time_before_it_can_reap_it() {
+        // A running harness: the reported start time is its own.
+        let dir = tempfile::tempdir().unwrap();
+        let (pid, started) = spawn(&spec(dir.path(), "sleep 30")).unwrap();
+        assert!(started.is_some(), "start time unreadable");
+        assert_eq!(super::super::group::started(pid), started);
+        super::super::end_group(pid, Duration::from_millis(200), || {});
+        await_exit(dir.path());
+        // One that exits at once: the host has reaped it, so its PID may name
+        // another process by now, yet the start time was read while it was
+        // still the harness.
+        let dir = tempfile::tempdir().unwrap();
+        let (_, started) = spawn(&spec(dir.path(), "exit 0")).unwrap();
+        await_exit(dir.path());
+        assert!(started.is_some(), "start time read after the harness ended");
+    }
+
+    #[test]
+    fn the_host_reports_a_start_time_only_to_an_mr_that_asks() {
+        // An mr built before start times were reported: the PID alone, in
+        // the readiness line and in the attach reply.
+        let dir = tempfile::tempdir().unwrap();
+        let mut old = spec(dir.path(), "sleep 30");
+        old.report_started = false;
+        let socket = old.socket.clone();
+        let (pid, started) = spawn(&old).unwrap();
+        assert_eq!(started, None);
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        let mut out = Vec::new();
+        frame(tag::ATTACH, &[], &mut out);
+        stream.write_all(&out).unwrap();
+        let mut frames = Frames::default();
+        let reply = loop {
+            if let Some(reply) = frames.next().unwrap() {
+                break reply;
+            }
+            assert!(frames.read(&stream).unwrap() > 0);
+        };
+        assert_eq!(reply, (tag::SPAWNED, pid.to_be_bytes().to_vec()));
+        drop(stream);
+        // This build's mr asks, and the attach reply carries what the host
+        // read at launch.
+        let terminal = super::super::Terminal::connect(&socket).unwrap();
+        assert_eq!(terminal.pid(), pid);
+        assert!(terminal.started().is_some());
+        assert_eq!(terminal.started(), super::super::group::started(pid));
+        drop(terminal);
+        super::super::end_group(pid, Duration::from_millis(200), || {});
+        await_exit(dir.path());
+    }
+
+    #[test]
+    fn attach_requests_are_read_whole() {
+        let mut out = Vec::new();
+        frame(tag::ATTACH, &[], &mut out);
+        assert_eq!(attach_request(&out), Some(false));
+        assert_eq!(attach_request(&out[..3]), None);
+        out.clear();
+        frame(tag::ATTACH, &[1], &mut out);
+        assert_eq!(attach_request(&out), Some(true));
+        assert_eq!(attach_request(&out[..5]), None);
+        out.clear();
+        frame(tag::INPUT, &[1], &mut out);
+        assert_eq!(attach_request(&out), None);
+    }
+
     #[test]
     fn host_readiness_reports_errors() {
         let dir = Path::new("/nowhere");
-        assert_eq!(ready("ok 42\n", dir).unwrap(), 42);
+        assert_eq!(
+            ready("ok 42 1700000000.000123\n", dir).unwrap(),
+            (42, Some("1700000000.000123".into()))
+        );
+        // A host that could not read the start time reports the ID alone.
+        assert_eq!(ready("ok 42\n", dir).unwrap(), (42, None));
+        assert!(ready("ok forty-two\n", dir).is_err());
         assert!(
             ready("error No such program\n", dir)
                 .unwrap_err()
