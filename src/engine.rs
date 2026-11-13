@@ -157,6 +157,12 @@ pub enum Cmd {
     EditSummary(String),
     /// Rerun one stopped candidate of a stopped fan-out stage, keeping the others.
     RetryCandidate { stage: String, candidate: String },
+    /// Raise the run's USD or token cap, and any exceeded stage cap, to the
+    /// given amount; unblocks a run its budget stopped. See `cost::raise_budget`.
+    RaiseBudget {
+        usd: Option<f64>,
+        tokens: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -859,10 +865,7 @@ impl Run {
     /// In memory only; `command` applies it under the lock.
     pub fn allow_repair(&mut self) -> Result<()> {
         ensure!(
-            self.status == Status::Blocked
-                && self.cursor < self.stages.len()
-                && self.review_failures().is_some()
-                && self.repair_passes >= self.repair_limit(),
+            self.repair_blocked(),
             "Only a run stopped by its repair limit can get another repair pass"
         );
         self.extra_repair_passes += 1;
@@ -873,7 +876,18 @@ impl Run {
         self.advance(Actor::User)
     }
 
-    fn repair_limit(&self) -> u32 {
+    /// Whether the run stopped because its review still requests changes
+    /// after every repair pass it allows: what `allow_repair` accepts.
+    pub fn repair_blocked(&self) -> bool {
+        self.status == Status::Blocked
+            && self.cursor < self.stages.len()
+            && self.review_failures().is_some()
+            && self.repair_passes >= self.repair_limit()
+    }
+
+    /// Repair passes the run allows: the workflow's limit plus those the
+    /// user added.
+    pub fn repair_limit(&self) -> u32 {
         self.workflow
             .max_repair_passes
             .saturating_add(self.extra_repair_passes)
@@ -1605,6 +1619,7 @@ pub fn command(project: &Path, id: &str, revision: Option<u64>, cmd: Cmd) -> Res
         Cmd::AllowRepair => run.allow_repair()?,
         Cmd::EditSummary(summary) => run.edit_summary(summary)?,
         Cmd::RetryCandidate { stage, candidate } => run.retry_candidate(&stage, &candidate)?,
+        Cmd::RaiseBudget { usd, tokens } => crate::cost::raise_budget(&mut run, usd, tokens)?,
     }
     run.persist()?;
     Ok(run)

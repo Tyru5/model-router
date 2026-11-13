@@ -208,7 +208,7 @@ a repair; advisory findings do not.
   reviews.
 - `max_repair_passes` (default 2; TUI `l`) bounds automatic passes; `0`
   disables them. Past the limit, or with no target, the run blocks.
-  `resume RUN_ID --allow-repair` allows one more pass.
+  `resume RUN_ID --allow-repair` (TUI `R`) allows one more pass.
 - The repair request reaches only the repaired stages and the requesting
   review; it is dropped once that review passes.
 - `run --with-review` enables existing review stages for one run; it does not

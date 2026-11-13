@@ -211,6 +211,8 @@ The saved list loads in the background and refreshes while runs are active.
 | `c` | idle | Continue the run |
 | `y` | idle | Retry current stage |
 | `Y` | idle | Retry one failed fan-out candidate (pick from a list) |
+| `R` | idle | Allow one more review repair pass when the repair limit stopped the run (`y` confirms) |
+| `B` | idle | Raise the USD cap a budget stopped the run on, then continue (`y` confirms) |
 | `i` | idle | Retry interactively |
 | `m` | idle | Replace model and retry |
 | `e` | idle | Edit an interactive handoff summary |
@@ -246,6 +248,18 @@ fan-out's candidates (★ on the winner), each stage's harness, attempts,
 retries, active time, checks, and usage, then the totals and cost with its
 source. A Next bar stays below it with what to do next: `d` diff first for a
 complete run, `y` retry first for a stopped one.
+
+Two stops have their own recovery, offered in the Next bar and footer only
+for that stop:
+
+- Repair limit: `R` asks to allow one more repair pass, saying how many ran
+  and the limit, then sends the review's findings back to the implementation
+  stage. Same as `resume RUN_ID --allow-repair`.
+- USD budget cap: `B` prompts for a new amount (`Ctrl+S` applies), showing the
+  cap and spend. It must exceed both; then `y` confirms and the run continues.
+  The run's cap and any exceeded stage cap become the amount, as with
+  `resume RUN_ID --budget-usd N`. A retry is not offered, since it would stop
+  on the same cap. A token cap is raised with `--budget-tokens N`.
 
 ### Output search
 

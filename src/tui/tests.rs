@@ -2401,6 +2401,225 @@ fn the_footer_offers_only_keys_the_selected_run_accepts() {
     assert!(!footer.contains("[c]"), "{footer}");
 }
 
+/// Waits for the focused run's driver to stop.
+fn settle_driver(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while app.session.running() && std::time::Instant::now() < deadline {
+        app.poll().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!app.session.running());
+}
+
+/// The saved run fixture its repair limit stopped, installed in the app's
+/// project and focused on Runs. No harness it names exists, so a driver
+/// started from it stops before launching anything.
+fn repair_blocked_app(project: &std::path::Path) -> App {
+    let mut app = theme_app(project);
+    app.ui.page = Page::Runs;
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/runs/blocked-repair-limit.json"
+    ))
+    .unwrap()
+    .replace("{{PROJECT}}", app.project.to_str().unwrap());
+    let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    value["adapters"] = serde_json::json!({});
+    for stage in value["workflow"]["stages"].as_array_mut().unwrap() {
+        stage["harness"] = "no-such-harness".into();
+    }
+    let id = value["id"].as_str().unwrap().to_owned();
+    let directory = crate::storage::run_dir(&app.project, &id).unwrap();
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join("run.json"),
+        serde_json::to_vec(&value).unwrap(),
+    )
+    .unwrap();
+    let run = crate::engine::load(&app.project, &id).unwrap();
+    assert!(run.repair_blocked());
+    crate::trust::approve_run(&run, &Settings::default(), None).unwrap();
+    app.session.adopt(run);
+    app
+}
+
+#[test]
+fn allow_repair_is_offered_only_at_the_repair_limit_and_resumes_once_confirmed() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = repair_blocked_app(project.path());
+    let id = app.slot().run.id.clone();
+    let screen = rows(&mut app, 80, 24).join("\n");
+    let footer = screen.lines().last().unwrap();
+    assert!(footer.contains("[R] allow repair"), "{footer}");
+    assert!(screen.contains("[R] allow repair   [y] retry"), "{screen}");
+    assert!(!screen.contains("[B]"), "{screen}");
+
+    // The dialog says how many passes ran; declining changes nothing.
+    app.key(shift('R')).unwrap();
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Ask(ask)) if matches!(**ask, Ask::AllowRepair { passes: 2, limit: 2, .. })
+    ));
+    let screen = rows(&mut app, 100, 30).join("\n");
+    assert!(screen.contains("after 2 repair passes"), "{screen}");
+    app.key(key(Key::Char('n'))).unwrap();
+    assert!(app.ui.dialog().is_none());
+    let saved = crate::engine::load(&app.project, &id).unwrap();
+    assert_eq!(
+        (saved.status, saved.extra_repair_passes),
+        (Status::Blocked, 0)
+    );
+
+    // Confirming allows one more pass and sends the review's findings back.
+    app.key(shift('R')).unwrap();
+    app.key(key(Key::Char('y'))).unwrap();
+    assert!(app.ui.dialog().is_none(), "{}", app.ui.message);
+    assert!(
+        app.ui.message.starts_with("Allowed 1 more repair pass"),
+        "{}",
+        app.ui.message
+    );
+    let saved = crate::engine::load(&app.project, &id).unwrap();
+    assert_eq!((saved.extra_repair_passes, saved.cursor), (1, 1));
+    settle_driver(&mut app);
+
+    // Any other stop neither offers nor accepts it.
+    let mut app = theme_app(project.path());
+    app.ui.page = Page::Runs;
+    let mut run = sample_run("failed");
+    run.status = Status::Failed;
+    run.cursor = 0;
+    app.session.adopt(run);
+    let screen = rows(&mut app, 120, 36).join("\n");
+    assert!(!screen.contains("[R]"), "{screen}");
+    let error = app.perform(ActionId::AllowRepair).unwrap_err();
+    assert!(format!("{error}").contains("repair limit"), "{error}");
+    assert!(app.ui.dialog().is_none());
+}
+
+/// A saved run its $0.10 run cap stopped after $0.25 of reported spend. No
+/// harness it names exists.
+fn budget_blocked_app(project: &std::path::Path) -> App {
+    let mut app = theme_app(project);
+    app.ui.page = Page::Runs;
+    let mut run = sample_run("budget");
+    for stage in &mut run.workflow.stages {
+        stage.harness = "no-such-harness".into();
+    }
+    run.project = app.project.clone();
+    run.workspace = app.project.clone();
+    run.directory = crate::storage::run_dir(&app.project, &run.id).unwrap();
+    for (n, attempt) in run
+        .stages
+        .iter_mut()
+        .flat_map(|s| &mut s.attempts)
+        .enumerate()
+    {
+        attempt.directory = run
+            .directory
+            .join("01-implement")
+            .join(format!("attempt-{n:03}"));
+        attempt.handoff_file = attempt.directory.join("handoff.json");
+    }
+    run.workflow.budget.max_usd = Some(0.1);
+    run.cursor = 2;
+    run.stages[2].status = Status::Blocked;
+    run.status = Status::Blocked;
+    run.error = crate::cost::check_budget(&run);
+    assert!(crate::cost::usd_budget_blocked(&run), "{:?}", run.error);
+    std::fs::create_dir_all(&run.directory).unwrap();
+    run.persist().unwrap();
+    app.session.adopt(run);
+    app
+}
+
+#[test]
+fn raise_budget_is_offered_only_on_a_usd_cap_and_checks_the_amount() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = budget_blocked_app(project.path());
+    let id = app.slot().run.id.clone();
+    let saved_cap = |app: &App| {
+        crate::engine::load(&app.project, &id)
+            .unwrap()
+            .workflow
+            .budget
+            .max_usd
+    };
+    let screen = rows(&mut app, 80, 24).join("\n");
+    let footer = screen.lines().last().unwrap();
+    assert!(footer.contains("[B] raise budget"), "{footer}");
+    // A retry would stop on the same cap.
+    assert!(!footer.contains("[y]"), "{footer}");
+    assert!(screen.contains("[B] raise budget   [d] diff"), "{screen}");
+    assert!(!screen.contains("[R]"), "{screen}");
+
+    // The prompt names the cap and the spend.
+    let type_amount = |app: &mut App, amount: &str| {
+        app.key(shift('B')).unwrap();
+        let title = dialog(app).unwrap();
+        assert!(title.contains("cap $0.10, spent $0.25"), "{title}");
+        for c in amount.chars() {
+            app.key(key(Key::Char(c))).unwrap();
+        }
+        app.key(ctrl('s'))
+    };
+    // Not a number, or not above the cap and the spend: rejected, and the
+    // prompt stays.
+    for bad in ["ten", "0.05", "0.2", "-3"] {
+        let error = type_amount(&mut app, bad).unwrap_err();
+        assert!(format!("{error}").contains("Enter "), "{bad}: {error}");
+        assert!(
+            matches!(app.ui.dialog(), Some(Modal::Input { .. })),
+            "{bad}"
+        );
+        app.key(key(Key::Esc)).unwrap();
+        assert!(app.ui.dialog().is_none());
+    }
+    assert_eq!(saved_cap(&app), Some(0.1));
+
+    // A valid amount asks first; declining changes nothing.
+    type_amount(&mut app, "$5").unwrap();
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Ask(ask)) if matches!(**ask, Ask::RaiseBudget { usd, cap, .. } if usd == 5.0 && cap == 0.1)
+    ));
+    let screen = rows(&mut app, 100, 30).join("\n");
+    assert!(screen.contains("from $0.10 to $5.00"), "{screen}");
+    app.key(key(Key::Esc)).unwrap();
+    assert!(app.ui.dialog().is_none());
+    assert_eq!(saved_cap(&app), Some(0.1));
+
+    // Confirming raises the cap and continues the run.
+    type_amount(&mut app, "5").unwrap();
+    app.key(key(Key::Char('y'))).unwrap();
+    assert!(app.ui.dialog().is_none(), "{}", app.ui.message);
+    assert!(
+        app.ui.message.starts_with("Budget raised to $5.00"),
+        "{}",
+        app.ui.message
+    );
+    assert_eq!(saved_cap(&app), Some(5.0));
+    settle_driver(&mut app);
+    assert!(!crate::cost::budget_blocked(&app.slot().run));
+
+    // A token cap is raised from the CLI; the key is not offered for it.
+    let mut app = budget_blocked_app(project.path());
+    let run = &mut app.slot_mut().run;
+    run.workflow.budget.max_usd = None;
+    run.workflow.budget.max_tokens = Some(10);
+    run.error = crate::cost::check_budget(run);
+    assert!(crate::cost::budget_blocked(run) && !crate::cost::usd_budget_blocked(run));
+    let screen = rows(&mut app, 120, 36).join("\n");
+    assert!(!screen.contains("[B]"), "{screen}");
+    let error = app.perform(ActionId::RaiseBudget).unwrap_err();
+    assert!(format!("{error}").contains("--budget-tokens"), "{error}");
+    // Nor is it for a run that stopped otherwise.
+    app.slot_mut().run.error = Some("Harness exited".into());
+    let error = app.perform(ActionId::RaiseBudget).unwrap_err();
+    assert!(format!("{error}").contains("budget"), "{error}");
+    assert!(app.ui.dialog().is_none());
+}
+
 #[test]
 fn saved_runs_say_none_yet_when_only_this_sessions_runs_exist() {
     let project = tempfile::tempdir().unwrap();

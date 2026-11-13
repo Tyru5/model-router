@@ -15,6 +15,9 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   failures stay marked for retry. Offered in a model-router checkout.
 - `doctor` counts passing live tests saved in the project
   (`.model-router/harness-tests/`), so TESTED updates after one passes.
+- TUI recovery keys for a stopped run: `R` allows one more repair pass after
+  the repair limit, `B` raises a USD budget cap after asking for the amount.
+  Each asks first and shows only for its stop.
 - TUI action menu: `Space`, then a group letter (Run, Stage, Workflow, Go,
   View) and an action letter, lists every action of the current view.
 - `completions SHELL [--bin NAME]`: shell completion scripts for bash, zsh,

@@ -233,6 +233,31 @@ impl App {
                     note: "Reruns the candidate from the fan-out base; the others keep their results and the judge chooses again.".into(),
                 });
             }
+            ActionId::AllowRepair => {
+                let run = self.session.run().context("No run selected")?;
+                ensure!(
+                    run.repair_blocked(),
+                    "Only a run stopped by its repair limit can get another repair pass"
+                );
+                self.ui.open(Modal::Ask(Box::new(Ask::AllowRepair {
+                    run: run.id.clone(),
+                    passes: run.repair_passes,
+                    limit: run.repair_limit(),
+                })));
+            }
+            ActionId::RaiseBudget => {
+                let run = self.session.run().context("No run selected")?;
+                let (cap, spent) = crate::cost::raise_floor(run)?;
+                self.input(
+                    &format!(
+                        "New USD budget (cap {}, spent {})",
+                        crate::report::dollars(cap),
+                        spent.amount()
+                    ),
+                    InputTarget::Budget,
+                    "",
+                );
+            }
             ActionId::ReplaceModel => {
                 let run = self.session.run().context("No run")?;
                 let stage = run

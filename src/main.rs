@@ -769,7 +769,10 @@ fn main_result() -> Result<()> {
                 })?;
             }
             if budget_usd.is_some() || budget_tokens.is_some() {
-                cost::raise_budget(&mut run, budget_usd, budget_tokens)?;
+                run.command(Cmd::RaiseBudget {
+                    usd: budget_usd,
+                    tokens: budget_tokens,
+                })?;
             }
             if advance {
                 run.command(Cmd::Confirm)?;

@@ -51,6 +51,8 @@ pub(super) enum ActionId {
     CancelStage,
     TakeOver,
     CloseRun,
+    AllowRepair,
+    RaiseBudget,
     Advance,
     Continue,
     Retry,
@@ -346,6 +348,8 @@ const ACTIONS: &[Entry] = {
             .footer_in(&[MonitorRunning])
             .menu(RunMenu, 't'),
         act(CloseRun, MonitorIdle, ch('x'), "close", "Close this run in the session; its files stay and it moves to Saved").menu(RunMenu, 'x'),
+        act(AllowRepair, MonitorIdle, ch('R'), "allow repair", "Allow one more review repair pass when the repair limit stopped the run ([y] confirms)").footer().menu(RunMenu, 'R'),
+        act(RaiseBudget, MonitorIdle, ch('B'), "raise budget", "Raise the USD cap a budget stopped the run on, then continue ([y] confirms)").footer().menu(RunMenu, 'B'),
         act(Advance, MonitorIdle, ch('a'), "advance", "Accept handoff and advance; also accepts a test stage's not-applicable waiver").footer().menu(RunMenu, 'a'),
         act(Continue, MonitorIdle, ch('c'), "continue", "Continue the run when idle (not in the moment a stage stops)").footer().menu(RunMenu, 'c'),
         act(Retry, MonitorIdle, ch('y'), "retry", "Explicitly retry current stage").footer().menu(RunMenu, 'y'),

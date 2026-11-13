@@ -61,4 +61,5 @@ budget = { max_usd = 2.0 }
 - `max_tokens` counts input, output, and cache writes; cache reads are
   excluded. Unknown costs count only toward `max_tokens`.
 - Continue: `model-router resume RUN_ID --budget-usd N` or `--budget-tokens N`
-  sets the run's cap and any exceeded stage cap to `N`.
+  sets the run's cap and any exceeded stage cap to `N`. In the TUI, `B` on a
+  run a USD cap stopped asks for `N` and confirms first.
