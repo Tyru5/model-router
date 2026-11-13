@@ -305,8 +305,8 @@ impl StageEditor {
                 };
                 self.fields[self.selected] = textarea(&values[next]);
                 if self.selected == 2 {
-                    for index in MODEL..=EFFORT {
-                        self.fields[index] = textarea("");
+                    for field in &mut self.fields[MODEL..=EFFORT] {
+                        *field = textarea("");
                     }
                     self.catalog = None;
                     return StageRequest::Catalog;
