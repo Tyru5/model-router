@@ -35,6 +35,7 @@ Other files in `<config dir>`:
 | `trust.json` | Per-project SHA-256 digest of trusted config sections. Written by `model-router trust` and the TUI prompt. |
 | `pricing.toml` | Your token prices, as `[models."ID"]` tables. See [cost.md](cost.md). |
 | `recent-projects.json` | Recent projects for the repository browser. |
+| `startup.json` | `version` that last played the startup animation. Delete it to see the animation again. |
 
 Project state lives under `<project>/.model-router/` (see
 [workflows.md](workflows.md#artifacts)).

@@ -20,9 +20,13 @@ capital letters (`T` = Shift+T).
 
 ## Startup
 
-A 1.7-second animation plays once. Any key skips it (the key is consumed);
+A 1.7-second animation plays on the first TUI launch of each installed
+version; later launches open the TUI directly. `<config dir>/startup.json`
+records the version that played it (skipping or interrupting it counts);
+delete the file to see it again. Any key skips it (the key is consumed);
 `Ctrl+C` exits. Skip it with `--no-animation`, `MODEL_ROUTER_NO_ANIMATION=1`,
-or `TERM=dumb`. CLI subcommands never play it.
+or `TERM=dumb`; these leave the first play for a later launch. CLI
+subcommands never play it.
 
 The header line shows the project: repository name, branch (or detached
 commit), changed-file count, and path; non-Git folders are labelled.

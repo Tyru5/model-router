@@ -84,7 +84,7 @@ and persistence across restart at 80×24 and 120×36. It also verifies that an
 interactive test stage cannot pass by printing results without a handoff file.
 
 `scripts/smoke_startup.py` checks visible animation frames, automatic completion,
-consuming the skip key, flag/environment bypass, resizing to a small terminal,
+no animation on a second launch of the same version, consuming the skip key, flag/environment bypass, resizing to a small terminal,
 paste, Ctrl+C/SIGTERM cleanup, and unaffected CLI output. It records the real
 terminal animation as `startup.gif`; rendering is also tested at 120×36, 80×24,
 40×10, and 1×1. Both color and `NO_COLOR` terminal runs passed.

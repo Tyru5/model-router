@@ -202,7 +202,10 @@ pub fn run(
         }
     }
     let mut screen = Screen::new()?;
-    if animate && !startup::play(&mut screen.terminal, &app.signal, app.ui.palette())? {
+    if animate
+        && startup::claim()
+        && !startup::play(&mut screen.terminal, &app.signal, app.ui.palette())?
+    {
         return Ok(());
     }
     let _ = storage::remember_project(&app.project);

@@ -8,13 +8,50 @@ use ratatui::{
     style::{Color, Modifier, Style},
     widgets::{Block, Paragraph},
 };
+use serde::{Deserialize, Serialize};
 use std::{
+    path::Path,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
 const DURATION: Duration = Duration::from_millis(1700);
 const FRAME: Duration = Duration::from_millis(25);
+/// In the config directory: the last version that played the animation.
+const SEEN_FILE: &str = "startup.json";
+
+#[derive(Serialize, Deserialize)]
+struct Seen {
+    version: String,
+}
+
+/// The animation plays once per installed version.
+fn first_for_version(stored: Option<&str>, current: &str) -> bool {
+    stored != Some(current)
+}
+
+/// True when this version has not played the animation yet, recording that it
+/// now has. Recorded before playing, so a skipped or interrupted animation
+/// counts as seen. A missing, unreadable, or corrupt marker plays it; a failed
+/// write is ignored, so it plays again next launch.
+pub(super) fn claim() -> bool {
+    claim_at(
+        &crate::config::config_dir().join(SEEN_FILE),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+fn claim_at(path: &Path, version: &str) -> bool {
+    let stored = crate::storage::read_json::<Seen>(path).ok();
+    if !first_for_version(stored.as_ref().map(|seen| seen.version.as_str()), version) {
+        return false;
+    }
+    let seen = Seen {
+        version: version.into(),
+    };
+    let _ = crate::storage::write_json(path, &seen);
+    true
+}
 
 /// Returns false when startup was interrupted, leaving terminal cleanup to Screen.
 pub(super) fn play<B: Backend>(
@@ -251,6 +288,35 @@ fn draw(frame: &mut Frame<'_>, elapsed: Duration, palette: Palette) {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn animation_plays_once_per_version() {
+        assert!(first_for_version(None, "0.2.0"));
+        assert!(first_for_version(Some("0.1.0"), "0.2.0"));
+        assert!(first_for_version(Some("0.3.0"), "0.2.0"));
+        assert!(!first_for_version(Some("0.2.0"), "0.2.0"));
+    }
+
+    #[test]
+    fn claim_records_the_version_and_tolerates_bad_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config").join(SEEN_FILE);
+        assert!(claim_at(&path, "0.1.0"));
+        assert!(!claim_at(&path, "0.1.0"));
+        assert!(claim_at(&path, "0.2.0"), "An upgrade plays it again");
+        assert!(!claim_at(&path, "0.2.0"));
+
+        std::fs::write(&path, "not json").unwrap();
+        assert!(claim_at(&path, "0.2.0"), "A corrupt marker plays it");
+        assert!(!claim_at(&path, "0.2.0"), "and is replaced");
+
+        // The marker's parent is a file, so the write fails: play, quietly.
+        let blocked = dir.path().join("file");
+        std::fs::write(&blocked, "").unwrap();
+        let unwritable = blocked.join(SEEN_FILE);
+        assert!(claim_at(&unwritable, "0.2.0"));
+        assert!(claim_at(&unwritable, "0.2.0"));
+    }
 
     #[test]
     fn startup_uses_each_themes_background() {

@@ -57,8 +57,14 @@ def main():
             (ROOT / "examples/demo.toml").read_text()
         )
         animation_env = {"MODEL_ROUTER_NO_ANIMATION": "0", "NO_COLOR": ""}
+        # Terminal's config dir; the animation plays once per version.
+        seen = project / "config-home/model-router/startup.json"
 
-        terminal = Terminal(project, env=animation_env, size=(80, 24))
+        def first_launch(extra=(), env=animation_env, **kwargs):
+            seen.unlink(missing_ok=True)
+            return Terminal(project, extra, env=env, **kwargs)
+
+        terminal = first_launch(size=(80, 24))
         try:
             started = time.monotonic()
             wait_for_intro(terminal)
@@ -90,9 +96,26 @@ def main():
             terminal.exit()
         finally:
             terminal.cleanup()
+        assert seen.exists(), "Startup did not record the version that played it"
+
+        # The same version with the same config dir opens straight to the TUI.
+        terminal = Terminal(project, env=animation_env)
+        try:
+            terminal.wait_for(
+                lambda: "1 Workflow" in terminal.text(),
+                "Second launch did not open the TUI",
+                timeout=1,
+            )
+            assert b"Any key to skip" not in terminal.raw, (
+                "Second launch of the same version animated"
+            )
+            terminal.send("q")
+            terminal.exit()
+        finally:
+            terminal.cleanup()
 
         # The skip key is consumed, so 'e' must not also open the stage editor.
-        terminal = Terminal(project, env=animation_env)
+        terminal = first_launch()
         try:
             wait_for_intro(terminal)
             started = time.monotonic()
@@ -116,7 +139,7 @@ def main():
             (["--no-animation"], animation_env),
             ([], {"MODEL_ROUTER_NO_ANIMATION": "1"}),
         ]:
-            terminal = Terminal(project, extra, env=env)
+            terminal = first_launch(extra, env)
             try:
                 terminal.wait_for(
                     lambda: "1 Workflow" in terminal.text(),
@@ -130,8 +153,9 @@ def main():
                 terminal.exit()
             finally:
                 terminal.cleanup()
+            assert not seen.exists(), "A bypassed startup used up the first play"
 
-        terminal = Terminal(project, env=animation_env)
+        terminal = first_launch()
         try:
             wait_for_intro(terminal)
             terminal.resize(40, 10, settle="clear")
@@ -154,7 +178,7 @@ def main():
             terminal.cleanup()
 
         for interrupt in ("key", "signal"):
-            terminal = Terminal(project, env=animation_env)
+            terminal = first_launch()
             try:
                 wait_for_intro(terminal)
                 if interrupt == "key":
@@ -179,7 +203,7 @@ def main():
         ), "Startup affected CLI output"
         assert not records(project), "Startup tests launched a model"
     print(
-        "PASS: animated frames, automatic completion, skip consumption, flag/env bypass, small-screen resize, paste, Ctrl+C/SIGTERM cleanup, and unchanged CLI output."
+        "PASS: animated frames, automatic completion, once per version, skip consumption, flag/env bypass, small-screen resize, paste, Ctrl+C/SIGTERM cleanup, and unchanged CLI output."
     )
     print(f"Preview: {ARTIFACTS / 'startup.gif'}")
 

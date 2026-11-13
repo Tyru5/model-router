@@ -90,6 +90,8 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Changed
 
+- TUI: the startup animation plays only on the first launch of each
+  installed version, recorded in `<config dir>/startup.json`.
 - TUI: Monitor and Runs are one Runs page (`2`): a sidebar of this
   session's runs and saved runs beside the selected one; Harnesses is `3`.
   Its list keys moved where they collided: filter `F`, status `s`,
