@@ -1768,6 +1768,60 @@ fn interactive_worker_failure_before_launch_finishes_its_terminal() {
 }
 
 #[test]
+fn a_panicking_worker_fails_the_run_and_finishes_its_terminal() {
+    let session = crate::process::InteractiveSession::new(80, 24);
+    let mut slot = super::run_slot::RunSlot::new(sample_run("crashed"));
+    slot.run.status = Status::Running;
+    slot.worker = Some(Worker::spawn(
+        Some(session.clone()),
+        |_| false,
+        |emit| {
+            emit(RunEvent::Output("before the panic".into()));
+            panic!("engine bug {}", 7)
+        },
+    ));
+    let start = std::time::Instant::now();
+    let result = loop {
+        if let Some(result) = slot.poll().1 {
+            break result;
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let error = result.unwrap_err();
+    assert!(error.contains("panicked: engine bug 7"), "{error}");
+    assert!(slot.worker.is_none());
+    assert!(!slot.in_progress());
+    assert_eq!(slot.run.status, Status::Failed);
+    assert_eq!(slot.run.error.as_deref(), Some(error.as_str()));
+    assert!(slot.logs.iter().any(|line| line == "before the panic"));
+    assert_eq!(
+        session
+            .attach(&AtomicBool::new(false), &AtomicBool::new(false))
+            .unwrap(),
+        crate::process::AttachOutcome::Finished
+    );
+}
+
+#[test]
+fn a_panic_off_the_tui_thread_leaves_the_terminal_alone() {
+    let tui = std::thread::current().id();
+    let restored = std::sync::atomic::AtomicUsize::new(0);
+    let restore = || {
+        restored.fetch_add(1, Ordering::Relaxed);
+    };
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| super::on_panic(tui, &restore))
+            .join()
+            .unwrap();
+    });
+    assert_eq!(restored.load(Ordering::Relaxed), 0);
+    super::on_panic(tui, &restore);
+    assert_eq!(restored.load(Ordering::Relaxed), 1);
+}
+
+#[test]
 fn text_dialog_scrolling_stops_at_the_last_line() {
     let project = tempfile::tempdir().unwrap();
     let mut app = theme_app(project.path());

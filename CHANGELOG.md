@@ -133,6 +133,9 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 - `handoffs` counts list items lost to repeated shortening correctly.
 - Process groups that parallel workers start are journaled at once, so a
   crash while checks run still lets `resume` stop them.
+- A panic in a TUI run's driver fails that run with the panic message
+  instead of leaving it running forever, and a panic off the TUI thread no
+  longer restores the terminal under the still-drawing TUI.
 
 ### Security
 
