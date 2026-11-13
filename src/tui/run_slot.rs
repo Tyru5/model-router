@@ -24,8 +24,8 @@ pub(super) struct Inbox {
     state: Option<Box<Run>>,
     output: VecDeque<String>,
     skipped: usize,
-    /// The final run and result. No run means the worker panicked, and the
-    /// UI's copy, which has every state it reported, is the latest.
+    /// The final run and result. No run means the worker panicked; the UI
+    /// then reloads the saved run (see `RunSlot::crashed`).
     done: Option<(Option<Box<Run>>, Outcome)>,
 }
 /// How a worker's run ended.
@@ -213,6 +213,23 @@ impl RunSlot {
                     | Status::AwaitingConfirmation
             )
     }
+    /// `engine::authorize_replay` for this idle run, before a command changes
+    /// it; what recovery stopped or left running goes to the output log.
+    pub(super) fn authorize_replay(
+        &mut self,
+        explicit: Option<&std::path::Path>,
+    ) -> anyhow::Result<()> {
+        let mut notes = String::new();
+        let result = engine::authorize_replay(&mut self.run, explicit, |event| {
+            if let RunEvent::Output(text) = event {
+                notes.push_str(&text);
+            }
+        });
+        for line in notes.lines() {
+            self.push_log(storage::truncate(line, 1500));
+        }
+        result
+    }
     pub(super) fn push_log(&mut self, line: String) {
         self.logs.push_back(line);
         self.log_version += 1;
@@ -274,10 +291,17 @@ impl RunSlot {
     }
     /// Fails the run whose worker panicked, in memory only: the record on
     /// disk still says running, which the next drive recovers as interrupted.
+    /// The worker may have saved the run after the last state it reported
+    /// (a launch records its process group without one), so the saved run,
+    /// which its unwinding has unlocked by now, is the latest; the last
+    /// reported state only stands in when it cannot be read.
     fn crashed(&mut self, result: &std::result::Result<Action, String>) {
         let Err(message) = result else {
             return;
         };
+        if let Ok(saved) = engine::load(&self.run.project, &self.run.id) {
+            self.run = saved;
+        }
         let running = self
             .run
             .stages

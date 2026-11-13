@@ -163,8 +163,10 @@ workspaces. A crash, failure,
 timeout, or cancellation never silently retries a possibly mutating stage.
 A harness's whole process group ends with its stage (SIGTERM, a grace period,
 then SIGKILL), including after a normal exit, and on Linux when mr dies. Each
-attempt records its process group while running; the next drive stops a group
-left behind by a crashed router before continuing. Git snapshot trees stay
+attempt records its process group, its leader's start time, and an inherited
+environment marker while running; the next drive stops a group left behind by
+a crashed router before continuing, and only if the start time or marker shows
+it is the recorded group. Git snapshot trees stay
 reachable through `refs/model-router/runs/<run>/` until the run is cleaned.
 
 The user can retry, switch model, reopen interactively, or resume a saved run.

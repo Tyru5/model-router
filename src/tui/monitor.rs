@@ -165,11 +165,11 @@ impl App {
                 self.start_driver()?
             }
             ActionId::Advance => {
-                engine::authorize_replay(
-                    self.session.run_mut().context("No run")?,
-                    self.editor.settings.explicit_config.as_deref(),
-                    |_| {},
-                )?;
+                let explicit = self.editor.settings.explicit_config.clone();
+                self.session
+                    .focused_mut()
+                    .context("No run")?
+                    .authorize_replay(explicit.as_deref())?;
                 self.session
                     .run_mut()
                     .context("No run")?

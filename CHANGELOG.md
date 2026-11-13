@@ -15,6 +15,9 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   failures stay marked for retry. Offered in a model-router checkout.
 - `doctor` counts passing live tests saved in the project
   (`.model-router/harness-tests/`), so TESTED updates after one passes.
+- `resume ID --release-groups`: forgets process groups recovery left running
+  because it could not prove they were the run's harnesses, without
+  signalling them, and prints each released ID.
 - TUI recovery keys for a stopped run: `R` allows one more repair pass after
   the repair limit, `B` raises a USD budget cap after asking for the amount.
   Each asks first and shows only for its stop.
@@ -119,6 +122,24 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Fixed
 
+- Recovery no longer signals a recorded process group ID that now belongs to
+  another process: it stops a group only if its leader's start time or the
+  `MODEL_ROUTER_GROUP` marker in a member's environment matches the record,
+  and checks again before SIGTERM and before SIGKILL, so a group that ends
+  during the grace period and whose ID is reused is not killed. A group it
+  cannot prove is left running and stays recorded in the run, as does one
+  that survives SIGTERM once nothing proves it is the run's, including when
+  an interactive harness's terminal host dies before mr first attaches. While it is
+  alive the run launches no harness (`resume`, retry, advance, `fork`), and
+  no new run or `rerun` starts in the same checkout; the error names the
+  group, why it is unproven, and the `kill` command. Runs saved by
+  earlier versions record neither, so their surviving groups are left
+  running and recorded the same way.
+- An interactive harness's start time is read by its terminal host before
+  the host can reap it, and reported on launch and on reattach, so a
+  short-lived harness's PID is not mistaken for a later process's.
+- `resume` prints what recovery stopped or left running instead of
+  discarding it; the TUI shows it in the run's output, `serve` in its log.
 - Harness process groups end with their stage; `resume` stops groups left by
   a crash.
 - Repair and attempt bookkeeping.
@@ -140,7 +161,9 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   crash while checks run still lets `resume` stop them.
 - A panic in a TUI run's driver fails that run with the panic message
   instead of leaving it running forever, and a panic off the TUI thread no
-  longer restores the terminal under the still-drawing TUI.
+  longer restores the terminal under the still-drawing TUI. The run is
+  reloaded from disk first, so retry and continue do not fail with "This run
+  changed in another process".
 
 ### Security
 

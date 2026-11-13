@@ -661,9 +661,10 @@ impl App {
             }
             Ask::AllowRepair { run, .. } => {
                 let explicit = self.editor.settings.explicit_config.clone();
-                let run = self.idle(run)?;
-                engine::authorize_replay(run, explicit.as_deref(), |_| {})?;
-                run.command(engine::Cmd::AllowRepair)?;
+                self.idle(run)?;
+                let slot = self.session.focused_mut().context("No run")?;
+                slot.authorize_replay(explicit.as_deref())?;
+                slot.run.command(engine::Cmd::AllowRepair)?;
                 self.start_driver()?;
                 self.ui.message = "Allowed 1 more repair pass; repairing…".into();
             }

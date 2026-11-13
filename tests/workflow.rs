@@ -672,26 +672,42 @@ fn background_children_end_with_a_harness_that_exits_normally() {
         .unwrap();
     thread::sleep(Duration::from_millis(100));
     assert!(!running(pid), "background child outlived its harness");
-    assert!(!process::group_alive(group.unwrap()));
+    assert!(!process::group_alive(group.unwrap().pgid));
 }
 
+/// Not a test: what `orphan` leaves running. This test binary, unlike system
+/// binaries, shows its environment to recovery's marker check on macOS.
 #[test]
-fn drive_stops_a_harness_group_left_by_a_dead_router() {
-    let (dir, _, mut run) = fixture(vec![stage("implementation", Role::Implementation)]);
-    assert_eq!(drive(&mut run), Action::Complete);
+#[ignore]
+fn linger() {
+    if std::env::var_os("MODEL_ROUTER_TEST_LINGER").is_some() {
+        thread::sleep(Duration::from_secs(30));
+    }
+}
+
+/// A crashed run whose recorded harness group is still alive: its leader
+/// exited and left a background child. Returns the child's pid.
+fn orphan(dir: &std::path::Path, run: &mut engine::Run, identity: process::Identity) -> i32 {
+    assert_eq!(drive(run), Action::Complete);
     // A crash mid-stage leaves the attempt running with its group recorded.
     let mut leader = {
         use std::os::unix::process::CommandExt;
-        std::process::Command::new("sh")
-            .args(["-c", "sleep 30 & echo $! > orphan.pid"])
-            .current_dir(dir.path())
-            .process_group(0)
-            .spawn()
-            .unwrap()
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(r#""$0" --exact linger --ignored >/dev/null 2>&1 & echo $! > orphan.pid"#)
+            .arg(std::env::current_exe().unwrap())
+            .env("MODEL_ROUTER_TEST_LINGER", "1")
+            .current_dir(dir)
+            .process_group(0);
+        if let Some(marker) = &identity.marker {
+            command.env(process::group::MARKER_ENV, marker);
+        }
+        command.spawn().unwrap()
     };
     let pgid = leader.id();
     leader.wait().unwrap();
-    let pid: i32 = fs::read_to_string(dir.path().join("orphan.pid"))
+    let pid: i32 = fs::read_to_string(dir.join("orphan.pid"))
         .unwrap()
         .trim()
         .parse()
@@ -702,13 +718,331 @@ fn drive_stops_a_harness_group_left_by_a_dead_router() {
     run.stages[0].status = Status::Running;
     let attempt = run.stages[0].attempts.last_mut().unwrap();
     attempt.status = Status::Running;
-    attempt.process_group = Some(pgid);
+    attempt.set_group(Some(process::Group { pgid, identity }));
     run.persist().unwrap();
-    assert_eq!(drive(&mut run), Action::Stopped);
+    pid
+}
+
+fn drive_logged(run: &mut engine::Run) -> (Action, String) {
+    let mut log = String::new();
+    let action = engine::drive(run, &AtomicBool::new(false), |event| {
+        if let engine::Event::Output(text) = event {
+            log.push_str(&text);
+        }
+    })
+    .unwrap();
+    (action, log)
+}
+
+#[test]
+fn drive_stops_a_harness_group_left_by_a_dead_router() {
+    let (dir, _, mut run) = fixture(vec![stage("implementation", Role::Implementation)]);
+    let identity = process::Identity {
+        started: Some("the exited leader".into()),
+        marker: Some(process::group::new_marker()),
+    };
+    let pid = orphan(dir.path(), &mut run, identity);
+    let (action, log) = drive_logged(&mut run);
+    assert_eq!(action, Action::Stopped);
+    assert!(log.contains("Stopping process group"), "{log}");
     assert!(run.error.as_deref().unwrap().contains("interrupted"));
     assert!(run.stages[0].attempts[0].process_group.is_none());
-    thread::sleep(Duration::from_millis(100));
+    assert!(run.stages[0].attempts[0].process_identity.is_empty());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while running(pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
     assert!(!running(pid), "orphaned harness child still running");
+}
+
+#[test]
+fn drive_leaves_alone_a_group_it_cannot_prove_is_the_recorded_one() {
+    // Saved by an earlier version (ID only), or recorded with a marker no
+    // process in the group carries: the ID may name an unrelated group.
+    for identity in [
+        process::Identity::default(),
+        process::Identity {
+            started: Some("the exited leader".into()),
+            marker: Some(process::group::new_marker()),
+        },
+    ] {
+        let (dir, _, mut run) = fixture(vec![stage("implementation", Role::Implementation)]);
+        let unmarked = process::Identity {
+            marker: None,
+            ..identity.clone()
+        };
+        let pid = orphan(dir.path(), &mut run, unmarked);
+        let attempt = run.stages[0].attempts.last_mut().unwrap();
+        let pgid = attempt.process_group.unwrap();
+        attempt.process_identity = identity.clone();
+        run.persist().unwrap();
+        // A run.json without the identity (an earlier version's) still loads.
+        let mut run = engine::load(dir.path(), &run.id).unwrap();
+        assert_eq!(run.stages[0].attempts[0].process_identity, identity);
+        let (action, log) = drive_logged(&mut run);
+        assert_eq!(action, Action::Stopped);
+        assert!(
+            log.contains(&format!("Left process group {pgid} running")),
+            "{log}"
+        );
+        assert!(running(pid), "an unverified group was signalled");
+        process::end_group(pgid, Duration::from_millis(100), || {});
+    }
+}
+
+/// A crashed run whose harness group is alive but carries no marker, so
+/// recovery cannot prove it is the run's. Returns its pgid and a member.
+fn unproven_orphan(dir: &std::path::Path, run: &mut engine::Run) -> (u32, i32) {
+    let identity = process::Identity {
+        started: Some("the exited leader".into()),
+        marker: Some(process::group::new_marker()),
+    };
+    let unmarked = process::Identity {
+        marker: None,
+        ..identity.clone()
+    };
+    let pid = orphan(dir, run, unmarked);
+    let attempt = run.stages[0].attempts.last_mut().unwrap();
+    let pgid = attempt.process_group.unwrap();
+    attempt.process_identity = identity;
+    run.persist().unwrap();
+    (pgid, pid)
+}
+
+/// Ends the group however the test ends.
+struct EndGroup(u32);
+impl Drop for EndGroup {
+    fn drop(&mut self) {
+        process::end_group(self.0, Duration::from_millis(100), || {});
+    }
+}
+
+/// A run the CLI can replay: its saved config, trusted.
+fn trusted_fixture() -> (tempfile::TempDir, engine::Run) {
+    let (dir, settings, run) = fixture(vec![stage("implementation", Role::Implementation)]);
+    settings
+        .save(&dir.path().join(".model-router.toml"))
+        .unwrap();
+    let (ok, stdout, stderr) = router(dir.path(), &["trust", "--yes"]);
+    assert!(ok, "{stdout}{stderr}");
+    (dir, run)
+}
+
+fn router(dir: &std::path::Path, args: &[&str]) -> (bool, String, String) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_model-router"))
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("MODEL_ROUTER_CONFIG_DIR", dir.join("config-home"))
+        .output()
+        .unwrap();
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn an_unproven_group_blocks_retry_until_released() {
+    let (dir, mut run) = trusted_fixture();
+    let (pgid, pid) = unproven_orphan(dir.path(), &mut run);
+    let _end = EndGroup(pgid);
+    let id = run.id.clone();
+    // Recovery leaves the group running, says so, and launches nothing.
+    for _ in 0..2 {
+        let (ok, stdout, stderr) = router(dir.path(), &["resume", &id, "--retry"]);
+        assert!(!ok, "{stdout}");
+        assert!(
+            stderr.contains(&format!("process group {pgid}: "))
+                && stderr.contains(&format!("kill -TERM -- -{pgid}"))
+                && stderr.contains(&format!("model-router resume {id} --release-groups")),
+            "{stderr}"
+        );
+        assert!(running(pid), "an unproven group was signalled");
+        let saved = engine::load(dir.path(), &id).unwrap();
+        assert_eq!(saved.stages[0].attempts.len(), 1, "a harness launched");
+        assert_eq!(
+            saved
+                .retained_groups()
+                .iter()
+                .map(|g| g.pgid)
+                .collect::<Vec<_>>(),
+            [pgid]
+        );
+    }
+    // Released after the user checked it: forgotten, not signalled.
+    let (ok, stdout, stderr) = router(dir.path(), &["resume", &id, "--release-groups", "--retry"]);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "Released process group {pgid} without signalling it"
+        )),
+        "{stdout}"
+    );
+    assert!(running(pid), "a released group was signalled");
+    let saved = engine::load(dir.path(), &id).unwrap();
+    assert_eq!(saved.status, Status::Complete);
+    assert_eq!(saved.stages[0].attempts.len(), 2);
+    assert!(saved.retained_groups().is_empty());
+}
+
+#[test]
+fn recovery_reports_a_group_it_leaves_running() {
+    let (dir, mut run) = trusted_fixture();
+    let (pgid, _) = unproven_orphan(dir.path(), &mut run);
+    let _end = EndGroup(pgid);
+    let (ok, stdout, _) = router(dir.path(), &["resume", &run.id, "--retry"]);
+    assert!(!ok);
+    assert!(
+        stdout.contains(&format!("Left process group {pgid} running")),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_retained_group_that_has_ended_is_dropped_silently() {
+    let (dir, mut run) = trusted_fixture();
+    let (pgid, _) = unproven_orphan(dir.path(), &mut run);
+    let id = run.id.clone();
+    let (ok, ..) = router(dir.path(), &["resume", &id, "--retry"]);
+    assert!(!ok);
+    // The user stops it, as the refusal says.
+    process::end_group(pgid, Duration::from_millis(100), || {});
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process::group_alive(pgid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!process::group_alive(pgid));
+    let (ok, stdout, stderr) = router(dir.path(), &["resume", &id, "--retry"]);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(!stdout.contains("process group"), "{stdout}");
+    let saved = engine::load(dir.path(), &id).unwrap();
+    assert_eq!(saved.status, Status::Complete);
+    assert!(saved.retained_groups().is_empty());
+}
+
+#[test]
+fn recovery_keeps_a_group_whose_unmarked_member_outlives_sigterm() {
+    let (dir, _, mut run) = fixture(vec![stage("implementation", Role::Implementation)]);
+    assert_eq!(drive(&mut run), Action::Complete);
+    // The recorded leader exits on SIGTERM; a member ignores it and carries
+    // no marker, so nothing proves the group is the run's once the leader
+    // is gone, and SIGKILL is skipped.
+    let marker = process::group::new_marker();
+    let file = dir.path().join("member.pid");
+    let mut leader = {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(
+                r#"trap 'exit 0' TERM
+sh -c 'trap "" TERM; echo $$ > "$1"; exec env -u MODEL_ROUTER_GROUP sleep 30' member "$0" &
+wait"#,
+            )
+            .arg(&file)
+            .env(process::group::MARKER_ENV, &marker)
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    };
+    let pgid = leader.id();
+    let group = process::Group::launched(pgid, Some(marker));
+    let _end = EndGroup(pgid);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let pid: i32 = loop {
+        if let Some(pid) = fs::read_to_string(&file)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "member never started");
+        thread::sleep(Duration::from_millis(10));
+    };
+    // Reaped as soon as it exits, as init reaps an orphaned leader.
+    let reaper = thread::spawn(move || leader.wait());
+    run.cursor = 0;
+    run.status = Status::Running;
+    run.stages[0].status = Status::Running;
+    let attempt = run.stages[0].attempts.last_mut().unwrap();
+    attempt.status = Status::Running;
+    attempt.set_group(Some(group));
+    run.persist().unwrap();
+
+    let mut log = String::new();
+    let error = engine::authorize_replay(&mut run, None, |event| {
+        if let engine::Event::Output(text) = event {
+            log.push_str(&text);
+        }
+    })
+    .unwrap_err();
+    reaper.join().unwrap().unwrap();
+    assert!(
+        log.contains(&format!("Stopping process group {pgid}")),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!(
+            "Process group {pgid} is still running after SIGTERM"
+        )),
+        "{log}"
+    );
+    assert!(
+        format!("{error:#}").contains(&format!("process group {pgid}: ")),
+        "{error:#}"
+    );
+    assert!(running(pid), "the member was killed");
+    let saved = engine::load(dir.path(), &run.id).unwrap();
+    assert_eq!(
+        saved
+            .retained_groups()
+            .iter()
+            .map(|g| g.pgid)
+            .collect::<Vec<_>>(),
+        [pgid]
+    );
+    assert!(saved.stages[0].attempts[0].process_group.is_none());
+    // Once it has ended, recovery forgets it and the run can go on.
+    process::end_group(pgid, Duration::from_millis(100), || {});
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process::group_alive(pgid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let mut run = engine::load(dir.path(), &run.id).unwrap();
+    let (action, log) = drive_logged(&mut run);
+    assert_eq!(action, Action::Stopped);
+    assert!(!log.contains("process group"), "{log}");
+    assert!(run.retained_groups().is_empty());
+}
+
+#[test]
+fn a_new_run_or_rerun_in_the_checkout_waits_for_another_runs_unproven_group() {
+    let (dir, mut run) = trusted_fixture();
+    let (pgid, _) = unproven_orphan(dir.path(), &mut run);
+    let _end = EndGroup(pgid);
+    let id = run.id.clone();
+    let (ok, ..) = router(dir.path(), &["resume", &id, "--retry"]);
+    assert!(!ok);
+    let runs = || {
+        fs::read_dir(dir.path().join(".model-router/runs"))
+            .unwrap()
+            .count()
+    };
+    let before = runs();
+    for args in [
+        vec!["rerun", id.as_str()],
+        vec!["run", "--task", "Another task"],
+    ] {
+        let (ok, stdout, stderr) = router(dir.path(), &args);
+        assert!(!ok, "{args:?}: {stdout}");
+        assert!(
+            stderr.contains(&format!("process group {pgid}: "))
+                && stderr.contains(&format!("model-router resume {id} --release-groups")),
+            "{args:?}: {stderr}"
+        );
+    }
+    assert_eq!(runs(), before, "a run was created");
 }
 
 #[cfg(target_os = "linux")]

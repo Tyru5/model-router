@@ -540,7 +540,13 @@ fn idle_run(server: &Server, project: Option<&str>, id: &str) -> Result<Run> {
     let (mut run, info) = load(server, project, id)?;
     ensure!(!info.active, "Run {id} is running; wait for it first");
     let settings = server.settings(&run.project)?;
-    engine::authorize_replay(&mut run, settings.explicit_config.as_deref(), |_| {})?;
+    // What recovery stopped or left running goes to the server's log.
+    let id = run.id.clone();
+    engine::authorize_replay(&mut run, settings.explicit_config.as_deref(), |event| {
+        if let engine::Event::Output(text) = event {
+            super::log(format!("run {id}: {}", text.trim_end()));
+        }
+    })?;
     Ok(run)
 }
 

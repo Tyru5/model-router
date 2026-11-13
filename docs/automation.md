@@ -51,8 +51,20 @@ Resume a run. Retry and model changes are explicit.
 | `--retry-candidate STAGE/CANDIDATE` | Rerun one stopped fan-out candidate, keeping the others. |
 | `--budget-usd N` / `--budget-tokens N` | Raise the run's cap (and any exceeded stage cap) to `N` and continue. |
 | `--notify` | As for `run`. |
+| `--release-groups` | First forget the process groups recovery left running for this run, without signalling them; prints each released ID. |
 
-After a crash, `resume` first stops any surviving harness process group.
+After a crash, `resume` first stops any surviving harness process group that
+it can identify as the recorded one (see [safety](safety.md#process-cleanup))
+and prints what it stopped. A group it cannot identify is left running and
+stays recorded in the run, as does a group that keeps running after SIGTERM
+once nothing proves it is the run's (SIGKILL is then skipped). While one is
+alive, `resume` (with or without `--retry`, `--advance`, or other options)
+and `fork` of that run exit with an error, and so do `run` and `rerun` in
+the same checkout (not in a worktree of their own). The error names each
+group, why it could not be identified, and
+`kill -TERM -- -PGID` to stop it. A recorded group that has exited is dropped
+without a message. If a group belongs to something else, check it, then run
+`resume ID --release-groups`.
 
 ### `rerun ID`
 

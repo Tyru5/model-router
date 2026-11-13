@@ -42,6 +42,11 @@ pub struct RunSummary {
     /// saved before this was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_bytes: Option<u64>,
+    /// Groups recovery left running for the run; see
+    /// `engine::refuse_unproven`, which reads them here for every run in
+    /// the checkout. Empty in summaries saved before this was recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_groups: Vec<crate::process::Group>,
 }
 impl From<&Run> for RunSummary {
     fn from(run: &Run) -> Self {
@@ -64,6 +69,7 @@ impl From<&Run> for RunSummary {
             rerun_of: run.rerun_of.clone(),
             revision: run.revision,
             run_bytes: None,
+            retained_groups: run.retained_groups().to_vec(),
         }
     }
 }
@@ -286,6 +292,8 @@ pub fn rerun_at(
     placement: Placement,
 ) -> Result<Run> {
     let source = engine::load(project, id)?;
+    // `Run::create_at_from` refuses a rerun in the checkout while a harness
+    // a run left there may still be running (`engine::refuse_unproven`).
     crate::trust::authorize_run_config(&source, settings.explicit_config.as_deref())?;
     let settings = Settings {
         adapters: source.adapters.clone(),
@@ -320,6 +328,8 @@ pub fn fork(
     model: Option<String>,
 ) -> Result<Run> {
     let source = engine::load(project, id)?;
+    // Not while a harness the source left running may still be at work.
+    engine::refuse_unproven(&source)?;
     // A fork replays the source's executable settings, as a rerun does.
     crate::trust::authorize_run_config(&source, settings.explicit_config.as_deref())?;
     let index = source

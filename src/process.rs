@@ -1,5 +1,8 @@
 //! Unix process supervision. No command is evaluated by a shell.
+pub mod group;
 pub mod host;
+
+pub use group::{Group, Identity, Verdict};
 
 use crate::{adapters::Invocation, sandbox::Plan, storage::FileLock};
 use anyhow::{Context, Result, ensure};
@@ -82,9 +85,19 @@ pub const GRACE: Duration = Duration::from_secs(5);
 /// Ends process group `pgid`: SIGTERM, up to `grace` for a clean exit, then
 /// SIGKILL for whatever is left. `reap` reaps the leader when it is our
 /// child, so its zombie does not count as alive.
-pub fn end_group(pgid: u32, grace: Duration, mut reap: impl FnMut()) {
+pub fn end_group(pgid: u32, grace: Duration, reap: impl FnMut()) {
+    end_group_if(pgid, grace, reap, || true);
+}
+
+/// `end_group`, sending each signal only if `still_ours` holds just before.
+fn end_group_if(
+    pgid: u32,
+    grace: Duration,
+    mut reap: impl FnMut(),
+    mut still_ours: impl FnMut() -> bool,
+) {
     reap();
-    if !group_alive(pgid) {
+    if !group_alive(pgid) || !still_ours() {
         return;
     }
     signal_group(pgid, libc::SIGTERM);
@@ -96,7 +109,9 @@ pub fn end_group(pgid: u32, grace: Duration, mut reap: impl FnMut()) {
             return;
         }
     }
-    kill_group(pgid);
+    if still_ours() {
+        kill_group(pgid);
+    }
     reap();
 }
 
@@ -239,7 +254,7 @@ fn launch(inv: &Invocation, sandbox: Option<&Plan>) -> (String, Vec<String>) {
 }
 
 /// `capture` inside an optional sandbox, reporting the harness's process
-/// group ID once it starts, so the caller can record it for crash recovery.
+/// group once it starts, so the caller can record it for crash recovery.
 #[allow(clippy::too_many_arguments)]
 pub fn capture_with(
     inv: &Invocation,
@@ -248,7 +263,7 @@ pub fn capture_with(
     timeout: Duration,
     cancel: &AtomicBool,
     sandbox: Option<&Plan>,
-    on_spawn: impl FnOnce(u32) -> Result<()>,
+    on_spawn: impl FnOnce(Group) -> Result<()>,
     mut on_output: impl FnMut(bool, &str),
 ) -> Result<Outcome> {
     // Check logs land in a directory the stage could write.
@@ -276,6 +291,8 @@ pub fn capture_with(
         command.env_remove(name);
     }
     command.envs(inv.environment()?);
+    let marker = group::new_marker();
+    command.env(group::MARKER_ENV, &marker);
     inv.write_files()?;
     die_with_parent(&mut command);
     let mut child = ProcessGroup {
@@ -283,7 +300,8 @@ pub fn capture_with(
             .spawn()
             .with_context(|| format!("Launch {}", inv.program))?,
     };
-    on_spawn(child.child.id())?;
+    // Not reaped yet, so the leader's start time is still readable.
+    on_spawn(Group::launched(child.child.id(), Some(marker)))?;
     let mut stdout = child.child.stdout.take().context("No stdout pipe")?;
     let mut stderr = child.child.stderr.take().context("No stderr pipe")?;
     let mut stdin = child.child.stdin.take();
@@ -1243,7 +1261,7 @@ pub fn interactive(
     session: &InteractiveSession,
     sandbox: Option<&Plan>,
     locks: &[PathBuf],
-    on_start: impl FnOnce(u32, &Path),
+    on_start: impl FnOnce(Group, &Path),
 ) -> Result<Outcome> {
     let (cols, rows) = match begin(session, cancel)? {
         Ok(size) => size,
@@ -1259,12 +1277,16 @@ pub fn interactive(
         writeln!(stderr_log, "{warning}")?;
     }
     let socket = host::socket_path()?;
+    let marker = group::new_marker();
     let spec = host::Spec {
         program,
         args,
         cwd: cwd.to_path_buf(),
         dir: dir.to_path_buf(),
-        env,
+        env: env
+            .into_iter()
+            .chain([(group::MARKER_ENV.to_owned(), marker.clone())])
+            .collect(),
         removed: inv
             .removed()
             .into_iter()
@@ -1275,18 +1297,68 @@ pub fn interactive(
         socket: socket.clone(),
         locks: locks.to_vec(),
         warning,
+        report_started: true,
     };
-    let pid = host::spawn(&spec)?;
-    on_start(pid, &socket);
+    // The host, not this process, is the harness's parent and reaps it, so
+    // only the host can read the leader's start time before its PID can be
+    // reused; it reports it with the PID.
+    let (pid, started) = host::spawn(&spec)?;
+    let group = Group {
+        pgid: pid,
+        identity: Identity {
+            started,
+            marker: Some(marker),
+        },
+    };
+    on_start(group.clone(), &socket);
     let terminal = match Terminal::connect(&socket) {
         Ok(terminal) => terminal,
         Err(error) => {
-            // Never leave a harness nobody can reach.
-            end_group(pid, GRACE, || {});
-            return Err(error);
+            // Never leave a harness nobody can reach. Its host may have died,
+            // leaving a member nothing proves is the harness's: say so, so the
+            // caller keeps the record.
+            return Err(match Survivor::after(&group) {
+                Some(survivor) => error.context(survivor),
+                None => error,
+            });
         }
     };
     terminal.supervise(dir, cancel, session)
+}
+
+/// A harness's process group that cleanup after a failure left running,
+/// because nothing still proved it was the harness's (see
+/// `group::end_recorded`) or it outlived SIGKILL. Carried in the error, so
+/// the caller keeps its record rather than forgetting it.
+#[derive(Debug)]
+pub struct Survivor {
+    pub group: Group,
+    pub why: &'static str,
+}
+impl Survivor {
+    /// Ends `group` as `group::end_recorded` does; Some when it is left running.
+    fn after(group: &Group) -> Option<Self> {
+        let why = match group::end_recorded(group, GRACE) {
+            Verdict::Unverified(why) => why,
+            Verdict::Ours => "it outlived SIGKILL",
+            Verdict::Gone | Verdict::Reused => return None,
+        };
+        Some(Self {
+            group: group.clone(),
+            why,
+        })
+    }
+}
+impl std::fmt::Display for Survivor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pgid = self.group.pgid;
+        write!(
+            f,
+            "Process group {pgid} may still be running the harness: {}. Stop it with \
+             `kill -TERM -- -{pgid}`",
+            self.why
+        )
+    }
 }
 
 /// Reconnects `session` to a harness whose host outlived an earlier mr.
@@ -1350,6 +1422,9 @@ pub struct Terminal {
     stream: UnixStream,
     frames: host::Frames,
     pid: u32,
+    /// The harness's start time as its host read it at launch; None from a
+    /// host built before it reported one.
+    started: Option<String>,
     locks: Vec<FileLock>,
 }
 
@@ -1376,7 +1451,8 @@ impl Terminal {
         let mut stream = UnixStream::connect(socket)
             .with_context(|| format!("Connect to the harness terminal {}", socket.display()))?;
         let mut out = Vec::new();
-        host::frame(host::tag::ATTACH, &[], &mut out);
+        // [1]: send the harness's start time too (see `host::attach_request`).
+        host::frame(host::tag::ATTACH, &[1], &mut out);
         // Before asking: macOS refuses options on a socket the host has
         // already answered (busy) and closed.
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -1399,8 +1475,13 @@ impl Terminal {
             .into_iter()
             .map(FileLock::from_fd)
             .collect();
-        let pid = match tag {
-            host::tag::SPAWNED if payload.len() == 4 => u32::from_be_bytes(payload[..].try_into()?),
+        let (pid, started) = match tag {
+            host::tag::SPAWNED if payload.len() >= 4 => (
+                u32::from_be_bytes(payload[..4].try_into()?),
+                String::from_utf8(payload[4..].to_vec())
+                    .ok()
+                    .filter(|started| !started.is_empty()),
+            ),
             host::tag::BUSY => return Ok(None),
             _ => anyhow::bail!("The harness terminal answered unexpectedly"),
         };
@@ -1410,6 +1491,7 @@ impl Terminal {
             stream,
             frames,
             pid,
+            started,
             locks,
         }))
     }
@@ -1450,6 +1532,12 @@ impl Terminal {
     /// The harness's process group.
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// When the harness started, as its host read it before it could reap
+    /// it; None from a host that did not report it.
+    pub fn started(&self) -> Option<String> {
+        self.started.clone()
     }
 
     fn supervise(

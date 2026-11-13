@@ -1254,6 +1254,46 @@ mod tests {
     }
 
     #[test]
+    fn rerun_in_the_checkout_waits_for_a_group_the_source_left_running() {
+        let project = tempfile::tempdir().unwrap();
+        let settings = settings("test-model");
+        let mut source = create(project.path(), &settings, "Port the parser");
+        assert_eq!(drive(&mut source), Action::Complete);
+        // Recovery left this group running: only its ID was recorded.
+        let mut group = {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap()
+        };
+        source.retained_groups = vec![crate::process::Group {
+            pgid: group.id(),
+            identity: Default::default(),
+        }];
+        source.persist().unwrap();
+        let mut app = app(project.path(), settings);
+        press(&mut app, "2n");
+        app.key(key(Key::Enter)).unwrap();
+        settle(&mut app);
+        let pgid = group.id();
+        assert!(
+            app.ui.message.contains(&format!("process group {pgid}: "))
+                && app.ui.message.contains(&format!(
+                    "model-router resume {} --release-groups",
+                    source.id
+                )),
+            "{}",
+            app.ui.message
+        );
+        assert!(!app.session.running());
+        assert_eq!(run_dirs(project.path()), 1);
+        group.kill().unwrap();
+        group.wait().unwrap();
+    }
+
+    #[test]
     fn compare_picks_a_stage_then_shows_the_difference() {
         let project = tempfile::tempdir().unwrap();
         let settings = settings("fail-once");

@@ -168,6 +168,30 @@ addresses, unless the URL you typed names such a host.
   scheduler is busy still leaves it); after a crash, the next `resume` stops
   any surviving group first. Discarding a fan-out
   round for a full retry retains its groups until recovery stops them.
+- A process group ID can name an unrelated group after a reboot or a long
+  gap, so each record also keeps the leader's start time (Linux: boot ID and
+  `/proc/<pid>/stat` start ticks; macOS: `proc_pidinfo` start time) and a
+  random marker every process in the group inherits as `MODEL_ROUTER_GROUP`.
+  Recovery stops a live group only if its leader has the recorded start time
+  or, once the leader has exited, a process in it carries the marker
+  (`/proc/<pid>/environ`; on macOS `KERN_PROCARGS2`, which hides the
+  environment of system binaries such as `/bin/sleep`). The check runs again
+  just before SIGTERM and before SIGKILL, against the record, so a group
+  that ends during the grace period and whose ID passes to another group is
+  not killed. A narrow race remains between each check and its signal.
+  An interactive harness's start time is read by its terminal host, which
+  is its parent, before the host can reap it.
+- A group that fails the check, and any group recorded by an earlier
+  version, is left running and stays recorded in `run.json`
+  (`retained_groups`): it may still be the run's harness editing the
+  workspace. So does a group whose leader exits on SIGTERM leaving a member
+  that proves nothing, as SIGKILL is skipped then. While one is alive the
+  run launches nothing (`resume`, retry, advance, TUI continue, `fork`), and
+  no new run or rerun starts in the same checkout (runs in their own
+  worktree may); the error names each group, why it could not be
+  identified, and `kill -TERM -- -PGID`. Once the group has exited the
+  record is dropped. `resume ID --release-groups` drops the records without
+  signalling, for a group you have checked belongs to something else.
 - Quitting the TUI (`q`) stops active runs. A running interactive stage stops
   too unless you choose to leave it running: its harness lives in a terminal
   host process (own session, private socket under `$XDG_RUNTIME_DIR` or the

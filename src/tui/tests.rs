@@ -1804,6 +1804,72 @@ fn a_panicking_worker_fails_the_run_and_finishes_its_terminal() {
 }
 
 #[test]
+fn a_worker_that_panics_after_saving_unreported_state_leaves_the_saved_revision() {
+    let project = tempfile::tempdir().unwrap();
+    let mut run = sample_run("saved-then-crashed");
+    run.project = project.path().into();
+    run.workspace = project.path().into();
+    run.directory = crate::storage::run_dir(project.path(), &run.id).unwrap();
+    for (n, attempt) in run
+        .stages
+        .iter_mut()
+        .flat_map(|s| &mut s.attempts)
+        .enumerate()
+    {
+        attempt.directory = run
+            .directory
+            .join("01-implement")
+            .join(format!("attempt-{n:03}"));
+        attempt.handoff_file = attempt.directory.join("handoff.json");
+        attempt.worktree = None;
+    }
+    run.resume = None;
+    for state in &mut run.stages {
+        state.fan_out = None;
+    }
+    std::fs::create_dir_all(&run.directory).unwrap();
+    run.status = Status::Running;
+    run.persist().unwrap();
+    let mut slot = super::run_slot::RunSlot::new(run.clone());
+    slot.worker = Some(Worker::spawn(
+        None,
+        |_| false,
+        move |emit| {
+            emit(RunEvent::State(Box::new(run.clone())));
+            // As a launch records its process group: saved, never reported.
+            run.persist().unwrap();
+            panic!("after the save")
+        },
+    ));
+    let start = std::time::Instant::now();
+    let result = loop {
+        if let Some(result) = slot.poll().1 {
+            break result;
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(result.unwrap_err().contains("after the save"));
+    let saved = crate::engine::load(project.path(), &slot.run.id).unwrap();
+    assert_eq!(slot.run.revision, saved.revision);
+    assert_eq!(slot.run.status, Status::Failed);
+    // So the next command is not refused as a change by another process.
+    let error = crate::engine::command(
+        project.path(),
+        &slot.run.id,
+        Some(slot.run.revision),
+        crate::engine::Cmd::Retry {
+            interactive: false,
+            model: None,
+        },
+    )
+    .err()
+    .map(|e| format!("{e:#}"))
+    .unwrap_or_default();
+    assert!(!error.contains("changed in another process"), "{error}");
+}
+
+#[test]
 fn a_panic_off_the_tui_thread_leaves_the_terminal_alone() {
     let tui = std::thread::current().id();
     let restored = std::sync::atomic::AtomicUsize::new(0);

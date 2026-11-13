@@ -203,6 +203,11 @@ pub struct Attempt {
     /// so the next `drive` can stop the orphaned group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_group: Option<u32>,
+    /// What tells `process_group` from a later group that reuses its ID.
+    /// Empty in runs saved before this was recorded; recovery then leaves
+    /// the group alone.
+    #[serde(default, skip_serializing_if = "process::Identity::is_empty")]
+    pub process_identity: process::Identity,
     /// The socket of an interactive harness's terminal host. Its host
     /// outlives mr, so while the attempt runs a later mr reattaches here
     /// instead of treating the attempt as interrupted.
@@ -215,6 +220,29 @@ pub struct Attempt {
     /// A fan-out candidate attempt's own Git worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<PathBuf>,
+}
+impl Attempt {
+    /// The recorded process group, with its identity.
+    pub fn group(&self) -> Option<process::Group> {
+        self.process_group.map(|pgid| process::Group {
+            pgid,
+            identity: self.process_identity.clone(),
+        })
+    }
+    /// Records `group` as this attempt's running process group, or none.
+    pub fn set_group(&mut self, group: Option<process::Group>) {
+        let (pgid, identity) = match group {
+            Some(group) => (Some(group.pgid), group.identity),
+            None => (None, process::Identity::default()),
+        };
+        self.process_group = pgid;
+        self.process_identity = identity;
+    }
+    fn take_group(&mut self) -> Option<process::Group> {
+        let group = self.group();
+        self.set_group(None);
+        group
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageState {
@@ -349,7 +377,12 @@ pub struct Run {
     pub stages: Vec<StageState>,
     /// Groups from discarded fan-out rounds, awaiting cleanup under both locks.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    orphan_groups: Vec<u32>,
+    orphan_groups: Vec<process::Group>,
+    /// Groups recovery found alive but could not prove are this run's, so
+    /// left running (see `stop_orphans`). While one is alive no harness
+    /// launches for the run; `release_groups` forgets them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) retained_groups: Vec<process::Group>,
     pub cursor: usize,
     pub repair_passes: u32,
     /// Repair passes the user allowed beyond the workflow's limit.
@@ -489,6 +522,11 @@ impl Run {
         source: Option<&Run>,
     ) -> Result<Self> {
         crate::config::validate_task(&task)?;
+        // A new run in the checkout (`run`, `rerun`, the TUI, `serve`) must
+        // not join a harness another run may have left running there.
+        if matches!(placement, Placement::Project) {
+            refuse_unproven_in_checkout(project)?;
+        }
         crate::trust::authorize_settings(project, settings)?;
         let snapshot = Settings {
             workflows: vec![workflow.clone()],
@@ -602,6 +640,7 @@ impl Run {
                 })
                 .collect(),
             orphan_groups: vec![],
+            retained_groups: vec![],
             cursor: 0,
             repair_passes: 0,
             extra_repair_passes: 0,
@@ -742,6 +781,11 @@ impl Run {
     pub fn command(&mut self, cmd: Cmd) -> Result<()> {
         *self = command(&self.project, &self.id, Some(self.revision), cmd)?;
         Ok(())
+    }
+    /// Groups recovery left running because it could not prove they are
+    /// this run's; see `refuse_unproven`.
+    pub fn retained_groups(&self) -> &[process::Group] {
+        &self.retained_groups
     }
     pub fn current_name(&self) -> &str {
         self.workflow
@@ -940,7 +984,7 @@ impl Run {
                     .candidates
                     .into_iter()
                     .flat_map(|candidate| candidate.attempts)
-                    .filter_map(|attempt| attempt.process_group),
+                    .filter_map(|mut attempt| attempt.take_group()),
             );
         }
     }
@@ -2139,6 +2183,7 @@ fn prepare(run: &mut Run) -> Result<Prepared> {
         usage: None,
         session,
         process_group: None,
+        process_identity: Default::default(),
         terminal: None,
         handoff_source: None,
         worktree: None,
@@ -2203,7 +2248,7 @@ fn classify_exit(
         Err(error) => {
             // The supervisor ended the group before returning its error.
             if let Some(attempt) = attempt {
-                attempt.process_group = None;
+                attempt.set_group(None);
             }
             return Ok(Exit::Stopped(Status::Failed, format!("{error:#}")));
         }
@@ -2214,7 +2259,7 @@ fn classify_exit(
         attempt.finished_at = Some(Utc::now());
         // Spend counts whether or not the stage succeeded. Usage events can be
         // spread through the log, so read far more than the final response needs.
-        attempt.process_group = None;
+        attempt.set_group(None);
         if attempt.mode == Mode::Unattended {
             attempt.usage = handoff::usage_file(&stdout, prepared.invocation.kind);
         } else {
@@ -2349,6 +2394,20 @@ fn resolve_handoff(
     })
 }
 
+/// Keeps in `retained_groups` a harness group that the failure in `result`
+/// left running (`process::Survivor`), so nothing launches beside it.
+fn keep_survivor(run: &mut Run, result: &Result<process::Outcome>) {
+    let Err(error) = result else {
+        return;
+    };
+    if let Some(survivor) = error.downcast_ref::<process::Survivor>() {
+        let group = &survivor.group;
+        if run.retained_groups.iter().all(|g| g.pgid != group.pgid) {
+            run.retained_groups.push(group.clone());
+        }
+    }
+}
+
 /// Completes the attempt's bookkeeping after its harness ended.
 fn finish(
     run: &mut Run,
@@ -2361,6 +2420,9 @@ fn finish(
     let mode = run.workflow.stages[index].mode;
     let harness = run.workflow.stages[index].harness.clone();
     let workspace = run.workspace.clone();
+    // Before `classify_exit` forgets the attempt's group and the caller
+    // saves the run and lets go of the workspace.
+    keep_survivor(run, &result);
     let attempt = run.stages[index].attempts.last_mut();
     let normalized = match classify_exit(attempt, mode, (&harness, &workspace), prepared, result)? {
         Exit::Succeeded(normalized) => normalized,
@@ -2431,12 +2493,12 @@ fn run_checks(
         &workspace,
         &prepared.directory,
         cancel,
-        |pgid| {
+        |group| {
             run.stages[index]
                 .attempts
                 .last_mut()
                 .context("No attempt")?
-                .process_group = pgid;
+                .set_group(group);
             run.persist()
         },
         |text| emit(Event::Output(text)),
@@ -2528,9 +2590,9 @@ fn execute_stage(
     };
     let workspace = run.workspace.clone();
     // Recorded so a later drive can stop the group if mr dies meanwhile.
-    let record = |run: &mut Run, pgid: u32| {
+    let record = |run: &mut Run, group: process::Group| {
         if let Some(attempt) = run.stages[index].attempts.last_mut() {
-            attempt.process_group = Some(pgid);
+            attempt.set_group(Some(group));
         }
         let _ = run.persist();
     };
@@ -2544,11 +2606,11 @@ fn execute_stage(
             session,
             prepared.sandbox.as_ref(),
             &locks,
-            |pgid, socket| {
+            |group, socket| {
                 if let Some(attempt) = run.stages[index].attempts.last_mut() {
                     attempt.terminal = Some(socket.to_path_buf());
                 }
-                record(run, pgid);
+                record(run, group);
             },
         );
         if left_running(run, &result, session, held, emit)? {
@@ -2566,8 +2628,8 @@ fn execute_stage(
             timeout,
             cancel,
             prepared.sandbox.as_ref(),
-            |pgid| {
-                record(run, pgid);
+            |group| {
+                record(run, group);
                 Ok(())
             },
             |err, text| {
@@ -2733,7 +2795,22 @@ fn reattach_stage(
     let result = match terminal {
         Ok(terminal) => {
             if let Some(attempt) = run.stages[index].attempts.last_mut() {
-                attempt.process_group = Some(terminal.pid());
+                let pid = terminal.pid();
+                // Only the host, the harness's parent, can read its start
+                // time before reaping it; one that does not report it
+                // leaves it unknown, never read here once the PID may name
+                // another process.
+                if attempt.process_group != Some(pid) {
+                    attempt.set_group(Some(process::Group {
+                        pgid: pid,
+                        identity: process::Identity {
+                            started: terminal.started(),
+                            marker: None,
+                        },
+                    }));
+                } else if attempt.process_identity.started.is_none() {
+                    attempt.process_identity.started = terminal.started();
+                }
             }
             emit(Event::Output(format!(
                 "Reattached to {} in its terminal\n",
@@ -2748,12 +2825,12 @@ fn reattach_stage(
                 None => {
                     // Its host died without recording an exit: stop whatever
                     // it left, and forget the dead socket.
-                    if let Some(pgid) = run.stages[index]
-                        .attempts
-                        .last()
-                        .and_then(|a| a.process_group)
-                    {
-                        process::end_group(pgid, process::GRACE, || {});
+                    if let Some(group) = run.stages[index].attempts.last().and_then(|a| a.group()) {
+                        if stop_recorded(&group, "its terminal host", emit)
+                            && run.retained_groups.iter().all(|g| g.pgid != group.pgid)
+                        {
+                            run.retained_groups.push(group);
+                        }
                     }
                     // Only ever a socket: run.json names this path.
                     if fs::symlink_metadata(socket)
@@ -2863,7 +2940,7 @@ impl Run {
                 .context("No attempt")?;
             attempt.error = Some(message.clone());
             attempt.finished_at.get_or_insert_with(Utc::now);
-            attempt.process_group = None;
+            attempt.set_group(None);
         }
         self.set(Target::Candidate(index, c), status, actor, &message)?;
         self.candidate_mut(index, c).error = Some(message);
@@ -2936,6 +3013,7 @@ impl Run {
             usage: None,
             session: None,
             process_group: None,
+            process_identity: Default::default(),
             terminal: None,
             handoff_source: None,
             worktree: None,
@@ -3052,6 +3130,7 @@ impl Run {
             usage: None,
             session,
             process_group: None,
+            process_identity: Default::default(),
             terminal: None,
             handoff_source: None,
             worktree: Some(worktree),
@@ -3101,6 +3180,7 @@ impl Run {
             let config = &stage.fan_out.as_ref().context("No fan-out")?.candidates[c];
             config.stage(stage)
         };
+        keep_survivor(self, &result);
         let attempt = self.candidate_mut(index, c).attempts.last_mut();
         let normalized = match classify_exit(
             attempt,
@@ -3151,12 +3231,12 @@ impl Run {
                 cwd,
                 &prepared.directory,
                 cancel,
-                |pgid| {
+                |group| {
                     self.candidate_mut(index, c)
                         .attempts
                         .last_mut()
                         .context("No attempt")?
-                        .process_group = pgid;
+                        .set_group(group);
                     self.persist()
                 },
                 |text| emit(Event::Output(text)),
@@ -3649,7 +3729,7 @@ enum Job {
     Candidate(usize, usize),
 }
 enum Message {
-    Spawned(Job, u32),
+    Spawned(Job, process::Group),
     Output(Job, bool, String),
     Done(Job, Result<process::Outcome>),
 }
@@ -3754,7 +3834,9 @@ fn next_launch(run: &Run, only: Option<usize>) -> (Option<Launch>, Option<usize>
 /// Process groups scheduler workers started and the run has not recorded
 /// yet. Only the scheduler thread saves the run, and it can be busy running
 /// checks for a long time, so each worker writes its group here the moment
-/// it exists; a crash meanwhile still leaves it for `stop_orphans`.
+/// it exists; a crash meanwhile still leaves it for `stop_orphans`. One
+/// group per line, as JSON with its identity; a bare number in journals
+/// written before groups were identified.
 struct SpawnJournal {
     path: PathBuf,
     lock: std::sync::Mutex<()>,
@@ -3766,20 +3848,21 @@ impl SpawnJournal {
             lock: std::sync::Mutex::new(()),
         }
     }
-    fn read(&self) -> Vec<u32> {
+    fn read(&self) -> Vec<process::Group> {
         fs::read_to_string(&self.path)
             .unwrap_or_default()
             .lines()
-            .filter_map(|line| line.trim().parse().ok())
+            .filter_map(|line| serde_json::from_str(line.trim()).ok())
             .collect()
     }
-    fn add(&self, pgid: u32) -> Result<()> {
+    fn add(&self, group: &process::Group) -> Result<()> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)?;
-        io::Write::write_all(&mut file, format!("{pgid}\n").as_bytes())?;
+        let line = format!("{}\n", serde_json::to_string(group)?);
+        io::Write::write_all(&mut file, line.as_bytes())?;
         file.sync_data()?;
         Ok(())
     }
@@ -3789,8 +3872,8 @@ impl SpawnJournal {
         let rest: Vec<String> = self
             .read()
             .into_iter()
-            .filter(|&g| g != pgid)
-            .map(|g| g.to_string())
+            .filter(|g| g.pgid != pgid)
+            .filter_map(|g| serde_json::to_string(&g).ok())
             .collect();
         if rest.is_empty() {
             let _ = fs::remove_file(&self.path);
@@ -3948,13 +4031,13 @@ fn schedule(
                                 timeout,
                                 cancel,
                                 sandbox.as_ref(),
-                                |pgid| {
+                                |group| {
                                     // Durable before this worker reports it;
                                     // forgotten below even if writing it
                                     // failed partway.
-                                    spawned.set(Some(pgid));
-                                    journal.add(pgid)?;
-                                    let _ = tx.send(Message::Spawned(job, pgid));
+                                    spawned.set(Some(group.pgid));
+                                    journal.add(&group)?;
+                                    let _ = tx.send(Message::Spawned(job, group));
                                     Ok(())
                                 },
                                 |err, text| {
@@ -3980,14 +4063,15 @@ fn schedule(
                 }
                 let message = rx.recv().context("Harness workers stopped")?;
                 match message {
-                    Message::Spawned(job, pgid) => {
+                    Message::Spawned(job, group) => {
                         // Recorded so a later drive can stop the group if mr dies meanwhile.
                         let attempt = match job {
                             Job::Stage(i) => run.stages[i].attempts.last_mut(),
                             Job::Candidate(i, c) => run.candidate_mut(i, c).attempts.last_mut(),
                         };
+                        let pgid = group.pgid;
                         if let Some(attempt) = attempt {
-                            attempt.process_group = Some(pgid);
+                            attempt.set_group(Some(group));
                         }
                         if run.persist().is_ok() {
                             journal.recorded(pgid);
@@ -4171,6 +4255,7 @@ fn drive_graph(run: &mut Run, cancel: &AtomicBool, emit: &mut impl FnMut(Event))
             save_changes(run);
             return Ok(Action::Stopped);
         }
+        refuse_unproven(run)?;
         run.hold = Some(Hold::default());
         let scheduled = schedule(run, cancel, emit, None);
         run.hold = None;
@@ -4223,7 +4308,27 @@ fn lock_run(run: &Run) -> Result<(storage::FileLock, storage::FileLock)> {
 /// it everywhere), so a retry never runs two agents on one workspace. Holding
 /// both locks means no live router owns them. Process group IDs are not
 /// reused while any member lives; a stale ID whose group is gone is ignored.
+/// A live group is stopped only if it is provably the recorded one (see
+/// `process::group::verify`): after a reboot or a long gap its ID may name
+/// one of the user's own groups, which is left running with a message. It
+/// may as well still be the run's harness, so the run keeps it in
+/// `retained_groups`, and `refuse_unproven` stops any launch while it is
+/// alive. Retained groups that have ended, or can now be proven and are
+/// stopped, are forgotten here without a word.
 fn stop_orphans(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
+    let retained = std::mem::take(&mut run.retained_groups);
+    let mut kept = Vec::new();
+    for group in &retained {
+        // Reported when it was retained; `refuse_unproven` names it again.
+        let alive = match process::group::verify(group) {
+            process::Verdict::Unverified(_) => true,
+            process::Verdict::Ours => stop_recorded(group, "an interrupted execution", emit),
+            process::Verdict::Gone | process::Verdict::Reused => false,
+        };
+        if alive {
+            kept.push(group.clone());
+        }
+    }
     let mut groups = std::mem::take(&mut run.orphan_groups);
     // A harness in its own terminal host is not orphaned: mr reattaches.
     let detached = detached_terminal(run).map(|_| run.cursor);
@@ -4242,28 +4347,28 @@ fn stop_orphans(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
             if Some(number) == kept {
                 continue;
             }
-            if let Some(pgid) = attempt.process_group.take() {
-                groups.push(pgid);
+            if let Some(group) = attempt.take_group() {
+                groups.push(group);
             }
         }
         for attempt in candidates {
-            if let Some(pgid) = attempt.process_group.take() {
-                groups.push(pgid);
+            if let Some(group) = attempt.take_group() {
+                groups.push(group);
             }
         }
     }
     // Groups a scheduler worker started but the run never recorded.
     let journal = SpawnJournal::new(run);
     groups.extend(journal.read());
-    for &pgid in &groups {
-        if process::group_alive(pgid) {
-            emit(Event::Output(format!(
-                "Stopping process group {pgid} left running by an interrupted execution\n"
-            )));
-            process::end_group(pgid, process::GRACE, || {});
+    for group in &groups {
+        let alive = stop_recorded(group, "an interrupted execution", emit);
+        if alive && kept.iter().all(|g| g.pgid != group.pgid) {
+            kept.push(group.clone());
         }
     }
-    if !groups.is_empty() {
+    let changed = !groups.is_empty() || kept != retained;
+    run.retained_groups = kept;
+    if changed {
         run.persist()?;
     }
     // Only now: an mr that dies while stopping them leaves the journal for
@@ -4272,8 +4377,140 @@ fn stop_orphans(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
     Ok(())
 }
 
+/// Refuses to launch anything for `run` while a group recovery left running
+/// (`stop_orphans`) is alive: it may be one of the run's harnesses, still
+/// editing the workspace. A run in the project's own checkout also waits
+/// for groups other runs left there. Names each group, why it could not be
+/// proven, and how to stop it or, if it is something else, release it.
+pub fn refuse_unproven(run: &Run) -> Result<()> {
+    let mut alive = unproven(&run.id, &run.retained_groups);
+    if !run.worktree {
+        alive.extend(unproven_in_checkout(&run.project, Some(&run.id)));
+    }
+    refuse(&format!("run {}", run.id), &alive)
+}
+
+/// Refuses to start a run in `project`'s own checkout while a group
+/// recovery left running for a run there is alive; see `refuse_unproven`.
+pub fn refuse_unproven_in_checkout(project: &Path) -> Result<()> {
+    refuse(
+        "a new run in this checkout",
+        &unproven_in_checkout(project, None),
+    )
+}
+
+/// Lines naming each of `groups`, retained by run `id`, still alive.
+fn unproven(id: &str, groups: &[process::Group]) -> Vec<String> {
+    groups
+        .iter()
+        .filter_map(|group| {
+            let pgid = group.pgid;
+            let why = match process::group::verify(group) {
+                process::Verdict::Unverified(why) => why,
+                process::Verdict::Ours => "it is still the run's and outlived SIGKILL",
+                process::Verdict::Gone | process::Verdict::Reused => return None,
+            };
+            Some(format!(
+                "  process group {pgid}: {why}. Left by run {id}. Stop it with \
+                 `kill -TERM -- -{pgid}`, or if it belongs to something else, release it with \
+                 `model-router resume {id} --release-groups`"
+            ))
+        })
+        .collect()
+}
+
+/// `unproven` for every run in `project`'s own checkout but `except`. Runs
+/// with their own worktree work elsewhere.
+fn unproven_in_checkout(project: &Path, except: Option<&str>) -> Vec<String> {
+    let Ok(entries) = crate::history::list(project) else {
+        return vec![];
+    };
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            crate::history::Entry::Summary(summary) => Some(summary),
+            crate::history::Entry::Damaged { .. } => None,
+        })
+        .filter(|summary| !summary.worktree && Some(summary.id.as_str()) != except)
+        .flat_map(|summary| unproven(&summary.id, &summary.retained_groups))
+        .collect()
+}
+
+fn refuse(what: &str, alive: &[String]) -> Result<()> {
+    if alive.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "Not launching a harness for {what}: a harness an earlier mr started may still be \
+         running in its workspace, and recovery could not prove these groups are it:\n{}",
+        alive.join("\n")
+    )
+}
+
+/// Forgets the groups recovery left running for `run` (see `stop_orphans`),
+/// without signalling them, once the user has checked they are not its
+/// harnesses. Returns them.
+pub fn release_groups(run: &mut Run) -> Result<Vec<process::Group>> {
+    let _lock = storage::lock_wait(&run.directory.join("run.lock"), LOCK_WAIT)?;
+    run.check_revision()?;
+    let released = std::mem::take(&mut run.retained_groups);
+    if !released.is_empty() {
+        run.persist()?;
+    }
+    Ok(released)
+}
+
+/// Stops `group`, recorded by `left_by`, if it is provably still that group,
+/// and says what it did. Returns whether it is alive afterwards and may
+/// still be that group: one it cannot prove is left running, and so is one
+/// whose leader exited on SIGTERM leaving a member that proves nothing (no
+/// SIGKILL then) or that outlived SIGKILL.
+fn stop_recorded(group: &process::Group, left_by: &str, emit: &mut impl FnMut(Event)) -> bool {
+    let pgid = group.pgid;
+    match process::group::verify(group) {
+        process::Verdict::Gone => false,
+        process::Verdict::Ours => {
+            emit(Event::Output(format!(
+                "Stopping process group {pgid} left running by {left_by}\n"
+            )));
+            match process::group::end_recorded(group, process::GRACE) {
+                process::Verdict::Gone | process::Verdict::Reused => false,
+                process::Verdict::Unverified(why) => {
+                    emit(Event::Output(format!(
+                        "Process group {pgid} is still running after SIGTERM, but {why}, so it \
+                         was not killed. If it is the one {left_by} left, stop it with \
+                         `kill -KILL -- -{pgid}`\n"
+                    )));
+                    true
+                }
+                process::Verdict::Ours => {
+                    emit(Event::Output(format!(
+                        "Process group {pgid} is still running after SIGKILL\n"
+                    )));
+                    true
+                }
+            }
+        }
+        process::Verdict::Reused => {
+            emit(Event::Output(format!(
+                "Not stopping process group {pgid}: another process now has that ID\n"
+            )));
+            false
+        }
+        process::Verdict::Unverified(why) => {
+            emit(Event::Output(format!(
+                "Left process group {pgid} running: {why}, so it may not be the one {left_by} \
+                 left. If it is, stop it with `kill -TERM -- -{pgid}`\n"
+            )));
+            true
+        }
+    }
+}
+
 /// Clean up an interrupted execution before checking replay approval. Recovery
 /// must stop surviving work even when revocation refuses another launch.
+/// Refuses, before any command changes the run, while a harness group it
+/// could not stop may still be running (`refuse_unproven`).
 pub fn authorize_replay(
     run: &mut Run,
     explicit: Option<&Path>,
@@ -4290,6 +4527,7 @@ pub fn authorize_replay(
     let (_lock, _workspace_lock) = lock_run(run)?;
     run.check_revision()?;
     stop_orphans(run, &mut emit)?;
+    refuse_unproven(run)?;
     crate::trust::authorize_run_config(run, explicit)
 }
 
@@ -4375,6 +4613,7 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
             emit(Event::State(Box::new(run.clone())));
             continue;
         }
+        refuse_unproven(run)?;
         if run.workflow.stages[run.cursor].role == Role::Ship {
             crate::ship::execute(run, &mut emit)?;
             continue;
@@ -4425,6 +4664,7 @@ pub fn run_interactive(
     let (lock, workspace_lock) = lock_run(run)?;
     run.check_revision()?;
     stop_orphans(run, &mut emit)?;
+    refuse_unproven(run)?;
     crate::trust::authorize_run(run)?;
     execute_stage(
         run,
@@ -4718,7 +4958,8 @@ mod tests {
             .spawn()
             .unwrap();
         let journal = SpawnJournal::new(&run);
-        journal.add(child.id()).unwrap();
+        let group = process::Group::launched(child.id(), None);
+        journal.add(&group).unwrap();
         // A recovery that cannot save the run keeps the journal for the next.
         let summary = run.directory.join("summary.json");
         fs::remove_file(&summary).unwrap();
@@ -4726,15 +4967,87 @@ mod tests {
         fs::write(summary.join("blocker"), "").unwrap();
         assert!(stop_orphans(&mut run, &mut |_| {}).is_err());
         assert!(child.try_wait().unwrap().is_some(), "orphan still running");
-        assert_eq!(journal.read(), vec![child.id()]);
+        assert_eq!(journal.read(), vec![group]);
         fs::remove_dir_all(&summary).unwrap();
         stop_orphans(&mut run, &mut |_| {}).unwrap();
         assert!(!run.directory.join("spawned-groups").exists());
-        // A group the run saved leaves the journal.
-        journal.add(7).unwrap();
-        journal.add(8).unwrap();
+        // A group the run saved leaves the journal; a bare ID from an
+        // earlier version reads as a group without identity.
+        fs::write(run.directory.join("spawned-groups"), "6\n7\n").unwrap();
+        let eight = process::Group {
+            pgid: 8,
+            identity: process::Identity {
+                started: Some("1.000000".into()),
+                marker: Some("m".into()),
+            },
+        };
+        journal.add(&eight).unwrap();
         journal.recorded(7);
-        assert_eq!(journal.read(), vec![8]);
+        let six = process::Group {
+            pgid: 6,
+            identity: process::Identity::default(),
+        };
+        assert_eq!(journal.read(), vec![six, eight]);
+    }
+
+    #[test]
+    fn a_harness_group_a_failed_launch_left_running_is_retained() {
+        use std::os::unix::process::CommandExt;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            workflows: vec![Workflow::new(
+                "W",
+                vec![Stage {
+                    id: "implement".into(),
+                    harness: "mock".into(),
+                    ..Stage::default()
+                }],
+            )],
+            adapters: BTreeMap::from([(
+                "mock".into(),
+                CustomAdapter {
+                    command: "python3".into(),
+                    ..CustomAdapter::default()
+                },
+            )]),
+            ..Settings::default()
+        };
+        let mut run = Run::create(
+            dir.path(),
+            &settings,
+            &settings.workflows[0],
+            "Task".into(),
+            false,
+        )
+        .unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = process::Group {
+            pgid: child.id(),
+            identity: process::Identity::default(),
+        };
+        // As `process::interactive` reports a failed first attach.
+        let result: Result<process::Outcome> = Err(anyhow::anyhow!(
+            "Connect to the harness terminal"
+        )
+        .context(process::Survivor {
+            group: group.clone(),
+            why: "its leader has exited",
+        }));
+        keep_survivor(&mut run, &result);
+        keep_survivor(&mut run, &result);
+        assert_eq!(run.retained_groups, vec![group]);
+        assert!(refuse_unproven(&run).is_err());
+        // Any other failure leaves nothing behind to keep.
+        let mut other = run.clone();
+        other.retained_groups.clear();
+        keep_survivor(&mut other, &Err(anyhow::anyhow!("The harness exited")));
+        assert!(other.retained_groups.is_empty());
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]
