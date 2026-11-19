@@ -161,6 +161,51 @@ fn report_lists_files_a_stage_wrote_in_a_git_workspace() {
 }
 
 #[test]
+fn cli_run_delivers_its_webhook_before_exiting() {
+    use std::{io::Read, io::Write, net::TcpListener, sync::mpsc};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/topic", listener.local_addr().unwrap());
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
+            }
+            // Recorded before the reply the router waits for.
+            let _ = tx.send(String::from_utf8_lossy(&request).into_owned());
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        }
+    });
+    // A stage that fails at once: the CLI exits right after notifying.
+    let mut implement = stage("implement", Role::Implementation);
+    implement.extra_args = vec!["--no-such-flag".into()];
+    let (dir, settings, _) = fixture(vec![implement]);
+    settings.save(&dir.path().join("config.toml")).unwrap();
+    let config = common::tempdir();
+    let output = Command::new(env!("CARGO_BIN_EXE_model-router"))
+        .arg("-C")
+        .arg(dir.path())
+        .arg("--config")
+        .arg(dir.path().join("config.toml"))
+        .args(["run", "--notify", "--task", "Fail and notify"])
+        .env("MODEL_ROUTER_CONFIG_DIR", config.path())
+        .env("MODEL_ROUTER_NOTIFY_URL", &url)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let request = rx
+        .try_recv()
+        .expect("the router exited before its webhook arrived");
+    assert!(request.starts_with("POST /topic "), "{request}");
+}
+
+#[test]
 fn cli_run_prints_the_report_and_labels_missing_git() {
     let (dir, settings, _) = fixture(vec![stage("implement", Role::Implementation)]);
     settings.save(&dir.path().join("config.toml")).unwrap();

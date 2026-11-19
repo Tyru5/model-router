@@ -134,6 +134,9 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   rather than leaving them recorded as running.
 - Budget caps now stop graph workflows (stages with `after`) before the next
   stage starts; before, they launched every stage regardless of spend.
+- CLI `--notify` webhooks reach their endpoint: `run`, `resume`, and `rerun`
+  wait up to 5 s for a webhook still being sent before exiting, instead of
+  dropping it.
 - Recovery no longer signals a recorded process group ID that now belongs to
   another process: it stops a group only if its leader's start time or the
   `MODEL_ROUTER_GROUP` marker in a member's environment matches the record,

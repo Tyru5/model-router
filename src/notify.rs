@@ -14,6 +14,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard, OnceLock},
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -23,8 +24,9 @@ pub const URL_ENV: &str = "MODEL_ROUTER_NOTIFY_URL";
 pub const CLI_ENV: &str = "MODEL_ROUTER_NOTIFY";
 /// The same event is not repeated within this window.
 pub const REPEAT_WINDOW: Duration = Duration::from_secs(180);
-#[cfg_attr(test, allow(dead_code))]
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Webhooks still being sent, for `wait_for_webhooks`.
+static WEBHOOKS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
 /// Longest title or body sent, in characters.
 const MAX_TEXT: usize = 240;
 
@@ -356,6 +358,16 @@ pub fn notify(event: NotifyEvent) {
     global().notify(&event);
 }
 
+/// Waits up to the webhook timeout for webhooks still being sent. A process
+/// that exits first drops them, so the CLI calls this before it ends.
+pub fn wait_for_webhooks() {
+    let pending = std::mem::take(&mut *relock(&WEBHOOKS));
+    let deadline = Instant::now() + WEBHOOK_TIMEOUT;
+    while pending.iter().any(|call| !call.is_finished()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Notifies about a driver stopping with `result`, if the user should know.
 pub fn notify_outcome(run: &Run, result: &std::result::Result<Action, String>) {
     if let Some(event) = NotifyEvent::from_outcome(run, result) {
@@ -431,7 +443,7 @@ fn desktop(event: &NotifyEvent) -> std::io::Result<()> {
 #[cfg(not(test))]
 fn webhook(url: String, event: &NotifyEvent) {
     let (title, body, kind) = (clean(&event.title), clean(&event.body), event.kind);
-    std::thread::spawn(move || {
+    let call = std::thread::spawn(move || {
         use reqwest::header::HeaderValue;
         let Ok(client) = reqwest::blocking::Client::builder()
             .timeout(WEBHOOK_TIMEOUT)
@@ -449,6 +461,9 @@ fn webhook(url: String, event: &NotifyEvent) {
         }
         let _ = request.send();
     });
+    let mut pending = relock(&WEBHOOKS);
+    pending.retain(|call| !call.is_finished());
+    pending.push(call);
 }
 
 #[cfg(test)]

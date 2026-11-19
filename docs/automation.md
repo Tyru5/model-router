@@ -29,7 +29,7 @@ Execute a workflow and persist its state and artifacts.
 | `--worktree` | Isolated Git worktree from committed `HEAD`. |
 | `--unattended` | Run every stage unattended this time. |
 | `--with-review` | Enable existing review stages this time (adds none). |
-| `--notify` | Notify when the run needs input, stops, or completes (also `MODEL_ROUTER_NOTIFY=1`). |
+| `--notify` | Notify when the run needs input, stops, or completes (also `MODEL_ROUTER_NOTIFY=1`). Before exiting, waits up to 5 s for a webhook still being sent. |
 
 Use one of `--task`, `--task-file`, `--task-url`. An untrusted project config
 is refused ([trust](safety.md#project-trust)). Interactive stages open their

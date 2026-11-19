@@ -1240,6 +1240,14 @@ fn trust_command(project: &Path, explicit: Option<&Path>, yes: bool, revoke: boo
 }
 
 fn cli_drive(run: &mut Run, cancel: &AtomicBool, notify: bool) -> Result<()> {
+    // However this returns, let the outcome's webhook reach its endpoint.
+    struct Webhooks;
+    impl Drop for Webhooks {
+        fn drop(&mut self) {
+            notify::wait_for_webhooks();
+        }
+    }
+    let _webhooks = Webhooks;
     loop {
         let action = drive_printing(run, cancel);
         if notify {
