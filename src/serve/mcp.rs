@@ -21,23 +21,34 @@ Typical use: list_workflows, optionally preview_run, then start_run and wait_run
 and get_report. A run waiting at a checkpoint (status awaiting_confirmation) continues with confirm_stage; \
 a failed or blocked one with retry_stage.";
 
-/// Reads requests until EOF. Tool calls run on their own threads so a long
+/// Reads requests until EOF, or until stdin cannot be read, which ends the
+/// session the same way. Tool calls run on their own threads so a long
 /// `wait_run` never blocks `cancel_run`; responses may arrive out of order.
 /// Returns the tool calls still in flight, so shutdown can let them answer.
 pub fn serve<W: Write + Send + 'static>(
     server: Arc<Server>,
-    input: impl BufRead,
+    mut input: impl BufRead,
     output: W,
-) -> Result<Vec<JoinHandle<()>>> {
+) -> Vec<JoinHandle<()>> {
     let output = Arc::new(Mutex::new(output));
     let mut calls: Vec<JoinHandle<()>> = vec![];
-    for line in input.lines() {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match input.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) => {
+                super::log(format!("stdin unreadable: {error}"));
+                break;
+            }
+        }
         calls.retain(|call| !call.is_finished());
-        let line = line?;
-        if line.trim().is_empty() {
+        if line.trim_ascii().is_empty() {
             continue;
         }
-        let message: Value = match serde_json::from_str(&line) {
+        // Bytes, not text: a line that is not UTF-8 is one bad request.
+        let message: Value = match serde_json::from_slice(&line) {
             Ok(message) => message,
             Err(error) => {
                 send(
@@ -51,7 +62,7 @@ pub fn serve<W: Write + Send + 'static>(
             send(&output, &response);
         }
     }
-    Ok(calls)
+    calls
 }
 
 fn send<W: Write>(output: &Mutex<W>, message: &Value) {

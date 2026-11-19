@@ -192,7 +192,7 @@ pub fn run(
             mcp::PROTOCOL_VERSION
         ));
         let stdin = std::io::stdin();
-        let calls = mcp::serve(server.clone(), stdin.lock(), std::io::stdout())?;
+        let calls = mcp::serve(server.clone(), stdin.lock(), std::io::stdout());
         log("stdin closed: cancelling active runs");
         // Cancelling first ends pending wait_run calls; then let every call
         // in flight answer, and cancel any run one of them just started.

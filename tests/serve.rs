@@ -358,6 +358,12 @@ fn mcp_reports_errors_and_cancels() {
     assert_eq!(missing["error"]["code"], -32601, "{missing}");
     mcp.send(json!("not an object"));
     assert_eq!(mcp.read()["error"]["code"], -32600);
+    // A line that is not UTF-8 is a parse error; the requests below still
+    // get answers.
+    let stdin = mcp.stdin.as_mut().unwrap();
+    stdin.write_all(b"{\"id\": \"\xff\"}\n").unwrap();
+    stdin.flush().unwrap();
+    assert_eq!(mcp.read()["error"]["code"], -32700);
 
     // Forced unattended, the interactive workflow completes.
     let forced = mcp.call(
