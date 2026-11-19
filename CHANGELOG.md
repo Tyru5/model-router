@@ -126,6 +126,9 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   unrecorded in its terminal host, when a screen redraw passes 1 MiB (a
   large truecolour screen): the host splits redraws into frames mr accepts,
   and an unreadable host stream now ends the harness's process group.
+- Pastes into an interactive stage are no longer cut off past 64 KiB: the
+  terminal host leaves input it cannot queue with mr until the harness reads
+  it, and writes to the harness as fast as its terminal takes it.
 - Recovery no longer signals a recorded process group ID that now belongs to
   another process: it stops a group only if its leader's start time or the
   `MODEL_ROUTER_GROUP` marker in a member's environment matches the record,

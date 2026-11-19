@@ -118,22 +118,25 @@ impl Frames {
         self.fds.truncate(MAX_FDS);
         Ok(n)
     }
-    /// Reads what is available without blocking. False at end of stream or
-    /// on an error that ends the connection.
+    /// Reads what is available without blocking, leaving the rest in the
+    /// socket once enough is buffered, so a peer that sends faster than the
+    /// frames are used waits. False at end of stream or on an error that
+    /// ends the connection.
     pub fn fill(&mut self, stream: &UnixStream) -> bool {
-        loop {
+        while self.buffer.len() <= 4 * FRAME_LIMIT {
             match self.read(stream) {
                 Ok(0) => return false,
-                Ok(_) => {
-                    if self.buffer.len() > 4 * FRAME_LIMIT {
-                        return true;
-                    }
-                }
+                Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return true,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => return false,
             }
         }
+        true
+    }
+    /// The tag of the next frame, whole or not.
+    fn peek(&self) -> Option<u8> {
+        self.buffer.first().copied()
     }
     pub fn next(&mut self) -> Result<Option<(u8, Vec<u8>)>> {
         if self.buffer.len() < 5 {
@@ -638,11 +641,13 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
         if let Some(active) = &mut client {
             let mut open = active.frames.fill(&active.stream);
             loop {
+                // Input the harness has not read yet stays with mr; dropping
+                // it would cut a paste short.
+                if state.input.len() >= INPUT_LIMIT && active.frames.peek() == Some(tag::INPUT) {
+                    break;
+                }
                 match active.frames.next() {
-                    Ok(Some((tag::INPUT, payload))) => {
-                        let room = INPUT_LIMIT.saturating_sub(state.input.len());
-                        state.input.extend(&payload[..payload.len().min(room)]);
-                    }
+                    Ok(Some((tag::INPUT, payload))) => state.input.extend(&payload),
                     Ok(Some((tag::RESIZE, payload))) if payload.len() == 4 => {
                         let cols = u16::from_be_bytes([payload[0], payload[1]]);
                         let rows = u16::from_be_bytes([payload[2], payload[3]]);
@@ -776,17 +781,15 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
                 pixel_height: 0,
             })?;
         }
-        if !state.input.is_empty() {
+        while !state.input.is_empty() {
             let (front, _) = state.input.as_slices();
             match writer.write(front) {
+                Ok(0) => break,
                 Ok(n) => {
                     state.input.drain(..n);
                 }
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(_) => state.input.clear(),
             }
         }
@@ -809,7 +812,12 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
         let mut polls = vec![
             libc::pollfd {
                 fd: if eof { -1 } else { fd },
-                events: libc::POLLIN,
+                events: libc::POLLIN
+                    | if state.input.is_empty() {
+                        0
+                    } else {
+                        libc::POLLOUT
+                    },
                 revents: 0,
             },
             libc::pollfd {
@@ -1063,6 +1071,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outcome.code, Some(0));
+    }
+
+    #[test]
+    fn a_paste_larger_than_the_input_queue_reaches_the_harness_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ready, received) = (dir.path().join("ready"), dir.path().join("received"));
+        let mut cat = spec(dir.path(), r#"stty raw -echo; touch "$0"; exec cat > "$1""#);
+        cat.args.push(ready.display().to_string());
+        cat.args.push(received.display().to_string());
+        let socket = cat.socket.clone();
+        let (pid, _) = spawn(&cat).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "the harness never started");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        let mut out = Vec::new();
+        frame(tag::ATTACH, &[], &mut out);
+        // 16 times the host's input queue, faster than a PTY takes it.
+        let paste: Vec<u8> = (0..16 * INPUT_LIMIT)
+            .map(|i| b'a' + (i % 26) as u8)
+            .collect();
+        for chunk in paste.chunks(16 * 1024) {
+            frame(tag::INPUT, chunk, &mut out);
+        }
+        stream.write_all(&out).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while fs::metadata(&received).map_or(0, |m| m.len()) < paste.len() as u64 {
+            assert!(
+                Instant::now() < deadline,
+                "the harness received {} of {} bytes",
+                fs::metadata(&received).map_or(0, |m| m.len()),
+                paste.len()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            fs::read(&received).unwrap() == paste,
+            "the paste arrived changed"
+        );
+        super::super::end_group(pid, Duration::from_millis(200), || {});
+        await_exit(dir.path());
     }
 
     #[test]
