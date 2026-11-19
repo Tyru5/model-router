@@ -94,6 +94,14 @@ pub(super) fn frame(tag: u8, payload: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(payload);
 }
 
+/// Terminal output as frames mr accepts: a redraw of a large screen can pass
+/// `FRAME_LIMIT`, and mr's decoder carries a sequence across frames.
+fn output_frames(raw: &[u8], out: &mut Vec<u8>) {
+    for chunk in raw.chunks(FRAME_LIMIT) {
+        frame(tag::OUTPUT, chunk, out);
+    }
+}
+
 /// Splits a byte stream into frames, keeping the descriptors it carries.
 #[derive(Default)]
 pub(super) struct Frames {
@@ -662,9 +670,7 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
             if open && active.written == active.out.len() {
                 let mut raw = Vec::new();
                 state.take_output(&mut raw);
-                if !raw.is_empty() {
-                    frame(tag::OUTPUT, &raw, &mut active.out);
-                }
+                output_frames(&raw, &mut active.out);
             }
             if !open || !flush(&mut active.stream, &mut active.out, &mut active.written) {
                 if let Some(gone) = client.take() {
@@ -857,9 +863,7 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
     if let Some(mut active) = client.take() {
         let mut raw = Vec::new();
         state.take_output(&mut raw);
-        if !raw.is_empty() {
-            frame(tag::OUTPUT, &raw, &mut active.out);
-        }
+        output_frames(&raw, &mut active.out);
         frame(tag::EXIT, &serde_json::to_vec(&exit)?, &mut active.out);
         let deadline = Instant::now() + Duration::from_secs(2);
         while flush(&mut active.stream, &mut active.out, &mut active.written)
@@ -1028,6 +1032,37 @@ mod tests {
         drop(terminal);
         super::super::end_group(pid, Duration::from_millis(200), || {});
         await_exit(dir.path());
+    }
+
+    #[test]
+    fn a_redraw_larger_than_a_frame_reaches_mr_whole() {
+        // A truecolour screen whose redraw is well past FRAME_LIMIT.
+        let dir = tempfile::tempdir().unwrap();
+        let drawn = dir.path().join("drawn");
+        let mut big = spec(
+            dir.path(),
+            r#"awk 'BEGIN { for (i = 0; i < 40000; i++) printf "\033[38;2;%d;%d;%dm\033[48;2;%d;%d;%dmx", i % 256, int(i / 256) % 256, (i * 7) % 256, (i * 3) % 256, (i * 5) % 256, (i * 11) % 256 }'; touch "$0"; sleep 2"#,
+        );
+        big.args.push(drawn.display().to_string());
+        (big.cols, big.rows) = (400, 100);
+        let socket = big.socket.clone();
+        spawn(&big).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !drawn.exists() {
+            assert!(Instant::now() < deadline, "the screen was never drawn");
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Attaching asks for a redraw of the whole screen.
+        let terminal = super::super::Terminal::connect(&socket).unwrap();
+        let session = super::super::InteractiveSession::new(400, 100);
+        let outcome = terminal
+            .supervise(
+                dir.path(),
+                &std::sync::atomic::AtomicBool::new(false),
+                &session,
+            )
+            .unwrap();
+        assert_eq!(outcome.code, Some(0));
     }
 
     #[test]

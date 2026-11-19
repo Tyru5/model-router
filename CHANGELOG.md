@@ -122,6 +122,10 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Fixed
 
+- An interactive stage no longer fails, leaving its harness running
+  unrecorded in its terminal host, when a screen redraw passes 1 MiB (a
+  large truecolour screen): the host splits redraws into frames mr accepts,
+  and an unreadable host stream now ends the harness's process group.
 - Recovery no longer signals a recorded process group ID that now belongs to
   another process: it stops a group only if its leader's start time or the
   `MODEL_ROUTER_GROUP` marker in a member's environment matches the record,

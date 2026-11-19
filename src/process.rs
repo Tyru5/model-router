@@ -1593,23 +1593,40 @@ impl Terminal {
                 host::flush(&mut self.stream, &mut out, &mut written) && frames.fill(&self.stream);
             // The host sends descriptors only with its answer to attaching.
             drop(frames.take_fds());
-            while let Some((tag, payload)) = frames.next()? {
-                match tag {
-                    host::tag::OUTPUT => {
-                        let mut state = session.state();
-                        decoder.process(&payload, |frame| state.output(frame));
+            let read = (|| -> Result<Option<Outcome>> {
+                while let Some((tag, payload)) = frames.next()? {
+                    match tag {
+                        host::tag::OUTPUT => {
+                            let mut state = session.state();
+                            decoder.process(&payload, |frame| state.output(frame));
+                        }
+                        host::tag::EXIT => {
+                            let exit: host::Exit = serde_json::from_slice(&payload)?;
+                            return Ok(Some(Outcome {
+                                code: exit.code,
+                                cancelled: cancelled || exit.cancelled,
+                                timed_out: false,
+                                released: false,
+                            }));
+                        }
+                        _ => {}
                     }
-                    host::tag::EXIT => {
-                        let exit: host::Exit = serde_json::from_slice(&payload)?;
-                        session.finish();
-                        return Ok(Outcome {
-                            code: exit.code,
-                            cancelled: cancelled || exit.cancelled,
-                            timed_out: false,
-                            released: false,
-                        });
-                    }
-                    _ => {}
+                }
+                Ok(None)
+            })();
+            match read {
+                Ok(Some(outcome)) => {
+                    session.finish();
+                    return Ok(outcome);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    session.finish();
+                    // Returning alone would leave the harness to its host as
+                    // if detached, with no run pointing at it. The host has
+                    // not reaped it, so the group is still the harness's.
+                    end_group(pgid, GRACE, || {});
+                    return Err(error);
                 }
             }
             if !open {
