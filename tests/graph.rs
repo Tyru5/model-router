@@ -37,6 +37,28 @@ fn overlap(a: &Attempt, b: &Attempt) -> bool {
 }
 
 #[test]
+fn a_stage_finishes_when_its_harness_ends_not_when_a_siblings_checks_do() {
+    // "fast" ends first and runs a 3 s check; "slow" ends during it.
+    let mut fast = delayed("fast", Role::Research, &[], 0.0);
+    fast.checks = vec![Check {
+        command: vec!["sleep".into(), "3".into()],
+        ..Check::default()
+    }];
+    let (_dir, _, mut run) = fixture(vec![
+        fast,
+        delayed("slow", Role::Planning, &[], 1.0),
+        delayed("join", Role::Summary, &["fast", "slow"], 0.0),
+    ]);
+    assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+    let slow = &run.stages[1].attempts[0];
+    let took = slow.finished_at.unwrap() - slow.started_at;
+    assert!(
+        took < chrono::Duration::milliseconds(2500),
+        "slow took {took} by its record"
+    );
+}
+
+#[test]
 fn parallel_read_only_stages_overlap_and_join() {
     let (dir, _, mut run) = fixture(vec![
         delayed("a", Role::Research, &[], 1.5),

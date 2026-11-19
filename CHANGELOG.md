@@ -104,6 +104,9 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   (0.4 ms a frame at 10,000 runs, was 38 ms): it builds only the rows that
   can be on screen, skips search matching without a search, and saved tasks
   are cleaned once when listed rather than on every frame.
+- Graph and fan-out stages: each harness's output is formatted on its own
+  worker thread, so the scheduler, which also runs checks, gets formatted
+  lines rather than raw output.
 - TUI: the startup animation plays only on the first launch of each
   installed version, recorded in `<config dir>/startup.json`.
 - TUI: Monitor and Runs are one Runs page (`2`): a sidebar of this
@@ -142,6 +145,8 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   rather than leaving them recorded as running.
 - Budget caps now stop graph workflows (stages with `after`) before the next
   stage starts; before, they launched every stage regardless of spend.
+- A graph stage or fan-out candidate whose harness ends while the scheduler
+  runs another's checks records when it ended, not when the checks did.
 - CLI `--notify` webhooks reach their endpoint: `run`, `resume`, and `rerun`
   wait up to 5 s for a webhook still being sent before exiting, instead of
   dropping it.

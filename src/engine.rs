@@ -2256,7 +2256,8 @@ fn classify_exit(
     let stdout = prepared.directory.join("stdout.log");
     if let Some(attempt) = attempt {
         attempt.exit_code = outcome.code;
-        attempt.finished_at = Some(Utc::now());
+        // A scheduler may have recorded when the harness ended already.
+        attempt.finished_at.get_or_insert_with(Utc::now);
         // Spend counts whether or not the stage succeeded. Usage events can be
         // spread through the log, so read far more than the final response needs.
         attempt.set_group(None);
@@ -3730,8 +3731,10 @@ enum Job {
 }
 enum Message {
     Spawned(Job, process::Group),
-    Output(Job, bool, String),
-    Done(Job, Result<process::Outcome>),
+    /// Formatted lines, as the worker's formatter produced them.
+    Output(Job, String),
+    /// The supervisor's result and when the harness ended.
+    Done(Job, Result<process::Outcome>, DateTime<Utc>),
 }
 /// What the scheduler starts next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3918,7 +3921,7 @@ fn schedule(
         let result = (|| -> Result<()> {
             let (tx, rx) = mpsc::channel::<Message>();
             let mut flight: Vec<(Job, Prepared, PathBuf)> = vec![];
-            let mut formatters = std::collections::HashMap::new();
+            let mut labels = std::collections::HashMap::new();
             let mut speaking = None;
             loop {
                 while !halted(run) {
@@ -4025,10 +4028,7 @@ fn schedule(
                         )));
                     }
                     speaking = Some(job);
-                    formatters.insert(
-                        job,
-                        (label, events::Formatter::new(prepared.invocation.kind)),
-                    );
+                    labels.insert(job, label);
                     let timeout = Duration::from_secs(run.workflow.stages[index].timeout_seconds);
                     let invocation = prepared.invocation.clone();
                     let sandbox = prepared.sandbox.clone();
@@ -4037,6 +4037,9 @@ fn schedule(
                     let tx = tx.clone();
                     scope.spawn(move || {
                         let spawned = std::cell::Cell::new(None);
+                        // Formatting here keeps it off the scheduler, which
+                        // also runs checks, and sends lines, not raw output.
+                        let mut formatter = events::Formatter::new(invocation.kind);
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             process::capture_with(
                                 &invocation,
@@ -4055,20 +4058,31 @@ fn schedule(
                                     Ok(())
                                 },
                                 |err, text| {
-                                    let _ = tx.send(Message::Output(job, err, text.to_owned()));
+                                    let lines = if err {
+                                        Some(format!("[stderr] {}", storage::clean_terminal(text)))
+                                    } else {
+                                        formatter.push(text)
+                                    };
+                                    if let Some(lines) = lines {
+                                        let _ = tx.send(Message::Output(job, lines));
+                                    }
                                 },
                             )
                         }))
                         .unwrap_or_else(|_| {
                             Err(anyhow::anyhow!("The harness supervisor panicked"))
                         });
+                        let ended = Utc::now();
+                        if let Some(rest) = formatter.finish() {
+                            let _ = tx.send(Message::Output(job, rest));
+                        }
                         // The group ended with the supervisor, so recovery
                         // must not signal its ID, even if the run never
                         // saved it or the scheduler stopped reading.
                         if let Some(pgid) = spawned.get() {
                             journal.recorded(pgid);
                         }
-                        let _ = tx.send(Message::Done(job, result));
+                        let _ = tx.send(Message::Done(job, result, ended));
                     });
                     flight.push((job, prepared, cwd));
                 }
@@ -4091,36 +4105,31 @@ fn schedule(
                             journal.recorded(pgid);
                         }
                     }
-                    Message::Output(job, err, text) => {
-                        let Some((label, formatter)) = formatters.get_mut(&job) else {
+                    Message::Output(job, lines) => {
+                        let Some(label) = labels.get(&job) else {
                             continue;
                         };
-                        let lines = if err {
-                            Some(format!("[stderr] {}", storage::clean_terminal(&text)))
-                        } else {
-                            formatter.push(&text)
-                        };
-                        if let Some(lines) = lines {
-                            if speaking != Some(job) {
-                                speaking = Some(job);
-                                emit(Event::Output(format!("── {label} ──\n")));
-                            }
-                            emit(Event::Output(lines));
+                        if speaking != Some(job) {
+                            speaking = Some(job);
+                            emit(Event::Output(format!("── {label} ──\n")));
                         }
+                        emit(Event::Output(lines));
                     }
-                    Message::Done(job, result) => {
+                    Message::Done(job, result, ended) => {
                         let Some(position) = flight.iter().position(|(j, ..)| *j == job) else {
                             continue;
                         };
                         let (_, prepared, cwd) = flight.swap_remove(position);
-                        if let Some((label, mut formatter)) = formatters.remove(&job) {
-                            if let Some(rest) = formatter.finish() {
-                                if speaking != Some(job) {
-                                    emit(Event::Output(format!("── {label} ──\n")));
-                                }
-                                emit(Event::Output(rest));
-                            }
+                        if labels.remove(&job).is_some() {
                             speaking = None;
+                        }
+                        // When the harness ended, not when this got to it.
+                        let attempt = match job {
+                            Job::Stage(i) => run.stages[i].attempts.last_mut(),
+                            Job::Candidate(i, c) => run.candidate_mut(i, c).attempts.last_mut(),
+                        };
+                        if let (Some(attempt), true) = (attempt, result.is_ok()) {
+                            attempt.finished_at = Some(ended);
                         }
                         match job {
                             Job::Stage(index) => {
