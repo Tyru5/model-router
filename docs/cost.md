@@ -55,7 +55,8 @@ budget = { max_usd = 2.0 }
 ```
 
 - After each attempt, a run whose known cost or counted tokens exceed a run or
-  stage cap stops, **blocked**, before its next stage.
+  stage cap stops, **blocked**, before its next stage. In a stage graph,
+  stages already running side by side finish first.
 - A running stage is never killed (live caps on streamed usage are future
   work).
 - `max_tokens` counts input, output, and cache writes; cache reads are

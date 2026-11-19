@@ -3933,6 +3933,20 @@ fn schedule(
                     let Some(launch) = launch else {
                         break;
                     };
+                    // As in `drive`, a cap stops the run before another stage
+                    // starts; stages already running finish.
+                    if let Launch::Stage(index)
+                    | Launch::FanOut(index)
+                    | Launch::Interactive(index) = launch
+                    {
+                        if let Some(reason) = crate::cost::check_budget(run) {
+                            run.cursor = index;
+                            run.stop(Status::Blocked, reason, Actor::Engine, false)?;
+                            run.persist()?;
+                            emit(Event::State(Box::new(run.clone())));
+                            break;
+                        }
+                    }
                     started += 1;
                     let (job, prepared, cwd) = match launch {
                         Launch::Interactive(index) => {

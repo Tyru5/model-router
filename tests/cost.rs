@@ -146,6 +146,34 @@ fn reported_cost_over_the_run_cap_blocks_before_the_next_stage() {
 }
 
 #[test]
+fn a_cap_also_blocks_stages_of_a_dependency_graph() {
+    let budget = Budget {
+        max_usd: Some(3.0),
+        max_tokens: None,
+    };
+    let after = |id: &str, model: &str, before: &str| Stage {
+        after: vec![before.into()],
+        ..stage(id, model)
+    };
+    let stages = vec![
+        stage("a", "cost-2"),
+        after("b", "cost-2", "a"),
+        after("c", "cost-2", "b"),
+    ];
+    let (dir, mut run) = create(stages, budget);
+    assert!(run.graph());
+    assert_eq!(drive(&mut run), Action::Stopped);
+    assert_eq!(run.status, Status::Blocked);
+    assert!(run.error.clone().unwrap().starts_with("Budget exceeded"));
+    assert_eq!(launches(dir.path()), ["cost-2", "cost-2"]);
+    assert_eq!(run.stages[2].status, Status::Blocked);
+    let mut run = engine::load(dir.path(), &run.id).unwrap();
+    cost::raise_budget(&mut run, Some(10.0), None).unwrap();
+    assert_eq!(drive(&mut run), Action::Complete);
+    assert_eq!(launches(dir.path()).len(), 3);
+}
+
+#[test]
 fn unknown_costs_count_only_toward_the_token_cap() {
     let budget = Budget {
         max_usd: Some(0.01),

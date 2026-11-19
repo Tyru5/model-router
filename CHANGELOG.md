@@ -132,6 +132,8 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 - `serve --mcp` answers a line that is not UTF-8 with a parse error instead
   of exiting, and an unreadable stdin now cancels active runs as EOF does,
   rather than leaving them recorded as running.
+- Budget caps now stop graph workflows (stages with `after`) before the next
+  stage starts; before, they launched every stage regardless of spend.
 - Recovery no longer signals a recorded process group ID that now belongs to
   another process: it stops a group only if its leader's start time or the
   `MODEL_ROUTER_GROUP` marker in a member's environment matches the record,
