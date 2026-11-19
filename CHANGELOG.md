@@ -96,6 +96,10 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Changed
 
+- Interactive stages echo keystrokes in about 1 ms instead of 40–80 ms: the
+  terminal host sends output as soon as it reads it, and mr wakes its
+  supervisor and attachment when input or output is queued instead of
+  polling every 40 ms.
 - TUI: the startup animation plays only on the first launch of each
   installed version, recorded in `<config dir>/startup.json`.
 - TUI: Monitor and Runs are one Runs page (`2`): a sidebar of this

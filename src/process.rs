@@ -437,6 +437,42 @@ pub enum AttachOutcome {
 #[derive(Clone)]
 pub struct InteractiveSession {
     shared: Arc<Mutex<SessionState>>,
+    /// Wakes the supervisor for queued input and flags, and the attachment
+    /// for new output, instead of waiting out their poll timeouts.
+    wakes: Arc<(Wake, Wake)>,
+}
+
+/// Wakes a thread blocked in poll(2) on `fd`; wakes before it looks
+/// coalesce. Without a socket pair (descriptors exhausted), pollers fall
+/// back to their timeouts.
+struct Wake(Option<(UnixStream, UnixStream)>);
+impl Wake {
+    fn new() -> Self {
+        Self(
+            UnixStream::pair()
+                .and_then(|(rx, tx)| {
+                    rx.set_nonblocking(true)?;
+                    tx.set_nonblocking(true)?;
+                    Ok((rx, tx))
+                })
+                .ok(),
+        )
+    }
+    fn wake(&self) {
+        if let Some((_, tx)) = &self.0 {
+            let _ = (&*tx).write(&[0]);
+        }
+    }
+    /// Takes pending wakes; call before checking what they announce.
+    fn clear(&self) {
+        if let Some((rx, _)) = &self.0 {
+            let mut bytes = [0u8; 64];
+            while matches!((&*rx).read(&mut bytes), Ok(n) if n > 0) {}
+        }
+    }
+    fn fd(&self) -> i32 {
+        self.0.as_ref().map_or(-1, |(rx, _)| rx.as_raw_fd())
+    }
 }
 
 struct SessionState {
@@ -579,7 +615,16 @@ impl InteractiveSession {
     pub fn new(cols: u16, rows: u16) -> Self {
         Self {
             shared: Arc::new(Mutex::new(SessionState::new(cols, rows))),
+            wakes: Arc::new((Wake::new(), Wake::new())),
         }
+    }
+
+    fn wake_supervisor(&self) {
+        self.wakes.0.wake();
+    }
+
+    fn wake_attachment(&self) {
+        self.wakes.1.wake();
     }
 
     fn state(&self) -> MutexGuard<'_, SessionState> {
@@ -592,6 +637,8 @@ impl InteractiveSession {
     /// Calling this for a running supervisor also stops and reaps its child.
     pub fn finish(&self) {
         self.state().finished = true;
+        self.wake_supervisor();
+        self.wake_attachment();
     }
 
     /// Lets go of a running harness without stopping it: its terminal host
@@ -600,6 +647,8 @@ impl InteractiveSession {
         let mut state = self.state();
         if state.started && !state.finished {
             state.released = true;
+            drop(state);
+            self.wake_supervisor();
         }
     }
 
@@ -660,6 +709,7 @@ impl InteractiveSession {
             if shutdown.load(Ordering::Relaxed) {
                 cancel.store(true, Ordering::Relaxed);
             }
+            self.wakes.1.clear();
             let (finished, capacity, stopping) = {
                 let mut state = self.state();
                 state.cancelled |= cancel.load(Ordering::Relaxed);
@@ -699,9 +749,14 @@ impl InteractiveSession {
                     },
                     revents: 0,
                 },
+                libc::pollfd {
+                    fd: self.wakes.1.fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
             ];
-            // SAFETY: both descriptors are borrowed; the array is initialized.
-            let result = unsafe { libc::poll(polls.as_mut_ptr(), 2, 40) };
+            // SAFETY: the descriptors are borrowed; the array is initialized.
+            let result = unsafe { libc::poll(polls.as_mut_ptr(), 3, 40) };
             if result < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {
@@ -711,9 +766,10 @@ impl InteractiveSession {
             }
             if result == 0 {
                 keys.flush(&mut self.state().input);
+                self.wake_supervisor();
             }
             ensure!(
-                polls
+                polls[..2]
                     .iter()
                     .all(|p| p.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) == 0),
                 "Interactive terminal disconnected"
@@ -767,6 +823,8 @@ impl InteractiveSession {
                     }
                     None => {}
                 }
+                // After queueing: the supervisor clears wakes before it looks.
+                self.wake_supervisor();
             }
         }
     }
@@ -1555,6 +1613,7 @@ impl Terminal {
         let mut cancelled = false;
         let mut stopped: Option<Instant> = None;
         loop {
+            session.wakes.0.clear();
             {
                 let mut state = session.state();
                 if state.released && stopped.is_none() {
@@ -1593,12 +1652,14 @@ impl Terminal {
                 host::flush(&mut self.stream, &mut out, &mut written) && frames.fill(&self.stream);
             // The host sends descriptors only with its answer to attaching.
             drop(frames.take_fds());
+            let mut output = false;
             let read = (|| -> Result<Option<Outcome>> {
                 while let Some((tag, payload)) = frames.next()? {
                     match tag {
                         host::tag::OUTPUT => {
                             let mut state = session.state();
                             decoder.process(&payload, |frame| state.output(frame));
+                            output = true;
                         }
                         host::tag::EXIT => {
                             let exit: host::Exit = serde_json::from_slice(&payload)?;
@@ -1614,6 +1675,9 @@ impl Terminal {
                 }
                 Ok(None)
             })();
+            if output {
+                session.wake_attachment();
+            }
             match read {
                 Ok(Some(outcome)) => {
                     session.finish();
@@ -1650,13 +1714,20 @@ impl Terminal {
                     released: false,
                 });
             }
-            let mut poll = libc::pollfd {
-                fd: self.stream.as_raw_fd(),
-                events: libc::POLLIN | if out.is_empty() { 0 } else { libc::POLLOUT },
-                revents: 0,
-            };
-            // SAFETY: the descriptor is borrowed; poll is one initialized pollfd.
-            unsafe { libc::poll(&mut poll, 1, 40) };
+            let mut polls = [
+                libc::pollfd {
+                    fd: self.stream.as_raw_fd(),
+                    events: libc::POLLIN | if out.is_empty() { 0 } else { libc::POLLOUT },
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: session.wakes.0.fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: both descriptors are borrowed; the array is initialized.
+            unsafe { libc::poll(polls.as_mut_ptr(), 2, 40) };
         }
     }
 }

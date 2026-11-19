@@ -640,44 +640,58 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
         // new one asks to attach.
         if let Some(active) = &mut client {
             let mut open = active.frames.fill(&active.stream);
+            let mut gone = false;
             loop {
-                // Input the harness has not read yet stays with mr; dropping
-                // it would cut a paste short.
-                if state.input.len() >= INPUT_LIMIT && active.frames.peek() == Some(tag::INPUT) {
-                    break;
-                }
-                match active.frames.next() {
-                    Ok(Some((tag::INPUT, payload))) => state.input.extend(&payload),
-                    Ok(Some((tag::RESIZE, payload))) if payload.len() == 4 => {
-                        let cols = u16::from_be_bytes([payload[0], payload[1]]);
-                        let rows = u16::from_be_bytes([payload[2], payload[3]]);
-                        state.resize(cols, rows);
-                    }
-                    Ok(Some((tag::STOP, _))) => {
-                        if stopping.is_none() {
-                            // Ask first: some harnesses only save a resumable
-                            // session when they exit cleanly.
-                            signal_group(pid, libc::SIGTERM);
-                            stopping = Some(Instant::now() + GRACE);
-                        }
-                    }
-                    Ok(Some((tag::LOCKS, _))) => {
-                        receive(&mut active.frames, &mut locks, spec.locks.len());
-                    }
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(_) => {
-                        open = false;
+                loop {
+                    // Input the harness has not read yet stays with mr; dropping
+                    // it would cut a paste short.
+                    if state.input.len() >= INPUT_LIMIT && active.frames.peek() == Some(tag::INPUT)
+                    {
                         break;
                     }
+                    match active.frames.next() {
+                        Ok(Some((tag::INPUT, payload))) => state.input.extend(&payload),
+                        Ok(Some((tag::RESIZE, payload))) if payload.len() == 4 => {
+                            let cols = u16::from_be_bytes([payload[0], payload[1]]);
+                            let rows = u16::from_be_bytes([payload[2], payload[3]]);
+                            state.resize(cols, rows);
+                        }
+                        Ok(Some((tag::STOP, _))) => {
+                            if stopping.is_none() {
+                                // Ask first: some harnesses only save a resumable
+                                // session when they exit cleanly.
+                                signal_group(pid, libc::SIGTERM);
+                                stopping = Some(Instant::now() + GRACE);
+                            }
+                        }
+                        Ok(Some((tag::LOCKS, _))) => {
+                            receive(&mut active.frames, &mut locks, spec.locks.len());
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(_) => {
+                            open = false;
+                            break;
+                        }
+                    }
                 }
+                if gone {
+                    break;
+                }
+                if open && active.written == active.out.len() {
+                    let mut raw = Vec::new();
+                    state.take_output(&mut raw);
+                    output_frames(&raw, &mut active.out);
+                }
+                if open && flush(&mut active.stream, &mut active.out, &mut active.written) {
+                    break;
+                }
+                // Gone, perhaps while this wrote: what it sent before
+                // closing, such as STOP, still counts.
+                gone = true;
+                active.frames.fill(&active.stream);
             }
-            if open && active.written == active.out.len() {
-                let mut raw = Vec::new();
-                state.take_output(&mut raw);
-                output_frames(&raw, &mut active.out);
-            }
-            if !open || !flush(&mut active.stream, &mut active.out, &mut active.written) {
+            if gone {
                 if let Some(gone) = client.take() {
                     part(gone, &mut locks, spec.locks.len());
                 }
@@ -845,8 +859,14 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
                 revents: 0,
             });
         }
+        // Output read this pass goes to an idle client now, not after a timeout.
+        let waiting = client
+            .as_ref()
+            .is_some_and(|active| active.written == active.out.len())
+            && (state.redraw || !state.output.is_empty() || !state.queries.is_empty());
+        let timeout = if waiting { 0 } else { 40 };
         // SAFETY: every descriptor is borrowed and outlives the call.
-        unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, 40) };
+        unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, timeout) };
     };
     drain_pty(
         &mut reader,
