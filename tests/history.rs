@@ -70,6 +70,16 @@ fn listing_reads_summaries_without_run_json() {
     run.persist().unwrap();
     let entries = history::list(dir.path()).unwrap();
     assert_eq!(summary(&entries[0]).revision, run.revision);
+    // Listed tasks are excerpts without terminal controls whatever the
+    // summary says: the TUI draws them as they are.
+    let path = run.directory.join("summary.json");
+    let mut raw: history::RunSummary = storage::read_json(&path).unwrap();
+    raw.task = "\x1b]0;title\x07\x1b[31mred\x1b[0m task\nsecond line".into();
+    storage::write_json(&path, &raw).unwrap();
+    assert_eq!(
+        summary(&history::list(dir.path()).unwrap()[0]).task,
+        "red task"
+    );
     // A run.json that broke after its summary was saved lists as damaged.
     fs::write(run.directory.join("run.json"), "{").unwrap();
     let entries = history::list(dir.path()).unwrap();

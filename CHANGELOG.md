@@ -100,6 +100,10 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   terminal host sends output as soon as it reads it, and mr wakes its
   supervisor and attachment when input or output is queued instead of
   polling every 40 ms.
+- TUI: the Runs sidebar draws in constant time however many runs are saved
+  (0.4 ms a frame at 10,000 runs, was 38 ms): it builds only the rows that
+  can be on screen, skips search matching without a search, and saved tasks
+  are cleaned once when listed rather than on every frame.
 - TUI: the startup animation plays only on the first launch of each
   installed version, recorded in `<config dir>/startup.json`.
 - TUI: Monitor and Runs are one Runs page (`2`): a sidebar of this

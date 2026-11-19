@@ -178,7 +178,7 @@ pub fn list(project: &Path) -> Result<Vec<Entry>> {
 /// full record decides, so a broken run.json lists as damaged and one saved
 /// without its summary (a crash between the two writes) lists current.
 fn read_summary(project: &Path, id: &str, dir: &Path) -> Result<RunSummary> {
-    if let Ok(summary) = storage::read_json::<RunSummary>(&dir.join("summary.json")) {
+    if let Ok(mut summary) = storage::read_json::<RunSummary>(&dir.join("summary.json")) {
         let run_bytes = fs::metadata(dir.join("run.json")).map(|meta| meta.len());
         let consistent = match (summary.run_bytes, run_bytes) {
             (Some(expected), Ok(actual)) => expected == actual,
@@ -186,6 +186,9 @@ fn read_summary(project: &Path, id: &str, dir: &Path) -> Result<RunSummary> {
             (_, Err(_)) => false,
         };
         if summary.id == id && consistent {
+            // Clean once here, not wherever it is shown: the TUI draws every
+            // saved task each frame.
+            summary.task = excerpt(&summary.task);
             return Ok(summary);
         }
     }
@@ -257,6 +260,9 @@ pub fn filter<'a>(entries: &'a [Entry], statuses: &[StatusFilter], search: &str)
         .iter()
         .filter(|entry| statuses.is_empty() || statuses.iter().any(|s| s.matches(entry)))
         .filter(|entry| {
+            if words.is_empty() {
+                return true;
+            }
             let text = match entry {
                 Entry::Summary(s) => {
                     format!("{} {} {} {}", s.id, s.workflow, s.task, s.status.label())

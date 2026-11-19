@@ -813,8 +813,22 @@ fn draw_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) 
         head.push_str(&format!(" “{}”", fit(search.trim(), 12)));
     }
     items.push(heading(head));
-    for (index, entry) in visible.iter().enumerate() {
-        if app.on_saved() && index == app.runs.selected.min(visible.len() - 1) {
+    // Only rows that can be on screen: the list scrolls just far enough to
+    // show the selection, so rows a screen or more from it never are.
+    let at = app.runs.selected.min(visible.len().saturating_sub(1));
+    let height = usize::from(inner.height);
+    let shown = if app.on_saved() {
+        at.saturating_sub(height)..at + height
+    } else {
+        0..height
+    };
+    for (index, entry) in visible
+        .iter()
+        .enumerate()
+        .skip(shown.start)
+        .take(shown.len())
+    {
+        if app.on_saved() && index == at {
             selected = Some(items.len());
         }
         let started = entry
@@ -823,7 +837,12 @@ fn draw_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) 
         items.push(match entry {
             Entry::Summary(run) => item(
                 status_glyph(run.status),
-                &title(&run.task, &run.workflow),
+                // `history::list` already reduced the task to an excerpt.
+                if run.task.is_empty() {
+                    &run.workflow
+                } else {
+                    &run.task
+                },
                 Span::styled(
                     // The status first, so a narrow sidebar cuts the date.
                     fit(&format!("{} · {started}", run.status.label()), width),
