@@ -1,8 +1,10 @@
-version = 1
+version = 2
 
 [[workflows]]
 name = "Feature development"
 max_repair_passes = 2
+sandbox_default = "by-role"
+protected_paths = [".github/workflows/*"]
 
 [[workflows.stages]]
 id = "research"
@@ -10,22 +12,23 @@ name = "Investigate"
 role = "research"
 enabled = true
 harness = "codex"
-model = "gpt-6-astra"
+model = ""
 provider = ""
 effort = ""
 mode = "unattended"
 instructions = "Investigate the task and relevant project files. Explain the root cause or requirements, cite evidence, and propose a concrete implementation plan. Do not change project code."
 extra_args = []
 timeout_seconds = 3600
+stall_timeout_seconds = 600
 repair_target = ""
 
 [[workflows.stages]]
 id = "implement"
 name = "Implement"
 role = "implementation"
-enabled = false
+enabled = true
 harness = "claude"
-model = "fable"
+model = ""
 provider = ""
 effort = ""
 mode = "interactive"
@@ -34,19 +37,54 @@ extra_args = []
 timeout_seconds = 3600
 repair_target = ""
 
+[[workflows.stages.checks]]
+command = ["cargo", "fmt", "--check"]
+required = true
+timeout_seconds = 120
+
+[[workflows.stages.checks]]
+command = ["cargo", "clippy", "--all-targets", "--locked", "--", "-D", "warnings"]
+required = true
+timeout_seconds = 300
+
+[[workflows.stages.checks]]
+command = ["cargo", "test", "--locked"]
+required = true
+timeout_seconds = 600
+
 [[workflows.stages]]
 id = "review"
 name = "Review (optional)"
 role = "review"
 enabled = false
 harness = "codex"
-model = "gpt-6-astra"
+model = ""
 provider = ""
 effort = ""
 mode = "unattended"
 instructions = "Review the implementation and test evidence. Do not modify code. Distinguish blocking correctness issues and failed required checks from advisory suggestions. Give an explicit pass or needs_changes verdict."
 extra_args = []
 timeout_seconds = 3600
+stall_timeout_seconds = 600
 repair_target = ""
+
+[[workflows.stages]]
+id = "summary"
+name = "Review summary"
+role = "summary"
+enabled = true
+harness = "codex"
+model = ""
+provider = ""
+effort = ""
+mode = "unattended"
+instructions = "Write a review brief for the person who will review this work. Use the original task, the prior stage handoffs and artifacts, and the actual changes in the working directory; inspect them with read-only commands such as git status, git diff --stat, and git diff, and never run commands that change files or Git state. Put the whole brief in the handoff summary as Markdown with sections: ## Outcome, ## Changes, ## Verification, ## Review focus, ## Open questions, ## Try it. Do not modify project files, commit, push, or publish."
+extra_args = []
+timeout_seconds = 1800
+stall_timeout_seconds = 600
+repair_target = ""
+
+[workflows.stages.harness_settings]
+sandbox = "read-only"
 
 [adapters]
