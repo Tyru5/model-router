@@ -231,7 +231,9 @@ pub(super) fn classify_exit(
         };
         return Ok(Exit::Stopped(
             Status::Failed,
-            format!("Harness exited with code {:?}. {detail}", outcome.code),
+            format!("Harness {}. {}", ended(outcome.code), detail.trim())
+                .trim_end()
+                .to_owned(),
         ));
     }
     let raw = process::read_tail(&stdout, 4 * 1024 * 1024)?;
@@ -497,11 +499,11 @@ Do not edit any project files or run destructive commands. Emit ONLY a valid han
                 &process::read_tail(&repair_dir.join("stderr.log"), 3000).unwrap_or_default(),
             ),
         };
-        let ended = match outcome.code {
-            Some(code) => format!("exited with code {code}"),
-            None => "was stopped by a signal".to_owned(),
-        };
-        failed(format!("the follow-up {ended}. {}", detail.trim()));
+        failed(format!(
+            "the follow-up {}. {}",
+            ended(outcome.code),
+            detail.trim()
+        ));
         return Ok(None);
     }
     let raw = process::read_tail(&repair_stdout, 2 * 1024 * 1024).unwrap_or_default();
@@ -1039,6 +1041,15 @@ pub(super) fn reattach_stage(
 /// that the router's Git would write through.
 pub(super) fn candidate_index(prepared: &Prepared) -> PathBuf {
     prepared.directory.with_extension("index")
+}
+
+/// How a harness process ended, for messages: its exit code, or a signal
+/// when it has none.
+fn ended(code: Option<i32>) -> String {
+    match code {
+        Some(code) => format!("exited with code {code}"),
+        None => "was stopped by a signal".to_owned(),
+    }
 }
 
 pub(super) const INTERRUPTED: &str =

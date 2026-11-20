@@ -223,7 +223,7 @@ fn auto_judge_applies_the_smallest_candidate_whose_checks_pass() {
                 .error
                 .as_deref()
                 .unwrap()
-                .contains("code Some(17)")
+                .contains("exited with code 17. ")
         );
         let written = lines(&dir.path().join("out.txt"));
         assert_eq!(written.len(), size);

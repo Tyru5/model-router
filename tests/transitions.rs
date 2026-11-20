@@ -83,6 +83,20 @@ fn transitions_record_every_status_change_across_a_repair_loop() {
     assert!(report.contains("review #2"), "{report}");
 }
 
+/// A failed harness reports its exit code as a number, then its error.
+#[test]
+fn failed_harness_reports_its_exit_code() {
+    let mut implement = stage("implementation", Role::Implementation);
+    implement.model = "fail".into();
+    let (_dir, _, mut run) = fixture(vec![implement]);
+    assert_eq!(drive(&mut run), Action::Stopped);
+    let error = run.error.clone().unwrap_or_default();
+    assert!(
+        error.starts_with("Harness exited with code 17. Simulated authentication"),
+        "{error}"
+    );
+}
+
 #[test]
 fn command_holds_the_run_lock_and_refuses_stale_revisions() {
     let mut implement = stage("implementation", Role::Implementation);

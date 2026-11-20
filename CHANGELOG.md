@@ -195,6 +195,8 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Fixed
 
+- Failed-stage messages show the exit code as a number (`exited with code 3`,
+  not `Some(3)`) or say the harness was stopped by a signal.
 - An interactive stage no longer fails, leaving its harness running
   unrecorded in its terminal host, when a screen redraw passes 1 MiB (a
   large truecolour screen): the host splits redraws into frames mr accepts,
