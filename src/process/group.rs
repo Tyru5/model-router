@@ -440,6 +440,18 @@ mod tests {
             .parse()
             .unwrap();
         assert!(super::super::group_alive(pgid));
+        // Until the member has exec'd this test binary it is still the
+        // forked `sh`, whose environment macOS hides, so a check could run
+        // before the marker is readable.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let member = u32::try_from(pid).unwrap();
+        while !carries(member, b"MODEL_ROUTER_TEST_LINGER=1") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the member never exec'd"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         (pgid, pid)
     }
 
