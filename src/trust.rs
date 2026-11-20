@@ -135,6 +135,21 @@ pub fn dangerous(settings: &Settings) -> Vec<String> {
                     options.describe()
                 ));
             }
+            if let Some(ship) = stage
+                .ship
+                .as_ref()
+                .filter(|_| stage.role == config::Role::Ship)
+            {
+                if !ship.secret_scanner.is_empty() {
+                    items.push(format!(
+                        "ship secret_scanner in {at}: {}",
+                        quoted(&ship.secret_scanner)
+                    ));
+                }
+                if !ship.secret_scan {
+                    items.push(format!("ship secret_scan = false in {at}"));
+                }
+            }
         }
     }
     for (name, provider) in &settings.providers {
@@ -462,6 +477,10 @@ struct IgnoredStage {
     sandbox_fallback: SandboxFallback,
     /// A ship stage's `confirm = false`, forced on while untrusted.
     ship_unconfirmed: bool,
+    /// A ship stage's `secret_scan = false`, forced on while untrusted.
+    ship_no_secret_scan: bool,
+    /// A ship stage's external `secret_scanner` command.
+    ship_secret_scanner: Vec<String>,
 }
 
 /// Neutralizes every dangerous section: custom adapters keep their names but
@@ -477,6 +496,7 @@ pub fn ignore(settings: &mut Settings) {
             command: BLOCKED_COMMAND.into(),
             interactive_args: adapter.interactive_args.as_ref().map(|_| vec![]),
             resume_args: adapter.resume_args.as_ref().map(|_| vec![]),
+            follow_up_args: adapter.follow_up_args.as_ref().map(|_| vec![]),
             output: adapter.output,
             session: adapter.session.clone(),
             ..CustomAdapter::default()
@@ -505,6 +525,13 @@ pub fn ignore(settings: &mut Settings) {
                 .collect();
             let downgraded = downgrades_sandbox(&default, stage);
             let ship_unconfirmed = unconfirmed_ship(stage);
+            let ship_no_secret_scan = stage.role == config::Role::Ship
+                && stage.ship.as_ref().is_some_and(|s| !s.secret_scan);
+            let ship_has_scanner = stage.role == config::Role::Ship
+                && stage
+                    .ship
+                    .as_ref()
+                    .is_some_and(|s| !s.secret_scanner.is_empty());
             if stage.checks.is_empty()
                 && stage.extra_args.is_empty()
                 && escalated.is_empty()
@@ -512,14 +539,25 @@ pub fn ignore(settings: &mut Settings) {
                 && stage.sandbox_writable.is_empty()
                 && stage.sandbox_fallback == SandboxFallback::Refuse
                 && !ship_unconfirmed
+                && !ship_no_secret_scan
+                && !ship_has_scanner
             {
                 continue;
             }
             for key in escalated.keys() {
                 stage.harness_settings.remove(key);
             }
-            if let Some(ship) = stage.ship.as_mut().filter(|_| ship_unconfirmed) {
-                ship.confirm = true;
+            let mut ship_secret_scanner = vec![];
+            if let Some(ship) = stage.ship.as_mut() {
+                if ship_unconfirmed {
+                    ship.confirm = true;
+                }
+                if ship_no_secret_scan {
+                    ship.secret_scan = true;
+                }
+                if ship_has_scanner {
+                    ship_secret_scanner = std::mem::take(&mut ship.secret_scanner);
+                }
             }
             ignored.stages.insert(
                 (workflow.name.clone(), stage.id.clone()),
@@ -536,6 +574,8 @@ pub fn ignore(settings: &mut Settings) {
                     sandbox_writable: std::mem::take(&mut stage.sandbox_writable),
                     sandbox_fallback: std::mem::take(&mut stage.sandbox_fallback),
                     ship_unconfirmed,
+                    ship_no_secret_scan,
+                    ship_secret_scanner,
                 },
             );
         }
@@ -594,8 +634,16 @@ pub fn restore(settings: &Settings) -> Settings {
             if stage.sandbox_fallback == SandboxFallback::Refuse {
                 stage.sandbox_fallback = original.sandbox_fallback;
             }
-            if let Some(ship) = stage.ship.as_mut().filter(|_| original.ship_unconfirmed) {
-                ship.confirm = false;
+            if let Some(ship) = stage.ship.as_mut() {
+                if original.ship_unconfirmed {
+                    ship.confirm = false;
+                }
+                if original.ship_no_secret_scan {
+                    ship.secret_scan = false;
+                }
+                if ship.secret_scanner.is_empty() {
+                    ship.secret_scanner = original.ship_secret_scanner.clone();
+                }
             }
         }
     }

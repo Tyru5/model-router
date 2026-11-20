@@ -13,14 +13,17 @@
 A project's `.model-router.toml` could run commands or send keys elsewhere.
 These sections take effect only after you trust the file:
 
-- custom adapters (`[adapters.*]`, including spec fields that reach the executable);
+- custom adapters (`[adapters.*]`, including spec fields that reach the
+  executable; `follow_up_args` enters the trust digest only when set);
 - stage `checks` and `extra_args`;
 - permission settings that loosen a harness (`danger-full-access`,
   `bypassPermissions`, `yolo`, Cursor sandbox `disabled`, Aider `yes-always`,
   Goose `auto`, Copilot `allow-all-tools`);
 - router sandbox loosening: a stage `sandbox` weaker than the workflow
   default would give it, `sandbox_writable` paths, `sandbox_fallback = "warn"`;
-- ship stages with `confirm = false` (while untrusted, ship stages ask first);
+- ship stages with `confirm = false` (while untrusted, ship stages ask first),
+  `secret_scan = false` (forced on while untrusted), or a `secret_scanner`
+  command;
 - providers with their own `base_url`, or a key variable other than the preset's.
 
 ```sh
@@ -220,3 +223,42 @@ leaves the pending queue as soon as its headers authenticate, so a body still
 on the way is never cut off. Request headers and bodies share a 10-second
 absolute read deadline; authorization is checked before waiting for a request
 body.
+
+MCP over stdio (`serve --mcp`) caps request lines at 2 MiB and concurrent
+`tools/call` workers at 32, of which at most 24 may be blocking `wait_run`
+calls.
+
+## Protected paths and secret scanning
+
+- Workflow `protected_paths` lists repository-relative globs (`*`, `**`, `?`).
+  It is enforced for ordinary stages (the stage stops **blocked**), for fan-out
+  candidates (the candidate stops **blocked** with its worktree retained), and
+  again at candidate selection; `ship` and `apply` also refuse matching files.
+- `ship` runs a built-in diff secret scanner (`secret_scan = true` by default)
+  at plan time and again right before `git commit-tree`. It reads the full diff
+  of the planned files only (no size cutoff; files Git treats as binary are
+  read as text), checks added lines for private key blocks and
+  AWS/GitHub/Anthropic/OpenAI/Slack/Stripe/Google tokens, lists at most 20 hits
+  followed by `and N more`, and never prints secret values.
+- Set `secret_scanner` (argument vector, no shell, e.g.
+  `["gitleaks", "protect", "--staged"]`) to also run an external scanner in
+  both phases. It runs with `cwd` = workspace, `{files}` and
+  `MODEL_ROUTER_SHIP_FILES` = planned paths, and `GIT_INDEX_FILE` = a private
+  index containing `HEAD` plus the planned files as they are now, so `--staged`
+  scanners see exactly what will be committed. Your own index is never read or
+  written; planning writes blob objects to Git's object database. Requires
+  project trust and fails closed if missing or non-zero.
+
+## Not enforced
+
+Some guarantees depend on the harness or OS rather than the router itself:
+
+| Area | What is not enforced by the router |
+| --- | --- |
+| Stage instructions | Prompt lines such as "do not modify code" are intent only; use `sandbox = "read-only"` (or `sandbox_default = "by-role"`) for OS enforcement. |
+| Native harness permissions | Passing `--sandbox`, `--permission-mode`, etc. relies on the harness honoring its own flags. |
+| Harness state directories | Under router sandboxing, harness config/cache directories stay writable so the CLI can run; a sandboxed harness could modify its own config. |
+| Detached processes | The router sandbox has no PID namespace. A process a harness detaches into a new session outlives the stage's process group and keeps its sandbox permissions. |
+| Custom `TMPDIR` / `XDG_RUNTIME_DIR` | Terminal-host socket hiding covers standard runtime/temp socket paths; a concurrent `mr` launched with a custom `TMPDIR` or `XDG_RUNTIME_DIR` puts its sockets elsewhere. |
+| Built-in secret scan | Pattern matching catches high-confidence token formats only; pair with an external `secret_scanner` (e.g. `gitleaks`) when broader coverage is required. |
+| Live spend caps | Budgets check after each attempt completes; an in-progress attempt is not stopped mid-stream (use `timeout_seconds` and `stall_timeout_seconds` to bound runaways). |

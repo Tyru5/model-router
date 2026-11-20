@@ -161,8 +161,28 @@ pub fn list() -> Vec<Value> {
     ]
 }
 
+const TOOL_NAMES: &[&str] = &[
+    "list_workflows",
+    "preview_run",
+    "start_run",
+    "run_status",
+    "wait_run",
+    "cancel_run",
+    "list_runs",
+    "get_handoff",
+    "get_report",
+    "confirm_stage",
+    "retry_stage",
+];
+
 pub fn exists(name: &str) -> bool {
-    list().iter().any(|tool| tool["name"] == name)
+    TOOL_NAMES.contains(&name)
+}
+
+/// Whether a call to the tool can hold its thread for a long time
+/// (`wait_run`, up to `MAX_WAIT_SECONDS`); the others answer at once.
+pub fn blocks(name: &str) -> bool {
+    name == "wait_run"
 }
 
 fn args<T: DeserializeOwned>(value: &Value) -> Result<T> {
@@ -254,6 +274,17 @@ struct RetryArgs {
 
 /// Runs a tool. Errors become `isError` results (MCP) or 400s (HTTP).
 pub fn call(server: &Server, name: &str, arguments: &Value) -> Result<Value> {
+    call_with(server, name, arguments, None, &mut |_| {})
+}
+
+/// Runs a tool with optional cancellation and progress reporting (for MCP).
+pub fn call_with(
+    server: &Server,
+    name: &str,
+    arguments: &Value,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    on_progress: &mut dyn FnMut(&Value),
+) -> Result<Value> {
     match name {
         "list_workflows" => list_workflows(server, args(arguments)?),
         "preview_run" => preview_run(server, args(arguments)?),
@@ -263,7 +294,7 @@ pub fn call(server: &Server, name: &str, arguments: &Value) -> Result<Value> {
             let (run, info) = load(server, a.project.as_deref(), &a.run_id)?;
             Ok(status_value(&run, &info))
         }
-        "wait_run" => wait_run(server, args(arguments)?),
+        "wait_run" => wait_run(server, args(arguments)?, cancel, on_progress),
         "cancel_run" => cancel_run(server, args(arguments)?),
         "list_runs" => list_runs(server, args(arguments)?),
         "get_handoff" => get_handoff(server, args(arguments)?),
@@ -397,7 +428,13 @@ fn settled(status: Status) -> bool {
     !matches!(status, Status::Pending | Status::Running)
 }
 
-fn wait_run(server: &Server, a: WaitArgs) -> Result<Value> {
+fn wait_run(
+    server: &Server,
+    a: WaitArgs,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    on_progress: &mut dyn FnMut(&Value),
+) -> Result<Value> {
+    use std::sync::atomic::Ordering;
     let timeout = a
         .timeout_seconds
         .unwrap_or(DEFAULT_WAIT_SECONDS)
@@ -405,20 +442,28 @@ fn wait_run(server: &Server, a: WaitArgs) -> Result<Value> {
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout);
     let (mut run, mut info) = load(server, a.project.as_deref(), &a.run_id)?;
     loop {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            break;
+        }
         if info.active {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
-            server.runs.wait(&a.run_id, left);
+            server.runs.wait_with(&a.run_id, left, cancel, |snapshot| {
+                on_progress(snapshot);
+            });
         } else if settled(run.status) {
             break;
         } else {
             // Driven by another process: poll its saved state.
             std::thread::sleep(
-                Duration::from_millis(500)
+                Duration::from_millis(250)
                     .min(deadline.saturating_duration_since(std::time::Instant::now())),
             );
         }
         (run, info) = load(server, a.project.as_deref(), &a.run_id)?;
-        if (!info.active && settled(run.status)) || std::time::Instant::now() >= deadline {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
+            || (!info.active && settled(run.status))
+            || std::time::Instant::now() >= deadline
+        {
             break;
         }
     }

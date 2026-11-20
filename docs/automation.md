@@ -110,6 +110,18 @@ attribute filters), the fork is saved as failed and says why. `report`
 shows `Forked from:` and marks reused handoffs; `compare --source` compares
 across a fork.
 
+### `apply ID`
+
+Apply a finished worktree run's changes back into the project checkout without
+committing, pushing, or touching Git's index or branches. Uses `git apply` with
+a 3-way merge fallback in a private index and leaves the checkout unchanged on
+conflict. Refuses active runs, non-worktree runs, and `protected_paths`.
+
+| Option | Meaning |
+| --- | --- |
+| `--check` | Report clean apply, 3-way merge, or conflict without touching the checkout or its index. Merge prediction requires Git 2.32 or later (older Git reports a conflict). |
+| `--yes` | Apply without asking after the preview (required without a terminal). |
+
 ### `ship ID`
 
 Commit a completed run's changes on a new branch after a preview, using the
@@ -284,7 +296,7 @@ and `.md` (success, checks, repairs, duration, usage per variant and run).
 
 | Command | Purpose | Options |
 | --- | --- | --- |
-| `init` | Write a starter or preset workflow (reviews disabled) | `--global`, `--force`, `--preset quick-task\|full-feature\|bug-fix\|investigation\|best-of-3` |
+| `init` | Write a starter or preset workflow (reviews disabled) | `--global`, `--force`, `--preset quick-task\|full-feature\|bug-fix\|investigation\|best-of-3`, `--detect` (detect installed harnesses, clear models/effort to inherit defaults, keep read-only intent via native setting or router `sandbox = "read-only"`, and move review stages off the implementing harness when another is installed) |
 | `presets` | List stage and workflow presets | |
 | `validate` | Validate the workflow file; runs nothing | |
 | `preview` | Exact argument vectors, no model launched | `-w, --workflow NAME`, `--task TEXT` (default `<your task>`) |

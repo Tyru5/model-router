@@ -500,7 +500,14 @@ pub fn resume(
             mode: Mode::Interactive,
             ..stage.clone()
         };
-        return build_inner(&stage, custom, configured, "", paths, Some(session));
+        return build_inner(
+            &stage,
+            custom,
+            configured,
+            "",
+            paths,
+            Launch::Resume(session),
+        );
     }
     let spec = harness::get(&stage.harness).context("Unknown adapter")?;
     let plan = spec.resume.context("Not resumable")?;
@@ -534,6 +541,97 @@ pub fn resume(
     Ok(invocation)
 }
 
+/// Whether the harness's unattended output arrives while it works. False
+/// when it prints one document at exit (Gemini's `--output-format json`, or
+/// a custom adapter with the `gemini-json` parser): a quiet stage then looks
+/// the same as a stalled one, so `stall_timeout_seconds` cannot apply.
+pub fn streams(harness: &str, custom: &BTreeMap<String, CustomAdapter>) -> bool {
+    match custom.get(harness) {
+        Some(adapter) => adapter.output.map(|o| o.kind()) != Some(OutputKind::Gemini),
+        None => harness::get(harness).is_none_or(|spec| spec.streams),
+    }
+}
+
+/// Whether the harness has an unattended follow-up command (see `follow_up`).
+pub fn has_follow_up(harness: &str, custom: &BTreeMap<String, CustomAdapter>) -> bool {
+    match custom.get(harness) {
+        Some(adapter) => adapter.follow_up_args.is_some(),
+        None => harness::get(harness).is_some_and(|s| s.follow_up.is_some()),
+    }
+}
+
+/// The unattended command that sends `prompt` to the existing `session`,
+/// built from the harness's `FollowUp` plan or a custom adapter's
+/// `follow_up_args`: `workflow.handoff_repair` uses it to ask for valid
+/// handoff JSON after a stage finished without one. An error says why there
+/// is no such command.
+pub fn follow_up(
+    stage: &Stage,
+    custom: &BTreeMap<String, CustomAdapter>,
+    configured: &BTreeMap<String, Provider>,
+    session: &str,
+    prompt: &str,
+    paths: &ContextPaths<'_>,
+) -> Result<Invocation> {
+    ensure!(
+        is_session_id(session),
+        "{session:?} is not a harness session ID"
+    );
+    ensure!(
+        has_follow_up(&stage.harness, custom),
+        "{} has no unattended follow-up command for a session",
+        stage.harness
+    );
+    let stage = Stage {
+        mode: Mode::Unattended,
+        ..stage.clone()
+    };
+    let mut invocation = build_inner(
+        &stage,
+        custom,
+        configured,
+        prompt,
+        paths,
+        Launch::FollowUp(session),
+    )?;
+    // The session exists; nothing is assigned.
+    invocation.assign = None;
+    Ok(invocation)
+}
+
+/// What a launch does with a session.
+#[derive(Clone, Copy)]
+enum Launch<'a> {
+    /// Starts one.
+    New,
+    /// A custom adapter's interactive `resume_args`.
+    Resume(&'a str),
+    /// The unattended follow-up on one.
+    FollowUp(&'a str),
+}
+
+/// The `--config KEY=VALUE` / `-c KEY=VALUE` pairs among `args`, each as
+/// `flag KEY=VALUE`.
+fn config_pairs(args: &[String], flag: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let value = if arg == "--config" || arg == "-c" {
+            iter.next().map(String::as_str)
+        } else {
+            arg.strip_prefix("--config=").or_else(|| {
+                arg.strip_prefix("-c")
+                    .filter(|rest| !rest.starts_with('-') && rest.contains('='))
+                    .map(|rest| rest.trim_start_matches('='))
+            })
+        };
+        if let Some(value) = value {
+            out.extend([flag.to_owned(), value.to_owned()]);
+        }
+    }
+    out
+}
+
 pub struct ContextPaths<'a> {
     pub workspace: &'a Path,
     pub attempt_dir: &'a Path,
@@ -548,22 +646,39 @@ pub fn build(
     prompt: &str,
     paths: &ContextPaths<'_>,
 ) -> Result<Invocation> {
-    build_inner(stage, custom, configured, prompt, paths, None)
+    build_inner(stage, custom, configured, prompt, paths, Launch::New)
 }
 
-/// `build`, or for a custom adapter with `resume`, its resume command.
+/// `build`, a custom adapter's resume command, or a follow-up.
 fn build_inner(
     stage: &Stage,
     custom: &BTreeMap<String, CustomAdapter>,
     configured: &BTreeMap<String, Provider>,
     prompt: &str,
     paths: &ContextPaths<'_>,
-    resume: Option<&str>,
+    launch: Launch<'_>,
 ) -> Result<Invocation> {
     validate_options(stage, configured)?;
     let routed = providers::route(&stage.harness, &stage.provider, configured);
-    let mut extra_args = harness_settings::arguments(stage)?;
-    extra_args.extend(stage.extra_args.clone());
+    let spec = harness::get(&stage.harness);
+    let follow_up = match (launch, spec.and_then(|s| s.follow_up)) {
+        (Launch::FollowUp(session), Some(plan)) if !custom.contains_key(&stage.harness) => {
+            Some((plan, session))
+        }
+        _ => None,
+    };
+    let extra_args = match follow_up.map(|(plan, _)| plan.extra) {
+        Some(harness::FollowUpExtra::ConfigOnly(flag)) => {
+            let mut args = harness_settings::config_arguments(stage, flag)?;
+            args.extend(config_pairs(&stage.extra_args, flag));
+            args
+        }
+        Some(harness::FollowUpExtra::Same) | None => {
+            let mut args = harness_settings::arguments(stage)?;
+            args.extend(stage.extra_args.clone());
+            args
+        }
+    };
     let mut invocation = Invocation {
         program: program(&stage.harness, custom),
         args: vec![],
@@ -591,12 +706,11 @@ fn build_inner(
             &extra_args,
             prompt,
             paths,
-            resume,
+            launch,
         )?;
         return Ok(invocation);
     }
-    let spec = harness::get(&stage.harness)
-        .with_context(|| format!("Unknown adapter {}", stage.harness))?;
+    let spec = spec.with_context(|| format!("Unknown adapter {}", stage.harness))?;
     let legacy = spec
         .version_override
         .is_some_and(|o| older_than(spec.name, &invocation.program, o.below_major));
@@ -609,12 +723,14 @@ fn build_inner(
         prompt,
         paths,
         legacy,
+        follow_up,
     )?;
     Ok(invocation)
 }
 
 /// Builds a built-in harness's invocation from its spec; `legacy` selects
-/// its version override.
+/// its version override. With `follow_up`, its template and prompt replace
+/// the mode's, and `{session}` expands to the session.
 #[allow(clippy::too_many_arguments)]
 fn build_spec(
     spec: &HarnessSpec,
@@ -625,10 +741,15 @@ fn build_spec(
     prompt: &str,
     paths: &ContextPaths<'_>,
     legacy: bool,
+    follow_up: Option<(harness::FollowUp, &str)>,
 ) -> Result<()> {
     let interactive = stage.mode == Mode::Interactive;
     invocation.kind = spec.output;
-    let (parts, prompt_pass, effort_pass) = spec.template(interactive, legacy);
+    let (parts, prompt_pass, effort_pass) = match follow_up {
+        Some((plan, _)) => (plan.args, plan.prompt, spec.template(false, legacy).2),
+        None => spec.template(interactive, legacy),
+    };
+    let session = follow_up.map_or("", |(_, session)| session);
     let model = &stage.model;
     let effort = &stage.effort;
     if let EffortPass::ModelSuffix(_) = effort_pass {
@@ -713,6 +834,8 @@ fn build_spec(
                     args.push(if item.contains("{final_file}") {
                         let file = utf8(&invocation.final_file, "Output")?;
                         expand(item, &[("{final_file}", file)])
+                    } else if follow_up.is_some() && item.contains("{session}") {
+                        expand(item, &[("{session}", session.to_owned())])
                     } else {
                         (*item).to_owned()
                     });
@@ -760,7 +883,18 @@ fn build_spec(
                     }
                     _ => {}
                 },
-                ProviderPass::CodexConfig => codex_provider_args(&mut args, stage, routed)?,
+                ProviderPass::CodexConfig => {
+                    // `codex exec resume` has no --oss/--local-provider.
+                    ensure!(
+                        follow_up.is_none()
+                            || routed.is_some()
+                            || !matches!(stage.provider.as_str(), "ollama" | "lmstudio"),
+                        "{} cannot follow up on a session using local provider {}",
+                        spec.display,
+                        stage.provider
+                    );
+                    codex_provider_args(&mut args, stage, routed)?;
+                }
             },
             Part::Effort => {
                 if !effort.is_empty() {
@@ -865,8 +999,9 @@ fn codex_provider_args(
 }
 
 /// A custom adapter's template arguments, then `model_flag`, `effort_flag`,
-/// extra arguments, and the prompt. With `resume`, `resume_args` replace the
-/// template and no prompt is passed.
+/// extra arguments, and the prompt. A resume uses `resume_args` and passes
+/// no prompt; a follow-up uses `follow_up_args` and passes the prompt as an
+/// unattended launch does.
 #[allow(clippy::too_many_arguments)]
 fn build_custom(
     invocation: &mut Invocation,
@@ -877,22 +1012,30 @@ fn build_custom(
     extra_args: &[String],
     prompt: &str,
     paths: &ContextPaths<'_>,
-    resume: Option<&str>,
+    launch: Launch<'_>,
 ) -> Result<()> {
     let interactive = stage.mode == Mode::Interactive;
     invocation.kind = adapter.output.map_or(OutputKind::Text, |o| o.kind());
     // An untrusted adapter keeps its name but runs BLOCKED_COMMAND, which no
     // PATH provides: previews show it and launches fail.
-    let template = match resume {
-        Some(_) => adapter
+    let template = match launch {
+        Launch::Resume(_) => adapter
             .resume_args
             .as_ref()
             .with_context(|| format!("{name} does not define resume_args"))?,
-        None if interactive => adapter
+        Launch::FollowUp(_) => adapter
+            .follow_up_args
+            .as_ref()
+            .with_context(|| format!("{name} does not define follow_up_args"))?,
+        Launch::New if interactive => adapter
             .interactive_args
             .as_ref()
             .with_context(|| format!("{name} does not define interactive_args"))?,
-        None => &adapter.args,
+        Launch::New => &adapter.args,
+    };
+    let session = match launch {
+        Launch::Resume(session) | Launch::FollowUp(session) => session,
+        Launch::New => "",
     };
     let values = [
         ("{prompt}", prompt.to_owned()),
@@ -911,7 +1054,7 @@ fn build_custom(
             "{api_key_env}",
             routed.map(|p| p.api_key_env.clone()).unwrap_or_default(),
         ),
-        ("{session}", resume.unwrap_or_default().to_owned()),
+        ("{session}", session.to_owned()),
     ];
     let a = &mut invocation.args;
     a.extend(template.iter().map(|arg| expand(arg, &values)));
@@ -924,7 +1067,7 @@ fn build_custom(
         }
     }
     a.extend(extra_args.iter().cloned());
-    if resume.is_some() {
+    if matches!(launch, Launch::Resume(_)) {
         return Ok(());
     }
     match &adapter.prompt {
@@ -1733,6 +1876,7 @@ mod tests {
                 "task",
                 &paths,
                 legacy,
+                None,
             )
             .map(|()| invocation)
         };

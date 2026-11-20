@@ -22,6 +22,9 @@ use std::{
 const BACKLOG: usize = 500;
 /// Events queued per subscriber; a stalled one loses events, never the run.
 const SUBSCRIBER_QUEUE: usize = 1024;
+/// Finished run handles kept in memory; older inactive ones are evicted so
+/// long-lived servers do not grow unbounded. Disk records remain intact.
+const MAX_FINISHED_RUNS: usize = 128;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -34,8 +37,14 @@ pub enum Message {
 }
 
 #[derive(Default)]
+struct Store {
+    runs: HashMap<String, Arc<Handle>>,
+    finished: VecDeque<String>,
+}
+
+#[derive(Default)]
 pub struct Registry {
-    runs: Mutex<HashMap<String, Arc<Handle>>>,
+    store: Mutex<Store>,
     /// Serializes placement decisions with run creation, so two concurrent
     /// starts cannot both choose the same checkout.
     starting: Mutex<()>,
@@ -51,6 +60,10 @@ struct State {
     active: bool,
     workspace: PathBuf,
     cancel: Arc<AtomicBool>,
+    /// Incremented on every state update and on completion, so waiters can
+    /// observe progress without polling.
+    version: u64,
+    last_state: Option<Value>,
     /// How the last drive ended: complete, confirm, interactive, stopped, or error.
     outcome: Option<String>,
     /// An error `engine::drive` returned rather than recorded in the run.
@@ -73,7 +86,30 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Registry {
     fn get(&self, id: &str) -> Option<Arc<Handle>> {
-        lock(&self.runs).get(id).cloned()
+        lock(&self.store).runs.get(id).cloned()
+    }
+
+    /// Evicts the oldest inactive handles while more than `max` runs are
+    /// tracked. An active run is never evicted and keeps its place in the
+    /// queue, so it is evicted in turn once it has finished.
+    fn evict_finished(&self, max: usize) {
+        let mut store = lock(&self.store);
+        let mut excess = store.finished.len().saturating_sub(max);
+        let Store { runs, finished } = &mut *store;
+        finished.retain(|id| {
+            if excess == 0 {
+                return true;
+            }
+            if runs
+                .get(id)
+                .is_some_and(|handle| lock(&handle.state).active)
+            {
+                return true;
+            }
+            runs.remove(id);
+            excess -= 1;
+            false
+        });
     }
 
     pub fn info(&self, id: &str) -> Info {
@@ -98,7 +134,8 @@ impl Registry {
         if worktree {
             return Ok((Placement::Worktree, None));
         }
-        let holder = lock(&self.runs)
+        let holder = lock(&self.store)
+            .runs
             .iter()
             .find(|(_, handle)| {
                 let state = lock(&handle.state);
@@ -137,9 +174,12 @@ impl Registry {
 
     /// Drives `run` on a new thread until it completes, stops, or waits.
     pub fn drive(&self, project: &Path, mut run: Run) -> Result<()> {
+        let id = run.id.clone();
         let handle = {
-            let mut runs = lock(&self.runs);
-            let handle = runs
+            let mut store = lock(&self.store);
+            store.finished.retain(|id| id != &run.id);
+            let handle = store
+                .runs
                 .entry(run.id.clone())
                 .or_insert_with(|| {
                     Arc::new(Handle {
@@ -148,6 +188,8 @@ impl Registry {
                             active: false,
                             workspace: run.workspace.clone(),
                             cancel: Arc::new(AtomicBool::new(false)),
+                            version: 0,
+                            last_state: None,
                             outcome: None,
                             error: None,
                             backlog: VecDeque::new(),
@@ -162,6 +204,8 @@ impl Registry {
             state.active = true;
             state.workspace = run.workspace.clone();
             state.cancel = Arc::new(AtomicBool::new(false));
+            state.version += 1;
+            state.last_state = None;
             state.outcome = None;
             state.error = None;
             state.backlog.clear();
@@ -204,6 +248,10 @@ impl Registry {
             lock(&handle.state).active = false;
             return Err(error.into());
         }
+        // Tracked for eviction once it is inactive (`drive` removed any
+        // earlier entry for this run above).
+        lock(&self.store).finished.push_back(id);
+        self.evict_finished(MAX_FINISHED_RUNS);
         Ok(())
     }
 
@@ -218,24 +266,48 @@ impl Registry {
         })
     }
 
-    /// Blocks until the run stops being driven here, or `timeout`. Returns
-    /// whether it is still active.
-    pub fn wait(&self, id: &str, timeout: Duration) -> bool {
+    /// Blocks until the run stops being driven here, `timeout` elapses, or
+    /// `cancel` is set. Invokes `on_progress` whenever the run publishes a new
+    /// state snapshot. Returns whether the run is still active.
+    pub fn wait_with(
+        &self,
+        id: &str,
+        timeout: Duration,
+        cancel: Option<&AtomicBool>,
+        mut on_progress: impl FnMut(&Value),
+    ) -> bool {
         let Some(handle) = self.get(id) else {
             return false;
         };
         let deadline = Instant::now() + timeout;
         let mut state = lock(&handle.state);
+        let mut seen = state.version;
         while state.active {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                break;
+            }
             let now = Instant::now();
             if now >= deadline {
                 break;
             }
+            let step = if cancel.is_some() {
+                Duration::from_millis(100).min(deadline - now)
+            } else {
+                deadline - now
+            };
             state = handle
                 .changed
-                .wait_timeout(state, deadline - now)
+                .wait_timeout(state, step)
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
+            if state.version != seen {
+                seen = state.version;
+                if let Some(snapshot) = state.last_state.clone() {
+                    drop(state);
+                    on_progress(&snapshot);
+                    state = lock(&handle.state);
+                }
+            }
         }
         state.active
     }
@@ -259,7 +331,7 @@ impl Registry {
 
     /// Cancels every active run and waits up to `grace` for them to stop.
     pub fn shutdown(&self, grace: Duration) {
-        let handles: Vec<_> = lock(&self.runs).values().cloned().collect();
+        let handles: Vec<_> = lock(&self.store).runs.values().cloned().collect();
         for handle in &handles {
             let state = lock(&handle.state);
             if state.active {
@@ -291,7 +363,12 @@ impl Info {
 
 impl Handle {
     fn publish(&self, message: Message) {
+        let notify = matches!(message, Message::State(_));
         let mut state = lock(&self.state);
+        if let Message::State(value) = &message {
+            state.version += 1;
+            state.last_state = Some(value.clone());
+        }
         if state.backlog.len() == BACKLOG {
             state.backlog.pop_front();
         }
@@ -302,11 +379,16 @@ impl Handle {
                 Err(mpsc::TrySendError::Disconnected(_))
             )
         });
+        drop(state);
+        if notify {
+            self.changed.notify_all();
+        }
     }
 
     fn finish(&self, run: &Run, outcome: &str, error: Option<String>) {
         let mut state = lock(&self.state);
         state.active = false;
+        state.version += 1;
         state.outcome = Some(outcome.to_owned());
         state.error = error.clone();
         let info = Info {
@@ -314,12 +396,75 @@ impl Handle {
             outcome: Some(outcome.to_owned()),
             error,
         };
-        let end = Message::End(tools::status_value(run, &info));
+        let status = tools::status_value(run, &info);
+        state.last_state = Some(status.clone());
+        let end = Message::End(status);
         for tx in state.subscribers.drain(..) {
             // A full queue still learns the stream ended when it disconnects.
             let _ = tx.try_send(end.clone());
         }
         drop(state);
         self.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evicts_oldest_inactive_handles_past_cap() {
+        let registry = Registry::default();
+        {
+            let mut store = lock(&registry.store);
+            for i in 0..5 {
+                let id = format!("run-{i}");
+                let active = i == 0;
+                store.runs.insert(
+                    id.clone(),
+                    Arc::new(Handle {
+                        project: PathBuf::from("/tmp"),
+                        state: Mutex::new(State {
+                            active,
+                            workspace: PathBuf::from("/tmp"),
+                            cancel: Arc::new(AtomicBool::new(false)),
+                            version: 0,
+                            last_state: None,
+                            outcome: None,
+                            error: None,
+                            backlog: VecDeque::new(),
+                            subscribers: vec![],
+                        }),
+                        changed: Condvar::new(),
+                    }),
+                );
+                store.finished.push_back(id);
+            }
+        }
+        registry.evict_finished(2);
+        {
+            let store = lock(&registry.store);
+            // Three over the cap: the three oldest inactive runs go. Active
+            // run-0 is skipped and keeps its place in the queue.
+            assert!(store.runs.contains_key("run-0"));
+            assert!(!store.runs.contains_key("run-1"));
+            assert!(!store.runs.contains_key("run-2"));
+            assert!(!store.runs.contains_key("run-3"));
+            assert!(store.runs.contains_key("run-4"));
+            assert_eq!(store.finished, ["run-0", "run-4"]);
+            // Nothing to do at the cap.
+        }
+        registry.evict_finished(2);
+        assert_eq!(lock(&registry.store).runs.len(), 2);
+        // Once run-0 has finished it is the oldest and is evicted in turn.
+        {
+            let store = lock(&registry.store);
+            lock(&store.runs["run-0"].state).active = false;
+        }
+        registry.evict_finished(1);
+        let store = lock(&registry.store);
+        assert!(!store.runs.contains_key("run-0"));
+        assert!(store.runs.contains_key("run-4"));
+        assert_eq!(store.finished, ["run-4"]);
     }
 }

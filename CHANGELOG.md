@@ -9,6 +9,59 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Added
 
+- `init --detect`: detects installed harnesses on `PATH`, adapts starter or
+  preset stages to them, leaves stage models and effort blank to inherit each
+  harness's default, keeps read-only intent when replacing an unavailable
+  harness (mapped to the new harness's native read-only setting, else router
+  `sandbox = "read-only"`), and moves review stages off the implementing
+  harness when another is installed.
+- Stage `stall_timeout_seconds` (editable in Harness settings and shown in
+  `preview`): stops an unattended stage when neither stdout nor stderr produces
+  output for that long; rejected for harnesses that print only at exit
+  (`gemini` and custom adapters with `output = "gemini-json"`, including
+  fan-out candidates), and ignored for interactive stages (`preview` notes
+  this).
+- Workflow `protected_paths` globs (`*`, `**`, `?`): enforced for ordinary
+  stages (stage stops **blocked**), fan-out candidates (candidate stops
+  **blocked** with its worktree retained), and candidate selection; `ship` and
+  `apply` refuse matching files.
+- Pre-ship secret scanning: `ship.secret_scan` (default `true`) scans the full
+  diff of the planned files only (no size cutoff; files Git treats as binary
+  are read as text) at plan time and right before commit, listing at most 20
+  hits then `and N more` without printing secret values; optional
+  `ship.secret_scanner` (argv, no shell, trust-gated, fails closed) runs in
+  both phases with `cwd` = workspace, `{files}`, `MODEL_ROUTER_SHIP_FILES`, and
+  `GIT_INDEX_FILE` pointing at a private index of `HEAD` plus the planned files
+  (leaving the user's index untouched; planning writes blob objects to the
+  object database).
+- Workflow `handoff_repair = true`: when an unattended stage exits 0 without a
+  valid handoff, sends one extra (possibly billed) follow-up on the same
+  session asking only for handoff JSON (`min(timeout_seconds, 120)` timeout;
+  process group recorded for crash recovery; skips and failures logged in stage
+  output). Works on `codex` (via `codex exec resume`, passing sandbox as
+  `--config sandbox_mode="…"`, dropping stage extra args other than
+  `-c`/`--config` pairs, and excluding local providers `ollama`/`lmstudio`),
+  `claude`, `pi`, `opencode`, and custom adapters with `follow_up_args`
+  (`resume_args` enables interactive takeover only).
+- `apply RUN_ID [--check] [--yes]` and TUI Runs `A`: applies a finished
+  worktree run's changes back into the project checkout without committing,
+  using `git apply` with a 3-way merge fallback in a private index and atomic
+  restore on conflict; `--check` reports clean apply, 3-way merge, or conflict
+  without touching the checkout or its index (merge prediction requires
+  Git 2.32+).
+- Billing classification and budget actions: per-stage
+  `billing = "api" | "subscription"` (precedence: stage `billing`, router
+  provider → `api`, then harness default—`codex`, `claude`, `cursor`, `gemini`,
+  `copilot` default to `subscription`; `pi`, `omp`, `opencode`, `aider`,
+  `goose`, `amp`, and custom adapters default to `api`), `cost` splits totals
+  into billed API spend and subscription API-equivalent estimates and notes
+  attempts with unknown cost (never counted as `$0`), and budgets accept
+  `on_exceed = "stop" | "warn"`.
+- MCP (`serve --mcp`): handles `notifications/cancelled` to abort in-flight
+  `wait_run` calls without a response, and emits `notifications/progress`
+  during `wait_run` when `_meta.progressToken` is set.
+- `docs/safety.md#not-enforced`: table of guarantees that depend on harnesses
+  or the OS rather than the router.
 - TUI Harnesses live tests: `x`/`a` mark harnesses, `t` tests the marked ones
   (or the selected one) in parallel with `scripts/capture_harness_output.py`
   (one real request each, confirmed first) and shows one result dialog;
@@ -51,9 +104,10 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   history (`!`).
 - Interactive sessions keep running across detach (`Ctrl+B`) and reattach;
   takeover of unattended stages in the native terminal (`t`).
-- omp harness. Declarative harness spec table; custom adapters gain
-  `output`, `session`, `resume_args`, `model_flag`, `effort_flag`, `prompt`;
-  `harnesses [--spec]`.
+- omp harness. Declarative harness spec table (including `follow_up`,
+  `streams`, `billing`, and `read_only`); custom adapters gain `output`,
+  `session`, `resume_args`, `follow_up_args`, `model_flag`, `effort_flag`,
+  `prompt`; `harnesses [--spec]`.
 - Router providers: OpenRouter plus 20 OpenAI-compatible presets;
   `providers [NAME]`.
 - Review summary stage that briefs the reviewer (`review.md`).
@@ -96,6 +150,14 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Changed
 
+- Modularized `src/engine.rs`, `src/process.rs`, `src/handoff.rs`, and
+  `src/main.rs` into focused submodules (`src/engine/`, `src/process/`,
+  `src/handoff/`, `src/cli/`), and updated the repository's own
+  `.model-router.toml` to v2 with `sandbox_default = "by-role"`, `summary`,
+  and router checks.
+- `serve`: finished run handles in memory are capped at 128 (older inactive
+  handles are evicted while disk records stay intact), and `tools::exists`
+  checks a static list instead of building schemas per call.
 - Interactive stages echo keystrokes in about 1 ms instead of 40–80 ms: the
   terminal host sends output as soon as it reads it, and mr wakes its
   supervisor and attachment when input or output is queued instead of
@@ -195,10 +257,13 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Security
 
-- Project trust: a project's custom adapters, checks, extra arguments,
-  loosened permissions or sandbox, unconfirmed ship stages, and custom
-  provider endpoints or key variables need `model-router trust`; `serve`
-  refuses untrusted projects.
+- `serve --mcp` caps JSON-RPC request lines at 2 MiB and concurrent
+  `tools/call` workers at 32 (at most 24 blocking `wait_run` calls).
+- Project trust: a project's custom adapters (including `follow_up_args` when
+  set), checks, extra arguments, loosened permissions or sandbox, unconfirmed
+  ship stages, `ship.secret_scanner` commands, `ship.secret_scan = false`
+  (forced on while untrusted), and custom provider endpoints or key variables
+  need `model-router trust`; `serve` refuses untrusted projects.
 - Task imports refuse HTTPS→HTTP redirects and redirects or DNS answers that
   reach loopback, link-local, or private addresses.
 - Provider `base_url` with credentials, query, or fragment is rejected;

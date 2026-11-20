@@ -1,5 +1,6 @@
 //! Golden adapter output: every built-in harness × mode × option variant,
-//! recorded as `adapters::build` / `assign_session` / `resume` results in
+//! recorded as `adapters::build` / `assign_session` / `resume` / `follow_up`
+//! (unattended, where the harness has one) results in
 //! tests/fixtures/adapter-golden/*.json. The adapter layer must reproduce
 //! them byte for byte. Regenerate (only for an intended change) with
 //! `MODEL_ROUTER_UPDATE_GOLDEN=1 cargo test --test adapter_golden`.
@@ -162,6 +163,25 @@ fn cases(harness: &str, mode: Mode) -> Vec<Case> {
             CURRENT,
         ),
     ];
+    if harness == "codex" {
+        // `codex exec resume` takes config overrides only: the follow-up
+        // keeps these and drops the other arguments.
+        list.push((
+            "extra-config-args",
+            Stage {
+                extra_args: vec![
+                    "-c".into(),
+                    "a=1".into(),
+                    "--config=b=2".into(),
+                    "--full-auto".into(),
+                    "--config".into(),
+                    "c=\"x\"".into(),
+                ],
+                ..with("m-1", "", "")
+            },
+            CURRENT,
+        ));
+    }
     let mut owned: Vec<Case> = list
         .drain(..)
         .map(|(name, stage, versions)| Case {
@@ -264,12 +284,23 @@ fn record(
         )
         .0
     });
-    json!({
+    let mut out = json!({
         "build": built,
         "session": session,
         "resumable": resumable,
         "resume": resumed,
-    })
+    });
+    // Only harnesses with an unattended follow-up record one, so the others'
+    // files stay as they were.
+    if stage.mode == Mode::Unattended && adapters::has_follow_up(&stage.harness, custom) {
+        let prompt = "Repair the handoff.\nLine two {session} $(x)";
+        out["follow_up"] = result_json(
+            adapters::follow_up(stage, custom, configured, "S-1", prompt, paths),
+            tmp,
+        )
+        .0;
+    }
+    out
 }
 
 fn check(name: &str, value: &Value, failures: &mut Vec<String>) {
@@ -358,6 +389,15 @@ fn adapter_output_matches_golden_files() {
                 interactive_args: Some(vec!["chat".into(), "{prompt}".into()]),
                 models_args: Some(vec!["models".into()]),
                 prompt_stdin: true,
+                session: Some(model_router::config::CustomSession {
+                    assign: None,
+                    reported: true,
+                }),
+                follow_up_args: Some(vec![
+                    "continue".into(),
+                    "{session}".into(),
+                    "{prompt_file}".into(),
+                ]),
                 ..CustomAdapter::default()
             },
         ),

@@ -19,13 +19,21 @@ on macOS. `MODEL_ROUTER_CONFIG_DIR` overrides it.
 
 ```sh
 model-router init                      # starter .model-router.toml in the project
+model-router init --detect             # detect installed harnesses; blank models inherit defaults
 model-router init --preset bug-fix     # quick-task | full-feature | bug-fix | investigation | best-of-3
 model-router init --global             # global templates; prints the path
 model-router validate                  # parse, migrate, warn; runs nothing
 ```
 
-`init` refuses to overwrite an existing file without `--force`. In the TUI,
-`s` saves project templates and `S` global templates.
+`init` refuses to overwrite an existing file without `--force`. `init --detect`
+checks `PATH` for installed harnesses, leaves stage models and effort blank to
+inherit each harness's default, and replaces any stage harness that is not
+installed while preserving read-only intent (mapped to the new harness's native
+read-only setting—Codex `sandbox = "read-only"`, Claude
+`permission_mode = "plan"`, Gemini `approval_mode = "plan"`—or else the
+stage's router `sandbox = "read-only"`). When more than one harness is
+installed, review stages move to a different harness than the implementing
+stage. In the TUI, `s` saves project templates and `S` global templates.
 
 Other files in `<config dir>`:
 
@@ -73,7 +81,9 @@ version = 2
 | `max_repair_passes` | `2` | Automatic review repair passes; `0` disables repair. TUI: `l`. |
 | `max_parallel` | `2` | Harness processes a graph workflow or fan-out runs at once. |
 | `sandbox_default` | `"off"` | Router sandbox for stages without `sandbox`: `off`, `read-only`, `workspace-write`, `by-role`. |
-| `budget` | none | `{ max_usd, max_tokens }` for the whole run. |
+| `budget` | none | `{ max_usd, max_tokens, on_exceed }` for the whole run. |
+| `protected_paths` | `[]` | Repository-relative globs (`*`, `**`, `?`, up to 64). Enforced for ordinary stages, fan-out candidates (candidate stops blocked), and candidate selection; `ship` and `apply` refuse matching files. |
+| `handoff_repair` | `false` | When `true`, an unattended stage that exits 0 without a valid handoff sends one follow-up on the same session asking only for handoff JSON (an extra, possibly billed request). Supported on `codex` (not local providers `ollama`/`lmstudio`), `claude`, `pi`, `opencode`, and custom adapters with `follow_up_args`. |
 | `stages` | required | `[[workflows.stages]]` tables, in list order (at most 64). |
 
 ## `[[workflows.stages]]`
@@ -93,6 +103,8 @@ version = 2
 | `extra_args` | `[]` | Extra harness arguments. Needs trust in a project config. |
 | `harness_settings` | `{}` | Native permission overrides; see [harnesses.md](harnesses.md#permission-settings). |
 | `timeout_seconds` | `3600` | Attempt timeout. |
+| `stall_timeout_seconds` | unset | Optional unattended inactivity limit in seconds: stops the stage if neither stdout nor stderr produces bytes for this long. Rejected for harnesses that print only at exit (`gemini` and custom adapters with `output = "gemini-json"`, including fan-out candidates); ignored for interactive stages (`preview` notes this). |
+| `billing` | unset | `"api"` or `"subscription"`. Precedence: stage `billing`, else `"api"` when routed through a router provider, else the harness default (`codex`, `claude`, `cursor`, `gemini`, `copilot` → `"subscription"`; `pi`, `omp`, `opencode`, `aider`, `goose`, `amp`, and custom adapters → `"api"`). The router does not detect a harness's login method; set `billing` explicitly when it differs from the default (for example, `billing = "subscription"` for `pi` or `omp` on a Claude or ChatGPT plan). See [cost.md](cost.md#billing). |
 | `repair_target` | `""` | Review only: implementation stage ID to repair. Empty = nearest enabled upstream. |
 | `checks` | `[]` | Router-run checks, below. Needs trust in a project config. |
 | `require_router_checks` | `false` | Test stages only: only a passing required router check (or an accepted waiver) satisfies the gate; model-reported passes do not. |
@@ -100,7 +112,7 @@ version = 2
 | `sandbox_writable` | `[]` | Extra writable paths (absolute or `~/`). |
 | `sandbox_network` | `true` | `false` cuts the sandboxed harness off the network. |
 | `sandbox_fallback` | `"refuse"` | `refuse` fails the stage if no sandbox backend works; `warn` runs unsandboxed. |
-| `budget` | none | `{ max_usd, max_tokens }` across this stage's attempts. |
+| `budget` | none | `{ max_usd, max_tokens, on_exceed }` across this stage's attempts. |
 | `ship` | defaults | Ship options; `ship` role only. Below. |
 | `after` | `[]` | Stage IDs this stage waits for. Any `after` makes the workflow a graph. |
 | `fan_out` | none | Best-of-N candidates and judge. Below. |
@@ -137,11 +149,13 @@ fan_out = { judge = "judge", candidates = [
 ### `budget`
 
 ```toml
-budget = { max_usd = 2.0, max_tokens = 2_000_000 }
+budget = { max_usd = 2.0, max_tokens = 2_000_000, on_exceed = "stop" }
 ```
 
-Both optional, both must be positive. `max_tokens` counts input, output, and
-cache writes (not cache reads). See [cost.md](cost.md#budgets).
+`max_usd` and `max_tokens` are optional and must be positive. `on_exceed` is
+`"stop"` (default: block before the next stage) or `"warn"` (log a warning and
+continue). `max_tokens` counts input, output, and cache writes (not cache
+reads). See [cost.md](cost.md#budgets).
 
 ### `ship`
 
@@ -158,6 +172,8 @@ cache writes (not cache reads). See [cost.md](cost.md#budgets).
 | `confirm` | `true` | `false` skips the preview. Needs trust in a project config. |
 | `include_untracked` | `true` | Commit files the run created. |
 | `include_preexisting` | `false` | Commit files you also changed before the run; otherwise they block the ship. |
+| `secret_scan` | `true` | Built-in scan of the full diff of the planned files only (no size cutoff; files Git treats as binary are read as text) for high-confidence secrets at plan time and right before commit; lists at most 20 hits then `and N more` (never prints secret values). Setting `false` needs trust in a project config. |
+| `secret_scanner` | `[]` | External scanner argv (no shell), e.g. `["gitleaks", "protect", "--staged"]`. Runs at plan time and right before commit with `cwd` = workspace, `{files}` and `MODEL_ROUTER_SHIP_FILES` = planned paths, and `GIT_INDEX_FILE` = a private index containing `HEAD` plus the planned files as they are now, so `--staged` scanners see exactly what will be committed without reading or writing your index. Planning writes blob objects to the object database. Needs trust; fails closed if missing or non-zero. |
 
 ## `[adapters.NAME]`
 
@@ -172,7 +188,8 @@ Custom harnesses. A project's adapters need trust.
 | `prompt_stdin` | `false` | Send the unattended prompt on stdin. |
 | `output` | `"text"` | Parser: `text`, `codex-jsonl`, `claude-stream`, `pi`, `cursor-stream`, `gemini-json`, `opencode`, `amp-stream`. |
 | `session` | none | `{ assign = "--session-id" }` (router picks an ID) or `{ reported = true }` (read from output events). |
-| `resume_args` | none | Interactive arguments that reopen `{session}`. Enables takeover; needs `session`. |
+| `resume_args` | none | Interactive arguments that reopen `{session}`. Enables interactive takeover only (not `handoff_repair`); needs `session`. |
+| `follow_up_args` | none | Unattended arguments that follow up on `{session}`. Enables `handoff_repair`; accepts the same placeholders as `args` plus `{session}`, receives the prompt as an unattended launch does, needs `session` (`assign` or `reported`), and enters the project trust digest only when set. |
 | `model_flag` | none | Appends `FLAG model` after `args` when the stage sets a model. |
 | `effort_flag` | none | Appends `FLAG effort`. |
 | `prompt` | none | `"stdin"`, `"arg"`, or `{ flag = "-p" }`. |
@@ -261,6 +278,7 @@ harness = "codex"
 | `MODEL_ROUTER_HARNESS_VERSIONS` | Override detected versions, e.g. `opencode=1.4.0`. |
 | `MODEL_ROUTER_FRAME_MARKER=1`, `MODEL_ROUTER_FRAME_FILE` | Test hook: smoke tests wait on frames written to this file. |
 | `MODEL_ROUTER_GROUP` | Set by the router on every harness and check it launches: a random marker that crash recovery uses to recognise the process group. Not read from your environment. |
+| `MODEL_ROUTER_SHIP_FILES` | Set by the router on `ship.secret_scanner`: newline-separated repository-relative paths of the planned ship files. Not read from your environment. |
 | `NO_COLOR` | Disables TUI colours (crossterm). Harnesses are always launched with `NO_COLOR=1`. |
 | `TERM=dumb` | Skips the startup animation. |
 | `PAGER`, `VISUAL`, `EDITOR` | Log/diff pager (default `less -R`) and editor. Split like shell words; no shell. |

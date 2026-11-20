@@ -7,7 +7,7 @@
 //! token caps. Nothing here makes a network request except
 //! `refresh_provider_prices`.
 use crate::{
-    config::Budget,
+    config::{Billing, Budget, BudgetAction, CustomAdapter},
     engine::{Attempt, Run, Status},
     handoff::Usage,
     providers::{self, ModelInfo, Provider},
@@ -95,6 +95,9 @@ impl Source {
 pub struct Estimate {
     pub usd: Option<f64>,
     pub source: Source,
+    /// Whether this spend is metered API billing or covered by a harness
+    /// subscription (estimated API-equivalent value).
+    pub billing: Billing,
     /// Tokens budgets count; see `counted_tokens`.
     pub tokens: u64,
 }
@@ -291,10 +294,26 @@ pub fn estimate(
     provider: Option<&str>,
     pricing: &Pricing,
 ) -> Estimate {
+    let billing = if provider.is_some() {
+        Billing::Api
+    } else {
+        Billing::Subscription
+    };
+    estimate_with_billing(usage, model, provider, billing, pricing)
+}
+
+pub fn estimate_with_billing(
+    usage: Option<&Usage>,
+    model: &str,
+    provider: Option<&str>,
+    billing: Billing,
+    pricing: &Pricing,
+) -> Estimate {
     let Some(usage) = usage else {
         return Estimate {
             usd: None,
             source: Source::Unknown,
+            billing,
             tokens: 0,
         };
     };
@@ -303,6 +322,7 @@ pub fn estimate(
         return Estimate {
             usd: Some(usd),
             source: Source::Reported,
+            billing,
             tokens,
         };
     }
@@ -310,11 +330,13 @@ pub fn estimate(
         Some((price, source)) => Estimate {
             usd: Some(price.cost(usage)),
             source,
+            billing,
             tokens,
         },
         None => Estimate {
             usd: None,
             source: Source::Unknown,
+            billing,
             tokens,
         },
     }
@@ -328,11 +350,52 @@ fn routed_provider(run: &Run, index: usize) -> Option<&str> {
         .then_some(stage.provider.as_str())
 }
 
+/// Effective billing mode for stage `index`: explicit stage `billing` wins;
+/// otherwise a router provider implies metered API spend, and a harness's
+/// own account uses the harness's usual billing (`HarnessSpec::billing`).
+/// A custom adapter counts as metered: the router knows nothing about its
+/// account, and calling real spend plan-covered would understate it.
+pub fn stage_billing(run: &Run, index: usize) -> Billing {
+    let Some(stage) = run.workflow.stages.get(index) else {
+        return Billing::Api;
+    };
+    billing_for(
+        stage.billing,
+        routed_provider(run, index).is_some(),
+        &stage.harness,
+        &run.adapters,
+    )
+}
+
+/// `stage_billing` from its parts: the stage's own `billing`, whether it is
+/// routed to a router provider, and its harness.
+pub fn billing_for(
+    explicit: Option<Billing>,
+    routed: bool,
+    harness: &str,
+    custom: &BTreeMap<String, CustomAdapter>,
+) -> Billing {
+    match explicit {
+        Some(billing) => billing,
+        None if routed => Billing::Api,
+        None => harness_billing(harness, custom),
+    }
+}
+
+/// The usual billing of a harness's own account.
+pub fn harness_billing(harness: &str, custom: &BTreeMap<String, CustomAdapter>) -> Billing {
+    if custom.contains_key(harness) {
+        return Billing::Api;
+    }
+    crate::harness::get(harness).map_or(Billing::Api, |spec| spec.billing)
+}
+
 pub fn attempt_estimate(run: &Run, index: usize, attempt: &Attempt, pricing: &Pricing) -> Estimate {
-    estimate(
+    estimate_with_billing(
         attempt.usage.as_ref(),
         &attempt.model,
         routed_provider(run, index),
+        stage_billing(run, index),
         pricing,
     )
 }
@@ -345,7 +408,9 @@ pub struct Part {
 }
 
 /// Summed estimates. `usd` adds every known amount; `unknown` counts
-/// attempts with no usage or no price.
+/// attempts with no usage or no price. `api` and `subscription` split known
+/// spend between metered API usage and subscription-covered usage (API
+/// equivalent).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct CostTotal {
     pub usd: f64,
@@ -353,6 +418,8 @@ pub struct CostTotal {
     pub config: Part,
     pub provider: Part,
     pub table: Part,
+    pub api: Part,
+    pub subscription: Part,
     pub attempts: usize,
     pub unknown: usize,
     /// Input, output, and cache-write tokens; what token caps count.
@@ -375,6 +442,12 @@ impl CostTotal {
         let usd = estimate.usd.unwrap_or(0.0);
         part.usd += usd;
         part.attempts += 1;
+        let bucket = match estimate.billing {
+            Billing::Api => &mut self.api,
+            Billing::Subscription => &mut self.subscription,
+        };
+        bucket.usd += usd;
+        bucket.attempts += 1;
         self.usd += usd;
     }
 
@@ -385,6 +458,8 @@ impl CostTotal {
             (&mut self.config, other.config),
             (&mut self.provider, other.provider),
             (&mut self.table, other.table),
+            (&mut self.api, other.api),
+            (&mut self.subscription, other.subscription),
         ] {
             mine.usd += theirs.usd;
             mine.attempts += theirs.attempts;
@@ -514,31 +589,70 @@ pub fn has_budget(run: &Run) -> bool {
 
 pub const EXCEEDED: &str = "Budget exceeded";
 
+/// Result of checking a run's budget caps before launching the next stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BudgetCheck {
+    Ok,
+    Warn(String),
+    Stop(String),
+}
+
+/// Evaluates budget caps honoring `on_exceed` (`stop` vs `warn`).
+pub fn check_budget_action(run: &Run) -> BudgetCheck {
+    if !has_budget(run) {
+        return BudgetCheck::Ok;
+    }
+    check_budget_action_with(run, &Pricing::load(&run.project))
+}
+
+pub fn check_budget_action_with(run: &Run, pricing: &Pricing) -> BudgetCheck {
+    let stages = stage_totals(run, pricing);
+    let mut total = CostTotal::default();
+    let mut stop_reason = None;
+    let mut warn_reason = None;
+    for (stage, spent) in run.workflow.stages.iter().zip(&stages) {
+        total.merge(spent);
+        if let Some(reason) = exceeded(&stage.budget, spent, &format!(" in stage {}", stage.name)) {
+            match stage.budget.on_exceed {
+                BudgetAction::Stop => stop_reason = stop_reason.or(Some(reason)),
+                BudgetAction::Warn => warn_reason = warn_reason.or(Some(reason)),
+            }
+        }
+    }
+    if let Some(reason) = exceeded(&run.workflow.budget, &total, "") {
+        match run.workflow.budget.on_exceed {
+            BudgetAction::Stop => stop_reason = stop_reason.or(Some(reason)),
+            BudgetAction::Warn => warn_reason = warn_reason.or(Some(reason)),
+        }
+    }
+    if let Some(reason) = stop_reason {
+        return BudgetCheck::Stop(format!(
+            "{reason}. Inspect the run, then raise the cap to continue: model-router -C {} resume {} --budget-usd N (or --budget-tokens N)",
+            run.project.display(),
+            run.id
+        ));
+    }
+    if let Some(reason) = warn_reason {
+        return BudgetCheck::Warn(format!("Warning: {reason} (on_exceed = warn; continuing)"));
+    }
+    BudgetCheck::Ok
+}
+
 /// Why the run must stop before its next stage: a stage's or the whole
 /// run's known cost or counted tokens exceed its cap. Unknown costs count
 /// toward token caps only. Reads pricing files; never the network.
 pub fn check_budget(run: &Run) -> Option<String> {
-    if !has_budget(run) {
-        return None;
+    match check_budget_action(run) {
+        BudgetCheck::Stop(reason) => Some(reason),
+        BudgetCheck::Ok | BudgetCheck::Warn(_) => None,
     }
-    check_budget_with(run, &Pricing::load(&run.project))
 }
 
 pub fn check_budget_with(run: &Run, pricing: &Pricing) -> Option<String> {
-    let stages = stage_totals(run, pricing);
-    let mut total = CostTotal::default();
-    let mut reason = None;
-    for (stage, spent) in run.workflow.stages.iter().zip(&stages) {
-        total.merge(spent);
-        reason =
-            reason.or_else(|| exceeded(&stage.budget, spent, &format!(" in stage {}", stage.name)));
+    match check_budget_action_with(run, pricing) {
+        BudgetCheck::Stop(reason) => Some(reason),
+        BudgetCheck::Ok | BudgetCheck::Warn(_) => None,
     }
-    let reason = reason.or_else(|| exceeded(&run.workflow.budget, &total, ""))?;
-    Some(format!(
-        "{reason}. Inspect the run, then raise the cap to continue: model-router -C {} resume {} --budget-usd N (or --budget-tokens N)",
-        run.project.display(),
-        run.id
-    ))
 }
 
 fn exceeded(budget: &Budget, spent: &CostTotal, scope: &str) -> Option<String> {
@@ -909,6 +1023,31 @@ pub fn render_summary(summary: &Summary) -> String {
         );
     }
     let _ = writeln!(text, "Total: {}", summary.total.text());
+    if summary.total.known() {
+        let mut split = vec![];
+        if summary.total.api.attempts > 0 {
+            split.push(format!(
+                "billed API {}",
+                report::dollars(summary.total.api.usd)
+            ));
+        }
+        if summary.total.subscription.attempts > 0 {
+            split.push(format!(
+                "subscription API-equivalent {}",
+                report::dollars(summary.total.subscription.usd)
+            ));
+        }
+        if !split.is_empty() {
+            let _ = writeln!(text, "Billing: {}", split.join(" · "));
+        }
+    }
+    if summary.total.unknown > 0 {
+        let _ = writeln!(
+            text,
+            "Note: {} of {} attempt(s) had unknown cost (missing usage or unpriced model; not counted as $0).",
+            summary.total.unknown, summary.total.attempts
+        );
+    }
     text
 }
 
@@ -1075,6 +1214,7 @@ mod tests {
         total.add(&Estimate {
             usd: None,
             source: Source::Unknown,
+            billing: Billing::Api,
             tokens: 5,
         });
         assert_eq!(
@@ -1084,6 +1224,7 @@ mod tests {
         total.add(&Estimate {
             usd: Some(0.25),
             source: Source::Reported,
+            billing: Billing::Api,
             tokens: 5,
         });
         assert_eq!(
@@ -1094,6 +1235,7 @@ mod tests {
         total.add(&Estimate {
             usd: Some(0.06),
             source: Source::Table,
+            billing: Billing::Subscription,
             tokens: 5,
         });
         assert_eq!(

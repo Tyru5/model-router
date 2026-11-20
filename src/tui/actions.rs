@@ -69,6 +69,7 @@ pub(super) enum ActionId {
     FindOutput,
     OpenLog,
     Diff,
+    ApplyWorktree,
     ToggleResults,
     // Runs
     PreviousRun,
@@ -379,6 +380,7 @@ const ACTIONS: &[Entry] = {
                 "[o] $PAGER; [e] $VISUAL/$EDITOR at the line in view; [D] git difftool --dir-diff (needs diff.tool)",
             ])
             .menu(View, 'd'),
+        act(ApplyWorktree, MonitorIdle, ch('A'), "apply", "Apply a finished worktree run's changes into the project checkout without committing ([y] confirms)").menu(RunMenu, 'A'),
         act(ToggleResults, MonitorIdle, ch('o'), "output", "Switch a finished run between its brief and output log").menu(View, 'o'),
         // Runs: the sidebar, whatever it selects
         act(PreviousRun, Runs, key(KeyCode::Up), "runs", "Select the previous run in the sidebar").also(&[ch('k')]).alias("↑↓").footer(),

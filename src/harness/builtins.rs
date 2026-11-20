@@ -60,6 +60,32 @@ pub const SPECS: &[HarnessSpec] = &[
             replace: None,
             keep_effort: true,
         }),
+        // `codex exec resume` (checked with codex-cli 0.170.0) rejects
+        // `--color` and `--sandbox`; the sandbox goes as a config key.
+        follow_up: Some(FollowUp {
+            args: &[
+                Part::Args(&[
+                    "exec",
+                    "resume",
+                    "--json",
+                    "--skip-git-repo-check",
+                    "--output-last-message",
+                    "{final_file}",
+                ]),
+                Part::Schema,
+                Part::Model,
+                Part::Provider,
+                Part::Effort,
+                Part::Extra,
+                Part::Args(&["{session}"]),
+                Part::Prompt,
+            ],
+            prompt: Prompt::StdinArg("-"),
+            extra: FollowUpExtra::ConfigOnly("--config"),
+        }),
+        streams: true,
+        // ChatGPT sign-in is the default login.
+        billing: Billing::Subscription,
         // codex exec --output-schema FILE since 0.41.0 (openai/codex#4079);
         // Codex structured output is strict.
         structured: Some(Structured {
@@ -102,6 +128,7 @@ pub const SPECS: &[HarnessSpec] = &[
                 emit: Emit::Value,
             },
         ],
+        read_only: Some(("sandbox", "read-only")),
         catalog: CatalogSource::CodexCache,
         version_override: NO_OVERRIDE,
         state_dirs: &[],
@@ -150,6 +177,29 @@ pub const SPECS: &[HarnessSpec] = &[
             replace: None,
             keep_effort: true,
         }),
+        // Print mode takes the same options with `--resume ID`.
+        follow_up: Some(FollowUp {
+            args: &[
+                Part::Args(&[
+                    "--resume",
+                    "{session}",
+                    "--print",
+                    "--output-format",
+                    "stream-json",
+                    "--verbose",
+                ]),
+                Part::Schema,
+                Part::Model,
+                Part::Effort,
+                Part::Extra,
+                Part::Prompt,
+            ],
+            prompt: Prompt::Stdin,
+            extra: FollowUpExtra::Same,
+        }),
+        streams: true,
+        // A claude.ai plan sign-in is the default login.
+        billing: Billing::Subscription,
         // --json-schema JSON, fixed for print mode in 2.1.22.
         structured: Some(Structured {
             flag: "--json-schema",
@@ -177,6 +227,7 @@ pub const SPECS: &[HarnessSpec] = &[
             escalating: &["bypassPermissions"],
             emit: Emit::Value,
         }],
+        read_only: Some(("permission_mode", "plan")),
         catalog: CatalogSource::ClaudeHelp {
             aliases: &["fable", "opus", "sonnet", "haiku"],
         },
@@ -236,8 +287,26 @@ pub const SPECS: &[HarnessSpec] = &[
             replace: None,
             keep_effort: true,
         }),
+        // `--session-id ID` reuses the directory's session with that ID.
+        follow_up: Some(FollowUp {
+            args: &[
+                Part::Args(&["--print", "--mode", "json"]),
+                Part::Model,
+                Part::Provider,
+                Part::Effort,
+                Part::Extra,
+                Part::Args(&["--session-id", "{session}"]),
+                Part::Prompt,
+            ],
+            prompt: Prompt::AtFile,
+            extra: FollowUpExtra::Same,
+        }),
+        streams: true,
+        // Provider API keys by default; plan logins are opt-in.
+        billing: Billing::Api,
         structured: None,
         settings: &[],
+        read_only: None,
         catalog: CatalogSource::PiList,
         version_override: NO_OVERRIDE,
         state_dirs: &[],
@@ -280,6 +349,10 @@ pub const SPECS: &[HarnessSpec] = &[
             replace: None,
             keep_effort: true,
         }),
+        follow_up: None,
+        streams: true,
+        // As Pi.
+        billing: Billing::Api,
         structured: None,
         settings: &[Setting {
             key: "approval_mode",
@@ -292,6 +365,7 @@ pub const SPECS: &[HarnessSpec] = &[
             escalating: &["yolo"],
             emit: Emit::Value,
         }],
+        read_only: None,
         catalog: CatalogSource::OmpJson,
         version_override: NO_OVERRIDE,
         state_dirs: &[],
@@ -333,6 +407,10 @@ pub const SPECS: &[HarnessSpec] = &[
             replace: None,
             keep_effort: true,
         }),
+        follow_up: None,
+        streams: true,
+        // Cursor plan.
+        billing: Billing::Subscription,
         structured: None,
         settings: &[Setting {
             key: "sandbox",
@@ -345,6 +423,7 @@ pub const SPECS: &[HarnessSpec] = &[
             escalating: &["disabled"],
             emit: Emit::Value,
         }],
+        read_only: None,
         catalog: CatalogSource::CursorList,
         version_override: NO_OVERRIDE,
         state_dirs: &[".cursor", ".config/cursor"],
@@ -379,6 +458,10 @@ pub const SPECS: &[HarnessSpec] = &[
         routing_note: "",
         session: Session::None,
         resume: None,
+        follow_up: None,
+        streams: false,
+        // Google account sign-in is the default login.
+        billing: Billing::Subscription,
         structured: None,
         settings: &[Setting {
             key: "approval_mode",
@@ -391,6 +474,7 @@ pub const SPECS: &[HarnessSpec] = &[
             escalating: &["yolo"],
             emit: Emit::Value,
         }],
+        read_only: Some(("approval_mode", "plan")),
         catalog: CatalogSource::Manual,
         version_override: NO_OVERRIDE,
         state_dirs: &[],
@@ -442,8 +526,26 @@ pub const SPECS: &[HarnessSpec] = &[
             replace: Some(&["--session", "{session}"]),
             keep_effort: false,
         }),
+        // `opencode run --session ID` continues a session. `Effort` only
+        // emits for 1.x (`--variant`); 2.x has it in the model.
+        follow_up: Some(FollowUp {
+            args: &[
+                Part::Args(&["run", "--format", "json"]),
+                Part::Model,
+                Part::Effort,
+                Part::Extra,
+                Part::Args(&["--session", "{session}"]),
+                Part::Prompt,
+            ],
+            prompt: Prompt::Arg,
+            extra: FollowUpExtra::Same,
+        }),
+        streams: true,
+        // Provider API keys.
+        billing: Billing::Api,
         structured: None,
         settings: &[],
+        read_only: None,
         catalog: CatalogSource::OpencodeModels,
         version_override: Some(VersionOverride {
             below_major: 2,
@@ -512,6 +614,10 @@ pub const SPECS: &[HarnessSpec] = &[
         routing_note: "",
         session: Session::None,
         resume: None,
+        follow_up: None,
+        streams: true,
+        // Provider API keys.
+        billing: Billing::Api,
         structured: None,
         // Unattended Aider cannot answer its confirmation prompts without this.
         settings: &[Setting {
@@ -525,6 +631,7 @@ pub const SPECS: &[HarnessSpec] = &[
             escalating: &["yes-always"],
             emit: Emit::Switch,
         }],
+        read_only: None,
         catalog: CatalogSource::Manual,
         version_override: NO_OVERRIDE,
         state_dirs: &[".aider"],
@@ -577,6 +684,10 @@ pub const SPECS: &[HarnessSpec] = &[
         routing_note: "",
         session: Session::None,
         resume: None,
+        follow_up: None,
+        streams: true,
+        // Provider API keys.
+        billing: Billing::Api,
         structured: None,
         // Goose reads its permission mode from GOOSE_MODE; `run` has no flag.
         settings: &[Setting {
@@ -590,6 +701,7 @@ pub const SPECS: &[HarnessSpec] = &[
             escalating: &["auto"],
             emit: Emit::Env,
         }],
+        read_only: None,
         catalog: CatalogSource::Manual,
         version_override: NO_OVERRIDE,
         state_dirs: &[],
@@ -629,8 +741,13 @@ pub const SPECS: &[HarnessSpec] = &[
             replace: None,
             keep_effort: true,
         }),
+        follow_up: None,
+        streams: true,
+        // Usage credits, charged per token.
+        billing: Billing::Api,
         structured: None,
         settings: &[],
+        read_only: None,
         catalog: CatalogSource::Modes(&["low", "medium", "high", "ultra"]),
         version_override: NO_OVERRIDE,
         state_dirs: &[".amp", ".config/amp", ".local/share/amp"],
@@ -657,6 +774,10 @@ pub const SPECS: &[HarnessSpec] = &[
         routing_note: "",
         session: Session::None,
         resume: None,
+        follow_up: None,
+        streams: true,
+        // GitHub Copilot plan.
+        billing: Billing::Subscription,
         structured: None,
         settings: &[Setting {
             key: "tool_permissions",
@@ -669,6 +790,7 @@ pub const SPECS: &[HarnessSpec] = &[
             escalating: &["allow-all-tools"],
             emit: Emit::Switch,
         }],
+        read_only: None,
         catalog: CatalogSource::Manual,
         version_override: NO_OVERRIDE,
         state_dirs: &[".copilot", ".config/github-copilot"],

@@ -48,7 +48,7 @@ Relative paths resolve against the server's project.
 | `preview_run` | `workflow?`, `task` | The exact harness commands, as `model-router preview`; runs nothing |
 | `start_run` | `workflow?`, `task`, `worktree?`, `overrides?: [{stage, harness?, model?, enabled?}]`, `force_unattended?` | Run status with `run_id`; the run continues on a background thread |
 | `run_status` | `run_id` | Status, cursor, current stage, per-stage status and handoff verdict, latest handoff, elapsed seconds, usage, `next` hint |
-| `wait_run` | `run_id`, `timeout_seconds?` (default 60, max 3600) | Run status plus `timed_out`, once the run completes, stops, or waits for a decision |
+| `wait_run` | `run_id`, `timeout_seconds?` (default 60, max 3600) | Run status plus `timed_out`, once the run completes, stops, or waits for a decision; emits `notifications/progress` when `_meta.progressToken` is set, and aborts without a response on `notifications/cancelled` |
 | `cancel_run` | `run_id` | Stops the harness; the run is saved as cancelled |
 | `list_runs` | `status?` (comma-separated, as `history --status`), `limit?` | History summaries, newest first |
 | `get_handoff` | `run_id`, `stage` (ID, name, or 1-based number) | The stage's full handoff, waiver, and attempts |
@@ -89,7 +89,11 @@ saved as cancelled can be retried later from the server, CLI, or TUI.
 - Every project must pass [project trust](safety.md#project-trust): a call
   naming a project whose `.model-router.toml` has untrusted sections fails
   until you run `model-router -C DIR trust`.
-- MCP: stdout carries JSON-RPC only; diagnostics go to stderr.
+- MCP: stdout carries JSON-RPC only; diagnostics go to stderr. Request lines are
+  capped at 2 MiB and concurrent `tools/call` workers at 32, of which at most
+  24 may be blocking `wait_run` calls (leaving slots for non-blocking calls
+  such as `cancel_run` and `run_status`). Finished run handles kept in memory
+  are capped at 128 (disk records are unaffected).
 
 ## HTTP API
 

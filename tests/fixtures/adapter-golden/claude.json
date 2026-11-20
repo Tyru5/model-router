@@ -43,6 +43,25 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":\"string\"}},\"type\":\"object\"}"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
     }
   },
   "unattended/model": {
@@ -95,6 +114,27 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":\"string\"}},\"type\":\"object\"}",
+        "--model",
+        "m-1"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
     }
   },
   "unattended/model+provider": {
@@ -104,6 +144,9 @@
     "session": null,
     "resumable": true,
     "resume": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "follow_up": {
       "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
     }
   },
@@ -115,6 +158,9 @@
     "resumable": true,
     "resume": {
       "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "follow_up": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
     }
   },
   "unattended/model+lmstudio": {
@@ -124,6 +170,9 @@
     "session": null,
     "resumable": true,
     "resume": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "follow_up": {
       "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
     }
   },
@@ -183,6 +232,29 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":\"string\"}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--effort",
+        "high"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
     }
   },
   "unattended/effort-only": {
@@ -235,6 +307,27 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":\"string\"}},\"type\":\"object\"}",
+        "--effort",
+        "high"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
     }
   },
   "unattended/model+provider+effort": {
@@ -244,6 +337,9 @@
     "session": null,
     "resumable": true,
     "resume": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "follow_up": {
       "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
     }
   },
@@ -255,6 +351,9 @@
     "resumable": true,
     "resume": {
       "error": "claude cannot use router provider proxy; it only uses its own account"
+    },
+    "follow_up": {
+      "error": "claude cannot use router provider proxy; it only uses its own account"
     }
   },
   "unattended/routed-keyless": {
@@ -264,6 +363,9 @@
     "session": null,
     "resumable": true,
     "resume": {
+      "error": "claude cannot use router provider local; it only uses its own account"
+    },
+    "follow_up": {
       "error": "claude cannot use router provider local; it only uses its own account"
     }
   },
@@ -275,6 +377,9 @@
     "resumable": true,
     "resume": {
       "error": "claude cannot use router provider groq; it only uses its own account"
+    },
+    "follow_up": {
+      "error": "claude cannot use router provider groq; it only uses its own account"
     }
   },
   "unattended/routed+effort": {
@@ -285,6 +390,9 @@
     "resumable": true,
     "resume": {
       "error": "claude cannot use router provider proxy; it only uses its own account"
+    },
+    "follow_up": {
+      "error": "claude cannot use router provider proxy; it only uses its own account"
     }
   },
   "unattended/provider-without-model": {
@@ -294,6 +402,9 @@
     "session": null,
     "resumable": true,
     "resume": {
+      "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
+    },
+    "follow_up": {
       "error": "claude uses its existing provider/auth configuration; leave the provider field empty"
     }
   },
@@ -349,6 +460,27 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--model",
+        "m-1",
+        "--effort",
+        "high"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
     }
   },
   "unattended/old-version-routed": {
@@ -358,6 +490,9 @@
     "session": null,
     "resumable": true,
     "resume": {
+      "error": "claude cannot use router provider proxy; it only uses its own account"
+    },
+    "follow_up": {
       "error": "claude cannot use router provider proxy; it only uses its own account"
     }
   },
@@ -396,6 +531,23 @@
         "S-1"
       ],
       "stdin": null,
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
       "kind": "Claude",
       "final_file": "$TMP/attempt/final.txt",
       "env": [],
@@ -459,6 +611,29 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":\"string\"}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
     }
   },
   "unattended/user-output-schema": {
@@ -517,6 +692,29 @@
       "env": [],
       "files": [],
       "uses_output_schema": true
+    },
+    "follow_up": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":\"string\"}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
     }
   },
   "unattended/user-json-schema": {
@@ -568,6 +766,26 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--model",
+        "m-1",
+        "--json-schema={}"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
     }
   },
   "unattended/unknown-setting": {
@@ -577,6 +795,9 @@
     "session": null,
     "resumable": true,
     "resume": {
+      "error": "claude has no stage setting nope"
+    },
+    "follow_up": {
       "error": "claude has no stage setting nope"
     }
   },
@@ -636,6 +857,29 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":\"string\"}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "manual"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
     }
   },
   "unattended/setting:permission_mode=acceptEdits": {
@@ -694,6 +938,29 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":\"string\"}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "acceptEdits"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
     }
   },
   "unattended/setting:permission_mode=plan": {
@@ -752,6 +1019,29 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":\"string\"}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "plan"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
     }
   },
   "unattended/setting:permission_mode=dontAsk": {
@@ -810,6 +1100,29 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":\"string\"}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "dontAsk"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
     }
   },
   "unattended/setting:permission_mode=auto": {
@@ -868,6 +1181,29 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":\"string\"}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "auto"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
     }
   },
   "unattended/setting:permission_mode=bypassPermissions": {
@@ -926,6 +1262,29 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":\"string\"}},\"type\":\"object\"}",
+        "--model",
+        "m-1",
+        "--permission-mode",
+        "bypassPermissions"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
     }
   },
   "unattended/setting:permission_mode=": {
@@ -978,6 +1337,27 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "claude",
+      "args": [
+        "--resume",
+        "S-1",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--json-schema",
+        "{\"additionalProperties\":false,\"required\":[\"summary\",\"verdict\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[1,2]},\"summary\":{\"type\":\"string\",\"minLength\":1},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":\"string\"},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"}},\"required\":[\"kind\",\"path_or_url\"],\"additionalProperties\":false}},\"confidence\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":\"string\"}},\"type\":\"object\"}",
+        "--model",
+        "m-1"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Claude",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
     }
   },
   "unattended/setting:permission_mode+invalid": {
@@ -987,6 +1367,9 @@
     "session": null,
     "resumable": true,
     "resume": {
+      "error": "Invalid Permission mode for claude: not-a-choice"
+    },
+    "follow_up": {
       "error": "Invalid Permission mode for claude: not-a-choice"
     }
   },

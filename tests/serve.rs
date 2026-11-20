@@ -46,7 +46,8 @@ fn stage(id: &str, role: Role, harness: &str, mode: Mode) -> Stage {
     }
 }
 
-/// A project with workflows that are quick, interactive, slow, and steady (1 s).
+/// A project with workflows that are quick, interactive, slow, steady (1 s),
+/// and paced (three 1 s stages).
 fn project() -> tempfile::TempDir {
     let dir = tempfile::Builder::new()
         .prefix("serve test ")
@@ -94,6 +95,20 @@ fn project() -> tempfile::TempDir {
                     "steadymock",
                     Mode::Unattended,
                 )],
+            ),
+            // Three 1 s stages: its state changes while a client waits.
+            workflow(
+                "Paced",
+                vec![
+                    stage("research", Role::Research, "steadymock", Mode::Unattended),
+                    stage("plan", Role::Planning, "steadymock", Mode::Unattended),
+                    stage(
+                        "implement",
+                        Role::Implementation,
+                        "steadymock",
+                        Mode::Unattended,
+                    ),
+                ],
             ),
         ],
         adapters: BTreeMap::from([
@@ -670,4 +685,107 @@ fn mcp_answers_calls_in_flight_when_stdin_closes() {
     let response: Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(response["id"], 7);
     assert_eq!(response["result"]["isError"], false, "{response}");
+}
+
+/// `wait_run` with a progress token reports the run's state changes before
+/// it answers.
+#[test]
+fn mcp_wait_run_emits_progress_for_state_changes() {
+    let dir = project();
+    let mut mcp = Mcp::spawn(dir.path(), &[]);
+    let started = mcp.call(
+        "start_run",
+        json!({"workflow": "Paced", "task": "progress"}),
+    );
+    let run_id = started["run_id"].as_str().unwrap().to_owned();
+    // The run's three stages each take a second, so its state changes
+    // several times while this call waits.
+    mcp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 98,
+        "method": "tools/call",
+        "params": {
+            "name": "wait_run",
+            "arguments": {"run_id": run_id, "timeout_seconds": 60},
+            "_meta": {"progressToken": "tok-1"}
+        }
+    }));
+    let mut steps = vec![];
+    let response = loop {
+        let msg = mcp.read();
+        if msg.get("method").and_then(Value::as_str) == Some("notifications/progress") {
+            assert_eq!(msg["params"]["progressToken"], "tok-1", "{msg}");
+            assert!(msg["params"]["message"].is_string(), "{msg}");
+            steps.push(msg["params"]["progress"].as_u64().unwrap());
+            continue;
+        }
+        assert_eq!(msg["id"], 98, "{msg}");
+        break msg;
+    };
+    assert!(
+        !steps.is_empty(),
+        "no progress notification before the answer"
+    );
+    // Progress only increases, as MCP requires.
+    assert!(steps.windows(2).all(|w| w[0] < w[1]), "{steps:?}");
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(result["status"], "complete", "{response}");
+    assert_eq!(result["timed_out"], false, "{response}");
+}
+
+/// A cancelled `wait_run` never answers. The server reads requests in order
+/// and registers a call before reading the next line, so the cancellation
+/// below always finds call 99. Were it ignored, 99 would answer `timed_out`
+/// after 1 s, before call 100, which waits 3 s on the same run.
+#[test]
+fn mcp_cancelled_wait_run_never_answers() {
+    let dir = project();
+    let mut mcp = Mcp::spawn(dir.path(), &[]);
+    let started = mcp.call(
+        "start_run",
+        json!({"workflow": "Slow", "task": "cancel wait"}),
+    );
+    let run_id = started["run_id"].as_str().unwrap().to_owned();
+    let wait = |id: u64, seconds: u64| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "wait_run",
+                "arguments": {"run_id": run_id, "timeout_seconds": seconds},
+                "_meta": {"progressToken": format!("tok-{id}")}
+            }
+        })
+    };
+    mcp.send(wait(99, 1));
+    mcp.send(json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {"requestId": 99, "reason": "client cancelled"}
+    }));
+    mcp.send(wait(100, 3));
+    let response = loop {
+        let msg = mcp.read();
+        assert_ne!(
+            msg.get("id"),
+            Some(&json!(99)),
+            "cancelled request answered: {msg}"
+        );
+        if msg.get("method").and_then(Value::as_str) == Some("notifications/progress") {
+            // Nothing is reported for a cancelled request either.
+            assert_ne!(msg["params"]["progressToken"], "tok-99", "{msg}");
+            continue;
+        }
+        assert_eq!(msg["id"], 100, "{msg}");
+        break msg;
+    };
+    // Call 100 outlasted 99's timeout, and the run is still going.
+    assert_eq!(
+        response["result"]["structuredContent"]["timed_out"], true,
+        "{response}"
+    );
+    // The cancelled wait left the run alone, and cheap calls still answer.
+    let cancelled = mcp.call("cancel_run", json!({"run_id": run_id}));
+    assert_eq!(cancelled["run_id"], run_id, "{cancelled}");
 }

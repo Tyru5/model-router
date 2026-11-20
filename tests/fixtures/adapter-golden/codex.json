@@ -54,6 +54,32 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/model": {
@@ -117,6 +143,34 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/model+provider": {
@@ -186,6 +240,36 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_provider=\"openrouter\"",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/model+local-provider": {
@@ -258,6 +342,9 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "error": "Codex cannot follow up on a session using local provider ollama"
     }
   },
   "unattended/model+lmstudio": {
@@ -330,6 +417,9 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "error": "Codex cannot follow up on a session using local provider lmstudio"
     }
   },
   "unattended/model+effort": {
@@ -399,6 +489,36 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/effort-only": {
@@ -462,6 +582,34 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/model+provider+effort": {
@@ -537,6 +685,38 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_provider=\"openrouter\"",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/routed": {
@@ -638,6 +818,49 @@
       ],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/routed-keyless": {
@@ -719,6 +942,40 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-local.name=\"local\"",
+        "--config",
+        "model_providers.model-router-local.base_url=\"http://localhost:8000\"",
+        "--config",
+        "model_provider=\"model-router-local\"",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/routed-preset": {
@@ -820,6 +1077,49 @@
       ],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-groq.name=\"groq\"",
+        "--config",
+        "model_providers.model-router-groq.base_url=\"https://api.groq.com/openai/v1\"",
+        "--config",
+        "model_providers.model-router-groq.env_key=\"GROQ_API_KEY\"",
+        "--config",
+        "model_provider=\"model-router-groq\"",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GROQ_API_KEY",
+          {
+            "var": "GROQ_API_KEY"
+          }
+        ]
+      ],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/routed+effort": {
@@ -927,6 +1227,51 @@
       ],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/provider-without-model": {
@@ -936,6 +1281,9 @@
     "session": null,
     "resumable": true,
     "resume": {
+      "error": "A provider override requires a model"
+    },
+    "follow_up": {
       "error": "A provider override requires a model"
     }
   },
@@ -992,6 +1340,29 @@
         "S-1"
       ],
       "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--model",
+        "m-1",
+        "--config",
+        "model_reasoning_effort=\"high\"",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
       "kind": "Codex",
       "final_file": "$TMP/attempt/final.txt",
       "env": [],
@@ -1089,6 +1460,42 @@
       ],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--model",
+        "m-1",
+        "--config",
+        "model_providers.model-router-proxy.name=\"proxy\"",
+        "--config",
+        "model_providers.model-router-proxy.base_url=\"http://localhost:4000/v1\"",
+        "--config",
+        "model_providers.model-router-proxy.env_key=\"PROXY_KEY\"",
+        "--config",
+        "model_provider=\"model-router-proxy\"",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
     }
   },
   "unattended/old-version-default": {
@@ -1132,6 +1539,25 @@
         "S-1"
       ],
       "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
       "kind": "Codex",
       "final_file": "$TMP/attempt/final.txt",
       "env": [],
@@ -1206,6 +1632,34 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/user-output-schema": {
@@ -1265,6 +1719,34 @@
       "final_file": "$TMP/attempt/final.txt",
       "env": [],
       "files": [],
+      "uses_output_schema": true
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
       "uses_output_schema": true
     }
   },
@@ -1332,6 +1814,34 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/unknown-setting": {
@@ -1342,6 +1852,124 @@
     "resumable": true,
     "resume": {
       "error": "codex has no stage setting nope"
+    },
+    "follow_up": {
+      "error": "codex has no stage setting nope"
+    }
+  },
+  "unattended/extra-config-args": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "-c",
+        "a=1",
+        "--config=b=2",
+        "--full-auto",
+        "--config",
+        "c=\"x\"",
+        "-"
+      ],
+      "stdin": "Do the task.\nLine two {model} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "exec",
+        "--json",
+        "--color",
+        "never",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "-c",
+        "a=1",
+        "--config=b=2",
+        "--full-auto",
+        "--config",
+        "c=\"x\"",
+        "-"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "-c",
+        "a=1",
+        "--config=b=2",
+        "--full-auto",
+        "--config",
+        "c=\"x\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "a=1",
+        "--config",
+        "b=2",
+        "--config",
+        "c=\"x\"",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/setting:sandbox=read-only": {
@@ -1411,6 +2039,36 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "sandbox_mode=\"read-only\"",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/setting:sandbox=workspace-write": {
@@ -1480,6 +2138,36 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "sandbox_mode=\"workspace-write\"",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/setting:sandbox=danger-full-access": {
@@ -1549,6 +2237,36 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "sandbox_mode=\"danger-full-access\"",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/setting:sandbox=": {
@@ -1612,6 +2330,34 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/setting:sandbox+invalid": {
@@ -1621,6 +2367,9 @@
     "session": null,
     "resumable": true,
     "resume": {
+      "error": "Invalid Sandbox for codex: not-a-choice"
+    },
+    "follow_up": {
       "error": "Invalid Sandbox for codex: not-a-choice"
     }
   },
@@ -1691,6 +2440,36 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "approval_policy=\"on-request\"",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/setting:approval_policy=never": {
@@ -1760,6 +2539,36 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "--config",
+        "approval_policy=\"never\"",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/setting:approval_policy=": {
@@ -1823,6 +2632,34 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "codex",
+      "args": [
+        "exec",
+        "resume",
+        "--json",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        "$TMP/attempt/final.txt",
+        "--output-schema",
+        "$TMP/attempt/output-schema.json",
+        "--model",
+        "m-1",
+        "S-1",
+        "-"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [
+        [
+          "$TMP/attempt/output-schema.json",
+          "{\"additionalProperties\":false,\"required\":[\"schema_version\",\"summary\",\"verdict\",\"findings\",\"decisions\",\"files_changed\",\"tests\",\"unresolved\",\"not_applicable\",\"artifacts\",\"confidence\",\"next_steps\",\"selected\"],\"properties\":{\"schema_version\":{\"type\":\"integer\",\"enum\":[2]},\"summary\":{\"type\":\"string\"},\"verdict\":{\"type\":\"string\",\"enum\":[\"complete\",\"pass\",\"needs_changes\",\"blocked\"]},\"findings\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"severity\":{\"type\":\"string\",\"enum\":[\"blocking\",\"advisory\"]},\"description\":{\"type\":\"string\"}},\"required\":[\"severity\",\"description\"],\"additionalProperties\":false}},\"decisions\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"files_changed\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"tests\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"status\":{\"type\":\"string\",\"enum\":[\"passed\",\"failed\",\"not_run\"]},\"required\":{\"type\":\"boolean\"}},\"required\":[\"command\",\"status\",\"required\"],\"additionalProperties\":false}},\"unresolved\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"not_applicable\":{\"type\":[\"string\",\"null\"]},\"artifacts\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"kind\":{\"type\":\"string\",\"enum\":[\"patch\",\"file\",\"url\",\"note\"]},\"path_or_url\":{\"type\":\"string\"},\"description\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"kind\",\"path_or_url\",\"description\"],\"additionalProperties\":false}},\"confidence\":{\"type\":[\"string\",\"null\"],\"enum\":[\"low\",\"medium\",\"high\",null]},\"next_steps\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"selected\":{\"type\":[\"string\",\"null\"]}},\"type\":\"object\"}"
+        ]
+      ],
+      "uses_output_schema": true
     }
   },
   "unattended/setting:approval_policy+invalid": {
@@ -1832,6 +2669,9 @@
     "session": null,
     "resumable": true,
     "resume": {
+      "error": "Invalid Approval policy for codex: not-a-choice"
+    },
+    "follow_up": {
       "error": "Invalid Approval policy for codex: not-a-choice"
     }
   },
@@ -2800,6 +3640,64 @@
     "resumable": true,
     "resume": {
       "error": "codex has no stage setting nope"
+    }
+  },
+  "interactive/extra-config-args": {
+    "build": {
+      "program": "codex",
+      "args": [
+        "--model",
+        "m-1",
+        "-c",
+        "a=1",
+        "--config=b=2",
+        "--full-auto",
+        "--config",
+        "c=\"x\"",
+        "Do the task.\nLine two {model} $(x)"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "session": {
+      "assigned": false,
+      "args": [
+        "--model",
+        "m-1",
+        "-c",
+        "a=1",
+        "--config=b=2",
+        "--full-auto",
+        "--config",
+        "c=\"x\"",
+        "Do the task.\nLine two {model} $(x)"
+      ]
+    },
+    "resumable": true,
+    "resume": {
+      "program": "codex",
+      "args": [
+        "resume",
+        "--model",
+        "m-1",
+        "-c",
+        "a=1",
+        "--config=b=2",
+        "--full-auto",
+        "--config",
+        "c=\"x\"",
+        "S-1"
+      ],
+      "stdin": null,
+      "kind": "Codex",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
     }
   },
   "interactive/setting:sandbox=read-only": {

@@ -37,7 +37,21 @@
       ]
     },
     "resumable": false,
-    "resume": null
+    "resume": null,
+    "follow_up": {
+      "program": "mine-cli",
+      "args": [
+        "continue",
+        "S-1",
+        "$TMP/prompt.md"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
   },
   "mine/unattended/model+effort": {
     "build": {
@@ -77,7 +91,21 @@
       ]
     },
     "resumable": false,
-    "resume": null
+    "resume": null,
+    "follow_up": {
+      "program": "mine-cli",
+      "args": [
+        "continue",
+        "S-1",
+        "$TMP/prompt.md"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
   },
   "mine/unattended/native-provider": {
     "build": {
@@ -117,7 +145,21 @@
       ]
     },
     "resumable": false,
-    "resume": null
+    "resume": null,
+    "follow_up": {
+      "program": "mine-cli",
+      "args": [
+        "continue",
+        "S-1",
+        "$TMP/prompt.md"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    }
   },
   "mine/unattended/routed": {
     "build": {
@@ -166,7 +208,29 @@
       ]
     },
     "resumable": false,
-    "resume": null
+    "resume": null,
+    "follow_up": {
+      "program": "mine-cli",
+      "args": [
+        "continue",
+        "S-1",
+        "$TMP/prompt.md",
+        "--x"
+      ],
+      "stdin": "Repair the handoff.\nLine two {session} $(x)",
+      "kind": "Text",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    }
   },
   "mine/interactive/default": {
     "build": {

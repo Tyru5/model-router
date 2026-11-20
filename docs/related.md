@@ -43,27 +43,30 @@ winding down at survey time.
 
 ## Ideas worth borrowing
 
-Ranked by value for the effort, with the source in parentheses. None is
-implemented; each is a bounded piece of work.
+Ranked by value for the effort, with the source in parentheses.
 
-1. **Protected paths.** A project list of globs; a stage whose diff touches
-   one is blocked, or the ship preview pauses on it (Ralphy, Claudexor).
+1. **Protected paths** *(implemented)*. Workflow `protected_paths` globs;
+   enforced on ordinary stages, fan-out candidates (candidate stops blocked),
+   and candidate selection, and refused by `ship` and `apply` (Ralphy,
+   Claudexor).
 2. **Block and advise policies.** Regex rules over changed lines; `block`
    fails the run whatever the review said, `advise` is injected into the
    review prompt; fail closed when the diff cannot be read (Vibestrate).
-3. **Stall timeout and bounded retry.** Kill an unattended stage that emits
-   no events for a while, with a `stalled` cause in the transition log and a
-   capped exponential retry delay (Symphony).
-4. **Secret scan before ship.** Refuse to commit or open a PR when a pinned
-   scanner finds a secret, is missing, or fails (Claudexor).
+3. **Stall timeout** *(implemented)* **and bounded retry.** Stage
+   `stall_timeout_seconds` stops an unattended stage that produces no output
+   for a while; capped exponential retry backoff remains open (Symphony).
+4. **Secret scan before ship** *(implemented)*. Built-in diff scanner
+   (`secret_scan = true`) plus opt-in trust-gated external `secret_scanner`
+   failing closed at plan and commit time (Claudexor).
 5. **Lifecycle hooks.** `before_stage`/`after_stage`/`before_ship` commands
    with a timeout; before-hooks abort, after-hooks log; gated behind
    `trust` like custom adapters (Symphony, Tutti).
 6. **Harness version pins.** Optional expected versions checked by
    `doctor --strict`, recorded in each attempt's `command.json`
    (agents-cli).
-7. **Cost honesty.** Separate billed from subscription-covered spend, show
-   unknown usage as unknown rather than `$0`, and a budget `on_exceed` of
-   warn, downgrade, or stop (Kodo, Vibestrate).
-8. **A "not enforced" list** in [safety.md](safety.md) naming guarantees that
-   depend on a harness honoring its own flags (ccswarm).
+7. **Billing split and budget actions** *(implemented)*. `cost` splits billed
+   API spend from subscription API-equivalent estimates, notes attempts with
+   unknown cost rather than counting them as `$0`, and budgets support
+   `on_exceed = "warn" | "stop"` (Kodo, Vibestrate).
+8. **A "not enforced" list** *(implemented)* in [safety.md](safety.md#not-enforced)
+   naming guarantees that depend on a harness honoring its own flags (ccswarm).

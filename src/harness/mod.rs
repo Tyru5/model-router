@@ -9,6 +9,7 @@
 //! `adapters` (the escape hatch): [`ProviderPass::CodexConfig`],
 //! [`Routing::CodexConfig`], and [`Routing::OpencodeJson`].
 use crate::adapters::OutputKind;
+use crate::config::Billing;
 use serde::{Serialize, Serializer};
 
 mod builtins;
@@ -227,6 +228,30 @@ pub struct Resume {
     pub keep_effort: bool,
 }
 
+/// The unattended command that sends one more prompt to an existing session
+/// (`workflow.handoff_repair`). It lists only what the harness accepts when
+/// it resumes: a resume subcommand can take fewer flags than a new session.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct FollowUp {
+    /// The whole template; `{session}` and `{final_file}` expand in `Args`.
+    pub args: &'static [Part],
+    pub prompt: Prompt,
+    pub extra: FollowUpExtra,
+}
+
+/// What `Part::Extra` passes in a follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FollowUpExtra {
+    /// Stage settings and extra arguments, as for a new session.
+    Same,
+    /// Only what can be written as `FLAG key=value`: stage settings that
+    /// have a config key, and the stage's own `--config`/`-c` extra
+    /// arguments. Everything else is left out, because the resume
+    /// subcommand rejects it (`codex exec resume` has no `--sandbox`).
+    ConfigOnly(&'static str),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Structured {
     pub flag: &'static str,
@@ -339,8 +364,22 @@ pub struct HarnessSpec {
     pub routing_note: &'static str,
     pub session: Session,
     pub resume: Option<Resume>,
+    /// The unattended follow-up on a session; None when the harness has no
+    /// such command.
+    pub follow_up: Option<FollowUp>,
+    /// False when unattended output arrives as one document at exit, so a
+    /// quiet stage cannot be told from a stalled one
+    /// (`stall_timeout_seconds` is rejected).
+    pub streams: bool,
+    /// How the harness's own account is usually paid for, when the stage is
+    /// not routed to a router provider and sets no `billing`
+    /// (`cost::stage_billing`).
+    pub billing: Billing,
     pub structured: Option<Structured>,
     pub settings: &'static [Setting],
+    /// The `(setting key, choice)` that keeps the harness from changing
+    /// files; None when it has no such setting.
+    pub read_only: Option<(&'static str, &'static str)>,
     pub catalog: CatalogSource,
     pub version_override: Option<VersionOverride>,
     /// Home-relative state paths the router sandbox leaves writable, beyond
@@ -545,8 +584,26 @@ mod tests {
             if spec.resume.is_some() {
                 assert_ne!(spec.session, Session::None, "{}", spec.name);
             }
+            if let Some(follow_up) = spec.follow_up {
+                assert!(spec.resume.is_some(), "{}", spec.name);
+                assert!(follow_up.args.contains(&Part::Prompt), "{}", spec.name);
+                assert!(follow_up.args.contains(&Part::Extra), "{}", spec.name);
+                let names_session = follow_up
+                    .args
+                    .iter()
+                    .any(|part| matches!(part, Part::Args(items) if items.contains(&"{session}")));
+                assert!(names_session, "{} follow-up needs {{session}}", spec.name);
+            }
             for setting in spec.settings {
                 assert!(!setting.choices.is_empty(), "{}", setting.key);
+            }
+            if let Some((key, choice)) = spec.read_only {
+                let setting = spec.settings.iter().find(|s| s.key == key);
+                assert!(
+                    setting.is_some_and(|s| s.choices.contains(&choice)),
+                    "{} read_only names no setting choice",
+                    spec.name
+                );
             }
         }
         assert_eq!(NAMES.len(), SPECS.len());

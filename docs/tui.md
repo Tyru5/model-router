@@ -124,12 +124,15 @@ options. See [configuration.md](configuration.md#workflowsstages) for values.
 
 ### Harness settings
 
-`c` edits model, provider, effort, execution, timeout, native permissions, and
-extra arguments for the selected stage. `Tab`/`Shift+Tab`/`Ctrl+N/P` move;
-`←`/`→`, `Space`, or `Enter` cycle choices; `F7` browses models and returns.
-`Ctrl+S` applies, `Esc` cancels. Changing the harness clears its settings,
-model, provider, and effort; extra arguments are kept for review. Permission
-values: [harnesses.md](harnesses.md#permission-settings).
+`c` edits model, provider, effort, execution, timeout, native permissions,
+extra arguments, and optional stall timeout for the selected stage.
+`Tab`/`Shift+Tab`/`Ctrl+N/P` move; `←`/`→`, `Space`, or `Enter` cycle choices;
+`F7` browses models and returns. `Ctrl+S` applies, `Esc` cancels. Changing the
+harness clears its settings, model, provider, and effort; extra arguments are
+kept for review. Stall timeout is rejected for harnesses that print only at
+exit (`gemini`, and custom adapters using `output = "gemini-json"` on config
+validation) and ignored while interactive. Permission values:
+[harnesses.md](harnesses.md#permission-settings).
 
 ### Repository browser
 
@@ -217,6 +220,7 @@ The saved list loads in the background and refreshes while runs are active.
 | `m` | idle | Replace model and retry |
 | `e` | idle | Edit an interactive handoff summary |
 | `d` | idle | [Diff view](#diff-view) |
+| `A` | idle | Apply a finished worktree run's changes into the project checkout without committing (`y` confirms) |
 | `o` | idle | Brief ↔ output feed |
 | `x` | idle | Close the run here (files stay; it moves to Saved) |
 

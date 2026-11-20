@@ -119,6 +119,24 @@ pub fn arguments(stage: &Stage) -> Result<Vec<String>> {
     Ok(args)
 }
 
+/// The stage's settings that have a config key, each as `flag key="value"`:
+/// for commands that take config overrides but not the settings' own flags.
+pub fn config_arguments(stage: &Stage, flag: &str) -> Result<Vec<String>> {
+    validate(stage)?;
+    let mut args = Vec::new();
+    for setting in settings(&stage.harness) {
+        let value = stage
+            .harness_settings
+            .get(setting.key)
+            .filter(|v| !v.is_empty());
+        if let (Some(value), Some(key)) = (value, setting.config_key) {
+            args.push(flag.into());
+            args.push(format!("{key}={}", serde_json::to_string(value)?));
+        }
+    }
+    Ok(args)
+}
+
 /// Environment variables the stage's settings set, e.g. Goose's GOOSE_MODE.
 pub fn environment(stage: &Stage) -> Vec<(String, String)> {
     settings(&stage.harness)

@@ -6,13 +6,13 @@ model entitlement database.
 
 | Adapter | Reference | Integration detail |
 | --- | --- | --- |
-| Codex | Installed `codex exec --help` and model-cache metadata | `--model`, `--config model_reasoning_effort`, JSON events, `--output-last-message`, `--output-schema` (handoff schema, 0.41.0+); interactive prompt is positional. Takeover runs `codex resume THREAD_ID`. |
-| Claude Code | Installed `claude --help`; [model configuration](https://code.claude.com/docs/en/model-config) | `--print --output-format stream-json --verbose`, `--json-schema` (handoff schema, 2.1.22+), stdin prompt, `--model`, `--effort`, `--session-id` (unattended and interactive) for takeover with `--resume`; explicit permission denials are handled. |
-| Pi | Installed `pi --help`; [CLI source/documentation](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) | `--print --mode json`, `@prompt-file`, `--provider`, `--model`, `--thinking`. Provider catalogs include extension-defined models. A provider defined only in the router's `[providers]` is rejected before launch. Takeover: router-chosen `--session-id`. |
+| Codex | Installed `codex exec --help` and model-cache metadata | `--model`, `--config model_reasoning_effort`, JSON events, `--output-last-message`, `--output-schema` (handoff schema, 0.41.0+); interactive prompt is positional. Takeover runs `codex resume THREAD_ID`. Follow-up (`handoff_repair`) runs `codex exec resume` with `--json --skip-git-repo-check --output-last-message`, optional `--output-schema`, `--model`, and `--config` (`sandbox` passes as `--config sandbox_mode="…"`; extra args other than `-c`/`--config` pairs are dropped; local providers `ollama`/`lmstudio` cannot follow up). |
+| Claude Code | Installed `claude --help`; [model configuration](https://code.claude.com/docs/en/model-config) | `--print --output-format stream-json --verbose`, `--json-schema` (handoff schema, 2.1.22+), stdin prompt, `--model`, `--effort`, `--session-id` (unattended and interactive) for takeover and print-mode follow-up with `--resume`; explicit permission denials are handled. |
+| Pi | Installed `pi --help`; [CLI source/documentation](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) | `--print --mode json`, `@prompt-file`, `--provider`, `--model`, `--thinking`. Provider catalogs include extension-defined models. A provider defined only in the router's `[providers]` is rejected before launch. Takeover and print-mode follow-up reuse the router-chosen `--session-id`. |
 | omp (oh-my-pi) | Installed `omp --help` and `omp models --json` | `--print --mode json` (Pi's event format), `@prompt-file`, `--model provider/model`, `--thinking`, `--approval-mode`. Catalog from `omp models --json`, with per-model thinking levels. Takeover: `omp --resume ID` from its `session` event. |
 | Cursor Agent | Installed `cursor-agent --help` (2026.10.22); [CLI documentation](https://cursor.com/docs/cli/overview) | Print-mode stream JSON and account model listing. Uses `cursor-agent`; `agent` only when it links into Cursor's `cursor-agent` directory or its `--help` names the Cursor Agent, since other tools use that name. Unattended uses `--output-format stream-json`, whose retries emit `{type: retry}` events; takeover `--resume ID`. |
-| Gemini CLI | [Headless reference](https://geminicli.com/docs/cli/headless/) and [CLI reference](https://geminicli.com/docs/cli/cli-reference/) | `--prompt`, JSON `response`, native `--model`; interactive uses `--prompt-interactive`. |
-| OpenCode | Installed `opencode run --help` and `opencode --help` (2.2.5, 2026-11-05); [CLI reference](https://opencode.ai/docs/cli/) | 2.x: `run --format json --model provider/model#variant`; interactive is the root TUI with `--prompt`, its model set through `OPENCODE_CONFIG_CONTENT` (`model`), and no variant option, so interactive effort is rejected. Before 2.x (detected `--version` major below 2): `run --interactive`, `--model`, `--variant`. `MODEL_ROUTER_HARNESS_VERSIONS=opencode=1.4.0` overrides detection. Takeover: `opencode --session ID`. |
+| Gemini CLI | [Headless reference](https://geminicli.com/docs/cli/headless/) and [CLI reference](https://geminicli.com/docs/cli/cli-reference/) | `--prompt`, single JSON `response` printed at exit (`streams = false`, so `stall_timeout_seconds` is rejected), native `--model`; interactive uses `--prompt-interactive`. |
+| OpenCode | Installed `opencode run --help` and `opencode --help` (2.2.5, 2026-11-05); [CLI reference](https://opencode.ai/docs/cli/) | 2.x: `run --format json --model provider/model#variant`; interactive is the root TUI with `--prompt`, its model set through `OPENCODE_CONFIG_CONTENT` (`model`), and no variant option, so interactive effort is rejected. Before 2.x (detected `--version` major below 2): `run --interactive`, `--model`, `--variant`. `MODEL_ROUTER_HARNESS_VERSIONS=opencode=1.4.0` overrides detection. Takeover: `opencode --session ID`. Follow-up: `opencode run --session ID`. |
 | Aider | [Scripting](https://aider.chat/docs/scripting.html) and [options](https://aider.chat/docs/config/options.html) | `--message-file` unattended; interactive `--read` plus `--load` command file, written at launch (never by previews). Disable auto/dirty commits. `--yes-always` is the Confirmations setting. Aider has no flag to skip its `.env` files (home, Git root, working directory); routed providers pass `--openai-api-base` so a `.env` cannot redirect the endpoint. |
 | Goose | [CLI command reference](https://github.com/aaif-goose/goose/blob/main/documentation/docs/guides/goose-cli-commands.md) | `run --text`, `--provider`, `--model`; `--interactive` continues the conversation. Permission mode via `GOOSE_MODE` (`run` has no flag). |
 | Amp | Installed `amp --help`; [modes](https://ampcode.com/docs/models-and-subagents) | `--execute --stream-json` reads stdin. `--mode` selects a mode, which can change its underlying model. Takeover: `amp threads continue ID`. |
@@ -49,8 +49,9 @@ list each configured provider's `/models`, keeping context length and prices
 ## Adding a harness
 
 Every built-in harness is one `HarnessSpec` entry in `src/harness/builtins.rs`.
-The builder (`adapters::build`/`resume`), settings editor, catalog, doctor,
-provider routing, and sandbox state paths all read it. An entry declares:
+The builder (`adapters::build`/`resume`/`follow_up`), settings editor, catalog,
+doctor, provider routing, billing defaults, `init --detect`, and sandbox state
+paths all read it. An entry declares:
 
 | Field | Meaning |
 | --- | --- |
@@ -60,24 +61,36 @@ provider routing, and sandbox state paths all read it. An entry declares:
 | `model`, `effort`, `efforts` | `Flag`/`Qualified` (provider/model)/`Mode`; effort `Flag`, `ConfigKv`, `ModelSuffix('#')`, or `None`, plus documented levels. |
 | `provider`, `routing` | How a native provider name is passed, and how a `[providers.NAME]` entry is injected: `OwnAccount`, `Registry`, `OpenAiEnv { .. }`, or the custom `CodexConfig`/`OpencodeJson` strategies. |
 | `output` | The parser (`OutputKind`). |
-| `session`, `resume` | `Assign { flag, .. }`, `Reported`, or `None`; resume prepends/appends/replaces with `{session}`. |
+| `session`, `resume` | `Assign { flag, .. }`, `Reported`, or `None`; resume prepends/appends/replaces with `{session}` for interactive takeover. |
+| `follow_up` | Optional unattended session follow-up command (`FollowUp`: argument template with `{session}` and `{final_file}`, prompt delivery, and `FollowUpExtra::Same` or `ConfigOnly`), used by `workflow.handoff_repair`. |
+| `streams` | `false` when unattended output arrives as one document at exit (`gemini`), so `stall_timeout_seconds` is rejected. |
+| `billing` | Default billing (`Billing::Api` or `Billing::Subscription`) when a stage sets no `billing` and is not routed through a router provider. |
 | `structured` | Native schema flag, first supporting version, inline or file. |
 | `settings` | Permission/sandbox settings for the stage editor. |
+| `read_only` | Optional `(setting_key, choice)` for the harness's native read-only mode (`codex`: `sandbox=read-only`, `claude`: `permission_mode=plan`, `gemini`: `approval_mode=plan`); used by `init --detect` when replacing an unavailable harness. |
 | `catalog`, `version_override`, `state_dirs`, `notes` | Model listing source, older-version arguments, sandbox-writable state paths, and notes. |
 
 So adding a harness is:
 
-1. One table entry. `model-router harnesses --spec NAME` shows the result.
+1. One table entry. `model-router harnesses --spec NAME` prints every field above as JSON.
 2. Parser fixtures under `tests/fixtures/harness-output/` (see below).
 3. Its cases in `tests/adapter_golden.rs` (`HARNESSES`, `SETTINGS`), then
    `MODEL_ROUTER_UPDATE_GOLDEN=1 cargo test --test adapter_golden` to record
    `tests/fixtures/adapter-golden/NAME.json`. Review the JSON: it is the exact
-   argv, environment, stdin, files, and parser for every mode and option.
+   argv, environment, stdin, files, and parser for every mode and option,
+   including `follow_up` for unattended harnesses that define one.
 
 Doctor needs no list: it probes the flags of sample invocations built from the
 spec, and a unit test checks every flag the spec declares is probed. Only a new
 mechanism (not a new harness) needs Rust code: a new `Part`, `Prompt`, or
 `Routing` variant. Tools that fit the custom adapter fields need no code at all.
+
+Custom adapters (`[adapters.NAME]`) support unattended handoff repair via
+`follow_up_args`: it accepts the same placeholders as `args` plus `{session}`,
+receives the prompt the same way an unattended launch does, requires `session`
+(`assign` or `reported`), and enters the project trust digest only when set.
+`resume_args` enables interactive takeover; `follow_up_args` enables
+`handoff_repair`.
 
 ## Native structured output
 

@@ -14,6 +14,7 @@ pub mod harness;
 pub mod harness_settings;
 pub mod history;
 pub mod notify;
+pub mod policy;
 pub mod presets;
 pub mod process;
 pub mod providers;

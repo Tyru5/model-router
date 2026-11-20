@@ -111,6 +111,7 @@ fn reported_cost_over_the_run_cap_blocks_before_the_next_stage() {
     let budget = Budget {
         max_usd: Some(3.0),
         max_tokens: None,
+        ..Budget::default()
     };
     let stages = vec![
         stage("a", "cost-2"),
@@ -150,6 +151,7 @@ fn a_cap_also_blocks_stages_of_a_dependency_graph() {
     let budget = Budget {
         max_usd: Some(3.0),
         max_tokens: None,
+        ..Budget::default()
     };
     let after = |id: &str, model: &str, before: &str| Stage {
         after: vec![before.into()],
@@ -178,6 +180,7 @@ fn unknown_costs_count_only_toward_the_token_cap() {
     let budget = Budget {
         max_usd: Some(0.01),
         max_tokens: Some(1_000),
+        ..Budget::default()
     };
     let stages = vec![
         stage("a", "tokens-600"),
@@ -210,6 +213,7 @@ fn stage_caps_and_table_prices_gate_too() {
     first.budget = Budget {
         max_usd: Some(0.1),
         max_tokens: None,
+        ..Budget::default()
     };
     let (dir, mut run) = create(vec![first, stage("b", "cost-1")], Budget::default());
     assert_eq!(drive(&mut run), Action::Stopped);
@@ -255,6 +259,7 @@ fn cli_resumes_with_a_raised_budget_and_aggregates_history() {
     let budget = Budget {
         max_usd: Some(1.0),
         max_tokens: None,
+        ..Budget::default()
     };
     let stages = vec![
         stage("a", "cost-2"),

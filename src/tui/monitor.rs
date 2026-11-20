@@ -115,6 +115,15 @@ impl App {
                 self.ui.external = Some(super::external::page_file(&path)?);
             }
             ActionId::Diff => self.show_diff()?,
+            ActionId::ApplyWorktree => {
+                let run = self.session.run().context("No run selected")?;
+                let plan = engine::apply_worktree_plan(run)?;
+                self.ui.open(Modal::Ask(Box::new(Ask::ApplyWorktree {
+                    run: run.id.clone(),
+                    files: plan.files.len(),
+                    preview: plan.preview(),
+                })));
+            }
             ActionId::ToggleResults => self.toggle_results()?,
             ActionId::Handoff => {
                 let run = self.session.run().context("No run selected")?;

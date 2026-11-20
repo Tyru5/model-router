@@ -190,6 +190,8 @@ impl WorkflowPreset {
             max_repair_passes: 2,
             sandbox_default: Default::default(),
             budget: Default::default(),
+            protected_paths: vec![],
+            handoff_repair: false,
             max_parallel: if self.candidates.is_empty() {
                 2
             } else {
@@ -224,6 +226,89 @@ impl WorkflowPreset {
                     stage
                 })
                 .collect(),
+        }
+    }
+}
+
+/// Adapts a starter or preset workflow to the harnesses installed on this
+/// machine (`init --detect`), clearing hardcoded model IDs so each stage
+/// inherits its harness's native default instead of failing on account-specific
+/// names. A stage whose harness is not installed moves to the first installed
+/// one. When two or more harnesses are installed, a review stage moves off the
+/// harness that implements (its repair target's, else the first
+/// implementation stage's), so the review is independent. A stage that was
+/// read-only stays read-only on its new harness (`switch_harness`).
+pub fn apply_detected_harnesses(workflow: &mut Workflow, available: &[&str]) {
+    let primary = available.first().copied();
+    for stage in &mut workflow.stages {
+        if stage.role == Role::Ship {
+            continue;
+        }
+        stage.model.clear();
+        stage.effort.clear();
+        if let Some(first) = primary {
+            if !available.contains(&stage.harness.as_str()) {
+                switch_harness(stage, first);
+            }
+        }
+        if let Some(fan) = &mut stage.fan_out {
+            for (index, candidate) in fan.candidates.iter_mut().enumerate() {
+                candidate.model.clear();
+                candidate.effort.clear();
+                if !available.is_empty() && !available.contains(&candidate.harness.as_str()) {
+                    candidate.harness = available[index % available.len()].to_owned();
+                }
+            }
+        }
+    }
+    // Reviews last: every implementation stage has its final harness now.
+    let implementer = |target: &str, stages: &[Stage]| -> Option<String> {
+        let implementation = |s: &&Stage| s.role == Role::Implementation;
+        stages
+            .iter()
+            .filter(implementation)
+            .find(|s| s.id == target)
+            .or_else(|| stages.iter().find(implementation))
+            .map(|s| s.harness.clone())
+    };
+    for index in 0..workflow.stages.len() {
+        if workflow.stages[index].role != Role::Review {
+            continue;
+        }
+        let Some(implementer) =
+            implementer(&workflow.stages[index].repair_target, &workflow.stages)
+        else {
+            continue;
+        };
+        let stage = &mut workflow.stages[index];
+        if stage.harness != implementer {
+            continue;
+        }
+        if let Some(other) = available.iter().find(|name| **name != implementer) {
+            switch_harness(stage, other);
+        }
+    }
+}
+
+/// Moves `stage` to `harness`. Native settings belong to the old harness
+/// and are dropped, except a read-only one (`HarnessSpec::read_only`): it
+/// becomes the new harness's read-only setting, or, when that harness has
+/// none, the router's own `sandbox = "read-only"`.
+fn switch_harness(stage: &mut Stage, harness: &str) {
+    let spec = crate::harness::get;
+    let read_only = spec(&stage.harness)
+        .and_then(|old| old.read_only)
+        .is_some_and(|(key, choice)| {
+            stage.harness_settings.get(key).map(String::as_str) == Some(choice)
+        });
+    stage.harness = harness.to_owned();
+    stage.harness_settings.clear();
+    if read_only {
+        match spec(harness).and_then(|new| new.read_only) {
+            Some((key, choice)) => {
+                stage.harness_settings.insert(key.into(), choice.into());
+            }
+            None => stage.sandbox = Some(crate::config::Sandbox::ReadOnly),
         }
     }
 }

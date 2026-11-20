@@ -197,6 +197,42 @@ pub fn apply(
     Ok(Applied::Conflict(files.to_vec()))
 }
 
+/// What `apply` would do, without touching the workspace: a plain apply
+/// check, then the three-way merge in a copy of the snapshot index only
+/// (`git apply --3way --cached`, Git 2.32 or later; an older Git reports a
+/// conflict where a merge might have worked).
+pub fn check(
+    workspace: &Path,
+    index: &Path,
+    files: &[String],
+    patch: &Path,
+    scratch: &Path,
+) -> Result<Applied> {
+    let top = PathBuf::from(git(workspace, None, &["rev-parse", "--show-toplevel"])?);
+    let patch = std::path::absolute(patch)?;
+    let patch = patch.to_str().context("Patch path must be UTF-8")?;
+    if fs::metadata(patch)?.len() == 0
+        || git(&top, None, &["apply", "--check", "--binary", patch]).is_ok()
+    {
+        return Ok(Applied::Clean);
+    }
+    fs::create_dir_all(scratch)?;
+    let merge = std::path::absolute(scratch.join("check.index"))?;
+    fs::copy(index, &merge).context("Copy the snapshot index")?;
+    let merged = git(
+        &top,
+        Some(&merge),
+        &["apply", "--3way", "--cached", "--binary", patch],
+    )
+    .is_ok();
+    let _ = fs::remove_file(&merge);
+    Ok(if merged {
+        Applied::Merged
+    } else {
+        Applied::Conflict(files.to_vec())
+    })
+}
+
 /// Puts `files` back as they are in tree `tree`: present ones checked out,
 /// absent ones removed.
 fn restore(top: &Path, tree: &str, files: &[String], scratch: &Path) -> Result<()> {

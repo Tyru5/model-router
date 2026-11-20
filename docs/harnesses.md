@@ -9,22 +9,26 @@ references and fixtures: [adapters.md](adapters.md).
 `model-router harnesses` lists them; `--spec [NAME]` prints the resolved spec
 as JSON.
 
-| Name | Program | Selection | Integration | Takeover |
-| --- | --- | --- | --- | --- |
-| `codex` | `codex` | Model ID; optional provider, effort | `exec` JSON events; final response file | yes |
-| `claude` | `claude` | Alias or full ID; optional effort | Print-mode stream JSON | yes |
-| `pi` | `pi` | Provider + model ID; optional thinking | Print-mode JSON | yes |
-| `omp` | `omp` | Provider + model (`provider/model`); optional thinking | Pi's JSON format; approval mode | yes |
-| `cursor` | `cursor-agent` | Cursor model slug | Print-mode stream JSON | yes |
-| `gemini` | `gemini` | Gemini model ID | Headless JSON | no |
-| `opencode` | `opencode` | `provider/model`; optional variant | Run-mode JSON; TUI with `--prompt` (`run --interactive` before 2.x) | yes |
-| `aider` | `aider` | Native/LiteLLM model ID | Message file; auto-commits disabled | no |
-| `goose` | `goose` | Provider + model | `run`; interactive continuation | no |
-| `amp` | `amp` | Mode, e.g. `high` (may change the model) | Execute-mode JSON | yes |
-| `copilot` | `copilot` | Copilot model ID | Programmatic prompt | no |
-| custom | yours | Anything | [Custom adapters](#custom-adapters) | with `resume_args` |
+| Name | Program | Selection | Integration | Takeover | Follow-up |
+| --- | --- | --- | --- | --- | --- |
+| `codex` | `codex` | Model ID; optional provider, effort | `exec` JSON events; final response file | yes | yes |
+| `claude` | `claude` | Alias or full ID; optional effort | Print-mode stream JSON | yes | yes |
+| `pi` | `pi` | Provider + model ID; optional thinking | Print-mode JSON | yes | yes |
+| `omp` | `omp` | Provider + model (`provider/model`); optional thinking | Pi's JSON format; approval mode | yes | no |
+| `cursor` | `cursor-agent` | Cursor model slug | Print-mode stream JSON | yes | no |
+| `gemini` | `gemini` | Gemini model ID | Headless JSON (at exit) | no | no |
+| `opencode` | `opencode` | `provider/model`; optional variant | Run-mode JSON; TUI with `--prompt` (`run --interactive` before 2.x) | yes | yes |
+| `aider` | `aider` | Native/LiteLLM model ID | Message file; auto-commits disabled | no | no |
+| `goose` | `goose` | Provider + model | `run`; interactive continuation | no | no |
+| `amp` | `amp` | Mode, e.g. `high` (may change the model) | Execute-mode JSON | yes | no |
+| `copilot` | `copilot` | Copilot model ID | Programmatic prompt | no | no |
+| custom | yours | Anything | [Custom adapters](#custom-adapters) | with `resume_args` | with `follow_up_args` |
 
-All built-ins also run interactively in their native terminal.
+All built-ins also run interactively in their native terminal. **Follow-up** is
+the unattended session command used by `handoff_repair` (`codex` cannot follow
+up on its local providers `ollama` and `lmstudio`). `gemini` prints its JSON
+document only on exit (`streams = false`), so `stall_timeout_seconds` is
+rejected for it.
 
 ## Choosing a model
 
@@ -175,8 +179,9 @@ args = ["--print", "{prompt}"]
 interactive_args = ["{prompt}"]
 models_args = ["models", "--plain"]       # one model ID per line
 output = "claude-stream"                  # or codex-jsonl, pi, cursor-stream, gemini-json, opencode, amp-stream, text
-session = { assign = "--session-id" }     # or { reported = true }
-resume_args = ["--resume", "{session}"]   # enables takeover
+session = { assign = "--session-id" }               # or { reported = true }
+resume_args = ["--resume", "{session}"]             # enables interactive takeover
+follow_up_args = ["--resume", "{session}", "--print"] # enables handoff_repair
 model_flag = "--model"
 effort_flag = "--effort"
 prompt = { flag = "-p" }                  # or "arg", or "stdin"
@@ -184,7 +189,10 @@ prompt = { flag = "-p" }                  # or "arg", or "stdin"
 
 Choose `my_cli` as a stage's harness. Arguments are passed directly; no shell,
 and task/model text is never re-expanded. Order: `args`, model flag, effort
-flag, extra arguments, prompt. All fields:
+flag, extra arguments, prompt. `resume_args` enables interactive takeover only;
+`follow_up_args` enables `handoff_repair` (uses the same placeholders as `args`
+plus `{session}`, receives the prompt as an unattended launch does, and requires
+`session`). All fields:
 [configuration.md](configuration.md#adaptersname). A project's adapters need
 [trust](safety.md#project-trust). Model-only tools work too, e.g.
 `command = "ollama"`, `args = ["run", "{model}", "{prompt}"]`.

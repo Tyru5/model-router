@@ -79,10 +79,11 @@ inspect the handoff, then advance (`a`), reopen (`i`), retry (`y`), or replace
 the model (`m`). CLI: `resume RUN_ID --advance`, `--interactive`, `--retry`,
 `--model ID`.
 
-Failures, cancellation, malformed review verdicts, and timeouts stop the run.
-Retries keep filesystem changes and get their own attempt logs. Completed
-stages are never replayed. Runs snapshot their workflow: editing templates
-never changes an existing run.
+Failures, cancellation, malformed review verdicts, timeouts, and stall timeouts
+(`stall_timeout_seconds` on unattended streaming stages; ignored while
+interactive) stop the run. Retries keep filesystem changes and get their own
+attempt logs. Completed stages are never replayed. Runs snapshot their
+workflow: editing templates never changes an existing run.
 
 ### Several runs and worktrees
 
@@ -147,6 +148,9 @@ after = ["implement"]   # also waits for the judge
 - The router applies the winning patch to the workspace. If it conflicts with
   changes made since, the workspace is left as it was and the run blocks with
   the patch and worktree paths.
+- Workflow `protected_paths` is enforced on each candidate (a candidate that
+  edits a matching file stops **blocked** with its worktree retained) and
+  checked again before a chosen candidate is applied.
 - Losing candidates stay on disk until `clean` removes the run.
 - One stopped candidate can be rerun alone:
   `resume RUN_ID --retry-candidate implement/c2`, or `Y` on the Runs page.
@@ -196,6 +200,25 @@ Prior handoffs are bounded (14,000 bytes in total, at most 5,000 each): long
 strings and lists are cut, then whole fields omitted. `handoffs RUN_ID`
 shows exactly what a stage receives and warns when decisions, unresolved
 items, or findings were lost.
+
+When `handoff_repair = true` is set on a workflow and an unattended stage exits
+0 without a valid handoff, the router sends one follow-up on the same session
+asking only for handoff JSON before stopping the stage.
+
+- Supported on `codex`, `claude`, `pi`, `opencode`, and custom adapters with
+  `follow_up_args` (`resume_args` enables interactive takeover only).
+- Codex uses `codex exec resume` with `--json --skip-git-repo-check
+  --output-last-message`, optional `--output-schema`, `--model`, and `--config`:
+  `sandbox` passes as `--config sandbox_mode="…"`, stage `extra_args` other
+  than `-c`/`--config` pairs are dropped, and Codex with local providers
+  (`ollama`, `lmstudio`) cannot follow up.
+- Follow-up timeout is `min(timeout_seconds, 120)` (and `stall_timeout_seconds`,
+  if set, is also capped at 120 s).
+- Skips and failures print `Handoff repair skipped: <reason>` or
+  `Handoff repair failed: <reason>` in stage output.
+- The follow-up's process group is recorded for crash recovery.
+- Each follow-up is an extra (possibly billed) request; reported usage is added
+  to the attempt.
 
 ## Reviews and repairs
 
@@ -302,6 +325,12 @@ optionally opens a draft PR with `gh`.
   no trailers or attribution.
 - Any Git or `gh` failure blocks the stage with its exact error and what was
   already done.
+- `ship` refuses files matching workflow `protected_paths`, and runs pre-ship
+  secret scanning (`secret_scan = true` by default, plus optional
+  `secret_scanner`) at plan time and again right before committing, using a
+  private index (planning writes blob objects to Git's object database; your
+  own index is never read or written). See
+  [safety.md](safety.md#protected-paths-and-secret-scanning).
 - Branch, commit, push, and PR URL appear in the handoff and `report`.
 - After the fact: `model-router ship RUN_ID [--push] [--draft-pr] [--yes]`.
 

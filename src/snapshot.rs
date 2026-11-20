@@ -348,6 +348,64 @@ pub fn patch(dir: &Path, from: &str, to: &str, max: usize) -> Result<String> {
     Ok(text)
 }
 
+/// The whole `git diff` between two trees, one line at a time and never
+/// cut, for scans that must see all of it. `--text` shows files Git would
+/// call binary, so their added lines are read too. Lines are decoded
+/// lossily.
+pub fn patch_lines(dir: &Path, from: &str, to: &str, mut each: impl FnMut(&str)) -> Result<()> {
+    let mut child = Command::new("git")
+        .args([
+            "--no-pager",
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--text",
+            from,
+            to,
+        ])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Start Git")?;
+    let stdout = child.stdout.take().context("No Git output")?;
+    // Drained beside stdout, so a long error cannot block Git.
+    let mut stderr = child.stderr.take().context("No Git output")?;
+    let errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    let mut reader = std::io::BufReader::new(stdout);
+    let mut line = Vec::new();
+    let read = loop {
+        line.clear();
+        match std::io::BufRead::read_until(&mut reader, b'\n', &mut line) {
+            Ok(0) => break Ok(()),
+            Ok(_) => {
+                if line.last() == Some(&b'\n') {
+                    line.pop();
+                }
+                each(&String::from_utf8_lossy(&line));
+            }
+            Err(error) => break Err(error),
+        }
+    };
+    if read.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    let error = errors.join().unwrap_or_default();
+    read.context("Read git diff")?;
+    ensure!(status.success(), "git diff: {}", error.trim());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

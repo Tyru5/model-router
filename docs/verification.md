@@ -1,27 +1,18 @@
 # Verification
 
-Verified locally on Linux with Rust 1.93.0. Installed executable reports
-`model-router 0.1.0`.
+Verified locally on Linux with Rust 1.100.0 (and MSRV 1.85).
 
 | Check | Result |
 | --- | --- |
-| `cargo test --locked` | 141 tests passed |
+| `cargo test --locked --no-fail-fast` | 525 tests passed (0 failed, 2 ignored helper tests) |
 | `cargo clippy --all-targets --locked -- -D warnings` | Passed |
 | `cargo fmt --check` | Passed |
 | `cargo +1.85 check --all-targets --locked` (MSRV) | Passed |
-| `cargo +1.99 clippy --all-targets --locked -- -D warnings` | Passed |
-| `cargo build --release --locked` | Passed; installation rebuilt the final changed code |
-| `cargo install --path . --locked` | Installed successfully in the user's Cargo bin directory |
-| Installed `model-router --version` | `model-router 0.1.0` |
-| Installed import commands | `run --help` exposes `--task-file` and `--task-url`; installed executable matches the release build |
-| Installed preset commands | `presets` lists 12 stages and four workflows; `init --preset` accepts the workflow keys |
-| Installed `model-router preview --task 'Example task'` | Astra research, interactive Claude implementation, review disabled |
-| Real terminal smoke tests | Workflow, repository browser, task import, stage presets, theme selection, and startup animation scripts passed using offline fixtures and actual PTYs |
-| Terminal loss and shutdown | Eight real-PTY scenarios passed: idle/startup disconnect, unattended/interactive cancellation, terminals without SIGHUP, and normal SIGTERM/SIGHUP cleanup |
-| Theme selection | All 12 palettes preview and save; Ctrl+N/P, cancellation, cross-project persistence, restart, themed startup, and invalid preferences verified |
-| Stage harness settings | Stage isolation, native permission arguments, conflict validation, model discovery returning to the draft, cancellation, and persistence passed; workflow, preset, and theme PTY regressions also passed |
-| Private GitHub task import | Imported `Tyru5/model-router/blob/main/docs/spec.md` into an editable TUI preview using the existing `gh` login; no workflow started |
-| Native model discovery | Codex cache, Pi catalog, Cursor account list, and OpenCode catalog returned selections |
+| `python3 scripts/smoke_shutdown.py` | 8/8 real-PTY disconnect and signal scenarios passed |
+| `presets` | 15 stage presets and 5 workflow presets; `init --preset` and `init --detect` verified |
+| `themes` | 14 themes covered by unit tests (contrast, rendering in all views/dialogs) and `smoke_themes.py` |
+| Guardrails & server (`tests/guardrails.rs`, `tests/serve.rs`) | Stall timeouts, `protected_paths`, pre-ship secret scanning, trust gates, `handoff_repair`, worktree `apply`, budget `on_exceed = "warn"`, billing API/subscription split, MCP line/worker bounds, `notifications/cancelled`, `notifications/progress`, and finished-run handle eviction passed |
+| Previous PTY smoke runs (requiring `uv` / `pyte`) | Workflow, repository browser, task import, stage presets, theme selection, harness settings, startup animation, detach/reattach, and diff review scripts pass offline in CI (`ubuntu-latest`) |
 
 The tests cover original-task preservation, cross-stage handoffs, disabled reviews,
 repair limits, invalid verdicts, rerunning affected reviews, explicit model

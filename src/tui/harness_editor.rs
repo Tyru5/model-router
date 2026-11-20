@@ -29,6 +29,7 @@ enum FieldKind {
     Timeout,
     Native(&'static harness_settings::Setting),
     Arguments,
+    StallTimeout,
 }
 struct Field {
     kind: FieldKind,
@@ -119,6 +120,17 @@ impl HarnessEditor {
             label: "Extra arguments",
             help: "Additional native CLI arguments, including permissions not listed here. Shell quoting is supported; no shell is executed. Native settings remain in effect unless explicitly overridden. Use P on Workflow to preview the command.",
             text: textarea(&stage.extra_args.iter().map(|a| shell_words::quote(a).into_owned()).collect::<Vec<_>>().join(" ")),
+        });
+        fields.push(Field {
+            kind: FieldKind::StallTimeout,
+            label: "Stall timeout (seconds)",
+            help: "Optional inactivity limit in seconds for unattended stages (ignored while interactive). Stops the stage if neither stdout nor stderr produces output for this long. Blank disables stall detection.",
+            text: textarea(
+                &stage
+                    .stall_timeout_seconds
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+            ),
         });
         Self {
             stage,
@@ -258,6 +270,22 @@ impl HarnessEditor {
                 FieldKind::Arguments => {
                     stage.extra_args = shell_words::split(&value)
                         .context("Extra arguments have unmatched quotes")?
+                }
+                FieldKind::StallTimeout => {
+                    if value.is_empty() {
+                        stage.stall_timeout_seconds = None;
+                    } else {
+                        let secs: u64 = value
+                            .parse()
+                            .context("Stall timeout must be a positive whole number of seconds")?;
+                        ensure!(secs > 0, "Stall timeout must be greater than zero");
+                        ensure!(
+                            crate::harness::get(&stage.harness).is_none_or(|spec| spec.streams),
+                            "{} prints its output only when it exits, so a stall timeout would stop a working stage. Leave it blank",
+                            stage.harness
+                        );
+                        stage.stall_timeout_seconds = Some(secs);
+                    }
                 }
             }
         }

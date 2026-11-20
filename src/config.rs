@@ -139,6 +139,15 @@ pub struct Stage {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub harness_settings: BTreeMap<String, String>,
     pub timeout_seconds: u64,
+    /// Unattended inactivity timeout in seconds: stop when the harness produces
+    /// no stdout or stderr output for this long. None disables stall detection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stall_timeout_seconds: Option<u64>,
+    /// How this stage is billed: API (metered) or subscription-covered.
+    /// Unset infers API when routed through a router provider, else subscription
+    /// for native-account harnesses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub billing: Option<Billing>,
     /// An upstream implementation stage ID; empty chooses the nearest enabled one.
     pub repair_target: String,
     /// Commands the router runs after the harness succeeds, independent of its handoff.
@@ -280,6 +289,8 @@ impl Default for Stage {
             extra_args: vec![],
             harness_settings: BTreeMap::new(),
             timeout_seconds: 3600,
+            stall_timeout_seconds: None,
+            billing: None,
             repair_target: String::new(),
             checks: vec![],
             require_router_checks: false,
@@ -295,9 +306,49 @@ impl Default for Stage {
     }
 }
 
-/// Spend caps. A run stops before its next stage once known estimated cost
-/// exceeds `max_usd` or counted tokens exceed `max_tokens` (input, output,
-/// and cache writes). Unknown fields warn, like the workflow's.
+/// Whether a stage's spend is billed per token (API) or covered by a flat
+/// harness subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Billing {
+    Api,
+    Subscription,
+}
+impl Billing {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Subscription => "subscription",
+        }
+    }
+}
+
+/// What happens when a budget cap is exceeded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BudgetAction {
+    /// Block the run before launching the next stage (default).
+    #[default]
+    Stop,
+    /// Emit a warning in the run output and continue.
+    Warn,
+}
+impl BudgetAction {
+    pub fn is_stop(&self) -> bool {
+        *self == Self::Stop
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Warn => "warn",
+        }
+    }
+}
+
+/// Spend caps. A run stops (or warns when `on_exceed = "warn"`) before its
+/// next stage once known estimated cost exceeds `max_usd` or counted tokens
+/// exceed `max_tokens` (input, output, and cache writes). Unknown fields warn,
+/// like the workflow's.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Budget {
@@ -305,6 +356,8 @@ pub struct Budget {
     pub max_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "BudgetAction::is_stop")]
+    pub on_exceed: BudgetAction,
 }
 impl Budget {
     pub fn is_empty(&self) -> bool {
@@ -358,6 +411,15 @@ pub struct Workflow {
     /// Caps on the whole run's spend; see `cost`.
     #[serde(default, skip_serializing_if = "Budget::is_empty")]
     pub budget: Budget,
+    /// Repository-relative glob patterns that no stage may modify and ship
+    /// refuses to commit (e.g. `.github/workflows/*`, `**/Cargo.lock`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected_paths: Vec<String>,
+    /// When true, an unattended stage on a resumable harness that exits 0 with
+    /// missing or malformed handoff JSON gets one lightweight session-resume
+    /// follow-up asking only for valid handoff JSON before failing.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub handoff_repair: bool,
 }
 fn two() -> u32 {
     2
@@ -376,6 +438,8 @@ impl Workflow {
             max_parallel: two(),
             stages,
             budget: Budget::default(),
+            protected_paths: vec![],
+            handoff_repair: false,
         }
     }
     /// Appends the review summary unless a stage already has the summary role.
@@ -408,7 +472,7 @@ impl Workflow {
 }
 impl Default for Workflow {
     fn default() -> Self {
-        Self { name: "Feature development".into(), max_repair_passes: 2, sandbox_default: Sandbox::Off, budget: Budget::default(), max_parallel: 2, stages: vec![
+        Self { name: "Feature development".into(), max_repair_passes: 2, sandbox_default: Sandbox::Off, budget: Budget::default(), max_parallel: 2, protected_paths: vec![], handoff_repair: false, stages: vec![
         Stage { id: "research".into(), name: "Investigate".into(), role: Role::Research, model: "gpt-6-astra".into(),
             instructions: "Investigate the task and relevant project files. Explain the root cause or requirements, cite evidence, and propose a concrete implementation plan. Do not change project code.".into(), ..Stage::default() },
         Stage { id: "implement".into(), name: "Implement".into(), role: Role::Implementation, harness: "claude".into(), model: "sonnet".into(), mode: Mode::Interactive,
@@ -439,6 +503,10 @@ pub struct CustomAdapter {
     /// Interactive arguments that reopen `{session}`; enables takeover.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_args: Option<Vec<String>>,
+    /// Unattended arguments that send one more prompt to `{session}`, in
+    /// place of `args`; enables `workflow.handoff_repair`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub follow_up_args: Option<Vec<String>>,
     /// `FLAG model`, after `args`, when the stage sets a model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_flag: Option<String>,
@@ -521,6 +589,9 @@ impl CustomAdapter {
         if let Some(args) = &self.resume_args {
             fields.push(("resume", args.clone()));
         }
+        if let Some(args) = &self.follow_up_args {
+            fields.push(("follow-up", args.clone()));
+        }
         for (name, flag) in [
             ("model flag", &self.model_flag),
             ("effort flag", &self.effort_flag),
@@ -587,6 +658,10 @@ impl CustomAdapter {
         ensure!(
             self.resume_args.is_none() || self.session.is_some(),
             "Custom adapter {name} resume_args needs a session (assign or reported)"
+        );
+        ensure!(
+            self.follow_up_args.is_none() || self.session.is_some(),
+            "Custom adapter {name} follow_up_args needs a session (assign or reported)"
         );
         Ok(())
     }
@@ -709,6 +784,7 @@ pub fn unknown_fields(value: &toml::Value) -> Vec<String> {
     let budget = keys(&Budget {
         max_usd: Some(1.0),
         max_tokens: Some(1),
+        on_exceed: BudgetAction::Warn,
     });
     let adapter = CustomAdapter {
         interactive_args: Some(vec![]),
@@ -716,6 +792,7 @@ pub fn unknown_fields(value: &toml::Value) -> Vec<String> {
         output: Some(CustomOutput::Text),
         session: Some(CustomSession::default()),
         resume_args: Some(vec![]),
+        follow_up_args: Some(vec![]),
         model_flag: Some(String::new()),
         effort_flag: Some(String::new()),
         prompt: Some(CustomPrompt::Mode(PromptMode::Arg)),
@@ -732,6 +809,8 @@ pub fn unknown_fields(value: &toml::Value) -> Vec<String> {
         sandbox_default: Sandbox::ByRole,
         // Saved only when not the default.
         max_parallel: 3,
+        protected_paths: vec!["x".into()],
+        handoff_repair: true,
         ..Workflow::default()
     });
     for (index, item) in value
@@ -845,6 +924,15 @@ impl Settings {
                 .budget
                 .validate(&format!("Workflow {}", workflow.name))?;
             ensure!(
+                workflow.protected_paths.len() <= 64
+                    && workflow
+                        .protected_paths
+                        .iter()
+                        .all(|p| !p.trim().is_empty() && !p.contains('\0')),
+                "Workflow {} protected_paths must contain at most 64 non-empty patterns without NUL",
+                workflow.name
+            );
+            ensure!(
                 (1..=16).contains(&workflow.max_parallel),
                 "Workflow {} max_parallel must be 1–16",
                 workflow.name
@@ -871,6 +959,29 @@ impl Settings {
                     "Stage {} needs a positive timeout",
                     stage.name
                 );
+                ensure!(
+                    stage.stall_timeout_seconds != Some(0),
+                    "Stage {} stall_timeout_seconds must be positive",
+                    stage.name
+                );
+                if stage.stall_timeout_seconds.is_some() {
+                    // A fan-out stage runs its candidates' harnesses.
+                    let harnesses: Vec<&str> = match &stage.fan_out {
+                        Some(fan_out) => fan_out
+                            .candidates
+                            .iter()
+                            .map(|c| c.harness.as_str())
+                            .collect(),
+                        None => vec![stage.harness.as_str()],
+                    };
+                    for harness in harnesses {
+                        ensure!(
+                            crate::adapters::streams(harness, &self.adapters),
+                            "Stage {} sets stall_timeout_seconds, but {harness} prints its output only when it exits, so a working stage would be stopped as stalled. Remove stall_timeout_seconds and rely on timeout_seconds",
+                            stage.name
+                        );
+                    }
+                }
                 ensure!(
                     stage.instructions.len() <= 8192,
                     "Stage instructions must be at most 8192 bytes"

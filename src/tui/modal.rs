@@ -211,6 +211,12 @@ pub(super) enum Ask {
     TestHarness {
         harnesses: Vec<String>,
     },
+    /// Apply a finished worktree run's patch into the project checkout.
+    ApplyWorktree {
+        run: String,
+        files: usize,
+        preview: String,
+    },
 }
 impl Ask {
     pub(super) fn text(&self, app: &App) -> AskText {
@@ -312,6 +318,11 @@ impl Ask {
                 "Discard changes?",
                 "This editor has changes that are not applied.".into(),
                 &[("y / Enter", "discard"), ("n / Esc", "keep editing")],
+            ),
+            Self::ApplyWorktree { preview, .. } => (
+                "Apply worktree changes?",
+                preview.clone(),
+                &[("y / Enter", "apply uncommitted"), ("n / Esc", "cancel")],
             ),
             Self::TestHarness { harnesses } => (
                 if harnesses.len() == 1 {
@@ -699,6 +710,29 @@ impl App {
                 self.ui.dialogs.pop();
             }
             Ask::TestHarness { harnesses } => self.start_harness_tests(harnesses.clone())?,
+            Ask::ApplyWorktree { run, files, .. } => {
+                let loaded = self.idle(run)?.clone();
+                let (_, outcome) = engine::apply_worktree(&loaded, false)?;
+                self.repo.checked = None;
+                match outcome {
+                    crate::fanout::Applied::Clean => {
+                        self.ui.message = format!(
+                            "Applied {files} file(s) from {run} into the checkout (uncommitted)."
+                        );
+                    }
+                    crate::fanout::Applied::Merged => {
+                        self.ui.message = format!(
+                            "Applied {files} file(s) from {run} into the checkout via 3-way merge (uncommitted)."
+                        );
+                    }
+                    crate::fanout::Applied::Conflict(paths) => {
+                        anyhow::bail!(
+                            "Could not apply {run} (conflicts in {}); checkout left unchanged",
+                            paths.join(", ")
+                        );
+                    }
+                }
+            }
             Ask::SaveAndExit | Ask::LeaveRunning => {}
         }
         Ok(DialogResult::Close)

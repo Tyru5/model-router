@@ -37,6 +37,23 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--session",
+        "S-1",
+        "Repair the handoff.\nLine two {session} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
     }
   },
   "unattended/model": {
@@ -91,6 +108,25 @@
           }
         ]
       ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "m-1",
+        "--session",
+        "S-1",
+        "Repair the handoff.\nLine two {session} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
       "files": [],
       "uses_output_schema": false
     }
@@ -149,6 +185,25 @@
       ],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "openrouter/m-1",
+        "--session",
+        "S-1",
+        "Repair the handoff.\nLine two {session} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
     }
   },
   "unattended/model+local-provider": {
@@ -203,6 +258,25 @@
           }
         ]
       ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "ollama/m-1",
+        "--session",
+        "S-1",
+        "Repair the handoff.\nLine two {session} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
       "files": [],
       "uses_output_schema": false
     }
@@ -261,6 +335,25 @@
       ],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "lmstudio/m-1",
+        "--session",
+        "S-1",
+        "Repair the handoff.\nLine two {session} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
     }
   },
   "unattended/model+effort": {
@@ -317,6 +410,25 @@
       ],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "m-1#high",
+        "--session",
+        "S-1",
+        "Repair the handoff.\nLine two {session} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
     }
   },
   "unattended/effort-only": {
@@ -337,6 +449,9 @@
       "env": [],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "error": "OpenCode selects a variant (effort) as part of the model; choose a model"
     }
   },
   "unattended/model+provider+effort": {
@@ -391,6 +506,25 @@
           }
         ]
       ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "openrouter/m-1#high",
+        "--session",
+        "S-1",
+        "Repair the handoff.\nLine two {session} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
       "files": [],
       "uses_output_schema": false
     }
@@ -486,6 +620,44 @@
       ],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "model-router-proxy/m-1",
+        "--session",
+        "S-1",
+        "Repair the handoff.\nLine two {session} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-proxy"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"proxy\",\"options\":{\"baseURL\":\"http://localhost:4000/v1\",\"apiKey\":\"{env:PROXY_KEY}\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
     }
   },
   "unattended/routed-keyless": {
@@ -561,6 +733,38 @@
                 "model"
               ],
               "value": "\"model-router-local/m-1\""
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "model-router-local/m-1",
+        "--session",
+        "S-1",
+        "Repair the handoff.\nLine two {session} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-local"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"local\",\"options\":{\"baseURL\":\"http://localhost:8000\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
             }
           }
         ]
@@ -660,6 +864,44 @@
       ],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "model-router-groq/m-1",
+        "--session",
+        "S-1",
+        "Repair the handoff.\nLine two {session} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "GROQ_API_KEY",
+          {
+            "var": "GROQ_API_KEY"
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-groq"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"groq\",\"options\":{\"baseURL\":\"https://api.groq.com/openai/v1\",\"apiKey\":\"{env:GROQ_API_KEY}\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
     }
   },
   "unattended/routed+effort": {
@@ -753,6 +995,44 @@
       ],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "model-router-proxy/m-1#high",
+        "--session",
+        "S-1",
+        "Repair the handoff.\nLine two {session} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-proxy"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"proxy\",\"options\":{\"baseURL\":\"http://localhost:4000/v1\",\"apiKey\":\"{env:PROXY_KEY}\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
     }
   },
   "unattended/provider-without-model": {
@@ -762,6 +1042,9 @@
     "session": null,
     "resumable": true,
     "resume": {
+      "error": "A provider override requires a model"
+    },
+    "follow_up": {
       "error": "A provider override requires a model"
     }
   },
@@ -804,6 +1087,27 @@
       "args": [
         "--session",
         "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "m-1",
+        "--variant",
+        "high",
+        "--session",
+        "S-1",
+        "Repair the handoff.\nLine two {session} $(x)"
       ],
       "stdin": null,
       "kind": "OpenCode",
@@ -893,6 +1197,44 @@
       ],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "model-router-proxy/m-1",
+        "--session",
+        "S-1",
+        "Repair the handoff.\nLine two {session} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [
+        [
+          "PROXY_KEY",
+          {
+            "var": "PROXY_KEY"
+          }
+        ],
+        [
+          "OPENCODE_CONFIG_CONTENT",
+          {
+            "json_insert": {
+              "path": [
+                "provider",
+                "model-router-proxy"
+              ],
+              "value": "{\"npm\":\"@ai-sdk/openai-compatible\",\"name\":\"proxy\",\"options\":{\"baseURL\":\"http://localhost:4000/v1\",\"apiKey\":\"{env:PROXY_KEY}\"},\"models\":{\"m-1\":{\"limit\":{\"context\":32768,\"output\":8192}}}}"
+            }
+          }
+        ]
+      ],
+      "files": [],
+      "uses_output_schema": false
     }
   },
   "unattended/old-version-default": {
@@ -926,6 +1268,23 @@
       "args": [
         "--session",
         "S-1"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--session",
+        "S-1",
+        "Repair the handoff.\nLine two {session} $(x)"
       ],
       "stdin": null,
       "kind": "OpenCode",
@@ -993,6 +1352,27 @@
       ],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "m-1",
+        "--extra-flag",
+        "v",
+        "--session",
+        "S-1",
+        "Repair the handoff.\nLine two {session} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
     }
   },
   "unattended/user-output-schema": {
@@ -1053,6 +1433,27 @@
       ],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "m-1",
+        "--output-schema",
+        "mine.json",
+        "--session",
+        "S-1",
+        "Repair the handoff.\nLine two {session} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": true
     }
   },
   "unattended/user-json-schema": {
@@ -1111,6 +1512,26 @@
       ],
       "files": [],
       "uses_output_schema": false
+    },
+    "follow_up": {
+      "program": "opencode",
+      "args": [
+        "run",
+        "--format",
+        "json",
+        "--model",
+        "m-1",
+        "--json-schema={}",
+        "--session",
+        "S-1",
+        "Repair the handoff.\nLine two {session} $(x)"
+      ],
+      "stdin": null,
+      "kind": "OpenCode",
+      "final_file": "$TMP/attempt/final.txt",
+      "env": [],
+      "files": [],
+      "uses_output_schema": false
     }
   },
   "unattended/unknown-setting": {
@@ -1120,6 +1541,9 @@
     "session": null,
     "resumable": true,
     "resume": {
+      "error": "opencode has no stage setting nope"
+    },
+    "follow_up": {
       "error": "opencode has no stage setting nope"
     }
   },

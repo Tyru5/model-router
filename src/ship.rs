@@ -52,6 +52,14 @@ pub struct Options {
     /// Commit files changed both before and during the run (with the user's
     /// earlier edits). Otherwise such files block the stage.
     pub include_preexisting: bool,
+    /// Scan added diff lines for high-confidence secrets before committing
+    /// (default true). Fails closed on any match.
+    pub secret_scan: bool,
+    /// Optional external secret scanner argv (no shell), e.g.
+    /// `["gitleaks", "protect", "--staged"]`. Requires project trust; fails
+    /// closed when missing or exiting non-zero.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_scanner: Vec<String>,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -65,6 +73,8 @@ impl Default for Options {
             confirm: true,
             include_untracked: true,
             include_preexisting: false,
+            secret_scan: true,
+            secret_scanner: vec![],
         }
     }
 }
@@ -88,6 +98,15 @@ impl Options {
                 .iter()
                 .any(|v| v.contains('\0')),
             "Ship options cannot contain NUL"
+        );
+        ensure!(
+            self.secret_scanner.len() <= 32
+                && self.secret_scanner.iter().all(|a| !a.contains('\0'))
+                && self
+                    .secret_scanner
+                    .first()
+                    .is_none_or(|p| !p.trim().is_empty()),
+            "Ship secret_scanner must be a non-empty command vector without NUL"
         );
         Ok(())
     }
@@ -144,6 +163,15 @@ pub struct Plan {
     /// The remote to push to.
     pub push: Option<String>,
     pub pr: Option<PullRequest>,
+    /// Whether built-in secret scanning runs again on the staged tree before commit.
+    #[serde(default = "default_true")]
+    pub secret_scan: bool,
+    /// External secret scanner command verified before commit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_scanner: Vec<String>,
+}
+fn default_true() -> bool {
+    true
 }
 
 /// What a ship did; saved as ship.json. With `error`, what it did before it
@@ -532,6 +560,43 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
             " (all skipped)"
         }
     );
+    let file_paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+    if !run.workflow.protected_paths.is_empty() {
+        let protected =
+            crate::policy::protected_matches(&run.workflow.protected_paths, &file_paths);
+        ensure!(
+            protected.is_empty(),
+            "Refusing to ship protected path(s): {}",
+            protected
+                .iter()
+                .map(|(path, pat)| format!("{path} (matches {pat})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if options.secret_scan || !options.secret_scanner.is_empty() {
+        // The same private index the commit is built from, in a scratch
+        // directory: the scans see exactly the planned files as they would
+        // be committed now, not skipped files or the user's own index.
+        let scratch = tempfile::Builder::new()
+            .prefix("ship-scan-")
+            .tempdir_in(&run.directory)
+            .context("Create a scratch directory for the ship scan")?;
+        let index = std::path::absolute(scratch.path().join("index"))?;
+        let tree = stage_planned(dir, &head, &files, &index)?;
+        scan_staged(
+            dir,
+            &Staged {
+                head: &head,
+                tree: &tree,
+                index: &index,
+                files: &files,
+            },
+            options.secret_scan,
+            &options.secret_scanner,
+            ("", "refusing to ship"),
+        )?;
+    }
     // Edits since the run's last attempt are committed as they are now.
     if let Some(now) = snapshot::tree(dir, &run.directory) {
         if now != end {
@@ -626,6 +691,8 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
         author: format!("{name} <{email}>"),
         push,
         pr,
+        secret_scan: options.secret_scan,
+        secret_scanner: options.secret_scanner.clone(),
     })
 }
 
@@ -753,6 +820,77 @@ pub fn apply(plan: &Plan, dir: &Path, mut log: impl FnMut(String)) -> Outcome {
     outcome
 }
 
+/// The planned paths, NUL-terminated, for `git update-index -z --stdin`.
+fn path_list(files: &[FileChange]) -> Vec<u8> {
+    let mut list = Vec::new();
+    for file in files {
+        list.extend_from_slice(file.path.as_bytes());
+        list.push(0);
+    }
+    list
+}
+
+/// A private Git index file, removed with its lock when dropped.
+struct PrivateIndex(PathBuf);
+impl Drop for PrivateIndex {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+        let mut lock = self.0.clone().into_os_string();
+        lock.push(".lock");
+        let _ = fs::remove_file(lock);
+    }
+}
+
+/// Stages exactly `files`, as they are in the working tree now, on top of
+/// `head` in the private index at `index` (replaced if present), and returns
+/// the tree. The user's own index is not read or written.
+fn stage_planned(work: &Path, head: &str, files: &[FileChange], index: &Path) -> Result<String> {
+    let _ = fs::remove_file(index);
+    let private = [("GIT_INDEX_FILE", index)];
+    exec("git", &["read-tree", head], work, &private)?;
+    exec_with(
+        "git",
+        &["update-index", "--add", "--remove", "-z", "--stdin"],
+        work,
+        &private,
+        Some(&path_list(files)),
+    )?;
+    exec("git", &["write-tree"], work, &private)
+}
+
+/// What a ship would commit: `tree` on top of `head`, staged in `index`.
+struct Staged<'a> {
+    head: &'a str,
+    tree: &'a str,
+    index: &'a Path,
+    files: &'a [FileChange],
+}
+
+/// The secret scans of a staged ship, the same at plan and at commit time.
+/// The built-in scan reads the whole diff from `head` to the staged tree,
+/// however large. The external scanner runs in the workspace with the
+/// planned paths and the private index (see `policy::run_external_scanner`).
+/// `wording` is where the secrets were found and what is refused.
+fn scan_staged(
+    work: &Path,
+    staged: &Staged<'_>,
+    builtin: bool,
+    scanner: &[String],
+    (found_in, refusing): (&str, &str),
+) -> Result<()> {
+    if builtin {
+        let mut scan = crate::policy::SecretScan::default();
+        snapshot::patch_lines(work, staged.head, staged.tree, |line| scan.line(line))
+            .context("Read the ship diff for the secret scan; refusing to ship unscanned")?;
+        scan.ensure_clean(found_in, refusing)?;
+    }
+    if !scanner.is_empty() {
+        let file_paths: Vec<String> = staged.files.iter().map(|f| f.path.clone()).collect();
+        crate::policy::run_external_scanner(work, scanner, &file_paths, staged.index)?;
+    }
+    Ok(())
+}
+
 fn apply_steps(
     plan: &Plan,
     dir: &Path,
@@ -767,29 +905,29 @@ fn apply_steps(
         short(&plan.head),
         short(&head)
     );
-    // Stage exactly the planned paths in a private index from HEAD.
-    let index = std::path::absolute(dir.join("ship.index"))?;
-    let _ = fs::remove_file(&index);
-    let private = [("GIT_INDEX_FILE", index.as_path())];
-    exec("git", &["read-tree", &head], work, &private)?;
-    let mut list = Vec::new();
-    for file in &plan.files {
-        list.extend_from_slice(file.path.as_bytes());
-        list.push(0);
-    }
-    exec_with(
-        "git",
-        &["update-index", "--add", "--remove", "-z", "--stdin"],
-        work,
-        &private,
-        Some(&list),
-    )?;
-    let tree = exec("git", &["write-tree"], work, &private)?;
-    let _ = fs::remove_file(&index);
+    // Stage exactly the planned paths in a private index from HEAD. It
+    // stays until the scans below have read it.
+    let index = PrivateIndex(std::path::absolute(dir.join("ship.index"))?);
+    let tree = stage_planned(work, &head, &plan.files, &index.0)?;
+    let head_tree = git(work, &["rev-parse", &format!("{head}^{{tree}}")])?;
     ensure!(
-        tree != git(work, &["rev-parse", &format!("{head}^{{tree}}")])?,
+        tree != head_tree,
         "The planned files match HEAD; nothing to commit"
     );
+    scan_staged(
+        work,
+        &Staged {
+            head: &head,
+            tree: &tree,
+            index: &index.0,
+            files: &plan.files,
+        },
+        plan.secret_scan,
+        &plan.secret_scanner,
+        (" in staged changes", "refusing to commit"),
+    )?;
+    drop(index);
+    let list = path_list(&plan.files);
     let message = std::path::absolute(dir.join("commit-message.txt"))?;
     let message = message.to_str().context("Attempt path must be UTF-8")?;
     // `commit-tree` ignores commit.gpgSign; honor it as `git commit` would.
