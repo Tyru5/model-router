@@ -63,6 +63,39 @@ cargo-dist builds Linux (x86_64/aarch64, static musl) and macOS
 `vX.Y.Z` tag is pushed. Release notes come from that version's section of
 [CHANGELOG.md](../CHANGELOG.md).
 
+The repository is private, so release assets on GitHub need a token.
+`.github/workflows/r2.yml` runs after each successful tag release (or by hand
+with a tag) and copies the `.tar.xz` archives and their `.sha256` files to a
+Cloudflare R2 bucket served on a public domain:
+
+```text
+install.sh                                    scripts/install.sh with the bucket URL filled in
+latest.txt                                    newest stable version, e.g. 0.2.0
+vX.Y.Z/model-router-<target>.tar.xz(.sha256)  one folder per release
+```
+
+Prerelease tags (`v1.0.0-rc.1`) get a folder but never move `install.sh` or
+`latest.txt`. `scripts/install.sh` picks the target from `uname`, downloads
+over HTTPS with curl or wget, checks the SHA-256, and installs `model-router`
+and an `mr` link into `$CARGO_HOME/bin` (default `~/.cargo/bin`). It accepts
+`--version X.Y.Z` and `--to DIR`, or `MODEL_ROUTER_VERSION`,
+`MODEL_ROUTER_INSTALL_DIR`, and `MODEL_ROUTER_DOWNLOAD_URL`. It leaves an
+existing `mr` that is not a link to `model-router` in place.
+
+The bucket is `model-router-downloads` in the Cloudflare account, served at
+`https://model-router.tiru5.me` (custom domain on the `tiru5.me` zone). The
+workflow defaults to that bucket, account, and URL; `R2_BUCKET` and
+`R2_ACCOUNT_ID` secrets and an `R2_PUBLIC_URL` variable override them.
+
+One-time setup:
+
+1. Cloudflare dashboard → R2 → Manage API tokens → create a token with Object
+   Read & Write on `model-router-downloads` only.
+2. Add its S3 credentials as repository secrets `R2_ACCESS_KEY_ID` and
+   `R2_SECRET_ACCESS_KEY`. The workflow skips with a notice until both are set.
+3. For a release that already exists, run the **R2 downloads** workflow by
+   hand with its tag.
+
 ## Amp orbs
 
 `.agents/setup` prepares fresh orbs: stable Rust (rustfmt, clippy), Rust 1.85,

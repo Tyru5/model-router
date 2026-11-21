@@ -1,0 +1,142 @@
+# Mirror a finished release to the Cloudflare R2 bucket behind the public
+# downloads domain. The repository is private, so GitHub release assets need a
+# token; scripts/install.sh installs from the bucket instead. Skipped until the
+# R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY secrets are set (docs/development.md).
+# Bucket model-router-downloads, served at https://model-router.tiru5.me.
+#
+# Bucket layout:
+#   install.sh                                   the installer, with R2_PUBLIC_URL filled in
+#   latest.txt                                   newest stable version, e.g. 0.2.0
+#   vX.Y.Z/model-router-<target>.tar.xz(.sha256) the dist archives for each release
+name: R2 downloads
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (e.g. v0.2.0)
+        required: true
+      make_latest:
+        description: Point latest.txt and install.sh at this release
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r2-downloads
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # Release also runs on pull requests; only tag pushes have a release.
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    env:
+      # Tag pushes report the tag as the run's head branch.
+      TAG: ${{ inputs.tag || github.event.workflow_run.head_branch }}
+      MAKE_LATEST: ${{ github.event_name != 'workflow_dispatch' || inputs.make_latest }}
+      PUBLIC_URL: ${{ vars.R2_PUBLIC_URL || 'https://model-router.tiru5.me' }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID || 'c485a751be12ae57e1d97370ee6b4e47' }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET || 'model-router-downloads' }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      # R2 rejects the checksum headers newer AWS CLIs send by default.
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+    steps:
+      - id: config
+        name: Check configuration
+        run: |
+          missing=()
+          for name in PUBLIC_URL R2_ACCOUNT_ID R2_BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            [ -n "${!name}" ] || missing+=("$name")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::notice::R2 publishing is not configured (missing ${missing[*]}); see docs/development.md"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Not a release tag: $TAG"
+            exit 1
+          fi
+          if [[ "$PUBLIC_URL" != https://* ]]; then
+            echo "::error::R2_PUBLIC_URL must start with https://"
+            exit 1
+          fi
+          # Prereleases get their own folder but never become latest.
+          if [[ "$TAG" == *-* ]]; then
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "latest=$MAKE_LATEST" >> "$GITHUB_OUTPUT"
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the release
+        if: steps.config.outputs.enabled == 'true'
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+
+      - name: Download release archives
+        if: steps.config.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist \
+            --pattern 'model-router-*.tar.xz' --pattern 'model-router-*.tar.xz.sha256'
+          cd dist
+          shopt -s nullglob
+          archives=(model-router-*.tar.xz)
+          [ ${#archives[@]} -gt 0 ] || { echo "::error::$TAG has no .tar.xz archives"; exit 1; }
+          for f in "${archives[@]}"; do
+            echo "$(cut -d ' ' -f 1 "$f.sha256")  $f" | sha256sum -c -
+          done
+
+      - name: Fill in the installer's download URL
+        if: steps.config.outputs.enabled == 'true'
+        run: |
+          url=${PUBLIC_URL%/}
+          sed "s|^DEFAULT_DOWNLOAD_URL=\"\"\$|DEFAULT_DOWNLOAD_URL=\"$url\"|" scripts/install.sh > dist-install.sh
+          grep -qx "DEFAULT_DOWNLOAD_URL=\"$url\"" dist-install.sh || { echo "::error::Could not set the URL in install.sh"; exit 1; }
+          sh -n dist-install.sh
+
+      - name: Upload to R2
+        if: steps.config.outputs.enabled == 'true'
+        env:
+          LATEST: ${{ steps.config.outputs.latest }}
+        run: |
+          s3=(aws s3 cp --only-show-errors --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com")
+          # Archives first, so latest.txt never names a version that is not there yet.
+          for f in dist/*; do
+            "${s3[@]}" "$f" "s3://$R2_BUCKET/$TAG/$(basename "$f")" \
+              --content-type "$([[ $f == *.sha256 ]] && echo text/plain || echo application/x-xz)" \
+              --cache-control "public, max-age=31536000, immutable"
+            echo "uploaded $TAG/$(basename "$f")"
+          done
+          if [ "$LATEST" != true ]; then
+            echo "Left install.sh and latest.txt unchanged"
+            exit 0
+          fi
+          "${s3[@]}" dist-install.sh "s3://$R2_BUCKET/install.sh" \
+            --content-type "text/x-shellscript; charset=utf-8" --cache-control no-cache
+          printf '%s\n' "${TAG#v}" > latest.txt
+          "${s3[@]}" latest.txt "s3://$R2_BUCKET/latest.txt" \
+            --content-type "text/plain; charset=utf-8" --cache-control no-cache
+          echo "latest is now ${TAG#v}"
+
+      - name: Check the public URLs
+        if: steps.config.outputs.enabled == 'true' && steps.config.outputs.latest == 'true'
+        run: |
+          url=${PUBLIC_URL%/}
+          curl -fsSI "$url/install.sh" > /dev/null
+          [ "$(curl -fsS "$url/latest.txt")" = "${TAG#v}" ]
+          curl -fsSI "$url/$TAG/model-router-x86_64-unknown-linux-musl.tar.xz" > /dev/null
+          echo "Install with: curl --proto '=https' --tlsv1.2 -LsSf $url/install.sh | sh"

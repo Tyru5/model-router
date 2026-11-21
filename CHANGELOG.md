@@ -7,6 +7,14 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ## [Unreleased]
 
+### Added
+
+- `scripts/install.sh`: installs `model-router` and `mr` on Linux or macOS from
+  the release download bucket, with SHA-256 verification, `--version`, and
+  `--to`. The **R2 downloads** workflow copies each release's archives to a
+  Cloudflare R2 bucket and uploads the installer there, since GitHub release
+  assets of the private repository need a token.
+
 ### Security
 
 - `serve --http`: enforce the 64 KiB header cap while reading lines, cap long-lived event streams and `wait_run` requests at 24 of the 32 authenticated connection slots so quick calls (`cancel_run`, `run_status`) stay runnable, and verify project trust once per call.
