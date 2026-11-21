@@ -7,6 +7,8 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-20
+
 ### Added
 
 - `init --detect`: detects installed harnesses on `PATH`, adapts starter or
@@ -95,7 +97,6 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   host process. Quitting asks whether to leave it running (TUI `q`, CLI `d`);
   the next `mr` (or `resume ID`) reattaches with the screen intact, or
   finishes the stage if the harness exited meanwhile.
-
 - Release builds for Linux (x86_64/aarch64, static musl) and macOS
   (x86_64/aarch64) via cargo-dist, with a shell installer, Homebrew formula,
   checksums, and an `mr` alias; `scripts/build.sh` and `just` recipes.
@@ -321,5 +322,6 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 - CI: format, clippy, tests on Linux and macOS, MSRV check, and terminal smoke
   tests.
 
-[Unreleased]: https://github.com/Tyru5/model-router/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Tyru5/model-router/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Tyru5/model-router/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Tyru5/model-router/releases/tag/v0.1.0
