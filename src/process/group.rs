@@ -342,23 +342,37 @@ fn carries_with_buffer(pid: u32, needle: &[u8], buffer: &mut [u8]) -> bool {
         return false;
     };
     let max = buffer.len();
-    let mut size = max;
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, id];
-    // SAFETY: the output buffer is `size` bytes long.
-    let read = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            3,
-            buffer.as_mut_ptr().cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    read == 0
-        && buffer[..size.min(max)]
-            .split(|&b| b == 0)
-            .any(|entry| entry == needle)
+    // Copying a live process's arguments fails with EIO for a few
+    // milliseconds at a time, more under load, and now and then with EINVAL,
+    // which a zombie also returns for good. Retry both, EINVAL briefly.
+    let deadline = std::time::Instant::now() + Duration::from_millis(100);
+    let mut einval_retries = 2;
+    loop {
+        let mut size = max;
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, id];
+        // SAFETY: the output buffer is `size` bytes long.
+        let read = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if read == 0 {
+            return buffer[..size.min(max)]
+                .split(|&b| b == 0)
+                .any(|entry| entry == needle);
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EIO) if std::time::Instant::now() < deadline => {}
+            Some(libc::EINVAL) if einval_retries > 0 => einval_retries -= 1,
+            _ => return false,
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

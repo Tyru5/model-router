@@ -35,6 +35,7 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 - Fix permanent `StatsCache` loading locks when switching projects, stale one-frame output search status, multi-line `Ask::ApplyWorktree` dialog truncation, and overflow-prone UI/duration calculations.
 - Harden process-group capture, interactive terminal-host teardown, and crash-recovery termination under signal and timeout races.
 - Detect TUI terminal hangup on macOS, where `poll` reports `POLLHUP` only when `POLLIN` is requested.
+- On macOS, retry reading a process group member's run marker when `sysctl(KERN_PROCARGS2)` fails briefly with `EIO` or `EINVAL`, so recovery and teardown no longer skip a leaderless group that is the run's own.
 
 ## [0.2.0] - 2026-11-20
 
