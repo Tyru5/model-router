@@ -173,9 +173,11 @@ impl Drop for PanicHook {
 #[cfg(unix)]
 fn any_disconnected<const N: usize>(fds: [std::os::unix::io::RawFd; N]) -> bool {
     const LOST: libc::c_short = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+    // macOS reports POLLHUP only for descriptors polled for input; Linux
+    // reports it regardless. Readable input alone is not a disconnect.
     let mut pollfds = fds.map(|fd| libc::pollfd {
         fd,
-        events: 0,
+        events: libc::POLLIN,
         revents: 0,
     });
     // SAFETY: `pollfds` points to `N` initialized `libc::pollfd` structs.

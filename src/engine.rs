@@ -1267,6 +1267,9 @@ mod tests {
 
     #[test]
     fn prompt_and_inspect_handoffs_emit_identical_exhausted_budget_pointer() {
+        // Enough prior stages that the budget runs out whatever the length
+        // of the temp paths in each excerpt (macOS's are much longer).
+        const STAGES: usize = 12;
         let dir = tempfile::tempdir().unwrap();
         let make_stage = |id: &str| Stage {
             id: id.into(),
@@ -1277,7 +1280,7 @@ mod tests {
         };
         let workflow = Workflow::new(
             "Budget",
-            (1..=7).map(|i| make_stage(&format!("s{i}"))).collect(),
+            (1..=STAGES).map(|i| make_stage(&format!("s{i}"))).collect(),
         );
         let settings = Settings {
             workflows: vec![workflow.clone()],
@@ -1295,22 +1298,22 @@ mod tests {
         let decisions: Vec<String> = (0..32)
             .map(|j| format!("decision {j:02}: {}", "x".repeat(120)))
             .collect();
-        for i in 0..6 {
+        for i in 0..STAGES - 1 {
             run.stages[i].status = Status::Complete;
             let mut handoff = Handoff::unstructured(long.clone());
             handoff.decisions = decisions.clone();
             run.stages[i].handoff = Some(handoff);
-            run.stages[i].inherited = Some(run.directory.join(format!("0{}-s{}", i + 1, i + 1)));
+            run.stages[i].inherited = Some(run.directory.join(format!("{:02}-s{}", i + 1, i + 1)));
         }
-        run.cursor = 6;
+        run.cursor = STAGES - 1;
         let handoff = run
             .workspace
             .join(".model-router/handoffs")
             .join(&run.id)
-            .join("s7-001.json");
+            .join(format!("s{STAGES}-001.json"));
         let schema = run
             .directory
-            .join("07-s7/attempt-001")
+            .join(format!("{STAGES:02}-s{STAGES}/attempt-001"))
             .join(handoff::SCHEMA_FILE);
         let direct = prompt(&run, &handoff, &schema);
         let inspection = inspect_handoffs(&run, None).unwrap();
@@ -1319,11 +1322,12 @@ mod tests {
             direct.contains("[omitted: prior handoff budget exhausted; full artifact at "),
             "{direct}"
         );
-        // Reverse order: s6..s1 -> s1 (last in inspection list) hits budget == 0.
-        assert_eq!(inspection.handoffs.len(), 6);
-        assert!(!inspection.handoffs[5].sent);
+        // Nearest stage first, so s1 (last in the list) has no budget left.
+        assert_eq!(inspection.handoffs.len(), STAGES - 1);
+        let oldest = inspection.handoffs.last().unwrap();
+        assert!(!oldest.sent);
         assert_eq!(
-            inspection.handoffs[5].reason.as_deref(),
+            oldest.reason.as_deref(),
             Some("prior handoff budget exhausted")
         );
     }

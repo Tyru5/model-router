@@ -24,6 +24,7 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 - Detect TUI PTY hangup without a controlling terminal via zero-timeout `poll` (`POLLHUP`/`POLLERR`/`POLLNVAL`), stopping active runs and restoring terminal modes across normal exit, error paths, and panics.
 - Fix permanent `StatsCache` loading locks when switching projects, stale one-frame output search status, multi-line `Ask::ApplyWorktree` dialog truncation, and overflow-prone UI/duration calculations.
 - Harden process-group capture, interactive terminal-host teardown, and crash-recovery termination under signal and timeout races.
+- Detect TUI terminal hangup on macOS, where `poll` reports `POLLHUP` only when `POLLIN` is requested.
 
 ## [0.2.0] - 2026-11-20
 
