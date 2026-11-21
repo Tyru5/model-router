@@ -69,9 +69,7 @@ review = args.role.startswith("review") or args.select is not None
 blocking = review and number <= args.review_fail_until
 handoff = {
     "summary": f"{args.role} evidence from model {args.model}, attempt {number}",
-    "verdict": "needs_changes"
-    if blocking
-    else ("pass" if review else "complete"),
+    "verdict": "needs_changes" if blocking else ("pass" if review else "complete"),
     "findings": [{"severity": "blocking", "description": "Mock required fix"}]
     if blocking
     else [],

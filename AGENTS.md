@@ -39,19 +39,21 @@ and fixtures. Keep them offline.
 
 ## Code map
 
-- `src/engine.rs`: runs, stages, attempts, repair loop, resume. The largest
-  module; most behaviour changes land here.
+- `src/engine.rs`, `src/engine/`: runs, stages, attempts, scheduling, prompts,
+  repair loop, recovery, apply, and resume. Most behaviour changes land here.
 - `src/harness/builtins.rs`: one `HarnessSpec` per built-in harness.
   `src/adapters.rs` builds argv/env/stdin from a spec.
-- `src/handoff.rs`: output normalization and handoff parsing.
-  `schema/handoff.schema.json` is the published schema.
-- `src/process.rs`, `src/process/host.rs`: process groups, PTYs, and the
-  terminal host process that lets interactive stages outlive `mr`.
-- `src/config.rs`, `src/trust.rs`, `src/sandbox.rs`, `src/ship.rs`: config
-  loading, project trust, OS sandbox, and the only code path that commits.
+- `src/handoff.rs`, `src/handoff/`: output normalization, usage extraction, and
+  handoff parsing. `schema/handoff.schema.json` is the published schema.
+- `src/process.rs`, `src/process/`: process groups, capture, PTYs, interactive
+  sessions, and the terminal host (`host.rs`) that lets interactive stages
+  outlive `mr`.
+- `src/config.rs`, `src/trust.rs`, `src/sandbox.rs`, `src/policy.rs`,
+  `src/ship.rs`: config loading, project trust, OS sandbox, protected paths and
+  secret scanning, and the only code path that commits.
 - `src/serve/`: MCP and HTTP server. `src/tui/`: the TUI (unit tests in
   `src/tui/tests.rs`).
-- `src/main.rs`: clap CLI.
+- `src/main.rs`, `src/cli/`: clap CLI and subcommand handlers.
 
 ## Invariants
 

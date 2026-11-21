@@ -4,7 +4,7 @@ Verified locally on Linux with Rust 1.100.0 (and MSRV 1.85).
 
 | Check | Result |
 | --- | --- |
-| `cargo test --locked --no-fail-fast` | 525 tests passed (0 failed, 2 ignored helper tests) |
+| `cargo test --locked --no-fail-fast` | 541 tests passed (0 failed, 2 ignored helper tests) |
 | `cargo clippy --all-targets --locked -- -D warnings` | Passed |
 | `cargo fmt --check` | Passed |
 | `cargo +1.85 check --all-targets --locked` (MSRV) | Passed |
@@ -41,7 +41,7 @@ History tests cover summary listing without run records, damaged records,
 filters, reruns from snapshots, attempt comparison, symlink-safe sizes, cleanup
 selection with held locks, the CLI commands, and the Runs page dialogs.
 
-All four workflow presets execute with offline harnesses in their defined order,
+All five workflow presets execute with offline harnesses in their defined order,
 passing the original task, stage instructions, and prior handoffs through each
 enabled stage. Review stages remain skipped by default. Required failed and
 unrun checks, and unstructured verification responses, stop execution before
@@ -92,7 +92,7 @@ This reproduces the former full-core CPU loop on terminal EOF. Crossterm's
 forwarder also cancels on hangup, invalid input descriptors, or EOF. Terminal cleanup and
 error reporting tolerate disconnected stdout/stderr.
 
-`scripts/smoke_themes.py` checks all 13 themes in a real terminal, including
+`scripts/smoke_themes.py` checks all 14 themes in a real terminal, including
 Ctrl+N/P previews, cancellation, saved preferences, repository switching,
 restart, startup colours, and recovery from invalid preferences. Rust tests
 cover failed saves, unchanged task/workflow contents, text contrast, and every
