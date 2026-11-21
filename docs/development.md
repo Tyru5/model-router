@@ -96,6 +96,13 @@ One-time setup:
 3. For a release that already exists, run the **R2 downloads** workflow by
    hand with its tag.
 
+## Website
+
+`site/` is the landing page: one static `index.html` and `icon.png`, no build
+step. The Vercel project `model-router` (team Tirus) is linked to this
+repository with root directory `site`, so a push to `main` that changes `site/`
+deploys it to production and other branches get preview deployments.
+
 ## Amp orbs
 
 `.agents/setup` prepares fresh orbs: stable Rust (rustfmt, clippy), Rust 1.85,

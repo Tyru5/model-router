@@ -1,0 +1,576 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Model Router: route each stage to the right agent</title>
+<meta name="description" content="Model Router sends one task through Codex, Claude Code, Gemini, Amp, or your own CLI, with the model you choose for every stage, and ends with a brief of what changed and how it was checked.">
+<meta name="theme-color" content="#163A30">
+<link rel="icon" href="/icon.png">
+<link rel="apple-touch-icon" href="/icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Overpass:wght@400;500;700;900&family=Overpass+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --deep:#163A30; --green:#1F4D3F; --board:#10302A; --route:#E8A82A;
+  --lamp:#E0503A; --go:#7BD99A; --enamel:#F4F5F0; --ink:#13261F; --rule:#CBD3C8; --muted:#4D6359;
+  --plate:#E4E8E0; --plate-lo:#CDD4CB;
+  /* the app's own Model Router theme, used only inside the terminal */
+  --t-bg:#0d1421; --t-fg:#dee7f2; --t-muted:#8da0b4; --t-acc:#4fd1c5; --t-line:#2e4156; --t-sel:#1d3d46;
+  --t-warn:#f6c15b; --t-red:#fa7e7e; --t-blue:#73b8ff; --t-vio:#a691f9;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;font-family:Overpass,system-ui,sans-serif;font-size:18px;line-height:1.55;color:var(--ink);background:var(--enamel);-webkit-font-smoothing:antialiased}
+a{color:inherit}
+:focus-visible{outline:3px solid var(--route);outline-offset:3px;border-radius:2px}
+code,kbd,pre,.mono{font-family:"Overpass Mono",ui-monospace,monospace}
+code{font-size:.88em}
+.wrap{max-width:1180px;margin:0 auto;padding:0 28px}
+section{padding:104px 0}
+h2{font-weight:900;font-size:clamp(32px,3.8vw,50px);line-height:1.02;letter-spacing:-.02em;margin:0 0 18px;max-width:20ch}
+.intro{font-size:20px;color:var(--muted);max-width:56ch;margin:0 0 44px}
+
+/* ---------- Hero ---------- */
+.hero{background:var(--deep);color:#EEF2EC;padding-bottom:72px}
+nav{display:flex;align-items:center;justify-content:space-between;padding:22px 0}
+.brand{display:flex;align-items:center;gap:12px;font-weight:900;font-size:20px;text-decoration:none;letter-spacing:-.01em}
+.brand img{width:36px;height:36px;border-radius:7px}
+nav ul{display:flex;gap:28px;list-style:none;margin:0;padding:0;font-weight:500;font-size:16px}
+nav ul a{text-decoration:none;opacity:.82}
+nav ul a:hover{opacity:1;text-decoration:underline;text-decoration-color:var(--route);text-underline-offset:5px}
+.lede{display:grid;grid-template-columns:1.25fr 1fr;gap:56px;align-items:end;padding:56px 0 48px}
+.lede>*{min-width:0}
+h1{font-weight:900;font-size:clamp(44px,6.2vw,86px);line-height:.97;letter-spacing:-.025em;margin:0;max-width:13ch}
+.lede p{font-size:20px;line-height:1.5;margin:0 0 26px;color:#CFDCD3;max-width:46ch}
+.install{display:flex;align-items:stretch;background:var(--board);border:2px solid #2B5E4D;border-radius:6px;overflow:hidden}
+.install code{flex:1;min-width:0;overflow-x:auto;padding:14px 16px;white-space:normal;overflow-wrap:anywhere;color:#F3E6C4;font-size:13px;line-height:1.6}
+.install button{flex-shrink:0;font:700 15px Overpass,sans-serif;background:var(--route);color:var(--ink);border:0;padding:0 18px;cursor:pointer}
+.install button:hover{background:#F2BC48}
+.lede .alt{margin:14px 0 0;font-size:16px;color:#AFC3B7}
+.alt code{color:#F3E6C4}
+
+.diagram{margin:0;background:var(--board);border:2px solid #2B5E4D;border-radius:8px;padding:20px 22px 14px}
+.diagram svg{display:block;width:100%;height:auto}
+.track{fill:none;stroke:var(--route);stroke-width:7;stroke-linecap:round}
+.track.siding{stroke-dasharray:14 10;opacity:.75}
+.sleepers{stroke:#2E6352;stroke-width:3}
+.stn text{fill:#EEF2EC;font-family:Overpass,sans-serif}
+.stn .name{font-weight:900;font-size:19px}
+.stn .who{font-size:14px;fill:#A9C1B4}
+.stn .post{stroke:#A9C1B4;stroke-width:3}
+.stn .lamp{fill:#4A2620;stroke:#0B221C;stroke-width:3;transition:fill .25s}
+.stn[data-state="warn"] .lamp{fill:var(--route)}
+.stn[data-state="go"] .lamp{fill:var(--go)}
+.stn.off text{opacity:.4}
+.terminus text{fill:#EEF2EC;font-weight:700;font-size:15px;font-family:Overpass,sans-serif}
+.siding-label{fill:#E8C77A;font-size:14px;font-family:Overpass,sans-serif;font-style:italic}
+#token rect{fill:#F4F5F0}
+#token circle{fill:var(--lamp)}
+.log{display:flex;gap:14px;align-items:baseline;border-top:2px solid #234F42;margin-top:10px;padding-top:12px;font-family:"Overpass Mono",monospace;font-size:14px;color:#D6E3DA;min-height:2.6em}
+.log b{color:var(--route);font-weight:600;white-space:nowrap}
+
+/* ---------- Set the line: patch bay ---------- */
+.rack{display:grid;grid-template-columns:1fr 360px;background:var(--deep);border-radius:10px;padding:14px;gap:14px}
+.rack>*{min-width:0}
+.panel{position:relative;background:linear-gradient(180deg,#EEF1EA,var(--plate) 45%,var(--plate-lo));border-radius:5px;padding:26px 34px 22px}
+.panel::before,.panel::after{content:"";position:absolute;width:10px;height:10px;border-radius:50%;background:radial-gradient(circle at 35% 35%,#f4f4f2,#8d918c);top:12px}
+.panel::before{left:12px}.panel::after{right:12px}
+.rowlabel{font-weight:700;font-size:14px;color:var(--muted);margin:0 0 12px}
+.jacks{display:flex;justify-content:space-between;gap:10px;position:relative;z-index:2}
+#p-stages{align-items:flex-end}
+.jack{all:unset;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:8px;width:100px;text-align:center}
+.jack .hole{width:40px;height:40px;border-radius:50%;background:radial-gradient(circle,#0b120f 0 9px,#2c3a34 10px 14px,#93a098 15px 17px,#c7cfc6 18px);box-shadow:0 1px 0 #fff8,inset 0 1px 2px #0006}
+.jack .name{font-weight:900;font-size:15.5px;line-height:1.15}
+.jack .sub{font-size:12.5px;color:var(--muted);font-family:"Overpass Mono",monospace;margin-top:-6px}
+#p-stages .sub{margin:-6px 0 2px}
+.jack .lampx{width:10px;height:10px;border-radius:50%;background:#4A2620;box-shadow:inset 0 1px 1px #0006}
+.jack.on .lampx{background:var(--go);box-shadow:0 0 8px var(--go)}
+.jack.armed .hole{box-shadow:0 0 0 4px var(--route),inset 0 1px 2px #0006}
+.jack:hover .hole{box-shadow:0 0 0 3px #0003,inset 0 1px 2px #0006}
+.jack:focus-visible{outline:none}
+.jack:focus-visible .hole{box-shadow:0 0 0 4px var(--route)}
+.gap{height:170px}
+.hint{margin:16px 0 0;font-size:15px;color:var(--muted);min-height:1.5em}
+svg.cables{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:3;overflow:visible}
+svg.cables path{fill:none;stroke-width:7;stroke-linecap:round}
+svg.cables path.shadow{stroke:#0003;stroke-width:9;transform:translate(2px,4px)}
+svg.cables circle{stroke:#0004;stroke-width:1.5}
+.readout{position:relative;background:var(--board);border-radius:5px;padding:18px 20px;color:#D6E3DA;font:400 13.5px/1.7 "Overpass Mono",monospace;overflow:auto;contain:size}
+.readout .ttl{display:flex;justify-content:space-between;color:#8FAA9C;border-bottom:1px solid #234F42;padding-bottom:8px;margin-bottom:10px;font-family:Overpass,sans-serif;font-size:14px}
+.readout pre{margin:0;white-space:pre-wrap}
+.readout .h{color:#7E978B}
+.readout .k{color:#BFD6C8}
+.readout .s{color:var(--route)}
+.readout .chg{background:#2B5E4D;border-radius:2px}
+
+/* ---------- Drive it from the keyboard ---------- */
+.drive{background:var(--board);color:#EEF2EC}
+.drive .intro{color:#B6CBBF}
+.term{background:var(--t-bg);color:var(--t-fg);border:1px solid #2B5E4D;border-radius:10px;overflow:hidden;box-shadow:0 30px 70px -30px #000}
+.term:focus-visible{outline:3px solid var(--route);outline-offset:4px}
+.chrome{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--t-line);background:#0b111c;font:400 12.5px "Overpass Mono",monospace;color:var(--t-muted)}
+.chrome i{width:11px;height:11px;border-radius:50%;background:#26354a}
+.chrome span{margin-left:10px}
+.chrome em{margin-left:auto;font-style:normal}
+.term.focused .chrome em{color:var(--t-acc)}
+.screen{font:400 14px/1.7 "Overpass Mono",monospace;padding:14px 18px 10px;min-height:470px;display:flex;flex-direction:column}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--t-line);margin-bottom:14px}
+.tabs button{all:unset;cursor:pointer;padding:4px 14px;color:var(--t-muted)}
+.tabs button[aria-selected="true"]{color:#06221f;background:var(--t-acc)}
+.tabs .wf{margin-left:auto;color:var(--t-muted);padding:4px 0}
+.view{flex:1;display:none}
+.view.on{display:block}
+.box{border:1px solid var(--t-line);padding:8px 12px;margin-bottom:12px;position:relative}
+.box>.lbl{position:absolute;top:-11px;left:10px;background:var(--t-bg);padding:0 6px;color:var(--t-muted)}
+.stages{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:12px}
+.stg{border:1px solid var(--t-line);padding:8px 10px;cursor:pointer;min-width:0}
+.stg b{display:block;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stg small{display:block;color:var(--t-muted);font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stg.off{opacity:.45}
+.stg.sel{border-color:var(--t-acc);background:var(--t-sel)}
+.stg.sel b{color:var(--t-acc)}
+.kv{display:grid;grid-template-columns:110px 1fr;gap:0 12px;margin:0}
+.kv dt{color:var(--t-muted)}
+.kv dd{margin:0}
+.t-acc{color:var(--t-acc)} .t-warn{color:var(--t-warn)} .t-red{color:var(--t-red)} .t-blue{color:var(--t-blue)} .t-vio{color:var(--t-vio)} .t-mut{color:var(--t-muted)}
+.runs{display:grid;grid-template-columns:260px 1fr;gap:14px}
+.side .r{padding:3px 8px;display:flex;justify-content:space-between;gap:8px;white-space:nowrap}
+.side .r span:first-child{overflow:hidden;text-overflow:ellipsis}
+.side .r.sel{background:var(--t-sel);color:var(--t-acc)}
+.out{border:1px solid var(--t-line);padding:8px 12px;height:360px;overflow:hidden;display:flex;flex-direction:column;justify-content:flex-end}
+.out div{white-space:pre-wrap}
+table.h{width:100%;border-collapse:collapse}
+table.h th{text-align:left;color:var(--t-muted);font-weight:400;border-bottom:1px solid var(--t-line);padding:2px 8px 4px 0}
+table.h td{padding:3px 8px 3px 0}
+.status{display:flex;gap:18px;border-top:1px solid var(--t-line);margin-top:10px;padding-top:6px;color:var(--t-muted);font-size:13px;flex-wrap:wrap}
+.status kbd{color:var(--t-acc);font-weight:600}
+.keybar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:18px 0 0;font-size:16px;color:#B6CBBF}
+.keybar button{font:500 14px "Overpass Mono",monospace;background:var(--deep);color:#EEF2EC;border:1.5px solid #2F6654;border-bottom-width:3px;border-radius:5px;padding:5px 10px;cursor:pointer}
+.keybar button:hover{border-color:var(--route)}
+.keybar button kbd{color:var(--route);margin-right:6px;font-weight:600}
+.modes{display:grid;grid-template-columns:repeat(3,1fr);margin-top:64px;border-top:2px solid #234F42}
+.modes>div{padding:26px 28px 0 0}
+.modes h3{margin:0 0 6px;font-size:21px;font-weight:900;letter-spacing:-.01em}
+.modes p{margin:0;font-size:16px;color:#B6CBBF}
+
+/* ---------- Interlocks ---------- */
+.frame{background:var(--green);color:#EEF2EC}
+.frame .intro{color:#BCD0C4}
+.levers{display:grid;grid-template-columns:repeat(3,1fr);border-top:2px solid #2F6654}
+.lever{display:grid;grid-template-columns:32px 1fr;gap:20px;align-items:start;padding:30px 28px 30px 0;border-bottom:2px solid #2F6654}
+.lever svg{width:32px;height:38px;display:block;margin-top:2px}
+.lever h3{margin:0 0 6px;font-size:21px;font-weight:900;letter-spacing:-.01em}
+.lever p{margin:0;font-size:16px;color:#C6D7CD}
+
+/* ---------- Harnesses and CLI ---------- */
+#cli .wrap{max-width:1260px}
+.board{display:grid;grid-template-columns:1fr 1.25fr;gap:64px;align-items:start}
+.board>*{min-width:0}
+.names{list-style:none;margin:0;padding:0;columns:2;column-gap:36px}
+.names li{font-weight:900;font-size:clamp(24px,2.6vw,34px);letter-spacing:-.02em;line-height:1.3;break-inside:avoid;border-bottom:2px solid var(--rule);padding:6px 0;display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;column-gap:12px}
+.names li span{font-weight:500;font-size:14px;color:var(--muted);letter-spacing:0}
+pre.cli{margin:0;background:var(--ink);color:#DDE7E0;border-radius:6px;padding:24px 26px;font-size:15px;line-height:1.75;overflow-x:auto}
+pre.cli .c{color:#7E978B}
+pre.cli .k{color:var(--route)}
+
+footer{border-top:2px solid var(--rule);padding:36px 0 56px;font-size:15px;color:var(--muted)}
+footer .wrap{display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap}
+footer a{margin-left:22px}
+
+@media (max-width:1000px){
+  .rack{grid-template-columns:1fr}
+  .readout{contain:none;max-height:420px}
+}
+@media (max-width:900px){
+  .lede,.board{grid-template-columns:1fr;gap:32px}
+  nav ul{display:none}
+  .diagram{overflow-x:auto}
+  .diagram svg{min-width:680px}
+  .stages{grid-template-columns:repeat(2,1fr)}
+  .runs{grid-template-columns:1fr}
+  .side{display:none}
+  .modes,.levers{grid-template-columns:1fr}
+  .names{columns:1}
+}
+@media (max-width:700px){
+  .panel{padding:24px 12px 18px}
+  .jacks{gap:2px}
+  .jack{width:auto;flex:1 1 0;min-width:0}
+  .jack .hole{transform:scale(.8)}
+  .jack .sub{display:none}
+  .jack .name{font-size:12.5px}
+  .keybar{font-size:14px}
+  .screen{font-size:12.5px;padding:12px 12px 8px}
+  .chrome span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .chrome em,.tabs .wf{display:none}
+  .tabs button{padding:4px 8px;white-space:nowrap}
+  .stages{grid-template-columns:1fr}
+}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="lever" viewBox="0 0 40 48">
+    <path d="M10 22 V14 a10 10 0 0 1 20 0 V22" fill="none" stroke="#C9D3CC" stroke-width="4.5" stroke-linecap="round"/>
+    <rect x="3" y="20" width="34" height="26" rx="5" fill="#E8A82A"/>
+    <circle cx="20" cy="31" r="3.5" fill="#0F2B24"/>
+    <rect x="18.4" y="32" width="3.2" height="7" rx="1.4" fill="#0F2B24"/>
+  </symbol>
+</svg>
+<header class="hero">
+  <div class="wrap">
+    <nav>
+      <a class="brand" href="#"><img src="/icon.png" alt="">Model Router</a>
+      <ul>
+        <li><a href="#line">Set the line</a></li>
+        <li><a href="#drive">Keyboard</a></li>
+        <li><a href="#safety">Safety</a></li>
+        <li><a href="#cli">CLI</a></li>
+      </ul>
+    </nav>
+
+    <div class="lede">
+      <h1>Route each stage of a task to the agent that does it best.</h1>
+      <div>
+        <p>Model Router sends one task through Codex, Claude Code, Gemini, Amp, or your own CLI, with the model you choose for every stage. It ends with a brief: what changed, how it was checked, and what to read closely.</p>
+        <div class="install">
+          <code id="cmd">curl -fsSL <span style="white-space:nowrap">https://model-router.tiru5.me/install.sh</span> | sh</code>
+          <button type="button" data-copy="#cmd">Copy</button>
+        </div>
+        <p class="alt">Then run <code>mr</code> in a repository. Linux and macOS.</p>
+      </div>
+    </div>
+
+    <figure class="diagram" aria-label="A task runs through Investigate, Implement, Review, and Review summary. Review asks for one repair pass, then passes.">
+      <svg viewBox="0 80 1000 245" role="img">
+        <title>The workflow as a track diagram</title>
+        <g class="sleepers" aria-hidden="true" id="sleepers"></g>
+        <path class="track siding" d="M640 210 C690 210 690 120 640 120 H380 C330 120 330 210 380 210"/>
+        <path class="track" d="M40 210 H960"/>
+        <text class="siding-label" x="510" y="106" text-anchor="middle">Repair pass when review asks for changes</text>
+        <g class="terminus"><circle cx="40" cy="210" r="11" fill="#F4F5F0"/><text x="40" y="250" text-anchor="middle">Task</text></g>
+        <g class="terminus"><rect x="950" y="196" width="22" height="28" rx="3" fill="#F4F5F0"/><text x="960" y="250" text-anchor="middle">Brief</text></g>
+        <g class="stn" data-x="200" data-id="research" data-msgs='["Investigate handed off: Retry-After is parsed, then dropped in schedule_next()."]'>
+          <line class="post" x1="200" y1="222" x2="200" y2="246"/><circle class="lamp" cx="200" cy="256" r="10"/>
+          <text class="name" x="200" y="292" text-anchor="middle">Investigate</text>
+          <text class="who" x="200" y="312" text-anchor="middle"></text>
+        </g>
+        <g class="stn" data-x="400" data-id="implement" data-msgs='["Implement opened in its own terminal. You exited; checks passed.","Repair pass: Implement fixes the blocking finding."]'>
+          <line class="post" x1="400" y1="222" x2="400" y2="246"/><circle class="lamp" cx="400" cy="256" r="10"/>
+          <text class="name" x="400" y="292" text-anchor="middle">Implement</text>
+          <text class="who" x="400" y="312" text-anchor="middle"></text>
+        </g>
+        <g class="stn" data-x="600" data-id="review" data-msgs='["Review: needs_changes. One blocking finding in retry.rs.","Review: pass. No blocking findings."]'>
+          <line class="post" x1="600" y1="222" x2="600" y2="246"/><circle class="lamp" cx="600" cy="256" r="10"/>
+          <text class="name" x="600" y="292" text-anchor="middle">Review</text>
+          <text class="who" x="600" y="312" text-anchor="middle"></text>
+        </g>
+        <g class="stn" data-x="800" data-id="summary" data-msgs='["Review summary wrote review.md: outcome, changes, verification, review focus."]'>
+          <line class="post" x1="800" y1="222" x2="800" y2="246"/><circle class="lamp" cx="800" cy="256" r="10"/>
+          <text class="name" x="800" y="292" text-anchor="middle">Review summary</text>
+          <text class="who" x="800" y="312" text-anchor="middle"></text>
+        </g>
+        <path id="route" d="M40 210 H640 C690 210 690 120 640 120 H380 C330 120 330 210 380 210 H960" fill="none" stroke="none"/>
+        <g id="token" transform="translate(40,210)"><rect x="-17" y="-11" width="34" height="22" rx="4"/><circle cx="9" cy="0" r="4"/></g>
+      </svg>
+      <figcaption class="log"><b>Run r-0418</b><span id="log" aria-live="polite">New task: webhook retries ignore the Retry-After header.</span></figcaption>
+    </figure>
+  </div>
+</header>
+
+<main>
+  <section id="line">
+    <div class="wrap">
+      <h2>Set the line: one agent per stage</h2>
+      <p class="intro">Investigate with one model, implement with another, review with a third. Pick a stage, then plug it into a different harness. The config, the diagram above, and the terminal below follow along.</p>
+      <div class="rack">
+        <div class="panel" id="panel">
+          <p class="rowlabel">Stages</p>
+          <div class="jacks" id="p-stages"></div>
+          <div class="gap"></div>
+          <div class="jacks" id="p-harnesses"></div>
+          <p class="rowlabel" style="margin:16px 0 0">Harnesses</p>
+          <p class="hint" id="hint" aria-live="polite">Select a stage, then a harness to repatch it.</p>
+          <svg class="cables" id="cables" aria-hidden="true"></svg>
+        </div>
+        <div class="readout" aria-label="Resulting workflow configuration">
+          <div class="ttl"><span>.model-router.toml</span><span>written by s in the TUI</span></div>
+          <pre id="toml"></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="drive" class="drive">
+    <div class="wrap">
+      <h2>Drive it from the keyboard</h2>
+      <p class="intro">Everything happens in one terminal. This is the real layout with your line from above. Click it and press <code>r</code>.</p>
+
+      <div class="term" id="tui" tabindex="0" role="application" aria-label="Interactive Model Router demo. Press 1, 2, or 3 to switch views, left and right arrows to select a stage, o to turn a stage on or off, r to run.">
+        <div class="chrome"><i></i><i></i><i></i><span>mr ~/src/payments-api</span><em id="focus-note">click to use keys</em></div>
+        <div class="screen">
+          <div class="tabs" role="tablist">
+            <button role="tab" aria-selected="true" data-view="0">1 Workflow</button>
+            <button role="tab" aria-selected="false" data-view="1">2 Runs</button>
+            <button role="tab" aria-selected="false" data-view="2">3 Harnesses</button>
+            <span class="wf">Feature development</span>
+          </div>
+          <div class="view on">
+            <div class="box"><span class="lbl">Task</span>Webhook retries ignore the Retry-After header. Respect it, cap at 10 minutes, add a test.</div>
+            <div class="stages" id="t-stages"></div>
+            <div class="box"><span class="lbl" id="t-stage-lbl">Stage</span><dl class="kv" id="t-stage-kv"></dl></div>
+          </div>
+          <div class="view">
+            <div class="runs">
+              <div class="side">
+                <div class="t-mut" style="margin-bottom:4px">Runs</div>
+                <div class="r sel"><span>r-0418 webhook retry</span><span id="run-state" class="t-mut">ready</span></div>
+                <div class="r"><span>r-0417 flaky ci test</span><span class="t-acc">done</span></div>
+                <div class="r"><span>r-0416 rate limiter</span><span class="t-warn">review</span></div>
+                <div class="r"><span>r-0415 docs: auth</span><span class="t-acc">done</span></div>
+                <div class="t-mut" style="margin:14px 0 4px">Stages</div>
+                <div id="run-stages"></div>
+              </div>
+              <div class="out" id="out" aria-live="polite"><div class="t-mut">Press r to start a run.</div></div>
+            </div>
+          </div>
+          <div class="view">
+            <table class="h">
+              <thead><tr><th>Harness</th><th>Status</th><th>Structured output</th><th>Used by</th></tr></thead>
+              <tbody id="t-harnesses"></tbody>
+            </table>
+            <p class="t-mut" style="margin:16px 0 0">Checked by model-router doctor. No model request was sent.</p>
+          </div>
+          <div class="status" id="status"></div>
+        </div>
+      </div>
+      <div class="keybar" aria-label="Demo keys">
+        Or press these:
+        <button data-key="1"><kbd>1</kbd>Workflow</button>
+        <button data-key="2"><kbd>2</kbd>Runs</button>
+        <button data-key="3"><kbd>3</kbd>Harnesses</button>
+        <button data-key="ArrowRight"><kbd>→</kbd>Next stage</button>
+        <button data-key="o"><kbd>o</kbd>Turn stage on or off</button>
+        <button data-key="r"><kbd>r</kbd>Run</button>
+      </div>
+
+      <div class="modes">
+        <div><h3>Unattended when it can be</h3><p>Research, review, and the closing brief run in the background with their own timeouts. You're notified when a run needs you.</p></div>
+        <div><h3>Interactive when it matters</h3><p>Implementation opens the harness's own terminal. Detach with <code>Ctrl+B</code>, quit <code>mr</code>, and come back to the same screen.</p></div>
+        <div><h3>Handoffs, not scrollback</h3><p>Each stage passes a structured summary, verdict, findings, and test evidence to the next.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="safety" class="frame">
+    <div class="wrap">
+      <h2>Interlocks you can't pull past</h2>
+      <p class="intro">The router coordinates agents. It doesn't take their keys, widen their permissions, or touch your Git history without asking. Each one stays locked until you take an explicit step to release it.</p>
+      <div class="levers">
+        <div class="lever"><svg viewBox="0 0 40 48" aria-hidden="true"><use href="#lever"/></svg><div><h3>No commits by default</h3><p>Only a ship stage commits, on a new branch, after you confirm a preview.</p></div></div>
+        <div class="lever"><svg viewBox="0 0 40 48" aria-hidden="true"><use href="#lever"/></svg><div><h3>Your logins stay yours</h3><p>No stored credentials. Provider keys are read from your environment at launch and redacted in every record.</p></div></div>
+        <div class="lever"><svg viewBox="0 0 40 48" aria-hidden="true"><use href="#lever"/></svg><div><h3>Native permissions</h3><p>Each harness keeps its own approval rules unless a stage explicitly overrides them.</p></div></div>
+        <div class="lever"><svg viewBox="0 0 40 48" aria-hidden="true"><use href="#lever"/></svg><div><h3>Trust before commands</h3><p>A repo's config can't run checks or custom adapters until you run <code>model-router trust</code>.</p></div></div>
+        <div class="lever"><svg viewBox="0 0 40 48" aria-hidden="true"><use href="#lever"/></svg><div><h3>No silent model swaps</h3><p>A failed stage stops and offers retry, a replacement model, or resume.</p></div></div>
+        <div class="lever"><svg viewBox="0 0 40 48" aria-hidden="true"><use href="#lever"/></svg><div><h3>Clean exits</h3><p>Every harness process group ends with its stage. Optional bubblewrap or sandbox-exec per stage.</p></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="cli">
+    <div class="wrap board">
+      <div>
+        <h2>Harnesses on the line</h2>
+        <p class="intro">Install and log in to the ones you use. <code>model-router doctor</code> checks what it finds without sending a request.</p>
+        <ul class="names">
+          <li>Codex <span>structured output</span></li>
+          <li>Claude Code <span>structured output</span></li>
+          <li>Gemini</li><li>Amp</li><li>Cursor</li><li>OpenCode</li>
+          <li>Aider</li><li>Goose</li><li>Copilot</li><li>Pi</li>
+          <li>omp</li><li>Your CLI <span>custom adapter</span></li>
+        </ul>
+      </div>
+      <pre class="cli"><span class="c"># try the whole flow offline, no model calls</span>
+cargo run -- --config examples/demo.toml
+
+<span class="c"># see exact commands, nothing launched</span>
+<span class="k">model-router</span> preview --task 'Respect Retry-After'
+
+<span class="c"># run it unattended in an isolated worktree</span>
+<span class="k">model-router</span> run --task-file spec.md --unattended --worktree
+
+<span class="c"># retry a stage with a different model</span>
+<span class="k">model-router</span> resume r-0418 --retry --model opus
+
+<span class="c"># read the brief and the diff</span>
+<span class="k">model-router</span> report r-0418 --diff
+
+<span class="c"># let other agents drive it</span>
+<span class="k">model-router</span> serve --mcp</pre>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Model Router. Rust 1.85+, Linux and macOS.</span>
+  </div>
+</footer>
+
+<script>
+const $=s=>document.querySelector(s);
+const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
+document.querySelectorAll('[data-copy]').forEach(b=>b.addEventListener('click',()=>{
+  navigator.clipboard?.writeText(document.querySelector(b.dataset.copy).textContent);
+  b.textContent='Copied';setTimeout(()=>b.textContent='Copy',1600);
+}));
+
+/* ---------- Shared line: one source for the diagram, patch bay, and terminal ---------- */
+const H=[
+  {id:'codex',name:'Codex',model:'gpt-6-astra',c:'#E8A82A',out:'native',status:'ready'},
+  {id:'claude',name:'Claude Code',model:'sonnet',c:'#1F4D3F',out:'native',status:'ready'},
+  {id:'gemini',name:'Gemini',model:'',c:'#E0503A',out:'handoff file',status:'ready'},
+  {id:'amp',name:'Amp',model:'high',c:'#3E9A66',out:'handoff file',status:'ready'},
+  {id:'opencode',name:'OpenCode',model:'',c:'#3B6FA8',out:'handoff file',status:'ready'},
+  {id:'aider',name:'Aider',model:'',c:'#9A6B3A',out:'handoff file',status:'not installed'},
+];
+const S=[
+  {id:'research',name:'Investigate',role:'research',mode:'unattended',h:'codex',m:'gpt-6-astra',on:true,ins:'Find the root cause and propose a plan. Do not change code.'},
+  {id:'implement',name:'Implement',role:'implementation',mode:'interactive',h:'claude',m:'sonnet',on:true,ins:'Implement using the prior findings. Run checks.'},
+  {id:'review',name:'Review',role:'review',mode:'unattended',h:'gemini',m:'',on:true,ins:'Return pass or needs_changes with blocking findings.'},
+  {id:'summary',name:'Review summary',role:'summary',mode:'unattended',h:'codex',m:'',on:true,ins:'Write the review brief from the handoffs and the diff.'},
+];
+const hx=id=>H.find(h=>h.id===id);
+const who=s=>`${hx(s.h).name}, ${s.m||'default model'}`;
+let changed=null;
+function renderAll(){drawDiagram();drawPatch();drawTui();}
+
+/* ---------- Hero track ---------- */
+const sl=$('#sleepers');
+for(let x=52;x<955;x+=22){const l=document.createElementNS('http://www.w3.org/2000/svg','line');l.setAttribute('x1',x);l.setAttribute('x2',x);l.setAttribute('y1',199);l.setAttribute('y2',221);sl.appendChild(l);}
+const path=$('#route'),tok=$('#token'),log=$('#log');
+const L=path.getTotalLength();
+const stations=[...document.querySelectorAll('.stn')].map(el=>({el,x:+el.dataset.x,id:el.dataset.id,msgs:JSON.parse(el.dataset.msgs),n:0}));
+const first=log.textContent;
+function drawDiagram(){stations.forEach(st=>{const s=S.find(s=>s.id===st.id);st.el.querySelector('.who').textContent=s.on?who(s):'disabled';st.el.classList.toggle('off',!s.on);});}
+function pass(st){
+  const s=S.find(s=>s.id===st.id);
+  if(!s.on){log.textContent=`${s.name} skipped: stage disabled.`;return}
+  st.n++;st.el.dataset.state=(st.id==='review'&&st.n===1)?'warn':'go';log.textContent=st.msgs[Math.min(st.n,st.msgs.length)-1];
+}
+if(reduced){
+  stations.forEach(s=>{s.el.dataset.state='go'});tok.setAttribute('transform','translate(960,210)');
+  log.textContent='Complete. Review summary wrote review.md after one repair pass.';
+}else{
+  let start=null,prevX=40;const speed=165;
+  function frame(t){
+    if(start===null)start=t;
+    const d=(t-start)/1000*speed;
+    if(d>L+speed*2.2){start=t;prevX=40;stations.forEach(s=>{s.n=0;s.el.dataset.state=''});log.textContent=first;}
+    const p=path.getPointAtLength(Math.min(d,L));
+    tok.setAttribute('transform',`translate(${p.x.toFixed(1)},${p.y.toFixed(1)})`);
+    const onMain=Math.abs(p.y-210)<.5;
+    if(onMain&&prevX!==null){for(const s of stations){if(prevX<s.x&&p.x>=s.x)pass(s);}}
+    prevX=onMain?p.x:null;
+    if(d>=L&&log.textContent.startsWith('Review summary'))log.textContent='Complete. Brief saved to .model-router/runs/r-0418/review.md';
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ---------- Patch bay ---------- */
+let armed=null;
+$('#p-stages').innerHTML=S.map(s=>`<button class="jack" data-s="${s.id}" aria-label="Stage ${s.name}"><span class="lampx"></span><span class="name">${s.name}</span><span class="sub">${s.mode}</span><span class="hole"></span></button>`).join('');
+$('#p-harnesses').innerHTML=H.map(h=>`<button class="jack" data-h="${h.id}" aria-label="Harness ${h.name}"><span class="hole"></span><span class="name">${h.name}</span><span class="sub">${h.model||'default'}</span></button>`).join('');
+function centre(el,box){const r=el.querySelector('.hole').getBoundingClientRect();return[r.left-box.left+r.width/2,r.top-box.top+r.height/2]}
+function drawPatch(){
+  const panel=$('#panel'),box=panel.getBoundingClientRect();
+  let out='';
+  S.forEach(s=>{
+    const a=centre(panel.querySelector(`[data-s="${s.id}"]`),box),b=centre(panel.querySelector(`[data-h="${s.h}"]`),box);
+    const dy=b[1]-a[1],d=`M${a[0]} ${a[1]} C${a[0]} ${a[1]+dy*.62} ${b[0]} ${b[1]-dy*.3} ${b[0]} ${b[1]}`,c=hx(s.h).c;
+    out+=`<path class="shadow" d="${d}"/><path d="${d}" style="stroke:${c}"/><circle cx="${a[0]}" cy="${a[1]}" r="9" style="fill:${c}"/><circle cx="${b[0]}" cy="${b[1]}" r="9" style="fill:${c}"/>`;
+  });
+  $('#cables').innerHTML=out;
+  document.querySelectorAll('[data-s]').forEach(el=>{const s=S.find(s=>s.id===el.dataset.s);el.classList.toggle('on',s.on);el.classList.toggle('armed',el.dataset.s===armed);});
+  const str=v=>`<span class="s">"${v}"</span>`;
+  $('#toml').innerHTML='<span class="h">[[workflows]]</span>\n<span class="k">name</span> = '+str('Feature development')+'\n<span class="k">max_repair_passes</span> = 2\n'+S.map(s=>{
+    const hl=s.id===changed?' class="chg"':'';
+    return `\n<span class="h">[[workflows.stages]]</span>\n<span class="k">id</span> = ${str(s.id)}\n<span class="k">role</span> = ${str(s.role)}\n<span class="k">enabled</span> = ${s.on}\n<span${hl}><span class="k">harness</span> = ${str(s.h)}\n<span class="k">model</span> = ${str(s.m)}</span>\n<span class="k">mode</span> = ${str(s.mode)}`;
+  }).join('\n');
+  const c=$('#toml .chg');if(c)c.closest('.readout').scrollTo({top:c.offsetTop-90,behavior:reduced?'auto':'smooth'});
+}
+document.querySelectorAll('[data-s]').forEach(el=>el.addEventListener('click',()=>{
+  armed=armed===el.dataset.s?null:el.dataset.s;
+  $('#hint').textContent=armed?`Now pick a harness for ${S.find(s=>s.id===armed).name}.`:'Select a stage, then a harness to repatch it.';
+  drawPatch();
+}));
+document.querySelectorAll('[data-h]').forEach(el=>el.addEventListener('click',()=>{
+  if(!armed){$('#hint').textContent='Pick a stage first, then the harness to send it to.';return}
+  const s=S.find(s=>s.id===armed),h=hx(el.dataset.h);s.h=h.id;s.m=h.model;changed=s.id;
+  $('#hint').textContent=`${s.name} now runs on ${h.name}. Nothing else changed.`;
+  armed=null;renderAll();
+}));
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&armed){armed=null;drawPatch();}});
+addEventListener('resize',drawPatch);
+
+/* ---------- Terminal ---------- */
+let view=0,sel=0,running=false;
+const esc=s=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+function drawTui(){
+  document.querySelectorAll('.tabs button').forEach((b,i)=>b.setAttribute('aria-selected',i===view));
+  document.querySelectorAll('.view').forEach((v,i)=>v.classList.toggle('on',i===view));
+  $('#t-stages').innerHTML=S.map((s,i)=>`<div class="stg ${s.on?'':'off'} ${i===sel?'sel':''}" data-i="${i}"><b>${i+1} ${s.name}</b><small>${hx(s.h).name} / ${s.m||'default'}</small><small>${s.on?s.mode:'disabled'}</small></div>`).join('');
+  const s=S[sel];
+  $('#t-stage-lbl').textContent=s.name;
+  $('#t-stage-kv').innerHTML=`<dt>Role</dt><dd>${s.role}</dd><dt>Harness</dt><dd class="t-acc">${hx(s.h).name}</dd><dt>Model</dt><dd>${s.m||'harness default'}</dd><dt>Mode</dt><dd>${s.mode}</dd><dt>Enabled</dt><dd class="${s.on?'t-acc':'t-red'}">${s.on?'yes':'no'}</dd><dt>Prompt</dt><dd class="t-mut">${esc(s.ins)}</dd>`;
+  $('#run-stages').innerHTML=S.map(s=>`<div class="r"><span>${s.name}</span><span class="${s.st==='done'?'t-acc':s.st==='live'?'t-warn':'t-mut'}">${s.on?(s.st||'waiting'):'off'}</span></div>`).join('');
+  $('#t-harnesses').innerHTML=H.map(h=>{const used=S.filter(s=>s.h===h.id).map(s=>s.name).join(', ');return `<tr><td>${h.name}</td><td class="${h.status==='ready'?'t-acc':'t-mut'}">${h.status}</td><td>${h.out}</td><td class="t-mut">${used}</td></tr>`}).join('');
+  const hints=[[['←→','stage'],['m','model'],['o','on/off'],['e','edit'],['r','run'],['?','keys']],[['↑↓','run'],['t','session'],['d','diff'],['h','handoff'],['y','retry']],[['Enter','details'],['c','settings']]][view];
+  $('#status').innerHTML=hints.map(([k,l])=>`<span><kbd>${k}</kbd> ${l}</span>`).join('')+'<span style="margin-left:auto">q quit</span>';
+}
+function line(html){const o=$('#out'),d=document.createElement('div');d.innerHTML=html;o.appendChild(d);while(o.children.length>18)o.firstChild.remove();}
+const wait=ms=>new Promise(r=>setTimeout(r,reduced?0:ms));
+function script(s){
+  const n=hx(s.h).name,m=s.m||'default model';
+  if(s.mode==='interactive')return[`<span class="t-mut">${n} / ${m}</span> <span class="t-vio">interactive</span>`,'<span class="t-warn">waiting for its terminal: t opens it, Ctrl+B detaches</span>','you exited the session','<span class="t-mut">check</span> cargo fmt --check <span class="t-acc">passed</span>','<span class="t-mut">check</span> cargo test --locked <span class="t-acc">passed</span>, 214 tests','<span class="t-acc">handoff</span> verdict=complete, 3 files changed'];
+  if(s.role==='research')return[`<span class="t-mut">${n} / ${m}, unattended</span>`,'reading src/webhooks/retry.rs','reading src/http/client.rs','<span class="t-acc">handoff</span> verdict=complete confidence=high','  Retry-After is parsed, then dropped in schedule_next()'];
+  if(s.role==='review')return[`<span class="t-mut">${n} / ${m}, unattended</span>`,'<span class="t-acc">handoff</span> verdict=pass, no blocking findings'];
+  return[`<span class="t-mut">${n} / ${m}, read-only</span>`,'git diff --stat','<span class="t-acc">wrote</span> .model-router/runs/r-0418/review.md'];
+}
+async function run(){
+  if(running)return;running=true;view=1;S.forEach(s=>s.st='');$('#out').innerHTML='';$('#run-state').textContent='running';$('#run-state').className='t-warn';drawTui();
+  line(`<span class="t-blue">run r-0418</span> Feature development, ${S.filter(s=>s.on).length} of ${S.length} stages enabled`);
+  for(const s of S){
+    if(!s.on){line(`<span class="t-mut">skip ${s.name}: stage disabled</span>`);continue;}
+    s.st='live';drawTui();line(`<b class="t-acc">▸ ${s.name}</b>`);
+    for(const l of script(s)){await wait(500);line('  '+l);}
+    s.st='done';drawTui();await wait(300);
+  }
+  line('<b class="t-acc">✓ complete</b> 7m 42s, est. $0.61. Press o for the brief, d for the diff.');
+  $('#run-state').textContent='done';$('#run-state').className='t-acc';running=false;
+}
+function key(k){
+  if(k==='1'||k==='2'||k==='3'){view=+k-1;drawTui();return true}
+  if(k==='ArrowRight'||k==='l'){view=0;sel=(sel+1)%S.length;drawTui();return true}
+  if(k==='ArrowLeft'||k==='h'){view=0;sel=(sel+S.length-1)%S.length;drawTui();return true}
+  if(k==='o'){view=0;if(!running){S[sel].on=!S[sel].on;renderAll();}return true}
+  if(k==='r'){run();return true}
+  return false;
+}
+const tui=$('#tui');
+tui.addEventListener('keydown',e=>{if(e.metaKey||e.ctrlKey||e.altKey)return;if(key(e.key))e.preventDefault();});
+tui.addEventListener('focus',()=>{tui.classList.add('focused');$('#focus-note').textContent='keys active';});
+tui.addEventListener('blur',()=>{tui.classList.remove('focused');$('#focus-note').textContent='click to use keys';});
+document.querySelectorAll('.keybar button').forEach(b=>b.addEventListener('click',()=>key(b.dataset.key)));
+document.querySelectorAll('.tabs button').forEach(b=>b.addEventListener('click',()=>{view=+b.dataset.view;drawTui();}));
+$('#t-stages').addEventListener('click',e=>{const t=e.target.closest('.stg');if(t){sel=+t.dataset.i;drawTui();}});
+
+renderAll();
+document.fonts.ready.then(drawPatch);
+</script>
+</body>
+</html>
