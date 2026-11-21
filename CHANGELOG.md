@@ -7,6 +7,8 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-21
+
 ### Added
 
 - `scripts/install.sh`: installs `model-router` and `mr` on Linux or macOS from
@@ -349,6 +351,7 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 - CI: format, clippy, tests on Linux and macOS, MSRV check, and terminal smoke
   tests.
 
-[Unreleased]: https://github.com/Tyru5/model-router/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Tyru5/model-router/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/Tyru5/model-router/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Tyru5/model-router/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Tyru5/model-router/releases/tag/v0.1.0
