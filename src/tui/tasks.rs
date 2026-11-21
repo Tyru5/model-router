@@ -3,11 +3,14 @@
 //! for; `App::update` applies it and drops results for an earlier project.
 use super::{
     app::{App, Opened, Started},
-    completion::Loaded,
-    modal::Modal,
+    completion::{CompletionKey, Loaded},
+    modal::{Ask, Modal},
     path_picker::FolderEntry,
 };
-use crate::{catalog::Catalog, doctor::Report, history::Entry, stats::Stats, storage::RepoInfo};
+use crate::{
+    catalog::Catalog, doctor::Report, engine::ApplyPlan, fanout::Applied, history::Entry,
+    stats::Stats, storage::RepoInfo,
+};
 use std::{
     panic::{self, AssertUnwindSafe},
     path::PathBuf,
@@ -47,8 +50,21 @@ pub(super) enum Msg {
     /// a project switch, like `Started`.
     Changes {
         run: String,
-        key: String,
+        key: CompletionKey,
         result: Result<Loaded, String>,
+    },
+    /// Planned worktree apply for confirmation; `ticket` guards cancellation.
+    ApplyPlan {
+        ticket: u64,
+        run: String,
+        result: Result<ApplyPlan, String>,
+    },
+    /// Completed worktree apply; `ticket` guards cancellation.
+    AppliedWorktree {
+        ticket: u64,
+        run: String,
+        files: usize,
+        result: Result<Applied, String>,
     },
     /// A folder read for the path picker reading with `ticket`.
     Folder {
@@ -158,7 +174,6 @@ impl Tasks {
         Some(received)
     }
     /// Whether tasks are still running or unread.
-    #[cfg(test)]
     pub(super) fn busy(&self) -> bool {
         self.spawner.outstanding.load(Ordering::Relaxed) > 0
     }
@@ -175,13 +190,13 @@ impl Spawner {
 
 impl App {
     /// Applies a background result. Results for an earlier project are
-    /// dropped, except a created run and a run's changes, which belong to
-    /// the run.
+    /// dropped, except a created run, a run's changes, and worktree apply
+    /// work, which belong to the run.
     pub(super) fn update(&mut self, generation: u64, msg: Msg) {
         let current = generation == self.tasks.generation();
-        self.ui.redraw = true;
         match msg {
             Msg::Started(result) => {
+                self.ui.redraw = true;
                 self.starting = false;
                 let started = result
                     .map_err(anyhow::Error::msg)
@@ -191,8 +206,57 @@ impl App {
                 }
             }
             Msg::Changes { run, key, result } => {
+                self.ui.redraw = true;
                 if let Some(slot) = self.session.runs.iter_mut().find(|s| s.run.id == run) {
                     slot.changes_read(&key, result);
+                }
+            }
+            Msg::ApplyPlan {
+                ticket,
+                run,
+                result,
+            } => {
+                if self.ui.take_loading(ticket) {
+                    self.ui.redraw = true;
+                    match result {
+                        Ok(plan) => self.ui.open(Modal::Ask(Box::new(Ask::ApplyWorktree {
+                            run,
+                            files: plan.files.len(),
+                            preview: plan.preview(),
+                        }))),
+                        Err(error) => self.ui.error(error),
+                    }
+                }
+            }
+            Msg::AppliedWorktree {
+                ticket,
+                run,
+                files,
+                result,
+            } => {
+                if self.ui.take_loading(ticket) {
+                    self.ui.redraw = true;
+                    match result {
+                        Ok(Applied::Clean) => {
+                            self.repo.checked = None;
+                            self.ui.message = format!(
+                                "Applied {files} file(s) from {run} into the checkout (uncommitted)."
+                            );
+                        }
+                        Ok(Applied::Merged) => {
+                            self.repo.checked = None;
+                            self.ui.message = format!(
+                                "Applied {files} file(s) from {run} into the checkout via 3-way merge (uncommitted)."
+                            );
+                        }
+                        Ok(Applied::Conflict(paths)) => {
+                            self.ui.error(format!(
+                                "Could not apply {run} (conflicts in {}); checkout left unchanged",
+                                paths.join(", ")
+                            ));
+                        }
+                        Err(error) => self.ui.error(error),
+                    }
                 }
             }
             _ if !current => {}
@@ -202,6 +266,7 @@ impl App {
                 ticket: Some(ticket),
                 result,
             } => {
+                self.ui.redraw = true;
                 if self.ui.take_loading(ticket) {
                     self.show_catalog_result(harness, result);
                 }
@@ -210,8 +275,12 @@ impl App {
                 harness,
                 ticket: None,
                 result,
-            } => self.catalog_read(harness, result),
+            } => {
+                self.ui.redraw = true;
+                self.catalog_read(harness, result);
+            }
             Msg::Checks(result) => {
+                self.ui.redraw = true;
                 let checks = &mut self.harnesses.checks;
                 checks.checking = false;
                 if std::mem::take(&mut checks.again) {
@@ -232,6 +301,7 @@ impl App {
                 }
             }
             Msg::Runs(result) => {
+                self.ui.redraw = true;
                 self.runs.loading = false;
                 match result {
                     Ok(entries) => self.runs.show(entries, &self.project),
@@ -241,16 +311,18 @@ impl App {
             Msg::Repo(result) => {
                 self.repo.reading = false;
                 self.repo.checked = Some(std::time::Instant::now());
-                // Read every few seconds; only a change needs a frame.
-                self.ui.redraw = false;
+                // Read periodically; only a change needs a frame.
                 if let Ok(info) = result {
-                    self.ui.redraw = info != self.repo.info;
-                    self.repo.info = info;
+                    if info != self.repo.info {
+                        self.repo.info = info;
+                        self.ui.redraw = true;
+                    }
                 }
             }
             // Esc closed the wait and went back to the browser.
             Msg::Opened { ticket, result } => {
                 if self.ui.take_loading(ticket) {
+                    self.ui.redraw = true;
                     self.project_opened(result.map_err(anyhow::Error::msg));
                 }
             }
@@ -260,17 +332,21 @@ impl App {
                     Modal::Import(importer) => importer.waits_for(ticket),
                     _ => false,
                 });
-                match dialog {
+                let applied = match dialog {
                     Some(Modal::Repositories(picker)) => picker.folder_read(ticket, result),
                     Some(Modal::Import(importer)) => importer.folder_read(ticket, result),
                     _ => false,
                 };
+                if applied {
+                    self.ui.redraw = true;
+                }
             }
             Msg::Imported { ticket, result } => {
                 for dialog in &mut self.ui.dialogs {
                     if let Modal::Import(importer) = dialog {
                         if importer.import_waits_for(ticket) {
                             importer.imported(ticket, result);
+                            self.ui.redraw = true;
                             break;
                         }
                     }
@@ -280,12 +356,18 @@ impl App {
                 project,
                 ticket,
                 result,
-            } => self.stats_collected(project, ticket, result),
+            } => {
+                self.ui.redraw = true;
+                self.stats_collected(project, ticket, result);
+            }
             Msg::HarnessTest {
                 batch,
                 harness,
                 result,
-            } => self.harness_tested(batch, harness, result),
+            } => {
+                self.ui.redraw = true;
+                self.harness_tested(batch, harness, result);
+            }
         }
     }
 }

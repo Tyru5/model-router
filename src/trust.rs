@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
@@ -34,8 +35,30 @@ pub struct Review {
     /// The project was trusted before, with different dangerous sections.
     pub changed: bool,
 }
+fn escape_control(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(char::is_control) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            for escaped in c.escape_default() {
+                out.push(escaped);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
+}
+
 impl Review {
     pub fn text(&self) -> String {
+        let config_path = self
+            .project
+            .join(".model-router.toml")
+            .display()
+            .to_string();
         let mut text = format!(
             "{} {} defines sections that run commands or send credentials:\n",
             if self.changed {
@@ -43,14 +66,15 @@ impl Review {
             } else {
                 "Untrusted project config:"
             },
-            self.project.join(".model-router.toml").display()
+            escape_control(&config_path)
         );
         for item in &self.items {
-            text.push_str(&format!("  - {item}\n"));
+            text.push_str(&format!("  - {}\n", escape_control(item)));
         }
+        let quoted_project = shell_words::quote(&self.project.display().to_string()).into_owned();
         text.push_str(&format!(
             "Review them, then run: model-router -C {} trust [--yes]\n",
-            shell_words::quote(&self.project.display().to_string())
+            escape_control(&quoted_project)
         ));
         text
     }
@@ -65,7 +89,7 @@ pub enum Trust {
 
 /// Whether a provider entry sends prompts or a key anywhere a preset would not.
 pub fn provider_needs_trust(name: &str, provider: &Provider) -> bool {
-    let preset = providers::builtins().remove(name);
+    let preset = providers::builtin(name);
     let host = |url: &str| {
         reqwest::Url::parse(url).ok().map(|u| {
             (
@@ -75,16 +99,16 @@ pub fn provider_needs_trust(name: &str, provider: &Provider) -> bool {
             )
         })
     };
-    let custom_key = |preset: Option<&Provider>| {
+    let custom_key = |preset: Option<(&'static str, &'static str)>| {
         !provider.api_key_env.is_empty()
-            && preset.is_none_or(|p| p.api_key_env != provider.api_key_env)
+            && preset.is_none_or(|(_, api_key_env)| api_key_env != provider.api_key_env)
     };
     if provider.base_url.is_empty() {
         // An opt-in to a preset: only a different key variable matters.
-        return custom_key(preset.as_ref());
+        return custom_key(preset);
     }
-    match &preset {
-        Some(p) if host(&p.base_url) == host(&provider.base_url) => custom_key(preset.as_ref()),
+    match preset {
+        Some((base_url, _)) if host(base_url) == host(&provider.base_url) => custom_key(preset),
         _ => true,
     }
 }
@@ -96,8 +120,16 @@ fn quoted(args: &[String]) -> String {
 /// Dangerous items in `settings`, described with their full values, so the
 /// digest changes whenever any of them does.
 pub fn dangerous(settings: &Settings) -> Vec<String> {
+    dangerous_parts(&settings.workflows, &settings.adapters, &settings.providers)
+}
+
+fn dangerous_parts(
+    workflows: &[Workflow],
+    adapters: &BTreeMap<String, CustomAdapter>,
+    providers: &BTreeMap<String, Provider>,
+) -> Vec<String> {
     let mut items = vec![];
-    for (name, adapter) in &settings.adapters {
+    for (name, adapter) in adapters {
         let mut line = format!("custom adapter {name}: {}", quoted(&adapter_argv(adapter)));
         if let Some(args) = &adapter.interactive_args {
             line.push_str(&format!("; interactive: {}", quoted(args)));
@@ -112,7 +144,7 @@ pub fn dangerous(settings: &Settings) -> Vec<String> {
         }
         items.push(line);
     }
-    for workflow in &settings.workflows {
+    for workflow in workflows {
         for stage in &workflow.stages {
             let at = format!("{} / {}", workflow.name, stage.id);
             for check in &stage.checks {
@@ -152,10 +184,10 @@ pub fn dangerous(settings: &Settings) -> Vec<String> {
             }
         }
     }
-    for (name, provider) in &settings.providers {
+    for (name, provider) in providers {
         if provider_needs_trust(name, provider) {
             let url = if provider.base_url.is_empty() {
-                providers::resolve(name, &settings.providers)
+                providers::resolve(name, providers)
                     .map(|p| p.base_url.clone())
                     .unwrap_or_default()
             } else {
@@ -179,7 +211,7 @@ pub fn dangerous(settings: &Settings) -> Vec<String> {
 /// no backend works. Tighter settings (a stricter mode, no network) are safe.
 fn sandbox_loosening(workflow: &Workflow, stage: &Stage, at: &str) -> Vec<String> {
     let mut items = vec![];
-    if downgrades_sandbox(workflow, stage) {
+    if downgrades_sandbox(workflow.sandbox_default, stage) {
         items.push(format!(
             "sandbox = {} in {at} (workflow default: {})",
             stage.effective_sandbox(workflow).label(),
@@ -200,9 +232,10 @@ fn sandbox_loosening(workflow: &Workflow, stage: &Stage, at: &str) -> Vec<String
 
 /// Whether the stage's own mode is looser than its workflow's default.
 /// `Sandbox` orders off < workspace-write < read-only.
-fn downgrades_sandbox(workflow: &Workflow, stage: &Stage) -> bool {
-    stage.sandbox.is_some()
-        && stage.effective_sandbox(workflow) < workflow.sandbox_default.resolve(stage.role)
+fn downgrades_sandbox(workflow_default: Sandbox, stage: &Stage) -> bool {
+    stage
+        .sandbox
+        .is_some_and(|mode| mode < workflow_default.resolve(stage.role))
 }
 
 /// A ship stage that commits (and maybe pushes) without showing its plan.
@@ -241,9 +274,8 @@ pub fn store_path() -> PathBuf {
     config::config_dir().join("trust.json")
 }
 
-fn read_store() -> Result<Store> {
-    let path = store_path();
-    match fs::read(&path) {
+fn read_store_at(path: &Path) -> Result<Store> {
+    match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .with_context(|| format!("Read trust store {}", path.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Store::default()),
@@ -251,21 +283,30 @@ fn read_store() -> Result<Store> {
     }
 }
 
-fn write_store(store: &Store) -> Result<()> {
-    let path = store_path();
+fn read_store() -> Result<Store> {
+    read_store_at(&store_path())
+}
+
+fn write_store_at(path: &Path, store: &Store) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    crate::storage::atomic_write(&path, serde_json::to_string_pretty(store)?.as_bytes())
+    crate::storage::atomic_write(path, serde_json::to_string_pretty(store)?.as_bytes())
+}
+
+fn write_store(store: &Store) -> Result<()> {
+    write_store_at(&store_path(), store)
+}
+
+fn lock_at(path: &Path) -> Result<crate::storage::FileLock> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    crate::storage::lock_wait(path, std::time::Duration::from_secs(2))
 }
 
 fn approval_lock() -> Result<crate::storage::FileLock> {
-    let directory = config::config_dir();
-    fs::create_dir_all(&directory)?;
-    crate::storage::lock_wait(
-        &directory.join("trust.lock"),
-        std::time::Duration::from_secs(2),
-    )
+    lock_at(&config::config_dir().join("trust.lock"))
 }
 
 fn key(project: &Path) -> String {
@@ -283,13 +324,14 @@ pub fn check(project: &Path, settings: &Settings) -> Trust {
         return Trust::Trusted;
     }
     let digest = digest(&items);
+    let project_key = key(project);
     let stored = read_store()
         .ok()
-        .and_then(|mut store| store.projects.remove(&key(project)));
+        .and_then(|mut store| store.projects.remove(&project_key));
     match stored {
         Some(entry) if entry.sha256 == digest => Trust::Trusted,
         stored => Trust::Untrusted(Review {
-            project: PathBuf::from(key(project)),
+            project: PathBuf::from(project_key),
             items,
             digest,
             changed: stored.is_some(),
@@ -298,8 +340,16 @@ pub fn check(project: &Path, settings: &Settings) -> Trust {
 }
 
 pub fn approve(review: &Review) -> Result<()> {
-    let _lock = approval_lock()?;
-    let mut store = read_store().unwrap_or_default();
+    approve_at(
+        &store_path(),
+        &config::config_dir().join("trust.lock"),
+        review,
+    )
+}
+
+fn approve_at(store_path: &Path, lock_path: &Path, review: &Review) -> Result<()> {
+    let _lock = lock_at(lock_path)?;
+    let mut store = read_store_at(store_path)?;
     store.projects.insert(
         key(&review.project),
         Entry {
@@ -307,7 +357,7 @@ pub fn approve(review: &Review) -> Result<()> {
             trusted_at: Utc::now(),
         },
     );
-    write_store(&store)
+    write_store_at(store_path, &store)
 }
 
 fn run_approvals(project: &Path) -> PathBuf {
@@ -317,8 +367,16 @@ fn run_approvals(project: &Path) -> PathBuf {
 }
 
 fn snapshot_items(settings: &Settings) -> Vec<String> {
-    let mut items = dangerous(settings);
-    for workflow in &settings.workflows {
+    snapshot_items_parts(&settings.workflows, &settings.adapters, &settings.providers)
+}
+
+fn snapshot_items_parts(
+    workflows: &[Workflow],
+    adapters: &BTreeMap<String, CustomAdapter>,
+    providers: &BTreeMap<String, Provider>,
+) -> Vec<String> {
+    let mut items = dangerous_parts(workflows, adapters, providers);
+    for workflow in workflows {
         for stage in &workflow.stages {
             items.push(format!(
                 "execution policy in {} / {}: harness {}; sandbox {}; network {}; native settings {:?}; candidate harnesses {:?}",
@@ -337,16 +395,15 @@ fn snapshot_items(settings: &Settings) -> Vec<String> {
 }
 
 fn run_items(run: &crate::engine::Run) -> Vec<String> {
-    snapshot_items(&Settings {
-        workflows: vec![run.workflow.clone()],
-        adapters: run.adapters.clone(),
-        providers: run.providers.clone(),
-        ..Settings::default()
-    })
+    snapshot_items_parts(
+        std::slice::from_ref(&run.workflow),
+        &run.adapters,
+        &run.providers,
+    )
 }
 
 pub fn settings_approval(settings: &Settings) -> String {
-    digest(&snapshot_items(&restore(settings)))
+    digest(&snapshot_items(&restore_cow(settings)))
 }
 
 /// Settings constructed by an API caller are already authorized. Loaded
@@ -384,12 +441,16 @@ pub fn approve_run(
 
 fn write_run_approval(run: &crate::engine::Run) -> Result<()> {
     let items = run_items(run);
+    write_run_approval_items(&run.project, &run.id, &items)
+}
+
+fn write_run_approval_items(project: &Path, id: &str, items: &[String]) -> Result<()> {
     if items.is_empty() {
         return Ok(());
     }
-    let directory = run_approvals(&run.project);
+    let directory = run_approvals(project);
     fs::create_dir_all(&directory)?;
-    crate::storage::atomic_write(&directory.join(&run.id), digest(&items).as_bytes())
+    crate::storage::atomic_write(&directory.join(id), digest(items).as_bytes())
 }
 
 /// Replays must authorize the snapshot, not merely the current project TOML.
@@ -435,7 +496,7 @@ fn authorize_run_locked(run: &crate::engine::Run, explicit: Option<&Path>) -> Re
     if loaded.trust == Trust::Trusted {
         let approved = snapshot_items(&loaded.settings);
         if items.iter().all(|item| approved.contains(item)) {
-            return write_run_approval(run);
+            return write_run_approval_items(&run.project, &run.id, &items);
         }
     }
     anyhow::bail!(
@@ -514,16 +575,13 @@ pub fn ignore(settings: &mut Settings) {
         }
     }
     for workflow in &mut settings.workflows {
-        let default = Workflow {
-            stages: vec![],
-            ..workflow.clone()
-        };
+        let default = workflow.sandbox_default;
         for stage in &mut workflow.stages {
             let escalated: BTreeMap<String, String> = harness_settings::escalations(stage)
                 .into_iter()
                 .map(|(k, v)| (k.to_owned(), v.to_owned()))
                 .collect();
-            let downgraded = downgrades_sandbox(&default, stage);
+            let downgraded = downgrades_sandbox(default, stage);
             let ship_unconfirmed = unconfirmed_ship(stage);
             let ship_no_secret_scan = stage.role == config::Role::Ship
                 && stage.ship.as_ref().is_some_and(|s| !s.secret_scan);
@@ -587,11 +645,11 @@ pub fn ignore(settings: &mut Settings) {
 }
 
 /// Settings to save: ignored sections restored where the user left them empty.
-pub fn restore(settings: &Settings) -> Settings {
-    let mut saved = settings.clone();
+pub(crate) fn restore_cow(settings: &Settings) -> Cow<'_, Settings> {
     let Some(ignored) = &settings.ignored else {
-        return saved;
+        return Cow::Borrowed(settings);
     };
+    let mut saved = settings.clone();
     for (name, original) in &ignored.adapters {
         if let Some(adapter) = saved.adapters.get_mut(name) {
             if adapter.command == BLOCKED_COMMAND {
@@ -648,7 +706,12 @@ pub fn restore(settings: &Settings) -> Settings {
         }
     }
     saved.ignored = None;
-    saved
+    Cow::Owned(saved)
+}
+
+/// Settings to save: ignored sections restored where the user left them empty.
+pub fn restore(settings: &Settings) -> Settings {
+    restore_cow(settings).into_owned()
 }
 
 #[cfg(test)]
@@ -874,5 +937,44 @@ mod tests {
             error.contains("changed since this run was approved"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn review_text_escapes_control_and_ansi_sequences() {
+        let review = Review {
+            project: PathBuf::from("/tmp/proj\x1b[31m"),
+            items: vec![
+                "check in W / S: echo \x1b[1A\x1b[2K\rfake".into(),
+                "workflow line1\n  - injected line\u{009b}2J".into(),
+            ],
+            digest: "0".repeat(64),
+            changed: false,
+        };
+        let rendered = review.text();
+        assert!(
+            !rendered.chars().any(|c| c.is_control() && c != '\n'),
+            "{rendered:?}"
+        );
+        assert!(rendered.contains("\\u{1b}[2K"), "{rendered}");
+        assert!(rendered.contains("\\r"), "{rendered}");
+        assert!(rendered.contains("\\n  - injected line"), "{rendered}");
+        assert_eq!(rendered.lines().count(), 4, "{rendered}");
+    }
+
+    #[test]
+    fn approve_preserves_corrupt_store_instead_of_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("trust.json");
+        let lock = dir.path().join("trust.lock");
+        fs::write(&store, "{not valid json").unwrap();
+        let review = Review {
+            project: dir.path().to_path_buf(),
+            items: vec!["check in w / s: true".into()],
+            digest: "a".repeat(64),
+            changed: false,
+        };
+        let result = approve_at(&store, &lock, &review);
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&store).unwrap(), "{not valid json");
     }
 }

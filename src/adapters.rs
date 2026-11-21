@@ -164,14 +164,16 @@ impl Invocation {
 
 pub fn executable(program: &str) -> Option<PathBuf> {
     fn usable(path: &Path) -> bool {
-        if !path.is_file() {
+        let Ok(meta) = fs::metadata(path) else {
+            return false;
+        };
+        if !meta.is_file() {
             return false;
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            path.metadata()
-                .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+            meta.permissions().mode() & 0o111 != 0
         }
         #[cfg(not(unix))]
         {
@@ -366,11 +368,10 @@ pub const OUTPUT_SCHEMA_FILE: &str = "output-schema.json";
 
 /// Whether the invocation asks its harness for schema-constrained output.
 pub fn uses_output_schema(invocation: &Invocation) -> bool {
-    let flags: Vec<&str> = harness::SPECS
+    harness::SPECS
         .iter()
         .filter_map(|spec| spec.structured.map(|s| s.flag))
-        .collect();
-    invocation.args.iter().any(|a| flags.contains(&a.as_str()))
+        .any(|flag| invocation.args.iter().any(|a| a == flag))
 }
 
 /// Whether the harness is older than `major`. Unknown versions count as
@@ -401,7 +402,7 @@ pub fn validate_options(stage: &Stage, configured: &BTreeMap<String, Provider>) 
     // only the router defines would fail inside the harness.
     if spec.is_some_and(|s| s.routing == Routing::Registry)
         && configured.contains_key(&stage.provider)
-        && !providers::builtins().contains_key(&stage.provider)
+        && providers::builtin(&stage.provider).is_none()
     {
         bail!(
             "{harness} cannot use provider {provider}: it is defined only in model-router's [providers.{provider}], and {harness} uses its own provider registry. Define it in {harness}'s models.json, or choose a provider listed by `model-router models {harness}`",
@@ -509,8 +510,10 @@ pub fn resume(
             Launch::Resume(session),
         );
     }
-    let spec = harness::get(&stage.harness).context("Unknown adapter")?;
-    let plan = spec.resume.context("Not resumable")?;
+    let plan = harness::get(&stage.harness)
+        .context("Unknown adapter")?
+        .resume
+        .context("Not resumable")?;
     let stage = Stage {
         mode: Mode::Interactive,
         effort: if plan.keep_effort {
@@ -520,25 +523,14 @@ pub fn resume(
         },
         ..stage.clone()
     };
-    let mut invocation = build(&stage, custom, configured, "", paths)?;
-    invocation.assign = None;
-    let fill = |items: &[&str]| -> Vec<String> {
-        items
-            .iter()
-            .map(|item| expand(item, &[("{session}", session.to_owned())]))
-            .collect()
-    };
-    let args = &mut invocation.args;
-    // Interactive builds end with the prompt (Pi, omp: its @file); the session replaces it.
-    args.pop();
-    match plan.replace {
-        Some(items) => *args = fill(items),
-        None => {
-            args.splice(0..0, fill(plan.prepend));
-            args.extend(fill(plan.append));
-        }
-    }
-    Ok(invocation)
+    build_inner(
+        &stage,
+        custom,
+        configured,
+        "",
+        paths,
+        Launch::Resume(session),
+    )
 }
 
 /// Whether the harness's unattended output arrives while it works. False
@@ -723,14 +715,14 @@ fn build_inner(
         prompt,
         paths,
         legacy,
-        follow_up,
+        launch,
     )?;
     Ok(invocation)
 }
 
 /// Builds a built-in harness's invocation from its spec; `legacy` selects
-/// its version override. With `follow_up`, its template and prompt replace
-/// the mode's, and `{session}` expands to the session.
+/// its version override. With `Launch::FollowUp`, its template and prompt
+/// replace the mode's, and `{session}` expands to the session.
 #[allow(clippy::too_many_arguments)]
 fn build_spec(
     spec: &HarnessSpec,
@@ -741,10 +733,14 @@ fn build_spec(
     prompt: &str,
     paths: &ContextPaths<'_>,
     legacy: bool,
-    follow_up: Option<(harness::FollowUp, &str)>,
+    launch: Launch<'_>,
 ) -> Result<()> {
     let interactive = stage.mode == Mode::Interactive;
     invocation.kind = spec.output;
+    let follow_up = match (launch, spec.follow_up) {
+        (Launch::FollowUp(session), Some(plan)) => Some((plan, session)),
+        _ => None,
+    };
     let (parts, prompt_pass, effort_pass) = match follow_up {
         Some((plan, _)) => (plan.args, plan.prompt, spec.template(false, legacy).2),
         None => spec.template(interactive, legacy),
@@ -833,9 +829,9 @@ fn build_spec(
                 for item in items {
                     args.push(if item.contains("{final_file}") {
                         let file = utf8(&invocation.final_file, "Output")?;
-                        expand(item, &[("{final_file}", file)])
+                        expand(item, &[("{final_file}", &file)])
                     } else if follow_up.is_some() && item.contains("{session}") {
-                        expand(item, &[("{session}", session.to_owned())])
+                        expand(item, &[("{session}", session)])
                     } else {
                         (*item).to_owned()
                     });
@@ -909,6 +905,7 @@ fn build_spec(
                 }
             }
             Part::Extra => args.extend(extra_args.iter().cloned()),
+            Part::Prompt if matches!(launch, Launch::Resume(_)) => {}
             Part::Prompt => match prompt_pass {
                 Prompt::Stdin => invocation.stdin = Some(prompt.into()),
                 Prompt::StdinArg(arg) => {
@@ -947,6 +944,22 @@ fn build_spec(
                         },
                     ));
                 }
+            }
+        }
+    }
+    if let (Launch::Resume(session), Some(plan)) = (launch, spec.resume) {
+        invocation.assign = None;
+        let fill = |items: &[&str]| -> Vec<String> {
+            items
+                .iter()
+                .map(|item| expand(item, &[("{session}", session)]))
+                .collect()
+        };
+        match plan.replace {
+            Some(items) => args = fill(items),
+            None => {
+                args.splice(0..0, fill(plan.prepend));
+                args.extend(fill(plan.append));
             }
         }
     }
@@ -1037,24 +1050,24 @@ fn build_custom(
         Launch::Resume(session) | Launch::FollowUp(session) => session,
         Launch::New => "",
     };
+    let prompt_file = paths.prompt_file.display().to_string();
+    let handoff_file = paths.handoff_file.display().to_string();
+    let workspace = paths.workspace.display().to_string();
+    let run_dir = paths.attempt_dir.display().to_string();
+    let base_url = routed.map_or("", |p| p.base_url.as_str());
+    let api_key_env = routed.map_or("", |p| p.api_key_env.as_str());
     let values = [
-        ("{prompt}", prompt.to_owned()),
-        ("{model}", stage.model.clone()),
-        ("{provider}", stage.provider.clone()),
-        ("{effort}", stage.effort.clone()),
-        ("{prompt_file}", paths.prompt_file.display().to_string()),
-        ("{handoff_file}", paths.handoff_file.display().to_string()),
-        ("{workspace}", paths.workspace.display().to_string()),
-        ("{run_dir}", paths.attempt_dir.display().to_string()),
-        (
-            "{base_url}",
-            routed.map(|p| p.base_url.clone()).unwrap_or_default(),
-        ),
-        (
-            "{api_key_env}",
-            routed.map(|p| p.api_key_env.clone()).unwrap_or_default(),
-        ),
-        ("{session}", session.to_owned()),
+        ("{prompt}", prompt),
+        ("{model}", stage.model.as_str()),
+        ("{provider}", stage.provider.as_str()),
+        ("{effort}", stage.effort.as_str()),
+        ("{prompt_file}", prompt_file.as_str()),
+        ("{handoff_file}", handoff_file.as_str()),
+        ("{workspace}", workspace.as_str()),
+        ("{run_dir}", run_dir.as_str()),
+        ("{base_url}", base_url),
+        ("{api_key_env}", api_key_env),
+        ("{session}", session),
     ];
     let a = &mut invocation.args;
     a.extend(template.iter().map(|arg| expand(arg, &values)));
@@ -1209,19 +1222,21 @@ fn opencode_provider_env(stage: &Stage, provider: &Provider) -> (String, EnvValu
 }
 
 /// Expand only tokens present in the template, never tokens introduced by user input.
-fn expand(template: &str, values: &[(&str, String)]) -> String {
-    let mut output = String::new();
+fn expand(template: &str, values: &[(&str, &str)]) -> String {
+    let mut output = String::with_capacity(template.len());
     let mut rest = template;
-    while !rest.is_empty() {
+    while let Some(brace) = rest.find('{') {
+        output.push_str(&rest[..brace]);
+        rest = &rest[brace..];
         if let Some((key, value)) = values.iter().find(|(key, _)| rest.starts_with(*key)) {
             output.push_str(value);
             rest = &rest[key.len()..];
         } else {
-            let c = rest.chars().next().unwrap();
-            output.push(c);
-            rest = &rest[c.len_utf8()..];
+            output.push('{');
+            rest = &rest[1..];
         }
     }
+    output.push_str(rest);
     output
 }
 
@@ -1234,8 +1249,8 @@ mod tests {
             expand(
                 "x {prompt} {model}",
                 &[
-                    ("{prompt}", "literal {model} $(touch x)".into()),
-                    ("{model}", "chosen".into())
+                    ("{prompt}", "literal {model} $(touch x)"),
+                    ("{model}", "chosen")
                 ]
             ),
             "x literal {model} $(touch x) chosen"
@@ -1876,7 +1891,7 @@ mod tests {
                 "task",
                 &paths,
                 legacy,
-                None,
+                Launch::New,
             )
             .map(|()| invocation)
         };

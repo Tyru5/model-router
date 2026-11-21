@@ -13,8 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard, OnceLock},
-    thread::JoinHandle,
+    sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -25,10 +24,54 @@ pub const CLI_ENV: &str = "MODEL_ROUTER_NOTIFY";
 /// The same event is not repeated within this window.
 pub const REPEAT_WINDOW: Duration = Duration::from_secs(180);
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(5);
-/// Webhooks still being sent, for `wait_for_webhooks`.
-static WEBHOOKS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+#[cfg(not(test))]
+const WEBHOOK_QUEUE: usize = 32;
+#[cfg(not(test))]
+const REAPER_QUEUE: usize = 32;
 /// Longest title or body sent, in characters.
 const MAX_TEXT: usize = 240;
+
+struct InFlight {
+    count: Mutex<usize>,
+    idle: Condvar,
+}
+
+impl InFlight {
+    fn new() -> Self {
+        Self {
+            count: Mutex::new(0),
+            idle: Condvar::new(),
+        }
+    }
+
+    fn enter(&self) {
+        *relock(&self.count) += 1;
+    }
+
+    fn leave(&self) {
+        let mut count = relock(&self.count);
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.idle.notify_all();
+        }
+    }
+
+    fn wait_timeout(&self, timeout: Duration) {
+        let count = relock(&self.count);
+        if *count > 0 {
+            let _ = self
+                .idle
+                .wait_timeout_while(count, timeout, |remaining| *remaining > 0);
+        }
+    }
+}
+
+static WEBHOOK_INFLIGHT: OnceLock<Arc<InFlight>> = OnceLock::new();
+
+#[cfg(not(test))]
+fn webhook_inflight() -> &'static Arc<InFlight> {
+    WEBHOOK_INFLIGHT.get_or_init(|| Arc::new(InFlight::new()))
+}
 
 /// Which backends deliver notifications.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -361,10 +404,8 @@ pub fn notify(event: NotifyEvent) {
 /// Waits up to the webhook timeout for webhooks still being sent. A process
 /// that exits first drops them, so the CLI calls this before it ends.
 pub fn wait_for_webhooks() {
-    let pending = std::mem::take(&mut *relock(&WEBHOOKS));
-    let deadline = Instant::now() + WEBHOOK_TIMEOUT;
-    while pending.iter().any(|call| !call.is_finished()) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
+    if let Some(inflight) = WEBHOOK_INFLIGHT.get() {
+        inflight.wait_timeout(WEBHOOK_TIMEOUT);
     }
 }
 
@@ -423,47 +464,92 @@ pub fn desktop_command(event: &NotifyEvent) -> Option<(&'static str, Vec<String>
 
 #[cfg(not(test))]
 fn desktop(event: &NotifyEvent) -> std::io::Result<()> {
-    use std::process::{Command, Stdio};
+    use std::{
+        process::{Child, Command, Stdio},
+        sync::mpsc,
+    };
     let (program, args) = desktop_command(event)
         .ok_or_else(|| std::io::Error::other("not supported on this platform"))?;
-    let mut child = Command::new(program)
+    let child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| std::io::Error::new(e.kind(), format!("{program}: {e}")))?;
-    // Reaped in the background so it never becomes a zombie.
-    std::thread::spawn(move || {
-        let _ = child.wait();
+    // Reaped by one persistent worker so desktop notifications never leave zombies.
+    static REAPER: OnceLock<mpsc::SyncSender<Child>> = OnceLock::new();
+    let tx = REAPER.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<Child>(REAPER_QUEUE);
+        let _ = std::thread::Builder::new()
+            .name("notify reaper".into())
+            .spawn(move || {
+                for mut child in rx {
+                    let _ = child.wait();
+                }
+            });
+        tx
     });
+    if let Err(mpsc::TrySendError::Full(mut child) | mpsc::TrySendError::Disconnected(mut child)) =
+        tx.try_send(child)
+    {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
     Ok(())
 }
 
 #[cfg(not(test))]
+struct WebhookJob {
+    url: String,
+    title: String,
+    body: String,
+    kind: Kind,
+}
+
+#[cfg(not(test))]
 fn webhook(url: String, event: &NotifyEvent) {
-    let (title, body, kind) = (clean(&event.title), clean(&event.body), event.kind);
-    let call = std::thread::spawn(move || {
-        use reqwest::header::HeaderValue;
-        let Ok(client) = reqwest::blocking::Client::builder()
-            .timeout(WEBHOOK_TIMEOUT)
-            .build()
-        else {
-            return;
-        };
-        let mut request = client.post(&url).body(body);
-        if let Ok(value) = HeaderValue::from_bytes(title.as_bytes()) {
-            request = request.header("Title", value);
-        }
-        request = request.header("Tags", kind.tag());
-        if kind == Kind::NeedsInput {
-            request = request.header("Priority", "high");
-        }
-        let _ = request.send();
+    use std::sync::mpsc;
+    static WORKER: OnceLock<mpsc::SyncSender<WebhookJob>> = OnceLock::new();
+    let tx = WORKER.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<WebhookJob>(WEBHOOK_QUEUE);
+        let inflight = Arc::clone(webhook_inflight());
+        let _ = std::thread::Builder::new()
+            .name("notify webhook".into())
+            .spawn(move || {
+                use reqwest::header::HeaderValue;
+                for job in rx {
+                    if let Ok(client) = crate::providers::http_client() {
+                        let mut request = client
+                            .post(&job.url)
+                            .timeout(WEBHOOK_TIMEOUT)
+                            .body(job.body);
+                        if let Ok(value) = HeaderValue::from_bytes(job.title.as_bytes()) {
+                            request = request.header("Title", value);
+                        }
+                        request = request.header("Tags", job.kind.tag());
+                        if job.kind == Kind::NeedsInput {
+                            request = request.header("Priority", "high");
+                        }
+                        let _ = request.send();
+                    }
+                    inflight.leave();
+                }
+            });
+        tx
     });
-    let mut pending = relock(&WEBHOOKS);
-    pending.retain(|call| !call.is_finished());
-    pending.push(call);
+    let inflight = webhook_inflight();
+    inflight.enter();
+    let job = WebhookJob {
+        url,
+        title: clean(&event.title),
+        body: clean(&event.body),
+        kind: event.kind,
+    };
+    if tx.try_send(job).is_err() {
+        inflight.leave();
+    }
 }
 
 #[cfg(test)]
@@ -587,5 +673,29 @@ mod tests {
     #[test]
     fn cli_flag_enables_notifications() {
         assert!(cli_enabled(true));
+    }
+
+    #[test]
+    fn inflight_waiter_wakes_on_completion_and_bounds_timeout() {
+        let inflight = Arc::new(InFlight::new());
+        inflight.wait_timeout(Duration::from_millis(50));
+
+        inflight.enter();
+        let waiter_ref = Arc::clone(&inflight);
+        let done = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            waiter_ref.leave();
+        });
+        let started = Instant::now();
+        inflight.wait_timeout(Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        done.join().unwrap();
+
+        // Still-pending work returns after the timeout without blocking longer.
+        inflight.enter();
+        let started = Instant::now();
+        inflight.wait_timeout(Duration::from_millis(40));
+        assert!(started.elapsed() < Duration::from_millis(400));
+        inflight.leave();
     }
 }

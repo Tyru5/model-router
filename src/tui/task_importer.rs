@@ -10,7 +10,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::Style,
-    text::Line,
+    text::{Line, Span},
     widgets::{Paragraph, Tabs, Wrap},
 };
 use std::{
@@ -94,7 +94,7 @@ impl TaskImporter {
     }
 
     /// Whether a URL import is running.
-    pub fn busy(&self) -> bool {
+    pub(super) fn busy(&self) -> bool {
         self.job.is_some()
     }
     /// Whether its picker's folder read reports with `ticket`.
@@ -240,9 +240,27 @@ impl TaskImporter {
 
     pub fn draw(&mut self, frame: &mut Frame<'_>, rect: Rect, palette: Palette) {
         if let Some(job) = &self.job {
-            frame.render_widget(Paragraph::new(format!("Fetching task/spec…\n\n{}\n\nEsc cancels. The current task is unchanged until you apply a preview.", storage::clean_terminal(&job.source)))
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(vec![
+                        Span::styled(
+                            format!("{} ", super::widgets::spinner()),
+                            Style::default().fg(palette.accent),
+                        ),
+                        Span::raw("Fetching task/spec…"),
+                    ]),
+                    Line::raw(""),
+                    Line::raw(storage::clean_terminal(&job.source)),
+                    Line::raw(""),
+                    Line::raw(
+                        "Esc cancels. The current task is unchanged until you apply a preview.",
+                    ),
+                ])
                 .block(palette.modal("Import task/spec", &[("Esc", "cancel")]))
-                .style(Style::default().fg(palette.fg)).wrap(Wrap { trim: false }), rect);
+                .style(Style::default().fg(palette.fg))
+                .wrap(Wrap { trim: false }),
+                rect,
+            );
             return;
         }
         if let Some(draft) = &mut self.draft {
@@ -272,7 +290,8 @@ impl TaskImporter {
             );
             let field = &mut draft.fields[draft.mode];
             palette.style_textarea(field);
-            let bytes = content(field).len();
+            let bytes = field.lines().iter().map(String::len).sum::<usize>()
+                + field.lines().len().saturating_sub(1);
             field.set_block(palette.panel(format!(
                 " Editable task · {bytes} / {} bytes ",
                 config::MAX_TASK_BYTES

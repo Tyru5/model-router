@@ -34,6 +34,65 @@ impl Run {
         placement: Placement,
         source: Option<&Run>,
     ) -> Result<Self> {
+        Self::create_inner(
+            project, settings, workflow, task, placement, source, None, true, true,
+        )
+    }
+
+    pub(crate) fn create_rerun_from(
+        project: &Path,
+        settings: &Settings,
+        workflow: &Workflow,
+        task: String,
+        placement: Placement,
+        source: &Run,
+        rerun_of: String,
+    ) -> Result<Self> {
+        Self::create_inner(
+            project,
+            settings,
+            workflow,
+            task,
+            placement,
+            Some(source),
+            Some(rerun_of),
+            true,
+            true,
+        )
+    }
+
+    pub(crate) fn create_for_fork(
+        project: &Path,
+        settings: &Settings,
+        workflow: &Workflow,
+        task: String,
+        source: &Run,
+    ) -> Result<Self> {
+        Self::create_inner(
+            project,
+            settings,
+            workflow,
+            task,
+            Placement::WorktreeFromHead,
+            Some(source),
+            None,
+            false,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_inner(
+        project: &Path,
+        settings: &Settings,
+        workflow: &Workflow,
+        task: String,
+        placement: Placement,
+        source: Option<&Run>,
+        rerun_of: Option<String>,
+        capture_baseline: bool,
+        persist: bool,
+    ) -> Result<Self> {
         crate::config::validate_task(&task)?;
         // A new run in the checkout (`run`, `rerun`, the TUI, `serve`) must
         // not join a harness another run may have left running there.
@@ -109,15 +168,56 @@ impl Run {
             Utc::now().format("%Y%m%d-%H%M%S"),
             &uuid::Uuid::new_v4().to_string()[..8]
         );
+        struct RollbackCreate {
+            project: PathBuf,
+            id: String,
+            worktree: Option<PathBuf>,
+            directory: Option<PathBuf>,
+            armed: bool,
+        }
+        impl Drop for RollbackCreate {
+            fn drop(&mut self) {
+                if !self.armed {
+                    return;
+                }
+                if let Some(path) = &self.worktree {
+                    if let Some(s) = path.to_str() {
+                        let _ = storage::git(&self.project, &["worktree", "remove", "--force", s]);
+                    }
+                    let _ = fs::remove_dir_all(path);
+                    let _ = storage::git(&self.project, &["worktree", "prune"]);
+                    let _ = storage::git(
+                        &self.project,
+                        &["branch", "-D", &format!("model-router/{}", self.id)],
+                    );
+                }
+                snapshot::forget(&self.project, &self.id);
+                if let Some(dir) = &self.directory {
+                    let _ = fs::remove_dir_all(dir);
+                }
+            }
+        }
         let worktree = placement != Placement::Project;
         let workspace = if worktree {
             storage::create_worktree(&project, &id, placement == Placement::Worktree)?
         } else {
             project.clone()
         };
+        let mut rollback = RollbackCreate {
+            project: project.clone(),
+            id: id.clone(),
+            worktree: worktree.then(|| workspace.clone()),
+            directory: None,
+            armed: true,
+        };
         let directory = storage::metadata_dir(&project)?.join("runs").join(&id);
         fs::create_dir_all(&directory)?;
-        let baseline = snapshot::tree(&workspace, &directory);
+        rollback.directory = Some(directory.clone());
+        let baseline = if capture_baseline {
+            snapshot::tree(&workspace, &directory)
+        } else {
+            None
+        };
         let now = Utc::now();
         let mut run = Self {
             version: 1,
@@ -131,7 +231,7 @@ impl Run {
             directory,
             worktree,
             task,
-            rerun_of: None,
+            rerun_of,
             fork_of: None,
             workflow: workflow.clone(),
             adapters: settings.adapters.clone(),
@@ -167,7 +267,10 @@ impl Run {
             view: None,
         };
         crate::trust::approve_run(&run, settings, source)?;
-        run.persist()?;
+        if persist {
+            run.persist()?;
+        }
+        rollback.armed = false;
         Ok(run)
     }
 
@@ -175,20 +278,30 @@ impl Run {
     /// The summary records run.json's revision and size, so listing can tell
     /// when the two disagree.
     pub fn persist(&mut self) -> Result<()> {
+        let prev_revision = self.revision;
+        let prev_updated = self.updated_at;
         self.revision += 1;
         self.updated_at = Utc::now();
-        let record = serde_json::to_vec_pretty(&*self)?;
-        storage::atomic_write(&self.directory.join("run.json"), &record)?;
-        let summary = crate::history::RunSummary {
-            run_bytes: Some(record.len() as u64),
-            ..crate::history::RunSummary::from(&*self)
-        };
-        storage::write_json(&self.directory.join("summary.json"), &summary)?;
-        let mut journal = std::mem::take(&mut self.journal);
-        for record in &mut journal {
-            record.run_revision = self.revision;
+        let result = (|| -> Result<()> {
+            let record = serde_json::to_vec_pretty(&*self)?;
+            storage::atomic_write(&self.directory.join("run.json"), &record)?;
+            let summary = crate::history::RunSummary {
+                run_bytes: Some(record.len() as u64),
+                ..crate::history::RunSummary::from(&*self)
+            };
+            storage::write_json(&self.directory.join("summary.json"), &summary)?;
+            for record in &mut self.journal {
+                record.run_revision = self.revision;
+            }
+            transitions::append(&self.directory, &self.journal)
+        })();
+        if result.is_err() {
+            self.revision = prev_revision;
+            self.updated_at = prev_updated;
+            return result;
         }
-        transitions::append(&self.directory, &journal)
+        self.journal.clear();
+        Ok(())
     }
 
     /// The only place run, stage, and attempt statuses change. Refuses moves
@@ -328,6 +441,37 @@ impl Run {
             !(interactive && self.workflow.stages[index].fan_out.is_some()),
             "Fan-out candidates run unattended; retry without interactive, or retry one candidate"
         );
+        if self.status == Status::Running {
+            self.interrupt_candidates(INTERRUPTED)?;
+            if self.graph() {
+                for i in 0..self.stages.len() {
+                    if i == index || self.stages[i].status != Status::Running {
+                        continue;
+                    }
+                    if self.stages[i]
+                        .attempts
+                        .last()
+                        .is_some_and(|a| a.status == Status::Running)
+                    {
+                        self.set(
+                            Target::Attempt(i),
+                            Status::Failed,
+                            Actor::Recovery,
+                            INTERRUPTED,
+                        )?;
+                        let attempt = self.stages[i].attempts.last_mut().context("No attempt")?;
+                        attempt.error = Some(INTERRUPTED.into());
+                        attempt.finished_at.get_or_insert_with(Utc::now);
+                    }
+                    self.set(
+                        Target::Stage(i),
+                        Status::Failed,
+                        Actor::Recovery,
+                        INTERRUPTED,
+                    )?;
+                }
+            }
+        }
         if self.stages[index]
             .attempts
             .last()
@@ -558,16 +702,27 @@ impl Run {
             .as_ref()
             .and_then(|f| f.candidates.iter().position(|c| c.id == candidate))
             .with_context(|| format!("Stage {stage} has no candidate {candidate}"))?;
-        let state = &self.stages[index]
-            .fan_out
-            .as_ref()
-            .context("No fan-out")?
-            .candidates[c];
+        let (applied, cand_status) = {
+            let fan = self.stages[index].fan_out.as_ref().context("No fan-out")?;
+            (
+                fan.selection.as_ref().is_some_and(|s| s.applied),
+                fan.candidates[c].status,
+            )
+        };
         ensure!(
-            state.status.stopped(),
-            "Candidate {candidate} is {}; only a stopped candidate can be retried",
-            state.status.label()
+            !applied,
+            "A candidate was already applied; retry the fan-out stage to start a new round"
         );
+        ensure!(
+            cand_status.stopped(),
+            "Candidate {candidate} is {}; only a stopped candidate can be retried",
+            cand_status.label()
+        );
+        if let Some(fan) = self.stages[index].fan_out.as_mut() {
+            if fan.selection.as_ref().is_some_and(|s| !s.applied) {
+                fan.selection = None;
+            }
+        }
         let reason = format!("Retry candidate {candidate}");
         self.set(
             Target::Candidate(index, c),
@@ -587,7 +742,7 @@ impl Run {
     /// a second step. In memory only; `command` applies it under the lock.
     pub fn confirm(&mut self) -> Result<()> {
         ensure!(
-            self.status == Status::AwaitingConfirmation,
+            self.status == Status::AwaitingConfirmation && self.cursor < self.stages.len(),
             "No handoff awaits confirmation"
         );
         if self.workflow.stages[self.cursor].role == Role::Ship {
@@ -607,7 +762,11 @@ impl Run {
     pub(super) fn edit_summary(&mut self, summary: String) -> Result<()> {
         ensure!(
             self.status == Status::AwaitingConfirmation
-                && self.workflow.stages[self.cursor].role != Role::Review,
+                && self
+                    .workflow
+                    .stages
+                    .get(self.cursor)
+                    .is_some_and(|s| s.role != Role::Review),
             "Only an interactive non-review handoff summary can be edited"
         );
         ensure!(
@@ -634,7 +793,8 @@ impl Run {
         {
             return None;
         }
-        self.stages[self.cursor]
+        self.stages
+            .get(self.cursor)?
             .handoff
             .as_ref()?
             .not_applicable_reason()
@@ -800,7 +960,13 @@ impl Run {
     /// user's acceptance, sends a review's request to a repair, or moves on.
     pub(crate) fn advance(&mut self, actor: Actor) -> Result<()> {
         let index = self.cursor;
-        let name = self.workflow.stages[index].name.clone();
+        let name = self
+            .workflow
+            .stages
+            .get(index)
+            .context("This run is already complete")?
+            .name
+            .clone();
         match self.decide()? {
             Decision::Block(message) => self.stop(Status::Blocked, message, actor, true),
             Decision::AwaitWaiver => {
@@ -822,7 +988,14 @@ impl Run {
                     .map(|h| h.summary.clone())
                     .unwrap_or_default();
                 match self.select(fan, candidate, &by, &summary)? {
-                    Ok(()) => self.complete(index, actor),
+                    Ok(()) => {
+                        if let Some(tree) = snapshot::tree(&self.workspace, &self.directory) {
+                            if let Some(attempt) = self.stages[index].attempts.last_mut() {
+                                attempt.tree_after = Some(tree);
+                            }
+                        }
+                        self.complete(index, actor)
+                    }
                     Err(message) => self.stop(Status::Blocked, message, actor, true),
                 }
             }
@@ -1029,6 +1202,7 @@ impl Run {
             self.stages[index].fan_out = Some(FanOutState {
                 base,
                 base_commit,
+                round: number,
                 candidates,
                 selection: None,
             });
@@ -1098,38 +1272,82 @@ impl Run {
             .clone();
         let candidate = config.stage(&stage);
         let state = self.stages[index].fan_out.as_ref().context("No fan-out")?;
-        let (base, base_commit) = (state.base.clone(), state.base_commit.clone());
+        let (base, base_commit, round) =
+            (state.base.clone(), state.base_commit.clone(), state.round);
         let id = state.candidates[c].id.clone();
         let number = state.candidates[c].attempts.len() + 1;
-        let directory = self
+        let stage_dir = self
             .directory
-            .join(format!("{:02}-{}", index + 1, stage.id))
-            .join("candidates")
-            .join(&id)
-            .join(format!("attempt-{number:03}"));
+            .join(format!("{:02}-{}", index + 1, stage.id));
+        let directory = if round <= 1 {
+            stage_dir
+                .join("candidates")
+                .join(&id)
+                .join(format!("attempt-{number:03}"))
+        } else {
+            stage_dir
+                .join(format!("round-{round:03}"))
+                .join("candidates")
+                .join(&id)
+                .join(format!("attempt-{number:03}"))
+        };
         fs::create_dir_all(&directory)?;
+        let leaf = if round <= 1 {
+            format!("{id}-{number:03}")
+        } else {
+            format!("r{round:03}-{id}-{number:03}")
+        };
         let worktree = fanout::candidates_dir(&self.project, &self.id)?
             .join(&stage.id)
-            .join(format!("{id}-{number:03}"));
+            .join(&leaf);
+        struct RollbackWorktree {
+            project: PathBuf,
+            worktree: PathBuf,
+            armed: bool,
+        }
+        impl Drop for RollbackWorktree {
+            fn drop(&mut self) {
+                if self.armed {
+                    let _ = fanout::remove_worktrees(&self.project, &self.worktree);
+                }
+            }
+        }
         fanout::add_worktree(&self.workspace, &worktree, &base_commit)?;
+        let mut rollback = RollbackWorktree {
+            project: self.project.clone(),
+            worktree: worktree.clone(),
+            armed: true,
+        };
         // A project inside a larger repository works in the same subdirectory.
         let cwd = worktree.join(fanout::prefix(&self.workspace));
         let handoff_file = storage::metadata_dir(&cwd)?
             .join("handoffs")
             .join(&self.id)
-            .join(format!("{}-{id}-{number:03}.json", stage.id));
+            .join(format!("{}-{leaf}.json", stage.id));
         fs::create_dir_all(handoff_file.parent().context("No handoff directory")?)?;
-        let mut view = self.clone();
-        view.workspace = cwd.clone();
-        view.workflow.stages[index] = candidate.clone();
-        view.cursor = index;
-        view.view = Some(c);
+        ensure!(
+            fs::symlink_metadata(&handoff_file).is_err(),
+            "Handoff path already exists: {}",
+            handoff_file.display()
+        );
         // The prompt names this copy of the handoff schema.
         let schema_file = directory.join(handoff::SCHEMA_FILE);
-        storage::atomic_write(&schema_file, handoff::SCHEMA.as_bytes())?;
-        let text = prompt(&view, &handoff_file, &schema_file);
+        storage::atomic_write_fast(&schema_file, handoff::SCHEMA.as_bytes())?;
+        let text = prompt_for(
+            self,
+            PromptTarget {
+                cursor: index,
+                stage: &candidate,
+                workspace: &cwd,
+                view: Some(c),
+            },
+            &handoff_file,
+            &schema_file,
+            false,
+        )
+        .0;
         let prompt_file = directory.join("prompt.md");
-        storage::atomic_write(&prompt_file, text.as_bytes())?;
+        storage::atomic_write_fast(&prompt_file, text.as_bytes())?;
         let paths = ContextPaths {
             workspace: &cwd,
             attempt_dir: &directory,
@@ -1149,7 +1367,7 @@ impl Run {
                 program: &invocation.program,
             },
         )?;
-        storage::write_json(
+        storage::write_json_fast(
             &directory.join("command.json"),
             &serde_json::json!({ "program": invocation.program, "args": invocation.args, "stdin_from": invocation.stdin.as_ref().map(|_| "prompt.md"), "env": invocation.env.iter().map(|(name, _)| name).collect::<Vec<_>>(), "workspace": cwd, "model": candidate.model, "provider": candidate.provider, "effort": candidate.effort, "mode": candidate.mode, "candidate": id, "sandbox": sandbox }),
         )?;
@@ -1201,6 +1419,7 @@ impl Run {
             reason,
         )?;
         self.persist()?;
+        rollback.armed = false;
         Ok((
             Prepared {
                 invocation,
@@ -1213,133 +1432,54 @@ impl Run {
         ))
     }
 
-    /// Records how candidate `c`'s harness ended: its handoff, its router
-    /// checks (run in its worktree), and its changes from the base.
-    pub(super) fn finish_candidate(
+    /// Applies the results produced in a candidate worker thread onto candidate
+    /// `c`'s state. Returns a surviving process group ID kept in `retained_groups`.
+    pub(super) fn apply_candidate_post(
         &mut self,
         (index, c): (usize, usize),
-        prepared: &Prepared,
-        cwd: &Path,
-        result: Result<process::Outcome>,
-        cancel: &AtomicBool,
-        emit: &mut impl FnMut(Event),
-    ) -> Result<()> {
-        let candidate = {
-            let stage = &self.workflow.stages[index];
-            let config = &stage.fan_out.as_ref().context("No fan-out")?.candidates[c];
-            config.stage(stage)
-        };
-        keep_survivor(self, &result);
-        let attempt = self.candidate_mut(index, c).attempts.last_mut();
-        let normalized = match classify_exit(
-            attempt,
-            Mode::Unattended,
-            (&candidate.harness, cwd),
-            prepared,
-            result,
-        )? {
-            Exit::Succeeded(normalized) => normalized,
-            Exit::Stopped(status, message) => {
-                return self.stop_candidate(index, c, status, message, Actor::Engine);
-            }
-        };
-        let (source, handoff) = match resolve_handoff(&candidate, prepared, normalized)? {
-            Resolved::Handoff(source, handoff) => (source, *handoff),
-            Resolved::Stopped(status, message) => {
-                return self.stop_candidate(index, c, status, message, Actor::Engine);
-            }
-        };
-        storage::write_json(&prepared.directory.join("handoff.json"), &handoff)?;
-        let verdict = handoff.verdict;
-        let summary = handoff.summary.clone();
-        let state = self.candidate_mut(index, c);
-        state.handoff = Some(handoff);
-        let attempt = state.attempts.last_mut().context("No attempt")?;
-        attempt.handoff_source = Some(source);
-        let worktree = attempt.worktree.clone().context("No worktree")?;
-        if matches!(verdict, Verdict::Blocked | Verdict::NeedsChanges) {
-            return self.stop_candidate(
-                index,
-                c,
-                Status::Blocked,
-                format!(
-                    "Candidate reports incomplete work: {}",
-                    storage::truncate(&summary, 500)
-                ),
-                Actor::Engine,
-            );
+        post: Result<CandidatePost>,
+        ended: DateTime<Utc>,
+    ) -> Result<Option<u32>> {
+        if let Some(attempt) = self.candidate_mut(index, c).attempts.last_mut() {
+            attempt.set_group(None);
+            attempt.finished_at.get_or_insert(ended);
         }
-        if !candidate.checks.is_empty() {
-            // The receipt: what the checks are about to test, as for a stage.
-            let tested = snapshot::tree_with(&worktree, &candidate_index(prepared), &self.id);
-            if let Some(attempt) = self.candidate_mut(index, c).attempts.last_mut() {
-                attempt.checks_tree = tested;
-            }
-            let (results, cancelled) = checks::run(
-                &candidate.checks,
-                cwd,
-                &prepared.directory,
-                cancel,
-                |group| {
-                    self.candidate_mut(index, c)
-                        .attempts
-                        .last_mut()
-                        .context("No attempt")?
-                        .set_group(group);
-                    self.persist()
-                },
-                |text| emit(Event::Output(text)),
-            )?;
-            if let Some(attempt) = self.candidate_mut(index, c).attempts.last_mut() {
-                attempt.checks = results;
-            }
-            if cancelled {
-                return self.stop_candidate(
+        let post = match post {
+            Ok(post) => post,
+            Err(error) => {
+                self.stop_candidate(
                     index,
                     c,
-                    Status::Cancelled,
-                    "Candidate cancelled during checks; its worktree is retained".into(),
+                    Status::Failed,
+                    format!("Could not complete candidate bookkeeping: {error:#}"),
                     Actor::Engine,
-                );
+                )?;
+                return Ok(None);
+            }
+        };
+        let mut survivor_pgid = None;
+        if let Some(group) = post.survivor {
+            survivor_pgid = Some(group.pgid);
+            if self.retained_groups.iter().all(|g| g.pgid != group.pgid) {
+                self.retained_groups.push(group);
             }
         }
-        let base = self.stages[index]
-            .fan_out
-            .as_ref()
-            .context("No fan-out")?
-            .base
-            .clone();
-        let tree = snapshot::tree_with(&worktree, &candidate_index(prepared), &self.id)
-            .context("Snapshot the candidate's worktree")?;
-        let patch = prepared.directory.join("changes.diff");
-        fanout::write_patch(&worktree, &base, &tree, &patch)?;
-        let (files, added, removed) = fanout::stat(&worktree, &base, &tree)?;
-        // As for a stage (`exec::finish`): a candidate that changed a
-        // protected path stops blocked, so it is never chosen or applied.
-        // Its changes stay recorded for inspection.
-        let protected = crate::policy::protected_detail(&self.workflow.protected_paths, &files);
         let state = self.candidate_mut(index, c);
-        state.changes = Some(CandidateChanges {
-            files,
-            added,
-            removed,
-            patch,
-        });
+        state.handoff = post.handoff;
+        state.changes = post.changes;
         if let Some(attempt) = state.attempts.last_mut() {
-            attempt.tree_after = Some(tree);
+            attempt.exit_code = post.exit_code;
+            attempt.usage = post.usage;
+            attempt.handoff_source = post.handoff_source;
+            attempt.checks_tree = post.checks_tree;
+            attempt.checks = post.checks;
+            attempt.tree_after = post.tree_after;
         }
-        if let Some(detail) = protected {
-            return self.stop_candidate(
-                index,
-                c,
-                Status::Blocked,
-                format!(
-                    "Candidate modified protected path(s): {detail}. Its worktree is retained; update workflow protected_paths or retry the stage"
-                ),
-                Actor::Engine,
-            );
+        if let Some((status, message)) = post.stop {
+            self.stop_candidate(index, c, status, message, Actor::Engine)?;
+            return Ok(survivor_pgid);
         }
-        let reason = format!("Candidate {} complete", state.id);
+        let reason = format!("Candidate {} complete", self.candidate(index, c).id);
         self.set(
             Target::CandidateAttempt(index, c),
             Status::Complete,
@@ -1351,7 +1491,8 @@ impl Run {
             Status::Complete,
             Actor::Engine,
             reason,
-        )
+        )?;
+        Ok(survivor_pgid)
     }
 
     /// Whether no candidate of stage `index` waits or runs.
@@ -1392,7 +1533,8 @@ impl Run {
                 )
             })
             .collect();
-        let auto = state.selection.is_none() && graph::judge_of(&self.workflow, index).is_none();
+        let auto = state.selection.as_ref().is_none_or(|s| !s.applied)
+            && graph::judge_of(&self.workflow, index).is_none();
         let finish = |run: &mut Run| {
             let tree = snapshot::tree(&run.workspace, &run.directory);
             if let Some(attempt) = run.stages[index].attempts.last_mut() {
@@ -1601,15 +1743,24 @@ impl Run {
     /// returns it to pending.
     pub(super) fn settle(&mut self) -> Result<()> {
         let hold = self.hold.take().unwrap_or_default();
-        if let Some((review, target, feedback, reason)) = hold.repair {
-            self.repair_feedback = Some(feedback);
-            self.repair_review = Some(review);
-            self.repair_passes += 1;
-            // Invalidate all downstream handoffs, including previously passing reviews.
-            self.reset(target, Actor::Engine, &reason)?;
-            self.cursor = target;
-        }
         if let Some(index) = (0..self.stages.len()).find(|&i| self.stages[i].status.stopped()) {
+            // Never leave a parallel stage (e.g. one whose repair was deferred)
+            // stuck in Running when stopping at a sibling stage.
+            for i in 0..self.stages.len() {
+                if self.stages[i].status == Status::Running {
+                    let to = if self.workflow.stages[i].enabled {
+                        Status::Pending
+                    } else {
+                        Status::Skipped
+                    };
+                    self.set(
+                        Target::Stage(i),
+                        to,
+                        Actor::Engine,
+                        "Deferred because another stage stopped",
+                    )?;
+                }
+            }
             let status = self.stages[index].status;
             let message = hold
                 .stops
@@ -1632,6 +1783,29 @@ impl Run {
             self.cursor = index;
             self.error = Some(message.clone());
             return self.set(Target::Run, status, Actor::Engine, message);
+        }
+        if let Some((review, target, feedback, reason)) = hold.repair {
+            self.repair_feedback = Some(feedback);
+            self.repair_review = Some(review);
+            self.repair_passes += 1;
+            // Invalidate all downstream handoffs, including previously passing reviews.
+            self.reset(target, Actor::Engine, &reason)?;
+            for i in 0..self.stages.len() {
+                if self.stages[i].status == Status::Running {
+                    let to = if self.workflow.stages[i].enabled {
+                        Status::Pending
+                    } else {
+                        Status::Skipped
+                    };
+                    self.set(
+                        Target::Stage(i),
+                        to,
+                        Actor::Engine,
+                        "Deferred for repair pass",
+                    )?;
+                }
+            }
+            self.cursor = target;
         }
         if let Some(index) = self
             .stages
@@ -1700,4 +1874,141 @@ impl Run {
         self.error = Some(INTERRUPTED.into());
         Ok(())
     }
+}
+
+/// Outputs produced by a candidate worker thread before updating `Run`.
+#[derive(Default)]
+pub(super) struct CandidatePost {
+    pub(super) exit_code: Option<i32>,
+    pub(super) usage: Option<handoff::Usage>,
+    pub(super) handoff_source: Option<HandoffSource>,
+    pub(super) handoff: Option<Handoff>,
+    pub(super) checks_tree: Option<String>,
+    pub(super) checks: Vec<CheckResult>,
+    pub(super) tree_after: Option<String>,
+    pub(super) changes: Option<CandidateChanges>,
+    pub(super) stop: Option<(Status, String)>,
+    pub(super) survivor: Option<process::Group>,
+}
+
+/// Runs candidate post-processing in the worker thread: exit normalization,
+/// handoff resolution, router checks, worktree snapshot, patch, and policy check.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn post_process_candidate(
+    candidate: &Stage,
+    prepared: &Prepared,
+    cwd: &Path,
+    worktree: &Path,
+    base: &str,
+    run_id: &str,
+    protected_paths: &[String],
+    outcome_result: Result<process::Outcome>,
+    journal: &SpawnJournal,
+    cancel: &AtomicBool,
+    abort: &AtomicBool,
+    on_spawn: &mut impl FnMut(process::Group),
+    output: &mut impl FnMut(String),
+) -> Result<CandidatePost> {
+    let mut post = CandidatePost::default();
+    let outcome = match outcome_result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            post.survivor = error
+                .downcast_ref::<process::Survivor>()
+                .map(|s| s.group.clone());
+            post.stop = Some((Status::Failed, format!("{error:#}")));
+            return Ok(post);
+        }
+    };
+    post.exit_code = outcome.code;
+    post.usage = handoff::usage_file(
+        &prepared.directory.join("stdout.log"),
+        prepared.invocation.kind,
+    );
+    let normalized = match evaluate_outcome(Mode::Unattended, prepared, &outcome)? {
+        Exit::Succeeded(normalized) => normalized,
+        Exit::Stopped(status, message) => {
+            post.stop = Some((status, message));
+            return Ok(post);
+        }
+    };
+    let (source, handoff) = match resolve_handoff(candidate, prepared, normalized)? {
+        Resolved::Handoff(source, handoff) => (source, *handoff),
+        Resolved::Stopped(status, message) => {
+            post.stop = Some((status, message));
+            return Ok(post);
+        }
+    };
+    storage::write_json(&prepared.directory.join("handoff.json"), &handoff)?;
+    let verdict = handoff.verdict;
+    let summary = handoff.summary.clone();
+    post.handoff_source = Some(source);
+    post.handoff = Some(handoff);
+    if matches!(verdict, Verdict::Blocked | Verdict::NeedsChanges) {
+        post.stop = Some((
+            Status::Blocked,
+            format!(
+                "Candidate reports incomplete work: {}",
+                storage::truncate(&summary, 500)
+            ),
+        ));
+        return Ok(post);
+    }
+    if !candidate.checks.is_empty() {
+        post.checks_tree = snapshot::tree_with(worktree, &candidate_index(prepared), run_id);
+        let active_pgid = std::cell::Cell::new(None);
+        let (results, cancelled) = checks::run_with_abort(
+            &candidate.checks,
+            cwd,
+            &prepared.directory,
+            cancel,
+            Some(abort),
+            |group| {
+                match group {
+                    Some(group) => {
+                        active_pgid.set(Some(group.pgid));
+                        journal.add(&group)?;
+                        on_spawn(group);
+                    }
+                    None => {
+                        if let Some(pgid) = active_pgid.take() {
+                            journal.recorded(pgid);
+                        }
+                    }
+                }
+                Ok(())
+            },
+            output,
+        )?;
+        post.checks = results;
+        if cancelled {
+            post.stop = Some((
+                Status::Cancelled,
+                "Candidate cancelled during checks; its worktree is retained".into(),
+            ));
+            return Ok(post);
+        }
+    }
+    let tree = snapshot::tree_with(worktree, &candidate_index(prepared), run_id)
+        .context("Snapshot the candidate's worktree")?;
+    let patch = prepared.directory.join("changes.diff");
+    fanout::write_patch(worktree, base, &tree, &patch)?;
+    let (files, added, removed) = fanout::stat(worktree, base, &tree)?;
+    let protected = crate::policy::protected_detail(protected_paths, &files);
+    post.tree_after = Some(tree);
+    post.changes = Some(CandidateChanges {
+        files,
+        added,
+        removed,
+        patch,
+    });
+    if let Some(detail) = protected {
+        post.stop = Some((
+            Status::Blocked,
+            format!(
+                "Candidate modified protected path(s): {detail}. Its worktree is retained; update workflow protected_paths or retry the stage"
+            ),
+        ));
+    }
+    Ok(post)
 }

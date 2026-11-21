@@ -99,14 +99,33 @@ pub(super) struct Choice {
     pub(super) label: String,
     pub(super) value: PickValue,
 }
+/// Case-insensitive substring check where `needle_lower` is already lowercase.
+pub(super) fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if haystack.is_ascii() && needle_lower.is_ascii() {
+        let needle = needle_lower.as_bytes();
+        haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+    } else {
+        haystack.to_lowercase().contains(needle_lower)
+    }
+}
+
 pub(super) fn matching_choices<'a>(
     items: &'a [Choice],
     filter: &InputField<'_>,
 ) -> Vec<&'a Choice> {
     let query = content(filter).to_lowercase();
+    if query.is_empty() {
+        return items.iter().collect();
+    }
     items
         .iter()
-        .filter(|choice| choice.label.to_lowercase().contains(&query))
+        .filter(|choice| contains_ignore_case(&choice.label, &query))
         .collect()
 }
 pub(super) enum Modal {
@@ -712,26 +731,25 @@ impl App {
             Ask::TestHarness { harnesses } => self.start_harness_tests(harnesses.clone())?,
             Ask::ApplyWorktree { run, files, .. } => {
                 let loaded = self.idle(run)?.clone();
-                let (_, outcome) = engine::apply_worktree(&loaded, false)?;
-                self.repo.checked = None;
-                match outcome {
-                    crate::fanout::Applied::Clean => {
-                        self.ui.message = format!(
-                            "Applied {files} file(s) from {run} into the checkout (uncommitted)."
-                        );
-                    }
-                    crate::fanout::Applied::Merged => {
-                        self.ui.message = format!(
-                            "Applied {files} file(s) from {run} into the checkout via 3-way merge (uncommitted)."
-                        );
-                    }
-                    crate::fanout::Applied::Conflict(paths) => {
-                        anyhow::bail!(
-                            "Could not apply {run} (conflicts in {}); checkout left unchanged",
-                            paths.join(", ")
-                        );
-                    }
-                }
+                let loading = Loading::new("Applying worktree changes…");
+                let ticket = loading.ticket;
+                let id = run.clone();
+                let files = *files;
+                self.tasks.spawn(
+                    "Applying worktree changes stopped unexpectedly",
+                    move || {
+                        engine::apply_worktree(&loaded, false)
+                            .map(|(_, outcome)| outcome)
+                            .map_err(|e| format!("{e:#}"))
+                    },
+                    move |result| super::tasks::Msg::AppliedWorktree {
+                        ticket,
+                        run: id,
+                        files,
+                        result,
+                    },
+                );
+                return Ok(DialogResult::Replace(Modal::Loading(loading)));
             }
             Ask::SaveAndExit | Ask::LeaveRunning => {}
         }
@@ -1041,8 +1059,11 @@ impl App {
                 field.insert_str(text);
             }
             Some(Modal::Stage { editor, .. }) => editor.paste(text),
-            Some(Modal::Picker { filter, .. }) => {
-                filter.insert_str(text);
+            Some(Modal::Picker {
+                filter, selected, ..
+            }) => {
+                filter.insert_str(text.replace(['\r', '\n'], " "));
+                *selected = 0;
             }
             Some(Modal::Repositories(picker)) => picker.paste(text),
             Some(Modal::Import(importer)) => importer.paste(text),
@@ -1069,6 +1090,7 @@ pub(super) fn draw_modal(
         Modal::Diff(_) => (u16::MAX, u16::MAX),
         Modal::Handoff(_) => (100, 32),
         Modal::Loading(_) => (64, 7),
+        Modal::Ask(ask) if matches!(**ask, Ask::ApplyWorktree { .. }) => (80, 22),
         Modal::Ask(_) => (72, 9),
         _ => (95, 26),
     };
@@ -1135,16 +1157,25 @@ pub(super) fn draw_modal(
                         .style(Style::default().fg(palette.muted)),
                     chunks[1].inner(Margin::new(2, 1)),
                 );
-            }
-            frame.render_stateful_widget(
-                List::new(choices.iter().map(|c| ListItem::new(c.label.clone())))
+            } else {
+                let visible = usize::from(chunks[1].height.saturating_sub(2)).max(1);
+                let start = (*selected).saturating_sub(visible);
+                let end = (*selected + visible + 1).min(choices.len());
+                let rel = (*selected).saturating_sub(start);
+                frame.render_stateful_widget(
+                    List::new(
+                        choices[start..end]
+                            .iter()
+                            .map(|c| ListItem::new(c.label.as_str())),
+                    )
                     .highlight_style(palette.selected_style())
                     .highlight_symbol("▌ ")
                     .highlight_spacing(HighlightSpacing::Always)
                     .block(Block::default().padding(Padding::vertical(1))),
-                chunks[1],
-                &mut ListState::default().with_selected(Some(*selected)),
-            );
+                    chunks[1],
+                    &mut ListState::default().with_selected(Some(rel)),
+                );
+            }
             let mut lines = vec![];
             if let Some(text) = detail {
                 let mut parts = text.lines();
@@ -1209,28 +1240,31 @@ pub(super) fn draw_modal(
         Modal::Ask(_) => {
             let (title, question, keys) = ask.unwrap_or_default();
             let block = palette.modal(title, &[]);
-            let inner = block.inner(rect);
+            let inner = block.inner(rect).inner(Margin::new(1, 0));
             frame.render_widget(block, rect);
+            let [body_area, keys_area] =
+                Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(inner);
+            let cleaned = storage::clean_terminal(&question);
+            let mut body_lines = Vec::new();
+            if body_area.height > 2 {
+                body_lines.push(Line::raw(""));
+            }
+            for line in cleaned.lines() {
+                body_lines.push(Line::styled(
+                    line.to_owned(),
+                    Style::default().fg(palette.fg),
+                ));
+            }
             frame.render_widget(
-                Paragraph::new(vec![
-                    Line::raw(""),
-                    Line::styled(
-                        storage::clean_terminal(&question),
-                        Style::default().fg(palette.fg),
-                    ),
-                    Line::raw(""),
-                    palette.hints(keys),
-                ])
-                .wrap(Wrap { trim: false }),
-                inner.inner(Margin::new(1, 0)),
+                Paragraph::new(body_lines).wrap(Wrap { trim: false }),
+                body_area,
+            );
+            frame.render_widget(
+                Paragraph::new(vec![Line::raw(""), palette.hints(keys)]).wrap(Wrap { trim: false }),
+                keys_area,
             );
         }
         Modal::Loading(loading) => {
-            const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let tick = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() / 80)
-                .unwrap_or(0) as usize;
             let discovery = loading.text.starts_with("Reading");
             let block = palette.modal(
                 if discovery {
@@ -1247,7 +1281,7 @@ pub(super) fn draw_modal(
                     Line::raw(""),
                     Line::from(vec![
                         Span::styled(
-                            format!("{} ", SPIN[tick % SPIN.len()]),
+                            format!("{} ", super::widgets::spinner()),
                             Style::default().fg(palette.accent),
                         ),
                         Span::raw(loading.text.clone()),
@@ -1289,7 +1323,10 @@ fn draw_menu(frame: &mut Frame<'_>, scope: Scope, group: Option<Group>, palette:
         .unwrap_or(0);
     let area = frame.area();
     // Borders, group names, a gap, the actions, a gap, and the hint.
-    let height = (tallest as u16 + 6).min(area.height.saturating_sub(2));
+    let height = u16::try_from(tallest)
+        .unwrap_or(u16::MAX)
+        .saturating_add(6)
+        .min(area.height.saturating_sub(2));
     let rect = Rect::new(
         area.x,
         area.bottom().saturating_sub(height + 1),

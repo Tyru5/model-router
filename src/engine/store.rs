@@ -1,13 +1,27 @@
 use super::*;
 
 pub(super) fn set_aside_handoff(handoff_file: &Path, attempt_dir: &Path) -> Result<()> {
-    if handoff_file.exists() {
-        fs::create_dir_all(attempt_dir)?;
-        fs::rename(handoff_file, attempt_dir.join("handoff-file.json")).with_context(|| {
-            format!("Move the previous handoff {} aside", handoff_file.display())
-        })?;
+    let Ok(meta) = fs::symlink_metadata(handoff_file) else {
+        return Ok(());
+    };
+    fs::create_dir_all(attempt_dir)?;
+    let destination = attempt_dir.join("handoff-file.json");
+    match fs::rename(handoff_file, &destination) {
+        Ok(()) => Ok(()),
+        Err(err) if err.raw_os_error() == Some(libc::EXDEV) => {
+            if meta.file_type().is_symlink() {
+                fs::remove_file(handoff_file)?;
+            } else {
+                let mut src = fs::File::open(handoff_file)?;
+                let mut dst = storage::create_fresh(&destination)?;
+                io::copy(&mut src, &mut dst)?;
+                fs::remove_file(handoff_file)?;
+            }
+            Ok(())
+        }
+        Err(err) => Err(err)
+            .with_context(|| format!("Move the previous handoff {} aside", handoff_file.display())),
     }
-    Ok(())
 }
 
 /// The attempt paths a run records, which `load` respells and validates.
@@ -22,6 +36,7 @@ pub(super) fn recorded_paths(run: &mut Run) -> Vec<&mut PathBuf> {
         for attempt in attempts {
             paths.extend([&mut attempt.directory, &mut attempt.handoff_file]);
             paths.extend(&mut attempt.worktree);
+            paths.extend(attempt.checks.iter_mut().map(|check| &mut check.directory));
         }
     }
     paths
@@ -41,7 +56,12 @@ pub fn load(project: &Path, id: &str) -> Result<Run> {
             && no_parent(&run.project)
             && fs::canonicalize(&run.project)? == project
             && run.stages.len() == run.workflow.stages.len()
-            && run.cursor <= run.stages.len(),
+            && run.cursor <= run.stages.len()
+            && (run.cursor < run.stages.len()
+                || !matches!(
+                    run.status,
+                    Status::AwaitingConfirmation | Status::Interactive
+                )),
         "Invalid or unsupported run record"
     );
     // The record may spell the project through a link: the project moved
@@ -138,13 +158,19 @@ pub fn load(project: &Path, id: &str) -> Result<Run> {
             "Invalid or unsupported run record: stage {} has candidates its workflow does not",
             stage.id
         );
+        ensure!(
+            fan_out.round <= state.attempts.len(),
+            "Invalid or unsupported run record: stage {} has an invalid fan-out round",
+            stage.id
+        );
         for candidate in &fan_out.candidates {
             for (n, attempt) in candidate.attempts.iter().enumerate() {
-                let expected = base
-                    .join("candidates")
-                    .join(id)
-                    .join(&stage.id)
-                    .join(format!("{}-{:03}", candidate.id, n + 1));
+                let leaf = if fan_out.round <= 1 {
+                    format!("{}-{:03}", candidate.id, n + 1)
+                } else {
+                    format!("r{:03}-{}-{:03}", fan_out.round, candidate.id, n + 1)
+                };
+                let expected = base.join("candidates").join(id).join(&stage.id).join(leaf);
                 ensure!(
                     attempt.number == n + 1
                         && attempt.worktree.as_ref().is_none_or(|w| *w == expected),
@@ -160,16 +186,30 @@ pub fn load(project: &Path, id: &str) -> Result<Run> {
     // directory (`runs/<id>/…`, `handoffs/<id>/…`, …), never another run's.
     // Links may relocate the metadata directory or those directories, but
     // none inside one may lead out.
-    let resolved = |path: &Path| {
-        path.ancestors().find_map(|known| {
+    let mut resolved_cache: std::collections::HashMap<PathBuf, Option<PathBuf>> =
+        std::collections::HashMap::new();
+    let resolve_cached = |cache: &mut std::collections::HashMap<PathBuf, Option<PathBuf>>,
+                          path: &Path|
+     -> Option<PathBuf> {
+        if let Some(cached) = cache.get(path) {
+            return cached.clone();
+        }
+        let found = path.ancestors().find_map(|known| {
             Some(
                 fs::canonicalize(known)
                     .ok()?
                     .join(path.strip_prefix(known).ok()?),
             )
-        })
+        });
+        cache.insert(path.to_path_buf(), found.clone());
+        found
     };
-    let inside = |path: &Path| {
+    let resolved_runs = resolve_cached(&mut resolved_cache, &base.join("runs").join(id));
+    let resolved_handoffs = resolve_cached(&mut resolved_cache, &base.join("handoffs").join(id));
+    let resolved_worktrees = resolve_cached(&mut resolved_cache, &base.join("worktrees").join(id));
+    let resolved_candidates =
+        resolve_cached(&mut resolved_cache, &base.join("candidates").join(id));
+    let mut inside = |path: &Path| {
         let Ok(rest) = path.strip_prefix(&base) else {
             return false;
         };
@@ -181,42 +221,46 @@ pub fn load(project: &Path, id: &str) -> Result<Run> {
         if parts.len() <= 2 || parts[1] != std::ffi::OsStr::new(id) {
             return false;
         }
-        let laid_out = match parts[0].to_str() {
-            Some("runs") => parts.len() >= 4,
-            Some("handoffs") => true,
-            Some("worktrees" | "candidates") => parts
-                .iter()
-                .position(|part| *part == ".model-router")
-                .map_or(worktrees.iter().any(|w| w == path), |at| {
-                    parts.get(at + 1).is_some_and(|next| *next == "handoffs")
-                }),
-            _ => false,
+        let container = match parts[0].to_str() {
+            Some("runs") if parts.len() >= 4 => resolved_runs.as_ref(),
+            Some("handoffs") => resolved_handoffs.as_ref(),
+            Some("worktrees" | "candidates") => {
+                let laid_out = parts
+                    .iter()
+                    .position(|part| *part == ".model-router")
+                    .map_or(worktrees.iter().any(|w| w == path), |at| {
+                        parts.get(at + 1).is_some_and(|next| *next == "handoffs")
+                    });
+                if !laid_out {
+                    return false;
+                }
+                if parts[0] == std::ffi::OsStr::new("worktrees") {
+                    resolved_worktrees.as_ref()
+                } else {
+                    resolved_candidates.as_ref()
+                }
+            }
+            _ => return false,
         };
-        if !no_parent(path) || !laid_out {
+        if !no_parent(path) {
             return false;
-        }
-        let mut containers = vec![base.join(rest.components().take(2).collect::<PathBuf>())];
-        // A checkout's metadata directory may be a link to the project's
-        // (one Git does not ignore is checked out with it), so its handoffs
-        // land in this run's own handoff directory.
-        if matches!(parts[0].to_str(), Some("worktrees" | "candidates")) {
-            containers.push(base.join("handoffs").join(id));
         }
         // The last component is judged by name: a stage may leave a link at
         // a file it can write, which is read, moved, or removed, never
         // followed to write.
         let Some(path) = path
             .parent()
-            .and_then(resolved)
+            .and_then(|parent| resolve_cached(&mut resolved_cache, parent))
             .zip(path.file_name())
             .map(|(parent, name)| parent.join(name))
         else {
             return false;
         };
-        containers
-            .iter()
-            .filter_map(|container| resolved(container))
-            .any(|container| path.starts_with(container))
+        container.is_some_and(|c| path.starts_with(c))
+            || (matches!(parts[0].to_str(), Some("worktrees" | "candidates"))
+                && resolved_handoffs
+                    .as_ref()
+                    .is_some_and(|c| path.starts_with(c)))
     };
     ensure!(
         recorded_paths(&mut run)
@@ -242,6 +286,19 @@ pub fn command(project: &Path, id: &str, revision: Option<u64>, cmd: Cmd) -> Res
             "This run changed in another process; reload it before continuing"
         );
     }
+    let _workspace_lock = if matches!(cmd, Cmd::Confirm)
+        && run.status == Status::AwaitingConfirmation
+        && graph::judged_by(&run.workflow, run.cursor).is_some()
+    {
+        let lock = storage::lock_wait(
+            &storage::metadata_dir(&run.workspace)?.join("workspace.lock"),
+            LOCK_WAIT,
+        )?;
+        refuse_unproven(&run)?;
+        Some(lock)
+    } else {
+        None
+    };
     match cmd {
         Cmd::Retry { interactive, model } => run.retry(interactive, model)?,
         Cmd::TakeOver => run.take_over()?,
@@ -269,7 +326,8 @@ pub fn history(project: &Path) -> Result<Vec<Run>> {
 pub(super) fn save_changes(run: &Run) {
     if let Ok((from, to)) = run.change_range() {
         if let Ok(patch) = snapshot::patch(&run.workspace, from, to, snapshot::PATCH_LIMIT) {
-            let _ = storage::atomic_write(&run.directory.join("changes.diff"), patch.as_bytes());
+            let _ =
+                storage::atomic_write_fast(&run.directory.join("changes.diff"), patch.as_bytes());
         }
     }
 }

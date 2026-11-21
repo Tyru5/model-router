@@ -29,8 +29,10 @@ pub(super) enum Message {
     Spawned(Job, process::Group),
     /// Formatted lines, as the worker's formatter produced them.
     Output(Job, String),
-    /// The supervisor's result and when the harness ended.
-    Done(Job, Result<process::Outcome>, DateTime<Utc>),
+    /// A stage supervisor's result and when the harness ended.
+    StageDone(usize, Result<process::Outcome>, DateTime<Utc>),
+    /// A candidate worker's post-processed result and when the harness ended.
+    CandidateDone(usize, usize, Box<Result<run::CandidatePost>>, DateTime<Utc>),
 }
 /// What the scheduler starts next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,19 +41,50 @@ pub(super) enum Launch {
     FanOut(usize),
     Candidate(usize, usize),
     Interactive(usize),
+    Ship(usize),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Next {
+    Interactive(usize),
+    Ship(usize),
+}
+
+struct StageJob {
+    index: usize,
+    invocation: Invocation,
+    sandbox: Option<crate::sandbox::Plan>,
+    directory: PathBuf,
+    cwd: PathBuf,
+}
+
+struct CandidateJob {
+    index: usize,
+    c: usize,
+    prepared: Prepared,
+    cwd: PathBuf,
+    worktree: PathBuf,
+    candidate: Stage,
+    base: String,
+    run_id: String,
+    protected_paths: Vec<String>,
+}
+
+enum WorkerJob {
+    Stage(Box<StageJob>),
+    Candidate(Box<CandidateJob>),
 }
 
 /// The next thing to start, in list order, and a writer stage waiting to
 /// run alone. Stages start only when every stage they run after is done;
 /// parallel-safe ones run together up to `max_parallel` processes, others
-/// alone, and interactive ones alone with the run handed to their terminal.
-/// `only` limits it to that fan-out stage's candidates.
+/// alone, and interactive or ship ones alone. `only` limits it to that
+/// fan-out stage's candidates.
 pub(super) fn next_launch(run: &Run, only: Option<usize>) -> (Option<Launch>, Option<usize>) {
     let stages = &run.workflow.stages;
     let max = run.workflow.max_parallel.max(1) as usize;
     let mut flight = 0;
     let mut writer = false;
-    for (stage, state) in stages.iter().zip(&run.stages) {
+    for (index, (stage, state)) in stages.iter().zip(&run.stages).enumerate() {
         if let Some(fan) = &state.fan_out {
             flight += fan
                 .candidates
@@ -61,7 +94,7 @@ pub(super) fn next_launch(run: &Run, only: Option<usize>) -> (Option<Launch>, Op
         }
         if state.status == Status::Running && stage.fan_out.is_none() {
             flight += 1;
-            writer |= !graph::parallel_safe(stage);
+            writer |= !graph::parallel_safe(&run.workflow, index);
         }
     }
     let pending = |index: usize| {
@@ -105,10 +138,17 @@ pub(super) fn next_launch(run: &Run, only: Option<usize>) -> (Option<Launch>, Op
         if !ready {
             continue;
         }
+        if stage.role == Role::Ship {
+            return if flight == 0 {
+                (Some(Launch::Ship(index)), None)
+            } else {
+                (None, Some(index))
+            };
+        }
         if stage.mode == Mode::Interactive {
             return ((flight == 0).then_some(Launch::Interactive(index)), None);
         }
-        if graph::parallel_safe(stage) {
+        if graph::parallel_safe(&run.workflow, index) {
             if flight >= max {
                 return (None, None);
             }
@@ -196,8 +236,8 @@ pub(super) fn schedule(
     cancel: &AtomicBool,
     emit: &mut impl FnMut(Event),
     only: Option<usize>,
-) -> Result<(Option<usize>, usize)> {
-    let mut interactive = None;
+) -> Result<(Option<Next>, usize)> {
+    let mut next = None;
     let mut started = 0;
     let mut noted = vec![];
     let halted = |run: &Run| {
@@ -211,16 +251,20 @@ pub(super) fn schedule(
                 .iter()
                 .any(|s| s.status == Status::AwaitingConfirmation)
     };
+    let abort = AtomicBool::new(false);
+    let abort = &abort;
     let journal = SpawnJournal::new(run);
     let journal = &journal;
     let result = thread::scope(|scope| -> Result<()> {
+        let (tx, rx) = mpsc::channel::<Message>();
         let result = (|| -> Result<()> {
-            let (tx, rx) = mpsc::channel::<Message>();
-            let mut flight: Vec<(Job, Prepared, PathBuf)> = vec![];
+            let tx = &tx;
+            let mut flight: Vec<(Job, Option<Prepared>)> = vec![];
+            let mut deferred_settle: Vec<usize> = vec![];
             let mut labels = std::collections::HashMap::new();
             let mut speaking = None;
             loop {
-                while !halted(run) {
+                while !halted(run) && deferred_settle.is_empty() {
                     let (launch, waiting) = next_launch(run, only);
                     if let Some(index) = waiting.filter(|i| !noted.contains(i)) {
                         noted.push(index);
@@ -236,7 +280,8 @@ pub(super) fn schedule(
                     // starts; stages already running finish.
                     if let Launch::Stage(index)
                     | Launch::FanOut(index)
-                    | Launch::Interactive(index) = launch
+                    | Launch::Interactive(index)
+                    | Launch::Ship(index) = launch
                     {
                         match crate::cost::check_budget_action(run) {
                             crate::cost::BudgetCheck::Ok => {}
@@ -253,9 +298,13 @@ pub(super) fn schedule(
                         }
                     }
                     started += 1;
-                    let (job, prepared, cwd) = match launch {
+                    let (job, flight_prepared, worker_job) = match launch {
                         Launch::Interactive(index) => {
-                            interactive = Some(index);
+                            next = Some(Next::Interactive(index));
+                            break;
+                        }
+                        Launch::Ship(index) => {
+                            next = Some(Next::Ship(index));
                             break;
                         }
                         Launch::FanOut(index) => {
@@ -278,7 +327,14 @@ pub(super) fn schedule(
                             run.cursor = index;
                             match start_stage(run, emit)? {
                                 Some(prepared) => {
-                                    (Job::Stage(index), prepared, run.workspace.clone())
+                                    let worker = WorkerJob::Stage(Box::new(StageJob {
+                                        index,
+                                        invocation: prepared.invocation.clone(),
+                                        sandbox: prepared.sandbox.clone(),
+                                        directory: prepared.directory.clone(),
+                                        cwd: run.workspace.clone(),
+                                    }));
+                                    (Job::Stage(index), Some(prepared), worker)
                                 }
                                 None => continue,
                             }
@@ -286,7 +342,33 @@ pub(super) fn schedule(
                         Launch::Candidate(index, c) => match run.launch_candidate(index, c) {
                             Ok((prepared, cwd)) => {
                                 emit(Event::State(Box::new(run.clone())));
-                                (Job::Candidate(index, c), prepared, cwd)
+                                let stage = &run.workflow.stages[index];
+                                let candidate = stage
+                                    .fan_out
+                                    .as_ref()
+                                    .and_then(|f| f.candidates.get(c))
+                                    .context("No such candidate")?
+                                    .stage(stage);
+                                let fan_state =
+                                    run.stages[index].fan_out.as_ref().context("No fan-out")?;
+                                let base = fan_state.base.clone();
+                                let worktree = fan_state.candidates[c]
+                                    .attempts
+                                    .last()
+                                    .and_then(|a| a.worktree.clone())
+                                    .context("No worktree")?;
+                                let worker = WorkerJob::Candidate(Box::new(CandidateJob {
+                                    index,
+                                    c,
+                                    prepared,
+                                    cwd,
+                                    worktree,
+                                    candidate,
+                                    base,
+                                    run_id: run.id.clone(),
+                                    protected_paths: run.workflow.protected_paths.clone(),
+                                }));
+                                (Job::Candidate(index, c), None, worker)
                             }
                             Err(error) => {
                                 run.stop_candidate(
@@ -297,7 +379,15 @@ pub(super) fn schedule(
                                     Actor::Engine,
                                 )?;
                                 if run.fan_out_done(index) {
-                                    run.settle_fan_out(index, false)?;
+                                    if graph::judge_of(&run.workflow, index).is_none()
+                                        && !flight.is_empty()
+                                    {
+                                        if !deferred_settle.contains(&index) {
+                                            deferred_settle.push(index);
+                                        }
+                                    } else {
+                                        run.settle_fan_out(index, false)?;
+                                    }
                                 }
                                 run.persist()?;
                                 emit(Event::State(Box::new(run.clone())));
@@ -305,30 +395,28 @@ pub(super) fn schedule(
                             }
                         },
                     };
-                    let (index, label) = match job {
-                        Job::Stage(index) => (index, run.workflow.stages[index].name.clone()),
-                        Job::Candidate(index, c) => (
-                            index,
-                            format!(
-                                "{} · candidate {}",
-                                run.workflow.stages[index].name,
-                                run.candidate(index, c).id
-                            ),
+                    let (index, kind, label) = match &worker_job {
+                        WorkerJob::Stage(stage) => (
+                            stage.index,
+                            stage.invocation.kind,
+                            run.workflow.stages[stage.index].name.clone(),
                         ),
+                        WorkerJob::Candidate(cand) => {
+                            let state = run.candidate(cand.index, cand.c);
+                            let label = format!(
+                                "{} · candidate {}",
+                                run.workflow.stages[cand.index].name, state.id
+                            );
+                            emit(Event::Output(format!(
+                                "── {label} · attempt {} · {}{}{} ──\n",
+                                state.attempts.len(),
+                                state.harness,
+                                if state.model.is_empty() { "" } else { " " },
+                                state.model
+                            )));
+                            (cand.index, cand.prepared.invocation.kind, label)
+                        }
                     };
-                    if let Job::Candidate(..) = job {
-                        let state = match job {
-                            Job::Candidate(i, c) => run.candidate(i, c),
-                            Job::Stage(_) => unreachable!(),
-                        };
-                        emit(Event::Output(format!(
-                            "── {label} · attempt {} · {}{}{} ──\n",
-                            state.attempts.len(),
-                            state.harness,
-                            if state.model.is_empty() { "" } else { " " },
-                            state.model
-                        )));
-                    }
                     speaking = Some(job);
                     labels.insert(job, label);
                     let timeout = Duration::from_secs(run.workflow.stages[index].timeout_seconds);
@@ -336,66 +424,143 @@ pub(super) fn schedule(
                     // arrives only at exit.
                     let stall_timeout = run.workflow.stages[index]
                         .stall_timeout_seconds
-                        .filter(|_| prepared.invocation.kind != adapters::OutputKind::Gemini)
+                        .filter(|_| kind != adapters::OutputKind::Gemini)
                         .map(Duration::from_secs);
-                    let invocation = prepared.invocation.clone();
-                    let sandbox = prepared.sandbox.clone();
-                    let directory = prepared.directory.clone();
-                    let worker_cwd = cwd.clone();
-                    let tx = tx.clone();
+                    let worker_tx = tx.clone();
                     scope.spawn(move || {
+                        let (invocation, cwd, directory, sandbox) = match &worker_job {
+                            WorkerJob::Stage(stage) => (
+                                &stage.invocation,
+                                &stage.cwd,
+                                &stage.directory,
+                                stage.sandbox.as_ref(),
+                            ),
+                            WorkerJob::Candidate(cand) => (
+                                &cand.prepared.invocation,
+                                &cand.cwd,
+                                &cand.prepared.directory,
+                                cand.prepared.sandbox.as_ref(),
+                            ),
+                        };
                         let spawned = std::cell::Cell::new(None);
                         // Formatting here keeps it off the scheduler, which
                         // also runs checks, and sends lines, not raw output.
                         let mut formatter = events::Formatter::new(invocation.kind);
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            process::capture_with_stall(
-                                &invocation,
-                                &worker_cwd,
-                                &directory,
-                                timeout,
-                                stall_timeout,
-                                cancel,
-                                sandbox.as_ref(),
-                                |group| {
-                                    // Durable before this worker reports it;
-                                    // forgotten below even if writing it
-                                    // failed partway.
-                                    spawned.set(Some(group.pgid));
-                                    journal.add(&group)?;
-                                    let _ = tx.send(Message::Spawned(job, group));
-                                    Ok(())
-                                },
-                                |err, text| {
-                                    let lines = if err {
-                                        Some(format!("[stderr] {}", storage::clean_terminal(text)))
-                                    } else {
-                                        formatter.push(text)
-                                    };
-                                    if let Some(lines) = lines {
-                                        let _ = tx.send(Message::Output(job, lines));
-                                    }
-                                },
-                            )
-                        }))
-                        .unwrap_or_else(|_| {
-                            Err(anyhow::anyhow!("The harness supervisor panicked"))
-                        });
+                        let outcome_result =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                process::capture_with_stall_and_abort(
+                                    invocation,
+                                    cwd,
+                                    directory,
+                                    timeout,
+                                    stall_timeout,
+                                    cancel,
+                                    Some(abort),
+                                    sandbox,
+                                    |group| {
+                                        // Durable before this worker reports it;
+                                        // forgotten below if no survivor stayed.
+                                        spawned.set(Some(group.pgid));
+                                        journal.add(&group)?;
+                                        let _ = worker_tx.send(Message::Spawned(job, group));
+                                        Ok(())
+                                    },
+                                    |err, text| {
+                                        let lines = if err {
+                                            Some(format!(
+                                                "[stderr] {}",
+                                                storage::clean_terminal(text)
+                                            ))
+                                        } else {
+                                            formatter.push(text)
+                                        };
+                                        if let Some(lines) = lines {
+                                            let _ = worker_tx.send(Message::Output(job, lines));
+                                        }
+                                    },
+                                )
+                            }))
+                            .unwrap_or_else(|_| {
+                                Err(anyhow::anyhow!("The harness supervisor panicked"))
+                            });
                         let ended = Utc::now();
                         if let Some(rest) = formatter.finish() {
-                            let _ = tx.send(Message::Output(job, rest));
+                            let _ = worker_tx.send(Message::Output(job, rest));
                         }
-                        // The group ended with the supervisor, so recovery
-                        // must not signal its ID, even if the run never
-                        // saved it or the scheduler stopped reading.
-                        if let Some(pgid) = spawned.get() {
-                            journal.recorded(pgid);
+                        // If the group ended cleanly with the supervisor, forget
+                        // it now; if a Survivor remains, keep the journal entry
+                        // until the scheduler persists `retained_groups`.
+                        let survived = outcome_result
+                            .as_ref()
+                            .err()
+                            .is_some_and(|e| e.downcast_ref::<process::Survivor>().is_some());
+                        if !survived {
+                            if let Some(pgid) = spawned.get() {
+                                journal.recorded(pgid);
+                            }
                         }
-                        let _ = tx.send(Message::Done(job, result, ended));
+                        match worker_job {
+                            WorkerJob::Stage(stage) => {
+                                let _ = worker_tx.send(Message::StageDone(
+                                    stage.index,
+                                    outcome_result,
+                                    ended,
+                                ));
+                            }
+                            WorkerJob::Candidate(cand) => {
+                                let post =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        run::post_process_candidate(
+                                            &cand.candidate,
+                                            &cand.prepared,
+                                            &cand.cwd,
+                                            &cand.worktree,
+                                            &cand.base,
+                                            &cand.run_id,
+                                            &cand.protected_paths,
+                                            outcome_result,
+                                            journal,
+                                            cancel,
+                                            abort,
+                                            &mut |group| {
+                                                let _ =
+                                                    worker_tx.send(Message::Spawned(job, group));
+                                            },
+                                            &mut |text| {
+                                                let _ = worker_tx.send(Message::Output(job, text));
+                                            },
+                                        )
+                                    }))
+                                    .unwrap_or_else(|_| {
+                                        Err(anyhow::anyhow!("Candidate post-processing panicked"))
+                                    });
+                                let _ = worker_tx.send(Message::CandidateDone(
+                                    cand.index,
+                                    cand.c,
+                                    Box::new(post),
+                                    ended,
+                                ));
+                            }
+                        }
                     });
-                    flight.push((job, prepared, cwd));
+                    flight.push((job, flight_prepared));
                 }
                 if flight.is_empty() {
+                    if !deferred_settle.is_empty() {
+                        let cancelled = cancel.load(Ordering::Relaxed);
+                        for index in std::mem::take(&mut deferred_settle) {
+                            if run.stages[index].status == Status::Running
+                                && run.fan_out_done(index)
+                            {
+                                run.settle_fan_out(index, cancelled)?;
+                                run.persist()?;
+                                emit(Event::State(Box::new(run.clone())));
+                            }
+                        }
+                        if !halted(run) && next.is_none() {
+                            continue;
+                        }
+                    }
                     break;
                 }
                 let message = rx.recv().context("Harness workers stopped")?;
@@ -424,66 +589,103 @@ pub(super) fn schedule(
                         }
                         emit(Event::Output(lines));
                     }
-                    Message::Done(job, result, ended) => {
-                        let Some(position) = flight.iter().position(|(j, ..)| *j == job) else {
+                    Message::StageDone(index, done_result, ended) => {
+                        let job = Job::Stage(index);
+                        let Some(position) = flight.iter().position(|(j, _)| *j == job) else {
                             continue;
                         };
-                        let (_, prepared, cwd) = flight.swap_remove(position);
+                        let (_, prepared) = flight.swap_remove(position);
+                        let prepared = prepared.context("Missing stage flight state")?;
                         if labels.remove(&job).is_some() {
                             speaking = None;
                         }
+                        let survivor_pgid = done_result
+                            .as_ref()
+                            .err()
+                            .and_then(|e| e.downcast_ref::<process::Survivor>())
+                            .map(|s| s.group.pgid);
                         // When the harness ended, not when this got to it.
-                        let attempt = match job {
-                            Job::Stage(i) => run.stages[i].attempts.last_mut(),
-                            Job::Candidate(i, c) => run.candidate_mut(i, c).attempts.last_mut(),
-                        };
-                        if let (Some(attempt), true) = (attempt, result.is_ok()) {
+                        if let (Some(attempt), true) =
+                            (run.stages[index].attempts.last_mut(), done_result.is_ok())
+                        {
                             attempt.finished_at = Some(ended);
                         }
-                        match job {
-                            Job::Stage(index) => {
-                                run.cursor = index;
-                                conclude(run, &prepared, result, cancel, emit)?;
-                            }
-                            Job::Candidate(index, c) => {
-                                run.cursor = index;
-                                if let Err(error) = run.finish_candidate(
-                                    (index, c),
-                                    &prepared,
-                                    &cwd,
-                                    result,
-                                    cancel,
-                                    emit,
-                                ) {
-                                    run.stop_candidate(
-                                        index,
-                                        c,
-                                        Status::Failed,
-                                        format!(
-                                            "Could not complete candidate bookkeeping: {error:#}"
-                                        ),
-                                        Actor::Engine,
-                                    )?;
+                        run.cursor = index;
+                        conclude(run, &prepared, done_result, cancel, emit)?;
+                        if let Some(pgid) = survivor_pgid {
+                            journal.recorded(pgid);
+                        }
+                    }
+                    Message::CandidateDone(index, c, post_result, ended) => {
+                        let job = Job::Candidate(index, c);
+                        let Some(position) = flight.iter().position(|(j, _)| *j == job) else {
+                            continue;
+                        };
+                        flight.swap_remove(position);
+                        if labels.remove(&job).is_some() {
+                            speaking = None;
+                        }
+                        run.cursor = index;
+                        let survivor_pgid =
+                            run.apply_candidate_post((index, c), *post_result, ended)?;
+                        if run.fan_out_done(index) {
+                            if graph::judge_of(&run.workflow, index).is_none() && !flight.is_empty()
+                            {
+                                if !deferred_settle.contains(&index) {
+                                    deferred_settle.push(index);
                                 }
-                                if run.fan_out_done(index) {
-                                    run.settle_fan_out(index, cancel.load(Ordering::Relaxed))?;
-                                }
-                                run.persist()?;
-                                emit(Event::State(Box::new(run.clone())));
+                            } else {
+                                run.settle_fan_out(index, cancel.load(Ordering::Relaxed))?;
                             }
                         }
+                        run.persist()?;
+                        if let Some(pgid) = survivor_pgid {
+                            journal.recorded(pgid);
+                        }
+                        emit(Event::State(Box::new(run.clone())));
                     }
                 }
             }
             Ok(())
         })();
         if result.is_err() {
-            // Running harnesses end promptly; the scope waits for them.
-            cancel.store(true, Ordering::Relaxed);
+            // Running harnesses end promptly via the local abort flag while
+            // workers drain and report any survivors before the scope ends.
+            abort.store(true, Ordering::Relaxed);
+            drop(tx);
+            let mut survivors_added = false;
+            while let Ok(message) = rx.recv() {
+                match message {
+                    Message::StageDone(_, done_result, _) => {
+                        let before = run.retained_groups.len();
+                        keep_survivor(run, &done_result);
+                        if run.retained_groups.len() > before {
+                            survivors_added = true;
+                        }
+                    }
+                    Message::CandidateDone(_, _, post, _) => {
+                        if let Ok(post) = *post {
+                            if let Some(group) = post.survivor {
+                                if run.retained_groups.iter().all(|g| g.pgid != group.pgid) {
+                                    run.retained_groups.push(group);
+                                    survivors_added = true;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if survivors_added {
+                let _ = run.persist();
+            }
         }
         result
     });
     result?;
+    let cancel_requested = cancel.load(Ordering::Relaxed);
+    let before_cursor = run.cursor;
+    let before_error = run.error.clone();
     // Rounds the run stopped before every candidate started.
     for index in 0..run.stages.len() {
         if only.is_some_and(|only| only != index)
@@ -496,8 +698,10 @@ pub(super) fn schedule(
             .fan_out
             .as_ref()
             .map_or(0, |f| f.candidates.len());
+        let mut had_pending = false;
         for c in 0..count {
             if run.candidate(index, c).status == Status::Pending {
+                had_pending = true;
                 run.stop_candidate(
                     index,
                     c,
@@ -507,14 +711,16 @@ pub(super) fn schedule(
                 )?;
             }
         }
-        run.settle_fan_out(index, true)?;
+        run.settle_fan_out(index, cancel_requested || had_pending)?;
     }
     if only.is_none() {
         run.settle()?;
     }
-    run.persist()?;
+    if !run.journal.is_empty() || run.cursor != before_cursor || run.error != before_error {
+        run.persist()?;
+    }
     emit(Event::State(Box::new(run.clone())));
-    Ok((interactive, started))
+    Ok((next, started))
 }
 
 /// Runs the current fan-out stage of a list workflow: its candidates side
@@ -549,13 +755,16 @@ pub(super) fn drive_graph(
     cancel: &AtomicBool,
     emit: &mut impl FnMut(Event),
 ) -> Result<Action> {
+    let mut checkout_checked = false;
     loop {
         match run.status {
             Status::AwaitingConfirmation => return Ok(Action::Confirm),
             Status::Interactive => return Ok(Action::Interactive),
             Status::Failed | Status::Blocked | Status::Cancelled => {
                 save_changes(run);
-                run.persist()?;
+                if !run.journal.is_empty() {
+                    run.persist()?;
+                }
                 return Ok(Action::Stopped);
             }
             Status::Running => {
@@ -595,27 +804,41 @@ pub(super) fn drive_graph(
             save_changes(run);
             return Ok(Action::Stopped);
         }
-        refuse_unproven(run)?;
+        if !checkout_checked {
+            refuse_unproven(run)?;
+            checkout_checked = true;
+        } else {
+            refuse_own_unproven(run)?;
+        }
         run.hold = Some(Hold::default());
         let scheduled = schedule(run, cancel, emit, None);
         run.hold = None;
-        let (interactive, started) = scheduled?;
+        let (next, started) = scheduled?;
         if run.status == Status::Pending {
-            if let Some(index) = interactive {
-                run.cursor = index;
-                let reason = format!(
-                    "Stage {} waits for its terminal",
-                    run.workflow.stages[index].name
-                );
-                run.set(Target::Run, Status::Interactive, Actor::Engine, reason)?;
-                run.persist()?;
-                emit(Event::State(Box::new(run.clone())));
-                return Ok(Action::Interactive);
+            match next {
+                Some(Next::Ship(index)) => {
+                    run.cursor = index;
+                    crate::ship::execute(run, emit)?;
+                    continue;
+                }
+                Some(Next::Interactive(index)) => {
+                    run.cursor = index;
+                    let reason = format!(
+                        "Stage {} waits for its terminal",
+                        run.workflow.stages[index].name
+                    );
+                    run.set(Target::Run, Status::Interactive, Actor::Engine, reason)?;
+                    run.persist()?;
+                    emit(Event::State(Box::new(run.clone())));
+                    return Ok(Action::Interactive);
+                }
+                None => {
+                    ensure!(
+                        started > 0,
+                        "No stage can start; inspect the run's stage states"
+                    );
+                }
             }
-            ensure!(
-                started > 0,
-                "No stage can start; inspect the run's stage states"
-            );
         }
     }
 }

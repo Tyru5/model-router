@@ -61,15 +61,27 @@ pub fn report_command(
 }
 
 pub fn doctor_command(project: &Path, settings: &Settings, json: bool, strict: bool) -> Result<()> {
-    let reports = doctor::inspect_all(settings, project);
-    if json {
+    let reports = if json {
+        let reports = doctor::inspect_all(settings, project);
         println!("{}", serde_json::to_string_pretty(&reports)?);
+        reports
     } else {
+        let (reports, sandbox, tools) = std::thread::scope(|scope| {
+            let reports = scope.spawn(|| doctor::inspect_all(settings, project));
+            let sandbox = scope.spawn(doctor::sandbox_line);
+            let tools = scope.spawn(|| doctor::inspect_tools(project));
+            (
+                reports.join().expect("Harness check panicked"),
+                sandbox.join().expect("Sandbox check panicked"),
+                tools.join().expect("Tool check panicked"),
+            )
+        });
         print!("{}", doctor::table(&reports));
-        println!("\n{}", doctor::sandbox_line());
-        println!("{}", doctor::tools_line(&doctor::inspect_tools(project)));
+        println!("\n{sandbox}");
+        println!("{}", doctor::tools_line(&tools));
         println!("\n{}", doctor::AUTH_NOTE);
-    }
+        reports
+    };
     ensure!(
         !strict || !reports.iter().any(doctor::Report::missing_flags),
         "An installed harness lacks a flag the router passes"

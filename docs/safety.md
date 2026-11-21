@@ -213,16 +213,17 @@ addresses, unless the URL you typed names such a host.
 token, and only accepts projects under `--allow-root` paths. Server runs are
 unattended only and cannot confirm ship stages. See [serve.md](serve.md#safety).
 HTTP keeps connections that have not yet sent authenticated headers (at most
-16) apart from authenticated ones (at most 32, including event streams and
-requests still sending their body): when
+16) apart from authenticated ones (at most 32, of which at most 24 may be event
+streams or `wait_run` calls so quick calls such as `cancel_run` and `run_status`
+stay runnable): when
 the pending queue is full, the oldest pending connection is cut off once it has
 waited half a second (newer arrivals wait in the listen backlog until then), so
 idle sockets cannot lock out a client that sends its headers promptly, and a
 burst of clients is not cut off before its headers are read. A connection
 leaves the pending queue as soon as its headers authenticate, so a body still
-on the way is never cut off. Request headers and bodies share a 10-second
-absolute read deadline; authorization is checked before waiting for a request
-body.
+on the way is never cut off. Request headers are capped at 64 KiB (enforced
+while reading each line) and bodies at 1 MiB, sharing a 10-second absolute read
+deadline; authorization is checked before waiting for a request body.
 
 MCP over stdio (`serve --mcp`) caps request lines at 2 MiB and concurrent
 `tools/call` workers at 32, of which at most 24 may be blocking `wait_run`

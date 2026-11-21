@@ -1610,6 +1610,12 @@ fn shift_y_retries_one_failed_fan_out_candidate_of_the_stopped_stage() {
             .join("01-implement")
             .join(format!("attempt-{n:03}"));
         attempt.handoff_file = attempt.directory.join("handoff.json");
+        for (c, check) in attempt.checks.iter_mut().enumerate() {
+            check.directory = attempt
+                .directory
+                .join("checks")
+                .join(format!("{:02}", c + 1));
+        }
     }
     std::fs::create_dir_all(&run.directory).unwrap();
     run.persist().unwrap();
@@ -1821,6 +1827,12 @@ fn a_worker_that_panics_after_saving_unreported_state_leaves_the_saved_revision(
             .join("01-implement")
             .join(format!("attempt-{n:03}"));
         attempt.handoff_file = attempt.directory.join("handoff.json");
+        for (c, check) in attempt.checks.iter_mut().enumerate() {
+            check.directory = attempt
+                .directory
+                .join("checks")
+                .join(format!("{:02}", c + 1));
+        }
         attempt.worktree = None;
     }
     run.resume = None;
@@ -2586,6 +2598,12 @@ fn budget_blocked_app(project: &std::path::Path) -> App {
             .join("01-implement")
             .join(format!("attempt-{n:03}"));
         attempt.handoff_file = attempt.directory.join("handoff.json");
+        for (c, check) in attempt.checks.iter_mut().enumerate() {
+            check.directory = attempt
+                .directory
+                .join("checks")
+                .join(format!("{:02}", c + 1));
+        }
     }
     run.workflow.budget.max_usd = Some(0.1);
     run.cursor = 2;
@@ -3001,4 +3019,141 @@ fn open_log_pages_the_focused_attempts_stdout() {
         launch.argv.last().unwrap(),
         project.path().join("attempt/stdout.log").as_os_str()
     );
+}
+
+#[test]
+fn open_project_resets_route_stats_collecting_and_runs_sizes() {
+    let project = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    app.route_stats.collecting = true;
+    app.runs
+        .sizes
+        .lock()
+        .unwrap()
+        .insert("stale-run".into(), 42);
+    app.switch_project(other.path().into()).unwrap();
+    assert!(!app.route_stats.collecting);
+    assert!(app.runs.sizes.lock().unwrap().is_empty());
+    app.refresh_stats();
+    assert!(app.route_stats.collecting);
+}
+
+#[test]
+fn unchanged_repo_msg_does_not_clobber_pending_redraw_and_stale_msgs_stay_quiet() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    let old = app.tasks.generation();
+    app.tasks.next_generation();
+    app.ui.redraw = false;
+    app.update(old, Msg::Checks(Ok(vec![])));
+    assert!(!app.ui.redraw);
+    let cur = app.tasks.generation();
+    app.update(cur, Msg::Checks(Ok(vec![])));
+    assert!(app.ui.redraw);
+    let unchanged = app.repo.info.clone();
+    app.update(cur, Msg::Repo(Ok(unchanged)));
+    assert!(app.ui.redraw);
+    app.ui.redraw = false;
+    app.update(
+        cur,
+        Msg::Repo(Ok(Some(crate::storage::RepoInfo {
+            name: "changed".into(),
+            head: "main".into(),
+            detached: false,
+            changes: 1,
+        }))),
+    );
+    assert!(app.ui.redraw);
+}
+
+#[test]
+fn picker_paste_flattens_newlines_and_resets_selection() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    app.key(key(Key::Char('T'))).unwrap();
+    app.key(key(Key::Down)).unwrap();
+    app.key(key(Key::Down)).unwrap();
+    app.paste("Catppuccin\nLatte\r\n");
+    let Some(Modal::Picker {
+        selected, filter, ..
+    }) = app.ui.dialog()
+    else {
+        panic!("expected picker");
+    };
+    assert_eq!(*selected, 0);
+    assert!(!super::widgets::content(filter).contains(['\r', '\n']));
+}
+
+#[test]
+fn ask_apply_worktree_renders_multiline_preview_with_pinned_keys() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    let preview = (1..=15)
+        .map(|i| format!("M src/file_{i}.rs"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.ui.open(Modal::Ask(Box::new(Ask::ApplyWorktree {
+        run: "run-1".into(),
+        files: 15,
+        preview,
+    })));
+    let screen = rows(&mut app, 80, 24).join("\n");
+    assert!(screen.contains("M src/file_1.rs"), "{screen}");
+    assert!(screen.contains("M src/file_15.rs"), "{screen}");
+    assert!(
+        screen.contains("[y] / [Enter] apply uncommitted"),
+        "{screen}"
+    );
+    assert!(screen.contains("[n] / [Esc] cancel"), "{screen}");
+}
+
+#[test]
+fn output_search_status_shows_on_first_frame_without_lag() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = running_app(project.path());
+    app.slot_mut().logs.clear();
+    app.slot_mut().push_log("alpha one".into());
+    app.slot_mut().push_log("beta two".into());
+    app.slot_mut().push_log("alpha three".into());
+    app.slot_mut().log_search = Some(super::output_search::LogSearch {
+        query: "alpha".into(),
+        typing: false,
+        current: 0,
+    });
+    assert!(app.slot().cache.borrow().output.is_none());
+    let text = rows(&mut app, 80, 24).join("\n");
+    assert!(text.contains("/alpha · 1/2"), "{text}");
+}
+
+#[test]
+fn apply_worktree_plans_in_background_and_surfaces_errors_without_blocking() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    let mut run = sample_run("wt");
+    run.project = project.path().into();
+    run.workspace = project.path().into();
+    run.worktree = true;
+    app.session.adopt(run);
+    app.ui.page = Page::Runs;
+    app.perform(ActionId::ApplyWorktree).unwrap();
+    assert!(matches!(app.ui.dialog(), Some(Modal::Loading(_))));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while matches!(app.ui.dialog(), Some(Modal::Loading(_))) && std::time::Instant::now() < deadline
+    {
+        app.poll().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(app.ui.dialog().is_none());
+    assert!(!app.ui.alert.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn any_disconnected_detects_peer_hangup_without_blocking() {
+    use std::os::unix::{io::AsRawFd, net::UnixStream};
+    let (a, b) = UnixStream::pair().unwrap();
+    assert!(!super::any_disconnected([a.as_raw_fd()]));
+    drop(b);
+    assert!(super::any_disconnected([a.as_raw_fd()]));
 }

@@ -2,8 +2,10 @@
 //! No shell evaluates any command; external scanners run as argument vectors.
 use anyhow::{Context, Result, bail};
 use std::{
+    io::Read,
     path::Path,
     process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 /// Matches a repository-relative path against a glob pattern supporting `*`
@@ -15,35 +17,25 @@ pub fn matches_glob(pattern: &str, path: &str) -> bool {
     if pattern.is_empty() || path.is_empty() {
         return false;
     }
-    let pat_segs: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+    let mut pat_segs: Vec<&str> = Vec::new();
+    for seg in pattern.split('/').filter(|s| !s.is_empty()) {
+        if seg == "**" && pat_segs.last() == Some(&"**") {
+            continue;
+        }
+        pat_segs.push(seg);
+    }
     let path_segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     match_segments(&pat_segs, &path_segs)
 }
 
 fn match_segments(pat: &[&str], path: &[&str]) -> bool {
-    match (pat.first(), path.first()) {
-        (None, None) => true,
-        (Some(&"**"), _) => {
-            // `**` matches zero segments OR consumes one segment and retries.
-            match_segments(&pat[1..], path) || (!path.is_empty() && match_segments(pat, &path[1..]))
-        }
-        (Some(p), Some(s)) => match_segment(p, s) && match_segments(&pat[1..], &path[1..]),
-        _ => false,
-    }
-}
-
-fn match_segment(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
     let mut star: Option<(usize, usize)> = None;
-    while ti < t.len() {
-        // `*` in the pattern is always a wildcard, also when the text has a
-        // literal `*` there; there is no escape syntax.
-        if pi < p.len() && p[pi] == '*' {
+    while ti < path.len() {
+        if pi < pat.len() && pat[pi] == "**" {
             star = Some((pi, ti));
             pi += 1;
-        } else if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+        } else if pi < pat.len() && match_segment(pat[pi], path[ti]) {
             pi += 1;
             ti += 1;
         } else if let Some((sp, st)) = star {
@@ -54,7 +46,42 @@ fn match_segment(pattern: &str, text: &str) -> bool {
             return false;
         }
     }
-    while pi < p.len() && p[pi] == '*' {
+    while pi < pat.len() && pat[pi] == "**" {
+        pi += 1;
+    }
+    pi == pat.len()
+}
+
+fn match_segment(pattern: &str, text: &str) -> bool {
+    if pattern.is_ascii() && text.is_ascii() {
+        return match_segment_slice(pattern.as_bytes(), text.as_bytes(), b'*', b'?');
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    match_segment_slice(&p, &t, '*', '?')
+}
+
+fn match_segment_slice<T: Copy + Eq>(p: &[T], t: &[T], star_tok: T, q_tok: T) -> bool {
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        // `*` in the pattern is always a wildcard, also when the text has a
+        // literal `*` there; there is no escape syntax.
+        if pi < p.len() && p[pi] == star_tok {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if pi < p.len() && (p[pi] == q_tok || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if let Some((sp, st)) = star {
+            pi = sp + 1;
+            ti = st + 1;
+            star = Some((sp, ti));
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == star_tok {
         pi += 1;
     }
     pi == p.len()
@@ -321,6 +348,28 @@ fn has_exact_token(
     false
 }
 
+const SCANNER_TIMEOUT: Duration = Duration::from_secs(60);
+const SCANNER_OUTPUT_LIMIT: usize = 64 * 1024;
+
+fn read_capped_stream(mut stream: impl Read, limit: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if out.len() < limit {
+                    let take = n.min(limit - out.len());
+                    out.extend_from_slice(&buf[..take]);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    out
+}
+
 /// Runs a user-configured external secret scanner argv (no shell) in `dir`.
 /// `{files}` expands to `files`, which are also in `MODEL_ROUTER_SHIP_FILES`
 /// (one per line). `index` is a private Git index holding HEAD plus exactly
@@ -334,6 +383,16 @@ pub fn run_external_scanner(
     files: &[String],
     index: &Path,
 ) -> Result<()> {
+    run_external_scanner_within(dir, command, files, index, SCANNER_TIMEOUT)
+}
+
+fn run_external_scanner_within(
+    dir: &Path,
+    command: &[String],
+    files: &[String],
+    index: &Path,
+    timeout: Duration,
+) -> Result<()> {
     let Some((program, args)) = command.split_first() else {
         return Ok(());
     };
@@ -345,19 +404,55 @@ pub fn run_external_scanner(
             expanded.push(arg.clone());
         }
     }
-    let output = Command::new(program)
+    let mut child = Command::new(program)
         .args(&expanded)
         .current_dir(dir)
         .env("MODEL_ROUTER_SHIP_FILES", files.join("\n"))
         .env("GIT_INDEX_FILE", index)
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| {
             format!("Secret scanner {program:?} could not run; refusing to ship without scanning")
         })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let out_reader =
+        stdout.map(|s| std::thread::spawn(move || read_capped_stream(s, SCANNER_OUTPUT_LIMIT)));
+    let err_reader =
+        stderr.map(|s| std::thread::spawn(move || read_capped_stream(s, SCANNER_OUTPUT_LIMIT)));
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!(
+                        "Secret scanner `{}` timed out after {}s; refusing to ship",
+                        shell_words::join(command),
+                        timeout.as_secs()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).with_context(|| {
+                    format!("Secret scanner {program:?} failed while waiting; refusing to ship")
+                });
+            }
+        }
+    };
+    let stdout = out_reader.and_then(|t| t.join().ok()).unwrap_or_default();
+    let stderr = err_reader.and_then(|t| t.join().ok()).unwrap_or_default();
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
+        let stdout = String::from_utf8_lossy(&stdout);
         let detail = if !stderr.trim().is_empty() {
             stderr.trim()
         } else {
@@ -367,7 +462,7 @@ pub fn run_external_scanner(
         bail!(
             "Secret scanner `{}` failed (exit {:?}); refusing to ship{}",
             shell_words::join(command),
-            output.status.code(),
+            status.code(),
             if detail.is_empty() {
                 String::new()
             } else {
@@ -543,5 +638,56 @@ new file mode 100644
             index,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn repeated_doublestar_globs_do_not_backtrack_exponentially() {
+        let started = Instant::now();
+        assert!(!matches_glob(
+            "**/**/**/**/**/**/**/**/**/**/**/**/nope",
+            "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t",
+        ));
+        assert!(matches_glob(
+            "**/**/**/target/**/**/file.rs",
+            "x/y/target/z/file.rs",
+        ));
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn external_scanner_times_out_and_caps_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = dir.path().join("private.index");
+        let err = run_external_scanner_within(
+            dir.path(),
+            &[
+                "python3".into(),
+                "-c".into(),
+                "import time; time.sleep(5)".into(),
+            ],
+            &["a.rs".into()],
+            &index,
+            Duration::from_millis(120),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+
+        let err = run_external_scanner_within(
+            dir.path(),
+            &[
+                "python3".into(),
+                "-c".into(),
+                "import sys; sys.stdout.write('x' * 300000); sys.stderr.write('e' * 300000); sys.exit(1)".into(),
+            ],
+            &["a.rs".into()],
+            &index,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing to ship") && msg.len() < 1500,
+            "{msg}"
+        );
     }
 }

@@ -8,7 +8,7 @@ use std::{
     io::{self, BufRead, Write},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread::JoinHandle,
 };
@@ -35,36 +35,38 @@ Typical use: list_workflows, optionally preview_run, then start_run and wait_run
 and get_report. A run waiting at a checkpoint (status awaiting_confirmation) continues with confirm_stage; \
 a failed or blocked one with retry_stage.";
 
+type CancelMap = HashMap<String, Vec<(u64, Arc<AtomicBool>)>>;
+
+#[derive(Default)]
 struct InFlight {
     active: AtomicUsize,
     /// The blocking calls among `active`.
     blocking: AtomicUsize,
-    cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
-}
-
-impl Default for InFlight {
-    fn default() -> Self {
-        Self {
-            active: AtomicUsize::new(0),
-            blocking: AtomicUsize::new(0),
-            cancels: Mutex::new(HashMap::new()),
-        }
-    }
+    next_seq: AtomicU64,
+    cancels: Mutex<CancelMap>,
 }
 
 struct CallSlot {
     inflight: Arc<InFlight>,
     key: String,
+    seq: u64,
     blocking: bool,
 }
 
 impl Drop for CallSlot {
     fn drop(&mut self) {
-        self.inflight
+        let mut cancels = self
+            .inflight
             .cancels
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.key);
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entries) = cancels.get_mut(&self.key) {
+            entries.retain(|(seq, _)| *seq != self.seq);
+            if entries.is_empty() {
+                cancels.remove(&self.key);
+            }
+        }
+        drop(cancels);
         self.inflight.active.fetch_sub(1, Ordering::AcqRel);
         if self.blocking {
             self.inflight.blocking.fetch_sub(1, Ordering::AcqRel);
@@ -104,15 +106,19 @@ impl InFlight {
             return None;
         }
         let key = id.to_string();
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let flag = Arc::new(AtomicBool::new(false));
         self.cancels
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key.clone(), flag.clone());
+            .entry(key.clone())
+            .or_default()
+            .push((seq, flag.clone()));
         Some((
             CallSlot {
                 inflight: self.clone(),
                 key,
+                seq,
                 blocking,
             },
             flag,
@@ -121,13 +127,15 @@ impl InFlight {
 
     fn cancel(&self, id: &Value) {
         let key = id.to_string();
-        if let Some(flag) = self
+        if let Some(entries) = self
             .cancels
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&key)
         {
-            flag.store(true, Ordering::Relaxed);
+            for (_, flag) in entries {
+                flag.store(true, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -235,10 +243,15 @@ pub fn serve<W: Write + Send + 'static>(
 }
 
 fn send<W: Write>(output: &Mutex<W>, message: &Value) {
-    let mut output = output.lock().unwrap_or_else(|e| e.into_inner());
     // Compact JSON escapes newlines, so each message is one line.
-    let line = message.to_string();
-    if writeln!(output, "{line}")
+    let Ok(mut line) = serde_json::to_vec(message) else {
+        super::log("failed to serialize JSON-RPC message");
+        return;
+    };
+    line.push(b'\n');
+    let mut output = output.lock().unwrap_or_else(|e| e.into_inner());
+    if output
+        .write_all(&line)
         .and_then(|()| output.flush())
         .is_err()
     {
@@ -499,5 +512,20 @@ mod tests {
             assert!(tools::exists(name), "missing {name} in tools::exists");
         }
         assert!(!tools::exists("nonexistent_tool"));
+    }
+
+    #[test]
+    fn duplicate_request_ids_do_not_clobber_active_cancel_flag() {
+        let inflight = Arc::new(InFlight::default());
+        let id = json!(42);
+        let (slot_a, cancel_a) = inflight.acquire(&id, false).unwrap();
+        let (slot_b, cancel_b) = inflight.acquire(&id, false).unwrap();
+        drop(slot_a);
+        // Dropping the first call must keep the second call cancellable.
+        inflight.cancel(&id);
+        assert!(cancel_b.load(Ordering::Relaxed));
+        assert!(!cancel_a.load(Ordering::Relaxed));
+        drop(slot_b);
+        assert!(inflight.cancels.lock().unwrap().is_empty());
     }
 }

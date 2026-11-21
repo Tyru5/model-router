@@ -37,6 +37,10 @@ pub fn capture_with(
     )
 }
 
+fn is_cancelled(cancel: &AtomicBool, abort: Option<&AtomicBool>) -> bool {
+    cancel.load(Ordering::Relaxed) || abort.is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
 /// `capture_with` with an optional inactivity timeout: stops the process group
 /// when neither stdout nor stderr produces any bytes for `stall_timeout`.
 #[allow(clippy::too_many_arguments)]
@@ -49,13 +53,44 @@ pub fn capture_with_stall(
     cancel: &AtomicBool,
     sandbox: Option<&Plan>,
     on_spawn: impl FnOnce(Group) -> Result<()>,
+    on_output: impl FnMut(bool, &str),
+) -> Result<Outcome> {
+    capture_with_stall_and_abort(
+        inv,
+        cwd,
+        dir,
+        timeout,
+        stall_timeout,
+        cancel,
+        None,
+        sandbox,
+        on_spawn,
+        on_output,
+    )
+}
+
+/// `capture_with_stall` with an optional secondary `abort` flag alongside
+/// `cancel`, so a scheduler can stop sibling workers without mutating the
+/// caller's cancellation flag.
+#[allow(clippy::too_many_arguments)]
+pub fn capture_with_stall_and_abort(
+    inv: &Invocation,
+    cwd: &Path,
+    dir: &Path,
+    timeout: Duration,
+    stall_timeout: Option<Duration>,
+    cancel: &AtomicBool,
+    abort: Option<&AtomicBool>,
+    sandbox: Option<&Plan>,
+    on_spawn: impl FnOnce(Group) -> Result<()>,
     mut on_output: impl FnMut(bool, &str),
 ) -> Result<Outcome> {
     // Check logs land in a directory the stage could write.
-    let mut stdout_log = crate::storage::create_fresh(&dir.join("stdout.log"))?;
-    let mut stderr_log = crate::storage::create_fresh(&dir.join("stderr.log"))?;
+    let mut stdout_log = io::BufWriter::new(crate::storage::create_fresh(&dir.join("stdout.log"))?);
+    let mut stderr_log = io::BufWriter::new(crate::storage::create_fresh(&dir.join("stderr.log"))?);
     if let Some(warning) = sandbox.and_then(|plan| plan.warning.as_deref()) {
         writeln!(stderr_log, "{warning}")?;
+        stderr_log.flush()?;
         on_output(true, &format!("{warning}\n"));
     }
     let (program, args) = launch(inv, sandbox);
@@ -80,13 +115,18 @@ pub fn capture_with_stall(
     command.env(group::MARKER_ENV, &marker);
     inv.write_files()?;
     die_with_parent(&mut command);
-    let mut child = ProcessGroup {
-        child: command
-            .spawn()
-            .with_context(|| format!("Launch {}", inv.program))?,
-    };
+    let spawned = command
+        .spawn()
+        .with_context(|| format!("Launch {}", inv.program))?;
     // Not reaped yet, so the leader's start time is still readable.
-    on_spawn(Group::launched(child.child.id(), Some(marker)))?;
+    let group = Group::launched(spawned.id(), Some(marker));
+    let mut child = ProcessGroup {
+        child: spawned,
+        started: group.identity.started.clone(),
+        leader_reaped: false,
+        killed: false,
+    };
+    on_spawn(group)?;
     let mut stdout = child.child.stdout.take().context("No stdout pipe")?;
     let mut stderr = child.child.stderr.take().context("No stderr pipe")?;
     let mut stdin = child.child.stdin.take();
@@ -98,110 +138,226 @@ pub fn capture_with_stall(
     let (mut out_text, mut err_text) = (Utf8Stream::default(), Utf8Stream::default());
     let input = inv.stdin.as_deref().unwrap_or("").as_bytes();
     let mut sent = 0;
+    let mut stdout_eof = false;
+    let mut stderr_eof = false;
     let started = Instant::now();
     let mut last_activity = started;
     let mut cancelled = false;
     let mut timed_out = false;
     let mut stalled = false;
     let status = loop {
-        let out_bytes = drain(
-            &mut stdout,
-            &mut stdout_log,
-            false,
-            &mut out_text,
-            &mut on_output,
-        )?;
-        let err_bytes = drain(
-            &mut stderr,
-            &mut stderr_log,
-            true,
-            &mut err_text,
-            &mut on_output,
-        )?;
+        let out_bytes = if stdout_eof {
+            0
+        } else {
+            drain(
+                &mut stdout,
+                &mut stdout_log,
+                false,
+                &mut out_text,
+                &mut on_output,
+                &mut stdout_eof,
+                32,
+            )?
+        };
+        let err_bytes = if stderr_eof {
+            0
+        } else {
+            drain(
+                &mut stderr,
+                &mut stderr_log,
+                true,
+                &mut err_text,
+                &mut on_output,
+                &mut stderr_eof,
+                32,
+            )?
+        };
         if out_bytes > 0 || err_bytes > 0 {
             last_activity = Instant::now();
         }
         if let Some(pipe) = &mut stdin {
-            match pipe.write(&input[sent..]) {
-                Ok(n) => sent += n,
-                Err(e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => sent = input.len(),
-                Err(e) => return Err(e.into()),
+            while sent < input.len() {
+                match pipe.write(&input[sent..]) {
+                    Ok(0) => {
+                        sent = input.len();
+                        break;
+                    }
+                    Ok(n) => sent += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                        sent = input.len();
+                        break;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
             if sent == input.len() {
                 stdin.take();
             }
         }
         if let Some(status) = child.child.try_wait()? {
+            child.leader_reaped = true;
             break status;
         }
-        cancelled = cancel.load(Ordering::Relaxed);
+        cancelled = is_cancelled(cancel, abort);
         timed_out = started.elapsed() >= timeout;
         stalled = !timed_out && stall_timeout.is_some_and(|limit| last_activity.elapsed() >= limit);
         if cancelled || timed_out || stalled {
+            // Give children reading stdin EOF before or alongside SIGTERM.
+            stdin.take();
             // Ask first: harnesses such as omp only save a session they can
             // resume when they exit cleanly.
             signal_group(child.child.id(), libc::SIGTERM);
             let deadline = Instant::now() + GRACE;
             let status = loop {
-                drain(
-                    &mut stdout,
-                    &mut stdout_log,
-                    false,
-                    &mut out_text,
-                    &mut on_output,
-                )?;
-                drain(
-                    &mut stderr,
-                    &mut stderr_log,
-                    true,
-                    &mut err_text,
-                    &mut on_output,
-                )?;
+                if !stdout_eof {
+                    drain(
+                        &mut stdout,
+                        &mut stdout_log,
+                        false,
+                        &mut out_text,
+                        &mut on_output,
+                        &mut stdout_eof,
+                        32,
+                    )?;
+                }
+                if !stderr_eof {
+                    drain(
+                        &mut stderr,
+                        &mut stderr_log,
+                        true,
+                        &mut err_text,
+                        &mut on_output,
+                        &mut stderr_eof,
+                        32,
+                    )?;
+                }
                 if let Some(status) = child.child.try_wait()? {
                     // Leftover group members never get the grace period twice.
                     kill_group(child.child.id());
+                    child.leader_reaped = true;
+                    child.killed = true;
                     break status;
                 }
-                if Instant::now() >= deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
                     kill_group(child.child.id());
                     let _ = child.child.kill();
-                    break child.child.wait()?;
+                    let status = child.child.wait()?;
+                    child.leader_reaped = true;
+                    child.killed = true;
+                    break status;
                 }
-                thread::sleep(Duration::from_millis(25));
+                let wait_ms = remaining.as_millis().clamp(1, 25) as libc::c_int;
+                let mut polls = [
+                    libc::pollfd {
+                        fd: if stdout_eof { -1 } else { stdout.as_raw_fd() },
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: if stderr_eof { -1 } else { stderr.as_raw_fd() },
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                // SAFETY: pipe fds are open and outlive the poll call.
+                unsafe { libc::poll(polls.as_mut_ptr(), 2, wait_ms) };
             };
             break status;
         }
-        thread::sleep(Duration::from_millis(25));
+        let mut remaining = timeout.saturating_sub(started.elapsed());
+        if let Some(limit) = stall_timeout {
+            remaining = remaining.min(limit.saturating_sub(last_activity.elapsed()));
+        }
+        let wait_ms = if remaining.is_zero() {
+            1
+        } else {
+            remaining.as_millis().clamp(1, 50) as libc::c_int
+        };
+        let mut polls = [
+            libc::pollfd {
+                fd: if stdout_eof { -1 } else { stdout.as_raw_fd() },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if stderr_eof { -1 } else { stderr.as_raw_fd() },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stdin.as_ref().map_or(-1, |s| s.as_raw_fd()),
+                events: libc::POLLOUT,
+                revents: 0,
+            },
+        ];
+        // SAFETY: pipe fds are open and outlive the poll call.
+        unsafe { libc::poll(polls.as_mut_ptr(), 3, wait_ms) };
     };
     // Once the leader exits, drain available bytes without waiting for inherited
     // descriptors held by background grandchildren.
-    drain(
-        &mut stdout,
-        &mut stdout_log,
-        false,
-        &mut out_text,
-        &mut on_output,
-    )?;
-    drain(
-        &mut stderr,
-        &mut stderr_log,
-        true,
-        &mut err_text,
-        &mut on_output,
-    )?;
+    if !stdout_eof {
+        drain(
+            &mut stdout,
+            &mut stdout_log,
+            false,
+            &mut out_text,
+            &mut on_output,
+            &mut stdout_eof,
+            1024,
+        )?;
+    }
+    if !stderr_eof {
+        drain(
+            &mut stderr,
+            &mut stderr_log,
+            true,
+            &mut err_text,
+            &mut on_output,
+            &mut stderr_eof,
+            1024,
+        )?;
+    }
+    // Background children (dev servers, watchers) end with the stage.
+    drop(child);
+    if !stdout_eof {
+        drain(
+            &mut stdout,
+            &mut stdout_log,
+            false,
+            &mut out_text,
+            &mut on_output,
+            &mut stdout_eof,
+            1024,
+        )?;
+    }
+    if !stderr_eof {
+        drain(
+            &mut stderr,
+            &mut stderr_log,
+            true,
+            &mut err_text,
+            &mut on_output,
+            &mut stderr_eof,
+            1024,
+        )?;
+    }
     for (stderr, decoder) in [(false, &mut out_text), (true, &mut err_text)] {
         let rest = decoder.finish();
         if !rest.is_empty() {
             on_output(stderr, &rest);
         }
     }
-    // Background children (dev servers, watchers) end with the stage.
-    drop(child);
-    stdout_log.sync_all()?;
-    stderr_log.sync_all()?;
+    stdout_log
+        .into_inner()
+        .map_err(io::IntoInnerError::into_error)?
+        .sync_all()?;
+    stderr_log
+        .into_inner()
+        .map_err(io::IntoInnerError::into_error)?
+        .sync_all()?;
     Ok(Outcome {
         code: status.code(),
         cancelled,

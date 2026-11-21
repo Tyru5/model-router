@@ -167,6 +167,13 @@ impl HarnessEditor {
     }
 
     fn choices(&self, index: usize) -> Option<Vec<String>> {
+        let efforts = matches!(self.fields[index].kind, FieldKind::Effort)
+            .then(|| self.efforts())
+            .flatten();
+        self.choices_for(index, efforts.as_ref())
+    }
+
+    fn choices_for(&self, index: usize, efforts: Option<&Efforts>) -> Option<Vec<String>> {
         let field = &self.fields[index];
         match field.kind {
             FieldKind::Execution => Some(vec!["unattended".into(), "interactive".into()]),
@@ -177,7 +184,7 @@ impl HarnessEditor {
                     .collect(),
             ),
             FieldKind::Effort => {
-                let mut levels = self.efforts()?.levels;
+                let mut levels = efforts?.levels.clone();
                 let current = content(&field.text).trim().to_owned();
                 if !current.is_empty() && !levels.contains(&current) {
                     levels.push(current);
@@ -189,12 +196,12 @@ impl HarnessEditor {
         }
     }
 
-    fn help(&self, index: usize) -> String {
+    fn help_for(&self, index: usize, efforts: Option<&Efforts>) -> String {
         let field = &self.fields[index];
         if !matches!(field.kind, FieldKind::Effort) {
             return field.help.into();
         }
-        match self.efforts() {
+        match efforts {
             Some(efforts) => {
                 let model = self.value(|k| matches!(k, FieldKind::Model));
                 let mut help = format!(
@@ -400,9 +407,9 @@ impl HarnessEditor {
             halves[0],
             &mut ListState::default().with_selected(Some(self.selected)),
         );
-        let choices = self.choices(self.selected);
-        let help = self.help(self.selected);
         let efforts = self.efforts();
+        let choices = self.choices_for(self.selected, efforts.as_ref());
+        let help = self.help_for(self.selected, efforts.as_ref());
         let field = &mut self.fields[self.selected];
         let detail = Layout::vertical([
             Constraint::Length(

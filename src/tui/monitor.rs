@@ -3,10 +3,10 @@ use super::{
     app::App,
     completion::{draw_completion, draw_next, finished, next_height},
     handoff_view::HandoffView,
-    modal::{Ask, Choice, InputTarget, Modal, PickValue},
-    output_search::{Wrapped, visible_lines},
+    modal::{Ask, Choice, InputTarget, Loading, Modal, PickValue},
+    output_search::{Wrapped, format_search_status, visible_lines},
     run_slot::{RunSlot, SETTLE},
-    theme::Palette,
+    theme::{Palette, Theme},
     widgets::{StripStage, elapsed, empty_state, fit, key_chips, rows_for, stage_strip, textarea},
 };
 use crate::{
@@ -116,13 +116,20 @@ impl App {
             }
             ActionId::Diff => self.show_diff()?,
             ActionId::ApplyWorktree => {
-                let run = self.session.run().context("No run selected")?;
-                let plan = engine::apply_worktree_plan(run)?;
-                self.ui.open(Modal::Ask(Box::new(Ask::ApplyWorktree {
-                    run: run.id.clone(),
-                    files: plan.files.len(),
-                    preview: plan.preview(),
-                })));
+                let run = self.session.run().context("No run selected")?.clone();
+                let loading = Loading::new("Planning worktree apply…");
+                let ticket = loading.ticket;
+                let id = run.id.clone();
+                self.tasks.spawn(
+                    "Planning worktree apply stopped unexpectedly",
+                    move || engine::apply_worktree_plan(&run).map_err(|e| format!("{e:#}")),
+                    move |result| super::tasks::Msg::ApplyPlan {
+                        ticket,
+                        run: id,
+                        result,
+                    },
+                );
+                self.ui.open(Modal::Loading(loading));
             }
             ActionId::ToggleResults => self.toggle_results()?,
             ActionId::Handoff => {
@@ -642,7 +649,13 @@ fn rule(id: &str, width: u16, palette: Palette) -> Line<'static> {
 /// The selected run of this session: its title, stage strip, and then the
 /// feed of its output (with a card when it waits on the person), or the
 /// brief once it has finished.
-pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
+pub(super) fn draw_run(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    theme: Theme,
+    palette: Palette,
+) {
     let Some(slot) = app.session.focused() else {
         empty_state(
             frame,
@@ -680,16 +693,16 @@ pub(super) fn draw_run(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Pa
         rule_row,
     );
     if results {
-        draw_completion(frame, slot, body, palette);
+        draw_completion(frame, slot, body, theme, palette);
     } else {
-        draw_feed(frame, app, slot, body, palette);
+        draw_feed(frame, slot, body, theme, palette);
     }
 }
 
 /// The output of every stage in order, a paused or search line under it,
 /// and the needs-you card at the bottom; a finished run's output keeps its
 /// Next bar instead.
-fn draw_feed(frame: &mut Frame<'_>, app: &App, slot: &RunSlot, area: Rect, palette: Palette) {
+fn draw_feed(frame: &mut Frame<'_>, slot: &RunSlot, area: Rect, theme: Theme, palette: Palette) {
     let done = (slot.worker.is_none() && finished(&slot.run)).then(|| {
         key_chips(
             palette,
@@ -708,11 +721,16 @@ fn draw_feed(frame: &mut Frame<'_>, app: &App, slot: &RunSlot, area: Rect, palet
     let card_height = card.as_ref().map_or(0, |card| {
         // A blank row between the text and the keys; the output keeps at
         // least three rows.
-        (rows(&card.body) + 1 + rows(&card.keys) + 2).min(area.height.saturating_sub(3))
+        rows(&card.body)
+            .saturating_add(1)
+            .saturating_add(rows(&card.keys))
+            .saturating_add(2)
+            .min(area.height.saturating_sub(3))
     });
     let paused = !slot.log_view.follow;
-    let search = slot.output_search_status();
-    let notice = paused || search.is_some();
+    let search = slot.log_search.as_ref();
+    let has_search_notice = search.is_some_and(|s| s.typing || !slot.logs.is_empty());
+    let notice = paused || has_search_notice;
     let bar_height = done
         .as_ref()
         .map_or(0, |keys| next_height(keys, area.width));
@@ -727,7 +745,7 @@ fn draw_feed(frame: &mut Frame<'_>, app: &App, slot: &RunSlot, area: Rect, palet
     }
     let visible = usize::from(output.height);
     slot.log_visible.set(visible);
-    if slot.logs.is_empty() {
+    let search_status = if slot.logs.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::styled(
                 "Harness output appears here. Some harnesses emit their final response only when the stage finishes. Full logs are saved on disk.",
@@ -736,10 +754,13 @@ fn draw_feed(frame: &mut Frame<'_>, app: &App, slot: &RunSlot, area: Rect, palet
             .wrap(Wrap { trim: false }),
             output,
         );
+        search
+            .filter(|s| s.typing)
+            .map(|s| format_search_status(s, 0))
     } else {
         let width = usize::from(output.width);
         // Wrapped lines are kept until the log, width, or theme changes.
-        let key = (width, slot.log_version, app.ui.displayed_theme());
+        let key = (width, slot.log_version, theme);
         let mut cache = slot.cache.borrow_mut();
         let lines = match &cache.output {
             Some((cached, lines)) if *cached == key => lines.clone(),
@@ -751,6 +772,9 @@ fn draw_feed(frame: &mut Frame<'_>, app: &App, slot: &RunSlot, area: Rect, palet
             }
         };
         drop(cache);
+        let matches = search
+            .filter(|s| !s.query.is_empty())
+            .map(|s| slot.cached_matches(&lines, width, &s.query));
         // Paused output keeps its top line as new output arrives.
         let top = lines.top(slot.log_view, visible);
         frame.render_widget(
@@ -758,12 +782,17 @@ fn draw_feed(frame: &mut Frame<'_>, app: &App, slot: &RunSlot, area: Rect, palet
                 &lines,
                 top,
                 visible,
-                slot.log_search.as_ref(),
+                search,
+                matches.as_deref().map(Vec::as_slice),
                 palette,
             )),
             output,
         );
-    }
+        search.map(|s| {
+            let count = matches.as_ref().map_or(0, |m| m.len());
+            format_search_status(s, count)
+        })
+    };
     if notice {
         let mut spans = vec![];
         if paused {
@@ -772,8 +801,11 @@ fn draw_feed(frame: &mut Frame<'_>, app: &App, slot: &RunSlot, area: Rect, palet
                 Style::default().fg(palette.warn),
             ));
         }
-        if let Some(search) = search {
-            spans.push(Span::styled(search, Style::default().fg(palette.accent)));
+        if let Some(search_status) = search_status {
+            spans.push(Span::styled(
+                search_status,
+                Style::default().fg(palette.accent),
+            ));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), notice_row);
     }

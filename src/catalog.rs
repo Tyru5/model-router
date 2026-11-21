@@ -7,7 +7,14 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, fs, path::Path, sync::atomic::AtomicBool, time::Duration};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs::{self, OpenOptions},
+    io::Read,
+    path::Path,
+    sync::atomic::AtomicBool,
+    time::Duration,
+};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Model {
@@ -89,6 +96,30 @@ pub fn known_efforts(harness: &str) -> Option<&'static [&'static str]> {
 
 /// Catalog output kept from the end of a listing.
 const LISTING_LIMIT: usize = 2 * 1024 * 1024;
+const CODEX_CACHE_LIMIT: usize = 16 * 1024 * 1024;
+
+fn read_codex_cache(path: &Path) -> Option<String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > CODEX_CACHE_LIMIT as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take((CODEX_CACHE_LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > CODEX_CACHE_LIMIT {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
 
 /// The text of one `--flag` entry in a clap/commander style help page.
 fn help_option(help: &str, flag: &str) -> Option<String> {
@@ -320,7 +351,7 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
                 .map(std::path::PathBuf::from)
                 .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".codex")));
             if let Some(dir) = dir {
-                if let Ok(text) = fs::read_to_string(dir.join("models_cache.json")) {
+                if let Some(text) = read_codex_cache(&dir.join("models_cache.json")) {
                     if let Ok(value) = serde_json::from_str::<Value>(&text) {
                         if let Some(list) = value.get("models").and_then(Value::as_array) {
                             for value in list {
@@ -558,16 +589,17 @@ pub fn discover(harness: &str, settings: &Settings, project: &Path) -> Result<Ca
         note.push(' ');
         note.push_str(&extra);
     }
+    let mut existing: HashSet<(String, String)> = models
+        .iter()
+        .map(|m| (m.provider.clone(), m.id.clone()))
+        .collect();
     for stage in settings
         .workflows
         .iter()
         .flat_map(|w| &w.stages)
         .filter(|s| s.harness == harness && !s.model.is_empty())
     {
-        if !models
-            .iter()
-            .any(|m| m.id == stage.model && m.provider == stage.provider)
-        {
+        if existing.insert((stage.provider.clone(), stage.model.clone())) {
             let mut model = entry(&stage.model, "saved workflow", "unverified selection");
             model.provider = stage.provider.clone();
             models.push(model);

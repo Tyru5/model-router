@@ -270,6 +270,83 @@ else:
     assert_eq!(run.stages[0].attempts[0].process_group, None);
 }
 
+#[test]
+fn handoff_repair_cancellation_marks_cancelled_and_uses_attempt_schema() {
+    let dir = common::tempdir();
+    let script = dir.path().join("cancel_repair_mock.py");
+    fs::write(
+        &script,
+        r#"import json, sys, time
+args = sys.argv[1:]
+if "--resume" in args:
+    print("repair-running", file=sys.stderr, flush=True)
+    time.sleep(30)
+else:
+    print(json.dumps({"type": "session", "id": "sess-cancel-1"}))
+    print(json.dumps({"type": "result", "result": "Missing JSON"}))
+"#,
+    )
+    .unwrap();
+    let adapter = CustomAdapter {
+        command: "python3".into(),
+        args: vec![script.display().to_string()],
+        output: Some(CustomOutput::ClaudeStream),
+        session: Some(CustomSession {
+            assign: None,
+            reported: true,
+        }),
+        follow_up_args: Some(vec![
+            script.display().to_string(),
+            "--resume".into(),
+            "{session}".into(),
+            "--prompt-file".into(),
+            "{prompt_file}".into(),
+            "--run-dir".into(),
+            "{attempt_dir}".into(),
+        ]),
+        ..CustomAdapter::default()
+    };
+    let review = Stage {
+        id: "review".into(),
+        name: "Review".into(),
+        role: Role::Review,
+        harness: "repairable".into(),
+        model: "m".into(),
+        mode: Mode::Unattended,
+        ..Stage::default()
+    };
+    let mut wf = Workflow::new("RepairCancel", vec![review]);
+    wf.handoff_repair = true;
+    let settings = Settings {
+        workflows: vec![wf.clone()],
+        adapters: BTreeMap::from([("repairable".into(), adapter)]),
+        ..Settings::default()
+    };
+    let mut run = Run::create(dir.path(), &settings, &wf, "cancel repair".into(), false).unwrap();
+    let cancel = AtomicBool::new(false);
+    let action = engine::drive(&mut run, &cancel, |event| {
+        if let Event::Output(text) = event {
+            if text.contains("repair-running") {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    })
+    .unwrap();
+    assert_eq!(action, Action::Stopped);
+    assert_eq!(run.status, Status::Cancelled);
+    let attempt_dir = &run.stages[0].attempts[0].directory;
+    let repair_prompt = fs::read_to_string(attempt_dir.join("repair/prompt.md")).unwrap();
+    assert!(
+        repair_prompt.contains(
+            &attempt_dir
+                .join("handoff.schema.json")
+                .display()
+                .to_string()
+        ),
+        "{repair_prompt}"
+    );
+}
+
 /// A repair that cannot run, or whose follow-up fails, says why in the
 /// stage output instead of stopping silently.
 #[test]

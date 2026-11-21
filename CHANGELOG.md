@@ -7,6 +7,24 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ## [Unreleased]
 
+### Security
+
+- `serve --http`: enforce the 64 KiB header cap while reading lines, cap long-lived event streams and `wait_run` requests at 24 of the 32 authenticated connection slots so quick calls (`cancel_run`, `run_status`) stay runnable, and verify project trust once per call.
+- Cap config and benchmark reads at 2 MiB and provider model / Codex catalog reads at 16 MiB; harden project trust approvals, OS sandbox path resolution, protected-path validation, pre-ship secret scanning, and terminal escape cleaning on handoff and progress feeds.
+
+### Changed
+
+- Replace `fs2` with direct `libc::flock` in `src/storage.rs`, replace `ctrlc` (and its dedicated signal thread and duplicate `nix` version) with async-signal-safe `libc::sigaction` handlers (`SIGINT`, `SIGTERM`, `SIGHUP`) in `src/main.rs`, and trim `chrono` default features to `clock`, `serde`, and `std`.
+- Pool HTTP clients across providers, task imports, and webhooks; use persistent notification/reaper worker threads; parallelize `doctor` harness checks and provider pricing refreshes; index pricing tables by model/family with case-insensitive lookup.
+- Optimize engine, snapshot, ship, and storage paths: skip fsync on regenerable scratch artifacts, stream patch lines and git status/changed paths with bounded stderr capture, reduce prompt/history allocations, and harden graph/fan-out scheduling and state recovery.
+- Improve TUI responsiveness and per-frame efficiency: conditional animation/elapsed timers, adaptive idle event polling (`250 ms`), backgrounded saved-run sizing and worktree apply planning, viewport-windowed pickers and diff/file lists, coalesced wrapped textarea spans, and cached output search, diff stats, and completion briefs.
+
+### Fixed
+
+- Detect TUI PTY hangup without a controlling terminal via zero-timeout `poll` (`POLLHUP`/`POLLERR`/`POLLNVAL`), stopping active runs and restoring terminal modes across normal exit, error paths, and panics.
+- Fix permanent `StatsCache` loading locks when switching projects, stale one-frame output search status, multi-line `Ask::ApplyWorktree` dialog truncation, and overflow-prone UI/duration calculations.
+- Harden process-group capture, interactive terminal-host teardown, and crash-recovery termination under signal and timeout races.
+
 ## [0.2.0] - 2026-11-20
 
 ### Added

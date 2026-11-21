@@ -63,11 +63,11 @@ pub fn interactive(
         pgid: pid,
         identity: Identity {
             started,
-            marker: Some(marker),
+            marker: Some(marker.clone()),
         },
     };
     on_start(group.clone(), &socket);
-    let terminal = match Terminal::connect(&socket) {
+    let mut terminal = match Terminal::connect(&socket) {
         Ok(terminal) => terminal,
         Err(error) => {
             // Never leave a harness nobody can reach. Its host may have died,
@@ -79,6 +79,7 @@ pub fn interactive(
             });
         }
     };
+    terminal.set_marker(Some(marker));
     terminal.supervise(dir, cancel, session)
 }
 
@@ -94,7 +95,11 @@ pub struct Survivor {
 impl Survivor {
     /// Ends `group` as `group::end_recorded` does; Some when it is left running.
     fn after(group: &Group) -> Option<Self> {
-        let why = match group::end_recorded(group, GRACE) {
+        Self::after_within(group, GRACE)
+    }
+
+    pub(super) fn after_within(group: &Group, grace: Duration) -> Option<Self> {
+        let why = match group::end_recorded(group, grace) {
             Verdict::Unverified(why) => why,
             Verdict::Ours => "it outlived SIGKILL",
             Verdict::Gone | Verdict::Reused => return None,
@@ -124,15 +129,13 @@ pub fn reconnect(
     cancel: &AtomicBool,
     session: &InteractiveSession,
 ) -> Result<Outcome> {
-    if let Err(outcome) = begin(session, cancel)? {
-        // Stop it as if attached, rather than abandoning it.
-        let terminal = terminal;
-        let mut out = Vec::new();
-        host::frame(host::tag::STOP, &[], &mut out);
-        let mut stream = terminal.stream;
-        let _ = stream.set_nonblocking(false);
-        let _ = stream.write_all(&out);
-        return Ok(outcome);
+    {
+        let mut state = session.state();
+        ensure!(
+            !state.started && !state.finished,
+            "Interactive session has already ended or started"
+        );
+        state.started = true;
     }
     let _finish = SessionFinish(session);
     terminal.supervise(dir, cancel, session)
@@ -183,6 +186,7 @@ pub struct Terminal {
     /// The harness's start time as its host read it at launch; None from a
     /// host built before it reported one.
     started: Option<String>,
+    marker: Option<String>,
     locks: Vec<FileLock>,
 }
 
@@ -243,15 +247,29 @@ impl Terminal {
             host::tag::BUSY => return Ok(None),
             _ => anyhow::bail!("The harness terminal answered unexpectedly"),
         };
-        stream.set_read_timeout(None)?;
         stream.set_nonblocking(true)?;
         Ok(Some(Self {
             stream,
             frames,
             pid,
             started,
+            marker: None,
             locks,
         }))
+    }
+
+    pub fn set_marker(&mut self, marker: Option<String>) {
+        self.marker = marker;
+    }
+
+    fn group(&self) -> Group {
+        Group {
+            pgid: self.pid,
+            identity: Identity {
+                started: self.started.clone(),
+                marker: self.marker.clone(),
+            },
+        }
     }
 
     /// The run's locks the host held while detached, in its order; empty
@@ -304,7 +322,7 @@ impl Terminal {
         cancel: &AtomicBool,
         session: &InteractiveSession,
     ) -> Result<Outcome> {
-        let pgid = self.pid;
+        let group = self.group();
         let mut frames = std::mem::take(&mut self.frames);
         let mut decoder = OutputDecoder::default();
         let mut out = Vec::new();
@@ -314,7 +332,7 @@ impl Terminal {
         let mut stopped: Option<Instant> = None;
         loop {
             session.wakes.0.clear();
-            {
+            let has_more_input = {
                 let mut state = session.state();
                 if state.released && stopped.is_none() {
                     // Closing the connection leaves the harness to its host;
@@ -340,17 +358,20 @@ impl Terminal {
                 if size != Some(state.size) {
                     size = Some(state.size);
                     let (cols, rows) = state.size;
-                    let mut payload = cols.to_be_bytes().to_vec();
-                    payload.extend_from_slice(&rows.to_be_bytes());
-                    host::frame(host::tag::RESIZE, &payload, &mut out);
+                    let c = cols.to_be_bytes();
+                    let r = rows.to_be_bytes();
+                    host::frame(host::tag::RESIZE, &[c[0], c[1], r[0], r[1]], &mut out);
                 }
                 if !state.input.is_empty() && out.len() < INPUT_LIMIT {
-                    let input: Vec<u8> = state.input.drain(..).collect();
-                    host::frame(host::tag::INPUT, &input, &mut out);
+                    let (first, second) = state.input.as_slices();
+                    host::frame_slices(host::tag::INPUT, first, second, &mut out);
+                    state.input.clear();
                 }
-            }
-            let open =
-                host::flush(&mut self.stream, &mut out, &mut written) && frames.fill(&self.stream);
+                !state.input.is_empty()
+            };
+            let flushed = host::flush(&mut self.stream, &mut out, &mut written);
+            let filled = frames.fill(&self.stream);
+            let open = flushed && filled;
             // The host sends descriptors only with its answer to attaching.
             drop(frames.take_fds());
             let mut output = false;
@@ -389,10 +410,11 @@ impl Terminal {
                 Err(error) => {
                     session.finish();
                     // Returning alone would leave the harness to its host as
-                    // if detached, with no run pointing at it. The host has
-                    // not reaped it, so the group is still the harness's.
-                    end_group(pgid, GRACE, || {});
-                    return Err(error);
+                    // if detached, with no run pointing at it.
+                    return Err(match Survivor::after(&group) {
+                        Some(survivor) => error.context(survivor),
+                        None => error,
+                    });
                 }
             }
             if !open {
@@ -402,13 +424,18 @@ impl Terminal {
                     return Ok(outcome);
                 }
                 // The host died: its closed PTY hangs the harness up; make sure.
-                end_group(pgid, GRACE, || {});
-                anyhow::bail!("The harness terminal host stopped unexpectedly");
+                let error = anyhow::anyhow!("The harness terminal host stopped unexpectedly");
+                return Err(match Survivor::after(&group) {
+                    Some(survivor) => error.context(survivor),
+                    None => error,
+                });
             }
             if stopped.is_some_and(|at| at.elapsed() > GRACE * 2) {
-                // The host did not end it in time; do it here.
-                kill_group(pgid);
+                // The host did not end it in time; verify identity before stopping.
                 session.finish();
+                if let Some(survivor) = Survivor::after_within(&group, Duration::ZERO) {
+                    return Err(anyhow::anyhow!("Harness did not stop in time").context(survivor));
+                }
                 return Ok(Outcome {
                     code: None,
                     cancelled: true,
@@ -429,28 +456,36 @@ impl Terminal {
                     revents: 0,
                 },
             ];
+            let timeout = if has_more_input && out.is_empty() {
+                0
+            } else {
+                40
+            };
             // SAFETY: both descriptors are borrowed; the array is initialized.
-            unsafe { libc::poll(polls.as_mut_ptr(), 2, 40) };
+            unsafe { libc::poll(polls.as_mut_ptr(), 2, timeout) };
         }
     }
 }
 
 pub(super) fn drain_pty(
     reader: &mut impl Read,
-    transcript: &mut File,
+    transcript: &mut impl Write,
     decoder: &mut OutputDecoder,
     emit: &mut impl FnMut(&[u8]),
     bytes: &mut [u8; 8192],
     eof: &mut bool,
+    max_reads: usize,
 ) -> Result<()> {
     // Bound each pass, not the lifetime stream, so floods cannot starve cancel.
-    for _ in 0..32 {
+    let mut reads = 0usize;
+    while reads < max_reads {
         match reader.read(bytes) {
             Ok(0) => {
                 *eof = true;
                 break;
             }
             Ok(n) => {
+                reads += 1;
                 transcript.write_all(&bytes[..n])?;
                 decoder.process(&bytes[..n], &mut *emit);
             }
@@ -463,5 +498,6 @@ pub(super) fn drain_pty(
             Err(e) => return Err(e.into()),
         }
     }
+    transcript.flush()?;
     Ok(())
 }

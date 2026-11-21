@@ -166,12 +166,20 @@ pub fn list(project: &Path) -> Result<Vec<Entry>> {
             },
         });
     }
-    entries.sort_by(|a, b| {
-        b.created_at()
-            .cmp(&a.created_at())
-            .then_with(|| b.id().cmp(a.id()))
-    });
+    let mut keyed: Vec<(Option<DateTime<Utc>>, Entry)> = entries
+        .into_iter()
+        .map(|entry| (entry.created_at(), entry))
+        .collect();
+    keyed.sort_by(|(ta, a), (tb, b)| tb.cmp(ta).then_with(|| b.id().cmp(a.id())));
+    let entries = keyed.into_iter().map(|(_, entry)| entry).collect();
     Ok(entries)
+}
+
+fn is_clean_excerpt(text: &str) -> bool {
+    text.is_empty()
+        || (text == text.trim()
+            && !text.bytes().any(|b| b < 0x20 || b == 0x7f || b == 0xc2)
+            && (text.len() <= 200 || text.chars().count() <= 200))
 }
 
 /// The summary when run.json still has the size it recorded; otherwise the
@@ -188,7 +196,9 @@ fn read_summary(project: &Path, id: &str, dir: &Path) -> Result<RunSummary> {
         if summary.id == id && consistent {
             // Clean once here, not wherever it is shown: the TUI draws every
             // saved task each frame.
-            summary.task = excerpt(&summary.task);
+            if !is_clean_excerpt(&summary.task) {
+                summary.task = excerpt(&summary.task);
+            }
             return Ok(summary);
         }
     }
@@ -278,16 +288,14 @@ pub fn filter<'a>(entries: &'a [Entry], statuses: &[StatusFilter], search: &str)
 /// Starts a new run from a saved run's task, workflow snapshot, and adapter
 /// and provider snapshots, leaving the saved run unchanged. `worktree` defaults to its mode.
 pub fn rerun(project: &Path, settings: &Settings, id: &str, worktree: Option<bool>) -> Result<Run> {
-    let worktree = match worktree {
-        Some(worktree) => worktree,
-        None => engine::load(project, id)?.worktree,
-    };
-    let placement = if worktree {
+    let source = engine::load(project, id)?;
+    let use_worktree = worktree.unwrap_or(source.worktree);
+    let placement = if use_worktree {
         Placement::Worktree
     } else {
         Placement::Project
     };
-    rerun_at(project, settings, id, placement)
+    rerun_from(project, settings, source, placement)
 }
 
 /// Reruns saved run `id` as a new run working at `placement`.
@@ -298,7 +306,16 @@ pub fn rerun_at(
     placement: Placement,
 ) -> Result<Run> {
     let source = engine::load(project, id)?;
-    // `Run::create_at_from` refuses a rerun in the checkout while a harness
+    rerun_from(project, settings, source, placement)
+}
+
+fn rerun_from(
+    project: &Path,
+    settings: &Settings,
+    source: Run,
+    placement: Placement,
+) -> Result<Run> {
+    // `Run::create_rerun_from` refuses a rerun in the checkout while a harness
     // a run left there may still be running (`engine::refuse_unproven`).
     crate::trust::authorize_run_config(&source, settings.explicit_config.as_deref())?;
     let settings = Settings {
@@ -306,17 +323,16 @@ pub fn rerun_at(
         providers: source.providers.clone(),
         ..settings.clone()
     };
-    let mut run = Run::create_at_from(
+    let source_id = source.id.clone();
+    Run::create_rerun_from(
         project,
         &settings,
         &source.workflow,
         source.task.clone(),
         placement,
-        Some(&source),
-    )?;
-    run.rerun_of = Some(source.id);
-    run.persist()?;
-    Ok(run)
+        &source,
+        source_id,
+    )
 }
 
 /// Starts a new run in its own Git worktree from a saved run's checkpoint at
@@ -415,9 +431,8 @@ pub fn fork(
             continue;
         }
         let changed = state.attempts.iter().any(|a| {
-            a.finished_at.is_some_and(|end| end <= boundary.started_at)
-                && a.tree_after.is_some()
-                && a.tree_after != a.tree_before
+            a.started_at <= boundary.started_at
+                && (a.tree_after.is_none() || a.tree_after != a.tree_before)
         });
         ensure!(
             !changed,
@@ -434,14 +449,8 @@ pub fn fork(
         providers: source.providers.clone(),
         ..settings.clone()
     };
-    let mut run = Run::create_at_from(
-        project,
-        &settings,
-        &workflow,
-        source.task.clone(),
-        Placement::WorktreeFromHead,
-        Some(&source),
-    )?;
+    let mut run =
+        Run::create_for_fork(project, &settings, &workflow, source.task.clone(), &source)?;
     run.fork_of = Some(engine::Fork {
         run: source.id.clone(),
         stage: stage_id.into(),
@@ -741,10 +750,38 @@ fn items(out: &mut String, name: &str, x: Option<Vec<String>>, y: Option<Vec<Str
     }
     out.push_str(&format!("* {name:<14}{} → {}\n", count(&x), count(&y)));
     let (x, y) = (x.unwrap_or_default(), y.unwrap_or_default());
-    for item in x.iter().filter(|item| !y.contains(item)) {
-        out.push_str(&format!("  {:<14}- {item}\n", ""));
+    let (mut i, mut j) = (0, 0);
+    let mut only_y = Vec::new();
+    while i < x.len() && j < y.len() {
+        match x[i].cmp(&y[j]) {
+            std::cmp::Ordering::Less => {
+                out.push_str(&format!("  {:<14}- {}\n", "", x[i]));
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                only_y.push(&y[j]);
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                let common = &x[i];
+                while i < x.len() && &x[i] == common {
+                    i += 1;
+                }
+                while j < y.len() && &y[j] == common {
+                    j += 1;
+                }
+            }
+        }
     }
-    for item in y.iter().filter(|item| !x.contains(item)) {
+    while i < x.len() {
+        out.push_str(&format!("  {:<14}- {}\n", "", x[i]));
+        i += 1;
+    }
+    while j < y.len() {
+        only_y.push(&y[j]);
+        j += 1;
+    }
+    for item in only_y {
         out.push_str(&format!("  {:<14}+ {item}\n", ""));
     }
 }
@@ -943,7 +980,7 @@ pub fn cleanup_plan(project: &Path, criteria: &Criteria) -> Result<Plan> {
 fn removable(tree: &Path) -> Result<()> {
     ensure!(tree.join(".git").is_file(), "not a linked Git worktree");
     ensure!(
-        storage::git(tree, &["status", "--porcelain"])?.is_empty(),
+        storage::git_readonly(tree, &["status", "--porcelain"])?.is_empty(),
         "uncommitted changes"
     );
     Ok(())
@@ -969,19 +1006,18 @@ pub fn apply(plan: &Plan) -> Plan {
 fn remove(project: &Path, item: &Item) -> Result<Item> {
     let dir = &item.paths.first().context("No run directory")?.0;
     ensure!(dir.is_dir(), "Already removed");
-    let _lock = storage::lock(&dir.join("run.lock")).map_err(|_| anyhow!(IN_USE))?;
-    let mut done = Item {
-        paths: item
-            .paths
-            .iter()
-            .map(|(path, _)| (path.clone(), size(path)))
-            .collect(),
-        worktree: item
-            .worktree
-            .as_ref()
-            .map(|(tree, _)| (tree.clone(), size(tree))),
-        ..item.clone()
-    };
+    let _lock = storage::lock(&dir.join("run.lock")).map_err(|err| {
+        if err
+            .root_cause()
+            .downcast_ref::<io::Error>()
+            .is_some_and(|e| e.kind() == io::ErrorKind::WouldBlock)
+        {
+            anyhow!(IN_USE)
+        } else {
+            err
+        }
+    })?;
+    let mut done = item.clone();
     if let Some((tree, _)) = &item.worktree {
         // Never --force: Git refuses worktrees with changes. Branches stay.
         let removed = tree
@@ -993,16 +1029,32 @@ fn remove(project: &Path, item: &Item) -> Result<Item> {
             done.note = Some(format!("Worktree kept: {error:#}"));
         }
     }
+    let mut first_err: Option<anyhow::Error> = None;
+    let mut record = |res: Result<()>| {
+        if let Err(err) = res {
+            first_err.get_or_insert(err);
+        }
+    };
     // Candidate worktrees are the router's own, kept for inspection only.
-    crate::fanout::remove_worktrees(
+    record(crate::fanout::remove_worktrees(
         project,
         &project.join(".model-router/candidates").join(&item.id),
-    )?;
-    for (path, _) in item.paths.iter().rev() {
-        remove_path(path).with_context(|| format!("Remove {}", path.display()))?;
+    ));
+    let mut run_dir_removed = false;
+    for (idx, (path, _)) in item.paths.iter().enumerate().rev() {
+        let res = remove_path(path).with_context(|| format!("Remove {}", path.display()));
+        if res.is_ok() && idx == 0 {
+            run_dir_removed = true;
+        }
+        record(res);
     }
-    // Its snapshots become unreachable, so `git gc` may prune them.
-    crate::snapshot::forget(project, &item.id);
+    if run_dir_removed {
+        // Its snapshots become unreachable, so `git gc` may prune them.
+        crate::snapshot::forget(project, &item.id);
+    }
+    if let Some(err) = first_err {
+        return Err(err);
+    }
     Ok(done)
 }
 
@@ -1069,5 +1121,192 @@ impl Plan {
             out.push_str("Nothing to clean.\n");
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Role, Stage, Workflow};
+
+    #[test]
+    fn items_two_pointer_diff_preserves_order_and_duplicate_semantics() {
+        let mut out = String::new();
+        items(
+            &mut out,
+            "files",
+            Some(vec!["b".into(), "a".into(), "a".into(), "d".into()]),
+            Some(vec!["c".into(), "a".into(), "e".into()]),
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "* files         4 → 3");
+        assert_eq!(
+            &lines[1..],
+            [
+                "                - b",
+                "                - d",
+                "                + c",
+                "                + e",
+            ]
+        );
+    }
+
+    #[test]
+    fn remove_surfaces_non_lock_errors_without_masking_as_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join(".model-router/runs/r-err");
+        fs::create_dir_all(run_dir.join("run.lock")).unwrap();
+        let item = Item {
+            id: "r-err".into(),
+            status: "failed",
+            paths: vec![(run_dir, 0)],
+            worktree: None,
+            note: None,
+        };
+        let err = remove(dir.path(), &item).unwrap_err().to_string();
+        assert!(err != IN_USE && !err.contains("In use"), "{err}");
+    }
+
+    #[test]
+    fn fork_rejects_overlapping_or_crashed_non_upstream_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        fs::write(dir.path().join("f.txt"), "one\n").unwrap();
+        let workflow = Workflow::new(
+            "Graph",
+            vec![
+                Stage {
+                    id: "a".into(),
+                    name: "A".into(),
+                    role: Role::Research,
+                    harness: "mock".into(),
+                    ..Stage::default()
+                },
+                Stage {
+                    id: "b".into(),
+                    name: "B".into(),
+                    role: Role::Implementation,
+                    harness: "mock".into(),
+                    ..Stage::default()
+                },
+                Stage {
+                    id: "c".into(),
+                    name: "C".into(),
+                    role: Role::Test,
+                    harness: "mock".into(),
+                    after: vec!["a".into()],
+                    ..Stage::default()
+                },
+            ],
+        );
+        let mut settings = Settings {
+            workflows: vec![workflow.clone()],
+            ..Settings::default()
+        };
+        settings.adapters.insert(
+            "mock".into(),
+            crate::config::CustomAdapter {
+                command: "python3".into(),
+                ..Default::default()
+            },
+        );
+        let mut run = Run::create(dir.path(), &settings, &workflow, "Task".into(), false).unwrap();
+        let t0 = Utc::now();
+        let tree_a = run.baseline.clone().unwrap();
+        run.stages[0].status = Status::Complete;
+        run.stages[0].handoff = Some(Handoff::unstructured("done".to_string()));
+        run.stages[0].attempts.push(Attempt {
+            number: 1,
+            started_at: t0,
+            finished_at: Some(t0 + chrono::Duration::seconds(1)),
+            model: "m".into(),
+            mode: crate::config::Mode::Unattended,
+            status: Status::Complete,
+            exit_code: Some(0),
+            directory: run.directory.join("01-a/attempt-001"),
+            handoff_file: run.directory.join("01-a/attempt-001/handoff.json"),
+            error: None,
+            checks: vec![],
+            tree_before: Some(tree_a.clone()),
+            tree_after: Some(tree_a.clone()),
+            checks_tree: None,
+            usage: None,
+            session: None,
+            process_group: None,
+            process_identity: Default::default(),
+            terminal: None,
+            handoff_source: None,
+            worktree: None,
+        });
+        run.stages[2].status = Status::Failed;
+        run.stages[2].attempts.push(Attempt {
+            number: 1,
+            started_at: t0 + chrono::Duration::seconds(2),
+            finished_at: Some(t0 + chrono::Duration::seconds(3)),
+            model: "m".into(),
+            mode: crate::config::Mode::Unattended,
+            status: Status::Failed,
+            exit_code: Some(1),
+            directory: run.directory.join("03-c/attempt-001"),
+            handoff_file: run.directory.join("03-c/attempt-001/handoff.json"),
+            error: None,
+            checks: vec![],
+            tree_before: Some(tree_a.clone()),
+            tree_after: Some(tree_a.clone()),
+            checks_tree: None,
+            usage: None,
+            session: None,
+            process_group: None,
+            process_identity: Default::default(),
+            terminal: None,
+            handoff_source: None,
+            worktree: None,
+        });
+
+        // Stage b started before checkpoint c and crashed (tree_after: None).
+        run.stages[1].status = Status::Failed;
+        run.stages[1].attempts.push(Attempt {
+            number: 1,
+            started_at: t0,
+            finished_at: None,
+            model: "m".into(),
+            mode: crate::config::Mode::Unattended,
+            status: Status::Failed,
+            exit_code: None,
+            directory: run.directory.join("02-b/attempt-001"),
+            handoff_file: run.directory.join("02-b/attempt-001/handoff.json"),
+            error: None,
+            checks: vec![],
+            tree_before: Some(tree_a.clone()),
+            tree_after: None,
+            checks_tree: None,
+            usage: None,
+            session: None,
+            process_group: None,
+            process_identity: Default::default(),
+            terminal: None,
+            handoff_source: None,
+            worktree: None,
+        });
+        run.persist().unwrap();
+        let err = fork(dir.path(), &settings, &run.id, "c", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not upstream of c"), "{err}");
+
+        // Stage b started before checkpoint c and finished after, modifying files.
+        let mut loaded = engine::load(dir.path(), &run.id).unwrap();
+        loaded.stages[1].attempts[0].finished_at = Some(t0 + chrono::Duration::seconds(5));
+        loaded.stages[1].attempts[0].tree_after = Some("0".repeat(40));
+        loaded.persist().unwrap();
+        let err = fork(dir.path(), &settings, &run.id, "c", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not upstream of c"), "{err}");
     }
 }

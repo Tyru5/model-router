@@ -2,13 +2,16 @@ use crate::config::{MAX_TASK_BYTES, validate_task};
 use anyhow::{Context, Result, ensure};
 use std::{
     fs::OpenOptions,
+    future::Future,
     io::Read,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context as TaskContext, Poll, Waker},
     time::Duration,
 };
 
@@ -271,27 +274,11 @@ pub fn read_url(input: &str, cancel: &AtomicBool) -> Result<String> {
             decode(bytes)
         }
         Remote::Text(url) => {
+            ensure!(!cancel.load(Ordering::Relaxed), "Import cancelled");
             // Private addresses are reachable only when the URL itself names
             // one; redirects and DNS answers cannot lead there otherwise.
-            let allow_private = targets_private(&url);
-            let client = reqwest::blocking::Client::builder()
-                .connect_timeout(Duration::from_secs(5))
-                .timeout(Duration::from_secs(20))
-                .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                    let previous = attempt.previous().last().cloned();
-                    if attempt.previous().len() > 5 {
-                        return attempt.error("Too many redirects");
-                    }
-                    match previous.map(|from| redirect_allowed(&from, attempt.url(), allow_private))
-                    {
-                        Some(Err(error)) => attempt.error(error),
-                        _ => attempt.follow(),
-                    }
-                }))
-                .dns_resolver(Arc::new(PublicResolver { allow_private }))
-                .user_agent(concat!("model-router/", env!("CARGO_PKG_VERSION")))
-                .build()?;
-            let response = client
+            let client = http_client(targets_private(&url))?;
+            let mut response = client
                 .get(url)
                 .send()
                 .context("Fetch task/spec URL")?
@@ -316,15 +303,22 @@ pub fn read_url(input: &str, cancel: &AtomicBool) -> Result<String> {
                 "Task/spec exceeds the 32 KiB limit"
             );
             let mut bytes = Vec::new();
-            response
-                .take((MAX_DOCUMENT_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)
-                .context("Read task/spec response")?;
+            let mut buf = [0u8; 4096];
+            loop {
+                ensure!(!cancel.load(Ordering::Relaxed), "Import cancelled");
+                let read = match response.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) => return Err(err).context("Read task/spec response"),
+                };
+                bytes.extend_from_slice(&buf[..read]);
+                ensure!(
+                    bytes.len() <= MAX_DOCUMENT_BYTES,
+                    "Task/spec exceeds the 32 KiB limit"
+                );
+            }
             ensure!(!cancel.load(Ordering::Relaxed), "Import cancelled");
-            ensure!(
-                bytes.len() <= MAX_DOCUMENT_BYTES,
-                "Task/spec exceeds the 32 KiB limit"
-            );
             decode(bytes)
         }
     }
@@ -420,6 +414,53 @@ fn public_addrs(
     Ok(kept)
 }
 
+fn http_client(allow_private: bool) -> Result<&'static reqwest::blocking::Client> {
+    static PUBLIC: OnceLock<std::result::Result<reqwest::blocking::Client, String>> =
+        OnceLock::new();
+    static PRIVATE: OnceLock<std::result::Result<reqwest::blocking::Client, String>> =
+        OnceLock::new();
+    let slot = if allow_private { &PRIVATE } else { &PUBLIC };
+    slot.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+                let previous = attempt.previous().last().cloned();
+                if attempt.previous().len() > 5 {
+                    return attempt.error("Too many redirects");
+                }
+                match previous.map(|from| redirect_allowed(&from, attempt.url(), allow_private)) {
+                    Some(Err(error)) => attempt.error(error),
+                    _ => attempt.follow(),
+                }
+            }))
+            .dns_resolver(Arc::new(PublicResolver { allow_private }))
+            .user_agent(concat!("model-router/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|e| format!("{e:#}"))
+    })
+    .as_ref()
+    .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+type DnsResult = std::result::Result<reqwest::dns::Addrs, Box<dyn std::error::Error + Send + Sync>>;
+
+struct ResolveFuture {
+    state: Arc<Mutex<(Option<DnsResult>, Option<Waker>)>>,
+}
+
+impl Future for ResolveFuture {
+    type Output = DnsResult;
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(result) = state.0.take() {
+            return Poll::Ready(result);
+        }
+        state.1 = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
 /// Resolves with the system resolver and drops private addresses, so a
 /// public name (or a redirect to one) cannot reach internal services.
 struct PublicResolver {
@@ -429,11 +470,32 @@ impl reqwest::dns::Resolve for PublicResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let allow_private = self.allow_private;
         let host = name.as_str().to_owned();
-        Box::pin(async move {
-            let addrs: Vec<SocketAddr> = (host.as_str(), 0).to_socket_addrs()?.collect();
-            let kept = public_addrs(&host, addrs, allow_private)?;
-            Ok(Box::new(kept.into_iter()) as reqwest::dns::Addrs)
-        })
+        let state = Arc::new(Mutex::new((None, None::<Waker>)));
+        let worker_state = Arc::clone(&state);
+        if let Err(err) = std::thread::Builder::new()
+            .name("task-import dns".into())
+            .spawn(move || {
+                let resolved = (host.as_str(), 0)
+                    .to_socket_addrs()
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+                    .and_then(|addrs| {
+                        let kept = public_addrs(&host, addrs.collect(), allow_private)
+                            .map_err(std::io::Error::other)?;
+                        Ok(Box::new(kept.into_iter()) as reqwest::dns::Addrs)
+                    });
+                let mut guard = worker_state.lock().unwrap_or_else(|e| e.into_inner());
+                guard.0 = Some(resolved);
+                let waker = guard.1.take();
+                drop(guard);
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            })
+        {
+            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.0 = Some(Err(Box::new(err)));
+        }
+        Box::pin(ResolveFuture { state })
     }
 }
 
@@ -532,17 +594,22 @@ fn github(host: &str, endpoint: &str, query: &str, cancel: &AtomicBool) -> Resul
     };
     let mut received = 0;
     let mut oversized = false;
-    let result = process::capture(
+    let abort = AtomicBool::new(false);
+    let result = process::capture_with_stall_and_abort(
         &inv,
         temp.path(),
         temp.path(),
         Duration::from_secs(20),
+        None,
         cancel,
+        Some(&abort),
+        None,
+        |_| Ok(()),
         |_, chunk| {
             received += chunk.len();
             if received > 4 * MAX_DOCUMENT_BYTES {
                 oversized = true;
-                cancel.store(true, Ordering::Relaxed);
+                abort.store(true, Ordering::Relaxed);
             }
         },
     )

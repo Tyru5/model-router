@@ -15,18 +15,25 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// How long drawn hints may use stats before they are collected again.
-const REFRESH: Duration = Duration::from_secs(60);
+/// Fallback interval before stale stats are re-collected when no run finished.
+const FALLBACK_REFRESH: Duration = Duration::from_secs(300);
 
 /// Stats of the open project, collected in the background while the
-/// Workflow page shows, at most every `REFRESH`, and when the dialog opens.
+/// Workflow page shows, on demand / run completion or after `FALLBACK_REFRESH`.
 #[derive(Default)]
 pub(super) struct StatsCache {
     collected: Option<(PathBuf, Instant, Arc<Stats>)>,
-    collecting: bool,
+    pub(super) collecting: bool,
+    stale: bool,
 }
 
 impl StatsCache {
+    pub(super) fn invalidate(&mut self) {
+        self.stale = true;
+    }
+    pub(super) fn reset(&mut self) {
+        *self = Self::default();
+    }
     /// The last stats collected for `project`.
     fn get(&self, project: &Path) -> Option<&Stats> {
         self.collected
@@ -37,10 +44,10 @@ impl StatsCache {
     /// Whether `project`'s stats are missing or old, and none are being collected.
     fn due(&self, project: &Path) -> bool {
         !self.collecting
-            && self
-                .collected
-                .as_ref()
-                .is_none_or(|(path, at, _)| path != project || at.elapsed() >= REFRESH)
+            && (self.stale
+                || self.collected.as_ref().is_none_or(|(path, at, _)| {
+                    path != project || at.elapsed() >= FALLBACK_REFRESH
+                }))
     }
 }
 
@@ -88,6 +95,9 @@ impl App {
             Ok(stats) => {
                 if waiting {
                     self.text("Routing stats · suggestions only", stats.table(None));
+                }
+                if project == self.project {
+                    self.route_stats.stale = false;
                 }
                 self.route_stats.collected = Some((project, Instant::now(), stats));
             }

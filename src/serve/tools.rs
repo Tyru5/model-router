@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 /// Longest a single `wait_run` call blocks.
 const MAX_WAIT_SECONDS: u64 = 3600;
@@ -272,12 +272,8 @@ struct RetryArgs {
     force_unattended: bool,
 }
 
-/// Runs a tool. Errors become `isError` results (MCP) or 400s (HTTP).
-pub fn call(server: &Server, name: &str, arguments: &Value) -> Result<Value> {
-    call_with(server, name, arguments, None, &mut |_| {})
-}
-
-/// Runs a tool with optional cancellation and progress reporting (for MCP).
+/// Runs a tool with optional cancellation and progress reporting (for MCP/HTTP).
+/// Errors become `isError` results (MCP) or 400s (HTTP).
 pub fn call_with(
     server: &Server,
     name: &str,
@@ -309,6 +305,11 @@ pub fn call_with(
 /// drives must be addressed in its own project.
 pub(super) fn load(server: &Server, project: Option<&str>, id: &str) -> Result<(Run, Info)> {
     let project = server.project(project)?;
+    let run = load_in_project(server, &project, id)?;
+    Ok((run, server.runs.info(id)))
+}
+
+fn load_in_project(server: &Server, project: &Path, id: &str) -> Result<Run> {
     if let Some(owner) = server.runs.project_of(id) {
         ensure!(
             owner == project,
@@ -316,14 +317,12 @@ pub(super) fn load(server: &Server, project: Option<&str>, id: &str) -> Result<(
             owner.display()
         );
     }
-    let run = engine::load(&project, id)
-        .with_context(|| format!("No readable run {id} in {}", project.display()))?;
-    Ok((run, server.runs.info(id)))
+    engine::load(project, id)
+        .with_context(|| format!("No readable run {id} in {}", project.display()))
 }
 
 fn list_workflows(server: &Server, a: ProjectArgs) -> Result<Value> {
-    let project = server.project(a.project.as_deref())?;
-    let settings = server.settings(&project)?;
+    let (project, settings) = server.project_and_settings(a.project.as_deref())?;
     let workflows: Vec<Value> = settings
         .workflows
         .iter()
@@ -352,16 +351,14 @@ fn list_workflows(server: &Server, a: ProjectArgs) -> Result<Value> {
 }
 
 fn preview_run(server: &Server, a: PreviewArgs) -> Result<Value> {
-    let project = server.project(a.project.as_deref())?;
-    let settings = server.settings(&project)?;
+    let (project, settings) = server.project_and_settings(a.project.as_deref())?;
     let workflow = settings.workflow(a.workflow.as_deref())?;
     let preview = engine::preview(&settings, workflow, &project, &a.task)?;
     Ok(json!({"project": project, "workflow": workflow.name, "preview": preview}))
 }
 
 fn start_run(server: &Server, a: StartArgs) -> Result<Value> {
-    let project = server.project(a.project.as_deref())?;
-    let settings = server.settings(&project)?;
+    let (project, settings) = server.project_and_settings(a.project.as_deref())?;
     let mut workflow = settings.workflow(a.workflow.as_deref())?.clone();
     for change in &a.overrides {
         let stage = workflow
@@ -579,63 +576,78 @@ fn get_report(server: &Server, a: RunArgs) -> Result<Value> {
     Ok(value)
 }
 
-/// Reloads after the engine's last save and refuses runs this server or
-/// another process is driving.
-fn idle_run(server: &Server, project: Option<&str>, id: &str) -> Result<Run> {
-    let (mut run, info) = load(server, project, id)?;
-    ensure!(!info.active, "Run {id} is running; wait for it first");
-    let settings = server.settings(&run.project)?;
-    // What recovery stopped or left running goes to the server's log.
-    let id = run.id.clone();
-    engine::authorize_replay(&mut run, settings.explicit_config.as_deref(), |event| {
-        if let engine::Event::Output(text) = event {
-            super::log(format!("run {id}: {}", text.trim_end()));
-        }
-    })?;
-    Ok(run)
+/// Reloads after the engine's last save and atomically reserves and resumes a
+/// run this server is not already driving.
+fn resume_idle_run(
+    server: &Server,
+    project: Option<&str>,
+    id: &str,
+    prepare: impl FnOnce(&mut Run) -> Result<()>,
+) -> Result<Run> {
+    let (project, settings) = server.project_and_settings(project)?;
+    server.runs.resume_run(&project, id, || {
+        let mut run = load_in_project(server, &project, id)?;
+        // What recovery stopped or left running goes to the server's log.
+        let run_id = run.id.clone();
+        engine::authorize_replay(&mut run, settings.explicit_config.as_deref(), |event| {
+            if let engine::Event::Output(text) = event {
+                super::log(format!("run {run_id}: {}", text.trim_end()));
+            }
+        })?;
+        prepare(&mut run)?;
+        Ok(run)
+    })
 }
 
 fn confirm_stage(server: &Server, a: RunArgs) -> Result<Value> {
-    let mut run = idle_run(server, a.project.as_deref(), &a.run_id)?;
-    // The ship checkpoint is a person's decision to commit and publish.
-    ensure!(
-        run.workflow
-            .stages
-            .get(run.cursor)
-            .is_none_or(|s| s.role != crate::config::Role::Ship),
-        "Run {} waits for a person to confirm its ship plan: model-router resume {} --advance, or [a] in the TUI",
-        run.id,
-        run.id
-    );
-    run.confirm()?;
-    server.runs.drive(&run.project.clone(), run.clone())?;
+    let run = resume_idle_run(server, a.project.as_deref(), &a.run_id, |run| {
+        // The ship checkpoint is a person's decision to commit and publish.
+        ensure!(
+            run.workflow
+                .stages
+                .get(run.cursor)
+                .is_none_or(|s| s.role != crate::config::Role::Ship),
+            "Run {} waits for a person to confirm its ship plan: model-router resume {} --advance, or [a] in the TUI",
+            run.id,
+            run.id
+        );
+        run.confirm()
+    })?;
     Ok(status_value(&run, &server.runs.info(&run.id)))
 }
 
 fn retry_stage(server: &Server, a: RetryArgs) -> Result<Value> {
-    let mut run = idle_run(server, a.project.as_deref(), &a.run_id)?;
-    ensure!(
-        run.status != Status::Complete && run.cursor < run.stages.len(),
-        "Run {} is complete",
-        run.id
-    );
-    if run.workflow.stages[run.cursor].mode == Mode::Interactive {
+    let force_unattended = a.force_unattended;
+    let model = a.model.filter(|m| !m.trim().is_empty());
+    let run = resume_idle_run(server, a.project.as_deref(), &a.run_id, move |run| {
         ensure!(
-            a.force_unattended,
-            "Stage {} is interactive. The server runs unattended only; pass force_unattended: true to retry it unattended",
-            run.current_name()
+            run.status != Status::Complete && run.cursor < run.stages.len(),
+            "Run {} is complete",
+            run.id
         );
-        run.workflow.stages[run.cursor].mode = Mode::Unattended;
-    }
-    run.retry(false, a.model.filter(|m| !m.trim().is_empty()))?;
-    server.runs.drive(&run.project.clone(), run.clone())?;
+        if run.workflow.stages[run.cursor].mode == Mode::Interactive {
+            ensure!(
+                force_unattended,
+                "Stage {} is interactive. The server runs unattended only; pass force_unattended: true to retry it unattended",
+                run.current_name()
+            );
+            run.workflow.stages[run.cursor].mode = Mode::Unattended;
+        }
+        run.retry(false, model)
+    })?;
     Ok(status_value(&run, &server.runs.info(&run.id)))
 }
 
 /// What a client needs to follow a run, in `run_status`, `wait_run`, and
 /// streamed state events.
 pub fn status_value(run: &Run, info: &Info) -> Value {
-    let built = report::build(run);
+    let pricing = crate::cost::Pricing::load(&run.project);
+    status_value_with(run, info, &pricing)
+}
+
+/// Like `status_value`, reusing an already-loaded `Pricing` table.
+pub fn status_value_with(run: &Run, info: &Info, pricing: &crate::cost::Pricing) -> Value {
+    let usage = report::usage_total_with(run, pricing);
     let end = if info.active || !settled(run.status) {
         Utc::now()
     } else {
@@ -721,7 +733,7 @@ pub fn status_value(run: &Run, info: &Info) -> Value {
         "repair_passes": run.repair_passes,
         "stages": stages,
         "latest_handoff": latest,
-        "usage": built.usage,
-        "usage_text": report::usage_text(&built.usage),
+        "usage": usage,
+        "usage_text": report::usage_text(&usage),
     })
 }

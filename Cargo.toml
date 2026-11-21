@@ -12,14 +12,13 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 # The default Unix reader spins on EOF after a PTY closes, starving shutdown.
 # This backend breaks its read loop on EOF and preserves the poll timeout.
 crossterm = { version = "0.28", features = ["use-dev-tty"] }
 directories = "6"
-fs2 = "0.4"
 libc = "0.2"
 portable-pty = "0.9"
 ratatui = "0.29"
@@ -35,7 +34,6 @@ unicode-segmentation = "1"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
 vt100 = "0.15"
-ctrlc = { version = "3", features = ["termination"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 percent-encoding = "2"
 base64 = "0.22"

@@ -12,7 +12,7 @@ use std::{
     collections::HashMap,
     ffi::OsString,
     fs,
-    io::Read,
+    io::{BufRead, Read},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -90,6 +90,12 @@ pub fn tree_with(workspace: &Path, index: &Path, run: &str) -> Option<String> {
         &["update-ref", &format!("{}/{tree}", namespace(run)), &tree],
     );
     Some(tree)
+}
+
+/// The working tree as a Git tree ID now, through caller-provided `index` and
+/// without creating a ref. Ok(None) outside Git.
+pub fn capture_index(workspace: &Path, index: &Path) -> Result<Option<String>> {
+    capture(workspace, &std::path::absolute(index)?)
 }
 
 /// The working tree as a Git tree ID now, through a throwaway index and
@@ -215,10 +221,10 @@ pub fn forget(project: &Path, run: &str) {
 }
 
 fn capture(workspace: &Path, index: &Path) -> Result<Option<String>> {
-    if !is_repository(workspace) {
-        return Ok(None);
-    }
     if !index.exists() {
+        if !is_repository(workspace) {
+            return Ok(None);
+        }
         seed(workspace, index)?;
     }
     // Snapshots are taken under the run lock, so a leftover lock is from an
@@ -250,6 +256,20 @@ fn seed(workspace: &Path, index: &Path) -> Result<()> {
         git(workspace, Some(index), &["read-tree", "HEAD"])?;
     }
     Ok(())
+}
+
+/// File paths that differ between two snapshot trees (one `git diff` call).
+pub fn changed_paths(dir: &Path, from: &str, to: &str) -> Result<Vec<String>> {
+    let out = git(
+        dir,
+        None,
+        &["diff", "--no-renames", "-z", "--name-only", from, to],
+    )?;
+    Ok(out
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect())
 }
 
 /// Files that differ between two snapshot trees.
@@ -300,6 +320,7 @@ fn number(field: &[u8]) -> Option<u64> {
 
 /// `git diff` between two trees, cut after `max` bytes with a note.
 pub fn patch(dir: &Path, from: &str, to: &str, max: usize) -> Result<String> {
+    const STDERR_LIMIT: u64 = 64 * 1024;
     let mut child = Command::new("git")
         .args([
             "--no-pager",
@@ -319,26 +340,44 @@ pub fn patch(dir: &Path, from: &str, to: &str, max: usize) -> Result<String> {
         .stderr(Stdio::piped())
         .spawn()
         .context("Start Git")?;
+    let mut stdout = child.stdout.take().context("No Git output")?;
+    let mut stderr = child.stderr.take().context("No Git output")?;
     let mut bytes = Vec::new();
-    child
-        .stdout
-        .take()
-        .context("No Git output")?
-        .take(max as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    let truncated = bytes.len() > max;
-    if truncated {
-        let _ = child.kill();
-    }
-    let mut error = String::new();
-    child
-        .stderr
-        .take()
-        .context("No Git output")?
-        .read_to_string(&mut error)?;
+    let (read, error) = std::thread::scope(|scope| {
+        let errors = scope.spawn(move || {
+            let mut text = Vec::new();
+            let _ = stderr.by_ref().take(STDERR_LIMIT).read_to_end(&mut text);
+            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+            String::from_utf8_lossy(&text).into_owned()
+        });
+        let read = stdout.by_ref().take(max as u64 + 1).read_to_end(&mut bytes);
+        if read.is_err() || bytes.len() > max {
+            let _ = child.kill();
+        }
+        let error = errors.join().unwrap_or_default();
+        (read, error)
+    });
     let status = child.wait()?;
+    read.context("Read git diff")?;
+    let truncated = bytes.len() > max;
     ensure!(truncated || status.success(), "git diff: {}", error.trim());
-    bytes.truncate(max);
+    if truncated {
+        bytes.truncate(max);
+        // Trim an incomplete multi-byte UTF-8 sequence split at `max`, without
+        // disturbing valid or invalid bytes earlier in the diff.
+        let tail_start = bytes.len().saturating_sub(4);
+        if let Some(rel) = bytes[tail_start..]
+            .iter()
+            .rposition(|&b| (b & 0b1100_0000) != 0b1000_0000)
+        {
+            let pos = tail_start + rel;
+            if let Err(err) = std::str::from_utf8(&bytes[pos..]) {
+                if err.error_len().is_none() {
+                    bytes.truncate(pos);
+                }
+            }
+        }
+    }
     let mut text = String::from_utf8_lossy(&bytes).into_owned();
     if truncated {
         text.push_str(&format!(
@@ -348,11 +387,45 @@ pub fn patch(dir: &Path, from: &str, to: &str, max: usize) -> Result<String> {
     Ok(text)
 }
 
+fn retain_overlap(line: &mut Vec<u8>, overlap: usize) {
+    let mut start = line.len().saturating_sub(overlap).max(1);
+    while start < line.len() && (line[start] & 0b1100_0000) == 0b1000_0000 {
+        start += 1;
+    }
+    let tail_len = line.len() - start;
+    line.copy_within(start.., 1);
+    line[0] = b'+';
+    line.truncate(1 + tail_len);
+}
+
+fn emit_added_tail(
+    line: &mut Vec<u8>,
+    mut rest: &[u8],
+    limit: usize,
+    overlap: usize,
+    each: &mut impl FnMut(&str),
+) {
+    while !rest.is_empty() {
+        let allowed = limit.saturating_sub(line.len());
+        let copy_len = rest.len().min(allowed);
+        line.extend_from_slice(&rest[..copy_len]);
+        rest = &rest[copy_len..];
+        if line.len() == limit && !rest.is_empty() {
+            each(&String::from_utf8_lossy(line));
+            retain_overlap(line, overlap);
+        }
+    }
+    each(&String::from_utf8_lossy(line));
+}
+
 /// The whole `git diff` between two trees, one line at a time and never
 /// cut, for scans that must see all of it. `--text` shows files Git would
-/// call binary, so their added lines are read too. Lines are decoded
-/// lossily.
+/// call binary, so their added lines are read too. Very long lines are streamed
+/// in bounded 1 MiB chunks with a 256-byte overlap on added lines.
 pub fn patch_lines(dir: &Path, from: &str, to: &str, mut each: impl FnMut(&str)) -> Result<()> {
+    const LINE_CHUNK_LIMIT: usize = 1024 * 1024;
+    const OVERLAP: usize = 256;
+    const STDERR_LIMIT: u64 = 64 * 1024;
     let mut child = Command::new("git")
         .args([
             "--no-pager",
@@ -363,6 +436,8 @@ pub fn patch_lines(dir: &Path, from: &str, to: &str, mut each: impl FnMut(&str))
             "--no-ext-diff",
             "--no-textconv",
             "--no-renames",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
             "--text",
             from,
             to,
@@ -374,33 +449,93 @@ pub fn patch_lines(dir: &Path, from: &str, to: &str, mut each: impl FnMut(&str))
         .spawn()
         .context("Start Git")?;
     let stdout = child.stdout.take().context("No Git output")?;
-    // Drained beside stdout, so a long error cannot block Git.
+    // Drained concurrently, capped at 64 KiB + drained to sink so Git cannot block.
     let mut stderr = child.stderr.take().context("No Git output")?;
-    let errors = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = stderr.read_to_string(&mut text);
-        text
-    });
-    let mut reader = std::io::BufReader::new(stdout);
-    let mut line = Vec::new();
-    let read = loop {
-        line.clear();
-        match std::io::BufRead::read_until(&mut reader, b'\n', &mut line) {
-            Ok(0) => break Ok(()),
-            Ok(_) => {
-                if line.last() == Some(&b'\n') {
-                    line.pop();
+    let (read, error) = std::thread::scope(|scope| {
+        let errors = scope.spawn(move || {
+            let mut text = Vec::new();
+            let _ = stderr.by_ref().take(STDERR_LIMIT).read_to_end(&mut text);
+            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+            String::from_utf8_lossy(&text).into_owned()
+        });
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line: Vec<u8> = Vec::new();
+        let mut in_overflow = false;
+        let mut overflow_added = false;
+        let mut has_new_bytes = false;
+        let read = loop {
+            let buf = match std::io::BufRead::fill_buf(&mut reader) {
+                Ok(buf) => buf,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => break Err(err),
+            };
+            if buf.is_empty() {
+                if !line.is_empty() && (!in_overflow || (overflow_added && has_new_bytes)) {
+                    each(&String::from_utf8_lossy(&line));
                 }
-                each(&String::from_utf8_lossy(&line));
+                break Ok(());
             }
-            Err(error) => break Err(error),
+            if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let take = &buf[..pos];
+                if !in_overflow {
+                    let allowed = LINE_CHUNK_LIMIT.saturating_sub(line.len());
+                    if take.len() <= allowed {
+                        line.extend_from_slice(take);
+                        each(&String::from_utf8_lossy(&line));
+                    } else {
+                        let (head, rest) = take.split_at(allowed);
+                        line.extend_from_slice(head);
+                        let is_added = line.first() == Some(&b'+');
+                        each(&String::from_utf8_lossy(&line));
+                        if is_added {
+                            emit_added_tail(&mut line, rest, LINE_CHUNK_LIMIT, OVERLAP, &mut each);
+                        }
+                    }
+                } else if overflow_added && (!take.is_empty() || has_new_bytes) {
+                    emit_added_tail(&mut line, take, LINE_CHUNK_LIMIT, OVERLAP, &mut each);
+                }
+                line.clear();
+                in_overflow = false;
+                overflow_added = false;
+                has_new_bytes = false;
+                reader.consume(pos + 1);
+                continue;
+            }
+            if in_overflow && !overflow_added {
+                let n = buf.len();
+                reader.consume(n);
+                continue;
+            }
+            let allowed = LINE_CHUNK_LIMIT.saturating_sub(line.len());
+            let copy_len = buf.len().min(allowed);
+            line.extend_from_slice(&buf[..copy_len]);
+            if copy_len > 0 {
+                has_new_bytes = true;
+            }
+            reader.consume(copy_len);
+            if line.len() == LINE_CHUNK_LIMIT {
+                if !in_overflow {
+                    overflow_added = line.first() == Some(&b'+');
+                    in_overflow = true;
+                    each(&String::from_utf8_lossy(&line));
+                } else if overflow_added {
+                    each(&String::from_utf8_lossy(&line));
+                }
+                if overflow_added {
+                    retain_overlap(&mut line, OVERLAP);
+                    has_new_bytes = false;
+                } else {
+                    line.clear();
+                }
+            }
+        };
+        if read.is_err() {
+            let _ = child.kill();
         }
-    };
-    if read.is_err() {
-        let _ = child.kill();
-    }
+        let error = errors.join().unwrap_or_default();
+        (read, error)
+    });
     let status = child.wait()?;
-    let error = errors.join().unwrap_or_default();
     read.context("Read git diff")?;
     ensure!(status.success(), "git diff: {}", error.trim());
     Ok(())
@@ -576,5 +711,70 @@ mod tests {
         assert!(!is_repository(dir.path()));
         assert_eq!(tree(dir.path(), dir.path()), None);
         assert!(!dir.path().join("snapshot.index").exists());
+    }
+
+    #[test]
+    fn patch_trims_incomplete_utf8_and_changed_paths_tracks_edits() {
+        let Some(dir) = repository() else { return };
+        let workspace = dir.path();
+        let run_dir = run_dir(workspace);
+        let from = tree(workspace, &run_dir).unwrap();
+        // Multi-byte UTF-8 line (4-byte emoji repeatedly) + deletion + addition.
+        fs::write(
+            workspace.join("tracked.txt"),
+            format!("{}\n", "🦀".repeat(40)),
+        )
+        .unwrap();
+        fs::write(workspace.join("extra.txt"), "hi\n").unwrap();
+        fs::remove_file(workspace.join("doomed.txt")).unwrap();
+        let to = tree(workspace, &run_dir).unwrap();
+        let mut paths = changed_paths(workspace, &from, &to).unwrap();
+        paths.sort();
+        assert_eq!(paths, ["doomed.txt", "extra.txt", "tracked.txt"]);
+
+        let header_len = patch(workspace, &from, &to, 10_000)
+            .unwrap()
+            .find('🦀')
+            .unwrap();
+        // Cut right inside a 4-byte character (+1, +2, +3 bytes).
+        for offset in 1..=3 {
+            let cut = patch(workspace, &from, &to, header_len + offset).unwrap();
+            let prefix = cut.split("\n[Patch truncated").next().unwrap();
+            assert!(
+                !prefix.ends_with('\u{FFFD}'),
+                "split UTF-8 char at +{offset}: {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn patch_lines_catches_secrets_across_chunk_boundary_and_ignores_mnemonic_prefix() {
+        let Some(dir) = repository() else { return };
+        let workspace = dir.path();
+        git(workspace, None, &["config", "diff.mnemonicPrefix", "true"]).unwrap();
+        let run_dir = run_dir(workspace);
+        let from = tree(workspace, &run_dir).unwrap();
+
+        let prefix_len = 1024 * 1024 - 12;
+        let secret = format!("ghp_{}", "a1b2c3d4".repeat(4));
+        let mut big = "x".repeat(prefix_len - 1);
+        big.push(' ');
+        big.push_str(&secret);
+        big.push('\n');
+        fs::write(workspace.join("big.txt"), big.as_bytes()).unwrap();
+        let to = tree(workspace, &run_dir).unwrap();
+
+        let mut scan = crate::policy::SecretScan::default();
+        let mut seen_plus_header = false;
+        patch_lines(workspace, &from, &to, |line| {
+            if line == "+++ b/big.txt" {
+                seen_plus_header = true;
+            }
+            scan.line(line);
+        })
+        .unwrap();
+        assert!(seen_plus_header, "expected canonical b/ header");
+        assert_eq!(scan.hits().len(), 1);
+        assert_eq!(scan.hits()[0].file, "big.txt");
     }
 }

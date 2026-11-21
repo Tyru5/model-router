@@ -76,7 +76,7 @@ pub fn apply_worktree_plan(run: &Run) -> Result<ApplyPlan> {
                 .flat_map(|s| &s.attempts)
                 .find_map(|a| a.tree_before.clone())
                 .context("Run has no baseline Git snapshot to diff from")?;
-            let to = snapshot::tree(&workspace, &run.directory)
+            let to = snapshot::current_tree(&workspace)?
                 .context("Could not snapshot the run's worktree")?;
             (from, to)
         }
@@ -115,17 +115,19 @@ pub fn apply_worktree_plan(run: &Run) -> Result<ApplyPlan> {
 /// `check_only`, reports what that would do (clean, merged, or conflict)
 /// and leaves the checkout untouched.
 pub fn apply_worktree(run: &Run, check_only: bool) -> Result<(ApplyPlan, fanout::Applied)> {
-    let plan = apply_worktree_plan(run)?;
+    let project = fs::canonicalize(&run.project).unwrap_or_else(|_| run.project.clone());
     let _run_lock = storage::lock_wait(&run.directory.join("run.lock"), LOCK_WAIT)?;
     let _checkout_lock = storage::lock_wait(
-        &storage::metadata_dir(&plan.project)?.join("workspace.lock"),
+        &storage::metadata_dir(&project)?.join("workspace.lock"),
         LOCK_WAIT,
     )?;
+    run.check_revision()?;
+    let plan = apply_worktree_plan(run)?;
     let scratch = tempfile::tempdir().context("Create apply scratch directory")?;
     let patch_path = scratch.path().join("worktree.patch");
     fanout::write_patch(&plan.workspace, &plan.from, &plan.to, &patch_path)?;
     let index = scratch.path().join("checkout.index");
-    let current = snapshot::tree_with(&plan.project, &index, &run.id)
+    let current = snapshot::capture_index(&plan.project, &index)?
         .context("Snapshot the project checkout before applying")?;
     let file_paths: Vec<String> = plan.files.iter().map(|f| f.path.clone()).collect();
     if check_only {

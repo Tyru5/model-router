@@ -38,6 +38,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use unicode_width::UnicodeWidthStr;
 
 pub(super) struct App {
     pub(super) project: PathBuf,
@@ -106,8 +107,9 @@ impl App {
         self.session.focused_mut().expect("a focused run")
     }
 }
-/// How often the header re-reads Git status, and Runs re-reads active runs.
-const REPO_EVERY: Duration = Duration::from_secs(5);
+/// How often the header re-reads Git status (active vs idle), and Runs re-reads active runs.
+const REPO_EVERY_ACTIVE: Duration = Duration::from_secs(5);
+const REPO_EVERY_IDLE: Duration = Duration::from_secs(30);
 const RUNS_EVERY: Duration = Duration::from_secs(3);
 impl App {
     pub(super) fn new(
@@ -344,13 +346,17 @@ impl App {
         }
         self.refresh();
         self.poll_completion();
+        if self.runs.take_sizes_dirty() {
+            self.ui.redraw = true;
+        }
         Ok(self.session.quit_after_stop && !self.session.any_active())
     }
-    /// A run stopped: Git status and the saved runs list may have changed.
+    /// A run stopped: Git status, saved runs, and routing stats may have changed.
     fn run_stopped(&mut self) {
         self.ui.redraw = true;
         self.repo.checked = None;
         self.runs.stale = true;
+        self.route_stats.invalidate();
     }
     /// Starts reads that are due: saved runs on the Runs page, Git status,
     /// and stats for the Workflow page's hint.
@@ -367,10 +373,15 @@ impl App {
                 self.load_runs();
             }
         }
+        let repo_every = if self.session.any_active() {
+            REPO_EVERY_ACTIVE
+        } else {
+            REPO_EVERY_IDLE
+        };
         let due = self
             .repo
             .checked
-            .is_none_or(|at| at.elapsed() >= REPO_EVERY);
+            .is_none_or(|at| at.elapsed() >= repo_every);
         if due && !self.repo.reading {
             self.repo.reading = true;
             let project = self.project.clone();
@@ -570,15 +581,12 @@ impl App {
         self.editor.workflow = 0;
         self.editor.selected = 0;
         self.editor.task.clear();
-        self.runs.entries.clear();
-        self.runs.selected = 0;
-        self.runs.loading = false;
-        self.runs.stale = true;
-        self.runs.loaded_at = None;
+        self.runs.reset();
         self.harnesses.selected = 0;
         self.harnesses.checks.clear();
         // A test of the old project still runs, but its result is dropped.
         self.harnesses.tests.reset();
+        self.route_stats.reset();
         self.catalogs = Catalogs::default();
         self.editor.undo.clear();
         self.ui.page = Page::Workflow;
@@ -736,11 +744,28 @@ impl App {
             Page::Workflow => {}
         }
     }
-    /// Whether something on screen animates, so frames come faster.
+    /// Whether a loading spinner is drawn on screen, so frames come faster.
     pub(super) fn animating(&self) -> bool {
         matches!(self.ui.dialog(), Some(Modal::Loading(_)))
-            || self.starting
             || matches!(self.ui.dialog(), Some(Modal::Import(importer)) if importer.busy())
+    }
+    /// Whether an active elapsed timer is currently visible on screen (1 Hz).
+    pub(super) fn ticking(&self) -> bool {
+        (self.monitoring() && self.session.focused().is_some_and(RunSlot::in_progress))
+            || (matches!(self.ui.dialog(), Some(Modal::SessionRuns { .. }))
+                && self.session.runs.iter().any(RunSlot::in_progress))
+    }
+    /// Shorter event poll while work or animation is active; relaxed when idle.
+    pub(super) fn poll_timeout(&self) -> Duration {
+        if self.animating()
+            || self.session.any_active()
+            || self.tasks.busy()
+            || self.runs.is_sizing()
+        {
+            Duration::from_millis(70)
+        } else {
+            Duration::from_millis(250)
+        }
     }
     /// Whether the focused interactive stage may take the terminal now. An
     /// open dialog keeps it waiting, and the status line says how to open it.
@@ -833,7 +858,9 @@ fn read_project(path: PathBuf) -> std::result::Result<Opened, String> {
 
 pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     app.sync_runs();
-    let palette = app.ui.palette();
+    let theme = app.ui.displayed_theme();
+    let palette = theme.palette();
+    let can_test = app.ui.page == Page::Harnesses && app.can_test_harnesses();
     let area = frame.area();
     frame.render_widget(
         Block::default().style(Style::default().bg(palette.bg).fg(palette.fg)),
@@ -925,18 +952,25 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
                 skip.push(ActionId::Retry);
             }
         }
-        if app.page_scope() == Scope::Harnesses && !app.can_test_harnesses() {
+        if !can_test {
             skip.extend([ActionId::TestHarness, ActionId::MarkHarness]);
         }
         actions::footer(app.page_scope(), &skip)
     };
     let mut keys: Vec<(&str, &str)> = vec![];
+    let mut used_width = 0usize;
     for (key, label) in &hints {
-        keys.push((key.as_str(), *label));
-        if palette.hints(&keys).width() > room {
-            keys.pop();
+        let item_width = theme::key_label_width(key) + 1 + label.width();
+        let next_width = if keys.is_empty() {
+            item_width
+        } else {
+            used_width + 3 + item_width
+        };
+        if next_width > room {
             break;
         }
+        used_width = next_width;
+        keys.push((key.as_str(), *label));
     }
     let mut footer = palette.hints(&keys);
     footer.spans.insert(0, Span::raw(" "));
@@ -996,8 +1030,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let mut task_area = None;
     match app.ui.page {
         Page::Workflow => task_area = Some(draw_workflow(frame, app, body, palette)),
-        Page::Runs => draw_runs(frame, app, body, palette),
-        Page::Harnesses => draw_harnesses(frame, app, body, palette),
+        Page::Runs => draw_runs(frame, app, body, theme, palette),
+        Page::Harnesses => draw_harnesses(frame, app, body, palette, can_test),
     }
     let inline = task_area.filter(|_| editing_task(app));
     if !app.ui.message.is_empty() {

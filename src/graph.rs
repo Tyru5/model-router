@@ -6,7 +6,7 @@
 //! Disabled stages are transparent: their dependents wait on their own
 //! dependencies. A fan-out's dependents also wait for its judge, which
 //! applies the chosen candidate.
-use crate::config::{Mode, Role, Stage, Workflow};
+use crate::config::{Mode, Role, Workflow};
 use anyhow::{Result, bail, ensure};
 
 /// Whether `workflow` is a dependency graph rather than a list.
@@ -22,10 +22,17 @@ pub fn read_only(role: Role) -> bool {
     )
 }
 
-/// Whether `stage` may run beside other parallel-safe stages: unattended,
-/// and either read-only or a fan-out whose candidates each have a worktree.
-pub fn parallel_safe(stage: &Stage) -> bool {
-    stage.mode == Mode::Unattended && (stage.fan_out.is_some() || read_only(stage.role))
+/// Whether stage `index` may run beside other parallel-safe stages: unattended,
+/// not a ship stage or fan-out judge (which mutates the shared workspace), and
+/// either read-only or a fan-out whose candidates each have a worktree.
+pub fn parallel_safe(workflow: &Workflow, index: usize) -> bool {
+    let Some(stage) = workflow.stages.get(index) else {
+        return false;
+    };
+    stage.mode == Mode::Unattended
+        && stage.role != Role::Ship
+        && judged_by(workflow, index).is_none()
+        && (stage.fan_out.is_some() || read_only(stage.role))
 }
 
 /// The enabled judge stage of enabled fan-out stage `index`; None for `auto`,
@@ -229,7 +236,7 @@ pub fn validate(workflow: &Workflow) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Candidate, FanOut};
+    use crate::config::{Candidate, FanOut, Stage};
 
     fn stage(id: &str, role: Role, after: &[&str]) -> Stage {
         Stage {
@@ -381,5 +388,23 @@ mod tests {
         let flow = workflow(vec![implement, judge]);
         assert_eq!(judge_of(&flow, 0), None);
         assert_eq!(judged_by(&flow, 1), None);
+    }
+
+    #[test]
+    fn judges_and_ship_stages_are_not_parallel_safe() {
+        let mut implement = stage("implement", Role::Implementation, &[]);
+        implement.fan_out = fan("judge");
+        let judge = stage("judge", Role::Review, &["implement"]);
+        let other_review = stage("review", Role::Review, &[]);
+        let ship = stage("ship", Role::Ship, &["judge", "review"]);
+        let flow = workflow(vec![implement, judge, other_review, ship]);
+        assert!(parallel_safe(&flow, 0));
+        assert!(
+            !parallel_safe(&flow, 1),
+            "judge mutates the shared workspace"
+        );
+        assert!(parallel_safe(&flow, 2), "ordinary review is read-only");
+        assert!(!parallel_safe(&flow, 3), "ship stage mutates git state");
+        assert!(!parallel_safe(&flow, 99));
     }
 }

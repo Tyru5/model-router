@@ -682,11 +682,15 @@ fn clip(text: &str, width: usize) -> String {
     format!("{kept}…")
 }
 
-pub(super) fn draw_harnesses(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
+pub(super) fn draw_harnesses(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    palette: Palette,
+    marks: bool,
+) {
     let checks = &app.harnesses.checks;
     let tests = &app.harnesses.tests;
-    // A mark column for batch tests, in a model-router checkout.
-    let marks = app.can_test_harnesses();
     let wide = area.width >= 110;
     let names = app.harnesses.names(&app.editor.settings);
     let name_width = names.iter().map(|n| n.chars().count()).max().unwrap_or(7);

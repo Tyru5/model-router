@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write,
     fs,
     path::{Path, PathBuf},
@@ -116,7 +116,7 @@ pub fn counted_tokens(usage: &Usage) -> u64 {
 }
 
 #[derive(Deserialize)]
-struct Table {
+struct RawTable {
     #[serde(default)]
     as_of: String,
     #[serde(default)]
@@ -125,9 +125,26 @@ struct Table {
     models: BTreeMap<String, Price>,
 }
 
+struct Table {
+    as_of: String,
+    aliases: BTreeMap<String, String>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    models: BTreeMap<String, Price>,
+    index: PriceIndex,
+}
+
 fn table() -> &'static Table {
     static TABLE: OnceLock<Table> = OnceLock::new();
-    TABLE.get_or_init(|| toml::from_str(PRICES).expect("built-in price table parses"))
+    TABLE.get_or_init(|| {
+        let raw: RawTable = toml::from_str(PRICES).expect("built-in price table parses");
+        let index = PriceIndex::from_map(&raw.models, &raw.aliases);
+        Table {
+            as_of: raw.as_of,
+            aliases: raw.aliases,
+            models: raw.models,
+            index,
+        }
+    })
 }
 
 /// The date the built-in prices were last checked.
@@ -140,6 +157,10 @@ pub fn table_as_of() -> &'static str {
 /// suffixes, and with `.`/`@`/`_` as `-`. Harness aliases resolve to the
 /// model they select.
 pub fn normalize(id: &str) -> String {
+    normalize_with_aliases(id, &table().aliases, 0)
+}
+
+fn normalize_with_aliases(id: &str, aliases: &BTreeMap<String, String>, depth: u8) -> String {
     let mut id = id.trim().to_ascii_lowercase();
     if let Some(start) = id.find('[') {
         id.truncate(start);
@@ -179,45 +200,75 @@ pub fn normalize(id: &str) -> String {
         }
     }
     let id = parts.join("-");
-    match table().aliases.get(&id) {
-        Some(model) => normalize(model),
-        None => id,
+    if depth < 8 {
+        if let Some(model) = aliases.get(&id) {
+            return normalize_with_aliases(model, aliases, depth + 1);
+        }
     }
+    id
 }
 
-/// Exact ID (case-insensitive), then normalized ID, then (with `family`) the
-/// longest entry that prefixes the normalized ID at a `-` boundary.
-fn find(prices: &BTreeMap<String, Price>, model: &str, family: bool) -> Option<Price> {
-    let raw = model.trim().to_ascii_lowercase();
-    if let Some((_, price)) = prices.iter().find(|(id, _)| id.to_ascii_lowercase() == raw) {
-        return Some(*price);
+#[derive(Debug, Clone, Default)]
+struct PriceIndex {
+    exact: HashMap<String, Price>,
+    normalized: HashMap<String, Price>,
+}
+
+impl PriceIndex {
+    fn from_map(prices: &BTreeMap<String, Price>, aliases: &BTreeMap<String, String>) -> Self {
+        let mut index = Self::default();
+        for (id, price) in prices {
+            index.exact.entry(id.to_ascii_lowercase()).or_insert(*price);
+            index
+                .normalized
+                .entry(normalize_with_aliases(id, aliases, 0))
+                .or_insert(*price);
+        }
+        index
     }
-    let wanted = normalize(model);
-    if wanted.is_empty() {
-        return None;
+
+    fn insert(&mut self, id: &str, price: Price) {
+        let raw = id.to_ascii_lowercase();
+        let norm = normalize(id);
+        if !norm.is_empty() {
+            self.exact.retain(|k, _| k == &raw || normalize(k) != norm);
+        }
+        self.exact.insert(raw, price);
+        self.normalized.insert(norm, price);
     }
-    let keyed: Vec<(String, Price)> = prices.iter().map(|(id, p)| (normalize(id), *p)).collect();
-    if let Some((_, price)) = keyed.iter().find(|(id, _)| *id == wanted) {
-        return Some(*price);
+
+    /// Exact ID (case-insensitive), then normalized ID, then (with `family`) the
+    /// longest entry that prefixes the normalized ID at a `-` boundary.
+    fn find(&self, raw: &str, wanted: &str, family: bool) -> Option<Price> {
+        if let Some(&price) = self.exact.get(raw) {
+            return Some(price);
+        }
+        if wanted.is_empty() {
+            return None;
+        }
+        if let Some(&price) = self.normalized.get(wanted) {
+            return Some(price);
+        }
+        if !family {
+            return None;
+        }
+        for (idx, _) in wanted.rmatch_indices('-') {
+            if idx > 0 {
+                if let Some(&price) = self.normalized.get(&wanted[..idx]) {
+                    return Some(price);
+                }
+            }
+        }
+        None
     }
-    if !family {
-        return None;
-    }
-    keyed
-        .into_iter()
-        .filter(|(id, _)| {
-            !id.is_empty() && wanted.starts_with(id.as_str()) && wanted[id.len()..].starts_with('-')
-        })
-        .max_by_key(|(id, _)| id.len())
-        .map(|(_, price)| price)
 }
 
 /// Prices beyond the built-in table: user overrides and cached provider
 /// listings. `Pricing::default()` is the table alone.
 #[derive(Debug, Clone, Default)]
 pub struct Pricing {
-    overrides: BTreeMap<String, Price>,
-    providers: BTreeMap<String, BTreeMap<String, Price>>,
+    overrides: PriceIndex,
+    providers: BTreeMap<String, PriceIndex>,
 }
 impl Pricing {
     /// The user's pricing.toml, then `[pricing]` from the global and project
@@ -240,10 +291,11 @@ impl Pricing {
                 pricing.extend(config.get("pricing"));
             }
         }
+        let aliases = &table().aliases;
         pricing.providers = read_cache(project)
             .providers
             .into_iter()
-            .map(|(name, cached)| (name, cached.models))
+            .map(|(name, cached)| (name, PriceIndex::from_map(&cached.models, aliases)))
             .collect();
         pricing
     }
@@ -252,19 +304,22 @@ impl Pricing {
         for (id, value) in table.and_then(toml::Value::as_table).into_iter().flatten() {
             if let Ok(price) = value.clone().try_into::<Price>() {
                 if price.is_valid() {
-                    self.overrides.insert(id.clone(), price);
+                    self.overrides.insert(id, price);
                 }
             }
         }
     }
 
     pub fn with_override(mut self, model: &str, price: Price) -> Self {
-        self.overrides.insert(model.into(), price);
+        self.overrides.insert(model, price);
         self
     }
 
     pub fn with_provider(mut self, provider: &str, prices: BTreeMap<String, Price>) -> Self {
-        self.providers.insert(provider.into(), prices);
+        self.providers.insert(
+            provider.into(),
+            PriceIndex::from_map(&prices, &table().aliases),
+        );
         self
     }
 
@@ -274,16 +329,21 @@ impl Pricing {
         if model.trim().is_empty() {
             return None;
         }
-        if let Some(price) = find(&self.overrides, model, true) {
+        let raw = model.trim().to_ascii_lowercase();
+        let wanted = normalize(model);
+        if let Some(price) = self.overrides.find(&raw, &wanted, true) {
             return Some((price, Source::Config));
         }
         if let Some(price) = provider
             .and_then(|name| self.providers.get(name))
-            .and_then(|prices| find(prices, model, false))
+            .and_then(|prices| prices.find(&raw, &wanted, false))
         {
             return Some((price, Source::Provider));
         }
-        find(&table().models, model, true).map(|price| (price, Source::Table))
+        table()
+            .index
+            .find(&raw, &wanted, true)
+            .map(|price| (price, Source::Table))
     }
 }
 
@@ -390,12 +450,28 @@ pub fn harness_billing(harness: &str, custom: &BTreeMap<String, CustomAdapter>) 
     crate::harness::get(harness).map_or(Billing::Api, |spec| spec.billing)
 }
 
+/// Routed provider (if any) and effective billing mode for stage `index`.
+pub(crate) fn stage_estimate_params(run: &Run, index: usize) -> (Option<&str>, Billing) {
+    let routed = routed_provider(run, index);
+    let billing = match run.workflow.stages.get(index) {
+        Some(stage) => billing_for(
+            stage.billing,
+            routed.is_some(),
+            &stage.harness,
+            &run.adapters,
+        ),
+        None => Billing::Api,
+    };
+    (routed, billing)
+}
+
 pub fn attempt_estimate(run: &Run, index: usize, attempt: &Attempt, pricing: &Pricing) -> Estimate {
+    let (provider, billing) = stage_estimate_params(run, index);
     estimate_with_billing(
         attempt.usage.as_ref(),
         &attempt.model,
-        routed_provider(run, index),
-        stage_billing(run, index),
+        provider,
+        billing,
         pricing,
     )
 }
@@ -565,9 +641,16 @@ pub fn stage_totals(run: &Run, pricing: &Pricing) -> Vec<CostTotal> {
         .iter()
         .enumerate()
         .map(|(index, state)| {
+            let (provider, billing) = stage_estimate_params(run, index);
             let mut total = CostTotal::default();
             for attempt in &state.attempts {
-                total.add(&attempt_estimate(run, index, attempt, pricing));
+                total.add(&estimate_with_billing(
+                    attempt.usage.as_ref(),
+                    &attempt.model,
+                    provider,
+                    billing,
+                    pricing,
+                ));
             }
             total
         })
@@ -708,23 +791,24 @@ pub fn raise_floor(run: &Run) -> Result<(f64, CostTotal)> {
         "Only a run stopped by its budget can raise it"
     );
     let pricing = Pricing::load(&run.project);
-    let cap = exceeded_usd_cap(run, &pricing).with_context(|| {
+    let stages = stage_totals(run, &pricing);
+    let (cap, total) = exceeded_usd_cap_from(run, &stages).with_context(|| {
         format!(
             "A token cap stopped this run; raise it with: model-router -C {} resume {} --budget-tokens N",
             run.project.display(),
             run.id
         )
     })?;
-    Ok((cap, run_total(run, &pricing)))
+    Ok((cap, total))
 }
 
-/// The USD cap a raise must exceed: the run's cap, or the highest exceeded
-/// stage cap when larger. None unless a USD cap is exceeded.
-fn exceeded_usd_cap(run: &Run, pricing: &Pricing) -> Option<f64> {
-    let stages = stage_totals(run, pricing);
+/// The USD cap a raise must exceed (the run's cap, or the highest exceeded
+/// stage cap when larger) together with the summed spend. None unless a USD
+/// cap is exceeded.
+fn exceeded_usd_cap_from(run: &Run, stages: &[CostTotal]) -> Option<(f64, CostTotal)> {
     let mut total = CostTotal::default();
     let mut exceeded = None::<f64>;
-    for (stage, spent) in run.workflow.stages.iter().zip(&stages) {
+    for (stage, spent) in run.workflow.stages.iter().zip(stages) {
         total.merge(spent);
         if let Some(cap) = stage.budget.max_usd.filter(|&cap| spent.usd > cap) {
             exceeded = Some(exceeded.map_or(cap, |e| e.max(cap)));
@@ -734,7 +818,7 @@ fn exceeded_usd_cap(run: &Run, pricing: &Pricing) -> Option<f64> {
     if let Some(cap) = run_cap.filter(|&cap| total.usd > cap) {
         exceeded = Some(exceeded.map_or(cap, |e| e.max(cap)));
     }
-    exceeded.map(|cap| run_cap.map_or(cap, |run_cap| run_cap.max(cap)))
+    exceeded.map(|cap| (run_cap.map_or(cap, |run_cap| run_cap.max(cap)), total))
 }
 
 /// `resume --budget-usd/--budget-tokens`: sets the run's cap, and any stage
@@ -837,15 +921,92 @@ pub fn routed_providers(run: &Run) -> BTreeMap<String, Provider> {
         .collect()
 }
 
-/// Refreshes the cached `/models` prices of `providers` older than a day
-/// (or whose endpoint changed), one short request each. Failures, e.g.
-/// offline, keep the old cache and are otherwise ignored.
-pub fn refresh_provider_prices(project: &Path, providers: &BTreeMap<String, Provider>) {
-    refresh_with(project, providers, Utc::now(), |provider| {
-        providers::models_within(provider, std::time::Duration::from_secs(5))
-    });
+fn is_fresh(cache: &ProviderCache, name: &str, provider: &Provider, now: DateTime<Utc>) -> bool {
+    cache.providers.get(name).is_some_and(|cached| {
+        cached.base_url == provider.base_url && now - cached.fetched_at < Duration::days(1)
+    })
 }
 
+fn insert_cached(
+    cache: &mut ProviderCache,
+    name: &str,
+    provider: &Provider,
+    models: &[ModelInfo],
+    now: DateTime<Utc>,
+) -> bool {
+    let models = listed_prices(models);
+    if models.is_empty() {
+        return false;
+    }
+    cache.providers.insert(
+        name.to_owned(),
+        CachedPrices {
+            fetched_at: now,
+            base_url: provider.base_url.clone(),
+            models,
+        },
+    );
+    true
+}
+
+fn save_cache(project: &Path, cache: &ProviderCache) {
+    if let Ok(dir) = storage::metadata_dir(project) {
+        let _ = storage::write_json_fast(&dir.join(CACHE_FILE), cache);
+    }
+}
+
+/// Refreshes the cached `/models` prices of `providers` older than a day
+/// (or whose endpoint changed), fetching stale providers in parallel. Failures,
+/// e.g. offline, keep the old cache and are otherwise ignored.
+pub fn refresh_provider_prices(project: &Path, providers: &BTreeMap<String, Provider>) {
+    if providers.is_empty() {
+        return;
+    }
+    let now = Utc::now();
+    let mut cache = read_cache(project);
+    let stale: Vec<(&String, &Provider)> = providers
+        .iter()
+        .filter(|(name, provider)| !is_fresh(&cache, name, provider, now))
+        .collect();
+    if stale.is_empty() {
+        return;
+    }
+    let fetched: Vec<(&String, &Provider, Result<Vec<ModelInfo>>)> = if stale.len() == 1 {
+        let (name, provider) = stale[0];
+        vec![(
+            name,
+            provider,
+            providers::models_within(provider, std::time::Duration::from_secs(5)),
+        )]
+    } else {
+        std::thread::scope(|scope| {
+            let jobs: Vec<_> = stale
+                .into_iter()
+                .map(|(name, provider)| {
+                    scope.spawn(move || {
+                        (
+                            name,
+                            provider,
+                            providers::models_within(provider, std::time::Duration::from_secs(5)),
+                        )
+                    })
+                })
+                .collect();
+            jobs.into_iter().filter_map(|job| job.join().ok()).collect()
+        })
+    };
+    let mut changed = false;
+    for (name, provider, result) in fetched {
+        if let Ok(models) = result {
+            changed |= insert_cached(&mut cache, name, provider, &models, now);
+        }
+    }
+    if changed {
+        save_cache(project, &cache);
+    }
+}
+
+#[cfg(test)]
 fn refresh_with(
     project: &Path,
     providers: &BTreeMap<String, Provider>,
@@ -855,31 +1016,15 @@ fn refresh_with(
     let mut cache = read_cache(project);
     let mut changed = false;
     for (name, provider) in providers {
-        let fresh = cache.providers.get(name).is_some_and(|cached| {
-            cached.base_url == provider.base_url && now - cached.fetched_at < Duration::days(1)
-        });
-        if fresh {
+        if is_fresh(&cache, name, provider, now) {
             continue;
         }
         if let Ok(models) = fetch(provider) {
-            let models = listed_prices(&models);
-            if !models.is_empty() {
-                cache.providers.insert(
-                    name.clone(),
-                    CachedPrices {
-                        fetched_at: now,
-                        base_url: provider.base_url.clone(),
-                        models,
-                    },
-                );
-                changed = true;
-            }
+            changed |= insert_cached(&mut cache, name, provider, &models, now);
         }
     }
     if changed {
-        if let Ok(dir) = storage::metadata_dir(project) {
-            let _ = storage::write_json(&dir.join(CACHE_FILE), &cache);
-        }
+        save_cache(project, &cache);
     }
 }
 
@@ -920,11 +1065,18 @@ pub fn aggregate<'a>(
     };
     for run in runs {
         for (index, (stage, state)) in run.workflow.stages.iter().zip(&run.stages).enumerate() {
+            let (provider, billing) = stage_estimate_params(run, index);
             for attempt in &state.attempts {
                 if since.is_some_and(|since| attempt.started_at < since) {
                     continue;
                 }
-                let estimate = attempt_estimate(run, index, attempt, pricing);
+                let estimate = estimate_with_billing(
+                    attempt.usage.as_ref(),
+                    &attempt.model,
+                    provider,
+                    billing,
+                    pricing,
+                );
                 let model = if attempt.model.is_empty() {
                     "default".to_owned()
                 } else {
@@ -1326,5 +1478,25 @@ mod tests {
         let pricing = Pricing::load(dir.path());
         assert_eq!(pricing.lookup("my-model", None).unwrap().1, Source::Config);
         assert!(pricing.lookup("bad", None).is_none());
+    }
+
+    #[test]
+    fn later_overrides_replace_normalized_keys_and_family_picks_longest_boundary() {
+        let chained = Pricing::default()
+            .with_override("claude-sonnet-5.5", price(1.0, 2.0))
+            .with_override("claude-sonnet-5-5", price(3.0, 4.0));
+        let (p, _) = chained.lookup("claude-sonnet-5.5", None).unwrap();
+        assert_eq!(p.input, 3.0);
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".model-router.toml"),
+            "[pricing]\n\"gpt\" = { input = 1.0, output = 1.0 }\n\"gpt-5-mini\" = { input = 2.0, output = 2.0 }\n",
+        )
+        .unwrap();
+        let pricing = Pricing::load(dir.path());
+        let (family, _) = pricing.lookup("gpt-5-mini-20260101", None).unwrap();
+        assert_eq!(family.input, 2.0);
+        assert_eq!(pricing.lookup("o-missing", None), None);
     }
 }

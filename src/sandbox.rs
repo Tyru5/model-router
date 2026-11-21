@@ -148,13 +148,18 @@ fn probe() -> Detected {
 pub fn doctor_line() -> String {
     match detect() {
         Ok((backend, path)) => {
-            let version = std::process::Command::new(&path)
-                .arg("--version")
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-                .filter(|v| !v.is_empty());
+            let version = (backend != Backend::SandboxExec)
+                .then(|| {
+                    std::process::Command::new(&path)
+                        .arg("--version")
+                        .stdin(std::process::Stdio::null())
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                        .filter(|v| !v.is_empty())
+                })
+                .flatten();
             format!(
                 "Sandbox: {} available at {}{}",
                 backend.label(),
@@ -341,7 +346,12 @@ pub fn plan_with(
 }
 
 fn tidy(paths: &mut Vec<PathBuf>) {
-    paths.sort_by_key(|p| (p.components().count(), p.clone()));
+    paths.sort_by(|a, b| {
+        a.components()
+            .count()
+            .cmp(&b.components().count())
+            .then_with(|| a.cmp(b))
+    });
     paths.dedup();
 }
 
@@ -414,25 +424,129 @@ fn lexical(path: &Path) -> PathBuf {
     out
 }
 
+fn read_regular_file(path: &Path, limit: u64) -> Option<String> {
+    use std::io::Read;
+    if !fs::symlink_metadata(path).ok()?.file_type().is_file() {
+        return None;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > limit || bytes.contains(&0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn config_has_worktree(config: &str, gitdir: &Path, workspace: &Path) -> bool {
+    let mut in_core = false;
+    for raw in config.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            in_core = trimmed.eq_ignore_ascii_case("[core]");
+            continue;
+        }
+        if in_core {
+            if let Some((key, val)) = trimmed.split_once('=') {
+                if key.trim().eq_ignore_ascii_case("worktree") {
+                    let target = val.trim().trim_matches('"');
+                    if !target.is_empty() {
+                        if let Ok(resolved) = fs::canonicalize(gitdir.join(target)) {
+                            if resolved == workspace {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// A linked worktree's Git directory and the repository's common one.
 pub fn git_dirs(workspace: &Path) -> Vec<PathBuf> {
+    git_dirs_inner(workspace).unwrap_or_default()
+}
+
+fn git_dirs_inner(workspace: &Path) -> Option<Vec<PathBuf>> {
     let dot_git = workspace.join(".git");
-    if !dot_git.is_file() {
-        return vec![];
+    let text = read_regular_file(&dot_git, 4096)?;
+    let raw_gitdir = text
+        .lines()
+        .find_map(|l| l.strip_prefix("gitdir:"))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let gitdir = fs::canonicalize(workspace.join(raw_gitdir)).ok()?;
+    if !gitdir.is_dir() {
+        return None;
     }
-    let Some(gitdir) = fs::read_to_string(&dot_git).ok().and_then(|text| {
-        text.lines()
-            .find_map(|l| l.strip_prefix("gitdir:"))
-            .map(|p| workspace.join(p.trim()))
-    }) else {
-        return vec![];
-    };
-    let gitdir = canonical(&gitdir);
-    let mut dirs = vec![gitdir.clone()];
-    if let Ok(common) = fs::read_to_string(gitdir.join("commondir")) {
-        dirs.push(canonical(&gitdir.join(common.trim())));
+    let ws = canonical(workspace);
+    let meta = ws.join(".model-router");
+    // Never grant the workspace root/ancestor (e.g., `/`) or router metadata.
+    if ws.starts_with(&gitdir) || gitdir.starts_with(&meta) {
+        return None;
     }
-    dirs
+    if !fs::symlink_metadata(gitdir.join("HEAD"))
+        .ok()
+        .is_some_and(|m| m.is_file())
+    {
+        return None;
+    }
+    let has_back_pointer = fs::symlink_metadata(gitdir.join("gitdir")).is_ok();
+    let has_commondir = fs::symlink_metadata(gitdir.join("commondir")).is_ok();
+    if has_back_pointer {
+        let back_raw = read_regular_file(&gitdir.join("gitdir"), 4096)?;
+        let back_raw = back_raw.trim();
+        if back_raw.is_empty() {
+            return None;
+        }
+        let back = fs::canonicalize(gitdir.join(back_raw)).ok()?;
+        if back != ws.join(".git") {
+            return None;
+        }
+        if has_commondir {
+            let common_raw = read_regular_file(&gitdir.join("commondir"), 4096)?;
+            let common_raw = common_raw.trim();
+            if common_raw.is_empty() {
+                return None;
+            }
+            let common = fs::canonicalize(gitdir.join(common_raw)).ok()?;
+            if !common.is_dir()
+                || ws.starts_with(&common)
+                || common.starts_with(&meta)
+                || !fs::symlink_metadata(common.join("HEAD"))
+                    .ok()
+                    .is_some_and(|m| m.is_file())
+                || !common.join("objects").is_dir()
+                || !gitdir.starts_with(common.join("worktrees"))
+            {
+                return None;
+            }
+            return Some(vec![gitdir, common]);
+        }
+        return Some(vec![gitdir]);
+    }
+    if !has_commondir && gitdir.join("objects").is_dir() {
+        let config = read_regular_file(&gitdir.join("config"), 64 * 1024)?;
+        if config_has_worktree(&config, &gitdir, &ws) {
+            return Some(vec![gitdir]);
+        }
+    }
+    None
 }
 
 impl Plan {
@@ -528,14 +642,16 @@ impl Plan {
         }
         // `subpath` also matches the directory itself, which could then be
         // removed and replaced with a link.
-        text.push_str("(deny file-write*");
-        for path in &self.pinned {
-            text.push_str(&format!(
-                "\n    (literal {})",
-                sbpl_string(&path.display().to_string())
-            ));
+        if !self.pinned.is_empty() {
+            text.push_str("(deny file-write*");
+            for path in &self.pinned {
+                text.push_str(&format!(
+                    "\n    (literal {})",
+                    sbpl_string(&path.display().to_string())
+                ));
+            }
+            text.push_str(")\n");
         }
-        text.push_str(")\n");
         for path in &self.hidden {
             text.push_str(&format!(
                 "(deny file-write* network-outbound (subpath {}))\n",
@@ -543,14 +659,21 @@ impl Plan {
             ));
             // Seatbelt matches paths, so renaming a writable ancestor (such
             // as $TMPDIR) would give the sockets paths no rule names.
-            text.push_str("(deny file-write*");
-            for ancestor in path.ancestors().skip(1).filter(|a| a.parent().is_some()) {
-                text.push_str(&format!(
-                    "\n    (literal {})",
-                    sbpl_string(&ancestor.display().to_string())
-                ));
+            let ancestors: Vec<&Path> = path
+                .ancestors()
+                .skip(1)
+                .filter(|a| a.parent().is_some())
+                .collect();
+            if !ancestors.is_empty() {
+                text.push_str("(deny file-write*");
+                for ancestor in ancestors {
+                    text.push_str(&format!(
+                        "\n    (literal {})",
+                        sbpl_string(&ancestor.display().to_string())
+                    ));
+                }
+                text.push_str(")\n");
             }
-            text.push_str(")\n");
         }
         if !self.network {
             text.push_str("(deny network*)\n");
@@ -772,6 +895,14 @@ mod tests {
         let common = d.root.join("main repo/.git");
         let gitdir = common.join("worktrees/ws");
         fs::create_dir_all(&gitdir).unwrap();
+        fs::create_dir_all(common.join("objects")).unwrap();
+        fs::write(common.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(gitdir.join("HEAD"), "ref: refs/heads/ws\n").unwrap();
+        fs::write(
+            gitdir.join("gitdir"),
+            format!("{}\n", d.workspace.join(".git").display()),
+        )
+        .unwrap();
         fs::write(gitdir.join("commondir"), "../..\n").unwrap();
         fs::write(
             d.workspace.join(".git"),
@@ -800,6 +931,90 @@ mod tests {
                 .unwrap()
         };
         assert!(at(&d.workspace) < at(&d.attempt));
+    }
+
+    #[test]
+    fn forged_or_symlinked_dot_git_never_expands_writable_paths() {
+        let d = dirs();
+        let outside = d.root.join("outside");
+        fs::create_dir_all(outside.join("objects")).unwrap();
+        fs::write(outside.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let inside_meta = d.workspace.join(".model-router/fake-git");
+        fs::create_dir_all(&inside_meta).unwrap();
+        fs::write(inside_meta.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        // Symlinked .git is ignored.
+        let target_file = d.root.join("gitfile");
+        fs::write(&target_file, format!("gitdir: {}\n", outside.display())).unwrap();
+        std::os::unix::fs::symlink(&target_file, d.workspace.join(".git")).unwrap();
+        assert!(git_dirs(&d.workspace).is_empty());
+        fs::remove_file(d.workspace.join(".git")).unwrap();
+
+        // Root, ancestor, router metadata, or unrelated Git dir are all rejected.
+        for bad in [
+            "/".to_owned(),
+            d.root.display().to_string(),
+            inside_meta.display().to_string(),
+            outside.display().to_string(),
+        ] {
+            fs::write(d.workspace.join(".git"), format!("gitdir: {bad}\n")).unwrap();
+            assert!(git_dirs(&d.workspace).is_empty(), "accepted {bad}");
+        }
+
+        // Forged commondir pointing at root/ancestor is rejected even with a back-pointer.
+        let common = d.root.join("repo/.git");
+        let worktree_git = common.join("worktrees/ws");
+        fs::create_dir_all(&worktree_git).unwrap();
+        fs::write(worktree_git.join("HEAD"), "ref: refs/heads/ws\n").unwrap();
+        fs::write(
+            worktree_git.join("gitdir"),
+            format!("{}\n", d.workspace.join(".git").display()),
+        )
+        .unwrap();
+        fs::write(worktree_git.join("commondir"), "../../..\n").unwrap();
+        fs::write(
+            d.workspace.join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .unwrap();
+        assert!(git_dirs(&d.workspace).is_empty());
+
+        // Valid submodule / separate-git-dir matching core.worktree is accepted.
+        let sub_git = d.root.join("parent/.git/modules/sub");
+        fs::create_dir_all(sub_git.join("objects")).unwrap();
+        fs::write(sub_git.join("HEAD"), "0123456789abcdef\n").unwrap();
+        fs::write(
+            sub_git.join("config"),
+            format!("[core]\n\tworktree = {}\n", d.workspace.display()),
+        )
+        .unwrap();
+        fs::write(
+            d.workspace.join(".git"),
+            format!("gitdir: {}\n", sub_git.display()),
+        )
+        .unwrap();
+        assert_eq!(git_dirs(&d.workspace), vec![sub_git]);
+    }
+
+    #[test]
+    fn seatbelt_profile_with_empty_pinned_emits_no_bare_deny_block() {
+        let plan = Plan {
+            mode: Sandbox::ReadOnly,
+            backend: Some(Backend::SandboxExec),
+            program: Some(PathBuf::from("/usr/bin/sandbox-exec")),
+            writable: vec![PathBuf::from("/tmp/a")],
+            writable_if_present: vec![],
+            private_tmp: false,
+            network: true,
+            warning: None,
+            protected: vec![],
+            readable: vec![],
+            pinned: vec![],
+            hidden: vec![],
+        };
+        let profile = plan.profile();
+        assert!(!profile.contains("(deny file-write*)\n(deny network*)"));
+        assert_eq!(profile.matches("(deny file-write*)").count(), 1);
     }
 
     #[test]

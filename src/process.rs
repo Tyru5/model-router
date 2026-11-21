@@ -7,7 +7,7 @@ mod interactive;
 mod terminal;
 
 use capture::launch;
-pub use capture::{capture, capture_with, capture_with_stall};
+pub use capture::{capture, capture_with, capture_with_stall, capture_with_stall_and_abort};
 pub use group::{Group, Identity, Verdict};
 pub use interactive::{AttachOutcome, InteractiveSession};
 use interactive::{INPUT_LIMIT, OutputDecoder, Parked, PtyChild, SessionState};
@@ -130,21 +130,43 @@ pub(super) fn end_group_if(
     reap();
 }
 
+pub(super) fn group_reused(recorded: &Option<String>, pid: u32) -> bool {
+    let Some(rec) = recorded else {
+        return false;
+    };
+    group::started(pid).is_some_and(|now| now != *rec)
+}
+
 /// A harness leader and its process group. Background children (dev
 /// servers, watchers) must not keep editing the workspace after its lock is
 /// released, so dropping this always ends the whole group, after a normal
 /// exit too: SIGTERM, `GRACE`, then SIGKILL.
 pub(super) struct ProcessGroup {
     child: Child,
+    started: Option<String>,
+    leader_reaped: bool,
+    killed: bool,
 }
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        let child = &mut self.child;
-        end_group(child.id(), GRACE, || {
-            let _ = child.try_wait();
-        });
-        let _ = child.kill();
-        let _ = child.wait();
+        let pid = self.child.id();
+        if self.killed {
+            kill_group(pid);
+        } else {
+            let child = &mut self.child;
+            let started = &self.started;
+            let leader_reaped = self.leader_reaped;
+            end_group_if(
+                pid,
+                GRACE,
+                || {
+                    let _ = child.try_wait();
+                },
+                || !leader_reaped || !group_reused(started, pid),
+            );
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -155,34 +177,72 @@ pub struct Utf8Stream {
     partial: Vec<u8>,
 }
 impl Utf8Stream {
-    pub fn decode(&mut self, bytes: &[u8]) -> String {
-        let mut data = std::mem::take(&mut self.partial);
-        data.extend_from_slice(bytes);
-        let mut text = String::with_capacity(data.len());
-        let mut rest = &data[..];
-        loop {
+    pub fn decode_with(&mut self, mut bytes: &[u8], mut emit: impl FnMut(&str)) {
+        while !self.partial.is_empty() && !bytes.is_empty() {
+            self.partial.push(bytes[0]);
+            bytes = &bytes[1..];
+            match std::str::from_utf8(&self.partial) {
+                Ok(valid) => {
+                    emit(valid);
+                    self.partial.clear();
+                }
+                Err(error) => {
+                    if let Some(error_len) = error.error_len() {
+                        let valid_up_to = error.valid_up_to();
+                        if valid_up_to > 0 {
+                            emit(std::str::from_utf8(&self.partial[..valid_up_to]).unwrap_or(""));
+                        }
+                        emit("\u{fffd}");
+                        let drop_len = valid_up_to + error_len;
+                        let leftover = self.partial[drop_len..].to_vec();
+                        self.partial.clear();
+                        self.decode_slice(&leftover, &mut emit);
+                    } else if self.partial.len() >= 4 {
+                        let pending = std::mem::take(&mut self.partial);
+                        self.decode_slice(&pending, &mut emit);
+                    }
+                }
+            }
+        }
+        if self.partial.is_empty() && !bytes.is_empty() {
+            self.decode_slice(bytes, &mut emit);
+        }
+    }
+
+    fn decode_slice(&mut self, mut rest: &[u8], emit: &mut impl FnMut(&str)) {
+        while !rest.is_empty() {
             match std::str::from_utf8(rest) {
                 Ok(valid) => {
-                    text.push_str(valid);
+                    if !valid.is_empty() {
+                        emit(valid);
+                    }
                     break;
                 }
                 Err(error) => {
-                    let (valid, after) = rest.split_at(error.valid_up_to());
-                    text.push_str(std::str::from_utf8(valid).unwrap_or_default());
+                    let valid_up_to = error.valid_up_to();
+                    if valid_up_to > 0 {
+                        emit(std::str::from_utf8(&rest[..valid_up_to]).unwrap_or_default());
+                    }
+                    let after = &rest[valid_up_to..];
                     match error.error_len() {
                         Some(length) => {
-                            text.push(char::REPLACEMENT_CHARACTER);
+                            emit("\u{fffd}");
                             rest = &after[length..];
                         }
                         // An incomplete character at the end: wait for the rest.
                         None => {
-                            self.partial = after.to_vec();
+                            self.partial.extend_from_slice(after);
                             break;
                         }
                     }
                 }
             }
         }
+    }
+
+    pub fn decode(&mut self, bytes: &[u8]) -> String {
+        let mut text = String::new();
+        self.decode_with(bytes, |part| text.push_str(part));
         text
     }
 
@@ -194,30 +254,39 @@ impl Utf8Stream {
 
 pub(super) fn drain(
     reader: &mut impl Read,
-    log: &mut File,
+    log: &mut impl Write,
     stderr: bool,
     decoder: &mut Utf8Stream,
     on_output: &mut impl FnMut(bool, &str),
+    eof: &mut bool,
+    max_reads: usize,
 ) -> Result<usize> {
     let mut bytes = [0u8; 8192];
     let mut total = 0usize;
+    let mut reads = 0usize;
     // Bound each pass so a noisy process cannot starve cancellation/timeouts.
-    for _ in 0..32 {
+    while reads < max_reads {
         match reader.read(&mut bytes) {
-            Ok(0) => break,
+            Ok(0) => {
+                *eof = true;
+                break;
+            }
             Ok(n) => {
+                reads += 1;
                 total += n;
                 log.write_all(&bytes[..n])?;
-                let text = decoder.decode(&bytes[..n]);
-                if !text.is_empty() {
-                    on_output(stderr, &text);
-                }
+                decoder.decode_with(&bytes[..n], |text| {
+                    if !text.is_empty() {
+                        on_output(stderr, text);
+                    }
+                });
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
         }
     }
+    log.flush()?;
     Ok(total)
 }
 
@@ -256,9 +325,10 @@ pub fn read_tail(path: &Path, max: usize) -> Result<String> {
     let mut file = File::open(path)?;
     let length = file.metadata()?.len();
     file.seek(SeekFrom::Start(length.saturating_sub(max as u64)))?;
-    let mut data = Vec::new();
+    let mut data = Vec::with_capacity(length.min(max as u64) as usize);
     file.take(max as u64).read_to_end(&mut data)?;
-    Ok(String::from_utf8_lossy(&data).into_owned())
+    Ok(String::from_utf8(data)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()))
 }
 
 #[cfg(test)]
@@ -633,10 +703,12 @@ mod tests {
             true,
         );
         let terminal = Terminal::connect(&socket).unwrap();
+        let pgid = terminal.pid();
         let session = InteractiveSession::new(80, 24);
         let cancel = AtomicBool::new(true);
         let outcome = reconnect(terminal, dir.path(), &cancel, &session).unwrap();
         assert!(outcome.cancelled);
+        assert!(!group_alive(pgid), "harness group outlived reconnect()");
         wait_for(|| dir.path().join("saved").exists());
         wait_for(|| !socket.exists());
     }
@@ -773,5 +845,53 @@ mod tests {
         );
         assert!(restored.screen().contents().contains("header"));
         assert!(restored.screen().contents().contains("footer"));
+    }
+
+    #[test]
+    fn kitty_key_release_and_osc_hyperlinks_do_not_misfire() {
+        use interactive::{DrawingModes, enhanced_control, is_terminal_query};
+        assert_eq!(
+            enhanced_control(b"\x1b[98;5u"),
+            Some(AttachOutcome::Detached)
+        );
+        assert_eq!(
+            enhanced_control(b"\x1b[98;5:1u"),
+            Some(AttachOutcome::Detached)
+        );
+        assert_eq!(enhanced_control(b"\x1b[98;5:3u"), None);
+        assert_eq!(enhanced_control(b"\x1b[93;5:3u"), None);
+
+        assert!(!is_terminal_query(
+            b"\x1b]8;;https://example.com/?a=1\x1b\\"
+        ));
+        assert!(!is_terminal_query(b"\x1b]0;Title?\x07"));
+        assert!(is_terminal_query(b"\x1b]10;?\x07"));
+        assert!(is_terminal_query(b"\x1b]4;1;?\x1b\\"));
+
+        // Attached live streaming keeps queries in exact stream order.
+        let session = InteractiveSession::new(20, 6);
+        let mut state = session.state();
+        state.attached = true;
+        state.redraw = false;
+        state.output(b"before");
+        state.output(b"\x1b[6n");
+        state.output(b"after");
+        let mut live = Vec::new();
+        state.take_output(&mut live);
+        assert_eq!(live, b"before\x1b[6nafter");
+
+        // Private CSI ? r must not overwrite scroll region.
+        let mut modes = DrawingModes::default();
+        modes.process(b"2;10r");
+        modes.process(b"?1049r");
+        let mut out = Vec::new();
+        modes.restore(&mut out, state.parser.screen());
+        assert!(out.starts_with(b"\x1b[2;6r"), "{out:?}");
+
+        // Interrupted escape prefix emits cleanly without absorbing the next CSI.
+        let mut decoder = OutputDecoder::default();
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        decoder.process(b"\x1b[1\x1b[31m", |chunk| chunks.push(chunk.to_vec()));
+        assert_eq!(chunks, vec![b"\x1b[1".to_vec(), b"\x1b[31m".to_vec()]);
     }
 }

@@ -265,6 +265,9 @@ pub struct FanOutState {
     pub base: String,
     /// The private commit of `base` their worktrees check out.
     pub base_commit: String,
+    /// Stage attempt number that opened this fan-out round; 0 in legacy records.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub round: usize,
     pub candidates: Vec<CandidateState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<Selection>,
@@ -412,6 +415,10 @@ pub(super) struct Hold {
 }
 
 pub(super) fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+pub(super) fn is_zero_usize(value: &usize) -> bool {
     *value == 0
 }
 

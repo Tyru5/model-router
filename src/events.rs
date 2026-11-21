@@ -36,28 +36,51 @@ impl Formatter {
 
     /// Formatted text for the complete lines in `chunk`, or None when they
     /// carried nothing worth showing. Each chunk is scanned once.
-    pub fn push(&mut self, chunk: &str) -> Option<String> {
+    pub fn push(&mut self, mut chunk: &str) -> Option<String> {
+        let mut out = Vec::new();
+        if self.skipping {
+            let pos = chunk.find(['\n', '\r'])?;
+            self.skipping = false;
+            out.push(format!("… line longer than {PENDING_LIMIT} bytes omitted"));
+            chunk = &chunk[pos + 1..];
+        }
         let Some(end) = chunk.rfind(['\n', '\r']) else {
             self.hold(chunk);
-            return None;
+            return join(out.into_iter());
         };
-        let mut complete = std::mem::take(&mut self.pending);
-        let skipped = std::mem::take(&mut self.skipping);
-        complete.push_str(&chunk[..end]);
-        self.hold(&chunk[end + 1..]);
-        let mut lines = complete.split(['\n', '\r']);
-        // An overlong line's tail ends at the chunk's first line break.
-        let first = lines.next().unwrap_or("");
-        let note = skipped.then(|| format!("… line longer than {PENDING_LIMIT} bytes omitted"));
-        let first = (!skipped).then_some(first);
-        join(
-            note.into_iter().chain(
-                first
-                    .into_iter()
-                    .chain(lines)
-                    .flat_map(|line| describe(line, self.kind)),
-            ),
-        )
+        let tail = &chunk[end + 1..];
+        let complete = &chunk[..end];
+        if self.pending.is_empty() {
+            for line in complete.split(['\n', '\r']) {
+                push_described(&mut out, line, self.kind);
+            }
+        } else {
+            let mut prefix = std::mem::take(&mut self.pending);
+            match complete.find(['\n', '\r']) {
+                Some(first_break) => {
+                    let (head, rest) = (&complete[..first_break], &complete[first_break + 1..]);
+                    if prefix.len() + head.len() > PENDING_LIMIT {
+                        out.push(format!("… line longer than {PENDING_LIMIT} bytes omitted"));
+                    } else {
+                        prefix.push_str(head);
+                        out.extend(describe(&prefix, self.kind));
+                    }
+                    for line in rest.split(['\n', '\r']) {
+                        push_described(&mut out, line, self.kind);
+                    }
+                }
+                None => {
+                    if prefix.len() + complete.len() > PENDING_LIMIT {
+                        out.push(format!("… line longer than {PENDING_LIMIT} bytes omitted"));
+                    } else {
+                        prefix.push_str(complete);
+                        out.extend(describe(&prefix, self.kind));
+                    }
+                }
+            }
+        }
+        self.hold(tail);
+        join(out.into_iter())
     }
 
     fn hold(&mut self, text: &str) {
@@ -77,6 +100,14 @@ impl Formatter {
         let rest = std::mem::take(&mut self.pending);
         self.skipping = false;
         join(rest.lines().flat_map(|line| describe(line, self.kind)))
+    }
+}
+
+fn push_described(out: &mut Vec<String>, line: &str, kind: OutputKind) {
+    if line.len() > PENDING_LIMIT {
+        out.push(format!("… line longer than {PENDING_LIMIT} bytes omitted"));
+    } else {
+        out.extend(describe(line, kind));
     }
 }
 
@@ -123,12 +154,31 @@ fn str_at<'a>(value: &'a Value, pointer: &str) -> &'a str {
 
 /// One-line excerpt: whitespace collapsed, at most `max` characters.
 fn excerpt(text: &str, max: usize) -> String {
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= max {
-        flat
-    } else {
-        format!("{}…", flat.chars().take(max).collect::<String>())
+    let mut out = String::with_capacity(max.min(text.len()) + 4);
+    let mut count = 0usize;
+    let mut words = text.split_whitespace();
+    let Some(first) = words.next() else {
+        return out;
+    };
+    for word in std::iter::once(first).chain(words) {
+        if count > 0 {
+            if count == max {
+                out.push('…');
+                return out;
+            }
+            out.push(' ');
+            count += 1;
+        }
+        for c in word.chars() {
+            if count == max {
+                out.push('…');
+                return out;
+            }
+            out.push(c);
+            count += 1;
+        }
     }
+    out
 }
 
 fn message(prefix: &str, text: &str) -> Vec<String> {
@@ -603,5 +653,13 @@ mod tests {
         assert!(shown.starts_with("… line longer than"), "{shown}");
         assert!(shown.ends_with("next\n") && !shown.contains("tail"));
         assert_eq!(formatter.push("after\n"), Some("after\n".into()));
+        // A single oversized line ending with a newline is also dropped before parse.
+        let oversized = format!("{{\"msg\":\"{}\"}}\nok\n", "a".repeat(PENDING_LIMIT + 1));
+        let dropped = formatter.push(&oversized).unwrap();
+        assert!(dropped.starts_with("… line longer than"), "{dropped}");
+        assert!(dropped.ends_with("ok\n"));
+        assert_eq!(excerpt("  one   two\tthree  ", 7), "one two…");
+        assert_eq!(excerpt("🦀🦀🦀", 3), "🦀🦀🦀");
+        assert_eq!(excerpt("🦀🦀🦀🦀", 3), "🦀🦀🦀…");
     }
 }

@@ -1,24 +1,48 @@
 use super::*;
 
-pub fn prompt(run: &Run, handoff_path: &Path, schema_path: &Path) -> String {
-    prompt_parts(run, handoff_path, schema_path).0
+pub(super) struct PromptTarget<'a> {
+    pub(super) cursor: usize,
+    pub(super) stage: &'a Stage,
+    pub(super) workspace: &'a Path,
+    pub(super) view: Option<usize>,
 }
 
-/// The prompt, and what it carried of each upstream handoff. The handoff
-/// inspector reads the second part, so it reports exactly what `prompt` sends.
-pub(super) fn prompt_parts(
+pub fn prompt(run: &Run, handoff_path: &Path, schema_path: &Path) -> String {
+    let Some(stage) = run.workflow.stages.get(run.cursor) else {
+        return String::new();
+    };
+    prompt_for(
+        run,
+        PromptTarget {
+            cursor: run.cursor,
+            stage,
+            workspace: &run.workspace,
+            view: run.view,
+        },
+        handoff_path,
+        schema_path,
+        false,
+    )
+    .0
+}
+
+/// The prompt, and when `collect_views` is true, what it carried of each
+/// upstream handoff.
+pub(super) fn prompt_for(
     run: &Run,
+    target: PromptTarget<'_>,
     handoff_path: &Path,
     schema_path: &Path,
+    collect_views: bool,
 ) -> (String, Vec<HandoffView>) {
-    let stage = &run.workflow.stages[run.cursor];
+    let stage = target.stage;
     let mut text = format!(
         "You are completing stage {:?} (role: {}) in a multi-stage workflow.\n\nORIGINAL USER TASK\n{}\n\nSTAGE INSTRUCTIONS\n{}\n\nWORKING DIRECTORY\n{}\n\nFollow the project's own instructions. Do not commit, merge, or push unless the original task explicitly requests it. Do not change router configuration, run state, or other stages' artifacts.\n",
         stage.name,
         stage.role.label(),
         run.task,
         stage.instructions,
-        run.workspace.display()
+        target.workspace.display()
     );
     let mut views = vec![];
     let mut remaining = PRIOR_BUDGET;
@@ -29,20 +53,22 @@ pub(super) fn prompt_parts(
         .iter()
         .enumerate()
         .rev()
-        .filter(|(index, _)| order.precedes(*index, run.cursor))
+        .filter(|(index, _)| order.precedes(*index, target.cursor))
     {
         let name = run.workflow.stages[index].name.clone();
         let handoff = match (&state.handoff, state.status) {
             (Some(handoff), Status::Complete) => handoff,
             (_, status) => {
-                views.push(HandoffView::missing(
-                    name,
-                    if status == Status::Complete {
-                        "complete without a handoff".into()
-                    } else {
-                        format!("not complete ({})", status.label())
-                    },
-                ));
+                if collect_views {
+                    views.push(HandoffView::missing(
+                        name,
+                        if status == Status::Complete {
+                            "complete without a handoff".into()
+                        } else {
+                            format!("not complete ({})", status.label())
+                        },
+                    ));
+                }
                 continue;
             }
         };
@@ -52,16 +78,34 @@ pub(super) fn prompt_parts(
             .map(|a| a.directory.clone())
             .or_else(|| state.inherited.clone())
             .unwrap_or_default();
+        let full = directory.join("handoff.json");
         let budget = remaining.min(PRIOR_EACH);
-        let (excerpt, sent) = handoff_excerpt(handoff, budget, &directory.join("handoff.json"));
+        if budget == 0 {
+            if collect_views {
+                views.push(HandoffView::missing(
+                    name.clone(),
+                    "prior handoff budget exhausted".into(),
+                ));
+            }
+            text.push_str(&format!(
+                "\nPRIOR STAGE: {}\n[omitted: prior handoff budget exhausted; full artifact at {}]\nFull artifacts: {}\n",
+                name,
+                full.display(),
+                directory.display()
+            ));
+            continue;
+        }
+        let (excerpt, sent) = handoff_excerpt(handoff, budget, &full);
         remaining = remaining.saturating_sub(excerpt.len());
-        views.push(HandoffView::compare(
-            name.clone(),
-            handoff,
-            &sent,
-            budget,
-            excerpt.len(),
-        ));
+        if collect_views {
+            views.push(HandoffView::compare(
+                name.clone(),
+                handoff,
+                &sent,
+                budget,
+                excerpt.len(),
+            ));
+        }
         text.push_str(&format!(
             "\nPRIOR STAGE: {}\n{}\nFull artifacts: {}\n",
             name,
@@ -72,7 +116,7 @@ pub(super) fn prompt_parts(
     // Only the repaired stages and the review that asked see its request.
     let feedback = run.repair_feedback.as_ref().filter(|_| {
         run.repair_review
-            .is_none_or(|review| run.cursor == review || order.precedes(run.cursor, review))
+            .is_none_or(|review| target.cursor == review || order.precedes(target.cursor, review))
     });
     if let Some(feedback) = feedback {
         text.push_str(&format!(
@@ -94,7 +138,7 @@ pub(super) fn prompt_parts(
             ));
         }
     }
-    text.push_str(&fan_out_context(run));
+    text.push_str(&fan_out_context(run, target.cursor, target.view));
     text.push_str(&handoff::contract(stage.role, handoff_path, schema_path));
     (text, views)
 }
@@ -256,9 +300,6 @@ pub fn inspect_handoffs(run: &Run, stage_id: Option<&str>) -> Result<Inspection>
             run.cursor
         }
     };
-    let mut view = run.clone();
-    view.cursor = index;
-    view.view = None;
     let stage = &run.workflow.stages[index];
     // The paths the next attempt would get; nothing is created.
     let number = run.stages[index].attempts.len() + 1;
@@ -272,7 +313,18 @@ pub fn inspect_handoffs(run: &Run, stage_id: Option<&str>) -> Result<Inspection>
         .join(format!("{:02}-{}", index + 1, stage.id))
         .join(format!("attempt-{number:03}"))
         .join(handoff::SCHEMA_FILE);
-    let (prompt, handoffs) = prompt_parts(&view, &handoff, &schema);
+    let (prompt, handoffs) = prompt_for(
+        run,
+        PromptTarget {
+            cursor: index,
+            stage,
+            workspace: &run.workspace,
+            view: None,
+        },
+        &handoff,
+        &schema,
+        true,
+    );
     Ok(Inspection {
         stage: stage.name.clone(),
         handoffs,
@@ -351,7 +403,7 @@ pub(super) fn handoff_excerpt(
     if json.len() <= max {
         return (json, original);
     }
-    let mut value = original.clone();
+    let mut value = serde_json::Value::Null;
     for (chars, items) in [(1000, 40), (400, 20), (160, 10), (60, 5)] {
         // Each pass starts from the original, so "… N more" counts what the
         // list really lost rather than re-cutting an earlier pass's marker.
@@ -408,9 +460,8 @@ pub(super) fn shorten(value: &mut serde_json::Value, chars: usize, items: usize)
     }
 }
 
-pub(super) fn fan_out_context(run: &Run) -> String {
-    let index = run.cursor;
-    if let Some(c) = run.view {
+pub(super) fn fan_out_context(run: &Run, index: usize, view: Option<usize>) -> String {
+    if let Some(c) = view {
         let Some(state) = run.stages.get(index).and_then(|s| s.fan_out.as_ref()) else {
             return String::new();
         };

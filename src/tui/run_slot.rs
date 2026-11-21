@@ -159,7 +159,7 @@ pub(super) struct RunSlot {
     pub(super) results_limit: Cell<u16>,
     pub(super) changes: Option<completion::Loaded>,
     /// The key of the changes being computed.
-    pub(super) changes_pending: Option<String>,
+    pub(super) changes_pending: Option<completion::CompletionKey>,
     /// The run checkpoint whose waiver the status line last announced.
     pub(super) waiver_shown: String,
     /// Reopen the stage's session interactively once its worker stops.
@@ -171,11 +171,16 @@ pub(super) struct RunSlot {
 }
 /// Width, log version, and theme the output was wrapped for.
 pub(super) type OutputKey = (usize, u64, Theme);
-/// Wrapped output and the results report from the last frame, with what they were built from.
+/// Width, log version, and query the search matches were built for.
+pub(super) type SearchKey = (usize, u64, String);
+pub(super) type SearchMatches = std::rc::Rc<Vec<(usize, std::ops::Range<usize>)>>;
+/// Wrapped output, search matches, and results brief from the last frame, with what they were built from.
 #[derive(Default)]
 pub(super) struct DrawCache {
     pub(super) output: Option<(OutputKey, std::rc::Rc<output_search::Wrapped>)>,
-    pub(super) report: Option<(String, std::rc::Rc<crate::report::RunReport>)>,
+    pub(super) search: Option<(SearchKey, SearchMatches)>,
+    pub(super) report: Option<(completion::ReportKey, std::rc::Rc<crate::report::RunReport>)>,
+    pub(super) brief: Option<(completion::BriefKey, std::rc::Rc<completion::CachedBrief>)>,
 }
 impl RunSlot {
     pub(super) fn new(run: Run) -> Self {
@@ -342,7 +347,9 @@ impl RunSlot {
 }
 impl Drop for RunSlot {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        if !self.terminal().is_some_and(|t| t.released()) {
+            self.cancel.store(true, Ordering::Relaxed);
+        }
         if let Some(mut worker) = self.worker.take() {
             if let Some(thread) = worker.thread.take() {
                 let _ = thread.join();

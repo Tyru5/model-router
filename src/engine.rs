@@ -47,14 +47,15 @@ pub use types::{
 };
 
 use exec::{
-    Exit, INTERRUPTED, Prepared, Resolved, candidate_index, classify_exit, conclude, execute_stage,
-    keep_survivor, read_head, reattach_stage, resolve_handoff, start_stage,
+    Exit, INTERRUPTED, Prepared, Resolved, candidate_index, conclude, evaluate_outcome,
+    execute_stage, keep_survivor, read_head, reattach_stage, resolve_handoff, start_stage,
 };
 #[cfg(test)]
 use exec::{finish, prepare};
 #[cfg(test)]
 use prompt::handoff_excerpt;
-use recovery::{stop_orphans, stop_recorded};
+use prompt::{PromptTarget, prompt_for};
+use recovery::{refuse_own_unproven, stop_orphans, stop_recorded};
 use schedule::{SpawnJournal, auto_pick, drive_graph, execute_fan_out};
 use store::{LOCK_WAIT, lock_run, save_changes, set_aside_handoff};
 use types::{Decision, Hold, legal};
@@ -74,12 +75,16 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
     if run.graph() {
         return drive_graph(run, cancel, &mut emit);
     }
+    let mut checkout_checked = false;
     loop {
         match run.status {
             Status::AwaitingConfirmation => return Ok(Action::Confirm),
+            Status::Interactive => return Ok(Action::Interactive),
             Status::Failed | Status::Blocked | Status::Cancelled => {
                 save_changes(run);
-                run.persist()?;
+                if !run.journal.is_empty() {
+                    run.persist()?;
+                }
                 return Ok(Action::Stopped);
             }
             Status::Running => {
@@ -147,7 +152,12 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
                 continue;
             }
         }
-        refuse_unproven(run)?;
+        if !checkout_checked {
+            refuse_unproven(run)?;
+            checkout_checked = true;
+        } else {
+            refuse_own_unproven(run)?;
+        }
         if run.workflow.stages[run.cursor].role == Role::Ship {
             crate::ship::execute(run, &mut emit)?;
             continue;
@@ -192,7 +202,7 @@ pub fn run_interactive(
         return reattach_stage(run, &socket, cancel, session, &mut emit);
     }
     ensure!(
-        run.status == Status::Interactive,
+        run.status == Status::Interactive && run.cursor < run.stages.len(),
         "No interactive stage is ready"
     );
     let (lock, workspace_lock) = lock_run(run)?;
@@ -977,5 +987,344 @@ mod tests {
         run.confirm().unwrap();
         assert_eq!((run.status, run.cursor), (Status::Blocked, 0));
         assert!(run.error.as_deref().unwrap().contains("(exit 4)"));
+    }
+
+    #[test]
+    fn settle_keeps_sibling_failure_ahead_of_repair_and_clears_running() {
+        let s = |id: &str, role: Role, after: &[&str]| Stage {
+            id: id.into(),
+            name: id.into(),
+            role,
+            harness: "mock".into(),
+            after: after.iter().map(|a| (*a).into()).collect(),
+            ..Stage::default()
+        };
+        let settings = Settings {
+            workflows: vec![Workflow::new(
+                "Graph",
+                vec![
+                    s("impl", Role::Implementation, &[]),
+                    s("rev", Role::Review, &["impl"]),
+                    s("other", Role::Research, &["impl"]),
+                    s("extra", Role::Planning, &["impl"]),
+                ],
+            )],
+            adapters: BTreeMap::from([(
+                "mock".into(),
+                CustomAdapter {
+                    command: "python3".into(),
+                    ..CustomAdapter::default()
+                },
+            )]),
+            ..Settings::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut run = Run::create(
+            dir.path(),
+            &settings,
+            &settings.workflows[0],
+            "Task".into(),
+            false,
+        )
+        .unwrap();
+        run.stages[0].status = Status::Complete;
+        run.stages[1].status = Status::Complete;
+        run.stages[2].status = Status::Failed;
+        run.stages[3].status = Status::Running;
+        run.hold = Some(Hold {
+            repair: Some((1, 0, "feedback".into(), "repair".into())),
+            stops: vec![(2, "sibling failed".into())],
+        });
+        run.settle().unwrap();
+        assert_eq!(run.status, Status::Failed);
+        assert_eq!(run.cursor, 2);
+        assert_eq!(run.repair_passes, 0);
+        assert_eq!(run.stages[2].status, Status::Failed);
+        assert!(run.stages.iter().all(|st| st.status != Status::Running));
+    }
+
+    #[test]
+    fn retry_on_crashed_graph_marks_other_running_stages_failed() {
+        let s = |id: &str, role: Role, after: &[&str]| Stage {
+            id: id.into(),
+            name: id.into(),
+            role,
+            harness: "mock".into(),
+            after: after.iter().map(|a| (*a).into()).collect(),
+            ..Stage::default()
+        };
+        let settings = Settings {
+            workflows: vec![Workflow::new(
+                "Graph",
+                vec![
+                    s("a", Role::Research, &[]),
+                    s("b", Role::Planning, &[]),
+                    s("join", Role::Summary, &["a", "b"]),
+                ],
+            )],
+            adapters: BTreeMap::from([(
+                "mock".into(),
+                CustomAdapter {
+                    command: "python3".into(),
+                    ..CustomAdapter::default()
+                },
+            )]),
+            ..Settings::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut run = Run::create(
+            dir.path(),
+            &settings,
+            &settings.workflows[0],
+            "Task".into(),
+            false,
+        )
+        .unwrap();
+        run.status = Status::Running;
+        run.cursor = 0;
+        run.stages[0].status = Status::Failed;
+        run.stages[1].status = Status::Running;
+        run.stages[1].attempts.push(Attempt {
+            number: 1,
+            started_at: Utc::now(),
+            finished_at: None,
+            model: "m".into(),
+            mode: Mode::Unattended,
+            status: Status::Running,
+            exit_code: None,
+            directory: run.directory.join("02-b/attempt-001"),
+            handoff_file: run.directory.join("02-b/attempt-001/handoff.json"),
+            error: None,
+            checks: vec![],
+            tree_before: None,
+            tree_after: None,
+            checks_tree: None,
+            usage: None,
+            session: None,
+            process_group: None,
+            process_identity: Default::default(),
+            terminal: None,
+            handoff_source: None,
+            worktree: None,
+        });
+        run.retry(false, None).unwrap();
+        assert_eq!(run.status, Status::Pending);
+        assert_eq!(run.stages[0].status, Status::Pending);
+        assert_eq!(run.stages[1].status, Status::Failed);
+        assert_eq!(run.stages[1].attempts[0].status, Status::Failed);
+    }
+
+    #[test]
+    fn load_rejects_out_of_bounds_cursor_for_active_checkpoint() {
+        for status in [Status::AwaitingConfirmation, Status::Interactive] {
+            let dir = tempfile::tempdir().unwrap();
+            let settings = Settings {
+                workflows: vec![Workflow::new(
+                    "W",
+                    vec![Stage {
+                        id: "implement".into(),
+                        harness: "mock".into(),
+                        ..Stage::default()
+                    }],
+                )],
+                adapters: BTreeMap::from([(
+                    "mock".into(),
+                    CustomAdapter {
+                        command: "python3".into(),
+                        ..CustomAdapter::default()
+                    },
+                )]),
+                ..Settings::default()
+            };
+            let mut run = Run::create(
+                dir.path(),
+                &settings,
+                &settings.workflows[0],
+                "Task".into(),
+                false,
+            )
+            .unwrap();
+            run.status = status;
+            run.cursor = run.stages.len();
+            run.persist().unwrap();
+            assert!(load(dir.path(), &run.id).is_err());
+        }
+    }
+
+    #[test]
+    fn persist_and_release_groups_preserve_state_on_write_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            workflows: vec![Workflow::new(
+                "W",
+                vec![Stage {
+                    id: "implement".into(),
+                    harness: "mock".into(),
+                    ..Stage::default()
+                }],
+            )],
+            adapters: BTreeMap::from([(
+                "mock".into(),
+                CustomAdapter {
+                    command: "python3".into(),
+                    ..CustomAdapter::default()
+                },
+            )]),
+            ..Settings::default()
+        };
+        let mut run = Run::create(
+            dir.path(),
+            &settings,
+            &settings.workflows[0],
+            "Task".into(),
+            false,
+        )
+        .unwrap();
+        let group = process::Group {
+            pgid: 999999,
+            identity: process::Identity::default(),
+        };
+        run.retained_groups = vec![group.clone()];
+        run.set(Target::Stage(0), Status::Running, Actor::Engine, "test")
+            .unwrap();
+        let rev_before = run.revision;
+        let journal_len = run.journal.len();
+
+        let summary = run.directory.join("summary.json");
+        fs::remove_file(&summary).unwrap();
+        fs::create_dir(&summary).unwrap();
+        fs::write(summary.join("blocker"), "").unwrap();
+
+        assert!(run.persist().is_err());
+        assert_eq!(run.revision, rev_before);
+        assert_eq!(run.journal.len(), journal_len);
+
+        assert!(release_groups(&mut run).is_err());
+        assert_eq!(run.retained_groups, vec![group]);
+    }
+
+    #[test]
+    fn protected_paths_fail_closed_when_snapshot_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            workflows: vec![Workflow {
+                protected_paths: vec![".github/**".into()],
+                ..Workflow::new(
+                    "W",
+                    vec![Stage {
+                        id: "implement".into(),
+                        harness: "mock".into(),
+                        ..Stage::default()
+                    }],
+                )
+            }],
+            adapters: BTreeMap::from([(
+                "mock".into(),
+                CustomAdapter {
+                    command: "python3".into(),
+                    ..CustomAdapter::default()
+                },
+            )]),
+            ..Settings::default()
+        };
+        let mut run = Run::create(
+            dir.path(),
+            &settings,
+            &settings.workflows[0],
+            "Task".into(),
+            false,
+        )
+        .unwrap();
+        let prepared = prepare(&mut run).unwrap();
+        fs::write(prepared.directory.join("stdout.log"), "ok").unwrap();
+        fs::write(
+            &prepared.handoff_file,
+            r#"{"summary":"Done","verdict":"complete"}"#,
+        )
+        .unwrap();
+        let outcome = process::Outcome {
+            code: Some(0),
+            cancelled: false,
+            timed_out: false,
+            stalled: false,
+            released: false,
+        };
+        finish(
+            &mut run,
+            &prepared,
+            Ok(outcome),
+            &AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(run.status, Status::Blocked);
+        assert!(
+            run.error.as_deref().unwrap().contains("protected_paths"),
+            "{:?}",
+            run.error
+        );
+    }
+
+    #[test]
+    fn prompt_and_inspect_handoffs_emit_identical_exhausted_budget_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let make_stage = |id: &str| Stage {
+            id: id.into(),
+            name: id.into(),
+            role: Role::Research,
+            harness: "mock".into(),
+            ..Stage::default()
+        };
+        let workflow = Workflow::new(
+            "Budget",
+            (1..=7).map(|i| make_stage(&format!("s{i}"))).collect(),
+        );
+        let settings = Settings {
+            workflows: vec![workflow.clone()],
+            adapters: BTreeMap::from([(
+                "mock".into(),
+                CustomAdapter {
+                    command: "python3".into(),
+                    ..CustomAdapter::default()
+                },
+            )]),
+            ..Settings::default()
+        };
+        let mut run = Run::create(dir.path(), &settings, &workflow, "Task".into(), false).unwrap();
+        let long = "word ".repeat(250);
+        let decisions: Vec<String> = (0..32)
+            .map(|j| format!("decision {j:02}: {}", "x".repeat(120)))
+            .collect();
+        for i in 0..6 {
+            run.stages[i].status = Status::Complete;
+            let mut handoff = Handoff::unstructured(long.clone());
+            handoff.decisions = decisions.clone();
+            run.stages[i].handoff = Some(handoff);
+            run.stages[i].inherited = Some(run.directory.join(format!("0{}-s{}", i + 1, i + 1)));
+        }
+        run.cursor = 6;
+        let handoff = run
+            .workspace
+            .join(".model-router/handoffs")
+            .join(&run.id)
+            .join("s7-001.json");
+        let schema = run
+            .directory
+            .join("07-s7/attempt-001")
+            .join(handoff::SCHEMA_FILE);
+        let direct = prompt(&run, &handoff, &schema);
+        let inspection = inspect_handoffs(&run, None).unwrap();
+        assert_eq!(inspection.prompt, direct);
+        assert!(
+            direct.contains("[omitted: prior handoff budget exhausted; full artifact at "),
+            "{direct}"
+        );
+        // Reverse order: s6..s1 -> s1 (last in inspection list) hits budget == 0.
+        assert_eq!(inspection.handoffs.len(), 6);
+        assert!(!inspection.handoffs[5].sent);
+        assert_eq!(
+            inspection.handoffs[5].reason.as_deref(),
+            Some("prior handoff budget exhausted")
+        );
     }
 }

@@ -243,9 +243,14 @@ fn schema() -> &'static Value {
 
 /// The schema without annotations, as one line: Claude Code takes it inline.
 pub fn compact_schema() -> String {
-    let mut value = schema().clone();
-    strip_annotations(&mut value, false);
-    value.to_string()
+    static COMPACT: OnceLock<String> = OnceLock::new();
+    COMPACT
+        .get_or_init(|| {
+            let mut value = schema().clone();
+            strip_annotations(&mut value, false);
+            value.to_string()
+        })
+        .clone()
 }
 
 /// The schema for strict structured output (Codex): every property
@@ -281,12 +286,18 @@ pub fn strict_schema() -> String {
         object.insert("required".into(), Value::Array(names));
         object.insert("additionalProperties".into(), Value::Bool(false));
     }
-    let mut value = schema().clone();
-    strip_annotations(&mut value, true);
-    tighten(&mut value);
-    // Native output is always the current version.
-    value["properties"]["schema_version"] = json!({"type": "integer", "enum": [SCHEMA_VERSION]});
-    value.to_string()
+    static STRICT: OnceLock<String> = OnceLock::new();
+    STRICT
+        .get_or_init(|| {
+            let mut value = schema().clone();
+            strip_annotations(&mut value, true);
+            tighten(&mut value);
+            // Native output is always the current version.
+            value["properties"]["schema_version"] =
+                json!({"type": "integer", "enum": [SCHEMA_VERSION]});
+            value.to_string()
+        })
+        .clone()
 }
 
 fn strip_annotations(value: &mut Value, limits: bool) {
@@ -348,8 +359,9 @@ fn validate(value: &Value, schema: &Value, path: &str, closed: bool, errors: &mu
     if let Some(options) = schema.get("enum").and_then(Value::as_array) {
         if !options.contains(value) {
             let options: Vec<String> = options.iter().map(Value::to_string).collect();
+            let shown = storage::clean_terminal(&storage::truncate(&value.to_string(), 200));
             errors.push(format!(
-                "{at} is {value}; expected one of {}",
+                "{at} is {shown}; expected one of {}",
                 options.join(", ")
             ));
         }
@@ -440,6 +452,47 @@ fn structured(json: &str, role: Role) -> Result<Handoff> {
     Ok(result)
 }
 
+fn extract_marker_json_with_embedded_close(
+    after: &str,
+    before_first_close: usize,
+) -> Option<(&str, usize)> {
+    let inner_start = after[..before_first_close]
+        .rfind(OPEN)
+        .map_or(0, |i| i + OPEN.len());
+    let candidate_region = &after[inner_start..];
+    let trimmed = candidate_region.trim_start();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let mut de = serde_json::Deserializer::from_str(trimmed).into_iter::<Value>();
+    let Some(Ok(_)) = de.next() else {
+        return None;
+    };
+    let json_end = de.byte_offset();
+    let after_json = &trimmed[json_end..];
+    let ws = after_json.len() - after_json.trim_start().len();
+    if after_json[ws..].starts_with(CLOSE) {
+        let trimmed_offset = candidate_region.len() - trimmed.len();
+        let consumed_end = inner_start + trimmed_offset + json_end + ws + CLOSE.len();
+        return Some((&trimmed[..json_end], consumed_end));
+    }
+    None
+}
+
+fn strip_fence_json_prefix(rest: &str) -> Option<&str> {
+    let s = rest.trim_start();
+    let prefix = s.get(..4)?;
+    if !prefix.eq_ignore_ascii_case("json") {
+        return None;
+    }
+    let after = &s[4..];
+    if after.starts_with(char::is_whitespace) {
+        Some(after.trim_start())
+    } else {
+        None
+    }
+}
+
 /// Handoff JSON in response text, most trusted first: `<router-handoff>`
 /// blocks from last to first, then fenced JSON blocks from last to first,
 /// then the whole text.
@@ -450,22 +503,87 @@ fn candidates(text: &str, rejected: &mut Vec<String>) -> Vec<(String, HandoffSou
     while let Some(start) = rest.find(OPEN) {
         let after = &rest[start + OPEN.len()..];
         let Some(end) = after.find(CLOSE) else {
-            rejected.push("marker: the last <router-handoff> block is not closed".into());
+            if rejected.len() < 8 {
+                rejected.push("marker: the last <router-handoff> block is not closed".into());
+            }
             break;
         };
         // An unclosed opening marker before this one is not part of it.
         let block = &after[..end];
         let block = block.rsplit_once(OPEN).map_or(block, |(_, inner)| inner);
-        markers.push((block.trim().to_owned(), HandoffSource::Marker));
-        rest = &after[end + CLOSE.len()..];
+        let trimmed = block.trim();
+        if serde_json::from_str::<Value>(trimmed).is_ok() {
+            markers.push((trimmed.to_owned(), HandoffSource::Marker));
+            rest = &after[end + CLOSE.len()..];
+        } else if let Some((json_slice, consumed_end)) =
+            extract_marker_json_with_embedded_close(after, end)
+        {
+            markers.push((json_slice.to_owned(), HandoffSource::Marker));
+            rest = &after[consumed_end..];
+        } else {
+            markers.push((trimmed.to_owned(), HandoffSource::Marker));
+            rest = &after[end + CLOSE.len()..];
+        }
     }
     let mut fences = vec![];
-    let mut rest = text;
-    while let Some(start) = rest.find("```json") {
-        let after = &rest[start + "```json".len()..];
-        let end = after.find("```").unwrap_or(after.len());
-        fences.push((after[..end].trim().to_owned(), HandoffSource::Fence));
-        rest = &after[(end + 3).min(after.len())..];
+    let mut offset = 0usize;
+    while offset < text.len() {
+        let line_end = text[offset..].find('\n').map_or(text.len(), |i| offset + i);
+        let line = &text[offset..line_end];
+        let next_offset = if line_end < text.len() {
+            line_end + 1
+        } else {
+            text.len()
+        };
+        let trimmed = line.trim();
+        if let Some(rest_after_ticks) = trimmed.strip_prefix("```") {
+            if rest_after_ticks.trim().eq_ignore_ascii_case("json") {
+                let content_start = next_offset;
+                let mut scan = content_start;
+                let mut close_span: Option<(usize, usize)> = None;
+                while scan < text.len() {
+                    let end = text[scan..].find('\n').map_or(text.len(), |i| scan + i);
+                    let candidate_line = text[scan..end].trim();
+                    if candidate_line.starts_with("```")
+                        && candidate_line.bytes().all(|b| b == b'`')
+                    {
+                        close_span = Some((scan, if end < text.len() { end + 1 } else { end }));
+                        break;
+                    }
+                    if end == text.len() {
+                        break;
+                    }
+                    scan = end + 1;
+                }
+                if let Some((close_start, after_close)) = close_span {
+                    fences.push((
+                        text[content_start..close_start].trim().to_owned(),
+                        HandoffSource::Fence,
+                    ));
+                    offset = after_close;
+                    continue;
+                } else if let Some(inline_end) = text[content_start..].find("```") {
+                    fences.push((
+                        text[content_start..content_start + inline_end]
+                            .trim()
+                            .to_owned(),
+                        HandoffSource::Fence,
+                    ));
+                    offset = content_start + inline_end + 3;
+                    continue;
+                } else {
+                    fences.push((
+                        text[content_start..].trim().to_owned(),
+                        HandoffSource::Fence,
+                    ));
+                    break;
+                }
+            } else if let Some(after_lang) = strip_fence_json_prefix(rest_after_ticks) {
+                let body = after_lang.strip_suffix("```").unwrap_or(after_lang);
+                fences.push((body.trim().to_owned(), HandoffSource::Fence));
+            }
+        }
+        offset = next_offset;
     }
     let whole = text
         .starts_with('{')
@@ -517,6 +635,26 @@ pub fn parse(text: &str, role: Role) -> Result<Handoff> {
     .map(|(handoff, _)| handoff)
 }
 
+fn try_handoff_candidate(
+    json: &str,
+    source: HandoffSource,
+    role: Role,
+    rejected: &mut Vec<String>,
+) -> Option<(Handoff, HandoffSource)> {
+    match structured(json, role) {
+        Ok(handoff) => Some((handoff, source)),
+        Err(error) => {
+            if rejected.len() < 8 {
+                let error = format!("{}: {error:#}", source.label());
+                if !rejected.contains(&error) {
+                    rejected.push(error);
+                }
+            }
+            None
+        }
+    }
+}
+
 /// The stage's handoff and where it came from. Tries native structured
 /// output, then the handoff file, then the response's last marker block,
 /// fenced JSON, or whole-JSON text; the first valid one wins. Reviews and
@@ -524,30 +662,29 @@ pub fn parse(text: &str, role: Role) -> Result<Handoff> {
 /// text, marked unstructured.
 pub fn resolve(sources: Sources<'_>, role: Role) -> Result<(Handoff, HandoffSource)> {
     let mut rejected = vec![];
-    let native = sources
-        .native
-        .map(|json| (json.to_owned(), HandoffSource::Native));
-    // A file may hold markers or a fence too; it is still the file.
-    let file: Vec<_> = sources
-        .file
-        .map(|text| candidates(&storage::clean_terminal(text), &mut rejected))
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(json, _)| (json, HandoffSource::File))
-        .collect();
-    let text = sources.text.map(storage::clean_terminal);
-    let text = text.as_deref().map(str::trim);
-    let inline = text
-        .map(|text| candidates(text, &mut rejected))
-        .unwrap_or_default();
-    for (json, source) in native.into_iter().chain(file).chain(inline) {
-        match structured(&json, role) {
-            Ok(handoff) => return Ok((handoff, source)),
-            Err(error) => {
-                let error = format!("{}: {error:#}", source.label());
-                if !rejected.contains(&error) {
-                    rejected.push(error);
-                }
+    if let Some(json) = sources.native {
+        if let Some(found) = try_handoff_candidate(json, HandoffSource::Native, role, &mut rejected)
+        {
+            return Ok(found);
+        }
+    }
+    let cleaned_file = sources.file.map(storage::clean_terminal);
+    if let Some(file_text) = cleaned_file.as_deref() {
+        // A file may hold markers or a fence too; it is still the file.
+        for (json, _) in candidates(file_text, &mut rejected) {
+            if let Some(found) =
+                try_handoff_candidate(&json, HandoffSource::File, role, &mut rejected)
+            {
+                return Ok(found);
+            }
+        }
+    }
+    let cleaned_text = sources.text.map(storage::clean_terminal);
+    let trimmed_text = cleaned_text.as_deref().map(str::trim);
+    if let Some(text) = trimmed_text {
+        for (json, source) in candidates(text, &mut rejected) {
+            if let Some(found) = try_handoff_candidate(&json, source, role, &mut rejected) {
+                return Ok(found);
             }
         }
     }
@@ -566,7 +703,9 @@ pub fn resolve(sources: Sources<'_>, role: Role) -> Result<(Handoff, HandoffSour
             "Test stage did not return a valid structured handoff. Reopen or retry it with test evidence; verification has not passed{tried}"
         );
     }
-    let text = text.or(sources.file.map(str::trim)).unwrap_or("");
+    let text = trimmed_text
+        .or_else(|| cleaned_file.as_deref().map(str::trim))
+        .unwrap_or("");
     ensure!(
         !text.contains(OPEN),
         "The stage returned a malformed structured handoff; inspect it and retry{tried}"
@@ -1088,5 +1227,80 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn normalize_accepts_error_false_and_claude_structured_output_without_result_text() {
+        let out = normalize(
+            r#"{"type":"result","error":false,"is_error":false,"structured_output":{"summary":"ok","verdict":"pass"}}"#,
+            OutputKind::Claude,
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert!(out.structured.is_some());
+
+        let out_empty_err = normalize(
+            r#"{"type":"result","error":"","result":"done"}"#,
+            OutputKind::Claude,
+        );
+        assert!(out_empty_err.error.is_none(), "{:?}", out_empty_err.error);
+        assert_eq!(out_empty_err.text, "done");
+    }
+
+    #[test]
+    fn candidates_handle_embedded_fences_uppercase_json_and_clean_file_fallback() {
+        let fenced = concat!(
+            "```JSON\n",
+            r#"{"summary":"Run ```sh\ncargo test\n``` before shipping","verdict":"complete"}"#,
+            "\n```\n"
+        );
+        let (h, src) = resolve(
+            Sources {
+                text: Some(fenced),
+                ..Sources::default()
+            },
+            Role::Implementation,
+        )
+        .unwrap();
+        assert_eq!(src, HandoffSource::Fence);
+        assert!(h.summary.contains("cargo test"));
+
+        // `jsonp` must not match as a json fence.
+        assert!(
+            resolve(
+                Sources {
+                    text: Some("```jsonp\n{\"summary\":\"x\",\"verdict\":\"pass\"}\n```"),
+                    ..Sources::default()
+                },
+                Role::Review
+            )
+            .is_err()
+        );
+
+        // Marker containing `</router-handoff>` inside JSON string still parses.
+        let marked = r#"<router-handoff>
+{"summary":"Mention </router-handoff> inside JSON","verdict":"pass"}
+</router-handoff>"#;
+        let (h, src) = resolve(
+            Sources {
+                text: Some(marked),
+                ..Sources::default()
+            },
+            Role::Review,
+        )
+        .unwrap();
+        assert_eq!(src, HandoffSource::Marker);
+        assert!(h.summary.contains("</router-handoff>"));
+
+        // Interactive fallback to unstructured `sources.file` strips ANSI escapes.
+        let (plain, src) = resolve(
+            Sources {
+                file: Some("plain \x1b[31mred\x1b[0m output"),
+                ..Sources::default()
+            },
+            Role::Implementation,
+        )
+        .unwrap();
+        assert_eq!(src, HandoffSource::Unstructured);
+        assert_eq!(plain.summary, "plain red output");
     }
 }

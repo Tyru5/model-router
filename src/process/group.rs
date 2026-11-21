@@ -127,10 +127,7 @@ pub fn verify(group: &Group) -> Verdict {
     }
     if let Some(marker) = &identity.marker {
         let needle = format!("{MARKER_ENV}={marker}");
-        if members(group.pgid)
-            .into_iter()
-            .any(|pid| carries(pid, needle.as_bytes()))
-        {
+        if has_marked_member(group.pgid, needle.as_bytes()) {
             return Verdict::Ours;
         }
     }
@@ -167,7 +164,20 @@ pub fn end_recorded(group: &Group, grace: Duration) -> Verdict {
     if verdict != Verdict::Ours {
         return verdict;
     }
-    super::end_group_if(group.pgid, grace, || {}, || verify(group) == Verdict::Ours);
+    let mut first = true;
+    super::end_group_if(
+        group.pgid,
+        grace,
+        || {},
+        || {
+            if first {
+                first = false;
+                true
+            } else {
+                verify(group) == Verdict::Ours
+            }
+        },
+    );
     // Killed members linger until their parent, often init, reaps them.
     let deadline = std::time::Instant::now() + SETTLE;
     while super::group_alive(group.pgid) && std::time::Instant::now() < deadline {
@@ -186,12 +196,18 @@ const SETTLE: Duration = Duration::from_secs(1);
 /// its start time.
 #[cfg(target_os = "linux")]
 pub fn started(pid: u32) -> Option<String> {
+    static BOOT_ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let boot = BOOT_ID
+        .get_or_init(|| {
+            let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+            let boot = boot.trim();
+            (!boot.is_empty()).then(|| boot.to_owned())
+        })
+        .as_deref()?;
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // Field 22; the name in parentheses (field 2) may contain spaces.
     let ticks = stat.rsplit_once(')')?.1.split_whitespace().nth(19)?;
-    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-    let boot = boot.trim();
-    (!boot.is_empty()).then(|| format!("{boot}:{ticks}"))
+    Some(format!("{boot}:{ticks}"))
 }
 
 #[cfg(target_os = "macos")]
@@ -219,15 +235,14 @@ pub fn started(_pid: u32) -> Option<String> {
     None
 }
 
-/// The processes in group `pgid`.
 #[cfg(target_os = "linux")]
-fn members(pgid: u32) -> Vec<u32> {
+fn has_marked_member(pgid: u32, needle: &[u8]) -> bool {
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return vec![];
+        return false;
     };
     entries
         .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|pid| {
+        .filter(|&pid| {
             std::fs::read_to_string(format!("/proc/{pid}/stat"))
                 .ok()
                 .and_then(|stat| {
@@ -237,9 +252,26 @@ fn members(pgid: u32) -> Vec<u32> {
                 })
                 == Some(pgid)
         })
-        .collect()
+        .any(|pid| carries(pid, needle))
 }
 
+#[cfg(target_os = "macos")]
+fn has_marked_member(pgid: u32, needle: &[u8]) -> bool {
+    let Some(max) = kern_argmax() else {
+        return false;
+    };
+    let mut buffer = vec![0u8; max];
+    members(pgid)
+        .into_iter()
+        .any(|pid| carries_with_buffer(pid, needle, &mut buffer))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn has_marked_member(_pgid: u32, _needle: &[u8]) -> bool {
+    false
+}
+
+/// The processes in group `pgid`.
 #[cfg(target_os = "macos")]
 fn members(pgid: u32) -> Vec<u32> {
     let Ok(group) = libc::pid_t::try_from(pgid) else {
@@ -269,11 +301,6 @@ fn members(pgid: u32) -> Vec<u32> {
     vec![]
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn members(_pgid: u32) -> Vec<u32> {
-    vec![]
-}
-
 /// Whether process `pid`'s environment (or, on macOS, its arguments or
 /// environment) contains `needle`. False when it cannot be read, as for a
 /// zombie or another user's process. macOS also hides the environment of
@@ -281,35 +308,40 @@ fn members(_pgid: u32) -> Vec<u32> {
 #[cfg(target_os = "linux")]
 fn carries(pid: u32, needle: &[u8]) -> bool {
     std::fs::read(format!("/proc/{pid}/environ"))
-        .is_ok_and(|environ| environ.windows(needle.len()).any(|w| w == needle))
+        .is_ok_and(|environ| environ.split(|&b| b == 0).any(|entry| entry == needle))
 }
 
 #[cfg(target_os = "macos")]
-fn carries(pid: u32, needle: &[u8]) -> bool {
+fn kern_argmax() -> Option<usize> {
+    static ARGMAX: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *ARGMAX.get_or_init(|| {
+        let mut max: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        // SAFETY: the output is one c_int, and its size is passed.
+        let read = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&raw mut max).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (read == 0)
+            .then(|| usize::try_from(max).ok())
+            .flatten()
+            .filter(|&m| m > 0)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn carries_with_buffer(pid: u32, needle: &[u8], buffer: &mut [u8]) -> bool {
     let Ok(id) = libc::c_int::try_from(pid) else {
         return false;
     };
-    let mut max: libc::c_int = 0;
-    let mut size = std::mem::size_of::<libc::c_int>();
-    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
-    // SAFETY: the output is one c_int, and its size is passed.
-    let read = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            2,
-            (&raw mut max).cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    let Ok(max) = usize::try_from(max) else {
-        return false;
-    };
-    if read != 0 || max == 0 {
-        return false;
-    }
-    let mut buffer = vec![0u8; max];
+    let max = buffer.len();
     let mut size = max;
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, id];
     // SAFETY: the output buffer is `size` bytes long.
@@ -325,8 +357,17 @@ fn carries(pid: u32, needle: &[u8]) -> bool {
     };
     read == 0
         && buffer[..size.min(max)]
-            .windows(needle.len())
-            .any(|w| w == needle)
+            .split(|&b| b == 0)
+            .any(|entry| entry == needle)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn carries(pid: u32, needle: &[u8]) -> bool {
+    let Some(max) = kern_argmax() else {
+        return false;
+    };
+    let mut buffer = vec![0u8; max];
+    carries_with_buffer(pid, needle, &mut buffer)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -545,6 +586,53 @@ wait"#,
             Verdict::Unverified(_)
         ));
         assert!(running(pid), "the group was signalled");
+        // SAFETY: kill takes no pointers; this is the test's own child.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+
+    #[test]
+    fn env_var_with_same_suffix_is_not_mistaken_for_marker() {
+        let marker = new_marker();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("pid");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(r#""$0" --exact process::group::tests::linger --ignored >/dev/null 2>&1 & echo $! > "$1""#)
+            .arg(std::env::current_exe().unwrap())
+            .arg(&file)
+            .env("MODEL_ROUTER_TEST_LINGER", "1")
+            .env(format!("OTHER_{MARKER_ENV}"), &marker)
+            .process_group(0);
+        let mut leader = command.spawn().unwrap();
+        let pgid = leader.id();
+        leader.wait().unwrap();
+        let pid: libc::pid_t = std::fs::read_to_string(&file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let member = u32::try_from(pid).unwrap();
+        while !carries(member, b"MODEL_ROUTER_TEST_LINGER=1") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the member never exec'd"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let group = Group {
+            pgid,
+            identity: Identity {
+                started: Some("the exited leader".into()),
+                marker: Some(marker),
+            },
+        };
+        assert!(matches!(
+            end_recorded(&group, Duration::from_millis(300)),
+            Verdict::Unverified(_)
+        ));
+        assert!(running(pid), "prefixed env var must not match marker");
         // SAFETY: kill takes no pointers; this is the test's own child.
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }

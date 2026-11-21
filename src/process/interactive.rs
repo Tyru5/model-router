@@ -108,7 +108,7 @@ impl SessionState {
         }
     }
 
-    pub(super) fn resize(&mut self, cols: u16, rows: u16) {
+    pub(super) fn resize(&mut self, cols: u16, rows: u16) -> bool {
         let size = bounded_size(cols, rows);
         if self.size != size {
             self.size = size;
@@ -118,6 +118,9 @@ impl SessionState {
             }
             self.redraw = true;
             self.output.clear();
+            true
+        } else {
+            false
         }
     }
 
@@ -144,7 +147,8 @@ impl SessionState {
             .process(bytes, self.parser.screen().alternate_screen());
         // Queries emitted during startup/detachment must reach the real
         // terminal on attach, rather than disappearing into a screen redraw.
-        if is_terminal_query(bytes) {
+        // While already attached and streaming live output, keep them in stream order.
+        if is_terminal_query(bytes) && (!self.attached || self.redraw) {
             if self.queries.len() + bytes.len() <= SEQUENCE_LIMIT {
                 self.queries.extend_from_slice(bytes);
             }
@@ -286,27 +290,41 @@ impl InteractiveSession {
         let mut written = 0;
         let mut input = [0u8; 8192];
         let mut keys = InputDecoder::default();
+        let mut last_size_check = Instant::now();
+        let mut check_size = true;
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 cancel.store(true, Ordering::Relaxed);
             }
+            let new_size = if check_size || last_size_check.elapsed() >= Duration::from_millis(200)
+            {
+                check_size = false;
+                last_size_check = Instant::now();
+                stdout_size()
+            } else {
+                None
+            };
             self.wakes.1.clear();
-            let (finished, capacity, stopping) = {
+            let (finished, capacity, stopping, resized) = {
                 let mut state = self.state();
                 state.cancelled |= cancel.load(Ordering::Relaxed);
-                if let Ok((cols, rows)) = crossterm::terminal::size() {
-                    state.resize(cols, rows);
-                }
+                let resized = new_size.is_some_and(|(cols, rows)| state.resize(cols, rows));
                 if written == output.len() {
                     state.take_output(&mut output);
                     written = 0;
                 }
                 (
                     state.finished,
-                    INPUT_LIMIT - state.input.len() - keys.pending.len(),
+                    INPUT_LIMIT
+                        .saturating_sub(state.input.len())
+                        .saturating_sub(keys.pending.len()),
                     state.cancelled,
+                    resized,
                 )
             };
+            if resized {
+                self.wake_supervisor();
+            }
             if finished && (written == output.len() || stopping) {
                 attachment.clean = true;
                 return Ok(AttachOutcome::Finished);
@@ -336,16 +354,18 @@ impl InteractiveSession {
                     revents: 0,
                 },
             ];
+            let poll_ms = if keys.pending.is_empty() { 100 } else { 40 };
             // SAFETY: the descriptors are borrowed; the array is initialized.
-            let result = unsafe { libc::poll(polls.as_mut_ptr(), 3, 40) };
+            let result = unsafe { libc::poll(polls.as_mut_ptr(), 3, poll_ms) };
             if result < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {
+                    check_size = true;
                     continue;
                 }
                 return Err(error.into());
             }
-            if result == 0 {
+            if result == 0 && !keys.pending.is_empty() {
                 keys.flush(&mut self.state().input);
                 self.wake_supervisor();
             }
@@ -395,6 +415,8 @@ impl InteractiveSession {
                 match keys.forward(&input[..n as usize], &mut state.input) {
                     Some(AttachOutcome::Detached) => {
                         keys.flush(&mut state.input);
+                        drop(state);
+                        self.wake_supervisor();
                         attachment.clean = true;
                         return Ok(AttachOutcome::Detached);
                     }
@@ -408,6 +430,20 @@ impl InteractiveSession {
                 self.wake_supervisor();
             }
         }
+    }
+}
+
+fn stdout_size() -> Option<(u16, u16)> {
+    // SAFETY: winsize holds plain integer fields; zeroed is valid.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: ioctl writes terminal dimensions for STDOUT_FILENO into ws.
+    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0
+        && ws.ws_col > 0
+        && ws.ws_row > 0
+    {
+        Some((ws.ws_col, ws.ws_row))
+    } else {
+        None
     }
 }
 
@@ -425,6 +461,8 @@ impl Drop for AttachmentGuard<'_> {
         if !self.clean {
             state.cancelled = true;
             self.cancel.store(true, Ordering::Relaxed);
+            drop(state);
+            self.session.wake_supervisor();
         }
     }
 }
@@ -440,13 +478,17 @@ impl TerminalGuard {
         // SAFETY: stdout is a borrowed live terminal descriptor.
         let stdout_flags = unsafe { libc::fcntl(1, libc::F_GETFL) };
         ensure!(stdout_flags >= 0, "Cannot inspect terminal output flags");
-        let guard = Self {
+        crossterm::terminal::enable_raw_mode()?;
+        if let Err(error) = nonblocking(1) {
+            if !was_raw {
+                let _ = crossterm::terminal::disable_raw_mode();
+            }
+            return Err(error.into());
+        }
+        Ok(Self {
             was_raw,
             stdout_flags,
-        };
-        crossterm::terminal::enable_raw_mode()?;
-        nonblocking(1)?;
-        Ok(guard)
+        })
     }
 }
 
@@ -473,10 +515,20 @@ impl Drop for TerminalGuard {
                 };
                 if n > 0 {
                     written += n as usize;
+                } else if n < 0
+                    && matches!(
+                        io::Error::last_os_error().kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                    )
+                {
+                    continue;
                 } else {
                     break;
                 }
-            } else if ready != 0 {
+            } else if ready < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
                 break;
             }
         }
@@ -563,7 +615,11 @@ pub(super) fn enhanced_control(bytes: &[u8]) -> Option<AttachOutcome> {
     let (code, modifiers) = if let Some(body) = body.strip_suffix(b"u") {
         let mut params = body.split(|b| *b == b';');
         let code = params.next()?.split(|b| *b == b':').next()?;
-        let modifier = params.next()?.split(|b| *b == b':').next()?;
+        let mut mod_parts = params.next()?.split(|b| *b == b':');
+        let modifier = mod_parts.next()?;
+        if mod_parts.next() == Some(b"3") {
+            return None;
+        }
         (code, modifier)
     } else {
         let body = body.strip_prefix(b"27;")?.strip_suffix(b"~")?;
@@ -587,7 +643,43 @@ pub(super) fn is_terminal_query(bytes: &[u8]) -> bool {
             || csi == b"?u"
             || csi.ends_with(b"$p");
     }
-    (bytes.starts_with(b"\x1b]") && bytes.contains(&b'?')) || bytes.starts_with(b"\x1bP$q")
+    if let Some(osc) = bytes.strip_prefix(b"\x1b]") {
+        let osc = osc
+            .strip_suffix(b"\x07")
+            .or_else(|| osc.strip_suffix(b"\x1b\\"))
+            .unwrap_or(osc);
+        if let Some(sep) = osc.iter().position(|&b| b == b';') {
+            let code = &osc[..sep];
+            let param = &osc[sep + 1..];
+            return matches!(
+                code,
+                b"4" | b"10"
+                    | b"11"
+                    | b"12"
+                    | b"13"
+                    | b"14"
+                    | b"15"
+                    | b"16"
+                    | b"17"
+                    | b"18"
+                    | b"19"
+                    | b"52"
+                    | b"104"
+                    | b"110"
+                    | b"111"
+                    | b"112"
+                    | b"113"
+                    | b"114"
+                    | b"115"
+                    | b"116"
+                    | b"117"
+                    | b"118"
+                    | b"119"
+            ) && (param == b"?" || param.ends_with(b";?"));
+        }
+        return false;
+    }
+    bytes.starts_with(b"\x1bP$q")
 }
 
 // These native modes are not represented by vt100's screen serializer.
@@ -699,9 +791,11 @@ pub(super) struct DrawingModes {
 impl DrawingModes {
     pub(super) fn process(&mut self, csi: &[u8]) {
         if let Some(params) = csi.strip_suffix(b"r") {
-            let mut params = params.split(|b| *b == b';');
-            self.top = number(params.next().unwrap_or_default(), 1).max(1);
-            self.bottom = number(params.next().unwrap_or_default(), 0);
+            if params.iter().all(|b| b.is_ascii_digit() || *b == b';') {
+                let mut params = params.split(|b| *b == b';');
+                self.top = number(params.next().unwrap_or_default(), 1).max(1);
+                self.bottom = number(params.next().unwrap_or_default(), 0);
+            }
         }
         if let Some(params) = csi.strip_prefix(b"?") {
             if matches!(params.last(), Some(b'h' | b'l')) {
@@ -794,6 +888,16 @@ impl OutputDecoder {
             }
             let byte = bytes[0];
             bytes = &bytes[1..];
+            if byte == 0x1b && matches!(self.state, DecodeState::Escape | DecodeState::Csi) {
+                if !self.oversized && !self.pending.is_empty() {
+                    emit(&self.pending);
+                }
+                self.pending.clear();
+                self.oversized = false;
+                self.pending.push(byte);
+                self.state = DecodeState::Escape;
+                continue;
+            }
             if self.pending.len() < SEQUENCE_LIMIT && !self.oversized {
                 self.pending.push(byte);
             } else {
@@ -872,14 +976,28 @@ impl Drop for SessionFinish<'_> {
 pub(super) struct PtyChild {
     pub(super) child: Box<dyn portable_pty::Child + Send + Sync>,
     pub(super) pid: Option<u32>,
+    pub(super) started: Option<String>,
+    pub(super) leader_reaped: bool,
+    pub(super) killed: bool,
 }
 impl Drop for PtyChild {
     fn drop(&mut self) {
         let child = &mut self.child;
         if let Some(pid) = self.pid {
-            end_group(pid, GRACE, || {
-                let _ = child.try_wait();
-            });
+            if self.killed {
+                kill_group(pid);
+            } else {
+                let started = &self.started;
+                let leader_reaped = self.leader_reaped;
+                end_group_if(
+                    pid,
+                    GRACE,
+                    || {
+                        let _ = child.try_wait();
+                    },
+                    || !leader_reaped || !group_reused(started, pid),
+                );
+            }
         }
         if matches!(child.try_wait(), Ok(None)) {
             let _ = child.kill();

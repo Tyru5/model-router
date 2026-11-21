@@ -23,24 +23,32 @@ impl std::ops::Add for Usage {
     type Output = Self;
     /// Sums what either side reported.
     fn add(self, other: Self) -> Self {
-        fn plus<T: std::ops::Add<Output = T>>(a: Option<T>, b: Option<T>) -> Option<T> {
+        fn plus_u64(a: Option<u64>, b: Option<u64>) -> Option<u64> {
             match (a, b) {
-                (Some(a), Some(b)) => Some(a + b),
+                (Some(a), Some(b)) => Some(a.saturating_add(b)),
                 (a, b) => a.or(b),
             }
         }
+        let valid_cost = |c: Option<f64>| c.filter(|v| v.is_finite() && *v >= 0.0);
+        let cost_usd = match (valid_cost(self.cost_usd), valid_cost(other.cost_usd)) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, b) => a.or(b),
+        };
         Self {
-            input_tokens: plus(self.input_tokens, other.input_tokens),
-            output_tokens: plus(self.output_tokens, other.output_tokens),
-            cache_read_tokens: plus(self.cache_read_tokens, other.cache_read_tokens),
-            cache_write_tokens: plus(self.cache_write_tokens, other.cache_write_tokens),
-            cost_usd: plus(self.cost_usd, other.cost_usd),
+            input_tokens: plus_u64(self.input_tokens, other.input_tokens),
+            output_tokens: plus_u64(self.output_tokens, other.output_tokens),
+            cache_read_tokens: plus_u64(self.cache_read_tokens, other.cache_read_tokens),
+            cache_write_tokens: plus_u64(self.cache_write_tokens, other.cache_write_tokens),
+            cost_usd,
         }
     }
 }
 
 /// Usage from unattended harness output; None when it reports none.
 pub fn usage(raw: &str, kind: OutputKind) -> Option<Usage> {
+    if kind == OutputKind::Text {
+        return None;
+    }
     json_values(raw).fold(None, |found, event| add_usage(found, &event, kind))
 }
 
@@ -56,13 +64,99 @@ fn add_usage(found: Option<Usage>, event: &Value, kind: OutputKind) -> Option<Us
 
 /// Largest single JSON document (Gemini's output) read whole for usage.
 const DOCUMENT_LIMIT: u64 = 16 << 20;
+const MAX_LINE_BYTES: usize = 4 << 20;
+
+enum LineRead {
+    Eof,
+    Line,
+    TooLong,
+}
+
+fn read_line_capped(
+    reader: &mut impl std::io::BufRead,
+    buf: &mut Vec<u8>,
+    limit: usize,
+) -> std::io::Result<LineRead> {
+    buf.clear();
+    loop {
+        let chunk = match reader.fill_buf() {
+            Ok(chunk) => chunk,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if chunk.is_empty() {
+            return Ok(if buf.is_empty() {
+                LineRead::Eof
+            } else {
+                LineRead::Line
+            });
+        }
+        if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            let take = pos + 1;
+            if buf.len() + take > limit {
+                reader.consume(take);
+                return Ok(LineRead::TooLong);
+            }
+            buf.extend_from_slice(&chunk[..take]);
+            reader.consume(take);
+            return Ok(LineRead::Line);
+        }
+        let len = chunk.len();
+        if buf.len() + len > limit {
+            reader.consume(len);
+            loop {
+                let rest = match reader.fill_buf() {
+                    Ok(rest) => rest,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                };
+                if rest.is_empty() {
+                    return Ok(LineRead::TooLong);
+                }
+                if let Some(pos) = rest.iter().position(|&b| b == b'\n') {
+                    reader.consume(pos + 1);
+                    return Ok(LineRead::TooLong);
+                }
+                let n = rest.len();
+                reader.consume(n);
+            }
+        }
+        buf.extend_from_slice(chunk);
+        reader.consume(len);
+    }
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn line_may_have_usage(line: &[u8], kind: OutputKind) -> bool {
+    match kind {
+        OutputKind::Claude | OutputKind::Amp => {
+            contains_bytes(line, b"usage") || contains_bytes(line, b"total_cost_usd")
+        }
+        OutputKind::Cursor => contains_bytes(line, b"usage"),
+        OutputKind::Codex => {
+            contains_bytes(line, b"turn.completed") && contains_bytes(line, b"usage")
+        }
+        OutputKind::Pi => contains_bytes(line, b"message_end") && contains_bytes(line, b"usage"),
+        OutputKind::OpenCode => {
+            contains_bytes(line, b"step_finish")
+                && (contains_bytes(line, b"tokens") || contains_bytes(line, b"cost"))
+        }
+        OutputKind::Gemini | OutputKind::Text => true,
+    }
+}
 
 /// Usage from an unattended harness's stdout.log, read one line at a time
 /// so a long log is never held in memory. Gemini prints one JSON document,
 /// read whole up to `DOCUMENT_LIMIT`; a log with no JSON lines is read the
 /// same way, in case it is one pretty-printed document.
 pub fn usage_file(path: &std::path::Path, kind: OutputKind) -> Option<Usage> {
-    use std::io::{BufRead, Read};
+    use std::io::Read;
+    if kind == OutputKind::Text {
+        return None;
+    }
     let document = |path: &std::path::Path| {
         let mut raw = String::new();
         let file = std::fs::File::open(path).ok()?;
@@ -81,10 +175,28 @@ pub fn usage_file(path: &std::path::Path, kind: OutputKind) -> Option<Usage> {
     let mut line = Vec::new();
     let (mut found, mut any) = (None, false);
     loop {
-        line.clear();
-        match reader.read_until(b'\n', &mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
+        match read_line_capped(&mut reader, &mut line, MAX_LINE_BYTES) {
+            Ok(LineRead::Eof) | Err(_) => break,
+            Ok(LineRead::TooLong) => {
+                any = true;
+                continue;
+            }
+            Ok(LineRead::Line) => {}
+        }
+        if !line.contains(&b'{') {
+            continue;
+        }
+        if !line_may_have_usage(&line, kind) {
+            if !any {
+                let trimmed = line.trim_ascii();
+                if trimmed.starts_with(b"{")
+                    && trimmed.ends_with(b"}")
+                    && !line_values(&String::from_utf8_lossy(trimmed)).is_empty()
+                {
+                    any = true;
+                }
+            }
+            continue;
         }
         let text = String::from_utf8_lossy(&line);
         for event in line_values(&text) {
@@ -144,9 +256,14 @@ fn json_values(raw: &str) -> impl Iterator<Item = Value> + '_ {
 
 fn event_usage(event: &Value, kind: OutputKind) -> Option<Usage> {
     let count = |pointer: &str| event.pointer(pointer).and_then(Value::as_u64);
-    let cost = |pointer: &str| event.pointer(pointer).and_then(Value::as_f64);
+    let cost = |pointer: &str| {
+        event
+            .pointer(pointer)
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v >= 0.0)
+    };
     let plus = |a: Option<u64>, b: Option<u64>| match (a, b) {
-        (Some(a), Some(b)) => Some(a + b),
+        (Some(a), Some(b)) => Some(a.saturating_add(b)),
         (a, b) => a.or(b),
     };
     let kind_name = event.get("type").and_then(Value::as_str).unwrap_or("");
@@ -295,15 +412,34 @@ pub fn session_usage_in(
     }
 }
 
-/// Parsed JSON lines of a log file, skipping lines that do not parse.
-fn log_lines(path: &std::path::Path) -> impl Iterator<Item = Value> {
-    use std::io::BufRead;
-    std::fs::File::open(path)
-        .ok()
-        .map(std::io::BufReader::new)
-        .into_iter()
-        .flat_map(|reader| reader.lines().map_while(Result::ok))
-        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+/// Streams parsed JSON lines matching `keep`, skipping invalid UTF-8 and
+/// oversized lines without aborting the file scan.
+fn for_each_log_line(
+    path: &std::path::Path,
+    mut keep: impl FnMut(&[u8]) -> bool,
+    mut on_event: impl FnMut(Value) -> std::ops::ControlFlow<()>,
+) {
+    let Ok(file) = std::fs::File::open(path) else {
+        return;
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        match read_line_capped(&mut reader, &mut line, MAX_LINE_BYTES) {
+            Ok(LineRead::Eof) | Err(_) => break,
+            Ok(LineRead::TooLong) => continue,
+            Ok(LineRead::Line) => {}
+        }
+        if !keep(&line) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&line);
+        if let Ok(event) = serde_json::from_str::<Value>(text.trim()) {
+            if on_event(event).is_break() {
+                break;
+            }
+        }
+    }
 }
 
 fn timestamp(event: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -342,29 +478,39 @@ fn claude_session_usage(
     }
     // Streamed messages repeat their usage; the last copy of an ID counts.
     let mut messages: std::collections::BTreeMap<String, Usage> = Default::default();
-    for (index, event) in files.iter().flat_map(|f| log_lines(f)).enumerate() {
-        if event.get("type").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        if !timestamp(&event).is_some_and(|t| t >= since && t <= until) {
-            continue;
-        }
-        let Some(usage) = event.pointer("/message/usage") else {
-            continue;
-        };
-        let count = |key: &str| usage.get(key).and_then(Value::as_u64);
-        let id = event
-            .pointer("/message/id")
-            .and_then(Value::as_str)
-            .map_or_else(|| format!("line-{index}"), str::to_owned);
-        messages.insert(
-            id,
-            Usage {
-                input_tokens: count("input_tokens"),
-                output_tokens: count("output_tokens"),
-                cache_read_tokens: count("cache_read_input_tokens"),
-                cache_write_tokens: count("cache_creation_input_tokens"),
-                cost_usd: None,
+    let mut index = 0usize;
+    for file in &files {
+        for_each_log_line(
+            file,
+            |raw| contains_bytes(raw, b"assistant") && contains_bytes(raw, b"usage"),
+            |event| {
+                let current = index;
+                index += 1;
+                if event.get("type").and_then(Value::as_str) != Some("assistant") {
+                    return std::ops::ControlFlow::Continue(());
+                }
+                if !timestamp(&event).is_some_and(|t| t >= since && t <= until) {
+                    return std::ops::ControlFlow::Continue(());
+                }
+                let Some(usage) = event.pointer("/message/usage") else {
+                    return std::ops::ControlFlow::Continue(());
+                };
+                let count = |key: &str| usage.get(key).and_then(Value::as_u64);
+                let id = event
+                    .pointer("/message/id")
+                    .and_then(Value::as_str)
+                    .map_or_else(|| format!("line-{current}"), str::to_owned);
+                messages.insert(
+                    id,
+                    Usage {
+                        input_tokens: count("input_tokens"),
+                        output_tokens: count("output_tokens"),
+                        cache_read_tokens: count("cache_read_input_tokens"),
+                        cache_write_tokens: count("cache_creation_input_tokens"),
+                        cost_usd: None,
+                    },
+                );
+                std::ops::ControlFlow::Continue(())
             },
         );
     }
@@ -403,52 +549,76 @@ fn codex_session_usage(
             }
         }
     }
+    if let Some(id) = session {
+        // Check rollout files whose filename carries the session ID first.
+        files.sort_by_key(|p| {
+            !p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains(id))
+        });
+    }
     let mut found: Option<Usage> = None;
     for path in files {
-        let mut events = log_lines(&path);
-        let Some(meta) = events
-            .by_ref()
-            .find(|e| e.get("type").and_then(Value::as_str) == Some("session_meta"))
-        else {
-            continue;
-        };
-        let matches = match session {
-            Some(id) => meta.pointer("/payload/id").and_then(Value::as_str) == Some(id),
-            None => meta
-                .pointer("/payload/cwd")
-                .and_then(Value::as_str)
-                .is_some_and(|cwd| canonical(std::path::Path::new(cwd)) == workspace),
-        };
-        if !matches {
-            continue;
-        }
+        let mut matched_session = false;
+        let mut checked_meta = false;
         // Totals are cumulative over the session: the attempt spent the
         // last total in its window minus the last one before it.
         let (mut before, mut end) = (None, None);
-        for event in events {
-            if event.pointer("/payload/type").and_then(Value::as_str) != Some("token_count") {
-                continue;
-            }
-            let (Some(at), Some(total)) = (
-                timestamp(&event),
-                event.pointer("/payload/info/total_token_usage"),
-            ) else {
-                continue;
-            };
-            let count = |key: &str| total.get(key).and_then(Value::as_u64).unwrap_or(0);
-            let cached = count("cached_input_tokens");
-            let totals = [
-                count("input_tokens").saturating_sub(cached),
-                count("output_tokens"),
-                cached,
-            ];
-            if at < since {
-                before = Some(totals);
-            } else if at <= until {
-                end = Some(totals);
-            }
+        for_each_log_line(
+            &path,
+            |raw| contains_bytes(raw, b"session_meta") || contains_bytes(raw, b"token_count"),
+            |event| {
+                if !checked_meta {
+                    if event.get("type").and_then(Value::as_str) != Some("session_meta") {
+                        return std::ops::ControlFlow::Continue(());
+                    }
+                    checked_meta = true;
+                    matched_session = match session {
+                        Some(id) => meta_matches_id(&event, id),
+                        None => event
+                            .pointer("/payload/cwd")
+                            .and_then(Value::as_str)
+                            .is_some_and(|cwd| canonical(std::path::Path::new(cwd)) == workspace),
+                    };
+                    return if matched_session {
+                        std::ops::ControlFlow::Continue(())
+                    } else {
+                        std::ops::ControlFlow::Break(())
+                    };
+                }
+                if event.pointer("/payload/type").and_then(Value::as_str) != Some("token_count") {
+                    return std::ops::ControlFlow::Continue(());
+                }
+                let (Some(at), Some(total)) = (
+                    timestamp(&event),
+                    event.pointer("/payload/info/total_token_usage"),
+                ) else {
+                    return std::ops::ControlFlow::Continue(());
+                };
+                let count = |key: &str| total.get(key).and_then(Value::as_u64).unwrap_or(0);
+                let cached = count("cached_input_tokens");
+                let totals = [
+                    count("input_tokens").saturating_sub(cached),
+                    count("output_tokens"),
+                    cached,
+                ];
+                if at < since {
+                    before = Some(totals);
+                } else if at <= until {
+                    end = Some(totals);
+                }
+                std::ops::ControlFlow::Continue(())
+            },
+        );
+        if !matched_session {
+            continue;
         }
-        let Some(end) = end else { continue };
+        let Some(end) = end else {
+            if session.is_some() {
+                break;
+            }
+            continue;
+        };
         let before = before.unwrap_or_default();
         let spent = |i: usize| Some(end[i].saturating_sub(before[i]));
         let part = Usage {
@@ -462,8 +632,15 @@ fn codex_session_usage(
             Some(sum) => sum + part,
             None => part,
         });
+        if session.is_some() {
+            break;
+        }
     }
     found
+}
+
+fn meta_matches_id(event: &Value, id: &str) -> bool {
+    event.pointer("/payload/id").and_then(Value::as_str) == Some(id)
 }
 
 #[cfg(test)]
@@ -727,5 +904,74 @@ mod usage_tests {
         assert_eq!(usage("plain text", OutputKind::Text), None);
         assert_eq!(usage("", OutputKind::Codex), None);
         assert_eq!(usage(r#"{"response":"ok"}"#, OutputKind::Gemini), None);
+    }
+
+    #[test]
+    fn usage_saturates_ignores_bad_costs_and_survives_invalid_utf8_and_long_lines() {
+        // Negative/non-finite cost_usd is ignored and u64 addition saturates.
+        let huge = Usage {
+            input_tokens: Some(u64::MAX - 5),
+            cost_usd: Some(0.25),
+            ..Usage::default()
+        } + Usage {
+            input_tokens: Some(100),
+            cost_usd: Some(-5.0),
+            ..Usage::default()
+        };
+        assert_eq!(huge.input_tokens, Some(u64::MAX));
+        assert_eq!(huge.cost_usd, Some(0.25));
+
+        let raw_bad_cost = r#"{"type":"result","usage":{"input_tokens":1,"output_tokens":2},"total_cost_usd":-1.0}"#;
+        assert_eq!(
+            usage(raw_bad_cost, OutputKind::Claude).unwrap().cost_usd,
+            None
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let text_log = dir.path().join("text.log");
+        std::fs::write(&text_log, r#"{"type":"result","usage":{"input_tokens":5}}"#).unwrap();
+        assert_eq!(usage_file(&text_log, OutputKind::Text), None);
+
+        // Oversized line (> 4 MiB) is skipped without aborting subsequent lines.
+        let long_log = dir.path().join("long.jsonl");
+        let mut bytes = vec![b'x'; MAX_LINE_BYTES + 128];
+        bytes.push(b'\n');
+        bytes.extend_from_slice(
+            br#"{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":3}}"#,
+        );
+        bytes.push(b'\n');
+        std::fs::write(&long_log, bytes).unwrap();
+        assert_eq!(
+            usage_file(&long_log, OutputKind::Codex),
+            Some(tokens(12, 3, None, None))
+        );
+
+        // Claude session log with an invalid UTF-8 byte still counts later messages.
+        let claude_root = dir.path().join("claude");
+        let proj = claude_root.join("projects/p");
+        std::fs::create_dir_all(&proj).unwrap();
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let mut session_bytes = Vec::new();
+        session_bytes.extend_from_slice(b"{\"raw\": \"\xff\xfe\"}\n");
+        session_bytes.extend_from_slice(
+            br#"{"type":"assistant","timestamp":"2026-11-05T10:15:00Z","message":{"id":"m1","usage":{"input_tokens":7,"output_tokens":9}}}"#,
+        );
+        session_bytes.push(b'\n');
+        std::fs::write(proj.join(format!("{sid}.jsonl")), session_bytes).unwrap();
+        let roots = SessionRoots {
+            claude: Some(claude_root),
+            codex: None,
+        };
+        assert_eq!(
+            session_usage_in(
+                &roots,
+                "claude",
+                Some(sid),
+                dir.path(),
+                at("10:00:00"),
+                at("10:30:00"),
+            ),
+            Some(tokens(7, 9, None, None))
+        );
     }
 }

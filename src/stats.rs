@@ -70,6 +70,12 @@ pub struct Sample {
 /// The samples of a run. Stages still running, and stages that never ran,
 /// give none.
 pub fn samples(run: &Run) -> Vec<Sample> {
+    let pricing = crate::cost::Pricing::load(&run.project);
+    samples_with(run, &pricing)
+}
+
+/// Like `samples`, reusing an already-loaded `Pricing` table.
+pub fn samples_with(run: &Run, pricing: &crate::cost::Pricing) -> Vec<Sample> {
     let stages = &run.workflow.stages;
     // Every attempt in start order: a completed review followed by an
     // earlier stage's attempt sent work back for repair.
@@ -124,7 +130,6 @@ pub fn samples(run: &Run) -> Vec<Sample> {
                 && (requested[i] > 0 || run.stages[i].status == Status::Complete)
         })
     };
-    let pricing = crate::cost::Pricing::load(&run.project);
     let mut out = vec![];
     for (index, (stage, state)) in stages.iter().zip(&run.stages).enumerate() {
         let Some(last) = state.attempts.last() else {
@@ -180,10 +185,20 @@ pub fn samples(run: &Run) -> Vec<Sample> {
                 && required.len() == configured
                 && required.iter().all(|c| c.status == TestStatus::Passed)
         });
+        let (provider, billing) = crate::cost::stage_estimate_params(run, index);
         let cost_usd = state
             .attempts
             .iter()
-            .map(|a| crate::cost::attempt_estimate(run, index, a, &pricing).usd)
+            .map(|a| {
+                crate::cost::estimate_with_billing(
+                    a.usage.as_ref(),
+                    &a.model,
+                    provider,
+                    billing,
+                    pricing,
+                )
+                .usd
+            })
             .sum::<Option<f64>>();
         let first_pass = match stage.role {
             Role::Review => state.attempts.first().map(|first| {
@@ -262,6 +277,7 @@ pub fn collect(project: &Path) -> Collected {
         .filter(|c| c.version == CACHE_VERSION)
         .unwrap_or_default();
     let mut fresh = BTreeMap::new();
+    let mut pricing: Option<crate::cost::Pricing> = None;
     for entry in &entries {
         let summary = match entry {
             Entry::Summary(summary) => summary,
@@ -279,9 +295,11 @@ pub fn collect(project: &Path) -> Collected {
             None => match engine::load(project, &summary.id) {
                 Ok(run) => {
                     found.loaded += 1;
+                    let pricing =
+                        pricing.get_or_insert_with(|| crate::cost::Pricing::load(project));
                     CachedRun {
                         revision: run.revision,
-                        samples: samples(&run),
+                        samples: samples_with(&run, pricing),
                     }
                 }
                 Err(_) => {
@@ -296,7 +314,7 @@ pub fn collect(project: &Path) -> Collected {
     }
     let changed = found.loaded > 0 || !cache.runs.is_empty();
     if changed && project.join(".model-router/runs").is_dir() {
-        let _ = storage::write_json(
+        let _ = storage::write_json_fast(
             &path,
             &Cache {
                 version: CACHE_VERSION,
@@ -564,7 +582,10 @@ pub fn median(sorted: &[i64]) -> Option<i64> {
     match sorted.len() {
         0 => None,
         n if n % 2 == 1 => Some(sorted[n / 2]),
-        n => Some((sorted[n / 2 - 1] + sorted[n / 2]) / 2),
+        n => {
+            let (a, b) = (sorted[n / 2 - 1], sorted[n / 2]);
+            Some(a + (b - a) / 2)
+        }
     }
 }
 
@@ -827,11 +848,19 @@ impl Shortlist {
 pub fn projects(project: &Path, all: bool) -> Vec<PathBuf> {
     let mut list = vec![project.to_path_buf()];
     if all {
+        let mut seen = std::collections::HashSet::new();
+        if let Ok(canon) = std::fs::canonicalize(project) {
+            seen.insert(canon);
+        }
         for other in storage::recent_projects() {
-            let same = std::fs::canonicalize(&other).ok() == std::fs::canonicalize(project).ok();
-            if !same && !list.contains(&other) {
-                list.push(other);
+            if let Ok(canon) = std::fs::canonicalize(&other) {
+                if !seen.insert(canon) {
+                    continue;
+                }
+            } else if list.contains(&other) {
+                continue;
             }
+            list.push(other);
         }
     }
     list

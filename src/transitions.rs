@@ -103,11 +103,12 @@ pub fn append(dir: &Path, records: &[Record]) -> Result<()> {
         .with_context(|| format!("Open {}", path.display()))?;
     let length = file.metadata()?.len();
     if length > 0 {
-        let mut text = Vec::new();
-        file.read_to_end(&mut text)?;
-        if text.last() != Some(&b'\n') {
-            let keep = text.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-            file.set_len(keep as u64)?;
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0u8; 1];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            let keep = last_newline_end(&mut file, length)?;
+            file.set_len(keep)?;
         }
     }
     file.seek(SeekFrom::End(0))?;
@@ -119,6 +120,24 @@ pub fn append(dir: &Path, records: &[Record]) -> Result<()> {
     file.write_all(&lines)?;
     file.sync_data()
         .with_context(|| format!("Save {}", path.display()))
+}
+
+fn last_newline_end(file: &mut fs::File, length: u64) -> Result<u64> {
+    const CHUNK: u64 = 4096;
+    let mut end = length;
+    let mut buf = Vec::new();
+    while end > 0 {
+        let start = end.saturating_sub(CHUNK);
+        let len = (end - start) as usize;
+        buf.resize(len, 0);
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buf)?;
+        if let Some(pos) = buf.iter().rposition(|&b| b == b'\n') {
+            return Ok(start + pos as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
 }
 
 /// Every saved record, oldest first; none for runs saved before transitions

@@ -80,15 +80,22 @@ impl Screen {
     fn new() -> Result<Self> {
         terminal::enable_raw_mode()?;
         if let Err(e) = execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste) {
-            let _ = terminal::disable_raw_mode();
+            restore_terminal();
             return Err(e.into());
         }
         let output_closed = Arc::new(AtomicBool::new(false));
+        let terminal = match Terminal::new(CrosstermBackend::new(ScreenOutput {
+            stdout: io::stdout(),
+            closed: output_closed.clone(),
+        })) {
+            Ok(terminal) => terminal,
+            Err(e) => {
+                restore_terminal();
+                return Err(e.into());
+            }
+        };
         let mut screen = Self {
-            terminal: Terminal::new(CrosstermBackend::new(ScreenOutput {
-                stdout: io::stdout(),
-                closed: output_closed.clone(),
-            }))?,
+            terminal,
             output_closed,
             active: true,
         };
@@ -97,22 +104,14 @@ impl Screen {
     }
     fn resume(&mut self) -> Result<()> {
         terminal::enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
         self.active = true;
+        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
         self.terminal.clear()?;
         Ok(())
     }
     fn restore(&mut self) {
         if self.active {
-            let _ = terminal::disable_raw_mode();
-            let _ = execute!(
-                io::stdout(),
-                DisableBracketedPaste,
-                event::DisableMouseCapture,
-                LeaveAlternateScreen,
-                crossterm::style::ResetColor,
-                crossterm::cursor::Show
-            );
+            restore_terminal();
             self.active = false;
         }
     }
@@ -125,6 +124,20 @@ impl Drop for Screen {
         // terminal (including stderr) cannot turn normal shutdown into a panic.
         self.output_closed.store(true, Ordering::Relaxed);
     }
+}
+
+/// Best-effort terminal cleanup shared between normal teardown, error paths,
+/// and the TUI-thread panic hook.
+fn restore_terminal() {
+    let _ = terminal::disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        event::DisableMouseCapture,
+        LeaveAlternateScreen,
+        crossterm::style::ResetColor,
+        crossterm::cursor::Show
+    );
 }
 
 /// Restores the terminal when the TUI thread panics, and puts the previous
@@ -141,10 +154,7 @@ impl PanicHook {
         let chained = previous.clone();
         let tui = std::thread::current().id();
         std::panic::set_hook(Box::new(move |info| {
-            on_panic(tui, &|| {
-                let _ = terminal::disable_raw_mode();
-                let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
-            });
+            on_panic(tui, &restore_terminal);
             chained(info);
         }));
         Self { previous }
@@ -159,6 +169,30 @@ impl Drop for PanicHook {
         }
     }
 }
+/// Checks with `timeout = 0` whether any descriptor has hung up or errored.
+#[cfg(unix)]
+fn any_disconnected<const N: usize>(fds: [std::os::unix::io::RawFd; N]) -> bool {
+    const LOST: libc::c_short = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+    let mut pollfds = fds.map(|fd| libc::pollfd {
+        fd,
+        events: 0,
+        revents: 0,
+    });
+    // SAFETY: `pollfds` points to `N` initialized `libc::pollfd` structs.
+    let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), N as libc::nfds_t, 0) };
+    ready > 0 && pollfds.iter().any(|p| p.revents & LOST != 0)
+}
+
+#[cfg(unix)]
+fn terminal_disconnected() -> bool {
+    any_disconnected([libc::STDIN_FILENO, libc::STDOUT_FILENO])
+}
+
+#[cfg(not(unix))]
+fn terminal_disconnected() -> bool {
+    false
+}
+
 /// Runs `restore` only on the TUI thread.
 fn on_panic(tui: std::thread::ThreadId, restore: &dyn Fn()) {
     if std::thread::current().id() == tui {
@@ -212,12 +246,19 @@ pub fn run(
     app.adopt_detached();
     let mut drawn = Instant::now();
     'run: loop {
-        if app.signal.load(Ordering::Relaxed) {
+        let disconnected = terminal_disconnected();
+        if disconnected || app.signal.load(Ordering::Relaxed) {
             app.session.cancel_all();
             app.session.quit_after_stop = true;
         }
         if app.poll()? {
             break;
+        }
+        if disconnected {
+            // Terminal is gone: avoid drawing (EIO) and avoid spinning inside
+            // crossterm's POLLHUP loop while waiting for active runs to cancel.
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
         }
         if app.take_launch() {
             let result = match app.interactive_terminal() {
@@ -258,14 +299,16 @@ pub fn run(
             app.finish_external(result);
             continue;
         }
-        // Frames are drawn when something changed, and once a second for
-        // elapsed times; spinners animate faster.
+        // Frames are drawn when something changed, when an active elapsed timer
+        // is on screen (1 Hz), or when a loading spinner animates (~12.5 Hz).
         let tick = if app.animating() {
-            Duration::from_millis(80)
+            Some(Duration::from_millis(80))
+        } else if app.ticking() {
+            Some(Duration::from_secs(1))
         } else {
-            Duration::from_secs(1)
+            None
         };
-        if app.ui.redraw || drawn.elapsed() >= tick {
+        if app.ui.redraw || tick.is_some_and(|interval| drawn.elapsed() >= interval) {
             // Notifications from worker threads wait for the frame.
             let _terminal = crate::notify::terminal_lock();
             screen.terminal.draw(|frame| draw(frame, &mut app))?;
@@ -273,7 +316,7 @@ pub fn run(
             app.ui.redraw = false;
             drawn = Instant::now();
         }
-        if event::poll(Duration::from_millis(70))? {
+        if event::poll(app.poll_timeout())? {
             app.ui.redraw = true;
             // Handle all queued input before drawing again, so slow frames do
             // not make typing lag one event per frame.
@@ -289,7 +332,10 @@ pub fn run(
                     Event::Paste(text) => app.paste(&text),
                     _ => {}
                 }
-                if !event::poll(Duration::ZERO)? {
+                if app.session.launch_interactive
+                    || app.ui.external.is_some()
+                    || !event::poll(Duration::ZERO)?
+                {
                     break;
                 }
             }

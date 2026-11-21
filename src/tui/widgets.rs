@@ -13,6 +13,15 @@ use tui_textarea::CursorMove;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+pub(super) fn spinner() -> &'static str {
+    const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let tick = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() / 80)
+        .unwrap_or(0) as usize;
+    SPIN[tick % SPIN.len()]
+}
+
 pub(super) fn textarea(value: &str) -> InputField<'static> {
     let mut field = InputField::from(value.split('\n').map(str::to_owned).collect::<Vec<_>>());
     focus_textarea(&mut field);
@@ -46,10 +55,20 @@ pub(super) fn wrapped_textarea(
     let cursor = field.cursor();
     let selection = field.selection_range();
     let selection_style = field.selection_style();
-    let mut lines = Vec::new();
+    let cursor_style = field.cursor_style();
+    let tab = usize::from(field.tab_length()).max(1);
+    let mut lines = Vec::with_capacity(field.lines().len());
     let mut cursor_row = 0;
+    let flush = |line: &mut Line<'static>, run_text: &mut String, run_style: Style| {
+        if !run_text.is_empty() {
+            line.spans
+                .push(Span::styled(std::mem::take(run_text), run_style));
+        }
+    };
     for (row, source) in field.lines().iter().enumerate() {
         let mut line = Line::default();
+        let mut run_text = String::new();
+        let mut run_style = Style::default();
         let mut used = 0;
         let mut column = 0;
         // The trailing space gives the cursor a cell at the end of a line,
@@ -57,43 +76,69 @@ pub(super) fn wrapped_textarea(
         let end_cursor = cursor == (row, source.chars().count());
         for grapheme in source.graphemes(true).chain(end_cursor.then_some(" ")) {
             let count = grapheme.chars().count();
-            let value = if grapheme == "\t" {
-                let tab = usize::from(field.tab_length()).max(1);
-                " ".repeat(tab - used % tab)
-            } else {
-                grapheme.to_owned()
-            };
-            let mut style = Style::default();
-            if selection
+            let base_style = if selection
                 .is_some_and(|(start, end)| start < (row, column + count) && (row, column) < end)
             {
-                style = selection_style;
-            }
-            for (part, display) in value.graphemes(true).enumerate() {
-                let span = Span::raw(display.to_owned());
-                let size = span.width();
+                selection_style
+            } else {
+                Style::default()
+            };
+            let on_cursor = cursor.0 == row && (column..column + count).contains(&cursor.1);
+            if grapheme == "\t" {
+                let spaces = tab - used % tab;
+                for part in 0..spaces {
+                    if used > 0 && used + 1 > width {
+                        flush(&mut line, &mut run_text, run_style);
+                        lines.push(line);
+                        line = Line::default();
+                        used = 0;
+                    }
+                    let display_style = if part == 0 && on_cursor {
+                        cursor_row = lines.len();
+                        cursor_style
+                    } else {
+                        base_style
+                    };
+                    if !run_text.is_empty() && run_style != display_style {
+                        flush(&mut line, &mut run_text, run_style);
+                    }
+                    run_style = display_style;
+                    run_text.push(' ');
+                    used += 1;
+                }
+            } else {
+                let size = grapheme.width();
                 if used > 0 && used + size > width {
+                    flush(&mut line, &mut run_text, run_style);
                     lines.push(line);
                     line = Line::default();
                     used = 0;
                 }
-                let mut display_style = style;
-                if part == 0 && cursor.0 == row && (column..column + count).contains(&cursor.1) {
+                let display_style = if on_cursor {
                     cursor_row = lines.len();
-                    display_style = field.cursor_style();
+                    cursor_style
+                } else {
+                    base_style
+                };
+                if !run_text.is_empty() && run_style != display_style {
+                    flush(&mut line, &mut run_text, run_style);
                 }
-                line.spans.push(span.style(display_style));
+                run_style = display_style;
+                run_text.push_str(grapheme);
                 used += size;
             }
             column += count;
         }
+        flush(&mut line, &mut run_text, run_style);
         lines.push(line);
     }
     let top = cursor_row.saturating_sub(usize::from(inner.height) - 1);
-    frame.render_widget(
-        Paragraph::new(lines.into_iter().skip(top).collect::<Vec<_>>()).style(field.style()),
-        inner,
-    );
+    let visible: Vec<_> = lines
+        .into_iter()
+        .skip(top)
+        .take(usize::from(inner.height))
+        .collect();
+    frame.render_widget(Paragraph::new(visible).style(field.style()), inner);
 }
 pub(super) fn menu_key(key: KeyEvent) -> Key {
     match key.code {
@@ -104,7 +149,11 @@ pub(super) fn menu_key(key: KeyEvent) -> Key {
 }
 /// Lines needed to show `line` wrapped at `width`, capped at `max`.
 pub(super) fn rows_for(line: &Line<'_>, width: u16, max: u16) -> u16 {
-    (line.width() as u16).div_ceil(width.max(1)).clamp(1, max)
+    if max == 0 {
+        return 0;
+    }
+    let rows = line.width().div_ceil(usize::from(width.max(1))).max(1);
+    u16::try_from(rows).unwrap_or(max).min(max)
 }
 pub(super) fn elapsed(seconds: i64) -> String {
     match seconds {
@@ -144,7 +193,7 @@ pub(super) fn key_chips(palette: Palette, keys: &[(&str, &str)], width: usize) -
     let mut spans = Vec::with_capacity(keys.len() * 3);
     let mut used = 0;
     for (index, (key, label)) in keys.iter().enumerate() {
-        let size = super::theme::key_label(key).width() + 1 + label.width();
+        let size = super::theme::key_label_width(key) + 1 + label.width();
         if index > 0 {
             if used + 3 + size > width {
                 break;
@@ -472,5 +521,31 @@ mod tests {
         let last = |width| stage_strip(&stages, 4, width, palette).to_string();
         assert_eq!(last(19), "+3  ○ ━▶ ○ Summary ");
         assert_eq!(last(18), "+4  ○ Summary ");
+    }
+
+    #[test]
+    fn rows_for_handles_wide_lines_and_zero_max_safely() {
+        let wide = Line::raw("x".repeat(70_000));
+        assert_eq!(rows_for(&wide, 80, u16::MAX), 875);
+        assert_eq!(rows_for(&wide, 80, 0), 0);
+        assert_eq!(rows_for(&Line::raw(""), 80, u16::MAX), 1);
+    }
+
+    #[test]
+    fn wrapped_textarea_coalesces_spans_with_tabs_unicode_and_cursor() {
+        let mut field = textarea("a\tb界\nc");
+        field.move_cursor(CursorMove::Jump(0, 1));
+        field.set_selection_style(Style::default().bg(Color::Blue));
+        field.set_cursor_style(Style::default().bg(Color::Red));
+        field.start_selection();
+        field.move_cursor(CursorMove::Jump(0, 3));
+        let buffer = render(&mut field, 8, 3);
+        assert_eq!(buffer[(0, 0)].symbol(), "a");
+        assert_eq!(buffer[(1, 0)].symbol(), " ");
+        assert_eq!(buffer[(4, 0)].symbol(), "b");
+        assert_eq!(buffer[(5, 0)].symbol(), "界");
+        assert_eq!(buffer[(5, 0)].bg, Color::Red);
+        assert_eq!(buffer[(1, 0)].bg, Color::Blue);
+        assert_eq!(row(&buffer, 1), "c       ");
     }
 }

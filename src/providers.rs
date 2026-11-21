@@ -6,7 +6,7 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{borrow::Cow, collections::BTreeMap, time::Duration};
+use std::{borrow::Cow, collections::BTreeMap, io::Read, sync::OnceLock, time::Duration};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -117,6 +117,14 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("lmstudio", "http://localhost:1234/v1", ""),
 ];
 
+/// Looks up a built-in provider `(base_url, api_key_env)` without allocating.
+pub fn builtin(name: &str) -> Option<(&'static str, &'static str)> {
+    BUILTINS
+        .iter()
+        .find(|&&(entry, _, _)| entry == name)
+        .map(|&(_, base_url, api_key_env)| (base_url, api_key_env))
+}
+
 /// Providers available without configuration. A `[providers.NAME]` entry with
 /// the same name replaces the built-in definition.
 pub fn builtins() -> BTreeMap<String, Provider> {
@@ -169,14 +177,20 @@ pub fn resolve<'a>(
     if name.is_empty() {
         return None;
     }
-    let preset = || builtins().remove(name);
+    let preset = || {
+        builtin(name).map(|(base_url, api_key_env)| Provider {
+            base_url: base_url.into(),
+            api_key_env: api_key_env.into(),
+            ..Provider::default()
+        })
+    };
     match configured.get(name) {
         Some(entry) if entry.base_url.is_empty() => {
-            let preset = preset()?;
+            let (base_url, api_key_env) = builtin(name)?;
             Some(Cow::Owned(Provider {
-                base_url: preset.base_url,
+                base_url: base_url.into(),
                 api_key_env: if entry.api_key_env.is_empty() {
-                    preset.api_key_env
+                    api_key_env.into()
                 } else {
                     entry.api_key_env.clone()
                 },
@@ -213,7 +227,7 @@ pub fn validate(name: &str, provider: &Provider) -> Result<()> {
         "Provider {name} needs 0 < output_limit < context_limit (effective {output} and {context})"
     );
     ensure!(
-        !provider.base_url.is_empty() || builtins().contains_key(name),
+        !provider.base_url.is_empty() || builtin(name).is_some(),
         "Provider {name} needs base_url (only built-in names can omit it)"
     );
     if !provider.base_url.is_empty() {
@@ -295,6 +309,24 @@ pub fn parse_models(body: &str) -> Result<Vec<ModelInfo>> {
     Ok(models)
 }
 
+const MAX_MODELS_BYTES: usize = 16 * 1024 * 1024;
+
+/// Shared blocking HTTP client for provider listings and webhooks.
+pub(crate) fn http_client() -> Result<&'static reqwest::blocking::Client> {
+    static CLIENT: OnceLock<std::result::Result<reqwest::blocking::Client, String>> =
+        OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .user_agent(concat!("model-router/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .map_err(|e| format!("{e:#}"))
+        })
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 /// Lists models from the provider's OpenAI-compatible `GET /models`.
 /// Sends the key when set; OpenRouter's listing is public. No model request.
 pub fn models(provider: &Provider) -> Result<Vec<ModelInfo>> {
@@ -302,13 +334,13 @@ pub fn models(provider: &Provider) -> Result<Vec<ModelInfo>> {
 }
 
 pub fn models_within(provider: &Provider, timeout: Duration) -> Result<Vec<ModelInfo>> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(timeout)
-        .build()?;
-    let mut request = client.get(format!(
-        "{}/models",
-        provider.base_url.trim_end_matches('/')
-    ));
+    let client = http_client()?;
+    let mut request = client
+        .get(format!(
+            "{}/models",
+            provider.base_url.trim_end_matches('/')
+        ))
+        .timeout(timeout);
     if let Some(key) = (!provider.api_key_env.is_empty())
         .then(|| std::env::var(&provider.api_key_env).ok())
         .flatten()
@@ -316,7 +348,22 @@ pub fn models_within(provider: &Provider, timeout: Duration) -> Result<Vec<Model
         request = request.bearer_auth(key);
     }
     let response = request.send()?.error_for_status()?;
-    parse_models(&response.text()?)
+    ensure!(
+        response
+            .content_length()
+            .is_none_or(|n| n <= MAX_MODELS_BYTES as u64),
+        "Provider model list exceeds 16 MiB"
+    );
+    let mut bytes = Vec::new();
+    response
+        .take((MAX_MODELS_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= MAX_MODELS_BYTES,
+        "Provider model list exceeds 16 MiB"
+    );
+    let body = String::from_utf8(bytes).context("Provider model list is not UTF-8")?;
+    parse_models(&body)
 }
 
 #[cfg(test)]

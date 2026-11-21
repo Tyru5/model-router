@@ -128,7 +128,7 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
 pub fn write_patch(dir: &Path, from: &str, to: &str, path: &Path) -> Result<()> {
     // The candidate could write its attempt directory.
     let file = storage::create_fresh(path)?;
-    let status = Command::new("git")
+    let output = Command::new("git")
         .args([
             "--no-pager",
             "diff",
@@ -138,16 +138,27 @@ pub fn write_patch(dir: &Path, from: &str, to: &str, path: &Path) -> Result<()> 
             "--no-ext-diff",
             "--no-textconv",
             "--no-renames",
+            // Whatever diff.noprefix or diff.*Prefix say, `git apply` expects these.
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
             from,
             to,
         ])
         .current_dir(dir)
         .stdin(Stdio::null())
-        .stdout(file)
-        .stderr(Stdio::null())
-        .status()
-        .context("Start Git")?;
-    ensure!(status.success(), "git diff {from} {to} failed");
+        .stdout(Stdio::from(file))
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Start Git")?
+        .wait_with_output()
+        .context("Wait for Git")?;
+    if !output.status.success() {
+        let _ = fs::remove_file(path);
+        anyhow::bail!(
+            "git diff {from} {to} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
     Ok(())
 }
 
@@ -180,12 +191,28 @@ pub fn apply(
     if fs::metadata(patch)?.len() == 0 {
         return Ok(Applied::Clean);
     }
-    // Plain apply is atomic and leaves every index alone.
-    if git(&top, None, &["apply", "--check", "--binary", patch]).is_ok() {
-        git(&top, None, &["apply", "--binary", patch])?;
+    // Plain apply checks the whole patch before writing any file.
+    if git(&top, None, &["apply", "--binary", patch]).is_ok() {
         return Ok(Applied::Clean);
     }
     fs::create_dir_all(scratch)?;
+    let check_index = std::path::absolute(scratch.join("apply-check.index"))?;
+    fs::copy(index, &check_index).context("Copy the snapshot index")?;
+    let precheck = git(
+        &top,
+        Some(&check_index),
+        &["apply", "--3way", "--cached", "--binary", patch],
+    );
+    let _ = fs::remove_file(&check_index);
+    if let Err(err) = precheck {
+        let msg = err.to_string();
+        let unsupported = msg.contains("cannot be used")
+            || msg.contains("unknown option")
+            || msg.contains("usage:");
+        if !unsupported {
+            return Ok(Applied::Conflict(files.to_vec()));
+        }
+    }
     let merge = std::path::absolute(scratch.join("apply.index"))?;
     fs::copy(index, &merge).context("Copy the snapshot index")?;
     if git(&top, Some(&merge), &["apply", "--3way", "--binary", patch]).is_ok() {
@@ -233,20 +260,89 @@ pub fn check(
     })
 }
 
+fn is_plain_repo_path(file: &str) -> bool {
+    !file.is_empty()
+        && Path::new(file).components().all(|c| match c {
+            std::path::Component::Normal(part) => {
+                let part = part.to_string_lossy();
+                !part.eq_ignore_ascii_case(".git") && !part.eq_ignore_ascii_case(".model-router")
+            }
+            _ => false,
+        })
+}
+
 /// Puts `files` back as they are in tree `tree`: present ones checked out,
 /// absent ones removed.
 fn restore(top: &Path, tree: &str, files: &[String], scratch: &Path) -> Result<()> {
     let index = std::path::absolute(scratch.join("restore.index"))?;
     let _ = fs::remove_file(&index);
+    let plain_files: Vec<&str> = files
+        .iter()
+        .map(String::as_str)
+        .filter(|file| is_plain_repo_path(file))
+        .collect();
+    if plain_files.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(scratch)?;
     git(top, Some(&index), &["read-tree", tree])?;
-    let listed = git(top, Some(&index), &["ls-files", "-z"])?;
-    let present: std::collections::HashSet<&str> = listed.split('\0').collect();
-    let (keep, gone): (Vec<&String>, Vec<&String>) =
-        files.iter().partition(|f| present.contains(f.as_str()));
+    let mut present = std::collections::HashSet::new();
+    for chunk in plain_files.chunks(512) {
+        let mut command = Command::new("git");
+        command
+            .arg("--literal-pathspecs")
+            .args(["ls-files", "-z", "--"])
+            .args(chunk)
+            .current_dir(top)
+            .env("GIT_INDEX_FILE", &index)
+            .stdin(Stdio::null());
+        let output = command.output().context("Start Git")?;
+        ensure!(
+            output.status.success(),
+            "git ls-files: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        for name in output.stdout.split(|&b| b == 0) {
+            if !name.is_empty() {
+                present.insert(String::from_utf8_lossy(name).into_owned());
+            }
+        }
+    }
+    let (keep, gone): (Vec<&str>, Vec<&str>) = plain_files
+        .into_iter()
+        .partition(|file| present.contains(*file));
     if !keep.is_empty() {
-        let mut args = vec!["checkout-index", "-f", "--"];
-        args.extend(keep.iter().map(|f| f.as_str()));
-        git(top, Some(&index), &args)?;
+        let mut stdin_bytes = Vec::new();
+        for file in &keep {
+            stdin_bytes.extend_from_slice(file.as_bytes());
+            stdin_bytes.push(0);
+        }
+        let mut child = Command::new("git")
+            .args(["checkout-index", "-f", "-z", "--stdin"])
+            .current_dir(top)
+            .env("GIT_INDEX_FILE", &index)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Start Git")?;
+        let mut pipe = child.stdin.take();
+        let output = std::thread::scope(|scope| -> Result<std::process::Output> {
+            let writer = scope.spawn(move || -> std::io::Result<()> {
+                if let Some(mut pipe) = pipe.take() {
+                    std::io::Write::write_all(&mut pipe, &stdin_bytes)?;
+                }
+                Ok(())
+            });
+            let output = child.wait_with_output().context("Wait for Git")?;
+            let _ = writer.join();
+            Ok(output)
+        })?;
+        ensure!(
+            output.status.success(),
+            "git checkout-index: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     let root = fs::canonicalize(top)?;
     for file in gone {
@@ -256,18 +352,20 @@ fn restore(top: &Path, tree: &str, files: &[String], scratch: &Path) -> Result<(
         // files), and never Git's or the router's own, which no tree diff
         // names; anything else is left alone.
         let name = Path::new(file);
-        let plain = name.components().all(|c| match c {
-            std::path::Component::Normal(part) => {
-                let part = part.to_string_lossy();
-                !part.eq_ignore_ascii_case(".git") && !part.eq_ignore_ascii_case(".model-router")
-            }
-            _ => false,
-        });
         let dir = name.parent().unwrap_or(Path::new(""));
-        let inside =
-            plain && fs::canonicalize(top.join(dir)).is_ok_and(|parent| parent == root.join(dir));
+        let inside = fs::canonicalize(top.join(dir)).is_ok_and(|parent| parent == root.join(dir));
         if inside && fs::symlink_metadata(&path).is_ok() {
             fs::remove_file(&path).with_context(|| format!("Remove {}", path.display()))?;
+            let mut dir_path = path.parent();
+            while let Some(dir) = dir_path {
+                if dir == top || !dir.starts_with(top) {
+                    break;
+                }
+                if fs::remove_dir(dir).is_err() {
+                    break;
+                }
+                dir_path = dir.parent();
+            }
         }
     }
     let _ = fs::remove_file(&index);
@@ -366,5 +464,89 @@ mod tests {
             Applied::Conflict(_)
         ));
         assert_eq!(fs::read_to_string(repo.join("a")).unwrap(), "three\n");
+    }
+
+    #[test]
+    fn write_patch_and_apply_ignore_diff_noprefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, None, &["init", "-q"]).unwrap();
+        git(&repo, None, &["config", "diff.noprefix", "true"]).unwrap();
+        fs::write(repo.join("a.txt"), "one\n").unwrap();
+        let index = dir.path().join("index");
+        let tree = || {
+            git(&repo, Some(&index), &["add", "-A"]).unwrap();
+            git(&repo, Some(&index), &["write-tree"]).unwrap()
+        };
+        let from = tree();
+        fs::write(repo.join("a.txt"), "two\n").unwrap();
+        let to = tree();
+        let patch = dir.path().join("changes.diff");
+        write_patch(&repo, &from, &to, &patch).unwrap();
+        // Put the working tree back to `from`, then apply the generated patch.
+        fs::write(repo.join("a.txt"), "one\n").unwrap();
+        let current = tree();
+        let scratch = dir.path().join("scratch");
+        assert_eq!(
+            apply(
+                &repo,
+                &index,
+                &current,
+                &["a.txt".to_owned()],
+                &patch,
+                &scratch
+            )
+            .unwrap(),
+            Applied::Clean
+        );
+        assert_eq!(fs::read_to_string(repo.join("a.txt")).unwrap(), "two\n");
+    }
+
+    #[test]
+    fn restore_reverts_tracked_prunes_new_dirs_and_skips_unsafe_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let outside = dir.path().join("outside");
+        fs::create_dir(&repo).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("victim"), "keep").unwrap();
+        git(&repo, None, &["init", "-q"]).unwrap();
+        fs::write(repo.join("tracked.txt"), "original\n").unwrap();
+        let index = dir.path().join("index");
+        git(&repo, Some(&index), &["add", "-A"]).unwrap();
+        let baseline = git(&repo, Some(&index), &["write-tree"]).unwrap();
+
+        // Simulate partial mutations left by a failed apply.
+        fs::write(repo.join("tracked.txt"), "mutated\n").unwrap();
+        fs::create_dir_all(repo.join("newdir/nested")).unwrap();
+        fs::write(repo.join("newdir/nested/extra.txt"), "temp\n").unwrap();
+        fs::create_dir_all(repo.join(".model-router")).unwrap();
+        fs::write(repo.join(".model-router/run.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("link")).unwrap();
+
+        let files = vec![
+            "tracked.txt".to_owned(),
+            "newdir/nested/extra.txt".to_owned(),
+            "link/victim".to_owned(),
+            outside.join("victim").display().to_string(),
+            ".git/HEAD".to_owned(),
+            ".model-router/run.json".to_owned(),
+        ];
+        let scratch = dir.path().join("scratch");
+        restore(&repo, &baseline, &files, &scratch).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(repo.join("tracked.txt")).unwrap(),
+            "original\n"
+        );
+        assert!(!repo.join("newdir/nested/extra.txt").exists());
+        assert!(
+            !repo.join("newdir").exists(),
+            "empty parent directories must be pruned"
+        );
+        assert_eq!(fs::read_to_string(outside.join("victim")).unwrap(), "keep");
+        assert!(repo.join(".git/HEAD").is_file());
+        assert!(repo.join(".model-router/run.json").is_file());
     }
 }

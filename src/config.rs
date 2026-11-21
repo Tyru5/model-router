@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
+    io::Read,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 /// Built-in harness names, from the spec table (`harness::SPECS`).
@@ -458,6 +460,15 @@ impl Workflow {
                     stage.model.clear();
                     stage.effort.clear();
                     stage.harness_settings.clear();
+                    if let Some((key, value)) =
+                        crate::harness::get(&stage.harness).and_then(|spec| spec.read_only)
+                    {
+                        stage
+                            .harness_settings
+                            .insert(key.to_owned(), value.to_owned());
+                    } else if self.sandbox_default.resolve(Role::Summary) != Sandbox::ReadOnly {
+                        stage.sandbox = Some(Sandbox::ReadOnly);
+                    }
                 }
             }
         }
@@ -752,15 +763,81 @@ pub fn migrate(settings: &mut Settings) -> Result<Vec<String>> {
     Ok(notes)
 }
 
-/// Fields in `value` that `Settings` would ignore, as dotted paths. Stage and
-/// check fields are strict and fail parsing instead.
-pub fn unknown_fields(value: &toml::Value) -> Vec<String> {
+struct KnownKeys {
+    settings: HashSet<String>,
+    workflow: HashSet<String>,
+    budget: HashSet<String>,
+    adapters: HashSet<String>,
+    providers: HashSet<String>,
+    pricing: HashSet<String>,
+}
+
+fn known_keys() -> &'static KnownKeys {
     fn keys<T: Serialize>(sample: &T) -> HashSet<String> {
         toml::Value::try_from(sample)
             .ok()
             .and_then(|v| v.as_table().map(|t| t.keys().cloned().collect()))
             .unwrap_or_default()
     }
+    static KNOWN: OnceLock<KnownKeys> = OnceLock::new();
+    KNOWN.get_or_init(|| {
+        let mut sample = Settings::default();
+        sample.providers.insert("p".into(), Provider::default());
+        let price = crate::cost::Price {
+            input: 1.0,
+            output: 1.0,
+            cache_read: Some(1.0),
+            cache_write: Some(1.0),
+        };
+        sample.pricing.insert("m".into(), price);
+        let budget = keys(&Budget {
+            max_usd: Some(1.0),
+            max_tokens: Some(1),
+            on_exceed: BudgetAction::Warn,
+        });
+        let adapter = CustomAdapter {
+            interactive_args: Some(vec![]),
+            models_args: Some(vec![]),
+            output: Some(CustomOutput::Text),
+            session: Some(CustomSession::default()),
+            resume_args: Some(vec![]),
+            follow_up_args: Some(vec![]),
+            model_flag: Some(String::new()),
+            effort_flag: Some(String::new()),
+            prompt: Some(CustomPrompt::Mode(PromptMode::Arg)),
+            ..CustomAdapter::default()
+        };
+        let provider = Provider {
+            context_limit: Some(1),
+            output_limit: Some(1),
+            ..Provider::default()
+        };
+        let workflow = keys(&Workflow {
+            sandbox_default: Sandbox::ByRole,
+            // Saved only when not the default or non-empty.
+            max_parallel: 3,
+            budget: Budget {
+                max_usd: Some(1.0),
+                ..Budget::default()
+            },
+            protected_paths: vec!["x".into()],
+            handoff_repair: true,
+            ..Workflow::default()
+        });
+        KnownKeys {
+            settings: keys(&sample),
+            workflow,
+            budget,
+            adapters: keys(&adapter),
+            providers: keys(&provider),
+            pricing: keys(&price),
+        }
+    })
+}
+
+/// Fields in `value` that `Settings` would ignore, as dotted paths. Stage and
+/// check fields are strict and fail parsing instead.
+pub fn unknown_fields(value: &toml::Value) -> Vec<String> {
     fn extra(table: &toml::Value, known: &HashSet<String>, at: &str, out: &mut Vec<String>) {
         if let Some(table) = table.as_table() {
             for key in table.keys().filter(|k| !known.contains(*k)) {
@@ -772,47 +849,9 @@ pub fn unknown_fields(value: &toml::Value) -> Vec<String> {
             }
         }
     }
-    let mut sample = Settings::default();
-    sample.providers.insert("p".into(), Provider::default());
-    let price = crate::cost::Price {
-        input: 1.0,
-        output: 1.0,
-        cache_read: Some(1.0),
-        cache_write: Some(1.0),
-    };
-    sample.pricing.insert("m".into(), price);
-    let budget = keys(&Budget {
-        max_usd: Some(1.0),
-        max_tokens: Some(1),
-        on_exceed: BudgetAction::Warn,
-    });
-    let adapter = CustomAdapter {
-        interactive_args: Some(vec![]),
-        models_args: Some(vec![]),
-        output: Some(CustomOutput::Text),
-        session: Some(CustomSession::default()),
-        resume_args: Some(vec![]),
-        follow_up_args: Some(vec![]),
-        model_flag: Some(String::new()),
-        effort_flag: Some(String::new()),
-        prompt: Some(CustomPrompt::Mode(PromptMode::Arg)),
-        ..CustomAdapter::default()
-    };
-    let provider = Provider {
-        context_limit: Some(1),
-        output_limit: Some(1),
-        ..Provider::default()
-    };
+    let known = known_keys();
     let mut out = vec![];
-    extra(value, &keys(&sample), "", &mut out);
-    let workflow = keys(&Workflow {
-        sandbox_default: Sandbox::ByRole,
-        // Saved only when not the default.
-        max_parallel: 3,
-        protected_paths: vec!["x".into()],
-        handoff_repair: true,
-        ..Workflow::default()
-    });
+    extra(value, &known.settings, "", &mut out);
     for (index, item) in value
         .get("workflows")
         .and_then(toml::Value::as_array)
@@ -821,9 +860,9 @@ pub fn unknown_fields(value: &toml::Value) -> Vec<String> {
         .enumerate()
     {
         let at = format!("workflows[{index}]");
-        extra(item, &workflow, &at, &mut out);
+        extra(item, &known.workflow, &at, &mut out);
         if let Some(value) = item.get("budget") {
-            extra(value, &budget, &format!("{at}.budget"), &mut out);
+            extra(value, &known.budget, &format!("{at}.budget"), &mut out);
         }
         for (number, stage) in item
             .get("stages")
@@ -835,17 +874,17 @@ pub fn unknown_fields(value: &toml::Value) -> Vec<String> {
             if let Some(value) = stage.get("budget") {
                 extra(
                     value,
-                    &budget,
+                    &known.budget,
                     &format!("{at}.stages[{number}].budget"),
                     &mut out,
                 );
             }
         }
     }
-    for (section, known) in [
-        ("adapters", keys(&adapter)),
-        ("providers", keys(&provider)),
-        ("pricing", keys(&price)),
+    for (section, section_keys) in [
+        ("adapters", &known.adapters),
+        ("providers", &known.providers),
+        ("pricing", &known.pricing),
     ] {
         for (name, item) in value
             .get(section)
@@ -853,7 +892,7 @@ pub fn unknown_fields(value: &toml::Value) -> Vec<String> {
             .into_iter()
             .flatten()
         {
-            extra(item, &known, &format!("{section}.{name}"), &mut out);
+            extra(item, section_keys, &format!("{section}.{name}"), &mut out);
         }
     }
     out
@@ -1123,7 +1162,15 @@ impl Settings {
     /// Saves at the current version. Sections ignored because the project
     /// was untrusted are written back unchanged.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let mut saved = crate::trust::restore(self);
+        let restored = crate::trust::restore_cow(self);
+        if restored.version == VERSION {
+            restored.validate()?;
+            return crate::storage::atomic_write(
+                path,
+                toml::to_string_pretty(&*restored)?.as_bytes(),
+            );
+        }
+        let mut saved = restored.into_owned();
         saved.version = VERSION;
         saved.validate()?;
         crate::storage::atomic_write(path, toml::to_string_pretty(&saved)?.as_bytes())
@@ -1223,26 +1270,65 @@ impl Loaded {
     }
 }
 
+const MAX_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
+
+fn read_config_file(path: &Path, required: bool) -> Result<Option<String>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("Read {}", path.display())),
+    };
+    let meta = file
+        .metadata()
+        .with_context(|| format!("Read {}", path.display()))?;
+    if !meta.is_file() {
+        if !required && meta.is_dir() {
+            return Ok(None);
+        }
+        bail!("Config {} is not a regular file", path.display());
+    }
+    let mut buf = Vec::new();
+    file.take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut buf)
+        .with_context(|| format!("Read {}", path.display()))?;
+    ensure!(
+        buf.len() as u64 <= MAX_CONFIG_BYTES,
+        "Config {} exceeds {} byte limit",
+        path.display(),
+        MAX_CONFIG_BYTES
+    );
+    let text = String::from_utf8(buf).with_context(|| format!("Read {}", path.display()))?;
+    Ok(Some(text))
+}
+
 /// Loads `explicit`, else the project's config, else the global one, and
 /// checks the project's trust.
 pub fn load_config(project: &Path, explicit: Option<&Path>) -> Result<Loaded> {
     let project_path = project.join(".model-router.toml");
     let global = config_dir().join("config.toml");
-    let (source, origin) = if let Some(path) = explicit {
-        (Some(path.to_path_buf()), Origin::Explicit)
-    } else if project_path.is_file() {
-        (Some(project_path.clone()), Origin::Project)
-    } else if global.is_file() {
-        (Some(global), Origin::Global)
+    let (source, origin, text) = if let Some(path) = explicit {
+        let text =
+            read_config_file(path, true)?.with_context(|| format!("Read {}", path.display()))?;
+        (Some(path.to_path_buf()), Origin::Explicit, Some(text))
+    } else if let Some(text) = read_config_file(&project_path, false)? {
+        (Some(project_path.clone()), Origin::Project, Some(text))
+    } else if let Some(text) = read_config_file(&global, false)? {
+        (Some(global), Origin::Global, Some(text))
     } else {
-        (None, Origin::Default)
+        (None, Origin::Default, None)
     };
-    let mut settings = match &source {
-        Some(path) => {
-            parse(&fs::read_to_string(path).with_context(|| format!("Read {}", path.display()))?)
-                .with_context(|| format!("Parse {}", path.display()))?
+    let mut settings = match (&source, text) {
+        (Some(path), Some(text)) => {
+            parse(&text).with_context(|| format!("Parse {}", path.display()))?
         }
-        None => Settings::default(),
+        _ => Settings::default(),
     };
     settings.explicit_config = explicit.map(Path::to_path_buf);
     settings.validate()?;
@@ -1426,12 +1512,10 @@ checks = [
         assert_eq!(workflow.stages[0].budget.max_usd, Some(1.25));
         assert_eq!(settings.pricing["my-model"].cache_read, Some(0.15));
         assert_eq!(settings.pricing["my-model"].cache_write, None);
-        // Future budget fields warn instead of failing.
+        // Future budget fields warn instead of failing, and valid [workflows.budget] does not.
+        assert_eq!(settings.warnings.len(), 1, "{:?}", settings.warnings);
         assert!(
-            settings
-                .warnings
-                .iter()
-                .any(|w| w.contains("workflows[0].budget.hard")),
+            settings.warnings[0].contains("workflows[0].budget.hard"),
             "{:?}",
             settings.warnings
         );
@@ -1591,5 +1675,23 @@ checks = [
             "{warnings}"
         );
         assert!(!warnings.contains("research"), "{warnings}");
+    }
+
+    #[test]
+    fn oversized_or_non_regular_config_fails_without_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join(".model-router.toml");
+        fs::write(&big, "x".repeat(MAX_CONFIG_BYTES as usize + 1)).unwrap();
+        let err = load_config(dir.path(), None).unwrap_err();
+        assert!(format!("{err:#}").contains("limit"), "{err:#}");
+        fs::remove_file(&big).unwrap();
+
+        #[cfg(unix)]
+        {
+            let fifo = std::ffi::CString::new(big.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+            let err = load_config(dir.path(), None).unwrap_err();
+            assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
+        }
     }
 }

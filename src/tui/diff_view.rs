@@ -5,7 +5,7 @@
 //! Only the rows that fit are laid out each frame, and each file keeps at
 //! most `FILE_ROWS` rows; the pager shows the rest.
 use super::{
-    output_search::{find, highlight},
+    output_search::{SearchQuery, highlight},
     theme::Palette,
     widgets::rows_for,
 };
@@ -248,6 +248,8 @@ fn git_paths(line: &str) -> Option<(String, String)> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Diff {
     pub(super) files: Vec<DiffFile>,
+    longest: usize,
+    stat_text: String,
 }
 impl Diff {
     pub(super) fn parse(patch: &str) -> Self {
@@ -312,35 +314,45 @@ impl Diff {
                 Kind::Add | Kind::Context => {
                     file.adds += usize::from(kind == Kind::Add);
                     line = Some(next_line);
-                    next_line += 1;
+                    next_line = next_line.saturating_add(1);
                 }
                 Kind::Del => file.dels += 1,
                 Kind::Binary => file.binary = true,
                 Kind::NoNewline | Kind::Note => {}
             }
-            file.push(Row {
-                kind,
-                text: storage::clean_terminal(text).replace('\t', "    "),
-                line,
-            });
+            if file.rows.len() < FILE_ROWS {
+                file.push(Row {
+                    kind,
+                    text: storage::clean_terminal(text).replace('\t', "    "),
+                    line,
+                });
+            } else {
+                file.hidden += 1;
+            }
         }
-        Self { files }
-    }
-
-    pub(super) fn totals(&self) -> (usize, usize) {
-        self.files
+        let longest = files
             .iter()
-            .fold((0, 0), |(a, d), f| (a + f.adds, d + f.dels))
+            .map(|f| f.label().chars().count() + 14)
+            .max()
+            .unwrap_or(20);
+        let (adds, dels) = files
+            .iter()
+            .fold((0, 0), |(a, d), f| (a + f.adds, d + f.dels));
+        let count = files.len();
+        let stat_text = format!(
+            "{count} file{} · +{adds} −{dels}",
+            if count == 1 { "" } else { "s" }
+        );
+        Self {
+            files,
+            longest,
+            stat_text,
+        }
     }
 
     /// "3 files · +40 −5"
-    pub(super) fn stat(&self) -> String {
-        let (adds, dels) = self.totals();
-        let files = self.files.len();
-        format!(
-            "{files} file{} · +{adds} −{dels}",
-            if files == 1 { "" } else { "s" }
-        )
+    pub(super) fn stat(&self) -> &str {
+        &self.stat_text
     }
 }
 
@@ -498,23 +510,23 @@ impl DiffView {
 
     /// Recomputes matches for the query over every file's kept rows.
     fn search(&mut self) {
-        let query = self.query.as_str();
-        self.matches = if query.is_empty() {
-            vec![]
+        let sq = SearchQuery::new(&self.query);
+        if sq.is_empty() {
+            self.matches = vec![];
         } else {
-            self.diff
-                .files
-                .iter()
-                .enumerate()
-                .flat_map(|(f, file)| {
-                    file.rows.iter().enumerate().flat_map(move |(r, row)| {
-                        find(&row.text, query)
-                            .into_iter()
-                            .map(move |range| (f, r, range))
-                    })
-                })
-                .collect()
-        };
+            let mut matches = vec![];
+            let mut scratch = String::new();
+            let mut ranges = vec![];
+            for (f, file) in self.diff.files.iter().enumerate() {
+                for (r, row) in file.rows.iter().enumerate() {
+                    sq.find_into(&row.text, &mut scratch, &mut ranges);
+                    for range in ranges.drain(..) {
+                        matches.push((f, r, range));
+                    }
+                }
+            }
+            self.matches = matches;
+        }
         // The first match at or after the view.
         self.current = self
             .matches
@@ -655,13 +667,7 @@ impl DiffView {
         frame.render_widget(block, rect);
         let [body, footer] =
             Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(inner);
-        let longest = self
-            .diff
-            .files
-            .iter()
-            .map(|f| f.label().chars().count() + 14)
-            .max()
-            .unwrap_or(20) as u16;
+        let longest = u16::try_from(self.diff.longest).unwrap_or(u16::MAX);
         let list_width = longest.clamp(18, (body.width / 3).max(18));
         let [list, pane] =
             Layout::horizontal([Constraint::Length(list_width), Constraint::Min(10)]).areas(body);
@@ -715,7 +721,10 @@ impl DiffView {
     }
 
     fn draw_files(&self, frame: &mut Frame<'_>, area: Rect, palette: Palette) {
-        let items = self.diff.files.iter().map(|file| {
+        let visible = usize::from(area.height).max(1);
+        let start = self.file.saturating_sub(visible);
+        let end = (self.file + visible + 1).min(self.diff.files.len());
+        let items = self.diff.files[start..end].iter().map(|file| {
             let color = match file.status {
                 FileStatus::Added => palette.success,
                 FileStatus::Deleted => palette.red,
@@ -737,6 +746,7 @@ impl DiffView {
             }
             ListItem::new(Line::from(spans))
         });
+        let selected = (!self.diff.files.is_empty()).then(|| self.file.saturating_sub(start));
         frame.render_stateful_widget(
             List::new(items)
                 .highlight_style(palette.selected_style())
@@ -748,7 +758,7 @@ impl DiffView {
                         .border_style(Style::default().fg(palette.line)),
                 ),
             area,
-            &mut ListState::default().with_selected(Some(self.file)),
+            &mut ListState::default().with_selected(selected),
         );
     }
 

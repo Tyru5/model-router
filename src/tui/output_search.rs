@@ -12,23 +12,65 @@ use ratatui::{
 };
 use std::ops::Range;
 
+/// Prepared smart-case query so repeated searches across rows do not allocate.
+pub(super) struct SearchQuery {
+    needle: String,
+    case_sensitive: bool,
+}
+
+impl SearchQuery {
+    pub(super) fn new(query: &str) -> Self {
+        let case_sensitive = query.chars().any(char::is_uppercase);
+        let needle = if case_sensitive {
+            query.to_owned()
+        } else {
+            query.to_ascii_lowercase()
+        };
+        Self {
+            needle,
+            case_sensitive,
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.needle.is_empty()
+    }
+
+    pub(super) fn find_into(
+        &self,
+        haystack: &str,
+        scratch: &mut String,
+        out: &mut Vec<Range<usize>>,
+    ) {
+        out.clear();
+        if self.needle.is_empty() || haystack.len() < self.needle.len() {
+            return;
+        }
+        // ASCII folding preserves byte lengths and UTF-8 offsets.
+        let hay = if self.case_sensitive {
+            haystack
+        } else {
+            scratch.clear();
+            scratch.push_str(haystack);
+            scratch.make_ascii_lowercase();
+            scratch.as_str()
+        };
+        out.extend(
+            hay.match_indices(&self.needle)
+                .map(|(at, text)| at..at + text.len()),
+        );
+    }
+}
+
 /// Smart-case text search: case-insensitive (ASCII) unless the query has an
 /// uppercase letter.
+#[cfg(test)]
 pub(super) fn find(haystack: &str, query: &str) -> Vec<Range<usize>> {
-    if query.is_empty() {
-        return vec![];
-    }
-    let found = |hay: &str, needle: &str| {
-        hay.match_indices(needle)
-            .map(|(at, text)| at..at + text.len())
-            .collect()
-    };
-    if query.chars().any(char::is_uppercase) {
-        found(haystack, query)
-    } else {
-        // ASCII folding keeps byte offsets, so ranges index the original.
-        found(&haystack.to_ascii_lowercase(), &query.to_ascii_lowercase())
-    }
+    let sq = SearchQuery::new(query);
+    let mut scratch = String::new();
+    let mut out = vec![];
+    sq.find_into(haystack, &mut scratch, &mut out);
+    out
 }
 
 /// `line` with the byte `ranges` of its text restyled; `current` (an index
@@ -84,11 +126,6 @@ pub(super) fn highlight(
         style: line_style,
         alignment,
     }
-}
-
-/// The text of a line, spans joined.
-pub(super) fn line_text(line: &Line<'_>) -> String {
-    line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
 /// Where the output panel is.
@@ -162,18 +199,30 @@ impl Wrapped {
     }
     /// Every match: (row, byte range in that row).
     pub(super) fn matches(&self, query: &str) -> Vec<(usize, Range<usize>)> {
-        if query.is_empty() {
+        let sq = SearchQuery::new(query);
+        if sq.is_empty() {
             return vec![];
         }
-        self.lines
-            .iter()
-            .enumerate()
-            .flat_map(|(row, line)| {
-                find(&line_text(line), query)
-                    .into_iter()
-                    .map(move |range| (row, range))
-            })
-            .collect()
+        let mut matches = vec![];
+        let mut line_buf = String::new();
+        let mut scratch = String::new();
+        let mut ranges = vec![];
+        for (row, line) in self.lines.iter().enumerate() {
+            let text = if line.spans.len() == 1 {
+                line.spans[0].content.as_ref()
+            } else {
+                line_buf.clear();
+                for span in &line.spans {
+                    line_buf.push_str(span.content.as_ref());
+                }
+                line_buf.as_str()
+            };
+            sq.find_into(text, &mut scratch, &mut ranges);
+            for range in ranges.drain(..) {
+                matches.push((row, range));
+            }
+        }
+        matches
     }
 }
 
@@ -184,6 +233,7 @@ pub(super) fn visible_lines(
     top: usize,
     visible: usize,
     search: Option<&LogSearch>,
+    matches: Option<&[(usize, Range<usize>)]>,
     palette: Palette,
 ) -> Vec<Line<'static>> {
     let end = (top + visible).min(wrapped.lines.len());
@@ -191,7 +241,7 @@ pub(super) fn visible_lines(
     let Some(search) = search.filter(|s| !s.query.is_empty()) else {
         return rows.to_vec();
     };
-    let matches = wrapped.matches(&search.query);
+    let matches = matches.unwrap_or(&[]);
     rows.iter()
         .enumerate()
         .map(|(offset, line)| {
@@ -217,12 +267,44 @@ pub(super) fn visible_lines(
         .collect()
 }
 
+pub(super) fn format_search_status(search: &LogSearch, count: usize) -> String {
+    if search.typing {
+        return format!("/{}▏", search.query);
+    }
+    if count == 0 {
+        format!("/{} · no matches · [Esc] clears", search.query)
+    } else {
+        format!(
+            "/{} · {}/{count} · [n]/[N] next/previous · [Esc] clears",
+            search.query,
+            search.current.min(count - 1) + 1
+        )
+    }
+}
+
 impl RunSlot {
     /// The output as last drawn, and the panel height.
     fn drawn_output(&self) -> Option<(std::rc::Rc<Wrapped>, usize)> {
         let cache = self.cache.borrow();
         let (_, wrapped) = cache.output.as_ref()?;
         Some((wrapped.clone(), self.log_visible.get().max(1)))
+    }
+
+    pub(super) fn cached_matches(
+        &self,
+        wrapped: &Wrapped,
+        width: usize,
+        query: &str,
+    ) -> super::run_slot::SearchMatches {
+        let mut cache = self.cache.borrow_mut();
+        if let Some(((cw, cv, cq), matches)) = &cache.search {
+            if *cw == width && *cv == self.log_version && cq == query {
+                return matches.clone();
+            }
+        }
+        let matches = std::rc::Rc::new(wrapped.matches(query));
+        cache.search = Some(((width, self.log_version, query.to_owned()), matches.clone()));
+        matches
     }
 
     /// Moves the output by `delta` rows; reaching the end follows again.
@@ -322,9 +404,14 @@ impl RunSlot {
     /// above the bottom of the panel, and pauses the output there. Returns
     /// the status line when nothing matches.
     fn jump_to_match(&mut self, forward: Option<bool>) -> Option<String> {
-        let (wrapped, visible) = self.drawn_output()?;
+        let (width, wrapped, visible) = {
+            let cache = self.cache.borrow();
+            let ((width, _, _), wrapped) = cache.output.as_ref()?;
+            (*width, wrapped.clone(), self.log_visible.get().max(1))
+        };
+        let query = self.log_search.as_ref()?.query.clone();
+        let matches = self.cached_matches(&wrapped, width, &query);
         let search = self.log_search.as_mut()?;
-        let matches = wrapped.matches(&search.query);
         if matches.is_empty() {
             return Some(format!("No output matches “{}”.", search.query));
         }
@@ -352,26 +439,6 @@ impl RunSlot {
             anchor: wrapped.anchor(top),
         };
         None
-    }
-
-    /// The search line under the output panel: the query being typed, or
-    /// the match count.
-    pub(super) fn output_search_status(&self) -> Option<String> {
-        let search = self.log_search.as_ref()?;
-        if search.typing {
-            return Some(format!("/{}▏", search.query));
-        }
-        let (wrapped, _) = self.drawn_output()?;
-        let count = wrapped.matches(&search.query).len();
-        Some(if count == 0 {
-            format!("/{} · no matches · [Esc] clears", search.query)
-        } else {
-            format!(
-                "/{} · {}/{count} · [n]/[N] next/previous · [Esc] clears",
-                search.query,
-                search.current.min(count - 1) + 1
-            )
-        })
     }
 }
 

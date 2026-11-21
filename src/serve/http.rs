@@ -28,6 +28,9 @@ const KEEPALIVE: Duration = Duration::from_secs(15);
 const MAX_PENDING: usize = 16;
 /// Authenticated requests and event streams.
 const MAX_CONNECTIONS: usize = 32;
+/// Authenticated long-lived streams/waits (`events` and `wait_run`), leaving
+/// quick requests (`cancel_run`, `run_status`) runnable.
+const MAX_LONG_CONNECTIONS: usize = 24;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a pending connection is safe from being cut off: long enough
 /// for its worker to read headers that arrived with it.
@@ -53,8 +56,24 @@ struct Admission {
     pending: Arc<Mutex<Pending>>,
     id: u64,
     active: Arc<AtomicUsize>,
+    long: Arc<AtomicUsize>,
     /// Whether it was still queued when it first left.
     left: Cell<Option<bool>>,
+}
+
+fn reserve_slot(counter: &Arc<AtomicUsize>, max: usize) -> Option<ConnectionSlot> {
+    // A compare-exchange loop: `fetch_update` is deprecated on newer
+    // toolchains and its replacement is newer than the MSRV.
+    let mut n = counter.load(Ordering::Acquire);
+    loop {
+        if n >= max {
+            return None;
+        }
+        match counter.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(ConnectionSlot(counter.clone())),
+            Err(current) => n = current,
+        }
+    }
 }
 
 impl Admission {
@@ -74,21 +93,13 @@ impl Admission {
 
     /// An authenticated slot, or None when all are in use.
     fn authenticated(&self) -> Option<ConnectionSlot> {
-        // A compare-exchange loop: `fetch_update` is deprecated on newer
-        // toolchains and its replacement is newer than the MSRV.
-        let mut n = self.active.load(Ordering::Acquire);
-        loop {
-            if n >= MAX_CONNECTIONS {
-                return None;
-            }
-            match self
-                .active
-                .compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => return Some(ConnectionSlot(self.active.clone())),
-                Err(current) => n = current,
-            }
-        }
+        reserve_slot(&self.active, MAX_CONNECTIONS)
+    }
+
+    /// A slot for a long-lived call (`wait_run` or `/events`), capped below
+    /// `MAX_CONNECTIONS` so short calls are never starved.
+    fn long_lived(&self) -> Option<ConnectionSlot> {
+        reserve_slot(&self.long, MAX_LONG_CONNECTIONS)
     }
 }
 
@@ -109,6 +120,24 @@ pub fn new_token() -> String {
     )
 }
 
+fn wait_for_listener(listener: &TcpListener) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let mut pfd = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd references an open listener descriptor for this thread.
+        let _ = unsafe { libc::poll(&mut pfd, 1, 200) };
+    }
+    #[cfg(not(unix))]
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 pub fn serve(listener: TcpListener, server: Arc<Server>, token: String, stop: Arc<AtomicBool>) {
     if let Err(error) = listener.set_nonblocking(true) {
         super::log(format!("HTTP listener: {error}"));
@@ -116,6 +145,7 @@ pub fn serve(listener: TcpListener, server: Arc<Server>, token: String, stop: Ar
     }
     let token = Arc::new(token);
     let active = Arc::new(AtomicUsize::new(0));
+    let long = Arc::new(AtomicUsize::new(0));
     let pending = Arc::new(Mutex::new(Pending::default()));
     while !stop.load(Ordering::Relaxed) {
         let wait = {
@@ -153,11 +183,12 @@ pub fn serve(listener: TcpListener, server: Arc<Server>, token: String, stop: Ar
                     pending: pending.clone(),
                     id,
                     active: active.clone(),
+                    long: long.clone(),
                     left: Cell::new(None),
                 };
-                let (server, token) = (server.clone(), token.clone());
+                let (server, token, stop) = (server.clone(), token.clone(), stop.clone());
                 let spawned = std::thread::Builder::new().spawn(move || {
-                    if let Err(error) = connection(stream, &server, &token, &admission) {
+                    if let Err(error) = connection(stream, &server, &token, &admission, &stop) {
                         if error.kind() != io::ErrorKind::BrokenPipe {
                             super::log(format!("HTTP connection: {error}"));
                         }
@@ -172,7 +203,7 @@ pub fn serve(listener: TcpListener, server: Arc<Server>, token: String, stop: Ar
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(50));
+                wait_for_listener(&listener);
             }
             Err(error) => {
                 super::log(format!("HTTP accept: {error}"));
@@ -213,6 +244,38 @@ impl Read for RequestReader<'_> {
     }
 }
 
+/// Reads up to `\n` into `out`, failing once stored bytes would exceed `max_bytes`.
+fn read_http_line(
+    reader: &mut impl BufRead,
+    out: &mut String,
+    max_bytes: usize,
+) -> io::Result<usize> {
+    out.clear();
+    let mut total = 0usize;
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(total);
+        }
+        let take = buf
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(buf.len(), |pos| pos + 1);
+        if total + take > max_bytes {
+            return Err(invalid("Headers too large or truncated"));
+        }
+        let text =
+            std::str::from_utf8(&buf[..take]).map_err(|_| invalid("Headers must be UTF-8"))?;
+        out.push_str(text);
+        total += take;
+        let done = text.ends_with('\n');
+        reader.consume(take);
+        if done {
+            return Ok(total);
+        }
+    }
+}
+
 /// Calls `admit` once the headers authenticate, before reading the body;
 /// when it returns false (cut off, or no authenticated slot) reading stops.
 fn read_request(
@@ -227,7 +290,7 @@ fn read_request(
     };
     let mut reader = BufReader::new(source.take((MAX_HEADER_BYTES + MAX_BODY_BYTES) as u64));
     let mut line = String::new();
-    let mut header_bytes = reader.read_line(&mut line)?;
+    let mut header_bytes = read_http_line(&mut reader, &mut line, MAX_HEADER_BYTES)?;
     let mut parts = line.split_whitespace();
     let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
         return Err(invalid("Malformed request line"));
@@ -242,8 +305,8 @@ fn read_request(
     };
     let mut length = 0usize;
     loop {
-        line.clear();
-        let read = reader.read_line(&mut line)?;
+        let remaining = MAX_HEADER_BYTES.saturating_sub(header_bytes);
+        let read = read_http_line(&mut reader, &mut line, remaining)?;
         header_bytes += read;
         if read == 0 || header_bytes > MAX_HEADER_BYTES {
             return Err(invalid("Headers too large or truncated"));
@@ -327,6 +390,7 @@ fn connection(
     server: &Server,
     token: &str,
     admission: &Admission,
+    stop: &Arc<AtomicBool>,
 ) -> io::Result<()> {
     stream.set_nonblocking(false)?;
     // A client that stops reading an event stream must not pin its thread.
@@ -397,12 +461,33 @@ fn connection(
                     }
                 }
             };
-            match tools::call(server, name, &arguments) {
+            let _long = if tools::blocks(name) {
+                let Some(slot) = admission.long_lived() else {
+                    return respond(
+                        &mut stream,
+                        503,
+                        &json!({"error": "Too many concurrent long-lived connections"}),
+                    );
+                };
+                Some(slot)
+            } else {
+                None
+            };
+            match tools::call_with(server, name, &arguments, Some(stop.as_ref()), &mut |_| {}) {
                 Ok(result) => respond(&mut stream, 200, &json!({"result": result})),
                 Err(error) => respond(&mut stream, 400, &json!({"error": format!("{error:#}")})),
             }
         }
-        ("GET", ["runs", id, "events"]) => events(stream, server, id, &request.query),
+        ("GET", ["runs", id, "events"]) => {
+            let Some(_long) = admission.long_lived() else {
+                return respond(
+                    &mut stream,
+                    503,
+                    &json!({"error": "Too many concurrent long-lived connections"}),
+                );
+            };
+            events(stream, server, id, &request.query, stop)
+        }
         (_, ["tools"] | ["tools", _] | ["runs", _, "events"]) => {
             respond(&mut stream, 405, &json!({"error": "Method not allowed"}))
         }
@@ -422,7 +507,8 @@ fn query_param(query: &str, key: &str) -> Option<String> {
 }
 
 fn sse(stream: &mut TcpStream, event: &str, data: &Value) -> io::Result<()> {
-    write!(stream, "event: {event}\ndata: {data}\n\n")?;
+    let payload = format!("event: {event}\ndata: {data}\n\n");
+    stream.write_all(payload.as_bytes())?;
     stream.flush()
 }
 
@@ -440,7 +526,13 @@ fn send_message(stream: &mut TcpStream, message: &Message) -> io::Result<bool> {
 
 /// Streams a run's events until its drive thread finishes. A run this
 /// server is not driving gets its current state and `end` at once.
-fn events(mut stream: TcpStream, server: &Server, id: &str, query: &str) -> io::Result<()> {
+fn events(
+    mut stream: TcpStream,
+    server: &Server,
+    id: &str,
+    query: &str,
+    stop: &Arc<AtomicBool>,
+) -> io::Result<()> {
     let project = query_param(query, "project");
     let (run, info) = match tools::load(server, project.as_deref(), id) {
         Ok(loaded) => loaded,
@@ -459,16 +551,24 @@ fn events(mut stream: TcpStream, server: &Server, id: &str, query: &str) -> io::
             return Ok(());
         }
     }
+    let mut last_keepalive = Instant::now();
     loop {
-        match receiver.recv_timeout(KEEPALIVE) {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        match receiver.recv_timeout(Duration::from_secs(1)) {
             Ok(message) => {
+                last_keepalive = Instant::now();
                 if !send_message(&mut stream, &message)? {
                     return Ok(());
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                stream.write_all(b": keep-alive\n\n")?;
-                stream.flush()?;
+                if last_keepalive.elapsed() >= KEEPALIVE {
+                    stream.write_all(b": keep-alive\n\n")?;
+                    stream.flush()?;
+                    last_keepalive = Instant::now();
+                }
             }
             Err(RecvTimeoutError::Disconnected) => {
                 // The run ended while this subscriber's queue was full.
@@ -528,5 +628,53 @@ mod tests {
         );
         assert_eq!(query_param("a=1", "project"), None);
         assert_eq!(new_token().len(), 64);
+    }
+
+    #[test]
+    fn long_lived_subcap_leaves_slots_for_quick_requests() {
+        let admission = Admission {
+            pending: Arc::new(Mutex::new(Pending::default())),
+            id: 1,
+            active: Arc::new(AtomicUsize::new(0)),
+            long: Arc::new(AtomicUsize::new(0)),
+            left: Cell::new(Some(true)),
+        };
+        let mut active_slots = Vec::new();
+        let mut long_slots = Vec::new();
+        for _ in 0..MAX_LONG_CONNECTIONS {
+            active_slots.push(admission.authenticated().expect("auth slot"));
+            long_slots.push(admission.long_lived().expect("long slot"));
+        }
+        // Further long-lived requests are rejected while quick ones remain open.
+        assert!(admission.long_lived().is_none());
+        let mut quick = Vec::new();
+        for _ in 0..(MAX_CONNECTIONS - MAX_LONG_CONNECTIONS) {
+            quick.push(admission.authenticated().expect("quick auth slot"));
+        }
+        assert!(admission.authenticated().is_none());
+        drop(long_slots);
+        drop(active_slots);
+        drop(quick);
+        assert_eq!(admission.active.load(Ordering::Acquire), 0);
+        assert_eq!(admission.long.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn oversized_request_line_is_rejected_at_header_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let writer = std::thread::spawn(move || {
+            let line = format!(
+                "GET /{} HTTP/1.1\r\n\r\n",
+                "a".repeat(MAX_HEADER_BYTES + 128)
+            );
+            let _ = client.write_all(line.as_bytes());
+        });
+        let error = read_request(&stream, "token", Duration::from_secs(2), || true)
+            .err()
+            .expect("oversized request line must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        writer.join().unwrap();
     }
 }

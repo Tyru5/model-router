@@ -75,10 +75,9 @@ impl Server {
         })
     }
 
-    /// The project a tool call names, or the server's own. Relative paths
-    /// resolve against the server's project. Rejects projects outside the
-    /// allowed roots and untrusted ones.
-    fn project(&self, requested: Option<&str>) -> Result<PathBuf> {
+    /// The project a tool call names, or the server's own, after checking
+    /// allowed roots and configuration path.
+    fn check_project_root(&self, requested: Option<&str>) -> Result<(PathBuf, Option<&Path>)> {
         let project = match requested.map(str::trim).filter(|p| !p.is_empty()) {
             None => self.project.clone(),
             Some(path) => {
@@ -100,17 +99,30 @@ impl Server {
         let explicit = (project == self.project)
             .then_some(self.config.as_deref())
             .flatten();
+        Ok((project, explicit))
+    }
+
+    /// The project a tool call names, or the server's own. Relative paths
+    /// resolve against the server's project. Rejects projects outside the
+    /// allowed roots and untrusted ones.
+    fn project(&self, requested: Option<&str>) -> Result<PathBuf> {
+        let (project, explicit) = self.check_project_root(requested)?;
         ensure_trusted(&project, explicit)?;
         Ok(project)
     }
 
-    /// The project's settings, read afresh so edits apply to the next call.
-    /// `--config` applies to the server's own project only.
-    fn settings(&self, project: &Path) -> Result<config::Settings> {
-        let explicit = (project == self.project)
-            .then_some(self.config.as_deref())
-            .flatten();
-        Ok(config::load(project, explicit)?.0)
+    /// Resolves the project, verifies trust, and returns its settings in one load.
+    fn project_and_settings(&self, requested: Option<&str>) -> Result<(PathBuf, config::Settings)> {
+        let (project, explicit) = self.check_project_root(requested)?;
+        let loaded = config::load_config(&project, explicit)?;
+        if let Some(review) = loaded.review() {
+            anyhow::bail!(
+                "{}\nRun `model-router -C {} trust` first.",
+                review.text().trim_end(),
+                project.display()
+            );
+        }
+        Ok((project, loaded.settings))
     }
 }
 
@@ -172,20 +184,18 @@ pub fn run(
         let (server, stop) = (server.clone(), shutdown.clone());
         std::thread::spawn(move || http::serve(listener, server, token, stop));
     }
-    // A signal cancels every run, gives harnesses time to stop, then exits:
-    // the MCP loop may be blocked reading stdin.
-    {
-        let (server, stop) = (server.clone(), shutdown.clone());
+    if args.mcp {
+        // A signal cancels every run, gives harnesses time to stop, then exits:
+        // the MCP loop may be blocked reading stdin.
+        let (server_bg, stop) = (server.clone(), shutdown.clone());
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(100));
             }
             log("stopping: cancelling active runs");
-            server.runs.shutdown(SHUTDOWN_GRACE);
+            server_bg.runs.shutdown(SHUTDOWN_GRACE);
             std::process::exit(130);
         });
-    }
-    if args.mcp {
         log(format!(
             "MCP on stdio for {} (protocol {})",
             server.project.display(),
@@ -201,11 +211,14 @@ pub fn run(
         while calls.iter().any(|call| !call.is_finished()) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
+        server.runs.shutdown(SHUTDOWN_GRACE);
     } else {
         while !shutdown.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(100));
         }
+        log("stopping: cancelling active runs");
+        server.runs.shutdown(SHUTDOWN_GRACE);
+        std::process::exit(130);
     }
-    server.runs.shutdown(SHUTDOWN_GRACE);
     Ok(())
 }

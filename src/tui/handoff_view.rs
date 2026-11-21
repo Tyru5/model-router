@@ -13,7 +13,14 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap},
 };
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+
+struct CachedLines {
+    palette: Palette,
+    lines: Vec<Line<'static>>,
+    width: u16,
+    rows: u16,
+}
 
 pub(super) struct HandoffView {
     pub(super) handoff: Handoff,
@@ -23,6 +30,8 @@ pub(super) struct HandoffView {
     pub(super) scroll: u16,
     /// How far the body can scroll, as last drawn.
     limit: Cell<u16>,
+    /// Built lines and wrapped row count cached across scroll frames.
+    cached: RefCell<Option<CachedLines>>,
 }
 
 /// What a key asks of the app.
@@ -42,6 +51,7 @@ impl HandoffView {
             selected: 0,
             scroll: 0,
             limit: Cell::new(u16::MAX),
+            cached: RefCell::new(None),
         }
     }
 
@@ -202,15 +212,47 @@ impl HandoffView {
         let list_height = if files.is_empty() {
             0
         } else {
-            (files.len() as u16 + 1).min(inner.height / 3).max(2)
+            u16::try_from(files.len().saturating_add(1))
+                .unwrap_or(u16::MAX)
+                .min(inner.height / 3)
+                .max(2)
         };
         let [body, list] =
             Layout::vertical([Constraint::Min(3), Constraint::Length(list_height)]).areas(inner);
-        let lines = self.lines(palette);
-        let rows: u16 = lines
-            .iter()
-            .map(|l| super::widgets::rows_for(l, body.width, u16::MAX))
-            .fold(0, u16::saturating_add);
+        let (lines, rows) = {
+            let mut cache = self.cached.borrow_mut();
+            let hit = match cache.as_mut() {
+                Some(entry) if entry.palette == palette => {
+                    if entry.width != body.width {
+                        entry.rows = entry
+                            .lines
+                            .iter()
+                            .map(|l| super::widgets::rows_for(l, body.width, u16::MAX))
+                            .fold(0, u16::saturating_add);
+                        entry.width = body.width;
+                    }
+                    Some((entry.lines.clone(), entry.rows))
+                }
+                _ => None,
+            };
+            if let Some(hit) = hit {
+                hit
+            } else {
+                let lines = self.lines(palette);
+                let rows = lines
+                    .iter()
+                    .map(|l| super::widgets::rows_for(l, body.width, u16::MAX))
+                    .fold(0, u16::saturating_add);
+                let cloned = lines.clone();
+                *cache = Some(CachedLines {
+                    palette,
+                    lines,
+                    width: body.width,
+                    rows,
+                });
+                (cloned, rows)
+            }
+        };
         self.limit.set(rows.saturating_sub(body.height));
         frame.render_widget(
             Paragraph::new(lines)

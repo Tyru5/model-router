@@ -96,6 +96,15 @@ pub fn refuse_unproven_in_checkout(project: &Path) -> Result<()> {
     )
 }
 
+/// Refuses to launch anything for `run` while `run` itself holds an unproven
+/// surviving group in `retained_groups`.
+pub(super) fn refuse_own_unproven(run: &Run) -> Result<()> {
+    refuse(
+        &format!("run {}", run.id),
+        &unproven(&run.id, &run.retained_groups),
+    )
+}
+
 /// Lines naming each of `groups`, retained by run `id`, still alive.
 pub(super) fn unproven(id: &str, groups: &[process::Group]) -> Vec<String> {
     groups
@@ -116,21 +125,54 @@ pub(super) fn unproven(id: &str, groups: &[process::Group]) -> Vec<String> {
         .collect()
 }
 
+#[derive(Deserialize)]
+struct RetainedMeta {
+    id: String,
+    worktree: bool,
+    #[serde(default)]
+    run_bytes: Option<u64>,
+    #[serde(default)]
+    retained_groups: Vec<process::Group>,
+}
+
 /// `unproven` for every run in `project`'s own checkout but `except`. Runs
 /// with their own worktree work elsewhere.
 pub(super) fn unproven_in_checkout(project: &Path, except: Option<&str>) -> Vec<String> {
-    let Ok(entries) = crate::history::list(project) else {
+    let dir = project.join(".model-router/runs");
+    let Ok(items) = fs::read_dir(&dir) else {
         return vec![];
     };
-    entries
-        .iter()
-        .filter_map(|entry| match entry {
-            crate::history::Entry::Summary(summary) => Some(summary),
-            crate::history::Entry::Damaged { .. } => None,
-        })
-        .filter(|summary| !summary.worktree && Some(summary.id.as_str()) != except)
-        .flat_map(|summary| unproven(&summary.id, &summary.retained_groups))
-        .collect()
+    let mut lines = Vec::new();
+    for item in items.flatten() {
+        if !item.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let id = item.file_name().to_string_lossy().into_owned();
+        if except == Some(id.as_str()) {
+            continue;
+        }
+        let run_dir = item.path();
+        if let Ok(meta) = storage::read_json::<RetainedMeta>(&run_dir.join("summary.json")) {
+            let run_bytes = fs::metadata(run_dir.join("run.json")).map(|m| m.len());
+            let consistent = match (meta.run_bytes, run_bytes) {
+                (Some(expected), Ok(actual)) => expected == actual,
+                (None, Ok(actual)) => actual > 0,
+                (_, Err(_)) => false,
+            };
+            if meta.id == id && consistent {
+                if !meta.worktree && !meta.retained_groups.is_empty() {
+                    lines.extend(unproven(&meta.id, &meta.retained_groups));
+                }
+                continue;
+            }
+        }
+        if let Ok(run) = load(project, &id) {
+            if !run.worktree && !run.retained_groups.is_empty() {
+                lines.extend(unproven(&run.id, &run.retained_groups));
+            }
+        }
+    }
+    lines
 }
 
 pub(super) fn refuse(what: &str, alive: &[String]) -> Result<()> {
@@ -152,7 +194,10 @@ pub fn release_groups(run: &mut Run) -> Result<Vec<process::Group>> {
     run.check_revision()?;
     let released = std::mem::take(&mut run.retained_groups);
     if !released.is_empty() {
-        run.persist()?;
+        if let Err(err) = run.persist() {
+            run.retained_groups = released;
+            return Err(err);
+        }
     }
     Ok(released)
 }

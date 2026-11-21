@@ -100,7 +100,10 @@ saved as cancelled can be retried later from the server, CLI, or TUI.
 `--http ADDR` binds loopback only unless `--allow-remote` is given. Every
 request needs `Authorization: Bearer TOKEN`. The token comes from
 `MODEL_ROUTER_SERVE_TOKEN`, or is generated at startup and printed to stderr.
-Port 0 picks a free port; the bound address is printed to stderr.
+Port 0 picks a free port; the bound address is printed to stderr. HTTP allows at
+most 16 pending unauthenticated connections and 32 authenticated connections (of
+which at most 24 may be event streams or `wait_run` calls), with a 64 KiB header
+cap, 1 MiB body cap, and 10-second request read deadline.
 
 | Route | Body / query | Response |
 | --- | --- | --- |

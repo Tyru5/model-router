@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicPtr, Ordering},
     },
 };
 
@@ -359,20 +359,56 @@ fn main() {
     }
 }
 
+static CANCEL_FLAG: AtomicPtr<AtomicBool> = AtomicPtr::new(std::ptr::null_mut());
+
+extern "C" fn handle_termination_signal(_: libc::c_int) {
+    let ptr = CANCEL_FLAG.load(Ordering::Acquire);
+    if !ptr.is_null() {
+        // SAFETY: `register_cancel_flag` leaks a cloned `Arc<AtomicBool>` once
+        // for the process lifetime, and `AtomicBool::store` is lock-free and
+        // async-signal-safe.
+        unsafe { &*ptr }.store(true, Ordering::Relaxed);
+    }
+}
+
+fn register_cancel_flag(cancel: &Arc<AtomicBool>) {
+    let raw = Arc::into_raw(cancel.clone()) as *mut AtomicBool;
+    if CANCEL_FLAG
+        .compare_exchange(
+            std::ptr::null_mut(),
+            raw,
+            Ordering::Release,
+            Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        // SAFETY: `raw` was just produced by `Arc::into_raw` and never published.
+        unsafe { drop(Arc::from_raw(raw)) };
+    }
+}
+
+fn install_signal_handlers(cancel: &Arc<AtomicBool>) -> Result<()> {
+    register_cancel_flag(cancel);
+    // SAFETY: `action` is zero-initialized, `sa_mask` is emptied via
+    // `sigemptyset`, and `handle_termination_signal` is async-signal-safe.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handle_termination_signal as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = libc::SA_RESTART;
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            ensure!(
+                libc::sigaction(sig, &action, std::ptr::null_mut()) == 0,
+                "Register signal handler for {sig}: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn main_result() -> Result<()> {
     let cli = Cli::parse();
-    let cwd = catalog::check_project(Path::new("."))?;
-    let project = match &cli.project {
-        Some(path) => catalog::check_project(path)?,
-        None => catalog::detect_project(&cwd)?,
-    };
-    // Tell the TUI when the project was found above the current directory.
-    let detected_from = (cli.project.is_none() && project != cwd).then_some(cwd);
-    let cancel = Arc::new(AtomicBool::new(false));
-    let signal = cancel.clone();
-    ctrlc::set_handler(move || {
-        signal.store(true, Ordering::Relaxed);
-    })?;
     match &cli.command {
         Some(Commands::Presets) => {
             print!("{}", presets::listing());
@@ -381,6 +417,18 @@ fn main_result() -> Result<()> {
         Some(Commands::Completions { shell, bin }) => {
             return cli::manage::completions::<Cli>(*shell, bin);
         }
+        _ => {}
+    }
+    let cwd = catalog::check_project(Path::new("."))?;
+    let project = match &cli.project {
+        Some(path) => catalog::check_project(path)?,
+        None => catalog::detect_project(&cwd)?,
+    };
+    // Tell the TUI when the project was found above the current directory.
+    let detected_from = (cli.project.is_none() && project != cwd).then_some(cwd);
+    let cancel = Arc::new(AtomicBool::new(false));
+    install_signal_handlers(&cancel)?;
+    match &cli.command {
         Some(Commands::Init {
             global,
             force,
@@ -622,5 +670,25 @@ fn main_result() -> Result<()> {
             worktrees,
             yes,
         }) => cli::manage::clean(&project, older_than, status, keep, worktrees, yes),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn termination_signal_handler_sets_and_allows_resetting_cancel_flag() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        register_cancel_flag(&cancel);
+        assert!(!cancel.load(Ordering::Relaxed));
+
+        handle_termination_signal(libc::SIGTERM);
+        assert!(cancel.load(Ordering::Relaxed));
+
+        // Matches TUI resetting the cancel flag after returning from an external editor.
+        cancel.store(false, Ordering::Relaxed);
+        handle_termination_signal(libc::SIGHUP);
+        assert!(cancel.load(Ordering::Relaxed));
     }
 }

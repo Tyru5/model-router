@@ -1,26 +1,61 @@
 use anyhow::{Context, Result, ensure};
-use fs2::FileExt;
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
+    borrow::Cow,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{ErrorKind, Write},
     path::{Path, PathBuf},
     process::Command,
 };
 
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+    atomic_write_inner(path, data, true)
+}
+
+/// Atomically writes `data` to `path` without fsyncing the file or parent
+/// directory: for regenerable artifacts such as prompts and diff caches.
+pub fn atomic_write_fast(path: &Path, data: &[u8]) -> Result<()> {
+    atomic_write_inner(path, data, false)
+}
+
+fn atomic_write_inner(path: &Path, data: &[u8], sync: bool) -> Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    #[cfg(unix)]
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_file() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = temp
+                .as_file()
+                .set_permissions(fs::Permissions::from_mode(meta.permissions().mode()));
+        }
+    }
     temp.write_all(data)?;
-    temp.as_file().sync_all()?;
+    if sync {
+        temp.as_file().sync_all()?;
+    }
     temp.persist(path)
         .with_context(|| format!("Save {}", path.display()))?;
     #[cfg(unix)]
-    File::open(parent)?.sync_all()?;
+    if sync {
+        if let Ok(dir) = File::open(parent) {
+            if let Err(error) = dir.sync_all() {
+                let unsupported = matches!(
+                    error.kind(),
+                    ErrorKind::InvalidInput
+                        | ErrorKind::PermissionDenied
+                        | ErrorKind::ReadOnlyFilesystem
+                ) || error.raw_os_error() == Some(libc::EBADF);
+                if !unsupported {
+                    return Err(error.into());
+                }
+            }
+        }
+    }
     Ok(())
 }
 /// Creates `path` as a new file, first removing whatever file or link is
@@ -40,6 +75,9 @@ pub fn create_fresh(path: &Path) -> Result<File> {
 }
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     atomic_write(path, &serde_json::to_vec_pretty(value)?)
+}
+pub fn write_json_fast<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    atomic_write_fast(path, &serde_json::to_vec_pretty(value)?)
 }
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     serde_json::from_slice(&fs::read(path).with_context(|| format!("Read {}", path.display()))?)
@@ -62,6 +100,22 @@ pub fn metadata_dir(project: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
+fn flock(file: &File, operation: libc::c_int) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    loop {
+        // SAFETY: `file` owns a valid open file descriptor for the duration of the call.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), operation) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
+}
+
 /// The second field is set once the lock was handed to another process.
 pub struct FileLock(File, std::sync::atomic::AtomicBool);
 
@@ -73,7 +127,7 @@ impl Drop for FileLock {
         }
         // Closing alone can leave the lock held by a descriptor inherited by
         // another thread's child process until it execs. Release it explicitly.
-        let _ = FileExt::unlock(&self.0);
+        let _ = flock(&self.0, libc::LOCK_UN);
     }
 }
 
@@ -116,20 +170,35 @@ pub fn lock(path: &Path) -> Result<FileLock> {
         .create(true)
         .truncate(false)
         .open(path)?;
-    file.try_lock_exclusive()
+    flock(&file, libc::LOCK_EX | libc::LOCK_NB)
         .with_context(|| format!("Another router process is using {}", path.display()))?;
     Ok(FileLock(file, Default::default()))
 }
 
 /// `lock`, retrying for up to `wait` while another holder (often a brief
-/// probe such as `is_locked`) has it.
+/// probe such as `is_locked`) has it. Permanent open/lock errors return at once.
 pub fn lock_wait(path: &Path, wait: std::time::Duration) -> Result<FileLock> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
     let deadline = std::time::Instant::now() + wait;
     loop {
-        match lock(path) {
-            Ok(lock) => return Ok(lock),
-            Err(error) if std::time::Instant::now() >= deadline => return Err(error),
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+        match flock(&file, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(()) => return Ok(FileLock(file, Default::default())),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(error).with_context(|| {
+                        format!("Another router process is using {}", path.display())
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("Lock {}", path.display()));
+            }
         }
     }
 }
@@ -142,9 +211,9 @@ pub fn is_locked(path: &Path) -> bool {
     let Ok(file) = OpenOptions::new().read(true).open(path) else {
         return false;
     };
-    match FileExt::try_lock_shared(&file) {
+    match flock(&file, libc::LOCK_SH | libc::LOCK_NB) {
         Ok(()) => {
-            let _ = FileExt::unlock(&file);
+            let _ = flock(&file, libc::LOCK_UN);
             false
         }
         Err(_) => true,
@@ -190,21 +259,34 @@ pub struct RepoInfo {
 }
 
 pub fn repo_info(project: &Path) -> Option<RepoInfo> {
-    let top = git(project, &["rev-parse", "--show-toplevel"]).ok()?;
+    let top = git_readonly(project, &["rev-parse", "--show-toplevel"]).ok()?;
     let name = Path::new(&top)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| top.clone());
-    let (head, detached) = match git(project, &["symbolic-ref", "--short", "-q", "HEAD"]) {
-        Ok(branch) if !branch.is_empty() => (branch, false),
-        _ => (
-            git(project, &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|_| "no commits".into()),
-            true,
-        ),
+    let status = git_readonly(project, &["status", "--porcelain=v2", "--branch"]).ok()?;
+    let mut oid = None;
+    let mut branch_head = None;
+    let mut changes = 0usize;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("# branch.oid ") {
+            oid = Some(rest.trim());
+        } else if let Some(rest) = line.strip_prefix("# branch.head ") {
+            branch_head = Some(rest.trim());
+        } else if !line.starts_with('#') && !line.is_empty() {
+            changes += 1;
+        }
+    }
+    let (head, detached) = match branch_head {
+        Some("(detached)") | None => {
+            let short = oid
+                .filter(|o| *o != "(initial)")
+                .map(|o| o.get(..7).unwrap_or(o).to_owned())
+                .unwrap_or_else(|| "no commits".into());
+            (short, true)
+        }
+        Some(branch) => (branch.to_owned(), false),
     };
-    let changes = git(project, &["status", "--porcelain"])
-        .map(|s| s.lines().count())
-        .unwrap_or(0);
     Some(RepoInfo {
         name,
         head,
@@ -214,11 +296,20 @@ pub fn repo_info(project: &Path) -> Option<RepoInfo> {
 }
 
 pub fn git(project: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(project)
-        .output()
-        .context("Start Git")?;
+    git_with(project, args, false)
+}
+
+pub fn git_readonly(project: &Path, args: &[&str]) -> Result<String> {
+    git_with(project, args, true)
+}
+
+fn git_with(project: &Path, args: &[&str], no_optional_locks: bool) -> Result<String> {
+    let mut command = Command::new("git");
+    command.args(args).current_dir(project);
+    if no_optional_locks {
+        command.env("GIT_OPTIONAL_LOCKS", "0");
+    }
+    let output = command.output().context("Start Git")?;
     ensure!(
         output.status.success(),
         "git {}: {}",
@@ -234,7 +325,7 @@ pub fn git(project: &Path, args: &[&str]) -> Result<String> {
 /// project has uncommitted changes, which the worktree would not include.
 pub fn create_worktree(project: &Path, id: &str, require_clean: bool) -> Result<PathBuf> {
     ensure!(
-        !require_clean || git(project, &["status", "--porcelain"])?.is_empty(),
+        !require_clean || git_readonly(project, &["status", "--porcelain"])?.is_empty(),
         "Worktree mode starts from committed HEAD. Commit or stash project changes, or use the current directory instead"
     );
     let base = metadata_dir(project)?.join("worktrees");
@@ -255,11 +346,25 @@ pub fn create_worktree(project: &Path, id: &str, require_clean: bool) -> Result<
 }
 
 pub fn clean_terminal(text: &str) -> String {
-    let stripped = strip_ansi_escapes::strip_str(text);
-    stripped
-        .chars()
-        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
-        .collect()
+    let bytes = text.as_bytes();
+    if !bytes
+        .iter()
+        .any(|&b| (b < 0x20 && b != b'\n' && b != b'\t') || b == 0x7f || b == 0xc2)
+    {
+        return text.to_owned();
+    }
+    let stripped: Cow<'_, str> = if bytes.iter().any(|&b| b == 0x1b || b == 0xc2) {
+        Cow::Owned(strip_ansi_escapes::strip_str(text))
+    } else {
+        Cow::Borrowed(text)
+    };
+    let mut out = String::with_capacity(stripped.len());
+    for c in stripped.chars() {
+        if !c.is_control() || c == '\n' || c == '\t' {
+            out.push(c);
+        }
+    }
+    out
 }
 
 pub fn truncate(text: &str, max: usize) -> String {
@@ -314,5 +419,68 @@ mod tests {
         release.join().unwrap();
         let _held = lock(&path).unwrap();
         assert!(lock_wait(&path, std::time::Duration::from_millis(100)).is_err());
+        // Permanent open errors (like locking a directory) fail immediately.
+        let started = std::time::Instant::now();
+        assert!(lock_wait(dir.path(), std::time::Duration::from_secs(5)).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handed_over_lock_stays_held_after_drop_and_shared_probes_coexist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.lock");
+        let guard = lock(&path).unwrap();
+        let peer = guard.0.try_clone().unwrap();
+        guard.hand_over();
+        drop(guard);
+        assert!(is_locked(&path));
+        assert!(lock(&path).is_err());
+        drop(peer);
+        assert!(!is_locked(&path));
+
+        let probe_a = OpenOptions::new().read(true).open(&path).unwrap();
+        let probe_b = OpenOptions::new().read(true).open(&path).unwrap();
+        flock(&probe_a, libc::LOCK_SH | libc::LOCK_NB).unwrap();
+        flock(&probe_b, libc::LOCK_SH | libc::LOCK_NB).unwrap();
+        assert!(lock(&path).is_err());
+        let _ = flock(&probe_a, libc::LOCK_UN);
+        let _ = flock(&probe_b, libc::LOCK_UN);
+        drop(probe_a);
+        drop(probe_b);
+        assert!(lock(&path).is_ok());
+    }
+
+    #[test]
+    fn repo_info_handles_initial_branch_detached_and_dirty_states() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(repo_info(dir.path()).is_none());
+        let run_git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "{args:?}");
+        };
+        run_git(&["init", "-b", "main"]);
+        let empty = repo_info(dir.path()).unwrap();
+        assert_eq!(empty.head, "main");
+        assert!(!empty.detached);
+        assert_eq!(empty.changes, 0);
+
+        fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+        let dirty = repo_info(dir.path()).unwrap();
+        assert_eq!(dirty.changes, 1);
+
+        run_git(&["config", "user.name", "Test"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["add", "a.txt"]);
+        run_git(&["commit", "-m", "init"]);
+        run_git(&["checkout", "--detach"]);
+        let detached = repo_info(dir.path()).unwrap();
+        assert!(detached.detached);
+        assert_eq!(detached.changes, 0);
+        assert!(!detached.head.is_empty() && detached.head != "no commits");
     }
 }

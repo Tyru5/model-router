@@ -46,13 +46,35 @@ pub fn run(
     workspace: &Path,
     attempt: &Path,
     cancel: &AtomicBool,
+    record_group: impl FnMut(Option<process::Group>) -> Result<()>,
+    output: impl FnMut(String),
+) -> Result<(Vec<CheckResult>, bool)> {
+    run_with_abort(
+        checks,
+        workspace,
+        attempt,
+        cancel,
+        None,
+        record_group,
+        output,
+    )
+}
+
+/// Runs checks with an optional secondary `abort` flag alongside `cancel`.
+pub fn run_with_abort(
+    checks: &[Check],
+    workspace: &Path,
+    attempt: &Path,
+    cancel: &AtomicBool,
+    abort: Option<&AtomicBool>,
     mut record_group: impl FnMut(Option<process::Group>) -> Result<()>,
     mut output: impl FnMut(String),
 ) -> Result<(Vec<CheckResult>, bool)> {
     let mut results = Vec::new();
     let mut cancelled = false;
     for (index, check) in checks.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.load(Ordering::Relaxed) || abort.is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
             cancelled = true;
             break;
         }
@@ -76,9 +98,25 @@ pub fn run(
         }
         let label = format!("[check {}/{}]", index + 1, checks.len());
         output(format!("\n{label} {}\n", shell_words::join(&check.command)));
+        let started_at = Utc::now();
+        let Some((program, args)) = check.command.split_first() else {
+            let result = CheckResult {
+                command: check.command.clone(),
+                required: check.required,
+                status: TestStatus::Failed,
+                exit_code: None,
+                started_at,
+                finished_at: Utc::now(),
+                directory,
+                error: Some("Check command is empty".into()),
+            };
+            output(format!("{label} Check command is empty\n"));
+            results.push(result);
+            continue;
+        };
         let invocation = Invocation {
-            program: check.command[0].clone(),
-            args: check.command[1..].to_vec(),
+            program: program.clone(),
+            args: args.to_vec(),
             stdin: None,
             kind: OutputKind::Text,
             final_file: PathBuf::new(),
@@ -86,26 +124,45 @@ pub fn run(
             files: vec![],
             assign: None,
         };
-        let started_at = Utc::now();
         let mut line_start = true;
-        let outcome = process::capture_with(
+        let outcome = process::capture_with_stall_and_abort(
             &invocation,
             workspace,
             &directory,
             Duration::from_secs(check.timeout_seconds),
+            None,
             cancel,
+            abort,
             None,
             |group| record_group(Some(group)),
             |err, text| {
-                line_start = text.ends_with('\n');
-                output(format!(
-                    "{}{}",
-                    if err { "[stderr] " } else { "" },
-                    storage::clean_terminal(text)
-                ))
+                let cleaned = storage::clean_terminal(text);
+                if cleaned.is_empty() {
+                    return;
+                }
+                if !err {
+                    line_start = cleaned.ends_with('\n');
+                    output(cleaned);
+                    return;
+                }
+                let mut formatted = String::with_capacity(cleaned.len() + 9);
+                for segment in cleaned.split_inclusive('\n') {
+                    if line_start {
+                        formatted.push_str("[stderr] ");
+                    }
+                    formatted.push_str(segment);
+                    line_start = segment.ends_with('\n');
+                }
+                output(formatted);
             },
         );
-        record_group(None)?;
+        let survived = outcome
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.downcast_ref::<process::Survivor>().is_some());
+        if !survived {
+            record_group(None)?;
+        }
         let (status, exit_code, error) = match outcome {
             Ok(o) if o.cancelled => {
                 cancelled = true;
@@ -186,5 +243,44 @@ mod tests {
             let log = attempt.join(format!("checks/{n:02}/stdout.log"));
             assert_eq!(fs::read_to_string(&log).unwrap(), format!("{text}\n"));
         }
+    }
+
+    #[test]
+    fn empty_command_fails_cleanly_and_stderr_prefixes_lines_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempt = dir.path().join("attempt");
+        fs::create_dir_all(&attempt).unwrap();
+        let empty = Check {
+            command: vec![],
+            required: true,
+            ..Default::default()
+        };
+        let multi = Check {
+            command: vec![
+                "python3".into(),
+                "-c".into(),
+                "import sys, time; sys.stderr.write('a'); sys.stderr.flush(); time.sleep(0.05); sys.stderr.write('b\\nc\\n'); sys.stderr.flush()".into(),
+            ],
+            required: true,
+            ..Default::default()
+        };
+        let mut collected = String::new();
+        let (results, cancelled) = run(
+            &[empty, multi],
+            dir.path(),
+            &attempt,
+            &AtomicBool::new(false),
+            |_| Ok(()),
+            |text| collected.push_str(&text),
+        )
+        .unwrap();
+        assert!(!cancelled);
+        assert_eq!(results[0].status, TestStatus::Failed);
+        assert_eq!(results[0].error.as_deref(), Some("Check command is empty"));
+        assert_eq!(results[1].status, TestStatus::Passed);
+        assert!(
+            collected.contains("[stderr] ab\n[stderr] c\n"),
+            "{collected:?}"
+        );
     }
 }

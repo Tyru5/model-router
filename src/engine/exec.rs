@@ -32,14 +32,14 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
         None => handoff_dir.join(format!("{}-{number:03}.json", stage.id)),
     };
     ensure!(
-        !handoff_file.exists(),
+        fs::symlink_metadata(&handoff_file).is_err(),
         "Handoff path already exists: {}",
         handoff_file.display()
     );
     let prompt_file = directory.join("prompt.md");
     // The prompt names this copy of the handoff schema.
     let schema_file = directory.join(handoff::SCHEMA_FILE);
-    storage::atomic_write(&schema_file, handoff::SCHEMA.as_bytes())?;
+    storage::atomic_write_fast(&schema_file, handoff::SCHEMA.as_bytes())?;
     let text = match &resume {
         Some(resume) => format!(
             "Interactive takeover of harness session {}. The session's own history holds the stage prompt. Write a new handoff for this attempt to {}; the previous attempt's file there was moved aside and is not read.\n",
@@ -48,7 +48,7 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
         ),
         None => prompt(run, &handoff_file, &schema_file),
     };
-    storage::atomic_write(&prompt_file, text.as_bytes())?;
+    storage::atomic_write_fast(&prompt_file, text.as_bytes())?;
     let paths = ContextPaths {
         workspace: &run.workspace,
         attempt_dir: &directory,
@@ -83,7 +83,7 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
             program: &invocation.program,
         },
     )?;
-    storage::write_json(
+    storage::write_json_fast(
         &directory.join("command.json"),
         &serde_json::json!({ "program": invocation.program, "args": invocation.args, "stdin_from": invocation.stdin.as_ref().map(|_| "prompt.md"), "env": invocation.env.iter().map(|(name, _)| name).collect::<Vec<_>>(), "workspace": run.workspace, "model": stage.model, "provider": stage.provider, "effort": stage.effort, "mode": stage.mode, "sandbox": sandbox }),
     )?;
@@ -196,6 +196,37 @@ pub(super) fn classify_exit(
             );
         }
     }
+    evaluate_outcome(mode, prepared, &outcome)
+}
+
+fn format_failure_detail(
+    dir: &Path,
+    kind: adapters::OutputKind,
+    code: Option<i32>,
+    unattended: bool,
+    prefix: &str,
+) -> String {
+    // A JSON error event names the cause; stderr often holds only warnings.
+    let reported = unattended
+        .then(|| process::read_tail(&dir.join("stdout.log"), 4 * 1024 * 1024).ok())
+        .flatten()
+        .and_then(|raw| handoff::normalize(&raw, kind).error);
+    let detail = match reported {
+        Some(error) => error.to_string(),
+        None => storage::clean_terminal(
+            &process::read_tail(&dir.join("stderr.log"), 3000).unwrap_or_default(),
+        ),
+    };
+    format!("{prefix} {}. {}", ended(code), detail.trim())
+        .trim_end()
+        .to_owned()
+}
+
+pub(super) fn evaluate_outcome(
+    mode: Mode,
+    prepared: &Prepared,
+    outcome: &process::Outcome,
+) -> Result<Exit> {
     if outcome.cancelled {
         return Ok(Exit::Stopped(
             Status::Cancelled,
@@ -217,26 +248,18 @@ pub(super) fn classify_exit(
         ));
     }
     if !outcome.success() {
-        // A JSON error event names the cause; stderr often holds only warnings.
-        let reported = (mode == Mode::Unattended)
-            .then(|| process::read_tail(&stdout, 4 * 1024 * 1024).ok())
-            .flatten()
-            .and_then(|raw| handoff::normalize(&raw, prepared.invocation.kind).error);
-        let detail = match reported {
-            Some(error) => error.to_string(),
-            None => storage::clean_terminal(
-                &process::read_tail(&prepared.directory.join("stderr.log"), 3000)
-                    .unwrap_or_default(),
-            ),
-        };
         return Ok(Exit::Stopped(
             Status::Failed,
-            format!("Harness {}. {}", ended(outcome.code), detail.trim())
-                .trim_end()
-                .to_owned(),
+            format_failure_detail(
+                &prepared.directory,
+                prepared.invocation.kind,
+                outcome.code,
+                mode == Mode::Unattended,
+                "Harness",
+            ),
         ));
     }
-    let raw = process::read_tail(&stdout, 4 * 1024 * 1024)?;
+    let raw = process::read_tail(&prepared.directory.join("stdout.log"), 4 * 1024 * 1024)?;
     let normalized = if mode == Mode::Interactive {
         handoff::Normalized {
             text: storage::clean_terminal(&raw),
@@ -340,6 +363,12 @@ pub(super) fn keep_survivor(run: &mut Run, result: &Result<process::Outcome>) {
     }
 }
 
+enum RepairOutcome {
+    Repaired(HandoffSource, Box<Handoff>),
+    Cancelled,
+    Unchanged,
+}
+
 /// When `workflow.handoff_repair` is enabled and an unattended stage exited 0
 /// with missing or malformed handoff JSON, sends one follow-up on the same
 /// session asking only for valid handoff JSON (`adapters::follow_up`). Every
@@ -351,13 +380,13 @@ fn try_handoff_repair(
     failure: &str,
     cancel: &AtomicBool,
     emit: &mut impl FnMut(Event),
-) -> Result<Option<(HandoffSource, Handoff)>> {
+) -> Result<RepairOutcome> {
     let stage = run.workflow.stages[index].clone();
     if !run.workflow.handoff_repair
         || stage.mode != Mode::Unattended
         || cancel.load(Ordering::Relaxed)
     {
-        return Ok(None);
+        return Ok(RepairOutcome::Unchanged);
     }
     let mut skip = |reason: String| {
         emit(Event::Output(format!("Handoff repair skipped: {reason}\n")));
@@ -367,7 +396,7 @@ fn try_handoff_repair(
             "{} has no unattended follow-up command for a session",
             stage.harness
         ));
-        return Ok(None);
+        return Ok(RepairOutcome::Unchanged);
     }
     let session = run.stages[index]
         .attempts
@@ -380,18 +409,18 @@ fn try_handoff_repair(
         });
     let Some(session) = session else {
         skip(format!("no session ID recorded for {}", stage.harness));
-        return Ok(None);
+        return Ok(RepairOutcome::Unchanged);
     };
     let repair_dir = prepared.directory.join("repair");
     fs::create_dir_all(&repair_dir)?;
     let repair_prompt_file = repair_dir.join("prompt.md");
-    let schema_path = run.directory.join(handoff::SCHEMA_FILE);
+    let schema_path = prepared.directory.join(handoff::SCHEMA_FILE);
     let repair_prompt = format!(
         "Your previous response finished the stage work, but its handoff JSON was missing or invalid ({failure}).\n\
 Do not edit any project files or run destructive commands. Emit ONLY a valid handoff JSON matching the required contract for the work you just completed.\n{}",
         handoff::contract(stage.role, &prepared.handoff_file, &schema_path)
     );
-    storage::atomic_write(&repair_prompt_file, repair_prompt.as_bytes())?;
+    storage::atomic_write_fast(&repair_prompt_file, repair_prompt.as_bytes())?;
     let paths = ContextPaths {
         workspace: &run.workspace,
         attempt_dir: &repair_dir,
@@ -409,7 +438,7 @@ Do not edit any project files or run destructive commands. Emit ONLY a valid han
         Ok(invocation) => invocation,
         Err(error) => {
             skip(format!("{error:#}"));
-            return Ok(None);
+            return Ok(RepairOutcome::Unchanged);
         }
     };
     emit(Event::Output(format!(
@@ -436,8 +465,7 @@ Do not edit any project files or run destructive commands. Emit ONLY a valid han
             if let Some(attempt) = run.stages[index].attempts.last_mut() {
                 attempt.set_group(Some(group));
             }
-            let _ = run.persist();
-            Ok(())
+            run.persist()
         },
         |err, text| {
             if err {
@@ -453,7 +481,7 @@ Do not edit any project files or run destructive commands. Emit ONLY a valid han
     if let Some(attempt) = run.stages[index].attempts.last_mut() {
         attempt.set_group(None);
     }
-    let _ = run.persist();
+    run.persist()?;
     let mut failed = |reason: String| {
         emit(Event::Output(format!("Handoff repair failed: {reason}\n")));
     };
@@ -461,7 +489,7 @@ Do not edit any project files or run destructive commands. Emit ONLY a valid han
         Ok(outcome) => outcome,
         Err(error) => {
             failed(format!("{error:#}"));
-            return Ok(None);
+            return Ok(RepairOutcome::Unchanged);
         }
     };
     let repair_stdout = repair_dir.join("stdout.log");
@@ -475,7 +503,7 @@ Do not edit any project files or run destructive commands. Emit ONLY a valid han
     }
     if outcome.cancelled {
         failed("cancelled".into());
-        return Ok(None);
+        return Ok(RepairOutcome::Cancelled);
     }
     if outcome.stalled || outcome.timed_out {
         failed(format!(
@@ -486,25 +514,17 @@ Do not edit any project files or run destructive commands. Emit ONLY a valid han
                 "timed out"
             }
         ));
-        return Ok(None);
+        return Ok(RepairOutcome::Unchanged);
     }
     if !outcome.success() {
-        // As for a stage: a JSON error event names the cause.
-        let reported = process::read_tail(&repair_stdout, 4 * 1024 * 1024)
-            .ok()
-            .and_then(|raw| handoff::normalize(&raw, invocation.kind).error);
-        let detail = match reported {
-            Some(error) => error.to_string(),
-            None => storage::clean_terminal(
-                &process::read_tail(&repair_dir.join("stderr.log"), 3000).unwrap_or_default(),
-            ),
-        };
-        failed(format!(
-            "the follow-up {}. {}",
-            ended(outcome.code),
-            detail.trim()
+        failed(format_failure_detail(
+            &repair_dir,
+            invocation.kind,
+            outcome.code,
+            true,
+            "the follow-up",
         ));
-        return Ok(None);
+        return Ok(RepairOutcome::Unchanged);
     }
     let raw = process::read_tail(&repair_stdout, 2 * 1024 * 1024).unwrap_or_default();
     let normalized = handoff::normalize(&raw, invocation.kind);
@@ -516,24 +536,25 @@ Do not edit any project files or run destructive commands. Emit ONLY a valid han
         reattached: false,
     };
     match resolve_handoff(&stage, &repair_prepared, normalized)? {
-        Resolved::Handoff(source, handoff) => Ok(Some((source, *handoff))),
+        Resolved::Handoff(source, handoff) => Ok(RepairOutcome::Repaired(source, handoff)),
         Resolved::Stopped(_, message) => {
             failed(format!(
                 "the follow-up produced no valid handoff: {message}"
             ));
-            Ok(None)
+            Ok(RepairOutcome::Unchanged)
         }
     }
 }
 
-/// Completes the attempt's bookkeeping after its harness ended.
+/// Completes the attempt's bookkeeping after its harness ended, returning any
+/// fresh workspace snapshot already captured when no checks invalidated it.
 pub(super) fn finish(
     run: &mut Run,
     prepared: &Prepared,
     result: Result<process::Outcome>,
     cancel: &AtomicBool,
     emit: &mut impl FnMut(Event),
-) -> Result<()> {
+) -> Result<Option<String>> {
     let index = run.cursor;
     let mode = run.workflow.stages[index].mode;
     let harness = run.workflow.stages[index].harness.clone();
@@ -544,21 +565,37 @@ pub(super) fn finish(
     let attempt = run.stages[index].attempts.last_mut();
     let normalized = match classify_exit(attempt, mode, (&harness, &workspace), prepared, result)? {
         Exit::Succeeded(normalized) => normalized,
-        Exit::Stopped(status, message) => return run.stop(status, message, Actor::Engine, true),
+        Exit::Stopped(status, message) => {
+            run.stop(status, message, Actor::Engine, true)?;
+            return Ok(None);
+        }
     };
-    let (source, handoff) =
-        match resolve_handoff(&run.workflow.stages[index], prepared, normalized)? {
-            Resolved::Handoff(source, handoff) => (source, *handoff),
-            Resolved::Stopped(status, message) => {
-                if let Some((source, handoff)) =
-                    try_handoff_repair(run, index, prepared, &message, cancel, emit)?
-                {
-                    (source, handoff)
-                } else {
-                    return run.stop(status, message, Actor::Engine, true);
+    let (source, handoff) = match resolve_handoff(
+        &run.workflow.stages[index],
+        prepared,
+        normalized,
+    )? {
+        Resolved::Handoff(source, handoff) => (source, *handoff),
+        Resolved::Stopped(status, message) => {
+            match try_handoff_repair(run, index, prepared, &message, cancel, emit)? {
+                RepairOutcome::Repaired(source, handoff) => (source, *handoff),
+                RepairOutcome::Cancelled => {
+                    run.stop(
+                        Status::Cancelled,
+                        "Stage cancelled during handoff repair. Filesystem changes are retained; retry explicitly"
+                            .into(),
+                        Actor::Engine,
+                        true,
+                    )?;
+                    return Ok(None);
+                }
+                RepairOutcome::Unchanged => {
+                    run.stop(status, message, Actor::Engine, true)?;
+                    return Ok(None);
                 }
             }
-        };
+        }
+    };
     if let Some(attempt) = run.stages[index].attempts.last_mut() {
         attempt.handoff_source = Some(source);
     }
@@ -573,51 +610,85 @@ pub(super) fn finish(
     // A reported block stops the stage regardless of check results.
     let blocked = handoff.verdict == Verdict::Blocked;
     run.stages[index].handoff = Some(handoff);
+    let mut fresh_tree: Option<String> = None;
     if !run.workflow.protected_paths.is_empty() {
         let workspace = run.workspace.clone();
-        let before = run.stages[index]
+        let Some(before) = run.stages[index]
             .attempts
             .last()
-            .and_then(|a| a.tree_before.clone());
-        if let Some(before) = before {
-            let after = snapshot::tree(&workspace, &run.directory);
-            if let Some(after) = after {
-                if after != before {
-                    let changed: Vec<String> = snapshot::changes(&workspace, &before, &after)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|c| c.path)
-                        .collect();
-                    if let Some(detail) =
-                        crate::policy::protected_detail(&run.workflow.protected_paths, &changed)
-                    {
-                        return run.stop(
-                            Status::Blocked,
-                            format!(
-                                "Stage modified protected path(s): {detail}. Revert them or update workflow protected_paths before retrying"
-                            ),
-                            Actor::Engine,
-                            true,
-                        );
-                    }
+            .and_then(|a| a.tree_before.clone())
+        else {
+            run.stop(
+                Status::Blocked,
+                "Could not verify workflow protected_paths: no pre-stage Git snapshot was recorded"
+                    .into(),
+                Actor::Engine,
+                true,
+            )?;
+            return Ok(None);
+        };
+        let Some(after) = snapshot::tree(&workspace, &run.directory) else {
+            run.stop(
+                Status::Blocked,
+                "Could not snapshot workspace to verify workflow protected_paths; inspect workspace and retry"
+                    .into(),
+                Actor::Engine,
+                true,
+            )?;
+            return Ok(None);
+        };
+        fresh_tree = Some(after.clone());
+        if after != before {
+            let changed = match snapshot::changed_paths(&workspace, &before, &after) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    run.stop(
+                        Status::Blocked,
+                        format!(
+                            "Could not diff workspace to verify workflow protected_paths: {error:#}"
+                        ),
+                        Actor::Engine,
+                        true,
+                    )?;
+                    return Ok(fresh_tree);
                 }
+            };
+            if let Some(detail) =
+                crate::policy::protected_detail(&run.workflow.protected_paths, &changed)
+            {
+                run.stop(
+                    Status::Blocked,
+                    format!(
+                        "Stage modified protected path(s): {detail}. Revert them or update workflow protected_paths before retrying"
+                    ),
+                    Actor::Engine,
+                    true,
+                )?;
+                return Ok(fresh_tree);
             }
         }
     }
-    if !blocked && !run_checks(run, prepared, cancel, emit)? {
-        return Ok(());
+    if !blocked {
+        let existing = (!run.workflow.stages[index].checks.is_empty())
+            .then(|| fresh_tree.take())
+            .flatten();
+        if !run_checks(run, prepared, existing, cancel, emit)? {
+            return Ok(None);
+        }
     }
     if run.workflow.stages[index].mode == Mode::Interactive {
-        run.checkpoint()
+        run.checkpoint()?;
     } else {
-        run.advance(Actor::Engine)
+        run.advance(Actor::Engine)?;
     }
+    Ok(fresh_tree)
 }
 
 /// Runs the current stage's router checks. False when cancellation stopped the run.
 pub(super) fn run_checks(
     run: &mut Run,
     prepared: &Prepared,
+    existing_tree: Option<String>,
     cancel: &AtomicBool,
     emit: &mut impl FnMut(Event),
 ) -> Result<bool> {
@@ -639,7 +710,7 @@ pub(super) fn run_checks(
     }
     let workspace = run.workspace.clone();
     // The receipt: exactly what the checks are about to test.
-    let tested = snapshot::tree(&workspace, &run.directory);
+    let tested = existing_tree.or_else(|| snapshot::tree(&workspace, &run.directory));
     if let Some(attempt) = run.stages[index].attempts.last_mut() {
         attempt.checks_tree = tested;
     }
@@ -649,12 +720,16 @@ pub(super) fn run_checks(
         &prepared.directory,
         cancel,
         |group| {
+            let is_some = group.is_some();
             run.stages[index]
                 .attempts
                 .last_mut()
                 .context("No attempt")?
                 .set_group(group);
-            run.persist()
+            if is_some {
+                run.persist()?;
+            }
+            Ok(())
         },
         |text| emit(Event::Output(text)),
     )?;
@@ -713,18 +788,29 @@ pub(super) fn conclude(
     emit: &mut impl FnMut(Event),
 ) -> Result<()> {
     let index = run.cursor;
-    if let Err(error) = finish(run, prepared, result, cancel, emit) {
-        run.stop(
-            Status::Failed,
-            format!("Could not complete stage bookkeeping: {error:#}"),
-            Actor::Engine,
-            true,
-        )?;
-    }
-    // Finishing may move the cursor, so record the stage that ran.
-    let tree = snapshot::tree(&run.workspace, &run.directory);
-    if let Some(attempt) = run.stages[index].attempts.last_mut() {
-        attempt.tree_after = tree;
+    let fresh_tree = match finish(run, prepared, result, cancel, emit) {
+        Ok(tree) => tree,
+        Err(error) => {
+            run.stop(
+                Status::Failed,
+                format!("Could not complete stage bookkeeping: {error:#}"),
+                Actor::Engine,
+                true,
+            )?;
+            None
+        }
+    };
+    // Finishing may move the cursor, so record the stage that ran (unless
+    // `Decision::Select` already recorded a post-apply snapshot).
+    if run.stages[index]
+        .attempts
+        .last()
+        .is_some_and(|a| a.tree_after.is_none())
+    {
+        let tree = fresh_tree.or_else(|| snapshot::tree(&run.workspace, &run.directory));
+        if let Some(attempt) = run.stages[index].attempts.last_mut() {
+            attempt.tree_after = tree;
+        }
     }
     run.persist()?;
     emit(Event::State(Box::new(run.clone())));
@@ -745,12 +831,6 @@ pub(super) fn execute_stage(
     };
     let workspace = run.workspace.clone();
     // Recorded so a later drive can stop the group if mr dies meanwhile.
-    let record = |run: &mut Run, group: process::Group| {
-        if let Some(attempt) = run.stages[index].attempts.last_mut() {
-            attempt.set_group(Some(group));
-        }
-        let _ = run.persist();
-    };
     let result = if let Some((session, held)) = interactive {
         let locks = lock_paths(run)?;
         let result = process::interactive(
@@ -764,8 +844,11 @@ pub(super) fn execute_stage(
             |group, socket| {
                 if let Some(attempt) = run.stages[index].attempts.last_mut() {
                     attempt.terminal = Some(socket.to_path_buf());
+                    attempt.set_group(Some(group.clone()));
                 }
-                record(run, group);
+                if run.persist().is_err() {
+                    let _ = SpawnJournal::new(run).add(&group);
+                }
             },
         );
         if left_running(run, &result, session, held, emit)? {
@@ -792,8 +875,10 @@ pub(super) fn execute_stage(
             cancel,
             prepared.sandbox.as_ref(),
             |group| {
-                record(run, group);
-                Ok(())
+                if let Some(attempt) = run.stages[index].attempts.last_mut() {
+                    attempt.set_group(Some(group));
+                }
+                run.persist()
             },
             |err, text| {
                 if err {
@@ -956,7 +1041,8 @@ pub(super) fn reattach_stage(
         return Err(error);
     }
     let result = match terminal {
-        Ok(terminal) => {
+        Ok(mut terminal) => {
+            let mut updated = false;
             if let Some(attempt) = run.stages[index].attempts.last_mut() {
                 let pid = terminal.pid();
                 // Only the host, the harness's parent, can read its start
@@ -971,8 +1057,17 @@ pub(super) fn reattach_stage(
                             marker: None,
                         },
                     }));
+                    updated = true;
                 } else if attempt.process_identity.started.is_none() {
                     attempt.process_identity.started = terminal.started();
+                    updated = attempt.process_identity.started.is_some();
+                }
+                terminal.set_marker(attempt.process_identity.marker.clone());
+            }
+            if updated {
+                if let Err(error) = run.persist() {
+                    terminal.hand_over(&[], &locks.each_ref());
+                    return Err(error);
                 }
             }
             emit(Event::Output(format!(
@@ -1015,6 +1110,10 @@ pub(super) fn reattach_stage(
     let prepared = match reprepare(run) {
         Ok(prepared) => prepared,
         Err(error) => {
+            keep_survivor(run, &result);
+            if let Some(attempt) = run.stages[index].attempts.last_mut() {
+                attempt.set_group(None);
+            }
             run.stop(
                 Status::Failed,
                 format!("Could not finish the reattached stage: {error:#}"),

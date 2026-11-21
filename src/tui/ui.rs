@@ -77,10 +77,16 @@ impl Ui {
             ..
         }) = self.dialog()
         {
-            let choices = matching_choices(items, filter);
-            if let Some(choice) = choices.get((*selected).min(choices.len().saturating_sub(1))) {
-                if let PickValue::Theme(theme) = choice.value {
-                    return theme;
+            if items
+                .first()
+                .is_some_and(|c| matches!(c.value, PickValue::Theme(_)))
+            {
+                let choices = matching_choices(items, filter);
+                if let Some(choice) = choices.get((*selected).min(choices.len().saturating_sub(1)))
+                {
+                    if let PickValue::Theme(theme) = choice.value {
+                        return theme;
+                    }
                 }
             }
         }

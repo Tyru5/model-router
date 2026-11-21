@@ -5,7 +5,7 @@ use super::{
     app::App,
     run_slot::RunSlot,
     tasks::{Msg, Tasks},
-    theme::Palette,
+    theme::{Palette, Theme},
     widgets::{key_chips, pad, rows_for},
 };
 use crate::{
@@ -25,9 +25,75 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
+/// Key for a finished run's Git changes without formatting strings on every poll.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CompletionKey {
+    id: String,
+    status: Status,
+    range: std::result::Result<(String, String), &'static str>,
+}
+
+impl CompletionKey {
+    fn from_run(run: &Run) -> Self {
+        let range = match run.change_range() {
+            Ok((from, to)) => Ok((from.to_owned(), to.to_owned())),
+            Err(err) => Err(err),
+        };
+        Self {
+            id: run.id.clone(),
+            status: run.status,
+            range,
+        }
+    }
+
+    fn matches(&self, run: &Run) -> bool {
+        if self.id != run.id || self.status != run.status {
+            return false;
+        }
+        match (&self.range, run.change_range()) {
+            (Ok((a, b)), Ok((c, d))) => a == c && b == d,
+            (Err(a), Err(b)) => a == &b,
+            _ => false,
+        }
+    }
+}
+
+/// Key for a run's `RunReport`, matching `Run` fields directly without allocating.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ReportKey {
+    completion: CompletionKey,
+    revision: u64,
+}
+
+impl ReportKey {
+    fn from_run(run: &Run) -> Self {
+        Self {
+            completion: CompletionKey::from_run(run),
+            revision: run.revision,
+        }
+    }
+
+    fn matches(&self, run: &Run) -> bool {
+        self.revision == run.revision && self.completion.matches(run)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct BriefKey {
+    report: ReportKey,
+    changes_loaded: bool,
+    width: u16,
+    theme: Theme,
+}
+
+pub(super) struct CachedBrief {
+    pub(super) lines: Vec<Line<'static>>,
+    pub(super) rows: u16,
+}
+
 /// Changes and patch computed for one finished run state.
 pub(super) struct Loaded {
-    key: String,
+    key: CompletionKey,
     changes: Changes,
     patch: std::result::Result<String, String>,
 }
@@ -35,16 +101,15 @@ pub(super) struct Loaded {
 /// The run's report, rebuilt only when the run changes, not every frame.
 pub(super) fn cached_report(slot: &RunSlot) -> std::rc::Rc<RunReport> {
     let run = &slot.run;
-    let stamp = format!("{} {}", key(run), run.revision);
     let mut cache = slot.cache.borrow_mut();
-    match &cache.report {
-        Some((cached, report)) if *cached == stamp => report.clone(),
-        _ => {
-            let report = std::rc::Rc::new(report::build(run));
-            cache.report = Some((stamp, report.clone()));
-            report
+    if let Some((cached, report)) = &cache.report {
+        if cached.matches(run) {
+            return report.clone();
         }
     }
+    let report = std::rc::Rc::new(report::build(run));
+    cache.report = Some((ReportKey::from_run(run), report.clone()));
+    report
 }
 
 pub(super) fn finished(run: &Run) -> bool {
@@ -55,8 +120,8 @@ pub(super) fn finished(run: &Run) -> bool {
 }
 
 /// Identifies what the changes were computed from.
-fn key(run: &Run) -> String {
-    format!("{} {:?} {:?}", run.id, run.status, run.change_range())
+fn key(run: &Run) -> CompletionKey {
+    CompletionKey::from_run(run)
 }
 
 /// The directory Git ran in for this run: its workspace, else the project.
@@ -105,12 +170,12 @@ impl RunSlot {
     }
 
     fn loaded(&self) -> Option<&Loaded> {
-        self.changes.as_ref().filter(|l| l.key == key(&self.run))
+        self.changes.as_ref().filter(|l| l.key.matches(&self.run))
     }
 
     /// Computed changes for `key`; kept when still the ones waited for.
-    pub(super) fn changes_read(&mut self, key: &str, result: Result<Loaded, String>) {
-        if self.changes_pending.as_deref() != Some(key) {
+    pub(super) fn changes_read(&mut self, key: &CompletionKey, result: Result<Loaded, String>) {
+        if self.changes_pending.as_ref() != Some(key) {
             return;
         }
         self.changes_pending = None;
@@ -137,12 +202,15 @@ impl RunSlot {
         if self.worker.is_some() || !finished(run) {
             return message;
         }
-        let key = key(run);
-        let current = self.changes.as_ref().is_some_and(|l| l.key == key)
-            || self.changes_pending.as_ref() == Some(&key);
+        let current = self.changes.as_ref().is_some_and(|l| l.key.matches(run))
+            || self
+                .changes_pending
+                .as_ref()
+                .is_some_and(|k| k.matches(run));
         if current {
             return message;
         }
+        let key = key(run);
         // A newly finished run opens on its brief, unless a search is being
         // typed into its feed: the next keys still belong to the query.
         self.show_output = self.log_search.as_ref().is_some_and(|s| s.typing);
@@ -206,11 +274,11 @@ impl App {
 
     pub(super) fn show_diff(&mut self) -> Result<()> {
         let slot = self.finished_slot("The diff is available when the run finishes")?;
-        let Some(patch) = slot.loaded().map(|loaded| loaded.patch.clone()) else {
+        let Some(loaded) = slot.loaded() else {
             self.ui.message = "Computing changes…".into();
             return Ok(());
         };
-        match &patch {
+        match &loaded.patch {
             Ok(patch) if patch.trim().is_empty() => {
                 self.ui.message = "No files changed during this run.".into()
             }
@@ -593,43 +661,74 @@ fn next_keys(run: &Run) -> Vec<(&'static str, &'static str)> {
 /// The finished run's brief in one scrolling column: its error, the review
 /// brief, what changed, checks and unresolved items, each stage, and the
 /// totals. What to do next stays pinned below.
-pub(super) fn draw_completion(frame: &mut Frame<'_>, slot: &RunSlot, area: Rect, palette: Palette) {
-    let report = cached_report(slot);
-    let mut lines = vec![];
-    if let Some(error) = &report.error {
-        lines.push(Line::styled(
-            format!("Error: {}", storage::clean_terminal(error)),
-            Style::default()
-                .fg(palette.red)
-                .add_modifier(Modifier::BOLD),
-        ));
-        lines.push(Line::raw(""));
-    }
-    // The review brief leads: it is what the person reads first.
-    lines.extend(review_lines(&report, palette));
-    lines.extend(changes_lines(slot.loaded(), &report, palette));
-    lines.push(Line::raw(""));
-    lines.extend(findings_lines(&report, palette));
-    lines.push(Line::raw(""));
-    lines.extend(stage_lines(&report, area.width, palette));
-    lines.push(Line::raw(""));
-    lines.extend(total_lines(&report, palette));
-
+pub(super) fn draw_completion(
+    frame: &mut Frame<'_>,
+    slot: &RunSlot,
+    area: Rect,
+    theme: Theme,
+    palette: Palette,
+) {
     let next = key_chips(palette, &next_keys(&slot.run), area.width.into());
     let [body, bar] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(next_height(&next, area.width)),
     ])
     .areas(area);
-    // Rows the wrapped text takes, less what fits: how far it can scroll.
-    let rows: u16 = lines
-        .iter()
-        .map(|line| rows_for(line, body.width, u16::MAX))
-        .fold(0, u16::saturating_add);
-    let limit = rows.saturating_sub(body.height);
+
+    let loaded = slot.loaded();
+    let cached = {
+        let cache = slot.cache.borrow();
+        cache.brief.as_ref().and_then(|(k, b)| {
+            (k.width == body.width
+                && k.theme == theme
+                && k.changes_loaded == loaded.is_some()
+                && k.report.matches(&slot.run))
+            .then(|| b.clone())
+        })
+    };
+    let brief = if let Some(brief) = cached {
+        brief
+    } else {
+        let report = cached_report(slot);
+        let mut lines = vec![];
+        if let Some(error) = &report.error {
+            lines.push(Line::styled(
+                format!("Error: {}", storage::clean_terminal(error)),
+                Style::default()
+                    .fg(palette.red)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::raw(""));
+        }
+        // The review brief leads: it is what the person reads first.
+        lines.extend(review_lines(&report, palette));
+        lines.extend(changes_lines(loaded, &report, palette));
+        lines.push(Line::raw(""));
+        lines.extend(findings_lines(&report, palette));
+        lines.push(Line::raw(""));
+        lines.extend(stage_lines(&report, area.width, palette));
+        lines.push(Line::raw(""));
+        lines.extend(total_lines(&report, palette));
+        // Rows the wrapped text takes, less what fits: how far it can scroll.
+        let rows: u16 = lines
+            .iter()
+            .map(|line| rows_for(line, body.width, u16::MAX))
+            .fold(0, u16::saturating_add);
+        let built = std::rc::Rc::new(CachedBrief { lines, rows });
+        let key = BriefKey {
+            report: ReportKey::from_run(&slot.run),
+            changes_loaded: loaded.is_some(),
+            width: body.width,
+            theme,
+        };
+        slot.cache.borrow_mut().brief = Some((key, built.clone()));
+        built
+    };
+
+    let limit = brief.rows.saturating_sub(body.height);
     slot.results_limit.set(limit);
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(brief.lines.clone())
             .wrap(Wrap { trim: false })
             .scroll((slot.results_scroll.min(limit), 0)),
         body,

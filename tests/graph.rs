@@ -605,3 +605,138 @@ fn fan_outs_refuse_projects_outside_git() {
     .unwrap_err();
     assert!(error.to_string().contains("Git repository"), "{error}");
 }
+
+#[test]
+fn graph_ship_stage_waits_for_confirmation_then_commits() {
+    let mut implement = stage("implement", Role::Implementation);
+    implement.extra_args = vec!["--write-file".into(), "feat.txt".into()];
+    let mut review = stage("review", Role::Review);
+    review.after = vec!["implement".into()];
+    let ship = Stage {
+        id: "ship".into(),
+        name: "Ship".into(),
+        role: Role::Ship,
+        after: vec!["review".into()],
+        ship: Some(Default::default()),
+        ..Stage::default()
+    };
+    let Some((dir, mut run)) = git_run(vec![implement, review, ship]) else {
+        return;
+    };
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(drive(&mut run), Action::Confirm, "{:?}", run.error);
+    assert_eq!((run.status, run.cursor), (Status::AwaitingConfirmation, 2));
+    assert_eq!(git(dir.path(), &["rev-parse", "HEAD"]), head);
+
+    run.command(Cmd::Confirm).unwrap();
+    assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+    assert_ne!(git(dir.path(), &["rev-parse", "HEAD"]), head);
+}
+
+#[test]
+fn retrying_fan_out_stage_scopes_second_round_and_reloads_cleanly() {
+    let implement = fan_out(
+        &[("implement", "lines-1"), ("implement", "lines-2")],
+        "auto",
+    );
+    let review = Stage {
+        after: vec!["implement".into()],
+        extra_args: vec!["--review-fail-until".into(), "1".into()],
+        ..stage("review", Role::Review)
+    };
+    let Some((dir, mut run)) = git_run(vec![implement, review]) else {
+        return;
+    };
+    assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+    assert_eq!(run.repair_passes, 1);
+    assert_eq!(run.stages[0].attempts.len(), 2);
+    let state = run.stages[0].fan_out.as_ref().unwrap();
+    assert_eq!(state.round, 2);
+    let cand_attempt = &state.candidates[0].attempts[0];
+    assert!(
+        cand_attempt
+            .directory
+            .to_string_lossy()
+            .contains("round-002"),
+        "{}",
+        cand_attempt.directory.display()
+    );
+    assert!(
+        cand_attempt
+            .worktree
+            .as_ref()
+            .unwrap()
+            .to_string_lossy()
+            .contains("r002-c1-001"),
+        "{}",
+        cand_attempt.worktree.as_ref().unwrap().display()
+    );
+    let reloaded = engine::load(dir.path(), &run.id).unwrap();
+    assert_eq!(reloaded.stages[0].fan_out.as_ref().unwrap().round, 2);
+}
+
+#[test]
+fn auto_judge_conflict_blocks_and_retry_candidate_applies_on_next_round() {
+    let implement = fan_out(&[("implement", "lines-1"), ("implement", "fail")], "auto");
+    let Some((dir, mut run)) = git_run(vec![implement]) else {
+        return;
+    };
+    let cancel = AtomicBool::new(false);
+    let mut injected = false;
+    let action = engine::drive(&mut run, &cancel, |event| {
+        if !injected {
+            if let Event::State(state) = event {
+                if state.stages[0].status == Status::Running {
+                    fs::write(dir.path().join("out.txt"), "external conflicting change\n").unwrap();
+                    injected = true;
+                }
+            }
+        }
+    })
+    .unwrap();
+    assert!(injected);
+    assert_eq!(action, Action::Stopped);
+    assert_eq!(run.status, Status::Blocked);
+    let state = run.stages[0].fan_out.as_ref().unwrap();
+    assert!(
+        state
+            .selection
+            .as_ref()
+            .is_some_and(|s| !s.applied && s.candidate == "c1"),
+        "{:?}",
+        state.selection
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("out.txt")).unwrap(),
+        "external conflicting change\n"
+    );
+
+    // Resolve the external conflict and retry candidate c2 so the stage settles cleanly.
+    fs::remove_file(dir.path().join("out.txt")).unwrap();
+    let mut run = engine::command(
+        dir.path(),
+        &run.id,
+        Some(run.revision),
+        Cmd::RetryCandidate {
+            stage: "implement".into(),
+            candidate: "c2".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+    let state = run.stages[0].fan_out.as_ref().unwrap();
+    assert!(
+        state
+            .selection
+            .as_ref()
+            .is_some_and(|s| s.applied && s.candidate == "c1"),
+        "{:?}",
+        state.selection
+    );
+    assert!(
+        fs::read_to_string(dir.path().join("out.txt"))
+            .unwrap()
+            .contains("written by implement"),
+        "chosen candidate c1 patch must be applied after retry"
+    );
+}

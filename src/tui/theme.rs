@@ -508,6 +508,12 @@ pub fn key_label(key: &str) -> String {
         .join(" / ")
 }
 
+/// Display width of [`key_label(key)`] without allocating a formatted string.
+pub(super) fn key_label_width(key: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    key.width() + 2 * (key.matches(" / ").count() + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,5 +677,13 @@ mod tests {
                 .contains(Modifier::REVERSED)
         );
         assert_eq!(model_router.on_accent(), model_router.bg);
+    }
+
+    #[test]
+    fn key_label_width_matches_key_label() {
+        use unicode_width::UnicodeWidthStr;
+        for key in ["a", "Enter", "J / K", "↑↓ / Ctrl+N/P", "Ctrl+S", " "] {
+            assert_eq!(key_label_width(key), key_label(key).width(), "{key}");
+        }
     }
 }

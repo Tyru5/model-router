@@ -11,7 +11,9 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
+    collections::HashMap,
+    fs::{self, OpenOptions},
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         Mutex,
@@ -108,7 +110,40 @@ pub struct Plan {
 }
 
 pub fn load(path: &Path) -> Result<Bench> {
-    let text = fs::read_to_string(path).with_context(|| format!("Read {}", path.display()))?;
+    const MAX_BENCH_BYTES: usize = 2 * 1024 * 1024;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("Read {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("Read {}", path.display()))?;
+    ensure!(
+        metadata.is_file(),
+        "Bench file {} is not a regular file",
+        path.display()
+    );
+    ensure!(
+        metadata.len() <= MAX_BENCH_BYTES as u64,
+        "Bench file {} exceeds 2 MiB",
+        path.display()
+    );
+    let mut bytes = Vec::new();
+    file.take((MAX_BENCH_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("Read {}", path.display()))?;
+    ensure!(
+        bytes.len() <= MAX_BENCH_BYTES,
+        "Bench file {} exceeds 2 MiB",
+        path.display()
+    );
+    let text = String::from_utf8(bytes).with_context(|| format!("Parse {}", path.display()))?;
     toml::from_str(&text).with_context(|| format!("Parse {}", path.display()))
 }
 
@@ -159,6 +194,13 @@ impl Plan {
             crate::config::validate_task(&text).with_context(|| format!("Task {name}"))?;
             tasks.push((name, text));
         }
+        ensure!(
+            tasks
+                .len()
+                .checked_mul(bench.repeat)
+                .is_some_and(|n| n <= 1000),
+            "The bench expands to more than 1000 runs"
+        );
         let mut variants = vec![Variant {
             label: String::new(),
             assignments: vec![],
@@ -192,7 +234,16 @@ impl Plan {
                 "Stage {} appears twice in the matrix",
                 axis.stage
             );
-            let mut next = vec![];
+            let next_variants = variants
+                .len()
+                .checked_mul(axis.assignments.len())
+                .filter(|&v| {
+                    v.checked_mul(tasks.len())
+                        .and_then(|n| n.checked_mul(bench.repeat))
+                        .is_some_and(|n| n <= 1000)
+                })
+                .context("The bench expands to more than 1000 runs")?;
+            let mut next = Vec::with_capacity(next_variants);
             for variant in &variants {
                 for assignment in &axis.assignments {
                     let mut assignments = variant.assignments.clone();
@@ -205,10 +256,6 @@ impl Plan {
             }
             variants = next;
         }
-        ensure!(
-            variants.len() * tasks.len() * bench.repeat <= 1000,
-            "The bench expands to more than 1000 runs"
-        );
         for variant in &mut variants {
             let applied = apply(&workflow, variant)?;
             Settings {
@@ -376,8 +423,13 @@ impl CellResult {
             error,
         }
     }
-    fn from_run(cell: &Cell, variant: &str, run: &Run) -> Self {
-        let summary = report::build(run);
+    fn from_run_with(
+        cell: &Cell,
+        variant: &str,
+        run: &Run,
+        pricing: &crate::cost::Pricing,
+    ) -> Self {
+        let summary = report::build_with(run, pricing);
         // Router checks and model-reported tests of each stage's final attempt.
         let (mut passed, mut total) = (0, 0);
         let mut all_required_passed = true;
@@ -461,12 +513,14 @@ pub fn run(
         project.display()
     );
     let started_at = Utc::now();
+    let pricing = crate::cost::Pricing::load(project);
     let next = AtomicUsize::new(0);
     // Worktree creation takes Git locks in the project; one at a time.
     let creating = Mutex::new(());
     let results: Mutex<Vec<Option<CellResult>>> = Mutex::new(vec![None; plan.cells.len()]);
     let jobs = options.jobs.clamp(1, 32).min(plan.cells.len().max(1));
     std::thread::scope(|scope| {
+        let pricing = &pricing;
         for _ in 0..jobs {
             scope.spawn(|| {
                 loop {
@@ -485,7 +539,8 @@ pub fn run(
                             cell.task,
                             variant
                         ));
-                        let result = run_cell(project, settings, plan, cell, cancel, &creating);
+                        let result =
+                            run_cell(project, settings, plan, cell, cancel, &creating, pricing);
                         progress(format!(
                             "[{}/{}] {} {} · {}{}",
                             index + 1,
@@ -534,6 +589,7 @@ fn run_cell(
     cell: &Cell,
     cancel: &AtomicBool,
     creating: &Mutex<()>,
+    pricing: &crate::cost::Pricing,
 ) -> CellResult {
     let variant = &plan.variants[cell.variant].label;
     let failed =
@@ -557,14 +613,14 @@ fn run_cell(
         Err(error) => return failed(error),
     };
     if let Err(error) = drive(&mut run, cancel) {
-        let mut result = CellResult::from_run(cell, variant, &run);
+        let mut result = CellResult::from_run_with(cell, variant, &run, pricing);
         result.error = Some(format!("{error:#}"));
         if result.status != "complete" {
             result.status = "error".into();
         }
         return result;
     }
-    CellResult::from_run(cell, variant, &run)
+    CellResult::from_run_with(cell, variant, &run, pricing)
 }
 
 /// Drives a run until it stops; a checkpoint awaiting confirmation stops it.
@@ -580,8 +636,18 @@ fn drive(run: &mut Run, cancel: &AtomicBool) -> Result<()> {
     }
 }
 
+fn group_by_variant(results: &Results) -> HashMap<&str, Vec<&CellResult>> {
+    let mut grouped: HashMap<&str, Vec<&CellResult>> =
+        HashMap::with_capacity(results.variants.len());
+    for r in &results.results {
+        grouped.entry(r.variant.as_str()).or_default().push(r);
+    }
+    grouped
+}
+
 /// Per-variant totals, then every cell, as Markdown.
 pub fn markdown(results: &Results) -> String {
+    let by_variant = group_by_variant(results);
     let mut text = format!(
         "# Bench {}\n\nWorkflow: {} · {} run(s) · jobs {} · {} → {}\n\n| Variant | Success | Checks | Repairs | Median duration | Tokens | Cost |\n|---|---|---|---|---|---|---|\n",
         results.bench.display(),
@@ -592,11 +658,9 @@ pub fn markdown(results: &Results) -> String {
         results.finished_at.format("%H:%M:%S")
     );
     for variant in &results.variants {
-        let cells: Vec<_> = results
-            .results
-            .iter()
-            .filter(|r| r.variant == variant.label)
-            .collect();
+        let cells = by_variant
+            .get(variant.label.as_str())
+            .map_or(&[][..], Vec::as_slice);
         let success = cells.iter().filter(|r| r.success).count();
         let passed: usize = cells.iter().map(|r| r.checks_passed).sum();
         let total: usize = cells.iter().map(|r| r.checks_total).sum();
@@ -673,15 +737,14 @@ pub fn markdown(results: &Results) -> String {
 /// required router checks all passed at least `threshold` of the time.
 /// Cells that never started count as samples without evidence.
 pub fn shortlist(results: &Results, threshold: f64) -> crate::stats::Shortlist {
+    let by_variant = group_by_variant(results);
     let rows: Vec<_> = results
         .variants
         .iter()
         .map(|variant| {
-            let cells: Vec<_> = results
-                .results
-                .iter()
-                .filter(|r| r.variant == variant.label)
-                .collect();
+            let cells = by_variant
+                .get(variant.label.as_str())
+                .map_or(&[][..], Vec::as_slice);
             let mut durations: Vec<_> = cells
                 .iter()
                 .filter(|r| r.run.is_some())
@@ -727,4 +790,60 @@ pub fn save(project: &Path, results: &Results) -> Result<(PathBuf, PathBuf)> {
     storage::write_json(&json, results)?;
     storage::atomic_write(&md, markdown(results).as_bytes())?;
     Ok((json, md))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_combinatorial_matrix_explosion_without_allocating() {
+        let mut settings = Settings::default();
+        let stage_id = settings.workflows[0].stages[0].id.clone();
+        settings.workflows[0].stages = (0..10)
+            .map(|i| {
+                let mut s = settings.workflows[0].stages[0].clone();
+                s.id = format!("{stage_id}-{i}");
+                s.name = s.id.clone();
+                s.enabled = true;
+                s
+            })
+            .collect();
+        let bench = Bench {
+            workflow: None,
+            tasks: vec![BenchTask {
+                name: "t1".into(),
+                text: Some("Task".into()),
+                file: None,
+            }],
+            matrix: (0..10)
+                .map(|i| Axis {
+                    stage: format!("{stage_id}-{i}"),
+                    assignments: vec![
+                        Assignment {
+                            model: Some("a".into()),
+                            ..Assignment::default()
+                        },
+                        Assignment {
+                            model: Some("b".into()),
+                            ..Assignment::default()
+                        },
+                    ],
+                })
+                .collect(),
+            repeat: 1,
+        };
+        let err = Plan::new(
+            Path::new("bench.toml"),
+            &bench,
+            &settings,
+            &Options {
+                jobs: 1,
+                allow_interactive: true,
+            },
+        )
+        .err()
+        .expect("2^10 = 1024 variants must be rejected");
+        assert!(err.to_string().contains("1000"), "{err:#}");
+    }
 }

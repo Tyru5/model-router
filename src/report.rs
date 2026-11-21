@@ -13,7 +13,7 @@ use crate::{
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use serde::Serialize;
-use std::{fmt::Write, fs, path::Path};
+use std::{collections::HashSet, fmt::Write, fs, path::Path};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RunReport {
@@ -231,6 +231,7 @@ pub struct Receipt {
 /// Git (writing only objects).
 pub fn receipts(run: &Run) -> Vec<Receipt> {
     let dir = git_dir(run);
+    let mut is_repo: Option<bool> = None;
     let mut current: Option<std::result::Result<String, String>> = None;
     let mut now = || {
         current
@@ -284,9 +285,11 @@ pub fn receipts(run: &Run) -> Vec<Receipt> {
             Basis::None
         };
         let freshness = (!last.checks.is_empty()).then(|| match &last.checks_tree {
-            None if !snapshot::is_repository(dir) => Freshness::Unavailable {
-                reason: "not a Git repository".into(),
-            },
+            None if !*is_repo.get_or_insert_with(|| snapshot::is_repository(dir)) => {
+                Freshness::Unavailable {
+                    reason: "not a Git repository".into(),
+                }
+            }
             None => Freshness::Unavailable {
                 reason: "no snapshot was recorded for these checks (Git failed, or the run predates receipts)".into(),
             },
@@ -299,10 +302,8 @@ pub fn receipts(run: &Run) -> Vec<Receipt> {
             Some(tree) => match now() {
                 Err(reason) => Freshness::Unavailable { reason },
                 Ok(now) if now == *tree => Freshness::Current,
-                Ok(now) => match snapshot::changes(dir, tree, &now) {
-                    Ok(files) => Freshness::Stale {
-                        changed: files.into_iter().map(|f| f.path).collect(),
-                    },
+                Ok(now) => match snapshot::changed_paths(dir, tree, &now) {
+                    Ok(changed) => Freshness::Stale { changed },
                     Err(error) => Freshness::Unavailable {
                         reason: format!("{error:#}"),
                     },
@@ -394,39 +395,67 @@ pub fn render_receipts(receipts: &[Receipt]) -> String {
     text
 }
 
+/// Sums tokens and estimated costs across every attempt (including fan-out
+/// candidates) without building a full `RunReport` or reading `ship.json`.
+pub fn usage_total(run: &Run) -> UsageTotal {
+    usage_total_with(run, &Pricing::load(&run.project))
+}
+
+pub fn usage_total_with(run: &Run, pricing: &Pricing) -> UsageTotal {
+    let mut sum = UsageTotal::default();
+    for (index, state) in run.stages.iter().enumerate() {
+        let (provider, billing) = cost::stage_estimate_params(run, index);
+        let attempts = state.attempts.iter().chain(
+            state
+                .fan_out
+                .iter()
+                .flat_map(|f| &f.candidates)
+                .flat_map(|c| &c.attempts),
+        );
+        for attempt in attempts {
+            let estimate = cost::estimate_with_billing(
+                attempt.usage.as_ref(),
+                &attempt.model,
+                provider,
+                billing,
+                pricing,
+            );
+            sum.attempts += 1;
+            sum.cost.add(&estimate);
+            if let Some(usage) = attempt.usage {
+                sum.reported += 1;
+                sum.cost_reported += usize::from(usage.cost_usd.is_some());
+                sum.sum = sum.sum + usage;
+            }
+        }
+    }
+    sum
+}
+
 /// `build_with` the project's pricing.
 pub fn build(run: &Run) -> RunReport {
     build_with(run, &Pricing::load(&run.project))
 }
 
 pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
-    let estimates: Vec<Vec<cost::Estimate>> = run
-        .stages
-        .iter()
-        .enumerate()
-        .map(|(index, state)| {
-            state
-                .attempts
-                .iter()
-                .map(|a| cost::attempt_estimate(run, index, a, pricing))
-                .collect()
-        })
-        .collect();
-    // Candidate attempts in stage order, flattened per stage.
-    let candidate_estimates: Vec<Vec<cost::Estimate>> = run
-        .stages
-        .iter()
-        .enumerate()
-        .map(|(index, state)| {
+    let mut estimates: Vec<Vec<cost::Estimate>> = Vec::with_capacity(run.stages.len());
+    let mut candidate_estimates: Vec<Vec<cost::Estimate>> = Vec::with_capacity(run.stages.len());
+    for (index, state) in run.stages.iter().enumerate() {
+        let (provider, billing) = cost::stage_estimate_params(run, index);
+        let est = |a: &Attempt| {
+            cost::estimate_with_billing(a.usage.as_ref(), &a.model, provider, billing, pricing)
+        };
+        estimates.push(state.attempts.iter().map(est).collect());
+        candidate_estimates.push(
             state
                 .fan_out
                 .iter()
                 .flat_map(|f| &f.candidates)
                 .flat_map(|c| &c.attempts)
-                .map(|a| cost::attempt_estimate(run, index, a, pricing))
-                .collect()
-        })
-        .collect();
+                .map(est)
+                .collect(),
+        );
+    }
     // Only an unfinished attempt reads the clock.
     let now = Utc::now();
     let seconds = |a: &Attempt| {
@@ -443,6 +472,7 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
         });
     }
     let mut reported_files: Vec<String> = vec![];
+    let mut seen_files: HashSet<String> = HashSet::new();
     let mut stages = vec![];
     for (((stage, state), estimates), candidate_estimates) in run
         .workflow
@@ -501,7 +531,7 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
                 );
             }
             for file in &handoff.files_changed {
-                if !reported_files.contains(file) {
+                if seen_files.insert(file.clone()) {
                     reported_files.push(file.clone());
                 }
             }

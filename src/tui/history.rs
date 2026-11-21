@@ -4,7 +4,7 @@ use super::{
     app::{App, Page},
     modal::{Choice, Modal, PickValue},
     monitor::draw_run,
-    theme::Palette,
+    theme::{Palette, Theme},
     widgets::{content, empty_state, fit, kv, menu_key, textarea},
 };
 use crate::{
@@ -23,8 +23,11 @@ use ratatui::{
     widgets::{Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread,
 };
 
@@ -44,6 +47,29 @@ const STATUSES: [(&str, &[StatusFilter]); 6] = [
     ("damaged", &[StatusFilter::Damaged]),
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SizeStamp {
+    Summary {
+        revision: u64,
+        updated_millis: i64,
+        attempts: usize,
+    },
+    Damaged,
+}
+
+impl SizeStamp {
+    fn of(entry: &Entry) -> Self {
+        match entry {
+            Entry::Summary(summary) => Self::Summary {
+                revision: summary.revision,
+                updated_millis: summary.updated_at.timestamp_millis(),
+                attempts: summary.attempts,
+            },
+            Entry::Damaged { .. } => Self::Damaged,
+        }
+    }
+}
+
 /// The Runs page: a sidebar of this session's runs, then the project's saved
 /// runs, beside the selected one. Session runs are selected by focusing them.
 pub(super) struct RunsPage {
@@ -55,6 +81,7 @@ pub(super) struct RunsPage {
     pub(super) on_saved: bool,
     /// IDs of this session's runs, which the saved list leaves out.
     pub(super) open: Vec<String>,
+    open_set: HashSet<String>,
     /// Saved runs are being read.
     pub(super) loading: bool,
     /// The list needs reading when the page is next shown.
@@ -66,7 +93,11 @@ pub(super) struct RunsPage {
     /// Index into `STATUSES`.
     status: usize,
     /// Artifact sizes by run ID, filled in by a background thread.
-    sizes: Arc<Mutex<HashMap<String, u64>>>,
+    pub(super) sizes: Arc<Mutex<HashMap<String, u64>>>,
+    size_stamps: HashMap<String, SizeStamp>,
+    size_gen: Arc<AtomicU64>,
+    sizes_dirty: Arc<AtomicBool>,
+    sizing: Arc<AtomicBool>,
 }
 
 impl Default for RunsPage {
@@ -76,6 +107,7 @@ impl Default for RunsPage {
             selected: 0,
             on_saved: false,
             open: vec![],
+            open_set: HashSet::new(),
             loading: false,
             stale: true,
             loaded_at: None,
@@ -83,6 +115,10 @@ impl Default for RunsPage {
             filtering: false,
             status: 0,
             sizes: Arc::default(),
+            size_stamps: HashMap::new(),
+            size_gen: Arc::default(),
+            sizes_dirty: Arc::default(),
+            sizing: Arc::default(),
         }
     }
 }
@@ -90,6 +126,24 @@ impl Default for RunsPage {
 impl RunsPage {
     pub(super) fn set_vim(&mut self, enabled: bool) {
         self.filter.set_vim(enabled);
+    }
+    pub(super) fn reset(&mut self) {
+        self.entries.clear();
+        self.selected = 0;
+        self.loading = false;
+        self.stale = true;
+        self.loaded_at = None;
+        self.size_gen.fetch_add(1, Ordering::Relaxed);
+        self.sizes = Arc::default();
+        self.size_stamps.clear();
+        self.sizes_dirty.store(false, Ordering::Relaxed);
+        self.sizing.store(false, Ordering::Relaxed);
+    }
+    pub(super) fn is_sizing(&self) -> bool {
+        self.sizing.load(Ordering::Relaxed)
+    }
+    pub(super) fn take_sizes_dirty(&self) -> bool {
+        self.sizes_dirty.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -107,6 +161,7 @@ enum Kind {
         id: String,
         plan: Plan,
         worktrees: bool,
+        has_worktree: bool,
     },
 }
 
@@ -128,7 +183,7 @@ impl RunsPage {
             &content(&self.filter),
         )
         .into_iter()
-        .filter(|entry| !self.open.iter().any(|id| id == entry.id()))
+        .filter(|entry| !self.open_set.contains(entry.id()))
         .collect()
     }
     /// Whether a status or text filter hides any saved runs.
@@ -152,25 +207,57 @@ impl RunsPage {
         self.selected = index.min(visible.len().saturating_sub(1));
     }
     /// Shows freshly read summaries, keeping the selection, and starts
-    /// sizing them in the background.
+    /// sizing new or modified runs in the background.
     pub(super) fn show(&mut self, entries: Vec<Entry>, project: &std::path::Path) {
         let selected = self.selected_id();
         self.entries = entries;
         self.loaded_at = Some(std::time::Instant::now());
         self.reselect(selected);
-        let sizes = Arc::new(Mutex::new(HashMap::new()));
-        self.sizes = sizes.clone();
-        let (project, entries) = (project.to_path_buf(), self.entries.clone());
+        let my_gen = self.size_gen.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut next_stamps = HashMap::with_capacity(self.entries.len());
+        let mut missing = vec![];
+        {
+            let mut sizes = self.sizes.lock().unwrap_or_else(|e| e.into_inner());
+            for entry in &self.entries {
+                let id = entry.id();
+                let stamp = SizeStamp::of(entry);
+                next_stamps.insert(id.to_owned(), stamp);
+                let unchanged = self.size_stamps.get(id) == Some(&stamp) && sizes.contains_key(id);
+                if !unchanged {
+                    missing.push(entry.clone());
+                }
+            }
+            sizes.retain(|id, _| next_stamps.contains_key(id));
+        }
+        self.size_stamps = next_stamps;
+        if missing.is_empty() {
+            self.sizing.store(false, Ordering::Relaxed);
+            return;
+        }
+        self.sizing.store(true, Ordering::Relaxed);
+        let (project, sizes, size_gen, sizes_dirty, sizing) = (
+            project.to_path_buf(),
+            self.sizes.clone(),
+            self.size_gen.clone(),
+            self.sizes_dirty.clone(),
+            self.sizing.clone(),
+        );
         thread::spawn(move || {
-            for entry in entries {
-                // A refresh or exit dropped the map.
-                if Arc::strong_count(&sizes) == 1 {
+            for entry in missing {
+                if size_gen.load(Ordering::Relaxed) != my_gen {
                     return;
                 }
                 let bytes = history::run_size(&project, &entry);
+                if size_gen.load(Ordering::Relaxed) != my_gen {
+                    return;
+                }
                 if let Ok(mut sizes) = sizes.lock() {
                     sizes.insert(entry.id().to_owned(), bytes);
                 }
+                sizes_dirty.store(true, Ordering::Relaxed);
+            }
+            if size_gen.load(Ordering::Relaxed) == my_gen {
+                sizing.store(false, Ordering::Relaxed);
             }
         });
     }
@@ -192,10 +279,17 @@ impl App {
     }
     /// Leaves this session's runs out of the saved list, keeping its selection.
     pub(super) fn sync_runs(&mut self) {
-        let open: Vec<_> = self.session.runs.iter().map(|s| s.run.id.clone()).collect();
-        if open != self.runs.open {
+        let same = self.session.runs.len() == self.runs.open.len()
+            && self
+                .session
+                .runs
+                .iter()
+                .zip(&self.runs.open)
+                .all(|(slot, id)| slot.run.id == *id);
+        if !same {
             let selected = self.runs.selected_id();
-            self.runs.open = open;
+            self.runs.open = self.session.runs.iter().map(|s| s.run.id.clone()).collect();
+            self.runs.open_set = self.runs.open.iter().cloned().collect();
             self.runs.reselect(selected);
         }
     }
@@ -317,11 +411,17 @@ impl App {
                 if let Some(entry) = self.runs.selected_entry() {
                     let id = entry.id().to_owned();
                     let plan = self.cleanup_plan(&id, false)?;
+                    let has_worktree = plan
+                        .project
+                        .join(".model-router/worktrees")
+                        .join(&id)
+                        .exists();
                     self.ui.open(Modal::Confirm(Box::new(Confirm {
                         kind: Kind::Cleanup {
                             id,
                             plan,
                             worktrees: false,
+                            has_worktree,
                         },
                         error: String::new(),
                     })));
@@ -483,9 +583,15 @@ impl App {
                     id,
                     plan,
                     worktrees,
+                    has_worktree,
                 },
                 Key::Char('g'),
             ) => self.cleanup_plan(id, !*worktrees).map(|next| {
+                *has_worktree = next
+                    .project
+                    .join(".model-router/worktrees")
+                    .join(id)
+                    .exists();
                 *plan = next;
                 *worktrees = !*worktrees;
                 false
@@ -524,6 +630,7 @@ impl App {
                 self.ui.message.push_str(&format!(". {note}"));
             }
         }
+        self.route_stats.invalidate();
         self.load_runs();
         Ok(())
     }
@@ -583,17 +690,17 @@ impl Confirm {
                 rerun_lines(source, *worktree, palette),
             ),
             Kind::Cleanup {
-                id,
                 plan,
                 worktrees,
+                has_worktree,
+                ..
             } => {
                 let mut lines: Vec<_> = plan
                     .text(false)
                     .lines()
                     .map(|line| Line::raw(line.to_string()))
                     .collect();
-                let tree = plan.project.join(".model-router/worktrees").join(id);
-                if !worktrees && tree.exists() {
+                if !worktrees && *has_worktree {
                     lines.push(Line::raw(""));
                     lines.push(Line::styled(
                         "Its worktree stays. [g] also removes it when clean; its branch stays.",
@@ -698,25 +805,38 @@ fn rerun_lines(source: &Run, worktree: bool, palette: Palette) -> Vec<Line<'stat
 /// The Runs page: the sidebar, and the selected run beside it. Under 100
 /// columns a run of this session takes the whole width; the sidebar returns
 /// once a saved run is selected.
-pub(super) fn draw_runs(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
+pub(super) fn draw_runs(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    theme: Theme,
+    palette: Palette,
+) {
     // Narrow panes give a session's run the width, except while the filter,
     // which the sidebar holds, is being typed.
     if area.width < 98 && !app.on_saved() && !app.runs.filtering {
-        return draw_run(frame, app, area, palette);
+        return draw_run(frame, app, area, theme, palette);
     }
     let side = (area.width / 3).clamp(22, 34);
     let [sidebar, main] =
         Layout::horizontal([Constraint::Length(side), Constraint::Min(1)]).areas(area);
-    draw_sidebar(frame, app, sidebar, palette);
+    let visible = app.runs.visible();
+    draw_sidebar(frame, app, sidebar, palette, &visible);
     let main = Rect {
         x: main.x + 1,
         width: main.width.saturating_sub(1),
         ..main
     };
     if app.on_saved() {
-        draw_saved(frame, app, main, palette);
+        draw_saved(
+            frame,
+            app,
+            main,
+            palette,
+            visible.get(app.runs.selected).copied(),
+        );
     } else {
-        draw_run(frame, app, main, palette);
+        draw_run(frame, app, main, theme, palette);
     }
 }
 
@@ -731,7 +851,13 @@ pub(super) fn title(task: &str, workflow: &str) -> String {
 }
 
 /// This session's runs, then the saved ones, two lines each.
-fn draw_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
+fn draw_sidebar(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    palette: Palette,
+    visible: &[&Entry],
+) {
     let block = Block::default()
         .borders(Borders::RIGHT)
         .border_style(Style::default().fg(palette.line));
@@ -799,7 +925,6 @@ fn draw_sidebar(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) 
         }
         items.push(ListItem::new(""));
     }
-    let visible = app.runs.visible();
     let mut head = if app.runs.loading && app.runs.entries.is_empty() {
         "Saved · loading…".to_owned()
     } else {
@@ -900,8 +1025,14 @@ fn draw_filter(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
 }
 
 /// What a saved run was, and what opening it here offers.
-fn draw_saved(frame: &mut Frame<'_>, app: &App, area: Rect, palette: Palette) {
-    let Some(entry) = app.runs.selected_entry() else {
+fn draw_saved(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    palette: Palette,
+    entry: Option<&Entry>,
+) {
+    let Some(entry) = entry else {
         let (head, body) = if !app.runs.filtered() {
             (
                 "No runs yet",
@@ -1431,5 +1562,28 @@ mod tests {
         let footer = &lines[23];
         assert!(footer.contains("[↑↓] runs"), "{footer}");
         assert!(footer.contains("[Space] menu"), "{footer}");
+    }
+
+    #[test]
+    fn runs_sizes_cache_keeps_unchanged_entries_across_refreshes() {
+        let project = tempfile::tempdir().unwrap();
+        let settings = settings("test-model");
+        let run = create(project.path(), &settings, "Cached size");
+        let entries = history::list(project.path()).unwrap();
+        let mut page = RunsPage::default();
+        page.show(entries.clone(), project.path());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while page.is_sizing() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let initial = page.sizes.lock().unwrap()[&run.id];
+        assert!(page.take_sizes_dirty());
+        page.sizes
+            .lock()
+            .unwrap()
+            .insert(run.id.clone(), initial + 999);
+        page.show(entries, project.path());
+        assert!(!page.is_sizing());
+        assert_eq!(page.sizes.lock().unwrap()[&run.id], initial + 999);
     }
 }

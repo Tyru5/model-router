@@ -14,8 +14,8 @@ use anyhow::{Context, Result, bail, ensure};
 use portable_pty::{CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File},
-    io::{self, BufRead, BufReader, Read, Write},
+    fs,
+    io::{self, BufWriter, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::{
@@ -94,6 +94,14 @@ pub(super) fn frame(tag: u8, payload: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(payload);
 }
 
+pub(super) fn frame_slices(tag: u8, first: &[u8], second: &[u8], out: &mut Vec<u8>) {
+    let len = first.len() + second.len();
+    out.push(tag);
+    out.extend_from_slice(&(len as u32).to_be_bytes());
+    out.extend_from_slice(first);
+    out.extend_from_slice(second);
+}
+
 /// Terminal output as frames mr accepts: a redraw of a large screen can pass
 /// `FRAME_LIMIT`, and mr's decoder carries a sequence across frames.
 fn output_frames(raw: &[u8], out: &mut Vec<u8>) {
@@ -106,9 +114,19 @@ fn output_frames(raw: &[u8], out: &mut Vec<u8>) {
 #[derive(Default)]
 pub(super) struct Frames {
     buffer: Vec<u8>,
+    pos: usize,
     fds: Vec<OwnedFd>,
 }
 impl Frames {
+    pub(super) fn unread(&self) -> &[u8] {
+        &self.buffer[self.pos..]
+    }
+    fn unread_len(&self) -> usize {
+        self.buffer.len() - self.pos
+    }
+    pub(super) fn has_room(&self) -> bool {
+        self.unread_len() <= 4 * FRAME_LIMIT
+    }
     /// One read; 0 at end of stream.
     pub fn read(&mut self, stream: &UnixStream) -> io::Result<usize> {
         let mut bytes = [0u8; 16 * 1024];
@@ -123,7 +141,7 @@ impl Frames {
     /// frames are used waits. False at end of stream or on an error that
     /// ends the connection.
     pub fn fill(&mut self, stream: &UnixStream) -> bool {
-        while self.buffer.len() <= 4 * FRAME_LIMIT {
+        while self.has_room() {
             match self.read(stream) {
                 Ok(0) => return false,
                 Ok(_) => {}
@@ -136,20 +154,32 @@ impl Frames {
     }
     /// The tag of the next frame, whole or not.
     fn peek(&self) -> Option<u8> {
-        self.buffer.first().copied()
+        self.unread().first().copied()
     }
     pub fn next(&mut self) -> Result<Option<(u8, Vec<u8>)>> {
-        if self.buffer.len() < 5 {
+        let unread = self.unread();
+        if unread.len() < 5 {
             return Ok(None);
         }
-        let length = u32::from_be_bytes(self.buffer[1..5].try_into().expect("four bytes")) as usize;
+        let length = u32::from_be_bytes(unread[1..5].try_into().expect("four bytes")) as usize;
         ensure!(length <= FRAME_LIMIT, "Terminal host stream is corrupt");
-        if self.buffer.len() < 5 + length {
+        if unread.len() < 5 + length {
             return Ok(None);
         }
-        let tag = self.buffer[0];
-        let payload = self.buffer[5..5 + length].to_vec();
-        self.buffer.drain(..5 + length);
+        let tag = unread[0];
+        let payload = unread[5..5 + length].to_vec();
+        self.pos += 5 + length;
+        if self.pos == self.buffer.len() {
+            self.buffer.clear();
+            self.pos = 0;
+            if self.buffer.capacity() > 256 * 1024 {
+                self.buffer.shrink_to(64 * 1024);
+            }
+        } else if self.pos >= 64 * 1024 && self.pos * 2 >= self.buffer.len() {
+            self.buffer.copy_within(self.pos.., 0);
+            self.buffer.truncate(self.buffer.len() - self.pos);
+            self.pos = 0;
+        }
         Ok(Some((tag, payload)))
     }
     /// The descriptors received so far, in order; the frame that carried
@@ -303,12 +333,17 @@ pub(super) fn flush(stream: &mut UnixStream, out: &mut Vec<u8>, written: &mut us
 pub(crate) fn socket_dir() -> Result<PathBuf> {
     // SAFETY: getuid cannot fail.
     let uid = unsafe { libc::getuid() };
-    let dir = match std::env::var_os("XDG_RUNTIME_DIR")
+    let candidate = match std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute() && path.is_dir())
     {
         Some(runtime) => runtime.join("model-router"),
         None => std::env::temp_dir().join(format!("model-router-{uid}")),
+    };
+    let dir = if candidate.join("0123456789abcdef.sock").as_os_str().len() > 100 {
+        PathBuf::from(format!("/tmp/model-router-{uid}"))
+    } else {
+        candidate
     };
     // Created private, so a concurrent mr never sees it with umask bits.
     match fs::DirBuilder::new().mode(0o700).create(&dir) {
@@ -405,6 +440,49 @@ fn program() -> Result<PathBuf> {
     return std::env::current_exe().context("Cannot locate the model-router executable");
 }
 
+fn read_ready_line(
+    stdout: &mut std::process::ChildStdout,
+    timeout: Duration,
+    dir: &Path,
+) -> Result<String> {
+    nonblocking(stdout.as_raw_fd())?;
+    let deadline = Instant::now() + timeout;
+    let mut buf = Vec::with_capacity(128);
+    let mut chunk = [0u8; 512];
+    'read: loop {
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) => break 'read,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.contains(&b'\n') || buf.len() >= 4096 {
+                        break 'read;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "The terminal host timed out starting the harness; see {}",
+                dir.join("terminal-host.log").display()
+            );
+        }
+        let wait_ms = remaining.as_millis().clamp(1, 50) as libc::c_int;
+        let mut pfd = libc::pollfd {
+            fd: stdout.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: stdout is borrowed and outlives the poll call.
+        unsafe { libc::poll(&mut pfd, 1, wait_ms) };
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// Starts a host for `spec` and returns the harness's process group once it
 /// runs: its ID (the leader's PID) and the leader's start time, which the
 /// host reads before it can reap the leader (see `ready`).
@@ -413,7 +491,16 @@ pub(super) fn spawn(spec: &Spec) -> Result<(u32, Option<String>)> {
     if PROGRAM.get().is_none() {
         return spawn_thread(spec);
     }
-    let log = File::create(spec.dir.join("terminal-host.log"))?;
+    struct KillOnDrop(Option<std::process::Child>);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let log = crate::storage::create_fresh(&spec.dir.join("terminal-host.log"))?;
     let mut command = Command::new(program()?);
     command
         .arg(ARG)
@@ -432,16 +519,19 @@ pub(super) fn spawn(spec: &Spec) -> Result<(u32, Option<String>)> {
             Ok(())
         });
     }
-    let mut child = command.spawn().context("Start the terminal host")?;
+    let mut guard = KillOnDrop(Some(command.spawn().context("Start the terminal host")?));
+    let child = guard.0.as_mut().expect("spawned child");
     let mut stdin = child.stdin.take().context("Terminal host stdin")?;
     stdin.write_all(&serde_json::to_vec(spec)?)?;
     drop(stdin);
-    let mut line = String::new();
-    BufReader::new(child.stdout.take().context("Terminal host stdout")?).read_line(&mut line)?;
-    // mr reaps the host while it lives; after mr exits, init does.
-    thread::spawn(move || {
-        let _ = child.wait();
-    });
+    let mut stdout = child.stdout.take().context("Terminal host stdout")?;
+    let line = read_ready_line(&mut stdout, Duration::from_secs(10), &spec.dir)?;
+    if let Some(mut child) = guard.0.take() {
+        // mr reaps the host while it lives; after mr exits, init does.
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
     ready(&line, &spec.dir)
 }
 
@@ -518,32 +608,66 @@ fn receive(frames: &mut Frames, locks: &mut Vec<FileLock>, count: usize) {
     }
 }
 
-/// Lets go of a client, first taking locks it handed over that are still
-/// unread: dropping the connection would close them and free the locks. A
-/// write to an mr that has just closed fails even with its frames queued.
-fn part(mut gone: Client, locks: &mut Vec<FileLock>, count: usize) {
-    gone.frames.fill(&gone.stream);
-    while let Ok(Some((tag, _))) = gone.frames.next() {
-        if tag == tag::LOCKS {
-            receive(&mut gone.frames, locks, count);
+/// Lets go of a client, first taking locks and stop signals it sent before
+/// closing: dropping the connection would close unread lock descriptors and
+/// drop a queued STOP behind a large paste.
+fn part(
+    mut gone: Client,
+    locks: &mut Vec<FileLock>,
+    count: usize,
+    pid: u32,
+    stopping: &mut Option<Instant>,
+) {
+    for _ in 0..64 {
+        let open = gone.frames.fill(&gone.stream);
+        let mut drained = false;
+        while let Ok(Some((tag, _))) = gone.frames.next() {
+            drained = true;
+            match tag {
+                tag::LOCKS => receive(&mut gone.frames, locks, count),
+                tag::STOP if stopping.is_none() => {
+                    signal_group(pid, libc::SIGTERM);
+                    *stopping = Some(Instant::now() + GRACE);
+                }
+                _ => {}
+            }
+        }
+        if !open || !drained {
+            break;
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AttachCheck {
+    Incomplete,
+    Ready(bool),
+    Invalid,
 }
 
 /// Whether `buffer` starts with a whole attach request, and if so whether it
 /// asks for the harness's start time with its PID: payload `[1]`. An mr
 /// built before it could read one sends an empty payload, and a host built
 /// before then ignores the payload and answers with the PID alone.
-fn attach_request(buffer: &[u8]) -> Option<bool> {
-    if buffer.first() != Some(&tag::ATTACH) {
-        return None;
+fn attach_request(buffer: &[u8]) -> AttachCheck {
+    let Some(&first) = buffer.first() else {
+        return AttachCheck::Incomplete;
+    };
+    if first != tag::ATTACH {
+        return AttachCheck::Invalid;
     }
-    let len = u32::from_be_bytes(buffer.get(1..5)?.try_into().ok()?) as usize;
-    // Not one this host understands: answer it as an old mr's.
-    if len > 1 {
-        return Some(false);
+    let Some(header) = buffer.get(1..5) else {
+        return AttachCheck::Incomplete;
+    };
+    let len = u32::from_be_bytes(header.try_into().expect("four bytes")) as usize;
+    if len > FRAME_LIMIT {
+        return AttachCheck::Invalid;
     }
-    (buffer.len() >= 5 + len).then(|| buffer.get(5) == Some(&1))
+    if buffer.len() < 5 + len {
+        return AttachCheck::Incomplete;
+    }
+    // Larger payloads within FRAME_LIMIT still attach as an older/unknown mr.
+    AttachCheck::Ready(len == 1 && buffer.get(5) == Some(&1))
 }
 
 /// Binds the socket, launches the harness, reports it through `ready`, and
@@ -581,7 +705,8 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
             cmd.env(name, value);
         }
         cmd.cwd(&spec.cwd);
-        let transcript = File::create(spec.dir.join("stdout.log"))?;
+        let transcript =
+            BufWriter::new(crate::storage::create_fresh(&spec.dir.join("stdout.log"))?);
         let fd = pair
             .master
             .as_raw_fd()
@@ -617,6 +742,9 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
     let mut child = PtyChild {
         child: spawned,
         pid: Some(pid),
+        started: leader.clone(),
+        leader_reaped: false,
+        killed: false,
     };
     ready(match (&leader, spec.report_started) {
         (Some(leader), true) => format!("ok {pid} {leader}\n"),
@@ -635,6 +763,8 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
     let mut pending: Vec<(UnixStream, Frames)> = Vec::new();
     let mut locks: Vec<FileLock> = Vec::new();
     let mut stopping: Option<Instant> = None;
+    let mut raw = Vec::new();
+    let mut next_lock_try = Instant::now();
     let status = loop {
         // The attached mr first, so one that just let go is gone before a
         // new one asks to attach.
@@ -679,7 +809,6 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
                     break;
                 }
                 if open && active.written == active.out.len() {
-                    let mut raw = Vec::new();
                     state.take_output(&mut raw);
                     output_frames(&raw, &mut active.out);
                 }
@@ -693,7 +822,7 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
             }
             if gone {
                 if let Some(gone) = client.take() {
-                    part(gone, &mut locks, spec.locks.len());
+                    part(gone, &mut locks, spec.locks.len(), pid, &mut stopping);
                 }
                 state.attached = false;
                 state.output.clear();
@@ -719,65 +848,75 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
         while index < pending.len() {
             let (stream, frames) = &mut pending[index];
             let open = frames.fill(stream);
-            if let Some(report_started) = attach_request(&frames.buffer) {
-                let (mut stream, mut frames) = pending.remove(index);
-                let _ = frames.next();
-                let mut out = Vec::new();
-                // The attached mr may have let go since it was last read.
-                if let Some(gone) = client.take_if(|active| !active.frames.fill(&active.stream)) {
-                    part(gone, &mut locks, spec.locks.len());
-                    state.attached = false;
+            match attach_request(frames.unread()) {
+                AttachCheck::Ready(report_started) => {
+                    let (mut stream, mut frames) = pending.remove(index);
+                    if frames.next().is_err() {
+                        continue;
+                    }
+                    let mut out = Vec::new();
+                    // The attached mr may have let go since it was last read.
+                    if let Some(gone) = client.take_if(|active| !active.frames.fill(&active.stream))
+                    {
+                        part(gone, &mut locks, spec.locks.len(), pid, &mut stopping);
+                        state.attached = false;
+                        state.output.clear();
+                    }
+                    if client.is_some() {
+                        // Never take a live session from the mr attached to it.
+                        frame(tag::BUSY, &[], &mut out);
+                        let _ = stream.write(&out);
+                        continue;
+                    }
+                    let mut spawned = pid.to_be_bytes().to_vec();
+                    if let (true, Some(leader)) = (report_started, &leader) {
+                        spawned.extend_from_slice(leader.as_bytes());
+                    }
+                    frame(tag::SPAWNED, &spawned, &mut out);
+                    // A client never sends descriptors before attaching.
+                    drop(frames.take_fds());
+                    let mut written = 0;
+                    if !locks.is_empty() {
+                        // The attached mr takes the locks over, sent with the reply.
+                        let fds: Vec<_> = locks.iter().map(|lock| lock.fd().as_raw_fd()).collect();
+                        match send(&stream, &out, &fds) {
+                            Ok(n) if n > 0 => {
+                                for lock in locks.drain(..) {
+                                    lock.hand_over();
+                                }
+                                written = n;
+                            }
+                            // Keep them; that mr sees its connection close.
+                            _ => continue,
+                        }
+                    }
+                    client = Some(Client {
+                        stream,
+                        frames,
+                        out,
+                        written,
+                    });
+                    state.attached = true;
+                    state.redraw = true;
                     state.output.clear();
                 }
-                if client.is_some() {
-                    // Never take a live session from the mr attached to it.
-                    frame(tag::BUSY, &[], &mut out);
-                    let _ = stream.write(&out);
-                    continue;
+                AttachCheck::Invalid => {
+                    pending.remove(index);
                 }
-                let mut spawned = pid.to_be_bytes().to_vec();
-                if let (true, Some(leader)) = (report_started, &leader) {
-                    spawned.extend_from_slice(leader.as_bytes());
+                AttachCheck::Incomplete if !open => {
+                    pending.remove(index);
                 }
-                frame(tag::SPAWNED, &spawned, &mut out);
-                // A client never sends descriptors before attaching.
-                drop(frames.take_fds());
-                let mut written = 0;
-                if !locks.is_empty() {
-                    // The attached mr takes the locks over, sent with the reply.
-                    let fds: Vec<_> = locks.iter().map(|lock| lock.fd().as_raw_fd()).collect();
-                    match send(&stream, &out, &fds) {
-                        Ok(n) if n > 0 => {
-                            for lock in locks.drain(..) {
-                                lock.hand_over();
-                            }
-                            written = n;
-                        }
-                        // Keep them; that mr sees its connection close.
-                        _ => continue,
-                    }
+                AttachCheck::Incomplete => {
+                    index += 1;
                 }
-                client = Some(Client {
-                    stream,
-                    frames,
-                    out,
-                    written,
-                });
-                state.attached = true;
-                state.redraw = true;
-                state.output.clear();
-            } else if !open
-                || frames
-                    .buffer
-                    .first()
-                    .is_some_and(|first| *first != tag::ATTACH)
-            {
-                pending.remove(index);
-            } else {
-                index += 1;
             }
         }
-        if client.is_none() && locks.is_empty() && !spec.locks.is_empty() {
+        if client.is_none()
+            && locks.is_empty()
+            && !spec.locks.is_empty()
+            && Instant::now() >= next_lock_try
+        {
+            next_lock_try = Instant::now() + Duration::from_millis(100);
             // Only after an mr vanished without handing its locks over. All
             // or none, in mr's order; retried until that mr's locks are free.
             let taken: Result<Vec<_>> =
@@ -788,17 +927,20 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
         }
         if state.size != size {
             size = state.size;
-            master.resize(PtySize {
+            let _ = master.resize(PtySize {
                 cols: size.0,
                 rows: size.1,
                 pixel_width: 0,
                 pixel_height: 0,
-            })?;
+            });
         }
         while !state.input.is_empty() {
             let (front, _) = state.input.as_slices();
             match writer.write(front) {
-                Ok(0) => break,
+                Ok(0) => {
+                    state.input.clear();
+                    break;
+                }
                 Ok(n) => {
                     state.input.drain(..n);
                 }
@@ -814,14 +956,23 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
             &mut |frame| state.output(frame),
             &mut bytes,
             &mut eof,
+            32,
         )?;
         if let Some(status) = child.child.try_wait()? {
+            child.leader_reaped = true;
+            if stopping.is_some() {
+                kill_group(pid);
+                child.killed = true;
+            }
             break status;
         }
         if stopping.is_some_and(|deadline| Instant::now() >= deadline) {
             kill_group(pid);
             let _ = child.child.kill();
-            break child.child.wait()?;
+            let status = child.child.wait()?;
+            child.leader_reaped = true;
+            child.killed = true;
+            break status;
         }
         let mut polls = vec![
             libc::pollfd {
@@ -841,14 +992,22 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
             },
         ];
         if let Some(active) = &client {
+            let read_client = active.frames.has_room()
+                && !(state.input.len() >= INPUT_LIMIT && active.frames.peek() == Some(tag::INPUT));
+            let mut events = 0;
+            if read_client {
+                events |= libc::POLLIN;
+            }
+            if active.written < active.out.len() {
+                events |= libc::POLLOUT;
+            }
             polls.push(libc::pollfd {
-                fd: active.stream.as_raw_fd(),
-                events: libc::POLLIN
-                    | if active.written < active.out.len() {
-                        libc::POLLOUT
-                    } else {
-                        0
-                    },
+                fd: if events == 0 {
+                    -1
+                } else {
+                    active.stream.as_raw_fd()
+                },
+                events,
                 revents: 0,
             });
         }
@@ -868,19 +1027,36 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
         // SAFETY: every descriptor is borrowed and outlives the call.
         unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, timeout) };
     };
-    drain_pty(
-        &mut reader,
-        &mut transcript,
-        &mut decoder,
-        &mut |frame| state.output(frame),
-        &mut bytes,
-        &mut eof,
-    )?;
+    if !eof {
+        drain_pty(
+            &mut reader,
+            &mut transcript,
+            &mut decoder,
+            &mut |frame| state.output(frame),
+            &mut bytes,
+            &mut eof,
+            1024,
+        )?;
+    }
     // No descendant outlives the harness, as when mr owned it.
     drop(child);
-    let _ = transcript.sync_all();
+    if !eof {
+        drain_pty(
+            &mut reader,
+            &mut transcript,
+            &mut decoder,
+            &mut |frame| state.output(frame),
+            &mut bytes,
+            &mut eof,
+            1024,
+        )?;
+    }
+    transcript
+        .into_inner()
+        .map_err(io::IntoInnerError::into_error)?
+        .sync_all()?;
     let exit = Exit {
-        code: Some(status.exit_code() as i32),
+        code: status.signal().is_none().then(|| status.exit_code() as i32),
         cancelled: stopping.is_some(),
     };
     crate::storage::write_json(&spec.dir.join(EXIT_FILE), &exit)?;
@@ -889,16 +1065,25 @@ fn serve(spec: &Spec, ready: impl FnOnce(String)) -> Result<()> {
     // Nobody can attach to a finished harness; the record says how it ended.
     let _ = fs::remove_file(&spec.socket);
     if let Some(mut active) = client.take() {
-        let mut raw = Vec::new();
         state.take_output(&mut raw);
         output_frames(&raw, &mut active.out);
         frame(tag::EXIT, &serde_json::to_vec(&exit)?, &mut active.out);
         let deadline = Instant::now() + Duration::from_secs(2);
         while flush(&mut active.stream, &mut active.out, &mut active.written)
             && !active.out.is_empty()
-            && Instant::now() < deadline
         {
-            thread::sleep(Duration::from_millis(10));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let wait_ms = remaining.as_millis().clamp(1, 50) as libc::c_int;
+            let mut pfd = libc::pollfd {
+                fd: active.stream.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: active.stream is open and borrowed for this poll call.
+            unsafe { libc::poll(&mut pfd, 1, wait_ms) };
         }
     }
     Ok(())
@@ -1140,15 +1325,49 @@ mod tests {
     fn attach_requests_are_read_whole() {
         let mut out = Vec::new();
         frame(tag::ATTACH, &[], &mut out);
-        assert_eq!(attach_request(&out), Some(false));
-        assert_eq!(attach_request(&out[..3]), None);
+        assert_eq!(attach_request(&out), AttachCheck::Ready(false));
+        assert_eq!(attach_request(&out[..3]), AttachCheck::Incomplete);
         out.clear();
         frame(tag::ATTACH, &[1], &mut out);
-        assert_eq!(attach_request(&out), Some(true));
-        assert_eq!(attach_request(&out[..5]), None);
+        assert_eq!(attach_request(&out), AttachCheck::Ready(true));
+        assert_eq!(attach_request(&out[..5]), AttachCheck::Incomplete);
         out.clear();
         frame(tag::INPUT, &[1], &mut out);
-        assert_eq!(attach_request(&out), None);
+        assert_eq!(attach_request(&out), AttachCheck::Invalid);
+        // Oversized attach frame is rejected immediately instead of attaching.
+        let mut huge = vec![tag::ATTACH];
+        huge.extend_from_slice(&((FRAME_LIMIT + 1) as u32).to_be_bytes());
+        assert_eq!(attach_request(&huge), AttachCheck::Invalid);
+    }
+
+    #[test]
+    fn frames_cursor_compacts_across_many_small_frames() {
+        let mut frames = Frames::default();
+        for i in 0..2000u32 {
+            frame(tag::INPUT, &i.to_be_bytes(), &mut frames.buffer);
+        }
+        for i in 0..2000u32 {
+            let (tag, payload) = frames.next().unwrap().unwrap();
+            assert_eq!(tag, tag::INPUT);
+            assert_eq!(payload, i.to_be_bytes());
+        }
+        assert!(frames.next().unwrap().is_none());
+        assert!(frames.unread().is_empty());
+    }
+
+    #[test]
+    fn signal_terminated_harness_records_no_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = spec(dir.path(), "kill -KILL $$");
+        let socket = spec.socket.clone();
+        spawn(&spec).unwrap();
+        await_exit(dir.path());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while socket.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let exit = recorded(dir.path()).unwrap();
+        assert_eq!(exit.code, None);
     }
 
     #[test]

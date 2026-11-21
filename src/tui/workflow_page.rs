@@ -336,7 +336,8 @@ impl StageEditor {
             .split(chunks[0]);
         let value_width = halves[0].width.saturating_sub(4) as usize;
         let rows = FIELDS.iter().enumerate().map(|(i, label)| {
-            let value = content(&self.fields[i]).replace('\n', " ");
+            let limit = value_width;
+            let value = field_preview(&self.fields[i], limit);
             let choice = self.is_choice(i) || (i == MODEL && !self.typing_model);
             ListItem::new(vec![
                 Line::styled(*label, Style::default().fg(palette.muted)),
@@ -484,6 +485,31 @@ impl StageEditor {
             chunks[1],
         );
     }
+}
+
+/// Single-line prefix of `field` without copying the full multiline buffer.
+fn field_preview(field: &InputField<'_>, max_chars: usize) -> String {
+    let lines = field.lines();
+    let cap = max_chars.saturating_add(1);
+    let mut out = String::new();
+    let mut chars = 0usize;
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            if chars >= cap {
+                break;
+            }
+            out.push(' ');
+            chars += 1;
+        }
+        for ch in line.chars() {
+            if chars >= cap {
+                return out;
+            }
+            out.push(ch);
+            chars += 1;
+        }
+    }
+    out
 }
 
 /// A ship stage's options as TOML lines; empty for other stages.
@@ -724,22 +750,31 @@ impl App {
             ActionId::PickHarness => {
                 let items = catalog::known_harnesses(&self.editor.settings)
                     .into_iter()
-                    .map(|name| Choice {
-                        label: format!(
-                            "{} · {}",
-                            name,
-                            if adapters::executable(&adapters::program(
-                                &name,
-                                &self.editor.settings.adapters
-                            ))
-                            .is_some()
-                            {
-                                "installed"
-                            } else {
-                                "not installed"
-                            }
-                        ),
-                        value: PickValue::Harness(name),
+                    .map(|name| {
+                        let installed = self
+                            .harnesses
+                            .checks
+                            .report(&name)
+                            .map(|r| r.installed())
+                            .unwrap_or_else(|| {
+                                adapters::executable(&adapters::program(
+                                    &name,
+                                    &self.editor.settings.adapters,
+                                ))
+                                .is_some()
+                            });
+                        Choice {
+                            label: format!(
+                                "{} · {}",
+                                name,
+                                if installed {
+                                    "installed"
+                                } else {
+                                    "not installed"
+                                }
+                            ),
+                            value: PickValue::Harness(name),
+                        }
                     })
                     .collect();
                 self.ui.open(Modal::Picker {
@@ -1270,7 +1305,7 @@ fn draw_stage_detail(
     let columns = area.width >= 70 && facts.iter().all(|line| line.width() <= column);
     let half = facts.len().div_ceil(2);
     let fact_rows = if columns {
-        half as u16
+        u16::try_from(half).unwrap_or(u16::MAX)
     } else {
         facts
             .iter()
@@ -1279,9 +1314,15 @@ fn draw_stage_detail(
     };
     let warning_rows = warning
         .as_ref()
-        .map_or(0, |line| rows_for(line, area.width, 3) + 1);
+        .map_or(0, |line| rows_for(line, area.width, 3).saturating_add(1));
     // Blank rows only when the settings all fit with them.
-    let gap = u16::from(area.height >= 1 + warning_rows + fact_rows + 3);
+    let gap = u16::from(
+        area.height
+            >= 1u16
+                .saturating_add(warning_rows)
+                .saturating_add(fact_rows)
+                .saturating_add(3),
+    );
     let [title_row, _, warning_area, facts_area, _, more_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(gap),

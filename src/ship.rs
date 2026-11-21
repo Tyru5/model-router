@@ -334,10 +334,26 @@ fn exec_with(
     let mut child = command
         .spawn()
         .with_context(|| format!("Start {program}"))?;
-    if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        pipe.write_all(input)?;
-    }
-    let output = child.wait_with_output()?;
+    let output = std::thread::scope(|scope| -> Result<std::process::Output> {
+        let writer = stdin.zip(child.stdin.take()).map(|(input, mut pipe)| {
+            scope.spawn(move || -> std::io::Result<()> {
+                match pipe.write_all(input) {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                    Err(err) => Err(err),
+                }
+            })
+        });
+        let output = child.wait_with_output()?;
+        if let Some(handle) = writer {
+            if let Ok(Err(err)) = handle.join() {
+                if output.status.success() {
+                    return Err(err.into());
+                }
+            }
+        }
+        Ok(output)
+    })?;
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     ensure!(
         output.status.success(),
@@ -438,11 +454,26 @@ fn subject(text: &str) -> Option<String> {
 }
 
 fn expand(template: &str, values: &[(&str, &str)]) -> String {
-    values
-        .iter()
-        .fold(template.to_owned(), |text, (key, value)| {
-            text.replace(&format!("{{{key}}}"), value)
-        })
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        rest = &rest[open..];
+        let Some(close) = rest[1..].find('}') else {
+            out.push_str(rest);
+            return out;
+        };
+        let key = &rest[1..1 + close];
+        if let Some((_, value)) = values.iter().find(|(k, _)| *k == key) {
+            out.push_str(value);
+            rest = &rest[close + 2..];
+        } else {
+            out.push('{');
+            rest = &rest[1..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The run's changes up to its last non-ship attempt: the files to commit.
@@ -458,7 +489,7 @@ fn run_range(run: &Run) -> Result<(String, String)> {
         .zip(&run.stages)
         .filter(|(stage, _)| stage.role != Role::Ship)
         .flat_map(|(_, state)| &state.attempts)
-        .max_by_key(|a| a.started_at);
+        .max_by_key(|a| (a.finished_at.unwrap_or(a.started_at), a.started_at));
     let to = match latest {
         Some(attempt) => attempt
             .tree_after
@@ -467,10 +498,6 @@ fn run_range(run: &Run) -> Result<(String, String)> {
         None => from.clone(),
     };
     Ok((from, to))
-}
-
-fn paths(files: &[FileChange]) -> BTreeSet<String> {
-    files.iter().map(|f| f.path.clone()).collect()
 }
 
 /// Works out the ship for `run` without changing anything. Errors are the
@@ -483,6 +510,7 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
         "Ship needs the run's Git workspace: {}",
         dir.display()
     );
+    let top = PathBuf::from(git(dir, &["rev-parse", "--show-toplevel"])?);
     let name = git(dir, &["config", "user.name"]).unwrap_or_default();
     let email = git(dir, &["config", "user.email"]).unwrap_or_default();
     ensure!(
@@ -518,9 +546,10 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
     let (start, end) = run_range(run)?;
     let changed = snapshot::changes(dir, &start, &end)?;
     // Changes present when the run started, relative to the branch point.
-    let before = snapshot::changes(dir, &head, &start)?;
-    let before_paths = paths(&before);
-    let changed_paths = paths(&changed);
+    let before_paths: BTreeSet<String> = snapshot::changed_paths(dir, &head, &start)?
+        .into_iter()
+        .collect();
+    let changed_paths: BTreeSet<String> = changed.iter().map(|f| f.path.clone()).collect();
     let overlap: Vec<_> = changed_paths.intersection(&before_paths).cloned().collect();
     ensure!(
         overlap.is_empty() || options.include_preexisting,
@@ -534,21 +563,28 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
             overlap.join(", ")
         ));
     }
-    let tracked: BTreeSet<String> = git(dir, &["ls-tree", "-r", "-z", "--name-only", &head])?
+    let mut files = vec![];
+    let mut skipped = vec![];
+    if options.include_untracked {
+        files = changed;
+    } else {
+        let tracked: BTreeSet<String> = git(
+            &top,
+            &["ls-tree", "--full-tree", "-r", "-z", "--name-only", &head],
+        )?
         .split('\0')
         .filter(|p| !p.is_empty())
         .map(str::to_owned)
         .collect();
-    let mut files = vec![];
-    let mut skipped = vec![];
-    for file in changed {
-        if !options.include_untracked && !tracked.contains(&file.path) {
-            skipped.push(format!(
-                "{} (untracked; include_untracked = false)",
-                file.path
-            ));
-        } else {
-            files.push(file);
+        for file in changed {
+            if !tracked.contains(&file.path) {
+                skipped.push(format!(
+                    "{} (untracked; include_untracked = false)",
+                    file.path
+                ));
+            } else {
+                files.push(file);
+            }
         }
     }
     ensure!(
@@ -583,7 +619,7 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
             .tempdir_in(&run.directory)
             .context("Create a scratch directory for the ship scan")?;
         let index = std::path::absolute(scratch.path().join("index"))?;
-        let tree = stage_planned(dir, &head, &files, &index)?;
+        let tree = stage_planned(&top, &head, &files, &index)?;
         scan_staged(
             dir,
             &Staged {
@@ -598,11 +634,10 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
         )?;
     }
     // Edits since the run's last attempt are committed as they are now.
-    if let Some(now) = snapshot::tree(dir, &run.directory) {
+    if let Ok(Some(now)) = snapshot::current_tree(dir) {
         if now != end {
-            let later: Vec<_> = snapshot::changes(dir, &end, &now)?
+            let later: Vec<_> = snapshot::changed_paths(dir, &end, &now)?
                 .into_iter()
-                .map(|f| f.path)
                 .filter(|p| files.iter().any(|f| f.path == *p))
                 .collect();
             if !later.is_empty() {
@@ -816,7 +851,13 @@ pub fn apply(plan: &Plan, dir: &Path, mut log: impl FnMut(String)) -> Outcome {
     if let Err(error) = apply_steps(plan, dir, &mut outcome, &mut log) {
         outcome.error = Some(format!("{error:#}"));
     }
-    let _ = storage::write_json(&dir.join("ship.json"), &outcome);
+    if let Err(error) = storage::write_json(&dir.join("ship.json"), &outcome) {
+        let save_err = format!("Save {}: {error:#}", dir.join("ship.json").display());
+        outcome.error = Some(match outcome.error {
+            Some(existing) => format!("{existing}; {save_err}"),
+            None => save_err,
+        });
+    }
     outcome
 }
 
@@ -898,6 +939,7 @@ fn apply_steps(
     log: &mut impl FnMut(String),
 ) -> Result<()> {
     let work = plan.workspace.as_path();
+    let top = PathBuf::from(git(work, &["rev-parse", "--show-toplevel"])?);
     let head = git(work, &["rev-parse", "--verify", "HEAD^{commit}"])?;
     ensure!(
         head == plan.head,
@@ -908,7 +950,7 @@ fn apply_steps(
     // Stage exactly the planned paths in a private index from HEAD. It
     // stays until the scans below have read it.
     let index = PrivateIndex(std::path::absolute(dir.join("ship.index"))?);
-    let tree = stage_planned(work, &head, &plan.files, &index.0)?;
+    let tree = stage_planned(&top, &head, &plan.files, &index.0)?;
     let head_tree = git(work, &["rev-parse", &format!("{head}^{{tree}}")])?;
     ensure!(
         tree != head_tree,
@@ -953,12 +995,19 @@ fn apply_steps(
             &format!("refs/heads/{}", plan.branch),
         ],
     )?;
-    // The real index now matches the commit for the committed paths, so they
-    // show as clean; other staged or unstaged changes stay as they were.
+    // Sync ONLY the committed paths in the real index to match `commit`'s tree,
+    // avoiding re-hashing live working tree files and leaving unrelated staged
+    // changes untouched.
     exec_with(
         "git",
-        &["update-index", "--add", "--remove", "-z", "--stdin"],
-        work,
+        &[
+            "reset",
+            "-q",
+            &commit,
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ],
+        &top,
         &[],
         Some(&list),
     )?;
@@ -1176,7 +1225,10 @@ pub fn confirm(run: &mut Run) -> Result<()> {
     let index = run.cursor;
     ensure!(
         run.status == Status::AwaitingConfirmation
-            && run.stages[index].status == Status::AwaitingConfirmation,
+            && run
+                .stages
+                .get(index)
+                .is_some_and(|s| s.status == Status::AwaitingConfirmation),
         "No ship plan awaits confirmation"
     );
     let attempt = run.stages[index]
@@ -1211,11 +1263,26 @@ pub fn run_options(run: &Run) -> Options {
         .unwrap_or_default()
 }
 
+fn next_completed_number(base: &Path) -> usize {
+    fs::read_dir(base)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let s = name.to_str()?;
+            s.strip_prefix("ship-")?.parse::<usize>().ok()
+        })
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
 /// Where `model-router ship` saves its next ship of a finished run.
 pub fn completed_dir(run: &Run) -> PathBuf {
     let base = run.directory.join("ship");
-    let number = fs::read_dir(&base).map_or(0, |entries| entries.count()) + 1;
-    base.join(format!("ship-{number:03}"))
+    base.join(format!("ship-{:03}", next_completed_number(&base)))
 }
 
 /// `model-router ship`: plans a finished run's ship and saves the plan.
@@ -1226,7 +1293,19 @@ pub fn plan_completed(run: &Run, options: &Options) -> Result<(Plan, PathBuf)> {
         run.status.label()
     );
     let plan = plan(run, options)?;
-    let dir = completed_dir(run);
+    let base = run.directory.join("ship");
+    fs::create_dir_all(&base)?;
+    let mut number = next_completed_number(&base);
+    let dir = loop {
+        let candidate = base.join(format!("ship-{number:03}"));
+        match fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                number += 1;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    };
     save_plan(&plan, &dir)?;
     Ok((plan, dir))
 }
@@ -1296,6 +1375,14 @@ mod tests {
             ),
             "mr/1-s-{other}"
         );
+        // Substituted values containing placeholders must never be re-expanded.
+        assert_eq!(
+            expand(
+                "{subject}/{branch}",
+                &[("subject", "{branch}"), ("branch", "oops")]
+            ),
+            "{branch}/oops"
+        );
         let options = Options {
             push: true,
             draft_pr: true,
@@ -1312,6 +1399,148 @@ mod tests {
             }
             .validate()
             .is_err()
+        );
+    }
+
+    #[test]
+    fn completed_dir_picks_max_plus_one_when_earlier_entries_were_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut run = crate::report::tests::sample();
+        run.directory = dir.path().to_path_buf();
+        fs::create_dir_all(run.directory.join("ship/ship-002")).unwrap();
+        assert_eq!(completed_dir(&run), run.directory.join("ship/ship-003"));
+    }
+
+    #[test]
+    fn plan_works_in_subdirectory_with_include_untracked_false_without_writing_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        if git(root, &["config", "--get", "user.name"]).is_err() {
+            return;
+        }
+        git(root, &["init", "-b", "main"]).unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub/tracked.txt"), "one\n").unwrap();
+        git(root, &["add", "."]).unwrap();
+        git(
+            root,
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        )
+        .unwrap();
+
+        let sub = root.join("sub");
+        let run_dir = root.join(".model-router/runs/r-sub");
+        fs::create_dir_all(&run_dir).unwrap();
+        let baseline = snapshot::current_tree(&sub).unwrap();
+        fs::write(sub.join("tracked.txt"), "two\n").unwrap();
+        fs::write(sub.join("untracked.txt"), "skip me\n").unwrap();
+        let tree_after = snapshot::current_tree(&sub).unwrap();
+
+        let mut run = crate::report::tests::sample();
+        run.workflow.stages.truncate(1);
+        run.stages.truncate(1);
+        run.id = "r-sub".into();
+        run.project = sub.clone();
+        run.workspace = sub.clone();
+        run.directory = run_dir;
+        run.baseline = baseline;
+        run.stages[0].attempts.last_mut().unwrap().tree_after = tree_after;
+        let opts = Options {
+            include_untracked: false,
+            secret_scan: false,
+            ..Options::default()
+        };
+        let planned = plan(&run, &opts).unwrap();
+        assert_eq!(planned.files.len(), 1);
+        assert_eq!(planned.files[0].path, "sub/tracked.txt");
+        assert!(
+            git(root, &["for-each-ref", "refs/model-router/"])
+                .unwrap()
+                .is_empty(),
+            "dry-run plan must not create snapshot refs"
+        );
+        assert!(!run.directory.join("snapshot.index").exists());
+    }
+
+    #[test]
+    fn apply_syncs_planned_paths_from_subdirectory_keeping_unrelated_staged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-b", "main"]).unwrap();
+        git(root, &["config", "user.name", "Test User"]).unwrap();
+        git(root, &["config", "user.email", "test@example.com"]).unwrap();
+        git(root, &["config", "commit.gpgsign", "false"]).unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("notes.txt"), "note1\n").unwrap();
+        fs::write(root.join("sub/tracked.txt"), "one\n").unwrap();
+        fs::write(root.join("sub/deleted.txt"), "bye\n").unwrap();
+        git(root, &["add", "."]).unwrap();
+        git(
+            root,
+            &["-c", "core.hooksPath=/dev/null", "commit", "-qm", "init"],
+        )
+        .unwrap();
+
+        let sub = root.join("sub");
+        let run_dir = root.join(".model-router/runs/r-apply");
+        let attempt_dir = run_dir.join("02-ship/attempt-001");
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::write(root.join(".model-router/.gitignore"), "*\n").unwrap();
+        let baseline = snapshot::current_tree(&sub).unwrap();
+        fs::write(sub.join("tracked.txt"), "two\n").unwrap();
+        fs::write(sub.join("added.txt"), "new\n").unwrap();
+        fs::remove_file(sub.join("deleted.txt")).unwrap();
+        let tree_after = snapshot::current_tree(&sub).unwrap();
+
+        let mut run = crate::report::tests::sample();
+        run.workflow.stages.truncate(1);
+        run.stages.truncate(1);
+        run.id = "r-apply".into();
+        run.project = sub.clone();
+        run.workspace = sub;
+        run.directory = run_dir;
+        run.baseline = baseline;
+        run.stages[0].attempts.last_mut().unwrap().tree_after = tree_after;
+        let opts = Options {
+            confirm: false,
+            secret_scan: false,
+            ..Options::default()
+        };
+        let planned = plan(&run, &opts).unwrap();
+        assert_eq!(
+            planned
+                .files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            ["sub/added.txt", "sub/deleted.txt", "sub/tracked.txt"]
+        );
+
+        // User has unrelated staged edits and an untracked file outside the run.
+        fs::write(root.join("notes.txt"), "staged note\n").unwrap();
+        git(root, &["add", "notes.txt"]).unwrap();
+        fs::write(root.join("other.txt"), "dirty\n").unwrap();
+
+        save_plan(&planned, &attempt_dir).unwrap();
+        let outcome = apply(&planned, &attempt_dir, |_| {});
+        assert_eq!(outcome.error, None);
+        assert!(outcome.commit.is_some());
+        assert!(attempt_dir.join("ship.json").exists());
+        assert_eq!(
+            git(root, &["diff", "--name-only", "HEAD~1", "HEAD"]).unwrap(),
+            "sub/added.txt\nsub/deleted.txt\nsub/tracked.txt"
+        );
+        assert_eq!(
+            git(root, &["status", "--porcelain"]).unwrap(),
+            "M  notes.txt\n?? other.txt"
         );
     }
 }

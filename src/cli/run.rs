@@ -170,7 +170,7 @@ pub fn fork_command(
         run.id,
         fork.stage,
         fork.attempt,
-        &fork.snapshot[..fork.snapshot.len().min(10)],
+        fork.snapshot.get(..10).unwrap_or(&fork.snapshot),
         run.workspace.display(),
         run.directory.display()
     );
@@ -202,27 +202,51 @@ fn drive_printing(run: &mut Run, cancel: &AtomicBool) -> Result<Action> {
     let (tx, rx) = mpsc::sync_channel::<Line>(PRINT_QUEUE);
     let counter = dropped.clone();
     let printer = std::thread::spawn(move || {
-        let note = |count: usize| {
-            println!(
-                "[{count} output updates dropped while output was blocked; see the attempt's stdout.log]"
+        let mut stdout_broken = false;
+        let mut stderr_broken = false;
+        let write_out = |text: &str, broken: &mut bool| {
+            if *broken {
+                return;
+            }
+            let mut out = io::stdout().lock();
+            if let Err(err) = out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+                if err.kind() == io::ErrorKind::BrokenPipe {
+                    *broken = true;
+                }
+            }
+        };
+        let write_err = |text: &str, broken: &mut bool| {
+            if *broken {
+                return;
+            }
+            let mut err_out = io::stderr().lock();
+            if let Err(err) = writeln!(err_out, "{text}") {
+                if err.kind() == io::ErrorKind::BrokenPipe {
+                    *broken = true;
+                }
+            }
+        };
+        let note = |count: usize, broken: &mut bool| {
+            write_out(
+                &format!(
+                    "[{count} output updates dropped while output was blocked; see the attempt's stdout.log]\n"
+                ),
+                broken,
             );
         };
         for line in rx {
             let missed = counter.swap(0, Ordering::Relaxed);
             if missed > 0 {
-                note(missed);
+                note(missed, &mut stdout_broken);
             }
             match line {
-                Line::Out(text) => {
-                    print!("{text}");
-                    let _ = io::stdout().flush();
-                }
-                Line::Err(text) => eprintln!("{text}"),
+                Line::Out(text) => write_out(&text, &mut stdout_broken),
+                Line::Err(text) => write_err(&text, &mut stderr_broken),
             }
         }
         let missed = counter.swap(0, Ordering::Relaxed);
         if missed > 0 {
-            note(missed);
+            note(missed, &mut stdout_broken);
         }
     });
     let action = engine::drive(run, cancel, |event| {

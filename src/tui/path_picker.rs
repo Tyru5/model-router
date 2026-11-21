@@ -23,24 +23,33 @@ pub(super) struct FolderEntry {
     path: PathBuf,
     repository: bool,
     directory: bool,
+    name: String,
+    clean_name: String,
+    clean_path: String,
 }
 
 impl FolderEntry {
-    fn new(path: PathBuf) -> Self {
+    fn from_parts(path: PathBuf, directory: bool) -> Self {
         // Linked worktrees and submodules use a .git file instead of a directory.
-        let git = path.join(".git");
+        let repository = directory && path.join(".git").exists();
+        let name = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        let clean_name = storage::clean_terminal(&name);
+        let clean_path = storage::clean_terminal(&path.display().to_string());
         Self {
-            directory: path.is_dir(),
             path,
-            repository: git.is_dir() || git.is_file(),
+            repository,
+            directory,
+            name,
+            clean_name,
+            clean_path,
         }
     }
-    fn name(&self) -> String {
-        self.path
-            .file_name()
-            .unwrap_or(self.path.as_os_str())
-            .to_string_lossy()
-            .into_owned()
+    fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -80,11 +89,27 @@ fn read_entries(directory: &Path, files: bool) -> std::result::Result<Vec<Folder
     let mut entries: Vec<_> = fs::read_dir(directory)
         .map_err(|e| format!("Cannot browse {}: {e}", directory.display()))?
         .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            entry.file_name() != ".git"
-                && (entry.path().is_dir() || (files && entry.path().is_file()))
+        .filter_map(|entry| {
+            if entry.file_name() == ".git" {
+                return None;
+            }
+            let path = entry.path();
+            let (is_dir, is_file) = match entry.file_type() {
+                Ok(ft) if !ft.is_symlink() => (ft.is_dir(), ft.is_file()),
+                _ => {
+                    let is_dir = path.is_dir();
+                    let is_file = !is_dir && files && path.is_file();
+                    (is_dir, is_file)
+                }
+            };
+            if is_dir {
+                Some(FolderEntry::from_parts(path, true))
+            } else if files && is_file {
+                Some(FolderEntry::from_parts(path, false))
+            } else {
+                None
+            }
         })
-        .map(|entry| FolderEntry::new(entry.path()))
         .collect();
     entries.sort_by_cached_key(|entry| {
         (
@@ -112,7 +137,7 @@ impl PathPicker {
             recent: recent
                 .into_iter()
                 .filter(|p| p.is_dir())
-                .map(FolderEntry::new)
+                .map(|p| FolderEntry::from_parts(p, true))
                 .collect(),
             show_recent: false,
             selected: 0,
@@ -236,12 +261,15 @@ impl PathPicker {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, entry)| {
+                    if query.is_empty() {
+                        return Some(Some(index));
+                    }
                     let label = if self.show_recent {
-                        entry.path.display().to_string()
+                        entry.clean_path.as_str()
                     } else {
                         entry.name()
                     };
-                    label.to_lowercase().contains(&query).then_some(Some(index))
+                    super::modal::contains_ignore_case(label, &query).then_some(Some(index))
                 }),
         );
         matches
@@ -452,7 +480,11 @@ impl PathPicker {
                 chunks[3],
             );
         } else {
-            let rows = matches.iter().map(|index| match index {
+            let visible = usize::from(chunks[3].height).max(1);
+            let start = self.selected.saturating_sub(visible);
+            let end = (self.selected + visible + 1).min(matches.len());
+            let rel = self.selected.saturating_sub(start);
+            let rows = matches[start..end].iter().map(|index| match index {
                 None => ListItem::new(Line::from(vec![
                     Span::styled("[use]     ", Style::default().fg(palette.accent)),
                     Span::styled(
@@ -463,9 +495,9 @@ impl PathPicker {
                 Some(index) => {
                     let entry = &self.entries()[*index];
                     let label = if self.show_recent {
-                        entry.path.display().to_string()
+                        entry.clean_path.as_str()
                     } else {
-                        entry.name()
+                        entry.clean_name.as_str()
                     };
                     ListItem::new(Line::from(vec![
                         Span::styled(
@@ -484,7 +516,7 @@ impl PathPicker {
                                 palette.muted
                             }),
                         ),
-                        Span::raw(storage::clean_terminal(&label)),
+                        Span::raw(label),
                     ]))
                 }
             });
@@ -494,18 +526,20 @@ impl PathPicker {
                     .highlight_symbol("▌ ")
                     .highlight_spacing(HighlightSpacing::Always),
                 chunks[3],
-                &mut ListState::default().with_selected(Some(self.selected)),
+                &mut ListState::default().with_selected(Some(rel)),
             );
         }
         let detail = if self.error.is_empty() {
-            self.highlighted()
-                .map(|(path, _)| path.display().to_string())
-                .unwrap_or_default()
+            match matches.get(self.selected) {
+                Some(Some(index)) => self.entries()[*index].clean_path.clone(),
+                Some(None) => storage::clean_terminal(&self.directory.display().to_string()),
+                None => String::new(),
+            }
         } else {
-            self.error.split_whitespace().collect::<Vec<_>>().join(" ")
+            storage::clean_terminal(&self.error.split_whitespace().collect::<Vec<_>>().join(" "))
         };
         frame.render_widget(
-            Paragraph::new(storage::clean_terminal(&detail))
+            Paragraph::new(detail)
                 .style(Style::default().fg(if self.error.is_empty() {
                     palette.muted
                 } else {

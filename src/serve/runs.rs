@@ -68,8 +68,8 @@ struct State {
     outcome: Option<String>,
     /// An error `engine::drive` returned rather than recorded in the run.
     error: Option<String>,
-    backlog: VecDeque<Message>,
-    subscribers: Vec<mpsc::SyncSender<Message>>,
+    backlog: VecDeque<Arc<Message>>,
+    subscribers: Vec<mpsc::SyncSender<Arc<Message>>>,
 }
 
 /// What the server knows about a run beyond run.json.
@@ -82,6 +82,41 @@ pub struct Info {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+struct ReserveGuard {
+    handle: Arc<Handle>,
+    armed: bool,
+}
+
+impl Drop for ReserveGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut state = lock(&self.handle.state);
+            state.active = false;
+            state.version += 1;
+            drop(state);
+            self.handle.changed.notify_all();
+        }
+    }
+}
+
+fn new_handle(project: &Path, workspace: &Path) -> Arc<Handle> {
+    Arc::new(Handle {
+        project: project.to_path_buf(),
+        state: Mutex::new(State {
+            active: false,
+            workspace: workspace.to_path_buf(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            version: 0,
+            last_state: None,
+            outcome: None,
+            error: None,
+            backlog: VecDeque::new(),
+            subscribers: vec![],
+        }),
+        changed: Condvar::new(),
+    })
 }
 
 impl Registry {
@@ -173,56 +208,94 @@ impl Registry {
     }
 
     /// Drives `run` on a new thread until it completes, stops, or waits.
-    pub fn drive(&self, project: &Path, mut run: Run) -> Result<()> {
+    pub fn drive(&self, project: &Path, run: Run) -> Result<()> {
         let id = run.id.clone();
         let handle = {
             let mut store = lock(&self.store);
-            store.finished.retain(|id| id != &run.id);
             let handle = store
                 .runs
-                .entry(run.id.clone())
-                .or_insert_with(|| {
-                    Arc::new(Handle {
-                        project: project.to_path_buf(),
-                        state: Mutex::new(State {
-                            active: false,
-                            workspace: run.workspace.clone(),
-                            cancel: Arc::new(AtomicBool::new(false)),
-                            version: 0,
-                            last_state: None,
-                            outcome: None,
-                            error: None,
-                            backlog: VecDeque::new(),
-                            subscribers: vec![],
-                        }),
-                        changed: Condvar::new(),
-                    })
-                })
+                .entry(id.clone())
+                .or_insert_with(|| new_handle(project, &run.workspace))
                 .clone();
             let mut state = lock(&handle.state);
-            ensure!(!state.active, "Run {} is already running", run.id);
+            ensure!(!state.active, "Run {id} is already running");
+            state.active = true;
+            state.version += 1;
+            drop(state);
+            handle
+        };
+        let guard = ReserveGuard {
+            handle: handle.clone(),
+            armed: true,
+        };
+        self.spawn_run(&handle, run, guard)
+    }
+
+    /// Atomically reserves `id` as active before calling `prepare()` so two
+    /// concurrent `confirm_stage`/`retry_stage` calls cannot race on `run.json`.
+    pub fn resume_run(
+        &self,
+        project: &Path,
+        id: &str,
+        prepare: impl FnOnce() -> Result<Run>,
+    ) -> Result<Run> {
+        let handle = {
+            let mut store = lock(&self.store);
+            let handle = store
+                .runs
+                .entry(id.to_owned())
+                .or_insert_with(|| new_handle(project, project))
+                .clone();
+            ensure!(
+                handle.project == project,
+                "Run {id} belongs to project {}",
+                handle.project.display()
+            );
+            let mut state = lock(&handle.state);
+            ensure!(!state.active, "Run {id} is running; wait for it first");
+            state.active = true;
+            state.version += 1;
+            drop(state);
+            handle
+        };
+        let guard = ReserveGuard {
+            handle: handle.clone(),
+            armed: true,
+        };
+        let run = prepare()?;
+        let snapshot = run.clone();
+        self.spawn_run(&handle, run, guard)?;
+        Ok(snapshot)
+    }
+
+    fn spawn_run(&self, handle: &Arc<Handle>, mut run: Run, mut guard: ReserveGuard) -> Result<()> {
+        let id = run.id.clone();
+        let cancel = {
+            let mut state = lock(&handle.state);
             state.active = true;
             state.workspace = run.workspace.clone();
-            state.cancel = Arc::new(AtomicBool::new(false));
+            let cancel = Arc::new(AtomicBool::new(false));
+            state.cancel = cancel.clone();
             state.version += 1;
             state.last_state = None;
             state.outcome = None;
             state.error = None;
             state.backlog.clear();
-            drop(state);
-            handle
+            cancel
         };
-        let cancel = lock(&handle.state).cancel.clone();
         let spawned = std::thread::Builder::new()
-            .name(format!("run {}", run.id))
+            .name(format!("run {id}"))
             .spawn({
                 let handle = handle.clone();
                 move || {
+                    let pricing = crate::cost::Pricing::load(&run.project);
                     let result = engine::drive(&mut run, &cancel, |event| {
                         handle.publish(match event {
-                            Event::State(run) => {
-                                Message::State(tools::status_value(&run, &Info::active()))
-                            }
+                            Event::State(run) => Message::State(tools::status_value_with(
+                                &run,
+                                &Info::active(),
+                                &pricing,
+                            )),
                             Event::Output(text) => Message::Output(text),
                         })
                     });
@@ -241,16 +314,17 @@ impl Registry {
                             ("error", Some(format!("{error:#}")))
                         }
                     };
-                    handle.finish(&run, outcome, error);
+                    handle.finish(&run, outcome, error, &pricing);
                 }
             });
-        if let Err(error) = spawned {
-            lock(&handle.state).active = false;
-            return Err(error.into());
+        spawned?;
+        guard.armed = false;
+        // Tracked for eviction once it is inactive.
+        {
+            let mut store = lock(&self.store);
+            store.finished.retain(|existing| existing != &id);
+            store.finished.push_back(id);
         }
-        // Tracked for eviction once it is inactive (`drive` removed any
-        // earlier entry for this run above).
-        lock(&self.store).finished.push_back(id);
         self.evict_finished(MAX_FINISHED_RUNS);
         Ok(())
     }
@@ -313,7 +387,7 @@ impl Registry {
     }
 
     /// Recent events and a stream of later ones, while the run is active.
-    pub fn subscribe(&self, id: &str) -> Option<(Vec<Message>, mpsc::Receiver<Message>)> {
+    pub fn subscribe(&self, id: &str) -> Option<Subscription> {
         let handle = self.get(id)?;
         let mut state = lock(&handle.state);
         if !state.active {
@@ -361,6 +435,8 @@ impl Info {
     }
 }
 
+pub type Subscription = (Vec<Arc<Message>>, mpsc::Receiver<Arc<Message>>);
+
 impl Handle {
     fn publish(&self, message: Message) {
         let notify = matches!(message, Message::State(_));
@@ -369,13 +445,14 @@ impl Handle {
             state.version += 1;
             state.last_state = Some(value.clone());
         }
+        let message = Arc::new(message);
         if state.backlog.len() == BACKLOG {
             state.backlog.pop_front();
         }
-        state.backlog.push_back(message.clone());
+        state.backlog.push_back(Arc::clone(&message));
         state.subscribers.retain(|tx| {
             !matches!(
-                tx.try_send(message.clone()),
+                tx.try_send(Arc::clone(&message)),
                 Err(mpsc::TrySendError::Disconnected(_))
             )
         });
@@ -385,7 +462,13 @@ impl Handle {
         }
     }
 
-    fn finish(&self, run: &Run, outcome: &str, error: Option<String>) {
+    fn finish(
+        &self,
+        run: &Run,
+        outcome: &str,
+        error: Option<String>,
+        pricing: &crate::cost::Pricing,
+    ) {
         let mut state = lock(&self.state);
         state.active = false;
         state.version += 1;
@@ -396,12 +479,12 @@ impl Handle {
             outcome: Some(outcome.to_owned()),
             error,
         };
-        let status = tools::status_value(run, &info);
+        let status = tools::status_value_with(run, &info, pricing);
         state.last_state = Some(status.clone());
-        let end = Message::End(status);
+        let end = Arc::new(Message::End(status));
         for tx in state.subscribers.drain(..) {
             // A full queue still learns the stream ended when it disconnects.
-            let _ = tx.try_send(end.clone());
+            let _ = tx.try_send(Arc::clone(&end));
         }
         drop(state);
         self.changed.notify_all();

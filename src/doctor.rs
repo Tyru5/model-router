@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::atomic::AtomicBool,
+    sync::{OnceLock, atomic::AtomicBool},
     thread,
     time::Duration,
 };
@@ -100,10 +100,12 @@ impl Report {
 /// Checks every built-in and custom harness in parallel threads.
 pub fn inspect_all(settings: &Settings, project: &Path) -> Vec<Report> {
     let names = catalog::known_harnesses(settings);
+    let live = live_fixtures(project);
     thread::scope(|scope| {
+        let live = &live;
         let checks: Vec<_> = names
             .iter()
-            .map(|name| scope.spawn(move || inspect(name, settings, project)))
+            .map(|name| scope.spawn(move || inspect_with(name, settings, project, live)))
             .collect();
         checks
             .into_iter()
@@ -113,6 +115,11 @@ pub fn inspect_all(settings: &Settings, project: &Path) -> Vec<Report> {
 }
 
 pub fn inspect(harness: &str, settings: &Settings, project: &Path) -> Report {
+    let live = live_fixtures(project);
+    inspect_with(harness, settings, project, &live)
+}
+
+fn inspect_with(harness: &str, settings: &Settings, project: &Path, live: &[Fixture]) -> Report {
     let program = adapters::program(harness, &settings.adapters);
     let mut report = Report {
         harness: harness.into(),
@@ -128,7 +135,7 @@ pub fn inspect(harness: &str, settings: &Settings, project: &Path) -> Report {
         notes: vec![AUTH_NOTE.into()],
     };
     if report.builtin {
-        check(&mut report, project);
+        check_with(&mut report, project, live);
     } else if settings.adapters.contains_key(harness) {
         report
             .notes
@@ -139,13 +146,36 @@ pub fn inspect(harness: &str, settings: &Settings, project: &Path) -> Report {
     report
 }
 
-fn check(report: &mut Report, project: &Path) {
+fn check_with(report: &mut Report, project: &Path, live: &[Fixture]) {
     let fixtures: Vec<_> = manifest()
-        .into_iter()
-        .chain(live_fixtures(project))
+        .iter()
+        .chain(live)
         .filter(|f| f.harness == report.harness)
+        .cloned()
         .collect();
     record_fixtures(report, &fixtures);
+    if report.installed() {
+        let version = probe(
+            &report.program,
+            &["--version".into()],
+            project,
+            VERSION_TIMEOUT,
+        );
+        match version {
+            Ok((true, text)) => report.version = first_line(&text),
+            Ok((false, _)) => report
+                .notes
+                .push(format!("{} --version failed.", report.program)),
+            Err(error) => report
+                .notes
+                .push(format!("{} --version: {error:#}", report.program)),
+        }
+        adapters::remember_version(&report.program, report.version.as_deref());
+    } else {
+        report
+            .notes
+            .push(format!("{} not found on PATH.", report.program));
+    }
     let uses = flag_uses(&report.harness).unwrap_or_else(|error| {
         report
             .notes
@@ -154,12 +184,9 @@ fn check(report: &mut Report, project: &Path) {
     });
     let help_args: BTreeSet<&Vec<String>> = uses.iter().map(|u| &u.help).collect();
     let mut helps = BTreeMap::new();
-    if report.installed() {
-        let program = report.program.clone();
-        let program = program.as_str();
-        let (version, outputs) = thread::scope(|scope| {
-            let version =
-                scope.spawn(|| probe(program, &["--version".into()], project, VERSION_TIMEOUT));
+    if report.installed() && !help_args.is_empty() {
+        let program = report.program.as_str();
+        let outputs: Vec<_> = thread::scope(|scope| {
             let outputs: Vec<_> = help_args
                 .iter()
                 .map(|args| {
@@ -167,22 +194,11 @@ fn check(report: &mut Report, project: &Path) {
                     (*args, output)
                 })
                 .collect();
-            (
-                joined(version),
-                outputs
-                    .into_iter()
-                    .map(|(args, output)| (args, joined(output)))
-                    .collect::<Vec<_>>(),
-            )
+            outputs
+                .into_iter()
+                .map(|(args, output)| (args, joined(output)))
+                .collect()
         });
-        match version {
-            Ok((true, text)) => {
-                report.version = first_line(&text);
-                adapters::remember_version(program, report.version.as_deref());
-            }
-            Ok((false, _)) => report.notes.push(format!("{program} --version failed.")),
-            Err(error) => report.notes.push(format!("{program} --version: {error:#}")),
-        }
         for (args, output) in outputs {
             let command = format!("{program} {}", args.join(" "));
             let flags = match output.map(|(_, text)| help_flags(&text)) {
@@ -198,10 +214,6 @@ fn check(report: &mut Report, project: &Path) {
             };
             helps.insert(args.clone(), flags);
         }
-    } else {
-        report
-            .notes
-            .push(format!("{} not found on PATH.", report.program));
     }
     match_version(report, &fixtures);
     let capabilities: Vec<_> = uses
@@ -475,7 +487,7 @@ fn version_tokens(line: &str) -> impl Iterator<Item = &str> {
 struct Manifest {
     fixture: Vec<Fixture>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Fixture {
     harness: String,
     version: String,
@@ -485,10 +497,15 @@ struct Fixture {
     live: bool,
 }
 
-fn manifest() -> Vec<Fixture> {
-    toml::from_str::<Manifest>(MANIFEST)
-        .map(|m| m.fixture)
-        .unwrap_or_default()
+fn manifest() -> &'static [Fixture] {
+    static FIXTURES: OnceLock<Vec<Fixture>> = OnceLock::new();
+    FIXTURES
+        .get_or_init(|| {
+            toml::from_str::<Manifest>(MANIFEST)
+                .map(|m| m.fixture)
+                .unwrap_or_default()
+        })
+        .as_slice()
 }
 
 /// Lists the versions `fixtures` cover and counts the built-in ones.
@@ -585,25 +602,33 @@ pub struct Tool {
 
 /// `git` and `gh` on this host, found as harness executables are.
 pub fn inspect_tools(project: &Path) -> Vec<Tool> {
-    TOOLS
-        .iter()
-        .map(|&(program, needed_for)| {
-            let path = adapters::executable_at(program, project);
-            let version = path.as_ref().and_then(|_| {
-                let (ok, text) =
-                    probe(program, &["--version".into()], project, VERSION_TIMEOUT).ok()?;
-                let line = first_line(&text)?;
-                let version = version_tokens(&line).next().map(str::to_owned);
-                ok.then(|| version.unwrap_or(line))
-            });
-            Tool {
-                program,
-                needed_for,
-                path,
-                version,
-            }
-        })
-        .collect()
+    thread::scope(|scope| {
+        let checks: Vec<_> = TOOLS
+            .iter()
+            .map(|&(program, needed_for)| {
+                scope.spawn(move || {
+                    let path = adapters::executable_at(program, project);
+                    let version = path.as_ref().and_then(|_| {
+                        let (ok, text) =
+                            probe(program, &["--version".into()], project, VERSION_TIMEOUT).ok()?;
+                        let line = first_line(&text)?;
+                        let version = version_tokens(&line).next().map(str::to_owned);
+                        ok.then(|| version.unwrap_or(line))
+                    });
+                    Tool {
+                        program,
+                        needed_for,
+                        path,
+                        version,
+                    }
+                })
+            })
+            .collect();
+        checks
+            .into_iter()
+            .map(|check| check.join().expect("Tool check panicked"))
+            .collect()
+    })
 }
 
 /// One line for `doctor`: `Tools: git 2.43.0 at /usr/bin/git; gh missing (...)`.
