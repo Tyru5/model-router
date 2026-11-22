@@ -166,6 +166,10 @@ if args.require_context and args.require_context not in prompt:
 if args.model == "fail" or (args.model == "fail-once" and number == 1):
     print("Simulated authentication or harness failure", file=sys.stderr)
     sys.exit(17)
+if args.model == "transient" or (args.model == "transient-once" and number == 1):
+    # A provider error the router retries when the stage sets `retry`.
+    print("HTTP 503 Service Unavailable", file=sys.stderr)
+    sys.exit(1)
 if args.model == "spawn-child":
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
     (root / "child.pid").write_text(str(child.pid))

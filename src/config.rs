@@ -1470,6 +1470,13 @@ impl Settings {
                 stage.budget.validate(&format!("Stage {}", stage.name))?;
                 if let Some(retry) = &stage.retry {
                     retry.validate(&format!("Stage {}", stage.name))?;
+                    // Rerunning a delegating parent would rerun or abandon the
+                    // tasks it started and the changes they applied.
+                    ensure!(
+                        retry.max_attempts == 0 || stage.delegation.is_none(),
+                        "Stage {} delegates, and a delegating stage does not retry automatically. Remove its retry and retry the stage explicitly",
+                        stage.name
+                    );
                 }
                 stage.hooks.validate(&format!("Stage {}", stage.name))?;
                 ensure!(

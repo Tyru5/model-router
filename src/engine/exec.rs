@@ -8,6 +8,11 @@ pub(super) struct Prepared {
     /// The harness ran under an earlier mr's approval (reattached), so the
     /// stage's checks need the run to be approved now.
     pub(super) reattached: bool,
+    /// The stage's first attempt in an automatic retry chain. Policy and
+    /// protected-path checks compare against its starting snapshot, so edits
+    /// an earlier failed attempt left behind are checked too. None: this
+    /// attempt's own snapshot.
+    pub(super) retry_from: Option<usize>,
 }
 
 pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
@@ -147,6 +152,7 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
         directory,
         handoff_file,
         reattached: false,
+        retry_from: None,
     })
 }
 
@@ -556,6 +562,7 @@ Do not edit any project files or run destructive commands. Emit ONLY a valid han
         directory: repair_dir,
         handoff_file: prepared.handoff_file.clone(),
         reattached: false,
+        retry_from: None,
     };
     match resolve_handoff(&stage, &repair_prepared, normalized)? {
         Resolved::Handoff(source, handoff) => Ok(RepairOutcome::Repaired(source, handoff)),
@@ -643,11 +650,12 @@ pub(super) fn finish(
             (false, true) => "workflow policies",
             (false, false) => unreachable!(),
         };
-        let Some(before) = run.stages[index]
-            .attempts
-            .last()
-            .and_then(|a| a.tree_before.clone())
-        else {
+        let attempts = &run.stages[index].attempts;
+        let from = prepared
+            .retry_from
+            .filter(|&first| first < attempts.len())
+            .unwrap_or(attempts.len().saturating_sub(1));
+        let Some(before) = attempts.get(from).and_then(|a| a.tree_before.clone()) else {
             run.stop(
                 Status::Blocked,
                 format!("Could not verify {what}: no pre-stage Git snapshot was recorded"),
@@ -985,6 +993,8 @@ pub(super) fn run_stage_hooks(
 
 /// Runs `after_stage` and (on Failed/Blocked) `on_failure` hooks for stage
 /// `index`, logging results without ever masking the stage's status or error.
+/// When a hook ran, the attempt's `tree_after` is taken again, so files the
+/// hooks changed are part of the stage's recorded changes.
 pub(super) fn run_post_stage_hooks(
     run: &mut Run,
     index: usize,
@@ -997,7 +1007,7 @@ pub(super) fn run_post_stage_hooks(
     if status == Status::Cancelled {
         return;
     }
-    let _ = run_stage_hooks(
+    let mut ran = run_stage_hooks(
         run,
         index,
         crate::hooks::HookEvent::AfterStage,
@@ -1005,9 +1015,10 @@ pub(super) fn run_post_stage_hooks(
         reattached,
         cancel,
         emit,
-    );
+    )
+    .map_or(true, |hooks| !hooks.results.is_empty());
     if matches!(status, Status::Failed | Status::Blocked) {
-        let _ = run_stage_hooks(
+        ran |= run_stage_hooks(
             run,
             index,
             crate::hooks::HookEvent::OnFailure,
@@ -1015,7 +1026,16 @@ pub(super) fn run_post_stage_hooks(
             reattached,
             cancel,
             emit,
-        );
+        )
+        .map_or(true, |hooks| !hooks.results.is_empty());
+    }
+    if ran {
+        let tree = snapshot::tree(&run.workspace, &run.directory);
+        if let Some(attempt) = run.stages[index].attempts.last_mut() {
+            if tree.is_some() {
+                attempt.tree_after = tree;
+            }
+        }
     }
 }
 
@@ -1165,6 +1185,8 @@ pub(super) fn conclude_inner(
             attempt.tree_after = tree;
         }
     }
+    // Without hooks the caller still decides on a transient retry, and saves
+    // once it has: a run stopped only until its retry is never saved stopped.
     if run_hooks {
         run_post_stage_hooks(
             run,
@@ -1174,8 +1196,8 @@ pub(super) fn conclude_inner(
             cancel,
             emit,
         );
+        run.persist()?;
     }
-    run.persist()?;
     emit(Event::State(Box::new(run.clone())));
     Ok(())
 }
@@ -1254,11 +1276,13 @@ pub(super) fn execute_stage(
     let stage_timeout = Duration::from_secs(run.workflow.stages[index].timeout_seconds);
     let stage_started = std::time::Instant::now();
     let mut retries_done = 0u32;
+    let retry_from = run.stages[index].attempts.len();
 
     loop {
-        let Some(prepared) = start_stage_inner(run, cancel, retries_done == 0, emit)? else {
+        let Some(mut prepared) = start_stage_inner(run, cancel, retries_done == 0, emit)? else {
             return Ok(());
         };
+        prepared.retry_from = Some(retry_from);
         let workspace = run.workspace.clone();
         // Events become readable lines; stdout.log keeps them raw.
         let mut formatter = events::Formatter::new(prepared.invocation.kind);
@@ -1397,33 +1421,10 @@ pub(super) fn execute_stage(
                 if stage.model.is_empty() { "" } else { " " },
                 stage.model
             )));
-            if sleep_interruptible(delay, cancel, None) {
-                run.cursor = index;
-                run.set(
-                    Target::Stage(index),
-                    Status::Pending,
-                    Actor::User,
-                    "Cancelled during retry backoff",
-                )?;
-                run.set(
-                    Target::Run,
-                    Status::Pending,
-                    Actor::User,
-                    "Cancelled during retry backoff",
-                )?;
-                run.stop(
-                    Status::Cancelled,
-                    "Stage cancelled during transient retry backoff. Filesystem changes are retained; retry explicitly".into(),
-                    Actor::User,
-                    false,
-                )?;
-                run.persist()?;
-                emit(Event::State(Box::new(run.clone())));
-                return Ok(());
-            }
-            retries_done = next_retry;
+            // Saved waiting, not stopped: the run only stops if the retry
+            // never happens, so metrics see one run_end.
             let reason = format!(
-                "Transient error retry {retries_done}/{} after {}s backoff",
+                "Transient error retry {next_retry}/{} after {}s backoff",
                 retry.max_attempts,
                 delay.as_secs()
             );
@@ -1438,6 +1439,19 @@ pub(super) fn execute_stage(
             run.set(Target::Run, Status::Pending, Actor::Engine, &reason)?;
             run.persist()?;
             emit(Event::State(Box::new(run.clone())));
+            if sleep_interruptible(delay, cancel, None) {
+                run.cursor = index;
+                run.stop(
+                    Status::Cancelled,
+                    "Stage cancelled during transient retry backoff. Filesystem changes are retained; retry explicitly".into(),
+                    Actor::User,
+                    false,
+                )?;
+                run.persist()?;
+                emit(Event::State(Box::new(run.clone())));
+                return Ok(());
+            }
+            retries_done = next_retry;
             continue;
         }
 
@@ -1538,6 +1552,7 @@ pub(super) fn reprepare(run: &Run) -> Result<Prepared> {
         directory,
         handoff_file: attempt.handoff_file.clone(),
         reattached: true,
+        retry_from: None,
     })
 }
 

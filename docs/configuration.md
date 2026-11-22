@@ -143,7 +143,7 @@ comma-separated ranges (`">=0.160.0, <0.200.0"`).
 | `fan_out` | none | Best-of-N candidates and judge. Below. |
 | `delegation` | none | The stage's agent may delegate tasks, launch runs, and schedule work. Below. Needs trust in a project config. |
 | `context_files` | `[]` | Extra repo-relative paths or globs injected into this stage's prompt after the workflow's `context_files` (same 32-file / 32 KiB total limit and workspace-only safety checks). |
-| `retry` | unset | Overrides workflow `retry` for this stage (`{ max_attempts, base_delay_seconds, max_delay_seconds }`). |
+| `retry` | unset | Overrides workflow `retry` for this stage (`{ max_attempts, base_delay_seconds, max_delay_seconds }`). Rejected on a delegating stage. |
 | `hooks` | `{}` | Stage lifecycle hooks (`before_stage`, `after_stage`, `before_ship`, `on_failure`), run after workflow hooks. Needs trust in a project config. |
 | `when_changed` | `[]` | Repo-relative globs (`*`, `**`, `?`, up to 32). In a Git repository, skips the stage (`skipped`) when no files changed so far in the run match any pattern; outside Git, runs normally. A fan-out judge with candidates waiting for its choice never skips. |
 
@@ -230,6 +230,14 @@ on the same harness and model with capped exponential backoff (`max_attempts`
 `base_delay_seconds` to `3600`).
 Permanent auth, permission, and invalid-request errors are not retried.
 
+A `fan_out` stage's `retry` applies to each candidate: a candidate that fails
+transiently runs again in a new worktree while the others keep their results,
+within the stage's `timeout_seconds` from its first attempt. Policy and
+`protected_paths` checks of a retried stage cover every change since its first
+attempt, including what failed attempts left. Delegating stages do not retry
+automatically: a stage `retry` with `max_attempts > 0` on a stage with
+`delegation` is a config error, and the workflow default skips them.
+
 ### `hooks`
 
 ```toml
@@ -246,8 +254,12 @@ Each hook entry has `command` (non-empty argv, no shell) and `timeout_seconds`
 `MODEL_ROUTER_STAGE_ID`, `MODEL_ROUTER_STAGE_ROLE`, and
 `MODEL_ROUTER_STAGE_STATUS`. `before_stage` and `before_ship` abort on non-zero
 exit or timeout; `after_stage` and `on_failure` log results under
-`<attempt>/hooks/<event>/NN/` without masking the stage outcome. Requires
-project trust.
+`<attempt>/hooks/<event>/NN/` without masking the stage outcome. Files that
+`after_stage` and `on_failure` hooks change are part of the stage's recorded
+changes (`changes.diff`, worktree apply). A `fan_out` stage runs
+`before_stage` once before its candidates start (a failure cancels them) and
+`after_stage`/`on_failure` once after the round settles, all in the workspace.
+Requires project trust.
 
 ### `policies`
 

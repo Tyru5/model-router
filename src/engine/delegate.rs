@@ -1062,6 +1062,7 @@ impl<'a> Owner<'a> {
             directory: turn_dir,
             handoff_file,
             reattached: false,
+            retry_from: None,
         };
         self.spawn_parent(scope, run, prepared);
         Ok(())
@@ -1748,6 +1749,7 @@ impl<'a> Owner<'a> {
                     directory: turn_dir,
                     handoff_file,
                     reattached: false,
+                    retry_from: None,
                 },
                 stage,
             },

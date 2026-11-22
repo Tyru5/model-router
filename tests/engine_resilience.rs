@@ -14,6 +14,7 @@ use model_router::{
     },
     cost,
     engine::{self, Action, Event, Run, Status},
+    events,
     policy::{DiffPolicy, PolicyAction},
     ship, transitions, trust,
 };
@@ -874,7 +875,7 @@ with open(handoff_path, "w") as f:
 }
 
 #[test]
-fn fanout_candidate_diff_policy_blocks_offending_candidate_and_graph_retries_transiently() {
+fn fanout_candidate_diff_policy_blocks_offending_candidate() {
     init_test_config_dir();
     let dir = common::tempdir();
     let scripts = common::tempdir();
@@ -1067,4 +1068,364 @@ handoff_path.write_text(json.dumps({
     }
     assert_eq!(fan_state.candidates[2].status, Status::Complete);
     assert_eq!(fan_state.selection.as_ref().unwrap().candidate, "c_good");
+}
+
+// -----------------------------------------------------------------------------
+// 6. Retries, hooks, and run metrics across stage kinds
+// -----------------------------------------------------------------------------
+
+/// The `run_end` metric statuses the run's saved commits produced, replayed
+/// from transitions.jsonl one commit (run revision) at a time.
+fn run_ends(run: &Run) -> Vec<String> {
+    let records = transitions::read(&run.directory).unwrap();
+    let mut ends = vec![];
+    let mut start = 0;
+    while start < records.len() {
+        let revision = records[start].run_revision;
+        let end = records[start..]
+            .iter()
+            .position(|r| r.run_revision != revision)
+            .map_or(records.len(), |n| start + n);
+        ends.extend(
+            events::collect_run_metrics(run, false, &records[start..end])
+                .into_iter()
+                .filter(|m| m.event == "run_end")
+                .map(|m| m.status),
+        );
+        start = end;
+    }
+    ends
+}
+
+fn retry(base_delay_seconds: u64) -> Retry {
+    Retry {
+        max_attempts: 2,
+        base_delay_seconds,
+        max_delay_seconds: base_delay_seconds.max(1),
+    }
+}
+
+/// Two parallel research stages, then a planning stage after both.
+fn graph_retry_workflow(r1_model: &str, r2_model: &str, base_delay_seconds: u64) -> Workflow {
+    let mut r1 = stage("r1", Role::Research);
+    r1.model = r1_model.into();
+    let mut r2 = stage("r2", Role::Research);
+    r2.model = r2_model.into();
+    let mut plan = stage("plan", Role::Planning);
+    plan.after = vec!["r1".into(), "r2".into()];
+    let mut wf = Workflow::new("GraphRetry", vec![r1, r2, plan]);
+    wf.retry = retry(base_delay_seconds);
+    wf
+}
+
+#[test]
+fn graph_stage_retries_restart_cancel_during_backoff_and_yield_to_a_failed_sibling() {
+    init_test_config_dir();
+
+    // 1. A transient failure restarts the stage after its backoff; the run
+    // ends once.
+    let dir = common::tempdir();
+    let wf = graph_retry_workflow("transient-once", "test-model", 1);
+    let settings = common::settings(&wf);
+    let mut run = Run::create(dir.path(), &settings, &wf, "graph retry".into(), false).unwrap();
+    assert!(run.graph());
+    let mut output = String::new();
+    let action = engine::drive(&mut run, &AtomicBool::new(false), |ev| {
+        if let Event::Output(text) = ev {
+            output.push_str(&text);
+        }
+    })
+    .unwrap();
+    assert_eq!(action, Action::Complete, "{:?} {output}", run.error);
+    let statuses: Vec<Status> = run.stages[0].attempts.iter().map(|a| a.status).collect();
+    assert_eq!(statuses, [Status::Failed, Status::Complete]);
+    assert_eq!(run.stages[1].attempts.len(), 1);
+    assert_eq!(run.stages[2].status, Status::Complete);
+    assert!(output.contains("retrying 1/2 in 1s"), "{output}");
+    let records = transitions::read(&run.directory).unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|r| r.reason.contains("Transient error retry 1/2")),
+        "{records:?}"
+    );
+    assert_eq!(run_ends(&run), ["complete"]);
+
+    // 2. Cancelling during the backoff stops at once, without the retry.
+    let dir = common::tempdir();
+    let wf = graph_retry_workflow("transient", "test-model", 30);
+    let settings = common::settings(&wf);
+    let mut run = Run::create(dir.path(), &settings, &wf, "graph cancel".into(), false).unwrap();
+    let cancel = AtomicBool::new(false);
+    let started = Instant::now();
+    let action = engine::drive(&mut run, &cancel, |ev| {
+        if let Event::Output(text) = ev {
+            if text.contains("Transient failure") {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
+    })
+    .unwrap();
+    assert_eq!(action, Action::Stopped);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(run.status, Status::Cancelled);
+    assert_eq!(run.stages[0].status, Status::Cancelled);
+    assert_eq!(run.stages[0].attempts.len(), 1);
+    assert_eq!(run.stages[2].attempts.len(), 0);
+    assert_eq!(run_ends(&run), ["cancelled"]);
+
+    // 3. A sibling's permanent failure ends the backoff early: the run stops
+    // at the sibling and the retrying stage waits, never retried.
+    let dir = common::tempdir();
+    let wf = graph_retry_workflow("transient", "fail", 30);
+    let settings = common::settings(&wf);
+    let mut run = Run::create(dir.path(), &settings, &wf, "graph sibling".into(), false).unwrap();
+    let started = Instant::now();
+    assert_eq!(drive(&mut run), Action::Stopped);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the backoff should end when the sibling stops the run"
+    );
+    assert_eq!(run.status, Status::Failed);
+    assert_eq!(run.cursor, 1);
+    assert!(
+        run.error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Simulated authentication"),
+        "{:?}",
+        run.error
+    );
+    assert_eq!(run.stages[0].status, Status::Pending);
+    assert_eq!(run.stages[0].attempts.len(), 1);
+    assert_eq!(run.stages[1].status, Status::Failed);
+    assert_eq!(run_ends(&run), ["failed"]);
+}
+
+#[test]
+fn list_stage_retry_ends_the_run_once_in_metrics() {
+    init_test_config_dir();
+    let dir = common::tempdir();
+    let mut s = stage("impl", Role::Implementation);
+    s.model = "transient-once".into();
+    s.retry = Some(retry(1));
+    let wf = Workflow::new("ListRetry", vec![s]);
+    let settings = common::settings(&wf);
+    let mut run = Run::create(dir.path(), &settings, &wf, "list retry".into(), false).unwrap();
+    assert_eq!(drive(&mut run), Action::Complete);
+    assert_eq!(run.stages[0].attempts.len(), 2);
+    // The failed attempt still ends, as an attempt.
+    let records = transitions::read(&run.directory).unwrap();
+    let attempt_ends: Vec<String> = events::collect_run_metrics(&run, false, &records)
+        .into_iter()
+        .filter(|m| m.event == "attempt_end")
+        .map(|m| m.status)
+        .collect();
+    assert_eq!(attempt_ends, ["failed", "complete"]);
+    assert_eq!(run_ends(&run), ["complete"]);
+}
+
+/// A script that writes a blocked call on its first run, then fails with a
+/// provider error; later runs only hand off.
+fn blocked_then_transient(dir: &Path) -> CustomAdapter {
+    let script = dir.join("blocked_then_transient.py");
+    fs::write(
+        &script,
+        r#"import json, pathlib, sys
+count_file = pathlib.Path(sys.argv[1])
+handoff_path = pathlib.Path(sys.argv[2])
+n = int(count_file.read_text()) + 1 if count_file.exists() else 1
+count_file.write_text(str(n))
+if n == 1:
+    pathlib.Path("app.rs").write_text("fn main() { BLOCKED_API(); }\n")
+    sys.stderr.write("HTTP 503 Service Unavailable\n")
+    sys.exit(1)
+handoff_path.write_text(json.dumps({"schema_version": 2, "summary": "done", "verdict": "complete"}))
+"#,
+    )
+    .unwrap();
+    CustomAdapter {
+        command: "python3".into(),
+        args: vec![
+            script.display().to_string(),
+            dir.join("count").display().to_string(),
+            "{handoff_file}".into(),
+        ],
+        ..CustomAdapter::default()
+    }
+}
+
+#[test]
+fn edits_a_failed_attempt_left_before_its_automatic_retry_are_policy_checked() {
+    init_test_config_dir();
+    for graph in [false, true] {
+        let dir = common::tempdir();
+        let scripts = common::tempdir();
+        init_git(dir.path());
+        let mut s = stage("impl", Role::Implementation);
+        s.harness = "flaky".into();
+        s.retry = Some(retry(1));
+        let mut stages = vec![s];
+        if graph {
+            let mut after = stage("check", Role::Research);
+            after.after = vec!["impl".into()];
+            stages.push(after);
+        }
+        let mut wf = Workflow::new("RetryPolicy", stages);
+        wf.policies.push(DiffPolicy {
+            name: "no-blocked-api".into(),
+            action: PolicyAction::Block,
+            pattern: "BLOCKED_API".into(),
+            paths: vec!["*.rs".into()],
+            message: "BLOCKED_API is not permitted".into(),
+        });
+        let mut settings = common::settings(&wf);
+        settings
+            .adapters
+            .insert("flaky".into(), blocked_then_transient(scripts.path()));
+        let mut run =
+            Run::create(dir.path(), &settings, &wf, "retry policy".into(), false).unwrap();
+        assert_eq!(drive(&mut run), Action::Stopped, "graph {graph}");
+        assert_eq!(run.stages[0].attempts.len(), 2, "graph {graph}");
+        assert_eq!(run.stages[0].status, Status::Blocked, "graph {graph}");
+        assert_eq!(run.status, Status::Blocked, "graph {graph}");
+        assert!(
+            run.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("no-blocked-api"),
+            "graph {graph}: {:?}",
+            run.error
+        );
+    }
+}
+
+#[test]
+fn after_stage_hook_edits_are_part_of_the_recorded_changes() {
+    init_test_config_dir();
+    let dir = common::tempdir();
+    init_git(dir.path());
+    let mut s = stage("impl", Role::Implementation);
+    s.hooks.after_stage.push(Hook {
+        command: vec![
+            "python3".into(),
+            "-c".into(),
+            "import pathlib; pathlib.Path('hooked.txt').write_text('from the hook\\n')".into(),
+        ],
+        timeout_seconds: 10,
+    });
+    let wf = Workflow::new("HookChanges", vec![s]);
+    let settings = common::settings(&wf);
+    let mut run = Run::create(dir.path(), &settings, &wf, "hook changes".into(), false).unwrap();
+    assert_eq!(drive(&mut run), Action::Complete);
+    let attempt = &run.stages[0].attempts[0];
+    assert_ne!(attempt.tree_after, attempt.tree_before);
+    let diff = fs::read_to_string(run.directory.join("changes.diff")).unwrap();
+    assert!(diff.contains("hooked.txt"), "{diff}");
+    assert!(diff.contains("from the hook"), "{diff}");
+}
+
+/// A fan-out stage of two mock candidates whose counters survive their
+/// worktrees, so `transient-once` fails only a candidate's first attempt.
+fn fan_out_fixture(state: &Path, first_model: &str, hooks: Hooks) -> (Settings, Workflow) {
+    let candidate = |id: &str, model: &str| model_router::config::Candidate {
+        id: id.into(),
+        harness: "mockstate".into(),
+        model: model.into(),
+        provider: id.into(),
+        ..Default::default()
+    };
+    let mut fan = stage("impl", Role::Implementation);
+    fan.harness = "mockstate".into();
+    fan.retry = Some(retry(1));
+    fan.hooks = hooks;
+    fan.fan_out = Some(model_router::config::FanOut {
+        candidates: vec![candidate("c1", first_model), candidate("c2", "test-model")],
+        judge: "auto".into(),
+    });
+    let wf = Workflow::new("FanOutRetry", vec![fan]);
+    let mut settings = common::settings(&wf);
+    let mut adapter = settings.adapters["mock"].clone();
+    adapter
+        .args
+        .extend(["--state-dir".into(), state.display().to_string()]);
+    settings.adapters.insert("mockstate".into(), adapter);
+    (settings, wf)
+}
+
+fn log_hook(log: &Path, label: &str) -> Hook {
+    Hook {
+        command: vec![
+            "python3".into(),
+            "-c".into(),
+            format!(
+                "import pathlib; p = pathlib.Path({:?}); p.write_text((p.read_text() if p.exists() else '') + {label:?} + '\\n')",
+                log.display().to_string()
+            ),
+        ],
+        timeout_seconds: 10,
+    }
+}
+
+#[test]
+fn fan_out_rounds_run_stage_hooks_once_and_retry_candidates_transiently() {
+    init_test_config_dir();
+
+    // 1. Hooks wrap the round once; a candidate's transient failure reruns
+    // only that candidate.
+    let dir = common::tempdir();
+    let scripts = common::tempdir();
+    init_git(dir.path());
+    let log = scripts.path().join("hooks.log");
+    let hooks = Hooks {
+        before_stage: vec![log_hook(&log, "before")],
+        after_stage: vec![log_hook(&log, "after")],
+        on_failure: vec![log_hook(&log, "failure")],
+        ..Hooks::default()
+    };
+    let (settings, wf) = fan_out_fixture(scripts.path(), "transient-once", hooks);
+    let mut run = Run::create(dir.path(), &settings, &wf, "fan-out retry".into(), false).unwrap();
+    assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+    let fan = run.stages[0].fan_out.as_ref().unwrap();
+    let c1: Vec<Status> = fan.candidates[0]
+        .attempts
+        .iter()
+        .map(|a| a.status)
+        .collect();
+    assert_eq!(c1, [Status::Failed, Status::Complete]);
+    assert_eq!(fan.candidates[0].status, Status::Complete);
+    assert_eq!(fan.candidates[1].attempts.len(), 1);
+    assert_eq!(run.stages[0].attempts.len(), 1, "one round");
+    assert_eq!(fs::read_to_string(&log).unwrap(), "before\nafter\n");
+
+    // 2. A failing before_stage hook stops the round before any candidate
+    // starts, and runs on_failure.
+    let dir = common::tempdir();
+    let scripts = common::tempdir();
+    init_git(dir.path());
+    let log = scripts.path().join("hooks.log");
+    let hooks = Hooks {
+        before_stage: vec![Hook {
+            command: vec![
+                "python3".into(),
+                "-c".into(),
+                "import sys; sys.exit(2)".into(),
+            ],
+            timeout_seconds: 10,
+        }],
+        after_stage: vec![log_hook(&log, "after")],
+        on_failure: vec![log_hook(&log, "failure")],
+        ..Hooks::default()
+    };
+    let (settings, wf) = fan_out_fixture(scripts.path(), "test-model", hooks);
+    let mut run = Run::create(dir.path(), &settings, &wf, "fan-out hook".into(), false).unwrap();
+    assert_eq!(drive(&mut run), Action::Stopped);
+    assert_eq!(run.status, Status::Failed);
+    assert_eq!(run.stages[0].status, Status::Failed);
+    let fan = run.stages[0].fan_out.as_ref().unwrap();
+    for candidate in &fan.candidates {
+        assert_eq!(candidate.status, Status::Cancelled);
+        assert!(candidate.attempts.is_empty(), "no candidate may start");
+    }
+    assert_eq!(fs::read_to_string(&log).unwrap(), "failure\n");
 }

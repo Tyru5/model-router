@@ -55,9 +55,9 @@ pub use types::{
 
 use exec::{
     Exit, INTERRUPTED, Prepared, Resolved, candidate_index, conclude, conclude_inner,
-    evaluate_outcome, execute_stage, keep_survivor, read_head, reattach_stage, resolve_handoff,
-    run_post_stage_hooks, should_transient_retry, sleep_interruptible, start_stage,
-    start_stage_inner,
+    evaluate_outcome, execute_stage, is_transient_error, keep_survivor, read_head, reattach_stage,
+    resolve_handoff, run_post_stage_hooks, run_stage_hooks, should_transient_retry,
+    sleep_interruptible, start_stage, start_stage_inner,
 };
 #[cfg(test)]
 use exec::{finish, prepare};

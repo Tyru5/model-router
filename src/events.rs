@@ -738,7 +738,11 @@ pub fn collect_run_metrics(
         out.push(base("run_start", run.created_at, run.status.as_str()));
     }
     let mut pricing: Option<cost::Pricing> = None;
-    for rec in records {
+    // A run that stopped and resumed in the same commit (an automatic retry
+    // after a transient failure) has not ended: only the run's last status in
+    // the commit can end it.
+    let last_run = records.iter().rposition(|r| r.level == Level::Run);
+    for (position, rec) in records.iter().enumerate() {
         match rec.level {
             Level::Attempt if rec.to == Status::Running => {
                 let Some(idx) = rec.stage_index else {
@@ -852,7 +856,7 @@ pub fn collect_run_metrics(
                 }
                 out.push(item);
             }
-            Level::Run if is_terminal(rec.to) => {
+            Level::Run if is_terminal(rec.to) && last_run == Some(position) => {
                 let pricing_ref = pricing.get_or_insert_with(|| cost::Pricing::load(&run.project));
                 let total = cost::run_total(run, pricing_ref);
                 let usage = run_usage(run);

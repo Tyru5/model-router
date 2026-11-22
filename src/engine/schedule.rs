@@ -25,6 +25,8 @@ pub(super) enum Job {
     Stage(usize),
     Candidate(usize, usize),
     RetryWait(usize),
+    /// A fan-out candidate's transient retry backoff.
+    CandidateRetryWait(usize, usize),
 }
 pub(super) enum Message {
     Spawned(Job, process::Group),
@@ -40,6 +42,8 @@ pub(super) enum Message {
     ),
     /// A transient retry backoff delay finished (or was interrupted).
     RetryReady(usize, bool),
+    /// A candidate's transient retry backoff finished (or was interrupted).
+    CandidateRetryReady(usize, usize, bool),
     /// A candidate worker's post-processed result and when the harness ended.
     CandidateDone(usize, usize, Box<Result<run::CandidatePost>>, DateTime<Utc>),
 }
@@ -265,6 +269,9 @@ pub(super) fn schedule(
     };
     let abort = AtomicBool::new(false);
     let abort = &abort;
+    // Ends retry backoffs early: the run is stopping, so no retry would start.
+    let wake = AtomicBool::new(false);
+    let wake = &wake;
     let journal = SpawnJournal::new(run);
     let journal = &journal;
     let result = thread::scope(|scope| -> Result<()> {
@@ -275,11 +282,21 @@ pub(super) fn schedule(
             let mut deferred_settle: Vec<usize> = vec![];
             let mut labels = std::collections::HashMap::new();
             let mut speaking = None;
-            let mut stage_retries: std::collections::HashMap<usize, (u32, std::time::Instant)> =
-                std::collections::HashMap::new();
-            let mut retry_reason: std::collections::HashMap<usize, String> =
+            // Retries done, when the first attempt started, and that attempt's index.
+            let mut stage_retries: std::collections::HashMap<
+                usize,
+                (u32, std::time::Instant, usize),
+            > = std::collections::HashMap::new();
+            let mut candidate_retries: std::collections::HashMap<
+                (usize, usize),
+                (u32, std::time::Instant),
+            > = std::collections::HashMap::new();
+            let mut retry_reason: std::collections::HashMap<Job, String> =
                 std::collections::HashMap::new();
             loop {
+                if halted(run) {
+                    wake.store(true, Ordering::Relaxed);
+                }
                 while !halted(run) && deferred_settle.is_empty() {
                     let (launch, waiting) = next_launch(run, only);
                     if let Some(index) = waiting.filter(|i| !noted.contains(i)) {
@@ -340,18 +357,7 @@ pub(super) fn schedule(
                         }
                         Launch::FanOut(index) => {
                             run.cursor = index;
-                            let attempts = run.stages[index].attempts.len();
-                            if let Err(error) = run.start_fan_out(index) {
-                                let recorded = run.stages[index].attempts.len() > attempts;
-                                run.stop(
-                                    Status::Failed,
-                                    format!("{error:#}"),
-                                    Actor::Engine,
-                                    recorded,
-                                )?;
-                                run.persist()?;
-                            }
-                            emit(Event::State(Box::new(run.clone())));
+                            start_round(run, index, cancel, emit)?;
                             continue;
                         }
                         // A delegating stage runs alone in its own owner loop.
@@ -363,18 +369,21 @@ pub(super) fn schedule(
                         }
                         Launch::Stage(index) => {
                             run.cursor = index;
+                            let first = run.stages[index].attempts.len();
                             let entry = stage_retries
                                 .entry(index)
-                                .or_insert_with(|| (0, std::time::Instant::now()));
+                                .or_insert_with(|| (0, std::time::Instant::now(), first));
                             let first_attempt = entry.0 == 0;
                             let stage_started = entry.1;
+                            let retry_from = entry.2;
                             let stage_timeout =
                                 Duration::from_secs(run.workflow.stages[index].timeout_seconds);
                             let remaining_timeout = stage_timeout
                                 .saturating_sub(stage_started.elapsed())
                                 .max(Duration::from_secs(1));
                             match start_stage_inner(run, cancel, first_attempt, emit)? {
-                                Some(prepared) => {
+                                Some(mut prepared) => {
+                                    prepared.retry_from = Some(retry_from);
                                     let live_budget =
                                         crate::cost::LiveBudgetMonitor::for_stage(run, index);
                                     let worker = WorkerJob::Stage(Box::new(StageJob {
@@ -393,6 +402,9 @@ pub(super) fn schedule(
                         }
                         Launch::Candidate(index, c) => match run.launch_candidate(index, c) {
                             Ok((prepared, cwd)) => {
+                                candidate_retries
+                                    .entry((index, c))
+                                    .or_insert_with(|| (0, std::time::Instant::now()));
                                 emit(Event::State(Box::new(run.clone())));
                                 let stage = &run.workflow.stages[index];
                                 let candidate = stage
@@ -431,7 +443,7 @@ pub(super) fn schedule(
                                     format!("{error:#}"),
                                     Actor::Engine,
                                 )?;
-                                if run.fan_out_done(index) {
+                                if round_done(run, &flight, index) {
                                     if graph::judge_of(&run.workflow, index).is_none()
                                         && !flight.is_empty()
                                     {
@@ -439,7 +451,7 @@ pub(super) fn schedule(
                                             deferred_settle.push(index);
                                         }
                                     } else {
-                                        run.settle_fan_out(index, false)?;
+                                        settle_round(run, index, false, cancel, emit)?;
                                     }
                                 }
                                 run.persist()?;
@@ -474,8 +486,17 @@ pub(super) fn schedule(
                     labels.insert(job, label);
                     let timeout = match &worker_job {
                         WorkerJob::Stage(stage) => stage.timeout,
-                        WorkerJob::Candidate(_) => {
-                            Duration::from_secs(run.workflow.stages[index].timeout_seconds)
+                        // A retried candidate gets what its first attempt left.
+                        WorkerJob::Candidate(cand) => {
+                            let full =
+                                Duration::from_secs(run.workflow.stages[index].timeout_seconds);
+                            candidate_retries.get(&(cand.index, cand.c)).map_or(
+                                full,
+                                |(_, started)| {
+                                    full.saturating_sub(started.elapsed())
+                                        .max(Duration::from_secs(1))
+                                },
+                            )
                         }
                     };
                     // As in `execute_stage`: never for output that
@@ -594,6 +615,9 @@ pub(super) fn schedule(
                                 ));
                             }
                             WorkerJob::Candidate(cand) => {
+                                let exited = outcome_result
+                                    .as_ref()
+                                    .is_ok_and(|o| !o.cancelled && !o.timed_out && !o.stalled);
                                 let post =
                                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                         run::post_process_candidate(
@@ -620,6 +644,10 @@ pub(super) fn schedule(
                                     }))
                                     .unwrap_or_else(|_| {
                                         Err(anyhow::anyhow!("Candidate post-processing panicked"))
+                                    })
+                                    .map(|mut post| {
+                                        post.exited = exited;
+                                        post
                                     });
                                 let _ = worker_tx.send(Message::CandidateDone(
                                     cand.index,
@@ -637,9 +665,9 @@ pub(super) fn schedule(
                         let cancelled = cancel.load(Ordering::Relaxed);
                         for index in std::mem::take(&mut deferred_settle) {
                             if run.stages[index].status == Status::Running
-                                && run.fan_out_done(index)
+                                && round_done(run, &flight, index)
                             {
-                                run.settle_fan_out(index, cancelled)?;
+                                settle_round(run, index, cancelled, cancel, emit)?;
                                 run.persist()?;
                                 emit(Event::State(Box::new(run.clone())));
                             }
@@ -657,7 +685,7 @@ pub(super) fn schedule(
                         let attempt = match job {
                             Job::Stage(i) => run.stages[i].attempts.last_mut(),
                             Job::Candidate(i, c) => run.candidate_mut(i, c).attempts.last_mut(),
-                            Job::RetryWait(_) => None,
+                            Job::RetryWait(_) | Job::CandidateRetryWait(..) => None,
                         };
                         let pgid = group.pgid;
                         if let Some(attempt) = attempt {
@@ -683,12 +711,9 @@ pub(super) fn schedule(
                             flight.swap_remove(position);
                         }
                         let reason = retry_reason
-                            .remove(&index)
+                            .remove(&job)
                             .unwrap_or_else(|| "Transient error retry".into());
-                        if interrupted
-                            || cancel.load(Ordering::Relaxed)
-                            || abort.load(Ordering::Relaxed)
-                        {
+                        if cancel.load(Ordering::Relaxed) || abort.load(Ordering::Relaxed) {
                             run.cursor = index;
                             let _ = run.set(
                                 Target::Stage(index),
@@ -705,6 +730,18 @@ pub(super) fn schedule(
                             run.persist()?;
                             emit(Event::State(Box::new(run.clone())));
                         } else {
+                            // Interrupted otherwise: another stage stopped the
+                            // run, which stops at that stage; this one waits.
+                            let reason = if interrupted {
+                                stage_retries.remove(&index);
+                                emit(Event::Output(format!(
+                                    "Transient retry of {} dropped: another stage stopped the run\n",
+                                    run.workflow.stages[index].name
+                                )));
+                                "Transient retry dropped: another stage stopped the run".into()
+                            } else {
+                                reason
+                            };
                             run.set(
                                 Target::Stage(index),
                                 Status::Pending,
@@ -714,6 +751,54 @@ pub(super) fn schedule(
                             run.persist()?;
                             emit(Event::State(Box::new(run.clone())));
                         }
+                    }
+                    Message::CandidateRetryReady(index, c, interrupted) => {
+                        let job = Job::CandidateRetryWait(index, c);
+                        if let Some(position) = flight.iter().position(|(j, _)| *j == job) {
+                            flight.swap_remove(position);
+                        }
+                        let reason = retry_reason
+                            .remove(&job)
+                            .unwrap_or_else(|| "Transient error retry".into());
+                        run.cursor = index;
+                        if interrupted
+                            || cancel.load(Ordering::Relaxed)
+                            || abort.load(Ordering::Relaxed)
+                        {
+                            // The candidate's failure stands; the round settles.
+                            candidate_retries.remove(&(index, c));
+                            emit(Event::Output(format!(
+                                "Transient retry of {} · candidate {} dropped: the run is stopping\n",
+                                run.workflow.stages[index].name,
+                                run.candidate(index, c).id
+                            )));
+                            if round_done(run, &flight, index) {
+                                if graph::judge_of(&run.workflow, index).is_none()
+                                    && !flight.is_empty()
+                                {
+                                    if !deferred_settle.contains(&index) {
+                                        deferred_settle.push(index);
+                                    }
+                                } else {
+                                    settle_round(
+                                        run,
+                                        index,
+                                        cancel.load(Ordering::Relaxed),
+                                        cancel,
+                                        emit,
+                                    )?;
+                                }
+                            }
+                        } else {
+                            run.set(
+                                Target::Candidate(index, c),
+                                Status::Pending,
+                                Actor::Engine,
+                                &reason,
+                            )?;
+                        }
+                        run.persist()?;
+                        emit(Event::State(Box::new(run.clone())));
                     }
                     Message::StageDone(index, done_result, live_usage, budget_exceeded, ended) => {
                         let job = Job::Stage(index);
@@ -751,14 +836,11 @@ pub(super) fn schedule(
                             cancel,
                             emit,
                         )?;
-                        if let Some(pgid) = survivor_pgid {
-                            journal.recorded(pgid);
-                        }
                         let retry = run.workflow.stages[index].effective_retry(&run.workflow);
-                        let (retries_done, stage_started) = stage_retries
+                        let (retries_done, stage_started, retry_from) = stage_retries
                             .get(&index)
                             .copied()
-                            .unwrap_or((0, std::time::Instant::now()));
+                            .unwrap_or((0, std::time::Instant::now(), 0));
                         let stage_timeout =
                             Duration::from_secs(run.workflow.stages[index].timeout_seconds);
                         let mut scheduled_retry = false;
@@ -816,9 +898,10 @@ pub(super) fn schedule(
                                         if stage.model.is_empty() { "" } else { " " },
                                         stage.model
                                     )));
-                                    stage_retries.insert(index, (next_retry, stage_started));
+                                    stage_retries
+                                        .insert(index, (next_retry, stage_started, retry_from));
                                     retry_reason.insert(
-                                        index,
+                                        Job::RetryWait(index),
                                         format!(
                                             "Transient error retry {next_retry}/{} after {}s backoff",
                                             retry.max_attempts,
@@ -828,7 +911,7 @@ pub(super) fn schedule(
                                     let sleeper_tx = tx.clone();
                                     scope.spawn(move || {
                                         let interrupted =
-                                            sleep_interruptible(delay, cancel, Some(abort));
+                                            sleep_interruptible(delay, cancel, Some(wake));
                                         let _ = sleeper_tx
                                             .send(Message::RetryReady(index, interrupted));
                                     });
@@ -852,9 +935,14 @@ pub(super) fn schedule(
                                 cancel,
                                 emit,
                             );
-                            run.persist()?;
-                            emit(Event::State(Box::new(run.clone())));
                         }
+                        // `conclude_inner` left saving to here; a survivor's
+                        // journal entry goes only once the run records it.
+                        run.persist()?;
+                        if let Some(pgid) = survivor_pgid {
+                            journal.recorded(pgid);
+                        }
+                        emit(Event::State(Box::new(run.clone())));
                     }
                     Message::CandidateDone(index, c, post_result, ended) => {
                         let job = Job::Candidate(index, c);
@@ -866,16 +954,102 @@ pub(super) fn schedule(
                             speaking = None;
                         }
                         run.cursor = index;
+                        let exited = post_result.as_ref().as_ref().is_ok_and(|p| p.exited);
                         let survivor_pgid =
                             run.apply_candidate_post((index, c), *post_result, ended)?;
-                        if run.fan_out_done(index) {
+                        let retry = run.workflow.stages[index].effective_retry(&run.workflow);
+                        let (retries_done, started) = candidate_retries
+                            .get(&(index, c))
+                            .copied()
+                            .unwrap_or((0, std::time::Instant::now()));
+                        let mut scheduled_retry = false;
+                        if should_retry_candidate(
+                            run,
+                            (index, c),
+                            exited,
+                            retries_done,
+                            retry,
+                            cancel,
+                        ) {
+                            let next_retry = retries_done + 1;
+                            let delay = retry.delay_for(next_retry);
+                            let remaining =
+                                Duration::from_secs(run.workflow.stages[index].timeout_seconds)
+                                    .saturating_sub(started.elapsed());
+                            let label = format!(
+                                "{} · candidate {}",
+                                run.workflow.stages[index].name,
+                                run.candidate(index, c).id
+                            );
+                            let budget_ok = match crate::cost::check_budget_action(run) {
+                                crate::cost::BudgetCheck::Ok => true,
+                                crate::cost::BudgetCheck::Warn(warning) => {
+                                    emit(Event::Output(format!("{warning}\n")));
+                                    true
+                                }
+                                // The round settles; the next launch stops the run.
+                                crate::cost::BudgetCheck::Stop(_) => false,
+                            };
+                            if budget_ok
+                                && !remaining.is_zero()
+                                && (delay.is_zero() || delay < remaining)
+                            {
+                                let state = run.candidate(index, c);
+                                let error = state.error.as_deref().unwrap_or("transient error");
+                                emit(Event::Output(format!(
+                                    "Transient failure of {label} ({}); retrying {next_retry}/{} in {}s with {}{}{}\n",
+                                    storage::truncate(error.lines().next().unwrap_or(""), 160),
+                                    retry.max_attempts,
+                                    delay.as_secs(),
+                                    state.harness,
+                                    if state.model.is_empty() { "" } else { " " },
+                                    state.model
+                                )));
+                                candidate_retries.insert((index, c), (next_retry, started));
+                                retry_reason.insert(
+                                    Job::CandidateRetryWait(index, c),
+                                    format!(
+                                        "Transient error retry {next_retry}/{} after {}s backoff",
+                                        retry.max_attempts,
+                                        delay.as_secs()
+                                    ),
+                                );
+                                let sleeper_tx = tx.clone();
+                                scope.spawn(move || {
+                                    let interrupted =
+                                        sleep_interruptible(delay, cancel, Some(wake));
+                                    let _ = sleeper_tx.send(Message::CandidateRetryReady(
+                                        index,
+                                        c,
+                                        interrupted,
+                                    ));
+                                });
+                                flight.push((Job::CandidateRetryWait(index, c), None));
+                                scheduled_retry = true;
+                            } else if budget_ok {
+                                emit(Event::Output(format!(
+                                    "Transient retry {next_retry}/{} of {label} skipped: stage timeout budget exhausted\n",
+                                    retry.max_attempts
+                                )));
+                            }
+                        }
+                        if !scheduled_retry {
+                            candidate_retries.remove(&(index, c));
+                        }
+                        if round_done(run, &flight, index) {
                             if graph::judge_of(&run.workflow, index).is_none() && !flight.is_empty()
                             {
                                 if !deferred_settle.contains(&index) {
                                     deferred_settle.push(index);
                                 }
                             } else {
-                                run.settle_fan_out(index, cancel.load(Ordering::Relaxed))?;
+                                settle_round(
+                                    run,
+                                    index,
+                                    cancel.load(Ordering::Relaxed),
+                                    cancel,
+                                    emit,
+                                )?;
                             }
                         }
                         run.persist()?;
@@ -892,6 +1066,7 @@ pub(super) fn schedule(
             // Running harnesses end promptly via the local abort flag while
             // workers drain and report any survivors before the scope ends.
             abort.store(true, Ordering::Relaxed);
+            wake.store(true, Ordering::Relaxed);
             drop(tx);
             let mut survivors_added = false;
             while let Ok(message) = rx.recv() {
@@ -951,7 +1126,7 @@ pub(super) fn schedule(
                 )?;
             }
         }
-        run.settle_fan_out(index, cancel_requested || had_pending)?;
+        settle_round(run, index, cancel_requested || had_pending, cancel, emit)?;
     }
     if only.is_none() {
         run.settle()?;
@@ -971,6 +1146,21 @@ pub(super) fn execute_fan_out(
     emit: &mut impl FnMut(Event),
 ) -> Result<()> {
     let index = run.cursor;
+    if start_round(run, index, cancel, emit)? {
+        schedule(run, cancel, emit, Some(index))?;
+    }
+    Ok(())
+}
+
+/// Starts a round of fan-out stage `index` and runs the stage's
+/// `before_stage` hooks once for the whole round, in the workspace. False
+/// when the round did not start: the stage stopped, its candidates unstarted.
+fn start_round(
+    run: &mut Run,
+    index: usize,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(Event),
+) -> Result<bool> {
     let attempts = run.stages[index].attempts.len();
     if let Err(error) = run.start_fan_out(index) {
         let recorded = run.stages[index].attempts.len() > attempts;
@@ -982,11 +1172,123 @@ pub(super) fn execute_fan_out(
         )?;
         run.persist()?;
         emit(Event::State(Box::new(run.clone())));
-        return Ok(());
+        return Ok(false);
     }
     emit(Event::State(Box::new(run.clone())));
-    schedule(run, cancel, emit, Some(index))?;
+    let directory = run.stages[index]
+        .attempts
+        .last()
+        .map(|a| a.directory.clone())
+        .context("No fan-out attempt")?;
+    let hooks = run_stage_hooks(
+        run,
+        index,
+        crate::hooks::HookEvent::BeforeStage,
+        &directory,
+        false,
+        cancel,
+        emit,
+    )?;
+    let (status, message, actor) = if hooks.cancelled {
+        (
+            Status::Cancelled,
+            "Stage cancelled during before_stage hook. Filesystem changes are retained; retry explicitly".to_owned(),
+            Actor::User,
+        )
+    } else if let Some(error) = hooks.failed {
+        (Status::Failed, error, Actor::Engine)
+    } else {
+        return Ok(true);
+    };
+    let count = run.stages[index]
+        .fan_out
+        .as_ref()
+        .map_or(0, |f| f.candidates.len());
+    for c in 0..count {
+        if run.candidate(index, c).status == Status::Pending {
+            run.stop_candidate(
+                index,
+                c,
+                Status::Cancelled,
+                "Not started: a before_stage hook stopped the round".into(),
+                Actor::Engine,
+            )?;
+        }
+    }
+    run.cursor = index;
+    run.stop(status, message, actor, true)?;
+    if status == Status::Failed {
+        let _ = run_stage_hooks(
+            run,
+            index,
+            crate::hooks::HookEvent::OnFailure,
+            &directory,
+            false,
+            cancel,
+            emit,
+        );
+    }
+    run.persist()?;
+    emit(Event::State(Box::new(run.clone())));
+    Ok(false)
+}
+
+/// Settles the round of fan-out stage `index`, then runs the stage's
+/// `after_stage` (and, if it stopped, `on_failure`) hooks once for the round.
+fn settle_round(
+    run: &mut Run,
+    index: usize,
+    cancelled: bool,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(Event),
+) -> Result<()> {
+    run.settle_fan_out(index, cancelled)?;
+    if let Some(directory) = run.stages[index]
+        .attempts
+        .last()
+        .map(|a| a.directory.clone())
+    {
+        run_post_stage_hooks(run, index, &directory, false, cancel, emit);
+    }
     Ok(())
+}
+
+/// Whether the round of fan-out stage `index` is over: no candidate waits,
+/// runs, or waits out a transient retry backoff.
+fn round_done(run: &Run, flight: &[(Job, Option<Prepared>)], index: usize) -> bool {
+    run.fan_out_done(index)
+        && !flight
+            .iter()
+            .any(|(job, _)| matches!(job, Job::CandidateRetryWait(i, _) if *i == index))
+}
+
+/// Whether candidate `c` of fan-out stage `index`, which just ended, failed
+/// transiently and may run again: the stage's `retry` covers its candidates.
+fn should_retry_candidate(
+    run: &Run,
+    (index, c): (usize, usize),
+    exited: bool,
+    retries_done: u32,
+    retry: crate::config::Retry,
+    cancel: &AtomicBool,
+) -> bool {
+    let state = run.candidate(index, c);
+    if !exited
+        || cancel.load(Ordering::Relaxed)
+        || retries_done >= retry.max_attempts
+        || state.status != Status::Failed
+    {
+        return false;
+    }
+    let attempt = state.attempts.last();
+    let message = attempt
+        .and_then(|a| a.error.as_deref())
+        .or(state.error.as_deref())
+        .unwrap_or("");
+    let stderr_tail = attempt
+        .and_then(|a| process::read_tail(&a.directory.join("stderr.log"), 4096).ok())
+        .unwrap_or_default();
+    is_transient_error(message, &stderr_tail)
 }
 
 /// `drive` for a dependency graph: ready stages side by side where safe.

@@ -367,6 +367,10 @@ record includes `schema_version`, `event`, `timestamp`, `run_id`, `workflow`,
 `cache_write_tokens`, `estimated_usd`, `exit_code`) where applicable. No
 prompts, task text, or credentials are written.
 
+`run_end` is written each time the run stops (complete, failed, blocked, or
+cancelled). An attempt that fails and is retried automatically (`retry`) ends
+with `attempt_end` only; the run's `run_end` comes once the run stops.
+
 ## Scripting notes
 
 - Without a terminal, `run`/`resume` stop at interactive stages (resume from a

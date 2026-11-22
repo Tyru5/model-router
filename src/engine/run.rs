@@ -1566,6 +1566,7 @@ impl Run {
                 directory,
                 handoff_file,
                 reattached: false,
+                retry_from: None,
             },
             cwd,
         ))
@@ -2051,6 +2052,8 @@ pub(super) struct CandidatePost {
     pub(super) changes: Option<CandidateChanges>,
     pub(super) stop: Option<(Status, String)>,
     pub(super) survivor: Option<process::Group>,
+    /// The harness exited on its own: not cancelled, timed out, or stalled.
+    pub(super) exited: bool,
 }
 
 /// Runs candidate post-processing in the worker thread: exit normalization,
