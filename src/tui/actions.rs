@@ -105,6 +105,7 @@ pub(super) enum ActionId {
     NextNeedsInput,
     Notices,
     Notifications,
+    Tour,
     Interrupt,
 }
 
@@ -434,6 +435,7 @@ const ACTIONS: &[Entry] = {
         act(Notifications, Global, key(KeyCode::F(9)), "notifications", "Notifications…: terminal, desktop, and webhook backends, with a test")
             .more(&["Sent when a run needs input, stops blocked or failed, or completes (saved for all projects)"])
             .menu(View, 'N'),
+        act(Tour, Global, key(KeyCode::F(1)), "tour", "Show or hide the getting-started tour, which walks you to a first completed run").menu(View, 'g'),
         act(Interrupt, Global, ctrl('c'), "cancel/exit", "Cancel work, or exit (asks to save unsaved edits)"),
     ]
 };

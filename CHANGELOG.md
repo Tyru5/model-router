@@ -9,6 +9,13 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Added
 
+- TUI tour: on the first launch, a panel above the status line walks from
+  the Harnesses page through stages, the task, and starting a run to its
+  completion, naming the next key for each step and run state. `F1` shows or
+  hides it; `<config dir>/tour.json` records it finished or hidden so it
+  does not reopen. Earlier users (recent projects, no `tour.json`) get a
+  one-time status line about `F1` instead. See `docs/tui.md#tour`.
+
 - Delegation: a stage with `[workflows.stages.delegation]` gives its agent
   the router's MCP tools (`delegate_task`, `task_status`, `task_wait`,
   `task_send`, `task_cancel`, `task_apply`, `run_*`, `schedule_*`) through

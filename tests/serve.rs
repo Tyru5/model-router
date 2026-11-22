@@ -9,7 +9,7 @@ use std::{
     path::Path,
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 fn mock_adapter(extra: &[&str]) -> CustomAdapter {
@@ -412,6 +412,20 @@ fn mcp_reports_errors_and_cancels() {
     assert!(error.contains("No handoff awaits confirmation"), "{error}");
     let retried = mcp.call("retry_stage", json!({"run_id": id}));
     assert_eq!(retried["active"], true, "{retried}");
+    // The retry's attempt starts on the driver thread; a cancel before then
+    // stops the run with one attempt.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = mcp.call("run_status", json!({"run_id": id}));
+        if status["stages"][0]["attempts"] == 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the retry started no attempt: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     mcp.call("cancel_run", json!({"run_id": id}));
     let stopped = mcp.call("wait_run", json!({"run_id": id, "timeout_seconds": 60}));
     assert_eq!(stopped["status"], "cancelled", "{stopped}");

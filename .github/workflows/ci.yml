@@ -89,6 +89,8 @@ jobs:
         run: $SMOKE scripts/smoke_harness_settings.py
       - name: Startup animation
         run: $SMOKE scripts/smoke_startup.py
+      - name: Getting-started tour
+        run: $SMOKE scripts/smoke_tour.py
       - name: Native terminal detach and reattach
         run: $SMOKE scripts/smoke_detach.py
       - name: Diff review and external tools

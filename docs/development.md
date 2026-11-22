@@ -38,6 +38,7 @@ sleeping.
 | `smoke_themes` | All 14 themes, cancellation, restart, repo switching, invalid preferences |
 | `smoke_harness_settings` | Per-stage isolation, permission arguments, conflicts, model browsing, persistence |
 | `smoke_startup` | Animation, skip/bypass, resize, interrupt cleanup; records `.model-router/qa/startup.gif` |
+| `smoke_tour` | First-launch tour from Harnesses to a completed demo run, `F1`, no reopen once finished, the one-time `F1` line for earlier users. Other smoke tests write `tour.json` so the tour stays closed (`Terminal(tour=True)` opts in) |
 | `smoke_detach` | Detach and reattach of interactive sessions, including leaving one running after `mr` exits and reattaching from a new `mr` |
 | `smoke_review` | Diff view: file list, hunk/file jumps, search, `$PAGER`/`$VISUAL` hand-offs |
 | `smoke_delegation` | A delegating stage's task line on the Runs page; cancelling the stage cancels its task (skipped without bubblewrap or sandbox-exec) |

@@ -38,6 +38,7 @@ fn theme_app(project: &std::path::Path) -> App {
         Arc::new(AtomicBool::new(false)),
     );
     app.ui.theme_path = project.join("appearance.json");
+    app.tour.path = project.join("tour.json");
     app.harnesses.checks.probe = |_, _| vec![];
     app
 }
@@ -3155,5 +3156,231 @@ fn any_disconnected_detects_peer_hangup_without_blocking() {
     let (a, b) = UnixStream::pair().unwrap();
     assert!(!super::any_disconnected([a.as_raw_fd()]));
     drop(b);
-    assert!(super::any_disconnected([a.as_raw_fd()]));
+    // A child another test forks holds a copy of `b` until it execs, so the
+    // hangup can arrive a moment after the drop.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !super::any_disconnected([a.as_raw_fd()]) {
+        assert!(std::time::Instant::now() < deadline, "no hangup after 5 s");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// A harness check result: found on PATH or not.
+fn harness_report(harness: &str, installed: bool) -> crate::doctor::Report {
+    crate::doctor::Report {
+        harness: harness.into(),
+        builtin: true,
+        program: harness.into(),
+        path: installed.then(|| PathBuf::from(format!("/usr/bin/{harness}"))),
+        version: None,
+        tested_versions: vec![],
+        version_tested: None,
+        version_captured: false,
+        capabilities: None,
+        summary: "ok".into(),
+        notes: vec![],
+    }
+}
+
+#[test]
+fn the_tour_follows_the_user_from_harnesses_to_a_completed_run() {
+    use super::tour::Step;
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    let tour_file = app.tour.path.clone();
+    assert!(!rows(&mut app, 100, 30).join("\n").contains("Tour ·"));
+    app.key(key(Key::F(1))).unwrap();
+    let screen = rows(&mut app, 100, 30).join("\n");
+    assert!(screen.contains("Tour · 1 of 6 · Harnesses"), "{screen}");
+    assert!(screen.contains("Press [3]"), "{screen}");
+
+    // Harnesses shows its checks: codex is missing, the rest are installed.
+    app.key(key(Key::Char('3'))).unwrap();
+    app.harnesses.checks.checking = false;
+    app.harnesses.checks.reports = crate::config::BUILTINS
+        .iter()
+        .map(|name| harness_report(name, *name != "codex"))
+        .collect();
+    let screen = rows(&mut app, 100, 30).join("\n");
+    assert_eq!(app.tour_step(), Step::Workflow);
+    assert!(screen.contains("Press [1]"), "{screen}");
+
+    // A stage on a missing harness comes first.
+    app.key(key(Key::Char('1'))).unwrap();
+    let missing = app.editor.settings.workflows[0]
+        .stages
+        .iter()
+        .find(|s| s.enabled && s.harness == "codex")
+        .expect("the starter has a codex stage")
+        .name
+        .clone();
+    assert_eq!(
+        app.tour_step(),
+        Step::Stage {
+            name: missing.clone(),
+            harness: "codex".into(),
+            candidate: false,
+        }
+    );
+    assert!(rows(&mut app, 100, 30).join("\n").contains(&missing));
+    for stage in &mut app.editor.settings.workflows[0].stages {
+        if stage.harness == "codex" {
+            stage.harness = "claude".into();
+        }
+    }
+
+    // Then the task, then starting.
+    assert_eq!(app.tour_step(), Step::Task);
+    app.key(key(Key::Char('t'))).unwrap();
+    app.paste("Add a --version flag");
+    app.key(ctrl('s')).unwrap();
+    assert_eq!(app.tour_step(), Step::Start);
+    assert!(rows(&mut app, 100, 30).join("\n").contains("Press [r]"));
+
+    // A run started while the tour is open is followed through its states.
+    let mut run = sample_run("tour-run");
+    run.status = Status::Running;
+    app.tour_started(&run.id);
+    app.session.adopt(run);
+    assert!(rows(&mut app, 100, 30).join("\n").contains("Press [2]"));
+    app.ui.page = Page::Runs;
+    app.slot_mut().run.status = Status::AwaitingConfirmation;
+    let screen = rows(&mut app, 100, 30).join("\n");
+    assert!(screen.contains("Tour · 5 of 6"), "{screen}");
+    assert!(screen.contains("[a] accepts"), "{screen}");
+    assert!(!tour_file.exists(), "Nothing is saved before the end");
+
+    app.slot_mut().run.status = Status::Complete;
+    let screen = rows(&mut app, 100, 30).join("\n");
+    assert!(screen.contains("Tour · 6 of 6 · Done"), "{screen}");
+    assert!(
+        std::fs::read_to_string(&tour_file)
+            .unwrap()
+            .contains("finished")
+    );
+    // Hiding a finished tour keeps it finished.
+    app.key(key(Key::F(1))).unwrap();
+    assert!(!app.tour.open);
+    assert!(
+        std::fs::read_to_string(&tour_file)
+            .unwrap()
+            .contains("finished")
+    );
+    assert!(!rows(&mut app, 100, 30).join("\n").contains("Tour ·"));
+}
+
+#[test]
+fn hiding_the_tour_early_saves_it_and_small_screens_keep_the_page() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    app.key(key(Key::F(1))).unwrap();
+    // At the minimum size the page keeps its rows, and the panel keeps the
+    // line that says what to press.
+    let small = rows(&mut app, 65, 20).join("\n");
+    assert!(small.contains("Stages"), "{small}");
+    assert!(small.contains("Press [3]"), "{small}");
+    assert!(!small.contains("Model Router runs"), "{small}");
+    assert!(rows(&mut app, 80, 30).join("\n").contains("Tour · 1 of 6"));
+    app.key(key(Key::F(1))).unwrap();
+    assert!(
+        std::fs::read_to_string(&app.tour.path)
+            .unwrap()
+            .contains("hidden")
+    );
+    assert!(app.ui.message.contains("[F1] shows it again"));
+}
+
+/// The tour on Workflow, past Harnesses: only `missing` is not installed.
+fn toured_app(project: &std::path::Path, missing: &str) -> App {
+    let mut app = theme_app(project);
+    app.key(key(Key::F(1))).unwrap();
+    app.ui.page = Page::Harnesses;
+    app.harnesses.checks.reports = crate::config::BUILTINS
+        .iter()
+        .map(|name| harness_report(name, *name != missing))
+        .collect();
+    app.sync_tour();
+    app.ui.page = Page::Workflow;
+    app
+}
+
+#[test]
+fn the_tour_checks_the_harnesses_a_run_needs_and_at_least_one_stage() {
+    use super::tour::Step;
+    let project = tempfile::tempdir().unwrap();
+    let mut app = toured_app(project.path(), "gemini");
+    let stages = &mut app.editor.settings.workflows[0].stages;
+    for stage in stages.iter_mut() {
+        stage.harness = "claude".into();
+    }
+    // A ship stage runs in the router, so its harness does not matter.
+    stages[0].role = Role::Ship;
+    stages[0].harness = "gemini".into();
+    assert_eq!(app.tour_step(), Step::Task);
+    // A fan-out stage needs its candidates' harnesses.
+    let stages = &mut app.editor.settings.workflows[0].stages;
+    stages[1].fan_out = Some(crate::config::FanOut {
+        candidates: vec![crate::config::Candidate {
+            harness: "gemini".into(),
+            ..Default::default()
+        }],
+        judge: String::new(),
+    });
+    let name = stages[1].name.clone();
+    assert_eq!(
+        app.tour_step(),
+        Step::Stage {
+            name,
+            harness: "gemini".into(),
+            candidate: true,
+        }
+    );
+    // [h] would change the stage, not the candidate: the panel says [e].
+    assert!(
+        rows(&mut app, 100, 30)
+            .join("\n")
+            .contains("Fan-out candidates")
+    );
+    // Turning every stage off, as the advice allows, is no way to start.
+    for stage in &mut app.editor.settings.workflows[0].stages {
+        stage.enabled = false;
+    }
+    assert_eq!(app.tour_step(), Step::NoStage);
+    assert!(
+        rows(&mut app, 100, 30)
+            .join("\n")
+            .contains("[o] to turn it on")
+    );
+    // A new project's harnesses are unknown until Harnesses checks them.
+    app.harnesses.checks.clear();
+    assert_eq!(app.tour_step(), Step::Harnesses);
+}
+
+#[test]
+fn the_tour_names_the_followed_run_and_how_it_recovers() {
+    use super::tour::{Step, Watch};
+    let project = tempfile::tempdir().unwrap();
+    let mut app = toured_app(project.path(), "gemini");
+    let mut run = sample_run("tour-run");
+    run.status = Status::Running;
+    app.tour_started(&run.id);
+    app.session.adopt(run);
+    app.ui.page = Page::Runs;
+    assert_eq!(app.tour_step(), Step::Watch(Watch::Running));
+    // Another run selected: its keys would act on that one.
+    app.session.adopt(sample_run("other"));
+    assert_eq!(app.tour_step(), Step::Watch(Watch::Unselected));
+    app.session.focus_run("tour-run");
+    // A USD budget stop recovers with [B], not a retry.
+    let run = app.slot_mut();
+    run.run.status = Status::Blocked;
+    run.run.error = Some(format!("{}: $2.10 of $2.00", crate::cost::EXCEEDED));
+    assert_eq!(app.tour_step(), Step::Watch(Watch::Budget));
+    assert!(
+        rows(&mut app, 100, 30)
+            .join("\n")
+            .contains("[B] raises the cap")
+    );
+    app.slot_mut().run.error = Some("Harness exited 1".into());
+    assert_eq!(app.tour_step(), Step::Watch(Watch::Stopped));
 }
