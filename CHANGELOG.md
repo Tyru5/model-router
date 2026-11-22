@@ -7,6 +7,28 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ## [Unreleased]
 
+### Added
+
+- Delegation: a stage with `[workflows.stages.delegation]` gives its agent
+  the router's MCP tools (`delegate_task`, `task_status`, `task_wait`,
+  `task_send`, `task_cancel`, `task_apply`, `run_*`, `schedule_*`) through
+  `mr __mcp-bridge` and a per-turn Unix socket and token. Tasks run on named
+  `[delegates.*]` or allowlisted harness/model/provider targets, in their own
+  OS sandbox (`shared` read-only or `worktree`), never above the parent's
+  privilege ceiling. Finished tasks wake the parent with a follow-up turn.
+  Worktree tasks return sealed patches the parent applies with `task_apply`.
+  Parents: Claude Code, Codex, OpenCode, and custom adapters with
+  `mcp_config_args`; interactive stages too. Delegates need
+  `model-router trust`. See `docs/delegation.md`.
+- Agent-launched runs (`run_launch`) are driven by the TUI or `serve`; the
+  CLI leaves them pending for `model-router resume`.
+- Schedules: `schedule_task` writes `.model-router/schedules.json`; a
+  schedule fires only after `mr schedules approve ID`. `mr schedules
+  list|approve|pause|enable|delete|tick`; `serve` fires due schedules and
+  accepts `POST /schedules/<id>/trigger`.
+- Reports, previews, history, and the Runs page show tasks, wake turns, and
+  their cost.
+
 ### Security
 
 - Sandboxed stages can no longer make the router run commands outside the

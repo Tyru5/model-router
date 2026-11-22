@@ -603,6 +603,67 @@ fn candidate_lines(run: &engine::Run, width: u16, palette: Palette) -> Vec<Line<
         .collect()
 }
 
+/// One line per delegating stage with tasks: each task's target and status.
+fn task_lines(run: &engine::Run, width: u16, palette: Palette) -> Vec<Line<'static>> {
+    use crate::delegation::records::TaskStatus;
+    let muted = Style::default().fg(palette.muted);
+    run.stages
+        .iter()
+        .zip(&run.workflow.stages)
+        .filter_map(|(state, stage)| Some((state.attempts.last()?, stage)))
+        .filter(|(attempt, _)| !attempt.tasks.is_empty())
+        .map(|(attempt, stage)| {
+            let mut spans = vec![Span::styled(format!("  {} tasks ", stage.name), muted)];
+            for task in &attempt.tasks {
+                let status = match task.status {
+                    TaskStatus::Queued | TaskStatus::Starting => engine::Status::Pending,
+                    TaskStatus::Running => engine::Status::Running,
+                    TaskStatus::Waiting => engine::Status::AwaitingConfirmation,
+                    TaskStatus::Completed => engine::Status::Complete,
+                    TaskStatus::Blocked => engine::Status::Blocked,
+                    TaskStatus::Cancelled => engine::Status::Cancelled,
+                    TaskStatus::Failed | TaskStatus::Interrupted => engine::Status::Failed,
+                };
+                let target = task
+                    .target
+                    .delegate
+                    .clone()
+                    .unwrap_or_else(|| task.target.harness.clone());
+                spans.push(Span::styled(
+                    format!("  ↳ {} · {target} ", task.id),
+                    Style::default().fg(palette.fg),
+                ));
+                spans.push(Span::styled(
+                    Palette::status_glyph(status),
+                    Style::default().fg(palette.status_color(status)),
+                ));
+            }
+            if !attempt.turns.is_empty() {
+                spans.push(Span::styled(
+                    format!("  · {} wake(s)", attempt.turns.len()),
+                    muted,
+                ));
+            }
+            let line = Line::from(spans);
+            if line.width() > usize::from(width) {
+                Line::from(format!(
+                    "  {} tasks: {} ({} done)",
+                    stage.name,
+                    attempt.tasks.len(),
+                    attempt
+                        .tasks
+                        .iter()
+                        .filter(|t| t.status.is_terminal())
+                        .count()
+                ))
+                .style(muted)
+            } else {
+                line
+            }
+        })
+        .collect()
+}
+
 fn candidate_line(
     fan: &engine::FanOutState,
     stage: &crate::config::Stage,
@@ -672,12 +733,14 @@ pub(super) fn draw_run(
     let candidates = if results {
         vec![]
     } else {
-        candidate_lines(&slot.run, area.width, palette)
+        let mut lines = candidate_lines(&slot.run, area.width, palette);
+        lines.extend(task_lines(&slot.run, area.width, palette));
+        lines
     };
     let [head, strip_row, candidate_rows, rule_row, body] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(candidates.len().min(3) as u16),
+        Constraint::Length(candidates.len().min(4) as u16),
         Constraint::Length(1),
         Constraint::Min(1),
     ])

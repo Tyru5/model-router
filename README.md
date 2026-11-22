@@ -82,6 +82,8 @@ Replace the Astra ID if your account differs. `w` adds presets such as
 - Notifications: terminal, desktop, webhook → [tui](docs/tui.md#notifications)
 - Run history, reports, compare, stats, bench → [automation](docs/automation.md)
 - MCP and HTTP server for other agents → [serve](docs/serve.md)
+- Delegation: a stage's agent hands tasks to other harnesses and models,
+  launches runs, and schedules work you approve → [delegation](docs/delegation.md)
 - Fourteen themes and optional Vim motions → [themes](docs/themes.md), [tui](docs/tui.md#vim-motions)
 
 ## Keys

@@ -144,6 +144,41 @@ created after the stage started.
   own settings. A project config replaces your global one, so set the sandbox
   there too.
 
+## Delegation
+
+A delegating stage's agent reaches the router only through its own turn's
+broker ([delegation.md](delegation.md)).
+
+- Each parent turn gets a new Unix socket and a 32-byte token file in a
+  private 0700 directory (`model-router-orch` beside the terminal host's).
+  The harness's `model-router __mcp-bridge` presents the token; one live
+  connection per turn; both files are removed when the turn ends. The
+  environment, argv, `mcp.json`, and previews hold only their paths.
+- Every sandboxed stage has every orchestration directory hidden (bubblewrap
+  tmpfs; Seatbelt denies reads, writes, and connects). A delegating turn gets
+  back only its own socket and token file, after every deny. Other launches
+  drop inherited `MODEL_ROUTER_ORCH_*` variables.
+- Tasks always run in their own OS sandbox (`shared`: read-only; `worktree`:
+  writable inside its worktree, Git's shared refs, hooks, and config
+  read-only) and are refused when no backend works. A task never exceeds its
+  parent on write access, native permissions (`extra_args` or an escalating
+  setting count as escalated), network, or sandbox enforcement.
+- A worktree task's patch is sealed by the router after the task ends,
+  hashed in `run.json`, re-checked against `protected_paths` and for `.git`
+  or `.model-router` paths, and applied only by `task_apply`, with a journal
+  that crash recovery settles.
+- `delegation` and `[delegates.*]` need project trust and enter the run's
+  approval digest; untrusted, they are ignored.
+- Runs an agent launches get their own worktree, may not exceed the
+  launcher's ceiling (router checks and a secret scanner count as unsandboxed
+  commands), launch no runs or schedules, and count toward the launcher's
+  budget. A ship stage in a run an agent or schedule created always asks for
+  confirmation.
+- Schedules fire only with an approval receipt in
+  `<config dir>/schedule-approvals`, bound to everything the schedule would
+  run; any edit, pause, or enable forgets it, and `trust --revoke` forgets
+  them all. Sandboxed stages cannot write `<config dir>`.
+
 ## Secrets and redaction
 
 - Provider keys are read from the variable named by `api_key_env` at launch;
@@ -273,4 +308,5 @@ Some guarantees depend on the harness or OS rather than the router itself:
 | Detached processes | The router sandbox has no PID namespace. A process a harness detaches into a new session outlives the stage's process group and keeps its sandbox permissions. |
 | Custom `TMPDIR` / `XDG_RUNTIME_DIR` | Terminal-host socket hiding covers standard runtime/temp socket paths; a concurrent `mr` launched with a custom `TMPDIR` or `XDG_RUNTIME_DIR` puts its sockets elsewhere. |
 | Built-in secret scan | Pattern matching catches high-confidence token formats only; pair with an external `secret_scanner` (e.g. `gitleaks`) when broader coverage is required. |
+| Unsandboxed delegating stages | With `sandbox = "off"`, any process of your user can read a running turn's token file and reach its broker, as it could anything else you run. |
 | Live spend caps | Budgets check after each attempt completes; an in-progress attempt is not stopped mid-stream (use `timeout_seconds` and `stall_timeout_seconds` to bound runaways). |

@@ -47,6 +47,18 @@ pub struct RunSummary {
     /// the checkout. Empty in summaries saved before this was recorded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retained_groups: Vec<crate::process::Group>,
+    /// Tasks the run's stages delegated, across attempts.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tasks: usize,
+    /// Who created the run: the user, an agent (`run_launch`), or a schedule.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::engine::CreationSource::is_user"
+    )]
+    pub creation_source: crate::engine::CreationSource,
+}
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 impl From<&Run> for RunSummary {
     fn from(run: &Run) -> Self {
@@ -70,6 +82,13 @@ impl From<&Run> for RunSummary {
             revision: run.revision,
             run_bytes: None,
             retained_groups: run.retained_groups().to_vec(),
+            tasks: run
+                .stages
+                .iter()
+                .flat_map(|s| &s.attempts)
+                .map(|a| a.tasks.len())
+                .sum(),
+            creation_source: run.creation_source,
         }
     }
 }

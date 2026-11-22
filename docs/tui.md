@@ -323,6 +323,16 @@ Codex, Pi, omp, Cursor, OpenCode, Amp, and custom adapters with
 use `i`. Fan-out stages cannot be taken over. Details:
 [harnesses.md](harnesses.md#takeover).
 
+### Delegated tasks
+
+While a delegating stage runs, a line under the stage strip lists its
+tasks (`Implement tasks ↳ t1 · codex-review ●`) with their status and wake
+turns; task output appears in the feed under `── Implement · task t1
+(codex-review) ──`. `C` cancels the stage and its tasks. Runs the stage's
+agent launches join this session's runs and are driven in the background,
+without taking focus. Leaving an interactive delegating stage running closes
+its tools and cancels its tasks.
+
 ### Several runs
 
 `L` lists this session's runs (status, stage, elapsed, needs-input marker):

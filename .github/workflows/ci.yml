@@ -93,6 +93,8 @@ jobs:
         run: $SMOKE scripts/smoke_detach.py
       - name: Diff review and external tools
         run: $SMOKE scripts/smoke_review.py
+      - name: Delegated tasks
+        run: $SMOKE scripts/smoke_delegation.py
       # Plain python3: the raw-PTY harness must not need pyte.
       - name: Terminal disconnect and shutdown
         run: python3 scripts/smoke_shutdown.py

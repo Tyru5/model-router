@@ -57,9 +57,11 @@ def mcp_turn(config_path, script_path, prompt_text):
     turn = int(turn_file.read_text()) + 1 if turn_file.exists() else 1
     turn_file.write_text(str(turn))
     log = Path(script_path + ".calls.jsonl")
+
     def record(entry):
         with log.open("a") as f:
             f.write(json.dumps(entry) + "\n")
+
     record({"turn": turn, "prompt": prompt_text})
     turns = script.get("turns", [])
     actions = turns[turn - 1] if turn <= len(turns) else []
@@ -76,9 +78,15 @@ def mcp_turn(config_path, script_path, prompt_text):
         text=True,
     )
     next_id = [0]
+
     def rpc(method, params):
         next_id[0] += 1
-        bridge.stdin.write(json.dumps({"jsonrpc": "2.0", "id": next_id[0], "method": method, "params": params}) + "\n")
+        bridge.stdin.write(
+            json.dumps(
+                {"jsonrpc": "2.0", "id": next_id[0], "method": method, "params": params}
+            )
+            + "\n"
+        )
         bridge.stdin.flush()
         while True:
             line = bridge.stdout.readline()
@@ -87,17 +95,30 @@ def mcp_turn(config_path, script_path, prompt_text):
             message = json.loads(line)
             if message.get("id") == next_id[0]:
                 return message
-    rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "mock"}})
+
+    rpc(
+        "initialize",
+        {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "mock"},
+        },
+    )
     for action in actions:
         if "call" in action:
-            reply = rpc("tools/call", {"name": action["call"], "arguments": action.get("args", {})})
+            reply = rpc(
+                "tools/call",
+                {"name": action["call"], "arguments": action.get("args", {})},
+            )
             result = reply.get("result", {})
-            record({
-                "turn": turn,
-                "call": action["call"],
-                "error": result.get("isError", False),
-                "result": result.get("structuredContent"),
-            })
+            record(
+                {
+                    "turn": turn,
+                    "call": action["call"],
+                    "error": result.get("isError", False),
+                    "result": result.get("structuredContent"),
+                }
+            )
     bridge.stdin.close()
     bridge.wait(timeout=30)
     return turn, script

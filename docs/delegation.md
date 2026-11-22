@@ -1,9 +1,9 @@
-# Delegation (design)
+# Delegation
 
-Status: **proposed, not implemented.** This page is the build specification
-for orchestration agents: an agent running inside a stage hands sub-tasks to
+Orchestration agents: an agent running inside a stage hands sub-tasks to
 other harnesses and models through the router, launches and reads runs, and
-schedules work. The reference is T3 Code's orchestrator MCP server
+schedules work. This page began as the build specification and describes
+the implementation (`src/delegation/`, `src/engine/delegate*.rs`). The reference is T3 Code's orchestrator MCP server
 (`pingdotgg/t3code`, `docs/orchestration-v2/orchestrator-mcp-server.md`);
 where model-router differs, the reason is given.
 
@@ -126,82 +126,54 @@ stage harness (own process group, own sandbox)
   └─ mr __mcp-bridge  (stdio MCP; reads socket path + token file from env)
         │  Unix socket, per-turn token
         ▼
-broker thread (one per parent turn)
-        │  Message::Delegate { request, reply }
+broker (delegation::broker; one per parent turn)
+        │  Msg::Call { request, reply }
         ▼
-owner loop (engine::schedule): policy, persist, launch, wake
-        ├─ Job::Stage / Job::Interactive   parent turn 1
-        ├─ Job::Wake                       parent turns 2..n (follow_up)
-        ├─ Job::Task                       task turns
-        └─ deadline timer thread           Message::Deadline
+owner loop (engine::delegate): policy, persist, launch, wake
+        ├─ parent turn 1 (unattended worker, or the interactive terminal host)
+        ├─ parent wake turns 2..n (follow_up workers)
+        ├─ task turns (workers, own process group and sandbox)
+        └─ ticker thread             Msg::Tick every 100 ms
 ```
 
 ### Ownership
 
-The owner loop is the only writer of `run.json` and the only place that
-launches processes. Today list stages run inline (`engine.rs:178`), handoff
-repair runs its follow-up on the owner thread (`exec.rs:376`), and the loop
-blocks on `rx.recv()` with no timer (`schedule.rs:566`). Delegation changes
-that for delegating stages only:
+A delegating stage is never parallel-safe (`graph::parallel_safe`), so while
+it runs it is the only thing in flight. It runs in its own owner loop,
+`engine::delegate::drive_stage`, entered from the list driver
+(`engine::drive`), the graph scheduler (`schedule`'s `Launch::Stage`), and
+`run_interactive`. The loop is the only writer of `run.json` while it runs.
 
-- **List workflows.** A delegating stage runs through
-  `schedule(run, cancel, Some(index))`, as `execute_fan_out` already does
-  (`schedule.rs:748`); `next_launch`'s `only` path, which launches only
-  candidates today (`schedule.rs:107`), gains a `Launch::Stage` arm.
-  Non-delegating stages keep today's path.
-- **Graph workflows.** Already scheduled. A delegating stage is never
-  parallel-safe, so while it is in flight it is the owner's only stage.
-- **Interactive parents.** `run_interactive` (`engine.rs:184`) calls
-  `schedule` with `Job::Interactive(session)` instead of `execute_stage`. The
-  worker waits on the PTY session as `execute_stage` does today; the owner
-  loop serves the broker meanwhile.
-- **New jobs and messages:**
+- **Messages:** `Spawned`, `Terminal` (an interactive parent's host socket),
+  `Output`, `ParentDone`, `TaskDone`, `Call` (a tool request and its reply
+  channel), and `Tick`.
+- **Parent phases:**
 
   ```text
-  Job::Interactive(usize)          interactive parent turn
-  Job::Wake(usize, turn)           parent follow_up turn
-  Job::Task(usize, task, turn)     task turn
-  Message::Delegate(request, reply_tx)
-  Message::TaskDone(usize, task, Box<Result<TaskPost>>, ended)
-  Message::WakeDone(usize, turn, Result<Outcome>, ended)
-  Message::Deadline(usize)         stage deadline reached
-  Message::Cancel                  the run's cancel flag was set
-  ```
-
-- **Parent states** kept in `flight` so the loop does not exit while a parent
-  waits:
-
-  ```text
-  Running(turn) --exit 0, cohort open--> AwaitingCohort
-  AwaitingCohort --cohort ready--> Waking(turn+1) --> Running(turn+1)
-  Running(turn) --exit 0, cohort empty--> Final  (conclude: handoff, repair, checks)
-  any --non-zero exit | stall | deadline | cancel | refused wake--> Stopped
+  Running(turn) --exit 0, unread results--> Awaiting
+  Awaiting --cohort ready--> Running(turn+1)   (a wake turn)
+  Running(turn) --exit 0, nothing unread--> Done (conclude: handoff, repair, checks)
+  Running(1) --released to its terminal host--> Releasing --tasks settled--> Done
+  any --failure | deadline | cancel | refused wake--> Done (stopped)
   ```
 
 - **Blocking tool waits** (`mode: "wait"`, `task_wait`, `run_wait`) wait in
-  the broker thread on a condition the owner signals when task or run state
+  the broker's call threads on a condition the owner signals when task state
   changes. The owner never blocks on a tool call.
-- **Timer thread:** sends `Message::Deadline` when an unattended delegating
-  stage's `timeout_seconds` (which covers the whole stage) passes, and
-  `Message::Cancel` within 100 ms of the cancel flag being set, so an idle
-  owner wakes. The owner stops it explicitly (a stop flag plus an unpark)
-  before draining the channel, since the drain waits for every sender to
-  drop. Interactive parents have no stage deadline, as today. `stall_timeout_seconds` applies to running processes only and
-  pauses while the broker has a call in flight for that turn
-  (`capture_with_stall` reads an atomic in-flight counter).
-- **Final:** `conclude` (handoff, final-turn repair, checks) runs inline as
-  today, but only after the broker is closed and every task is terminal, so
-  nothing waits on it. `task_apply` runs on the owner; it is bounded by
-  `git apply`.
-- **Shutdown:** on stop, error, or cancel the owner first answers every
-  queued `Message::Delegate` with `parent_not_active`, then closes each
-  broker: sets its close flag, wakes its `accept` (the listener is polled
-  with a wake pipe, since `UnixListener` has no `shutdown`) and its blocked
-  waits, including a wait for an owner reply, which also checks the close
-  flag, and joins its thread, since a broker holds a `Sender<Message>`. It
-  then closes admission,
-  revokes the turn's token, cancels live tasks, waits for their groups, then
-  drains the channel as today (`schedule.rs:651`).
+- **Ticks** wake an idle owner for the stage deadline (`timeout_seconds`
+  covers the whole stage) and for cancellation. Interactive parents have no
+  stage deadline. The ticker stops with a flag and an unpark before the
+  channel drains.
+- **Stall timeout:** a parent prints nothing while a tool call waits (up to
+  45 s), so a delegating stage's `stall_timeout_seconds` must be at least 60
+  (config validation).
+- **Final:** `conclude` (handoff, final-turn repair, checks) runs after the
+  broker is closed and no task runs. `task_apply` runs on the owner.
+- **Shutdown:** the owner closes the broker (its close flag ends every call's
+  wait with `parent_not_active`, the accept loop is woken through a socket
+  pair, the live connection is shut down, and the thread joined), cancels
+  live tasks, stops the ticker, answers stray calls, and drains until every
+  worker reported.
 - Each task and wake process gets its own process group, journaled in
   `SpawnJournal` before `run.json` records it, and its own output paths.
 
@@ -405,8 +377,7 @@ the counterpart of a T3 thread.
   gone (cleaned), only the run's own caps apply, with a warning.
 - No recursion: inside a launched or scheduled run, `runs` and `schedules`
   are forced off. `max_runs` caps launches per parent attempt.
-- Who drives them: `engine::drive` takes a `RunHost` (launch, wait, retry,
-  cancel). The TUI and `serve` hosts drive launched runs like other session
+- Who drives them: the process-wide `RunHost` (`engine::set_run_host`). The TUI and `serve` hosts drive launched runs like other session
   runs. The CLI host creates them `pending` (`driven: false`), prints
   `model-router resume ID` for each, and lists them in its report; no
   detached `mr` is spawned. `run_retry` on a run no host drives is refused.
@@ -482,7 +453,7 @@ delegate_task
   -> broker -> owner: resolve target, ceiling, caps, budget admission
   -> persist TaskState{status: queued, key, fingerprint}
   -> worktree if isolation = worktree
-  -> Job::Task turn 1 (group journaled) -> starting -> running
+  -> task turn 1 (group journaled) -> starting -> running
   -> exit -> usage, handoff, session id, sealed patch (worktree)
   -> completed | failed | waiting (question) | ...
   -> cohort bookkeeping -> wake the parent when the cohort is ready
@@ -555,7 +526,7 @@ cannot be steered mid-turn, so the router delivers at process boundaries:
   turn still unread stops the stage `blocked` (`delegation: results not
   read`), even if the turn started new tasks, so an announced result never
   costs a second wake.
-- A wake runs `adapters::follow_up` as `Job::Wake` with the bridge attached
+- A wake runs `adapters::follow_up` on the owner loop with the bridge attached
   (`Part::Mcp` in the follow-up template) and a new socket and token.
 - **Refused or impossible wake** — `max_wake_turns` reached, budget admission
   refuses it, no session id, or the harness/provider has no `follow_up`: the
@@ -579,37 +550,28 @@ tasks`).
 
 ### Interactive parents
 
-- Same tools; the owner loop serves them while the user drives the harness
-  (`Job::Interactive`).
+- Same tools; the owner loop serves them while the harness runs in its
+  terminal host on a worker thread.
 - No automatic wake while the harness runs: a finished task updates the TUI
-  task panel and the notification line (CLI: a status line). Interactive
-  parents get the `[interactive]` instruction variant and its `next`: tell
-  the user what you wait on; when they prompt you, read results with
-  `task_status`.
-- `Ctrl+B` only switches the TUI view (`tui/actions.rs:445`); delegation
-  keeps working.
-- Release (TUI quit with "leave running", CLI `d`) while tasks are live or
-  the broker is open asks: cancel live tasks and close the tools, or stay. After release the
-  broker is closed for good; on reattach (`reattach_stage`) the bridge answers
-  `parent_not_active`, since the token cannot be handed back without storing
-  it.
-- `supports_wake` for an interactive parent needs `Session::Assign` (Claude
-  Code): an interactive Codex or OpenCode session runs in a PTY transcript,
-  so no session id can be read from it (`handoff/normalize.rs:47`).
-- The harness exits 0 with live or undelivered tasks: with `supports_wake`,
-  the owner waits for the cohort, then resumes the session unattended through
-  `follow_up` (a `Job::Wake`). Wake-turn exit, handoff, and repair logic runs
-  as `Mode::Unattended` (`exec.rs:186`, `:263`, `:303`, `:386` take the turn's
-  mode, not `stage.mode`); the stage then concludes with its configured
-  checkpoint behaviour unchanged. Each wake turn takes the stage's
-  `timeout_seconds` as a per-turn limit, since interactive stages have no
-  stage deadline. `adapters::follow_up` always builds an unattended launch
-  (`adapters.rs:577`),
-  so the native schema flag stays on (`adapters.rs:798`). Without `supports_wake` it cancels live
-  tasks and stops `blocked`, and the `[interactive]` instructions omit the
-  resume promise.
-- The CLI drives interactive stages too (`mr run`, `cli_interactive`,
-  `cli/run.rs:405`): its `d` (detach) follows the TUI's release rule.
+  task line. Interactive parents get the `[interactive]` instruction variant
+  and its `next`: tell the user what you wait on; when they prompt you, read
+  results with `task_status`.
+- `Ctrl+B` only switches the TUI view; delegation keeps working.
+- Release (TUI quit with "leave running", CLI `d`) closes the tools for good
+  and cancels live tasks, which settle before the terminal host takes the
+  run's locks; the TUI already asks before leaving a stage running. On
+  reattach the bridge answers `parent_not_active`, since the token cannot be
+  handed back without storing it.
+- Waking an interactive parent needs a session ID assigned at launch
+  (Claude Code, custom adapters with `session.assign`): an interactive Codex
+  or OpenCode session runs in a PTY transcript with no readable session ID.
+- The harness exits 0 with unread or running tasks: with a session to
+  resume, the owner waits for the cohort, then resumes the session
+  unattended through `follow_up`. The wake turn's exit, handoff, and repair
+  are judged as unattended (the stage's mode is switched for the conclusion
+  and restored); the stage keeps its interactive mode. Without one it cancels
+  live tasks and stops `blocked`, and the `[interactive]` instructions say to
+  read every result before exiting.
 
 ### Questions from tasks
 
@@ -814,10 +776,10 @@ be a leaf task.
 | codex | `--config mcp_servers.model-router.command="MR"`, `.args=["__mcp-bridge"]`, `.env.MODEL_ROUTER_ORCH_SOCK="…"`, `.env.MODEL_ROUTER_ORCH_TOKEN_FILE="…"`, `.tool_timeout_sec=120`; values TOML-quoted, since paths may hold spaces | `follow_up` (not `ollama`/`lmstudio`) | v1 |
 | opencode | `OPENCODE_CONFIG_CONTENT` gains `mcp.model-router = {"type": "local", "command": [MR, "__mcp-bridge"], "environment": {…}, "enabled": true}` via `EnvValue::JsonInsert` | `follow_up` | v1 |
 | custom | new `mcp_config_args` with `{mcp_config}` (the Claude-format file), plus the two variables; `follow_up_args` also accept `{mcp_config}`; `mcp_config_args` joins `CustomAdapter::launch_fields`, the trust digest, and `trust::ignore` | `follow_up_args` | v1; offline tests use it |
-| omp | `--mcp-config`-style flag if `omp --help` lists one, else not supported | none: wait-only | v1 if the offline help probe passes |
-| amp | `--mcp-config <turn>/mcp.json` | none: wait-only | v1 if the offline help probe passes |
-| copilot | `--additional-mcp-config <turn>/mcp.json` | none: wait-only | v1 if the offline help probe passes |
-| pi | needs a router-shipped `--extension` | — | not in v1 (needs a TypeScript bridge; revisit) |
+| omp | no MCP option in `omp --help` | — | not supported |
+| amp | `--mcp-config` exists, but its JSON shape could not be confirmed offline | — | not supported |
+| copilot | not installed where this was built; `--additional-mcp-config` unverified | — | not supported |
+| pi | needs a router-shipped `--extension` (a TypeScript bridge) | — | not supported |
 | cursor | CLI reads only `.cursor/mcp.json` | — | not supported: would edit files |
 | gemini | settings files only; `streams = false` | — | not supported |
 | goose | `--with-extension` takes a command string | — | not supported: argv invariant |
@@ -893,10 +855,11 @@ load unchanged.
 
 ## Surfaces
 
-- TUI: task panel under the stage (status, target, elapsed, cost, verdict,
-  questions); `Enter` opens a task's output and handoff; `C` cancels;
-  output headers `── implement · task t3 (codex-review) ──`; pending
-  schedule approvals on the Runs page (`a` approves).
+- TUI: a line under the stage strip lists each task's target and status, and
+  wake turns; task output appears in the feed under
+  `── Implement · task t3 (codex-review) ──`; `C` cancels the stage and its
+  tasks; runs the agent launches join the session in the background.
+  Schedules are approved from the CLI (`mr schedules approve ID`).
 - `report` / `report --json`: `tasks` per stage, `launched_runs`.
 - `serve`: `run_status` task counts; `get_handoff` includes task handoffs.
 - `preview`: each parent's injection and every named delegate's command.
@@ -954,35 +917,14 @@ Ordinary work needs no delegation.
 
 ## Build order
 
-All of this ships as one release; it lands in this order, each step with its
-tests, docs, and changelog entry.
-
-0. Done (prerequisite, a fix to current code): sandboxed stages cannot
-   write Git config, `config.worktree`, hooks, or a linked worktree's `.git`
-   file, `commondir`, and `gitdir`; the `.git` directory cannot be replaced;
-   a stage refuses to start when a Git config file or include target it could
-   write would be read (`sandbox::git_locks`,
-   `sandbox::refuse_writable_git_config`); router Git passes
-   `-c core.fsmonitor=false -c core.hooksPath=/dev/null`
-   (`snapshot::git_command`). See `docs/safety.md#sandboxing`.
-1. Records, config, trust, run snapshot, privilege table, `load` validation,
-   recovery, cost roll-up (on top of the fan-out spend fix).
-2. Owner loop changes: `Job`/`Message` variants, parent states, timer
-   thread, list-stage routing, `Job::Interactive`, `parallel_safe` rule,
-   `RunHost` seam.
-3. Broker, bridge, socket, token file, sandbox rules; `serve::mcp` tool-set
-   trait.
-4. Delegation tools, shared tasks, handoff turns, wake loop, questions;
-   custom-adapter parent.
-5. Claude, Codex, OpenCode parents; golden cases; `doctor`.
-6. Worktree tasks, sealed patches, `task_apply`, `task_send`.
-7. Run tools, provenance, ship confirmation rule.
-8. Schedules: store, approvals, `serve` scheduler, `tick`, webhook route.
-9. Interactive parents; wait-only parents (omp, Amp, Copilot) after their
-   probes.
-10. TUI task panel, report, preview, history; `smoke_delegation.py`;
-    `docs/safety.md`, `docs/configuration.md`, `docs/automation.md`,
-    `docs/tui.md`, `docs/serve.md`.
+Built in this order, each step with its tests: (0) the Git sandbox fix this
+design depends on (`sandbox::git_locks`, `sandbox::refuse_writable_git_config`,
+`snapshot::git_command`); (1) records, config, trust, ceiling, cost; (2–6)
+owner loop, broker and bridge, tools, wake loop, Claude/Codex/OpenCode/custom
+parents, worktree tasks and `task_apply`, `task_send`; (7) run tools and the
+`RunHost` (`engine::set_run_host`, registered by `serve` and the TUI); (8)
+schedules; (9) interactive parents; (10) report, `serve`, preview, history,
+TUI task line, `scripts/smoke_delegation.py`, docs.
 
 ## Tests
 
@@ -1037,10 +979,9 @@ All offline.
   schedule approval key; frame markers, no sleeps.
 - `cargo +1.85 check --all-targets --locked`.
 
-## Open decisions
+## Decided
 
-1. Claude needs `--allowedTools=mcp__model-router__*` to call the tools
-   unattended. Proposed: enabling delegation implies it.
-2. omp, Amp, and Copilot parents depend on offline help probes; a failed probe
-   moves the harness to "not supported" instead of delaying the release.
-3. Pi as a parent needs a TypeScript extension bridge. Proposed: not in v1.
+1. Enabling delegation on a Claude Code stage passes
+   `--allowedTools=mcp__model-router__*` so it can call the tools unattended.
+2. omp, Amp, Copilot, and Pi are not delegating parents (see
+   [Harness support](#harness-support)); every harness can run tasks.

@@ -74,6 +74,33 @@ pub struct StageReport {
     /// A fork reused this stage's handoff from its source run without running it.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub inherited: bool,
+    /// Tasks the latest attempt's agent delegated.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<TaskReport>,
+    /// Runs the stage's agent launched (`run_launch`), across attempts.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub launched_runs: Vec<String>,
+}
+
+/// One delegated task, as a report shows it.
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskReport {
+    pub id: String,
+    /// The named delegate, or the ad-hoc harness.
+    pub target: String,
+    pub harness: String,
+    pub model: String,
+    pub role: Role,
+    pub isolation: String,
+    pub status: String,
+    pub turns: usize,
+    pub summary: Option<String>,
+    pub verdict: Option<String>,
+    /// Sealed patch revisions, and which reached the checkout.
+    pub patches: usize,
+    pub applied: usize,
+    pub usage: UsageTotal,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -662,6 +689,58 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
             handoff_source: last.and_then(|a| a.handoff_source),
             fan_out,
             inherited: state.inherited.is_some(),
+            tasks: state
+                .attempts
+                .last()
+                .map(|attempt| {
+                    attempt
+                        .tasks
+                        .iter()
+                        .map(|task| {
+                            let estimates: Vec<cost::Estimate> = task
+                                .turns
+                                .iter()
+                                .map(|turn| cost::task_turn_estimate(run, task, turn, pricing))
+                                .collect();
+                            let handoff = task.latest_handoff.as_ref().or(task.handoff.as_ref());
+                            TaskReport {
+                                id: task.id.clone(),
+                                target: task
+                                    .target
+                                    .delegate
+                                    .clone()
+                                    .unwrap_or_else(|| task.target.harness.clone()),
+                                harness: task.target.harness.clone(),
+                                model: task.target.model.clone(),
+                                role: task.role,
+                                isolation: task.isolation.label().into(),
+                                status: task.status.label().into(),
+                                turns: task.turns.len(),
+                                summary: handoff.map(|h| h.summary.clone()),
+                                verdict: handoff.map(|h| format!("{:?}", h.verdict).to_lowercase()),
+                                patches: task.patches.len(),
+                                applied: task
+                                    .patches
+                                    .iter()
+                                    .filter(|p| {
+                                        p.apply.as_ref().is_some_and(|a| a.applied_at.is_some())
+                                    })
+                                    .count(),
+                                usage: usage_sum(
+                                    task.turns.iter().map(|t| t.usage).zip(estimates.iter()),
+                                ),
+                                error: task.error.clone(),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            launched_runs: state
+                .attempts
+                .iter()
+                .flat_map(|a| &a.launched_runs)
+                .map(|l| l.id.clone())
+                .collect(),
         });
     }
     // Stable, so each kind keeps stage order.
@@ -1132,8 +1211,56 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
                 let _ = writeln!(text, "    {line}");
             }
         }
+        for task in &stage.tasks {
+            let _ = writeln!(text, "    {}", task_text(task));
+        }
+        if !stage.launched_runs.is_empty() {
+            let _ = writeln!(
+                text,
+                "    launched runs: {}",
+                stage.launched_runs.join(", ")
+            );
+        }
     }
     text
+}
+
+/// A delegated task in one line: target, status, verdict, patches, spend.
+pub fn task_text(task: &TaskReport) -> String {
+    let mut line = format!(
+        "task {} {} ({}, {}) {}",
+        task.id,
+        task.target,
+        task.role.label(),
+        task.isolation,
+        task.status
+    );
+    if let Some(verdict) = &task.verdict {
+        let _ = write!(line, " · {verdict}");
+    }
+    if task.patches > 0 {
+        let _ = write!(
+            line,
+            " · {} patch(es), {} applied",
+            task.patches, task.applied
+        );
+    }
+    let _ = write!(
+        line,
+        " · {}",
+        cost_text(&task.usage.cost, &Budget::default())
+    );
+    if let Some(summary) = &task.summary {
+        let _ = write!(
+            line,
+            " · {}",
+            crate::storage::truncate(summary.lines().next().unwrap_or(""), 100)
+        );
+    }
+    if let Some(error) = &task.error {
+        let _ = write!(line, " · {}", crate::storage::truncate(error, 100));
+    }
+    line
 }
 
 /// A best-of-N stage's judge, choice, and candidates, one line each.

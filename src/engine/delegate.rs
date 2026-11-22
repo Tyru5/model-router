@@ -508,8 +508,15 @@ impl<'a> Owner<'a> {
                 }
                 Msg::Output(who, lines) => self.emit_lines(who, lines, emit),
                 Msg::Call(call) => {
+                    let quiet = matches!(
+                        call.request,
+                        Request::Status { deliver: false, .. } | Request::Capabilities { .. }
+                    );
                     let reply = self.handle(scope, run, call.request);
                     let _ = call.reply.send(reply);
+                    if !quiet {
+                        emit(Event::State(Box::new(run.clone())));
+                    }
                 }
                 Msg::TaskDone(id, outcome, ended) => {
                     self.task_done(run, &id, outcome, ended)?;

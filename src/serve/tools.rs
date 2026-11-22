@@ -559,7 +559,30 @@ fn get_handoff(server: &Server, a: HandoffArgs) -> Result<Value> {
         "handoff": state.handoff,
         "waiver": state.waiver,
         "attempts": state.attempts,
+        // Delegated tasks' handoffs, from the latest attempt.
+        "tasks": state.attempts.last().map(|a| a.tasks.iter().map(|t| json!({
+            "task_id": t.id,
+            "target": t.target,
+            "status": t.status.label(),
+            "handoff": t.handoff,
+            "latest_handoff": t.latest_handoff,
+            "questions": t.questions,
+        })).collect::<Vec<_>>()).unwrap_or_default(),
     }))
+}
+
+/// A stage's delegated tasks by status, for run_status; null without any.
+fn task_counts(state: &engine::StageState) -> Value {
+    let Some(attempt) = state.attempts.last().filter(|a| !a.tasks.is_empty()) else {
+        return Value::Null;
+    };
+    let mut counts = serde_json::Map::new();
+    for task in &attempt.tasks {
+        let entry = counts.entry(task.status.label()).or_insert(json!(0));
+        *entry = json!(entry.as_u64().unwrap_or(0) + 1);
+    }
+    counts.insert("wake_turns".into(), json!(attempt.turns.len()));
+    Value::Object(counts)
 }
 
 fn get_report(server: &Server, a: RunArgs) -> Result<Value> {
@@ -699,6 +722,7 @@ pub fn status_value_with(run: &Run, info: &Info, pricing: &crate::cost::Pricing)
                     "summary": excerpt(&h.summary),
                     "verdict": h.verdict,
                 })),
+                "tasks": task_counts(state),
             })
         })
         .collect();

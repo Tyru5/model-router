@@ -76,6 +76,10 @@ id = "implement"
 budget = { max_usd = 2.0, on_exceed = "warn" }
 ```
 
+- Delegated tasks spend under their own harness, model, and provider, and
+  count toward their stage and run, in `report`, and in `cost` history. A
+  stage's caps also count the runs its agent launched; a launched run
+  answers to its launcher's caps as well as its own.
 - After each attempt, a run whose known cost or counted tokens exceed a run or
   stage cap stops, **blocked**, before its next stage (or logs a warning and
   continues when `on_exceed = "warn"`). In a stage graph, stages already
