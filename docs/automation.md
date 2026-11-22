@@ -342,9 +342,9 @@ only after approval, and again after any edit, pause, or enable.
 
 | Command | Effect |
 | --- | --- |
-| `schedules` / `schedules list [--json]` | Each schedule: approval state, trigger, workflow, task, pause reason. |
+| `schedules` / `schedules list [--json]` | Each schedule: approval state, trigger, workflow, task, pause reason. `--json` adds each schedule's approval `digest` (null when the config is untrusted). |
 | `schedules add` | Create a schedule from the CLI: `--task TEXT` or `--task-file FILE`, optional `-w/--workflow NAME`, one trigger (`--every DUR`, `--at HH:MM`, `--cron "M H DOM MON DOW"`, or `--webhook`), optional `--tz` (`local` default, `UTC`, or `±HH:MM` for `--at`/`--cron`), optional `--id ID`, and `--approve` (approves immediately if the project is trusted). |
-| `schedules approve ID` | Approve the schedule as it stands now (the project config must be trusted). |
+| `schedules approve ID [--digest D]` | Approve the schedule as it stands now (the project config must be trusted). With `--digest`, approve only if its digest is still `D`; a schedule edited since is refused. |
 | `schedules pause ID` | Pause it; its approval is forgotten. |
 | `schedules enable ID` | Enable it again; it needs approval. |
 | `schedules delete ID` | Delete it. |

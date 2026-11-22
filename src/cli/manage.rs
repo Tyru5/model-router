@@ -378,7 +378,10 @@ pub enum SchedulesCommand {
         tz: Option<String>,
         approve: bool,
     },
-    Approve(String),
+    Approve {
+        id: String,
+        digest: Option<String>,
+    },
     Pause(String),
     Enable(String),
     Delete(String),
@@ -459,6 +462,7 @@ pub fn schedules(
                         serde_json::json!({
                             "schedule": s,
                             "approved": settings.as_ref().is_some_and(|c| schedules::approved(project, s, c)),
+                            "digest": settings.as_ref().and_then(|c| schedules::digest(project, s, c).ok()),
                             "next_due": schedules::next_due(s, now),
                         })
                     })
@@ -493,8 +497,8 @@ pub fn schedules(
             }
             Ok(())
         }
-        SchedulesCommand::Approve(id) => {
-            let schedule = schedules::approve(project, &id)?;
+        SchedulesCommand::Approve { id, digest } => {
+            let schedule = schedules::approve(project, &id, digest.as_deref())?;
             println!(
                 "Approved {}: {} runs workflow {} with task: {}",
                 schedule.id,

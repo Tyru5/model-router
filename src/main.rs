@@ -82,7 +82,13 @@ enum SchedulesAction {
         approve: bool,
     },
     /// Approve a schedule as it stands now; any later edit asks again.
-    Approve { id: String },
+    Approve {
+        id: String,
+        /// Approve only if the schedule still has this digest (from
+        /// `schedules list --json` or the agent's `schedule_task` result).
+        #[arg(long, value_name = "DIGEST")]
+        digest: Option<String>,
+    },
     /// Pause a schedule (its approval is forgotten).
     Pause { id: String },
     /// Enable a paused schedule; it then needs approval again.
@@ -557,8 +563,8 @@ fn main_result() -> Result<()> {
                                 tz,
                                 approve,
                             },
-                            SchedulesAction::Approve { id } => {
-                                cli::manage::SchedulesCommand::Approve(id)
+                            SchedulesAction::Approve { id, digest } => {
+                                cli::manage::SchedulesCommand::Approve { id, digest }
                             }
                             SchedulesAction::Pause { id } => {
                                 cli::manage::SchedulesCommand::Pause(id)

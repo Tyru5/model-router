@@ -264,6 +264,9 @@ pub(super) enum Ask {
         workflow: String,
         trigger: String,
         task: String,
+        /// `schedules::digest` of the definition shown: approval is refused
+        /// if the schedule changed since.
+        digest: String,
     },
     /// Permanently delete a schedule from `.model-router/schedules.json`.
     DeleteSchedule {
@@ -372,6 +375,7 @@ impl Ask {
                 workflow,
                 trigger,
                 task,
+                ..
             } => (
                 "Approve schedule",
                 format!(
@@ -881,8 +885,18 @@ impl App {
                     );
                 }
             }
-            Ask::ApproveSchedule { id, .. } => {
-                schedules::approve(&self.project, id)?;
+            Ask::ApproveSchedule { id, digest, .. } => {
+                if let Err(error) = schedules::approve(&self.project, id, Some(digest)) {
+                    // The question shows a stale definition: close it and
+                    // show the current one under the error.
+                    let Some(Modal::Schedules(view)) = self.ui.dialog_mut() else {
+                        return Err(error);
+                    };
+                    let _ = view.reload(&self.project);
+                    view.error = format!("{error:#}");
+                    self.ui.message = format!("Schedule {id} was not approved: {error:#}");
+                    return Ok(DialogResult::Close);
+                }
                 if let Some(Modal::Schedules(view)) = self.ui.dialog_mut() {
                     let _ = view.reload(&self.project);
                     view.status = format!("Approved schedule {id}.");
@@ -1314,12 +1328,13 @@ impl App {
                     view.status = "Reloaded schedules.".into();
                     Stay
                 }
-                SchedulesAction::Approve(schedule) => {
+                SchedulesAction::Approve { schedule, digest } => {
                     DialogResult::Push(Modal::Ask(Box::new(Ask::ApproveSchedule {
                         id: schedule.id,
                         workflow: schedule.workflow.unwrap_or_else(|| "(default)".into()),
                         trigger: schedule.trigger.describe(),
                         task: schedule.task,
+                        digest,
                     })))
                 }
                 SchedulesAction::Pause(id) => {

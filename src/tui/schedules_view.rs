@@ -22,6 +22,9 @@ use std::path::Path;
 pub(super) struct ScheduleRow {
     pub(super) schedule: Schedule,
     pub(super) approved: bool,
+    /// `schedules::digest` of this row as loaded, or why there is none:
+    /// approving passes it so a later edit is refused, not approved.
+    pub(super) digest: std::result::Result<String, String>,
     pub(super) next_due: Option<DateTime<Utc>>,
 }
 
@@ -29,7 +32,10 @@ pub(super) enum SchedulesAction {
     Stay,
     Close,
     Refresh,
-    Approve(Box<Schedule>),
+    Approve {
+        schedule: Box<Schedule>,
+        digest: String,
+    },
     Pause(String),
     Enable(String),
     Delete(String),
@@ -75,10 +81,17 @@ impl SchedulesView {
                 let approved = settings
                     .as_ref()
                     .is_some_and(|s| schedules::approved(project, &schedule, s));
+                let digest = match &settings {
+                    Some(s) => {
+                        schedules::digest(project, &schedule, s).map_err(|e| format!("{e:#}"))
+                    }
+                    None => Err("The project config is untrusted".into()),
+                };
                 let next_due = schedules::next_due(&schedule, now);
                 ScheduleRow {
                     schedule,
                     approved,
+                    digest,
                     next_due,
                 }
             })
@@ -142,7 +155,17 @@ impl SchedulesView {
                     );
                     return SchedulesAction::Stay;
                 }
-                SchedulesAction::Approve(Box::new(row.schedule.clone()))
+                match &row.digest {
+                    Ok(digest) => SchedulesAction::Approve {
+                        schedule: Box::new(row.schedule.clone()),
+                        digest: digest.clone(),
+                    },
+                    Err(why) => {
+                        self.error =
+                            format!("Schedule {} cannot be approved: {why}", row.schedule.id);
+                        SchedulesAction::Stay
+                    }
+                }
             }
             Key::Char('p') => match self.current() {
                 Some(row) => SchedulesAction::Pause(row.schedule.id.clone()),

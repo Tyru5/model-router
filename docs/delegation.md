@@ -404,7 +404,7 @@ Enabled by `delegation.schedules = true`.
 
 | Tool | Purpose |
 | --- | --- |
-| `schedule_task` | Create or update (`schedule_id`): `{workflow?, task, every? \| at? \| webhook: true, enabled}`. |
+| `schedule_task` | Create or update (`schedule_id`): `{workflow?, task, every? \| at? \| cron? \| webhook: true, tz?, enabled}`. On an update, `tz` alone re-times the stored `at`/`cron` trigger; an `every` or webhook schedule refuses it. |
 | `list_scheduled_tasks` | This project's schedules, with approval and executor state. |
 | `delete_scheduled_task` | Delete permanently. |
 
@@ -429,6 +429,12 @@ Enabled by `delegation.schedules = true`.
   the digest, so the schedule waits for approval again. Agents cannot write
   `config_dir()` from a sandbox; unsandboxed, the same-user caveat applies.
   `model-router schedules approve ID` or `u` (Schedules dialog) → `a` on the TUI Runs page approves.
+  The TUI confirmation passes the digest of the definition it shows, and
+  `schedules approve ID --digest D` does the same; the digest is compared
+  under `.model-router/schedules.lock`, so a schedule changed after it was
+  shown (an agent's `schedule_task` edit, a config change) is refused, not
+  approved. `schedule_task` results give the approve command with the
+  `--digest` of the definition they report.
 - Firing rechecks approval, trust, and the ceiling. A failed check pauses the
   schedule with the reason.
 - Executors: `mr serve` runs a scheduler thread and drives fired runs as its

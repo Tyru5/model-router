@@ -676,7 +676,7 @@ fn an_agent_s_schedule_fires_only_after_approval_and_once_per_occurrence() {
             .unwrap()
             .is_empty()
     );
-    schedules::approve(project, "s1").unwrap();
+    schedules::approve(project, "s1", None).unwrap();
     let approved_at = schedules::load(project).unwrap().schedules[0]
         .approved_at
         .unwrap();
@@ -703,7 +703,7 @@ fn an_agent_s_schedule_fires_only_after_approval_and_once_per_occurrence() {
             .unwrap()
             .is_empty()
     );
-    schedules::approve(project, "s2").unwrap();
+    schedules::approve(project, "s2", None).unwrap();
     assert_eq!(
         schedules::fire_due(project, much_later, Some("s2"))
             .unwrap()
@@ -727,6 +727,9 @@ fn schedule_task_mcp_tool_supports_cron_and_tz() {
         "turns": [[
             {"call": "schedule_task", "args": {"workflow": "Plain", "task": "Weekday cron", "cron": "0 9 * * 1-5", "tz": "UTC", "client_request_id": "c1"}},
             {"call": "schedule_task", "args": {"workflow": "Plain", "task": "Weekday cron", "cron": "0 9 * * 1-5", "tz": "+02:00", "client_request_id": "c1"}},
+            {"call": "schedule_task", "args": {"schedule_id": "s1", "tz": "+02:00"}},
+            {"call": "schedule_task", "args": {"workflow": "Plain", "task": "Six-hourly", "every": "6h"}},
+            {"call": "schedule_task", "args": {"schedule_id": "s2", "tz": "UTC"}},
             {"call": "list_scheduled_tasks"}
         ]],
         "handoffs": {"1": {"summary": "final", "verdict": "complete"}}
@@ -748,9 +751,40 @@ fn schedule_task_mcp_tool_supports_cron_and_tz() {
     assert!(created["next_due"].as_str().is_some(), "{created}");
     let conflict = &call(&calls, 1, "schedule_task")[1]["result"];
     assert_eq!(conflict["error"]["code"], "request_conflict", "{conflict}");
-
+    // A tz alone re-times the stored cron trigger.
+    let retimed = &call(&calls, 1, "schedule_task")[2]["result"];
+    assert_eq!(retimed["trigger"], "cron 0 9 * * 1-5 (+02:00)", "{retimed}");
+    // An every trigger takes no tz: refused, and nothing changes.
+    let refused = &call(&calls, 1, "schedule_task")[4]["result"];
+    assert_eq!(refused["error"]["code"], "invalid_request", "{refused}");
     let project = case.dir.path();
-    let approved = schedules::approve(project, "s1").unwrap();
+    let store = schedules::load(project).unwrap();
+    assert_eq!(store.schedules[0].revision, 2);
+    assert!(matches!(
+        &store.schedules[0].trigger,
+        schedules::Trigger::Cron { tz: Some(tz), .. } if tz == "+02:00"
+    ));
+    assert_eq!(store.schedules[1].revision, 1);
+
+    // Each result's approve command pins the definition it reports: the
+    // first one no longer matches after the tz edit, so it approves nothing.
+    let pinned = |result: &serde_json::Value| {
+        let command = result["approve"].as_str().unwrap().to_owned();
+        command
+            .split_once("--digest ")
+            .map(|(_, digest)| digest.trim().to_owned())
+            .unwrap_or_else(|| panic!("no --digest in {command}"))
+    };
+    let stale = schedules::approve(project, "s1", Some(&pinned(created))).unwrap_err();
+    assert!(
+        format!("{stale:#}").contains("changed after it was shown"),
+        "{stale:#}"
+    );
+    let settings = schedules::trusted_settings(project).unwrap();
+    let current = schedules::load(project).unwrap().schedules[0].clone();
+    assert!(!schedules::approved(project, &current, &settings));
+    let approved = schedules::approve(project, "s1", Some(&pinned(retimed))).unwrap();
+    assert!(schedules::approved(project, &approved, &settings));
     let next = schedules::next_due(&approved, chrono::Utc::now()).unwrap();
     let fired = schedules::fire_due(project, next, None).unwrap();
     assert_eq!(fired.len(), 1);

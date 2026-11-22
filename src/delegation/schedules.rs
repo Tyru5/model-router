@@ -308,7 +308,10 @@ fn parse_cron(expr: &str) -> Result<(String, CronExpr)> {
     parse_cron_field(parts[2], "day-of-month", 1, 31, false, &mut cron.doms)?;
     parse_cron_field(parts[3], "month", 1, 12, false, &mut cron.months)?;
     parse_cron_field(parts[4], "day-of-week", 0, 7, true, &mut cron.dows)?;
-    if !cron.dom_wild {
+    // With both day fields restricted a day matches either one (see
+    // `day_matches`), and every month has each weekday, so only a
+    // day-of-month restriction alone can rule out every date.
+    if !cron.dom_wild && cron.dow_wild {
         let feasible = (1..=12)
             .filter(|&m| cron.months[m])
             .any(|m| (1..=max_days_in_month(m)).any(|d| cron.doms[d]));
@@ -433,6 +436,28 @@ impl CronExpr {
             cur += Duration::minutes(1);
         }
         None
+    }
+}
+
+impl Trigger {
+    /// This trigger with its timezone replaced by `tz` (validated like
+    /// `parse_trigger`'s). Only `at` and `cron` triggers take one.
+    pub fn with_tz(&self, tz: Option<&str>) -> Result<Self> {
+        let tz = tz.map(str::trim).filter(|s| !s.is_empty());
+        match self {
+            Self::At { time, .. } => Ok(Self::At {
+                time: time.clone(),
+                tz: parse_tz(tz)?.0,
+            }),
+            Self::Cron { expr, .. } => Ok(Self::Cron {
+                expr: expr.clone(),
+                tz: parse_tz(tz)?.0,
+            }),
+            Self::Every { .. } | Self::Webhook => {
+                ensure!(tz.is_none(), "tz applies only to at or cron triggers");
+                Ok(self.clone())
+            }
+        }
     }
 }
 
@@ -660,8 +685,13 @@ pub fn add(project: &Path, options: AddOptions) -> Result<(Schedule, bool)> {
     Ok((schedule, options.approve))
 }
 
-/// Approves schedule `id` as it stands now (`mr schedules approve`).
-pub fn approve(project: &Path, id: &str) -> Result<Schedule> {
+/// Approves schedule `id` (`mr schedules approve`, the TUI Schedules
+/// dialog). With `expected`, the `digest` of the definition the user was
+/// shown, approval is refused when the schedule, its workflow, or the
+/// trusted config changed since: the comparison runs under the schedules
+/// lock, so an agent's `schedule_task` edit cannot slip in between. Without
+/// it, the schedule is approved as it stands now.
+pub fn approve(project: &Path, id: &str, expected: Option<&str>) -> Result<Schedule> {
     let settings = trusted_settings(project)?;
     update(project, |store| {
         let schedule = store
@@ -672,6 +702,15 @@ pub fn approve(project: &Path, id: &str) -> Result<Schedule> {
         ensure!(schedule.enabled, "Schedule {id} is paused; enable it first");
         check_launchable(&settings, schedule.workflow.as_deref(), &schedule.ceiling)?;
         let digest = digest(project, schedule, &settings)?;
+        if let Some(expected) = expected {
+            ensure!(
+                expected.trim() == digest,
+                "Schedule {id} changed after it was shown for approval (now revision {}: {}); \
+                 review it again before approving",
+                schedule.revision,
+                schedule.trigger.describe()
+            );
+        }
         let path = receipt(project, id).with_context(|| format!("Invalid schedule id {id}"))?;
         fs::create_dir_all(approvals_dir(project))?;
         crate::storage::atomic_write(&path, digest.as_bytes())?;
@@ -1057,6 +1096,15 @@ mod tests {
             Some(utc("2026-01-04T00:00:00Z"))
         );
 
+        // A day-of-month that never occurs in the months still fires on the
+        // restricted weekday: Feb 31st or a Monday. 2026-02-02 is Monday.
+        s.trigger = parse_trigger(None, None, Some("0 9 31 2 1"), false, Some("UTC")).unwrap();
+        s.approved_at = Some(utc("2026-01-01T00:00:00Z"));
+        assert_eq!(
+            next_due(&s, utc("2026-01-01T00:00:00Z")),
+            Some(utc("2026-02-02T09:00:00Z"))
+        );
+
         // Invalid cron expressions.
         for bad in [
             "",
@@ -1072,12 +1120,38 @@ mod tests {
             "10-5 * * * *",
             "1,,2 * * * *",
             "0 0 31 2 *",
+            "0 0 30,31 2 *",
         ] {
             assert!(
                 parse_trigger(None, None, Some(bad), false, Some("UTC")).is_err(),
                 "expected invalid cron: {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn with_tz_replaces_the_timezone_of_at_and_cron_only() {
+        let at = parse_trigger(None, Some("09:30"), None, false, None).unwrap();
+        assert_eq!(
+            at.with_tz(Some("utc")).unwrap(),
+            Trigger::At {
+                time: "09:30".into(),
+                tz: Some("UTC".into()),
+            }
+        );
+        let cron = parse_trigger(None, None, Some("0 9 * * 1"), false, Some("UTC")).unwrap();
+        assert_eq!(
+            cron.with_tz(Some("local")).unwrap(),
+            Trigger::Cron {
+                expr: "0 9 * * 1".into(),
+                tz: None,
+            }
+        );
+        assert!(at.with_tz(Some("Mars/Olympus")).is_err());
+        let every = parse_trigger(Some("6h"), None, None, false, None).unwrap();
+        assert!(every.with_tz(Some("UTC")).is_err());
+        assert!(Trigger::Webhook.with_tz(Some("UTC")).is_err());
+        assert_eq!(every.with_tz(None).unwrap(), every);
     }
 
     #[test]

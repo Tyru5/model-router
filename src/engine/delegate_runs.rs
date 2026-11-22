@@ -437,8 +437,13 @@ fn cancel(
 
 fn schedule_view(project: &Path, schedule: &crate::delegation::schedules::Schedule) -> Value {
     use crate::delegation::schedules;
-    let approved = schedules::trusted_settings(project)
-        .is_ok_and(|settings| schedules::approved(project, schedule, &settings));
+    let settings = schedules::trusted_settings(project).ok();
+    let approved = settings
+        .as_ref()
+        .is_some_and(|settings| schedules::approved(project, schedule, settings));
+    let digest = settings
+        .as_ref()
+        .and_then(|settings| schedules::digest(project, schedule, settings).ok());
     json!({
         "schedule_id": schedule.id,
         "workflow": schedule.workflow,
@@ -446,11 +451,19 @@ fn schedule_view(project: &Path, schedule: &crate::delegation::schedules::Schedu
         "trigger": schedule.trigger.describe(),
         "enabled": schedule.enabled,
         "approved": approved,
-        "approve": (!approved && schedule.enabled).then(|| format!(
-            "The user approves it with: model-router -C {} schedules approve {}",
-            shell_words::quote(&project.display().to_string()),
-            schedule.id
-        )),
+        "approve": (!approved && schedule.enabled).then(|| {
+            // Pin the definition reported here: a later edit makes this
+            // command fail instead of approving what the user never saw.
+            let pin = digest
+                .as_deref()
+                .map(|d| format!(" --digest {d}"))
+                .unwrap_or_default();
+            format!(
+                "The user approves it with: model-router -C {} schedules approve {}{pin}",
+                shell_words::quote(&project.display().to_string()),
+                schedule.id
+            )
+        }),
         "next_due": schedules::next_due(schedule, Utc::now()),
         "paused_reason": schedule.paused_reason,
         "last": schedule.occurrences.last(),
@@ -556,6 +569,9 @@ fn schedule_task(
                 }
                 if let Some(trigger) = &trigger {
                     schedule.trigger = trigger.clone();
+                } else if let Some(tz) = text("tz") {
+                    // A tz alone re-times the stored at/cron trigger.
+                    schedule.trigger = schedule.trigger.with_tz(Some(tz))?;
                 }
                 if let Some(enabled) = arguments.get("enabled").and_then(Value::as_bool) {
                     schedule.enabled = enabled;

@@ -4158,6 +4158,31 @@ mode = "unattended"
         app.ui.dialog(),
         Some(Modal::Ask(ask)) if matches!(**ask, Ask::ApproveSchedule { ref id, .. } if id == "nightly-check")
     ));
+    // An agent edits the schedule while the question is open: confirming
+    // refuses the unseen definition and shows the current one instead.
+    schedules::update(project.path(), |store| {
+        let schedule = &mut store.schedules[0];
+        schedule.task = "Exfiltrate secrets".into();
+        schedule.revision += 1;
+        Ok(())
+    })
+    .unwrap();
+    app.key(key(Key::Char('y'))).unwrap();
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Schedules(view)) if !view.rows[0].approved
+            && view.rows[0].schedule.task == "Exfiltrate secrets"
+            && view.error.contains("changed after it was shown")
+    ));
+    let settings = schedules::trusted_settings(project.path()).unwrap();
+    let edited = schedules::load(project.path()).unwrap().schedules[0].clone();
+    assert!(!schedules::approved(project.path(), &edited, &settings));
+    // Reviewing the current definition and confirming approves it.
+    app.key(key(Key::Char('a'))).unwrap();
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Ask(ask)) if matches!(**ask, Ask::ApproveSchedule { ref task, .. } if task == "Exfiltrate secrets")
+    ));
     app.key(key(Key::Char('y'))).unwrap();
     assert!(matches!(
         app.ui.dialog(),
