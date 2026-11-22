@@ -305,11 +305,18 @@ const SAMPLE_ROUTED: &str = "model-router-sample";
 fn flag_uses(harness: &str) -> Result<Vec<FlagUse>> {
     let temp = tempfile::tempdir()?;
     let prompt_file = temp.path().join("prompt.md");
+    // A delegating launch, so the delegation flags are probed too.
+    let mcp = adapters::McpLaunch {
+        program: temp.path().join("mr"),
+        sock: temp.path().join("orch.sock"),
+        token_file: temp.path().join("orch.token"),
+    };
     let paths = ContextPaths {
         workspace: temp.path(),
         attempt_dir: temp.path(),
         prompt_file: &prompt_file,
         handoff_file: &prompt_file,
+        mcp: Some(&mcp),
     };
     let mut uses: Vec<FlagUse> = vec![];
     let routes = crate::harness::get(harness).is_some_and(|spec| spec.routing.injects());

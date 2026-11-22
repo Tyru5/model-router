@@ -197,6 +197,15 @@ pub struct Attempt {
     /// A fan-out candidate attempt's own Git worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<PathBuf>,
+    /// Tasks a delegating stage's attempt started; see `delegation`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<crate::delegation::records::TaskState>,
+    /// A delegating attempt's wake turns after its first process.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turns: Vec<crate::delegation::records::Turn>,
+    /// Runs this attempt's agent launched (`run_launch`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launched_runs: Vec<crate::delegation::records::LaunchedRun>,
 }
 impl Attempt {
     /// The recorded process group, with its identity.
@@ -237,8 +246,35 @@ pub struct StageState {
     /// stage reused without running; see `history::fork`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherited: Option<PathBuf>,
+    /// Candidates of fan-out rounds that a rewind discarded, oldest first.
+    /// Kept so their spend still counts toward reports and budgets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discarded: Vec<CandidateState>,
 }
 impl StageState {
+    /// Every turn of every task the stage's attempts delegated.
+    pub fn task_turns(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &crate::delegation::records::TaskState,
+            &crate::delegation::records::TaskTurn,
+        ),
+    > {
+        self.attempts
+            .iter()
+            .flat_map(|a| &a.tasks)
+            .flat_map(|t| t.turns.iter().map(move |turn| (t, turn)))
+    }
+    /// Every fan-out candidate attempt with its candidate: the current
+    /// round's first, in order, then discarded rounds'.
+    pub fn candidate_attempts(&self) -> impl Iterator<Item = (&CandidateState, &Attempt)> {
+        self.fan_out
+            .iter()
+            .flat_map(|f| &f.candidates)
+            .chain(&self.discarded)
+            .flat_map(|c| c.attempts.iter().map(move |a| (c, a)))
+    }
     /// The attempt whose router checks stand for the stage: the latest one,
     /// or for a fan-out stage whose winner reached the workspace, that
     /// candidate's latest one, since candidates run the checks and the
@@ -354,6 +390,16 @@ pub struct Run {
     pub adapters: BTreeMap<String, CustomAdapter>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, Provider>,
+    /// The named delegates the workflow's stages may use, snapshotted at
+    /// creation so a replay never reads the current config's.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub delegates: BTreeMap<String, crate::delegation::Delegate>,
+    /// The run and stage attempt whose agent launched this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launched_by: Option<LaunchedBy>,
+    /// Who created the run: the user, an agent, or a schedule.
+    #[serde(default, skip_serializing_if = "CreationSource::is_user")]
+    pub creation_source: CreationSource,
     pub stages: Vec<StageState>,
     /// Groups from discarded fan-out rounds, awaiting cleanup under both locks.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -390,6 +436,39 @@ pub struct Run {
     /// The fan-out candidate whose prompt `prompt` renders.
     #[serde(skip)]
     pub(super) view: Option<usize>,
+    /// The bridge of a delegating stage's next launch, which `prepare`
+    /// renders into its invocation and sandbox.
+    #[serde(skip)]
+    pub(super) mcp: Option<crate::adapters::McpLaunch>,
+}
+
+/// The parent that launched a run with `run_launch`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchedBy {
+    pub run: String,
+    pub stage: String,
+    pub attempt: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreationSource {
+    #[default]
+    User,
+    Agent,
+    Schedule,
+}
+impl CreationSource {
+    pub fn is_user(&self) -> bool {
+        *self == Self::User
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Agent => "agent",
+            Self::Schedule => "schedule",
+        }
+    }
 }
 
 /// Where a fork started: the source run, the stage it continues from, that

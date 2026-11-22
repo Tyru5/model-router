@@ -62,6 +62,8 @@ pub(super) struct App {
     pub(super) starting: bool,
     /// Background work and the channel its results arrive on.
     pub(super) tasks: Tasks,
+    /// Launched runs an agent cancelled before this session adopted them.
+    pub(super) cancel_on_adopt: std::collections::HashSet<String>,
 }
 
 /// Git facts for the project, refreshed in the background.
@@ -132,6 +134,7 @@ impl App {
             repo: Repo::new(repo),
             starting: false,
             tasks: Tasks::default(),
+            cancel_on_adopt: Default::default(),
         }
     }
     pub(super) fn choose_theme(&mut self) {
@@ -208,6 +211,26 @@ impl App {
             "{holder} is using this folder. It is not a Git repository, so a second run cannot get its own worktree; wait for the first to finish"
         );
         Ok((Placement::WorktreeFromHead, Some(holder)))
+    }
+    /// Drives `run` (one an agent launched or retried) in this session
+    /// without moving focus off the run being watched.
+    pub(super) fn drive_in_background(&mut self, run: Run) -> Result<()> {
+        let watched = self.session.focused().map(|slot| slot.run.id.clone());
+        match self.session.runs.iter().position(|s| s.run.id == run.id) {
+            Some(index) => {
+                self.session.focus(index);
+                if let Some(slot) = self.session.focused_mut() {
+                    slot.run = run;
+                }
+            }
+            None => self.session.adopt(run),
+        }
+        let started = self.start_driver();
+        if let Some(id) = watched {
+            self.session.focus_run(&id);
+        }
+        self.runs.stale = true;
+        started
     }
     pub(super) fn start_driver(&mut self) -> Result<()> {
         let slot = self.session.focused_mut().context("No run selected")?;

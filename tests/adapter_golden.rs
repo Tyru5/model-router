@@ -349,6 +349,7 @@ fn adapter_output_matches_golden_files() {
         attempt_dir: &attempt,
         prompt_file: &prompt_file,
         handoff_file: &handoff_file,
+        mcp: None,
     };
     let configured = providers();
     let none = BTreeMap::new();
@@ -455,5 +456,58 @@ fn adapter_output_matches_golden_files() {
         }
     }
     check("custom", &Value::Object(out), &mut failures);
+
+    // A delegating stage's launches carry the bridge; every other launch
+    // above is byte-identical with or without delegation.
+    let mcp = adapters::McpLaunch {
+        program: dir.path().join("bin/model-router"),
+        sock: dir.path().join("orch/orch-0.sock"),
+        token_file: dir.path().join("orch/orch-0.token"),
+    };
+    let delegating = ContextPaths {
+        mcp: Some(&mcp),
+        ..paths
+    };
+    let delegator = BTreeMap::from([(
+        "delegator".to_string(),
+        CustomAdapter {
+            command: "delegator-cli".into(),
+            args: vec!["run".into(), "{prompt_file}".into()],
+            session: Some(model_router::config::CustomSession {
+                assign: Some("--session-id".into()),
+                reported: false,
+            }),
+            follow_up_args: Some(vec![
+                "resume".into(),
+                "{session}".into(),
+                "--mcp={mcp_config}".into(),
+            ]),
+            mcp_config_args: Some(vec!["--mcp-config".into(), "{mcp_config}".into()]),
+            ..CustomAdapter::default()
+        },
+    )]);
+    let mut out = serde_json::Map::new();
+    for harness in ["claude", "codex", "opencode", "delegator"] {
+        for mode in [Mode::Unattended, Mode::Interactive] {
+            if harness == "delegator" && mode == Mode::Interactive {
+                continue;
+            }
+            let stage = Stage {
+                harness: harness.into(),
+                mode,
+                model: if harness == "delegator" {
+                    String::new()
+                } else {
+                    "m-1".into()
+                },
+                ..Stage::default()
+            };
+            out.insert(
+                format!("{harness}/{}", mode.label()),
+                record(&stage, &delegator, &configured, &delegating, &tmp),
+            );
+        }
+    }
+    check("delegation", &Value::Object(out), &mut failures);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

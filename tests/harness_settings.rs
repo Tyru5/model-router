@@ -45,6 +45,7 @@ fn native_settings_reach_both_execution_modes_and_survive_reload() {
         attempt_dir: dir.path(),
         prompt_file: dir.path(),
         handoff_file: dir.path(),
+        mcp: None,
     };
     for (harness, key, value, flag, argument) in cases {
         for mode in [Mode::Unattended, Mode::Interactive] {

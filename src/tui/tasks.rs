@@ -83,12 +83,110 @@ pub(super) enum Msg {
         harness: String,
         result: Result<super::harnesses::TestOutcome, String>,
     },
+    /// A run an agent launched (or retried) for this session to drive in the
+    /// background, or one to cancel; applies after a project switch too.
+    Hosted(Result<Hosted, String>),
     /// Routing stats of `project`; `ticket` is the Stats dialog's wait, if any.
     Stats {
         project: PathBuf,
         ticket: Option<u64>,
         result: Result<Arc<Stats>, String>,
     },
+}
+
+/// What the session's run host asks of the app.
+pub(super) enum Hosted {
+    Drive(Box<crate::engine::Run>),
+    Cancel(String),
+}
+
+/// The TUI as the run host: launched runs join this session and are driven
+/// in the background, without taking focus.
+pub(super) struct TuiHost {
+    spawner: std::sync::Mutex<Spawner>,
+    /// Runs this session was asked to drive or retry: the only ones its
+    /// `cancel` answers for.
+    driven: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+impl TuiHost {
+    pub(super) fn new(spawner: Spawner) -> Self {
+        Self {
+            spawner: std::sync::Mutex::new(spawner),
+            driven: Default::default(),
+        }
+    }
+    fn claim(&self, id: &str) {
+        self.driven
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_owned());
+    }
+}
+impl crate::engine::RunHost for TuiHost {
+    fn drive(&self, project: &std::path::Path, id: &str) -> anyhow::Result<()> {
+        self.claim(id);
+        let (project, id) = (project.to_path_buf(), id.to_owned());
+        self.spawner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spawn(
+                "Adopting a launched run stopped unexpectedly.",
+                move || {
+                    crate::engine::load(&project, &id)
+                        .map(|run| Hosted::Drive(Box::new(run)))
+                        .map_err(|e| format!("{e:#}"))
+                },
+                Msg::Hosted,
+            );
+        Ok(())
+    }
+    fn retry(&self, project: &std::path::Path, id: &str) -> anyhow::Result<()> {
+        self.claim(id);
+        let (project, id) = (project.to_path_buf(), id.to_owned());
+        self.spawner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spawn(
+                "Retrying a launched run stopped unexpectedly.",
+                move || {
+                    crate::engine::command(
+                        &project,
+                        &id,
+                        None,
+                        crate::engine::Cmd::Retry {
+                            interactive: false,
+                            model: None,
+                        },
+                    )
+                    .map(|run| Hosted::Drive(Box::new(run)))
+                    .map_err(|e| format!("{e:#}"))
+                },
+                Msg::Hosted,
+            );
+        Ok(())
+    }
+    /// Cancels a run this session drives; the app holds the request until
+    /// the run is adopted if it arrives first. Any other run is not ours.
+    fn cancel(&self, id: &str) -> bool {
+        if !self
+            .driven
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(id)
+        {
+            return false;
+        }
+        let id = id.to_owned();
+        self.spawner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spawn(
+                "Cancelling a launched run stopped unexpectedly.",
+                move || Ok(Hosted::Cancel(id)),
+                Msg::Hosted,
+            );
+        true
+    }
 }
 
 /// A fresh number identifying a task's result, e.g. for the dialog waiting on it.
@@ -203,6 +301,37 @@ impl App {
                     .and_then(|started| self.begin(*started));
                 if let Err(error) = started {
                     self.ui.error(format!("{error:#}"));
+                }
+            }
+            Msg::Hosted(result) => {
+                self.ui.redraw = true;
+                match result {
+                    Ok(Hosted::Drive(run)) => {
+                        // Cancelled before it was adopted: it never starts.
+                        let result = if self.cancel_on_adopt.remove(&run.id) {
+                            self.runs.stale = true;
+                            crate::engine::cancel_pending(
+                                &run.project,
+                                &run.id,
+                                "Cancelled by the agent that launched it",
+                            )
+                            .map(drop)
+                        } else {
+                            self.drive_in_background(*run)
+                        };
+                        if let Err(error) = result {
+                            self.ui.error(format!("{error:#}"));
+                        }
+                    }
+                    Ok(Hosted::Cancel(id)) => {
+                        match self.session.runs.iter().find(|s| s.run.id == id) {
+                            Some(slot) => slot.cancel.store(true, Ordering::Relaxed),
+                            None => {
+                                self.cancel_on_adopt.insert(id);
+                            }
+                        }
+                    }
+                    Err(error) => self.ui.error(error),
                 }
             }
             Msg::Changes { run, key, result } => {

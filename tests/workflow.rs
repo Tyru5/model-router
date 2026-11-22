@@ -321,6 +321,7 @@ fn adapter_contracts_keep_prompt_and_models_literal() {
         attempt_dir: dir.path(),
         prompt_file: &path,
         handoff_file: &path,
+        mcp: None,
     };
     for harness in model_router::config::BUILTINS {
         for mode in [Mode::Unattended, Mode::Interactive] {
@@ -1166,13 +1167,28 @@ else:
         .unwrap()
         .path();
     let id = directory.file_name().unwrap().to_str().unwrap();
-    let saved = engine::load(dir.path(), id).unwrap();
-    let attempt = if fan_out {
-        &saved.stages[0].fan_out.as_ref().unwrap().candidates[0].attempts[0]
-    } else {
-        &saved.stages[0].attempts[0]
+    // The check wrote its marker before the router saved its group; wait
+    // for the save rather than racing it.
+    let recorded = |saved: &engine::Run| {
+        let attempt = if fan_out {
+            &saved.stages[0].fan_out.as_ref().unwrap().candidates[0].attempts[0]
+        } else {
+            &saved.stages[0].attempts[0]
+        };
+        attempt.process_group
     };
-    assert_eq!(attempt.process_group, Some(pgid));
+    let mut group = None;
+    while started.elapsed() < Duration::from_secs(10) {
+        group = engine::load(dir.path(), id)
+            .ok()
+            .and_then(|saved| recorded(&saved));
+        if group == Some(pgid) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(group, Some(pgid));
+    let saved = engine::load(dir.path(), id).unwrap();
     cleanup.router.kill().unwrap();
     cleanup.router.wait().unwrap();
     assert!(

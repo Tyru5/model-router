@@ -178,6 +178,7 @@ fn format_of(harness: &str) -> String {
         attempt_dir: dir.path(),
         prompt_file: dir.path(),
         handoff_file: dir.path(),
+        mcp: None,
     };
     let stage = Stage {
         harness: harness.into(),
@@ -211,6 +212,7 @@ fn kind_of(harness: &str) -> OutputKind {
         attempt_dir: dir.path(),
         prompt_file: dir.path(),
         handoff_file: dir.path(),
+        mcp: None,
     };
     let kinds: Vec<_> = [Mode::Unattended, Mode::Interactive]
         .into_iter()
@@ -373,7 +375,7 @@ fn doctor_reports_versions_and_flags_from_help_without_running_a_model() {
             ("--version", "2.1.289 (Claude Code)"),
             (
                 "--help",
-                "  -p, --print       Print response and exit\n  --output-format <format>  Output format\n  --verbose  Verbose\n  --json-schema <schema>  Schema\n  --session-id <uuid>  Session\n  -r, --resume [value]  Resume\n  --model <model>   Model\n  --effort <level>  Effort\n  --permission-mode <mode>  Mode",
+                "  -p, --print       Print response and exit\n  --output-format <format>  Output format\n  --verbose  Verbose\n  --json-schema <schema>  Schema\n  --session-id <uuid>  Session\n  -r, --resume [value]  Resume\n  --model <model>   Model\n  --effort <level>  Effort\n  --permission-mode <mode>  Mode\n  --mcp-config <configs...>  MCP servers\n  --allowedTools, --allowed-tools <tools...>  Allowed tools",
             ),
         ],
     );

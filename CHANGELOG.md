@@ -7,6 +7,54 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ## [Unreleased]
 
+### Added
+
+- Delegation: a stage with `[workflows.stages.delegation]` gives its agent
+  the router's MCP tools (`delegate_task`, `task_status`, `task_wait`,
+  `task_send`, `task_cancel`, `task_apply`, `run_*`, `schedule_*`) through
+  `mr __mcp-bridge` and a per-turn Unix socket and token. Tasks run on named
+  `[delegates.*]` or allowlisted harness/model/provider targets, in their own
+  OS sandbox (`shared` read-only or `worktree`), never above the parent's
+  privilege ceiling. Finished tasks wake the parent with a follow-up turn.
+  Worktree tasks return sealed patches the parent applies with `task_apply`.
+  Parents: Claude Code, Codex, OpenCode, and custom adapters with
+  `mcp_config_args`; interactive stages too. Delegates need
+  `model-router trust`. See `docs/delegation.md`.
+- Agent-launched runs (`run_launch`) are driven by the TUI or `serve`; the
+  CLI leaves them pending for `model-router resume`.
+- Schedules: `schedule_task` writes `.model-router/schedules.json`; a
+  schedule fires only after `mr schedules approve ID`. `mr schedules
+  list|approve|pause|enable|delete|tick`; `serve` fires due schedules and
+  accepts `POST /schedules/<id>/trigger`.
+- Reports, previews, history, and the Runs page show tasks, wake turns, and
+  their cost.
+
+### Security
+
+- Sandboxed stages can no longer make the router run commands outside the
+  sandbox through Git. A `workspace-write` stage could write `.git/config`
+  (an fsmonitor or filter command), add a hook, or swap in its own `.git`,
+  and the router's unsandboxed `git add -A` after the stage would run it.
+  Git config, `config.worktree`, and hooks are now read-only in every
+  sandbox mode, the `.git` directory (or a linked worktree's `.git` file and
+  `commondir`) cannot be replaced, a stage refuses to start when a Git config
+  file or include target it could write would be read, a `workspace-write`
+  stage refuses to start while its Git config or hooks entry is a symbolic
+  link it could replace, and the router's own Git commands disable fsmonitor
+  and hooks.
+
+### Fixed
+
+- Handoff repair saves the run before its follow-up starts, so `run.json` no
+  longer names the finished harness's process group while the follow-up
+  runs (a crash then could leave a stale group recorded).
+- Budgets now count fan-out candidate spend. `cost::stage_totals` summed only
+  a stage's own attempts, so run and stage caps never saw candidate spend, and
+  `model-router cost` left candidates out of its history. A repair rewind past
+  a fan-out stage also dropped the round's candidates from `run.json`, and
+  their spend with them; they are now kept as the stage's `discarded`
+  candidates and count in budgets, `report`, and `cost`.
+
 ## [0.2.1] - 2026-11-21
 
 ### Added

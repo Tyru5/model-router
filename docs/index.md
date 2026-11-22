@@ -14,6 +14,7 @@
 | [adapters.md](adapters.md) | Per-harness flag references, adding a harness, doctor internals, parser fixtures. |
 | [development.md](development.md) | Offline demo, tests and smoke tests, CI, releases, Amp orbs. |
 | [verification.md](verification.md) | Project verification log: what was checked and how. |
+| [delegation.md](delegation.md) | Delegation: a stage's agent delegating tasks to other harnesses, launching runs, and scheduling work; tools, lifecycle, isolation, limits, records. |
 | [related.md](related.md) | Comparable open-source tools, what they do differently, and ideas worth borrowing. |
 | [spec.md](spec.md) | Build specification and acceptance checks. |
 | [design-interview.md](design-interview.md) | Confirmed product decisions. |

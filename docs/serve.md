@@ -66,6 +66,17 @@ read the handoff with `get_handoff`, then `confirm_stage` or `retry_stage`.
 When it is `failed`, `blocked`, or `cancelled`, `retry_stage` (optionally with
 another `model`) reruns the current stage; earlier changes are kept.
 
+## Delegation hosts
+
+`serve` drives runs that a delegating stage's agent launches (`run_launch`)
+and that schedules fire, like runs its own clients start. It fires the
+server project's approved, due schedules every 30 s, and with `--http` adds
+`POST /schedules/<id>/trigger` (bearer token, like every route) for webhook
+schedules: `200 {"result": {"runs": [...]}}`, or `409` when the schedule is
+not an approved, enabled webhook schedule. `run_status` reports each
+delegating stage's task counts, and `get_handoff` includes its tasks'
+handoffs. See [delegation.md](delegation.md).
+
 ## Concurrency
 
 Each run is driven on its own thread, so several runs proceed at once. As in

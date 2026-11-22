@@ -337,6 +337,42 @@ optionally opens a draft PR with `gh`.
 Options: [configuration.md](configuration.md#ship). TUI: **Ship options**
 field (TOML).
 
+## Delegation
+
+A stage with `delegation` lets its agent hand self-contained tasks to other
+harnesses and models through the router, mid-run, instead of the workflow
+naming them in advance: a second-opinion review on another model, an
+independent investigation, an isolated implementation.
+
+```toml
+[delegates.codex-review]
+harness = "codex"
+model = "gpt-6.2-sol"
+
+[[workflows.stages]]
+id = "implement"
+role = "implementation"
+harness = "claude"
+[workflows.stages.delegation]
+delegates = ["codex-review"]
+```
+
+- The agent gets MCP tools (`orchestrator_capabilities`, `delegate_task`,
+  `task_status`, `task_wait`, `task_cancel`, `task_send`, `task_apply`).
+- Tasks see only the brief they are given, run unattended in their own OS
+  sandbox, and return a handoff. `shared` tasks are read-only in the stage's
+  checkout; `worktree` tasks work in their own worktree, and their sealed
+  patch reaches the checkout only through `task_apply`.
+- When the stage's turn ends with results unread, the router resumes its
+  session with the results once every task is finished or waiting on a
+  question; the stage's checks run after its last turn.
+- With `runs = true` the agent can launch and manage runs; with
+  `schedules = true` it can create schedules you approve
+  (`model-router schedules approve ID`).
+
+A delegating stage always runs alone. See [delegation.md](delegation.md) for
+the tools, limits, and safety rules.
+
 ## Budgets
 
 Workflow and stage `budget` caps stop a run before its next stage. See

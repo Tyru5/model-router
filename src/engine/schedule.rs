@@ -323,6 +323,13 @@ pub(super) fn schedule(
                             emit(Event::State(Box::new(run.clone())));
                             continue;
                         }
+                        // A delegating stage runs alone in its own owner loop.
+                        Launch::Stage(index) if run.workflow.stages[index].delegation.is_some() => {
+                            run.cursor = index;
+                            super::delegate::drive_stage(run, cancel, None, emit)?;
+                            emit(Event::State(Box::new(run.clone())));
+                            continue;
+                        }
                         Launch::Stage(index) => {
                             run.cursor = index;
                             match start_stage(run, emit)? {

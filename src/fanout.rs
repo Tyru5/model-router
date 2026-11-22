@@ -10,11 +10,11 @@ use anyhow::{Context, Result, ensure};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
 };
 
 fn git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<String> {
-    let mut command = Command::new("git");
+    let mut command = crate::snapshot::git_command();
     command.args(args).current_dir(dir).stdin(Stdio::null());
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
@@ -45,7 +45,7 @@ pub fn prefix(workspace: &Path) -> String {
 /// Commits snapshot `tree` (parent HEAD, if any) under `reference`, so a
 /// worktree can check it out. Returns the commit.
 pub fn base_commit(workspace: &Path, tree: &str, reference: &str) -> Result<String> {
-    let mut command = Command::new("git");
+    let mut command = crate::snapshot::git_command();
     command
         .args(["commit-tree", tree, "-m", "model-router fan-out base"])
         .current_dir(workspace)
@@ -128,7 +128,7 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
 pub fn write_patch(dir: &Path, from: &str, to: &str, path: &Path) -> Result<()> {
     // The candidate could write its attempt directory.
     let file = storage::create_fresh(path)?;
-    let output = Command::new("git")
+    let output = crate::snapshot::git_command()
         .args([
             "--no-pager",
             "diff",
@@ -260,7 +260,7 @@ pub fn check(
     })
 }
 
-fn is_plain_repo_path(file: &str) -> bool {
+pub(crate) fn is_plain_repo_path(file: &str) -> bool {
     !file.is_empty()
         && Path::new(file).components().all(|c| match c {
             std::path::Component::Normal(part) => {
@@ -288,7 +288,7 @@ fn restore(top: &Path, tree: &str, files: &[String], scratch: &Path) -> Result<(
     git(top, Some(&index), &["read-tree", tree])?;
     let mut present = std::collections::HashSet::new();
     for chunk in plain_files.chunks(512) {
-        let mut command = Command::new("git");
+        let mut command = crate::snapshot::git_command();
         command
             .arg("--literal-pathspecs")
             .args(["ls-files", "-z", "--"])
@@ -317,7 +317,7 @@ fn restore(top: &Path, tree: &str, files: &[String], scratch: &Path) -> Result<(
             stdin_bytes.extend_from_slice(file.as_bytes());
             stdin_bytes.push(0);
         }
-        let mut child = Command::new("git")
+        let mut child = crate::snapshot::git_command()
             .args(["checkout-index", "-f", "-z", "--stdin"])
             .current_dir(top)
             .env("GIT_INDEX_FILE", &index)

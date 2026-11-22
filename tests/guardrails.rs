@@ -691,6 +691,74 @@ print(json.dumps({"type": "result", "total_cost_usd": 2.0, "usage": {"input_toke
     );
 }
 
+/// Fan-out candidates' spend counts toward budgets, reports, and history,
+/// including the candidates of a round that a repair rewind discarded.
+#[test]
+fn fan_out_candidate_spend_counts_toward_budgets_after_a_rewind() {
+    let dir = common::tempdir();
+    init_git(dir.path());
+    let mut implement = stage("implement", Role::Implementation);
+    implement.fan_out = Some(FanOut {
+        candidates: ["lines-1", "lines-2"]
+            .into_iter()
+            .map(|model| Candidate {
+                harness: "costly".into(),
+                provider: "implement".into(),
+                model: model.into(),
+                ..Candidate::default()
+            })
+            .collect(),
+        judge: "auto".into(),
+    });
+    let mut review = stage("review", Role::Review);
+    review.extra_args = vec!["--review-fail-until".into(), "1".into()];
+    let mut wf = Workflow::new("CostlyFanOut", vec![implement, review]);
+    wf.max_repair_passes = 1;
+    wf.budget = Budget {
+        max_usd: Some(3.5),
+        max_tokens: None,
+        on_exceed: BudgetAction::Stop,
+    };
+    let mut settings = common::settings(&wf);
+    let mut costly = settings.adapters["mock"].clone();
+    costly.output = Some(CustomOutput::ClaudeStream);
+    // Stage extra arguments stay with the stage's own harness.
+    costly
+        .args
+        .extend(["--write-file", "out.txt", "--cost", "1"].map(String::from));
+    settings.adapters.insert("costly".into(), costly);
+    let mut run = Run::create(dir.path(), &settings, &wf, "costly".into(), false).unwrap();
+    // Round one ($2) passes the gate; the review's repair rewinds, and
+    // round two brings the run to $4 before the review runs again.
+    assert_eq!(drive(&mut run), Action::Stopped);
+    let error = run.error.clone().unwrap();
+    assert!(
+        error.starts_with("Budget exceeded: $4.00 of $3.50 (reported)"),
+        "{error}"
+    );
+    assert_eq!(common::count(dir.path(), "review"), 1);
+    let saved = engine::load(dir.path(), &run.id).unwrap();
+    assert_eq!(saved.stages[0].discarded.len(), 2);
+    assert_eq!(saved.stages[0].fan_out.as_ref().unwrap().round, 2);
+    // The stage's own attempt in each round reports nothing.
+    let pricing = cost::Pricing::default();
+    let spent = "$4.00 (reported) · cost unknown for 2 of 6 attempts";
+    assert_eq!(cost::stage_totals(&saved, &pricing)[0].text(), spent);
+    let report = model_router::report::build_with(&saved, &pricing);
+    assert_eq!(report.stages[0].usage.cost.text(), spent);
+    assert!(report.usage.cost.text().starts_with("$4.00 (reported)"));
+    let summary = cost::aggregate([&saved], None, &pricing);
+    // Both rounds, under the candidates' own harness and models.
+    let rows: Vec<_> = summary
+        .rows
+        .iter()
+        .filter(|r| r.harness == "costly")
+        .map(|r| (r.model.as_str(), r.cost.text()))
+        .collect();
+    let two = "$2.00 (reported)".to_owned();
+    assert_eq!(rows, [("lines-1", two.clone()), ("lines-2", two)]);
+}
+
 #[test]
 fn apply_detected_harnesses_clears_models_and_adapts_unavailable_harnesses() {
     let mut wf = Workflow::default();

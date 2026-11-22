@@ -5,7 +5,6 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
-    process::Command,
 };
 
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
@@ -295,6 +294,90 @@ pub fn repo_info(project: &Path) -> Option<RepoInfo> {
     })
 }
 
+/// Opens `relative` inside `base` for reading, one component at a time
+/// with `O_NOFOLLOW`, and requires a regular file: a link swapped in for any
+/// directory on the way cannot redirect the read.
+pub fn open_beneath(base: &Path, relative: &Path) -> Result<File> {
+    use std::ffi::CString;
+    use std::os::unix::{ffi::OsStrExt, io::FromRawFd};
+    let parts: Vec<&std::ffi::OsStr> = relative
+        .components()
+        .map(|c| match c {
+            std::path::Component::Normal(part) => Ok(part),
+            _ => Err(anyhow::anyhow!(
+                "{} is not a plain relative path",
+                relative.display()
+            )),
+        })
+        .collect::<Result<_>>()?;
+    let (last, dirs) = parts
+        .split_last()
+        .with_context(|| format!("{} names no file", relative.display()))?;
+    let base_c = CString::new(base.as_os_str().as_bytes())?;
+    // SAFETY: a valid NUL-terminated path; the result is checked.
+    let mut fd = unsafe {
+        libc::open(
+            base_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    ensure!(
+        fd >= 0,
+        "Open {}: {}",
+        base.display(),
+        std::io::Error::last_os_error()
+    );
+    let close = |fd: i32| {
+        // SAFETY: `fd` was opened above and is closed once.
+        unsafe { libc::close(fd) };
+    };
+    for dir in dirs {
+        let name = CString::new(dir.as_bytes())?;
+        // SAFETY: `fd` is an open directory; `name` is NUL-terminated.
+        let next = unsafe {
+            libc::openat(
+                fd,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        let error = std::io::Error::last_os_error();
+        close(fd);
+        ensure!(
+            next >= 0,
+            "Open {} in {}: {error}",
+            relative.display(),
+            base.display()
+        );
+        fd = next;
+    }
+    let name = CString::new(last.as_bytes())?;
+    // SAFETY: as above.
+    let file = unsafe {
+        libc::openat(
+            fd,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    let error = std::io::Error::last_os_error();
+    close(fd);
+    ensure!(
+        file >= 0,
+        "Open {} in {}: {error}",
+        relative.display(),
+        base.display()
+    );
+    // SAFETY: `file` is an open descriptor this File now owns.
+    let file = unsafe { File::from_raw_fd(file) };
+    ensure!(
+        file.metadata()?.is_file(),
+        "{} is not a regular file",
+        relative.display()
+    );
+    Ok(file)
+}
+
 pub fn git(project: &Path, args: &[&str]) -> Result<String> {
     git_with(project, args, false)
 }
@@ -304,7 +387,7 @@ pub fn git_readonly(project: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn git_with(project: &Path, args: &[&str], no_optional_locks: bool) -> Result<String> {
-    let mut command = Command::new("git");
+    let mut command = crate::snapshot::git_command();
     command.args(args).current_dir(project);
     if no_optional_locks {
         command.env("GIT_OPTIONAL_LOCKS", "0");
@@ -381,6 +464,7 @@ pub fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[cfg(unix)]
     #[test]

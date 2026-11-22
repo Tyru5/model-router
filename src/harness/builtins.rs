@@ -28,6 +28,7 @@ pub const SPECS: &[HarnessSpec] = &[
                 Part::Provider,
                 Part::Effort,
                 Part::Extra,
+                Part::Mcp,
                 Part::Prompt,
             ],
             interactive: &[
@@ -35,6 +36,7 @@ pub const SPECS: &[HarnessSpec] = &[
                 Part::Provider,
                 Part::Effort,
                 Part::Extra,
+                Part::Mcp,
                 Part::Prompt,
             ],
         },
@@ -77,6 +79,7 @@ pub const SPECS: &[HarnessSpec] = &[
                 Part::Provider,
                 Part::Effort,
                 Part::Extra,
+                Part::Mcp,
                 Part::Args(&["{session}"]),
                 Part::Prompt,
             ],
@@ -93,6 +96,7 @@ pub const SPECS: &[HarnessSpec] = &[
             since: [0, 41, 0],
             delivery: SchemaDelivery::File("output-schema.json"),
         }),
+        mcp: Some(McpInjection::CodexConfig),
         settings: &[
             Setting {
                 key: "sandbox",
@@ -149,9 +153,16 @@ pub const SPECS: &[HarnessSpec] = &[
                 Part::Model,
                 Part::Effort,
                 Part::Extra,
+                Part::Mcp,
                 Part::Prompt,
             ],
-            interactive: &[Part::Model, Part::Effort, Part::Extra, Part::Prompt],
+            interactive: &[
+                Part::Model,
+                Part::Effort,
+                Part::Extra,
+                Part::Mcp,
+                Part::Prompt,
+            ],
         },
         prompt: Modes {
             unattended: Prompt::Stdin,
@@ -192,6 +203,7 @@ pub const SPECS: &[HarnessSpec] = &[
                 Part::Model,
                 Part::Effort,
                 Part::Extra,
+                Part::Mcp,
                 Part::Prompt,
             ],
             prompt: Prompt::Stdin,
@@ -209,6 +221,7 @@ pub const SPECS: &[HarnessSpec] = &[
         // Choices checked against `claude --help` 2.1.318 on 2026-11-05:
         // acceptEdits, auto, bypassPermissions, manual, dontAsk, plan. Older
         // releases called `manual` `default`.
+        mcp: Some(McpInjection::ClaudeConfigFile),
         settings: &[Setting {
             key: "permission_mode",
             label: "Permission mode",
@@ -305,6 +318,7 @@ pub const SPECS: &[HarnessSpec] = &[
         // Provider API keys by default; plan logins are opt-in.
         billing: Billing::Api,
         structured: None,
+        mcp: None,
         settings: &[],
         read_only: None,
         catalog: CatalogSource::PiList,
@@ -354,6 +368,7 @@ pub const SPECS: &[HarnessSpec] = &[
         // As Pi.
         billing: Billing::Api,
         structured: None,
+        mcp: None,
         settings: &[Setting {
             key: "approval_mode",
             label: "Approval mode",
@@ -412,6 +427,7 @@ pub const SPECS: &[HarnessSpec] = &[
         // Cursor plan.
         billing: Billing::Subscription,
         structured: None,
+        mcp: None,
         settings: &[Setting {
             key: "sandbox",
             label: "Sandbox",
@@ -463,6 +479,7 @@ pub const SPECS: &[HarnessSpec] = &[
         // Google account sign-in is the default login.
         billing: Billing::Subscription,
         structured: None,
+        mcp: None,
         settings: &[Setting {
             key: "approval_mode",
             label: "Approval mode",
@@ -544,6 +561,7 @@ pub const SPECS: &[HarnessSpec] = &[
         // Provider API keys.
         billing: Billing::Api,
         structured: None,
+        mcp: Some(McpInjection::OpencodeConfig),
         settings: &[],
         read_only: None,
         catalog: CatalogSource::OpencodeModels,
@@ -620,6 +638,7 @@ pub const SPECS: &[HarnessSpec] = &[
         billing: Billing::Api,
         structured: None,
         // Unattended Aider cannot answer its confirmation prompts without this.
+        mcp: None,
         settings: &[Setting {
             key: "confirmations",
             label: "Confirmations",
@@ -690,6 +709,7 @@ pub const SPECS: &[HarnessSpec] = &[
         billing: Billing::Api,
         structured: None,
         // Goose reads its permission mode from GOOSE_MODE; `run` has no flag.
+        mcp: None,
         settings: &[Setting {
             key: "mode",
             label: "Permission mode",
@@ -746,6 +766,7 @@ pub const SPECS: &[HarnessSpec] = &[
         // Usage credits, charged per token.
         billing: Billing::Api,
         structured: None,
+        mcp: None,
         settings: &[],
         read_only: None,
         catalog: CatalogSource::Modes(&["low", "medium", "high", "ultra"]),
@@ -779,6 +800,7 @@ pub const SPECS: &[HarnessSpec] = &[
         // GitHub Copilot plan.
         billing: Billing::Subscription,
         structured: None,
+        mcp: None,
         settings: &[Setting {
             key: "tool_permissions",
             label: "Tool permissions",

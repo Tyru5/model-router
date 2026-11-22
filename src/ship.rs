@@ -1106,6 +1106,9 @@ pub fn execute(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
         terminal: None,
         handoff_source: None,
         worktree: None,
+        tasks: vec![],
+        turns: vec![],
+        launched_runs: vec![],
     });
     let reason = format!(
         "Ship attempt {number} started{}",
@@ -1146,7 +1149,9 @@ pub fn execute(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
     };
     let digest = plan.digest();
     let approved = confirmed.as_deref() == Some(approval(&digest).as_str());
-    if options.confirm && !approved {
+    // A run an agent or a schedule created never ships unconfirmed.
+    let confirm = options.confirm || !run.creation_source.is_user();
+    if confirm && !approved {
         let mut text = plan.preview();
         if confirmed.is_some() {
             text.insert_str(

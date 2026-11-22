@@ -69,6 +69,30 @@ pub struct Plan {
     /// another run's host could type into a harness outside its sandbox.
     #[serde(skip)]
     hidden: Vec<PathBuf>,
+    /// Git config and hooks (and a linked worktree's `.git` file and
+    /// `commondir`): read-only for every sandboxed stage. The router runs Git
+    /// in the workspace outside the sandbox, and Git runs commands its
+    /// config names (fsmonitor, filters, diff drivers) and hooks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub git_locked: Vec<PathBuf>,
+    /// The workspace's `.git` directory under `workspace-write`: writable,
+    /// but never renamed or replaced, so a stage cannot swap in a Git
+    /// directory of its own (bubblewrap binds it onto itself; Seatbelt
+    /// denies writes to the directory entry).
+    #[serde(skip)]
+    git_pinned: Vec<PathBuf>,
+    /// A delegating turn's own socket, token file, and bridge program:
+    /// reachable although every orchestration directory is hidden.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orch: Option<OrchAccess>,
+}
+
+/// What a delegating turn may reach of its broker.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OrchAccess {
+    pub sock: PathBuf,
+    pub token_file: PathBuf,
+    pub program: PathBuf,
 }
 
 /// Paths of one attempt.
@@ -311,6 +335,23 @@ pub fn plan_with(
             vec![]
         }
     };
+    // model-router's own config directory (trust, run and schedule
+    // approvals) is never the stage's to write: created now so it can be
+    // bound read-only, and refused as a grant.
+    if backend.is_some() {
+        let config = crate::config::config_dir();
+        let _ = fs::create_dir_all(&config);
+        let config = canonical(&config);
+        ensure!(
+            !all.iter().any(|w| w.starts_with(&config)),
+            "Stage {} cannot be sandboxed: a writable path lies inside model-router's config directory {}",
+            stage.id,
+            config.display()
+        );
+        if config.is_dir() && all.iter().any(|w| config.starts_with(w) && *w != config) {
+            protected.push(config);
+        }
+    }
     tidy(&mut protected);
     // Only paths hidden by the private /tmp need re-exposing.
     readable
@@ -322,14 +363,27 @@ pub fn plan_with(
     // Only real private directories hold sockets: a link planted at one of
     // these names (even by an earlier stage) must not hide where it leads.
     let _ = crate::process::host::socket_dir();
+    let _ = crate::delegation::broker::orch_socket_dir();
+    // Delegation sockets and token files too: only a delegating turn's own
+    // are re-exposed (`Plan::allow_orch`).
     let mut hidden: Vec<PathBuf> = crate::process::host::socket_dirs()
+        .into_iter()
+        .chain(crate::delegation::broker::orch_socket_dirs())
+        .collect::<Vec<_>>()
         .iter()
         .filter(|_| backend.is_some())
         .filter(|dir| crate::process::host::is_private_dir(dir))
         .filter_map(|dir| Some(canonical(dir.parent()?).join(dir.file_name()?)))
         .collect();
     tidy(&mut hidden);
-    Ok(Some(Plan {
+    let (mut git_pinned, mut git_locked) = if backend.is_some() {
+        git_locks(stage, mode, paths.workspace)?
+    } else {
+        (vec![], vec![])
+    };
+    tidy(&mut git_pinned);
+    tidy(&mut git_locked);
+    let plan = Plan {
         mode,
         backend,
         program,
@@ -342,7 +396,180 @@ pub fn plan_with(
         readable,
         pinned,
         hidden,
-    }))
+        git_locked,
+        git_pinned,
+        orch: None,
+    };
+    if plan.backend.is_some() {
+        refuse_writable_git_config(&plan, stage, paths.workspace, home)?;
+    }
+    Ok(Some(plan))
+}
+
+/// The Git files a sandboxed stage must not change, and (under
+/// `workspace-write`) the `.git` directory to pin: config, `config.worktree`
+/// and hooks of the workspace's Git directories, and a linked worktree's
+/// `.git` file, `commondir`, and `gitdir`. A missing hooks directory is
+/// created so it can be locked; so is a missing `config.worktree` when the
+/// repository enables per-worktree config.
+fn git_locks(
+    stage: &Stage,
+    mode: Sandbox,
+    workspace: &Path,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let dot_git = workspace.join(".git");
+    let Ok(meta) = fs::symlink_metadata(&dot_git) else {
+        // Not a repository root; a repository above the workspace is
+        // outside every writable path.
+        return Ok((vec![], vec![]));
+    };
+    ensure!(
+        !(meta.file_type().is_symlink() && mode == Sandbox::WorkspaceWrite),
+        "Stage {} cannot use the workspace-write sandbox while {} is a symbolic link: the stage could point it at a Git directory of its own",
+        stage.id,
+        dot_git.display()
+    );
+    let (mut pinned, mut locked, dirs) = if meta.is_dir() {
+        let gitdir = canonical(&dot_git);
+        let pinned = if mode == Sandbox::WorkspaceWrite {
+            vec![gitdir.clone()]
+        } else {
+            vec![]
+        };
+        (pinned, vec![], vec![gitdir])
+    } else if meta.is_file() {
+        let dirs = git_dirs(workspace);
+        let mut locked = vec![canonical(&dot_git)];
+        if let Some(gitdir) = dirs.first() {
+            locked.extend(
+                ["commondir", "gitdir"]
+                    .iter()
+                    .map(|name| gitdir.join(name))
+                    .filter(|path| path.exists()),
+            );
+        }
+        (vec![], locked, dirs)
+    } else {
+        (vec![], vec![], vec![])
+    };
+    for dir in &dirs {
+        let config = dir.join("config");
+        let hooks = dir.join("hooks");
+        if !hooks.exists() && dir.join("HEAD").is_file() {
+            fs::create_dir(&hooks).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })?;
+        }
+        let worktree_config = dir.join("config.worktree");
+        let enables_worktree_config = read_regular_file(&config, 64 * 1024)
+            .is_some_and(|text| text.to_ascii_lowercase().contains("worktreeconfig"));
+        if enables_worktree_config && !worktree_config.exists() {
+            storage_create_empty(&worktree_config)?;
+        }
+        // Locks protect a link's target, not the link: a stage that can
+        // write the Git directory could replace the link with its own file.
+        if mode == Sandbox::WorkspaceWrite {
+            for entry in [&config, &worktree_config, &hooks] {
+                ensure!(
+                    !fs::symlink_metadata(entry).is_ok_and(|m| m.file_type().is_symlink()),
+                    "Stage {} cannot use the workspace-write sandbox while {} is a symbolic link: the stage could replace it with Git config or hooks of its own. Make it a regular file or directory",
+                    stage.id,
+                    entry.display()
+                );
+            }
+        }
+        locked.extend(
+            [config, worktree_config, hooks]
+                .into_iter()
+                .filter(|path| path.exists())
+                .map(|path| canonical(&path)),
+        );
+    }
+    // A linked worktree's own Git directory holds its `config.worktree`.
+    pinned.retain(|p| !locked.contains(p));
+    Ok((pinned, locked))
+}
+
+fn storage_create_empty(path: &Path) -> Result<()> {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Refuses a sandboxed stage that could write a Git config file the router
+/// reads when it runs Git in the workspace after the stage: every file
+/// `git config --list --show-origin` names, and every `include.path` and
+/// `includeIf.*.path` target, which Git does not list when it is empty or
+/// missing.
+fn refuse_writable_git_config(
+    plan: &Plan,
+    stage: &Stage,
+    workspace: &Path,
+    home: Option<&Path>,
+) -> Result<()> {
+    let Ok(output) = crate::snapshot::git_command()
+        .args(["config", "--list", "--show-origin", "-z"])
+        .current_dir(workspace)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return Ok(());
+    };
+    if !output.status.success() {
+        return Ok(());
+    }
+    for path in git_config_sources(&output.stdout, workspace, home) {
+        ensure!(
+            !plan.stage_can_write(&path),
+            "Stage {} cannot be sandboxed: Git reads config from {}, which the stage could write, and the router runs Git in the workspace outside the sandbox. Move that file or include out of the stage's writable paths",
+            stage.id,
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Config files and include targets from `git config --list --show-origin -z`
+/// output (`file:PATH\0KEY\nVALUE\0` entries; relative paths are relative
+/// to `cwd`, include paths to their own file's directory).
+fn git_config_sources(output: &[u8], cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let text = String::from_utf8_lossy(output);
+    let mut fields = text.split('\0');
+    let mut sources = vec![];
+    while let (Some(origin), Some(entry)) = (fields.next(), fields.next()) {
+        let Some(file) = origin.strip_prefix("file:") else {
+            continue;
+        };
+        let file = cwd.join(file);
+        let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
+        let key = key.to_ascii_lowercase();
+        let include =
+            key == "include.path" || (key.starts_with("includeif.") && key.ends_with(".path"));
+        if include && !value.is_empty() {
+            let target = match (value.strip_prefix("~/"), home) {
+                (Some(rest), Some(home)) => home.join(rest),
+                (Some(_), None) => continue,
+                _ => file.parent().unwrap_or(cwd).join(value),
+            };
+            sources.push(target);
+        }
+        sources.push(file);
+    }
+    sources.sort();
+    sources.dedup();
+    sources
 }
 
 fn tidy(paths: &mut Vec<PathBuf>) {
@@ -368,6 +595,20 @@ pub fn harness_dirs(harness: &str) -> Vec<String> {
     let extra = crate::harness::get(harness).map_or(&[][..], |spec| spec.state_dirs);
     dirs.extend(extra.iter().map(|d| (*d).to_owned()));
     dirs
+}
+
+/// The stage's `sandbox_writable` grants as the sandbox resolves them; a
+/// path that cannot be expanded is kept as written (the plan refuses it).
+pub fn writable_grants(stage: &Stage) -> Vec<PathBuf> {
+    let home = home();
+    stage
+        .sandbox_writable
+        .iter()
+        .map(|raw| match expand(raw, home.as_deref()) {
+            Ok(path) => canonical(&path),
+            Err(_) => PathBuf::from(raw),
+        })
+        .collect()
 }
 
 /// `~/x` against `home`; other paths must be absolute.
@@ -550,6 +791,56 @@ fn git_dirs_inner(workspace: &Path) -> Option<Vec<PathBuf>> {
 }
 
 impl Plan {
+    /// Keeps a linked worktree's own Git directory (HEAD, index) and the
+    /// object store writable, so a worktree task can commit on its detached
+    /// HEAD, but makes the rest of the repository's shared one (refs, other
+    /// worktrees, packed-refs) read-only: a worktree task changes the main
+    /// checkout only through `task_apply`.
+    pub fn confine_shared_git(&mut self, workspace: &Path) {
+        if let [_, common] = git_dirs(workspace).as_slice() {
+            self.writable.retain(|p| p != common);
+            let objects = common.join("objects");
+            if objects.is_dir() && !self.writable.contains(&objects) {
+                self.writable.push(objects);
+            }
+            if !self.protected.contains(common) {
+                self.protected.push(common.clone());
+            }
+        }
+    }
+
+    /// Lets a delegating turn reach its own broker: the socket, the token
+    /// file, and the bridge program, after every directory that hides them.
+    pub fn allow_orch(&mut self, sock: &Path, token_file: &Path, program: &Path) {
+        self.orch = Some(OrchAccess {
+            sock: canonical(sock),
+            token_file: canonical(token_file),
+            program: canonical(program),
+        });
+    }
+
+    /// Whether the sandboxed stage could change `path`: under a writable
+    /// grant, and not under a Git lock or a deeper protected path.
+    pub fn stage_can_write(&self, path: &Path) -> bool {
+        let path = canonical(path);
+        if self.git_locked.iter().any(|l| path.starts_with(l)) {
+            return false;
+        }
+        let depth = |list: &[PathBuf]| {
+            list.iter()
+                .filter(|w| path.starts_with(w))
+                .map(|w| w.components().count())
+                .max()
+        };
+        let Some(granted) = depth(&self.writable).max(depth(&self.writable_if_present)) else {
+            return false;
+        };
+        !self
+            .protected
+            .iter()
+            .any(|p| path.starts_with(p) && p.components().count() > granted)
+    }
+
     /// The program and arguments that run `program args` inside the sandbox.
     pub fn wrap(&self, program: &str, args: &[String]) -> (String, Vec<String>) {
         let (Some(backend), Some(sandbox)) = (self.backend, &self.program) else {
@@ -588,15 +879,34 @@ impl Plan {
             )
             .chain(self.writable.iter().map(|p| (p, "--bind")))
             .chain(self.writable_if_present.iter().map(|p| (p, "--bind-try")))
+            .chain(self.git_pinned.iter().map(|p| (p, "--bind")))
             .collect();
         binds.sort_by_key(|(p, _)| p.components().count());
         for (path, flag) in binds {
             let path = path.display().to_string();
             args.extend([flag.to_owned(), path.clone(), path]);
         }
+        // After every grant, so no writable parent re-exposes them; a bind
+        // mount also cannot be renamed or replaced.
+        for path in &self.git_locked {
+            let path = path.display().to_string();
+            args.extend(["--ro-bind".to_owned(), path.clone(), path]);
+        }
         // After every bind, so none of them exposes these again.
         for path in &self.hidden {
             args.extend(["--tmpfs".into(), path.display().to_string()]);
+        }
+        // A delegating turn's own socket and token, after the tmpfs that hid
+        // their directory; the bridge program too when a private /tmp hid it.
+        if let Some(orch) = &self.orch {
+            let sock = orch.sock.display().to_string();
+            let token = orch.token_file.display().to_string();
+            args.extend(["--bind".into(), sock.clone(), sock]);
+            args.extend(["--ro-bind".into(), token.clone(), token]);
+            if self.private_tmp && orch.program.starts_with("/tmp") {
+                let program = orch.program.display().to_string();
+                args.extend(["--ro-bind".into(), program.clone(), program]);
+            }
         }
         args.extend(["--die-with-parent".into(), "--".into()]);
         args
@@ -640,6 +950,27 @@ impl Plan {
                 text.push_str(")\n");
             }
         }
+        // After the re-allow above, so no grant reaches them.
+        if !self.git_locked.is_empty() {
+            text.push_str("(deny file-write*");
+            for path in &self.git_locked {
+                text.push_str(&format!(
+                    "\n    (subpath {})",
+                    sbpl_string(&path.display().to_string())
+                ));
+            }
+            text.push_str(")\n");
+        }
+        if !self.git_pinned.is_empty() {
+            text.push_str("(deny file-write*");
+            for path in &self.git_pinned {
+                text.push_str(&format!(
+                    "\n    (literal {})",
+                    sbpl_string(&path.display().to_string())
+                ));
+            }
+            text.push_str(")\n");
+        }
         // `subpath` also matches the directory itself, which could then be
         // removed and replaced with a link.
         if !self.pinned.is_empty() {
@@ -654,7 +985,7 @@ impl Plan {
         }
         for path in &self.hidden {
             text.push_str(&format!(
-                "(deny file-write* network-outbound (subpath {}))\n",
+                "(deny file-read-data file-write* network-outbound (subpath {}))\n",
                 sbpl_string(&path.display().to_string())
             ));
             // Seatbelt matches paths, so renaming a writable ancestor (such
@@ -677,6 +1008,14 @@ impl Plan {
         }
         if !self.network {
             text.push_str("(deny network*)\n");
+        }
+        // Last, so no deny above (hidden directories, no network) wins.
+        if let Some(orch) = &self.orch {
+            let sock = sbpl_string(&orch.sock.display().to_string());
+            text.push_str(&format!(
+                "(allow file-read-data (literal {}))\n(allow file-read-metadata (literal {sock}))\n(allow network-outbound (remote unix-socket (path-literal {sock})))\n",
+                sbpl_string(&orch.token_file.display().to_string())
+            ));
         }
         text
     }
@@ -889,6 +1228,172 @@ mod tests {
         );
     }
 
+    fn git_init(dir: &Path) {
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// The router runs Git in the workspace outside the sandbox after a
+    /// stage, so a stage that wrote `.git/config` (fsmonitor, a filter) or a
+    /// hook could run commands unsandboxed.
+    #[test]
+    fn git_config_and_hooks_stay_read_only_under_workspace_write() {
+        let d = dirs();
+        git_init(&d.workspace);
+        fs::remove_dir_all(d.workspace.join(".git/hooks")).unwrap();
+        let stage = Stage {
+            role: Role::Implementation,
+            ..Stage::default()
+        };
+        let plan = plan_for(&d, &stage, Sandbox::ByRole, bwrap())
+            .unwrap()
+            .unwrap();
+        let git = d.workspace.join(".git");
+        assert_eq!(plan.git_locked, vec![git.join("config"), git.join("hooks")]);
+        assert!(
+            git.join("hooks").is_dir(),
+            "a missing hooks directory is created to lock it"
+        );
+        assert_eq!(plan.git_pinned, vec![git.clone()]);
+        assert!(!plan.stage_can_write(&git.join("config")));
+        assert!(!plan.stage_can_write(&git.join("hooks/pre-commit")));
+        assert!(plan.stage_can_write(&git.join("index")));
+        let argv = plan.bwrap_args();
+        let at = |flag: &str, p: &Path| {
+            argv.windows(3)
+                .position(|w| w[0] == flag && w[1] == p.display().to_string())
+                .unwrap_or_else(|| panic!("{flag} {p:?} in {argv:?}"))
+        };
+        // The locks come after every grant, including the workspace's.
+        assert!(at("--bind", &d.workspace) < at("--bind", &git));
+        assert!(at("--bind", &git) < at("--ro-bind", &git.join("config")));
+        assert!(at("--bind", &d.attempt) < at("--ro-bind", &git.join("hooks")));
+        let seatbelt = Plan {
+            backend: Some(Backend::SandboxExec),
+            ..plan.clone()
+        };
+        let profile = seatbelt.profile();
+        let config = profile
+            .find(&format!(
+                "(subpath {})",
+                sbpl_string(&git.join("config").display().to_string())
+            ))
+            .unwrap();
+        let workspace = profile
+            .find(&format!(
+                "(subpath {})",
+                sbpl_string(&d.workspace.display().to_string())
+            ))
+            .unwrap();
+        assert!(workspace < config, "{profile}");
+        assert!(
+            profile.contains(&format!(
+                "(literal {})",
+                sbpl_string(&git.display().to_string())
+            )),
+            "{profile}"
+        );
+    }
+
+    #[test]
+    fn read_only_stages_lock_git_files_without_pinning_a_writable_git_dir() {
+        let d = dirs();
+        git_init(&d.workspace);
+        let stage = Stage {
+            role: Role::Research,
+            ..Stage::default()
+        };
+        let plan = plan_for(&d, &stage, Sandbox::ByRole, bwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.mode, Sandbox::ReadOnly);
+        assert!(plan.git_pinned.is_empty());
+        assert!(plan.git_locked.contains(&d.workspace.join(".git/config")));
+        let git = d.workspace.join(".git").display().to_string();
+        assert!(
+            !plan
+                .bwrap_args()
+                .windows(2)
+                .any(|w| w[0] == "--bind" && w[1] == git),
+            "a read-only stage's Git directory is never bound writable"
+        );
+    }
+
+    #[test]
+    fn a_symlinked_git_config_refuses_workspace_write() {
+        let d = dirs();
+        git_init(&d.workspace);
+        let config = d.workspace.join(".git/config");
+        let outside = d.root.join("outside.gitconfig");
+        fs::rename(&config, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &config).unwrap();
+        let stage = Stage {
+            id: "implement".into(),
+            role: Role::Implementation,
+            ..Stage::default()
+        };
+        let error = plan_for(&d, &stage, Sandbox::ByRole, bwrap()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("is a symbolic link"), "{message}");
+        // Read-only, the Git directory is not writable, so the link stays.
+        let research = Stage {
+            role: Role::Research,
+            ..stage
+        };
+        assert!(plan_for(&d, &research, Sandbox::ByRole, bwrap()).is_ok());
+    }
+
+    #[test]
+    fn a_git_include_the_stage_could_write_refuses_the_sandbox() {
+        let d = dirs();
+        git_init(&d.workspace);
+        let config = d.workspace.join(".git/config");
+        let mut text = fs::read_to_string(&config).unwrap();
+        // Missing targets are not listed by `--show-origin`; still refused.
+        text.push_str("[include]\n\tpath = ../planted.gitconfig\n");
+        fs::write(&config, text).unwrap();
+        let stage = Stage {
+            id: "implement".into(),
+            role: Role::Implementation,
+            ..Stage::default()
+        };
+        let error = plan_for(&d, &stage, Sandbox::ByRole, bwrap()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("planted.gitconfig"), "{message}");
+        assert!(
+            message.contains("Stage implement cannot be sandboxed"),
+            "{message}"
+        );
+        // Read-only, the workspace is not writable, so the include is safe.
+        let research = Stage {
+            role: Role::Research,
+            ..Stage::default()
+        };
+        assert!(plan_for(&d, &research, Sandbox::ByRole, bwrap()).is_ok());
+    }
+
+    #[test]
+    fn git_config_sources_include_origins_and_include_targets() {
+        let cwd = Path::new("/w");
+        let home = Path::new("/h");
+        let output =
+            b"file:.git/config\0core.bare\nfalse\0file:.git/config\0include.path\nextra.cfg\0\
+file:/h/.gitconfig\0includeIf.gitdir:/w/.path\n~/more.cfg\0command line:\0core.x\ny\0";
+        assert_eq!(
+            git_config_sources(output, cwd, Some(home)),
+            vec![
+                PathBuf::from("/h/.gitconfig"),
+                PathBuf::from("/h/more.cfg"),
+                PathBuf::from("/w/.git/config"),
+                PathBuf::from("/w/.git/extra.cfg"),
+            ]
+        );
+    }
+
     #[test]
     fn workspace_write_includes_a_linked_worktrees_git_dirs() {
         let d = dirs();
@@ -931,6 +1436,37 @@ mod tests {
                 .unwrap()
         };
         assert!(at(&d.workspace) < at(&d.attempt));
+
+        // A worktree task: its own Git directory stays writable, re-bound
+        // after the shared one is made read-only.
+        let mut plan = plan;
+        plan.confine_shared_git(&d.workspace);
+        assert!(!plan.writable.contains(&common), "{:?}", plan.writable);
+        assert!(plan.protected.contains(&common), "{:?}", plan.protected);
+        let args = plan.bwrap_args();
+        let bind = |flag: &str, p: &Path| {
+            let p = p.display().to_string();
+            args.windows(3)
+                .position(|w| w[0] == flag && w[1] == p && w[2] == p)
+                .unwrap_or_else(|| panic!("{flag} {p} missing: {args:?}"))
+        };
+        assert!(
+            bind("--ro-bind", &common) < bind("--bind", &gitdir),
+            "{args:?}"
+        );
+        let objects = common.join("objects");
+        assert!(
+            bind("--ro-bind", &common) < bind("--bind", &objects),
+            "{args:?}"
+        );
+        let profile = plan.profile();
+        let deny = profile
+            .find(&format!("(subpath \"{}\")", common.display()))
+            .expect(&profile);
+        assert!(
+            profile[deny..].contains(&format!("(subpath \"{}\")", gitdir.display())),
+            "{profile}"
+        );
     }
 
     #[test]
@@ -1011,6 +1547,9 @@ mod tests {
             readable: vec![],
             pinned: vec![],
             hidden: vec![],
+            git_locked: vec![],
+            git_pinned: vec![],
+            orch: None,
         };
         let profile = plan.profile();
         assert!(!profile.contains("(deny file-write*)\n(deny network*)"));
@@ -1096,11 +1635,20 @@ mod tests {
         let plan = plan_for(&d, &stage, Sandbox::Off, detected)
             .unwrap()
             .unwrap();
-        assert_eq!(plan.protected, vec![d.workspace.clone()]);
+        // Seatbelt grants $TMPDIR, so the test config directory under it is
+        // protected too.
+        let config = canonical(&crate::config::config_dir());
+        let protected: Vec<&PathBuf> = plan.protected.iter().filter(|p| **p != config).collect();
+        assert_eq!(protected, vec![&d.workspace]);
         let profile = plan.profile();
         let quoted = |p: &Path| format!("(subpath \"{}\")", p.display());
+        let denied: String = plan
+            .protected
+            .iter()
+            .map(|p| format!("\n    {}", quoted(p)))
+            .collect();
         let deny = profile
-            .rfind(&format!("(deny file-write*\n    {}", quoted(&d.workspace)))
+            .rfind(&format!("(deny file-write*{denied})"))
             .expect(&profile);
         let reallow = profile[deny..].find("(allow file-write*").expect(&profile) + deny;
         assert!(
@@ -1137,7 +1685,11 @@ mod tests {
             .unwrap()
             .unwrap();
         let metadata = d.workspace.join(".model-router");
-        assert_eq!(plan.protected, vec![metadata.clone()]);
+        // On macOS $TMPDIR is writable, so the test config directory under
+        // it is protected too.
+        let config = canonical(&crate::config::config_dir());
+        let protected: Vec<&PathBuf> = plan.protected.iter().filter(|p| **p != config).collect();
+        assert_eq!(protected, vec![&metadata]);
         let args = plan.bwrap_args();
         let at = |flag: &str, path: &Path| {
             let path = path.display().to_string();
@@ -1296,6 +1848,57 @@ mod tests {
     }
 
     #[test]
+    fn a_delegating_turn_reaches_only_its_own_socket_and_token() {
+        let d = dirs();
+        let stage = Stage {
+            sandbox: Some(Sandbox::ReadOnly),
+            sandbox_network: false,
+            ..Stage::default()
+        };
+        let orch = canonical(&crate::delegation::broker::orch_socket_dir().unwrap());
+        let (sock, token) = (orch.join("orch-1.sock"), orch.join("orch-1.token"));
+        let mut plan = plan_for(&d, &stage, Sandbox::Off, bwrap())
+            .unwrap()
+            .unwrap();
+        assert!(plan.hidden.contains(&orch), "{:?}", plan.hidden);
+        plan.allow_orch(&sock, &token, Path::new("/usr/bin/mr"));
+        let argv = plan.bwrap_args();
+        let hide = argv
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == orch.display().to_string())
+            .unwrap();
+        let bind = argv
+            .windows(2)
+            .position(|w| w[0] == "--bind" && w[1] == sock.display().to_string())
+            .unwrap();
+        assert!(
+            hide < bind,
+            "the socket comes back after its directory is hidden"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--ro-bind" && w[1] == token.display().to_string())
+        );
+        let seatbelt = Plan {
+            backend: Some(Backend::SandboxExec),
+            ..plan
+        };
+        let profile = seatbelt.profile();
+        let deny = profile.find("(deny network*)").unwrap();
+        let allow = profile
+            .find("(allow network-outbound (remote unix-socket")
+            .unwrap();
+        assert!(
+            deny < allow,
+            "Seatbelt's last matching rule wins: {profile}"
+        );
+        assert!(profile.contains(&format!(
+            "(allow file-read-data (literal {}))",
+            sbpl_string(&token.display().to_string())
+        )));
+    }
+
+    #[test]
     fn stages_cannot_reach_terminal_host_sockets() {
         // Another run's host accepts keystrokes for a harness outside the
         // sandbox, so every existing socket directory is denied or hidden.
@@ -1310,11 +1913,20 @@ mod tests {
             .unwrap();
         let mine = canonical(&crate::process::host::socket_dir().unwrap());
         let deny = format!(
-            "(deny file-write* network-outbound (subpath {}))",
+            "(deny file-read-data file-write* network-outbound (subpath {}))",
             sbpl_string(&mine.display().to_string())
         );
         let profile = plan.profile();
         assert!(profile.contains(&deny), "{profile}");
+        // Delegation sockets and token files are hidden the same way.
+        let orch = canonical(&crate::delegation::broker::orch_socket_dir().unwrap());
+        assert!(
+            profile.contains(&format!(
+                "(deny file-read-data file-write* network-outbound (subpath {}))",
+                sbpl_string(&orch.display().to_string())
+            )),
+            "{profile}"
+        );
         let parent = mine.parent().unwrap().display().to_string();
         let pinned = format!("(literal {})", sbpl_string(&parent));
         assert!(

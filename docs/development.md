@@ -40,6 +40,7 @@ sleeping.
 | `smoke_startup` | Animation, skip/bypass, resize, interrupt cleanup; records `.model-router/qa/startup.gif` |
 | `smoke_detach` | Detach and reattach of interactive sessions, including leaving one running after `mr` exits and reattaching from a new `mr` |
 | `smoke_review` | Diff view: file list, hunk/file jumps, search, `$PAGER`/`$VISUAL` hand-offs |
+| `smoke_delegation` | A delegating stage's task line on the Runs page; cancelling the stage cancels its task (skipped without bubblewrap or sandbox-exec) |
 | `smoke_shutdown` | Shutdown and terminal loss |
 
 `scripts/capture_harness_output.py` captures real harness output into

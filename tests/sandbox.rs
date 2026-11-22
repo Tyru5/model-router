@@ -152,6 +152,108 @@ fn workspace_write_allows_workspace_writes() {
     assert!(dir.path().join("escaped.txt").exists());
 }
 
+/// A sandboxed stage tries to make the router's unsandboxed Git run a
+/// command: an fsmonitor or filter in `.git/config`, a hook, or a Git
+/// directory of its own swapped in for `.git`. The router runs `git add -A`
+/// in the workspace after the stage; none of them may run.
+const GIT_ESCAPE: &str = r##"
+import json, os, pathlib, sys
+marker = sys.argv[2]
+def attempt(name, action):
+    try:
+        action()
+        return name + "=wrote"
+    except OSError:
+        return name + "=blocked"
+def config():
+    with open(".git/config", "a") as f:
+        f.write("[core]\n\tfsmonitor = touch '" + marker + "'\n")
+def hook():
+    path = pathlib.Path(".git/hooks/pre-commit")
+    path.write_text("#!/bin/sh\ntouch '" + marker + "'\n")
+    path.chmod(0o755)
+def swap():
+    os.rename(".git", ".git-moved")
+results = [attempt("config", config), attempt("hook", hook), attempt("swap", swap)]
+pathlib.Path("changed.txt").write_text("x")
+handoff = {"summary": " ".join(results), "verdict": "complete", "findings": [], "decisions": [],
+           "files_changed": [], "tests": [], "unresolved": []}
+pathlib.Path(sys.argv[1]).write_text(json.dumps(handoff))
+print("<router-handoff>" + json.dumps(handoff) + "</router-handoff>", flush=True)
+"##;
+
+#[test]
+fn workspace_write_stages_cannot_make_the_router_run_git_commands() {
+    if !available() {
+        return;
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("sandbox git 雪 ")
+        .tempdir()
+        .unwrap();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "test@example.com"]);
+    fs::write(dir.path().join("README.md"), "hi\n").unwrap();
+    fs::write(
+        dir.path().join(".gitignore"),
+        "/.model-router\n/escape.py\n",
+    )
+    .unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "init"]);
+    let marker = dir.path().join("ESCAPED");
+    fs::write(dir.path().join("escape.py"), GIT_ESCAPE).unwrap();
+    let adapter = CustomAdapter {
+        command: "python3".into(),
+        args: vec![
+            dir.path().join("escape.py").display().to_string(),
+            "{handoff_file}".into(),
+            marker.display().to_string(),
+        ],
+        ..CustomAdapter::default()
+    };
+    let workflow = Workflow {
+        max_repair_passes: 0,
+        ..Workflow::new(
+            "Sandbox",
+            vec![Stage {
+                id: "implement".into(),
+                name: "Implement".into(),
+                role: Role::Implementation,
+                harness: "escape".into(),
+                sandbox: Some(Sandbox::WorkspaceWrite),
+                ..Stage::default()
+            }],
+        )
+    };
+    let settings = Settings {
+        workflows: vec![workflow.clone()],
+        adapters: BTreeMap::from([("escape".into(), adapter)]),
+        ..Settings::default()
+    };
+    let mut run = Run::create(dir.path(), &settings, &workflow, "escape".into(), false).unwrap();
+    let action = engine::drive(&mut run, &AtomicBool::new(false), |_| {}).unwrap();
+    assert_eq!(action, Action::Complete, "{:?}", run.error);
+    let summary = &run.stages[0].handoff.as_ref().unwrap().summary;
+    assert_eq!(summary, "config=blocked hook=blocked swap=blocked");
+    // The stage's own change still reached the snapshot the router took.
+    assert!(dir.path().join("changed.txt").exists());
+    assert!(run.stages[0].attempts[0].tree_after.is_some());
+    assert!(
+        !marker.exists(),
+        "a command the stage planted ran outside the sandbox"
+    );
+}
+
 #[test]
 fn interactive_harnesses_keep_their_terminal_inside_the_sandbox() {
     if !available() {

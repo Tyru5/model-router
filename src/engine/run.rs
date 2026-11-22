@@ -236,6 +236,21 @@ impl Run {
             workflow: workflow.clone(),
             adapters: settings.adapters.clone(),
             providers: settings.providers.clone(),
+            delegates: workflow
+                .stages
+                .iter()
+                .filter_map(|stage| stage.delegation.as_ref())
+                .flat_map(|delegation| &delegation.delegates)
+                .filter_map(|name| {
+                    settings
+                        .delegates
+                        .get(name)
+                        .map(|delegate| (name.clone(), delegate.clone()))
+                })
+                .collect(),
+            launched_by: None,
+            creation_source: Default::default(),
+            mcp: None,
             stages: workflow
                 .stages
                 .iter()
@@ -250,6 +265,7 @@ impl Run {
                     waiver: None,
                     fan_out: None,
                     inherited: None,
+                    discarded: vec![],
                 })
                 .collect(),
             orphan_groups: vec![],
@@ -636,13 +652,16 @@ impl Run {
 
     pub(super) fn clear_fan_out(&mut self, stage: usize) {
         if let Some(round) = self.stages[stage].fan_out.take() {
-            self.orphan_groups.extend(
-                round
-                    .candidates
-                    .into_iter()
-                    .flat_map(|candidate| candidate.attempts)
-                    .filter_map(|mut attempt| attempt.take_group()),
-            );
+            for mut candidate in round.candidates {
+                self.orphan_groups.extend(
+                    candidate
+                        .attempts
+                        .iter_mut()
+                        .filter_map(Attempt::take_group),
+                );
+                // Its spend still counts.
+                self.stages[stage].discarded.push(candidate);
+            }
         }
     }
 
@@ -1106,6 +1125,7 @@ impl Run {
     /// Marks every running fan-out candidate failed: its process died with
     /// an earlier router. Never retried silently.
     pub(super) fn interrupt_candidates(&mut self, message: &str) -> Result<()> {
+        self.interrupt_tasks(message);
         for index in 0..self.stages.len() {
             let count = self.stages[index]
                 .fan_out
@@ -1118,6 +1138,30 @@ impl Run {
             }
         }
         Ok(())
+    }
+
+    /// Marks every live delegated task, and its running turn, interrupted:
+    /// recovery does not replay delegation; the user retries the stage.
+    pub(super) fn interrupt_tasks(&mut self, message: &str) {
+        use crate::delegation::records::TaskStatus;
+        super::delegate_apply::settle_interrupted_applies(self);
+        let now = Utc::now();
+        for state in &mut self.stages {
+            for attempt in &mut state.attempts {
+                for task in &mut attempt.tasks {
+                    if !task.status.is_live() {
+                        continue;
+                    }
+                    task.status = TaskStatus::Interrupted;
+                    task.error = Some(message.into());
+                    for turn in task.turns.iter_mut().filter(|t| t.status.is_live()) {
+                        turn.status = TaskStatus::Interrupted;
+                        turn.finished_at.get_or_insert(now);
+                        turn.error = Some(message.into());
+                    }
+                }
+            }
+        }
     }
 
     pub(super) fn candidate(&self, index: usize, c: usize) -> &CandidateState {
@@ -1236,6 +1280,9 @@ impl Run {
             terminal: None,
             handoff_source: None,
             worktree: None,
+            tasks: vec![],
+            turns: vec![],
+            launched_runs: vec![],
         });
         let reason = format!("Fan-out round {number} started: {pending} candidate(s)");
         self.resume = None;
@@ -1353,6 +1400,7 @@ impl Run {
             attempt_dir: &directory,
             prompt_file: &prompt_file,
             handoff_file: &handoff_file,
+            mcp: None,
         };
         let mut invocation =
             adapters::build(&candidate, &self.adapters, &self.providers, &text, &paths)?;
@@ -1401,6 +1449,9 @@ impl Run {
             terminal: None,
             handoff_source: None,
             worktree: Some(worktree),
+            tasks: vec![],
+            turns: vec![],
+            launched_runs: vec![],
         });
         let reason = format!(
             "Candidate {id} attempt {number} started: {} {}",

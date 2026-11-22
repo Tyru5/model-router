@@ -24,7 +24,11 @@ use std::{
 };
 
 mod apply;
+mod delegate;
+mod delegate_apply;
+mod delegate_runs;
 mod exec;
+mod host;
 mod prompt;
 mod recovery;
 mod run;
@@ -34,6 +38,7 @@ mod types;
 
 pub use apply::{ApplyPlan, apply_worktree, apply_worktree_plan};
 pub use exec::detached_terminal;
+pub use host::{RunHost, cancel_pending, run_host, set_run_host};
 pub use prompt::{
     FieldView, HandoffView, Inspection, Kept, PRIOR_BUDGET, PRIOR_EACH, inspect_handoffs, prompt,
 };
@@ -42,8 +47,8 @@ pub use recovery::{
 };
 pub use store::{command, history, load};
 pub use types::{
-    Action, Attempt, CandidateChanges, CandidateState, Cmd, Event, FanOutState, Fork, Placement,
-    Resume, Run, Selection, StageState, Status, Transition, Waiver,
+    Action, Attempt, CandidateChanges, CandidateState, Cmd, CreationSource, Event, FanOutState,
+    Fork, LaunchedBy, Placement, Resume, Run, Selection, StageState, Status, Transition, Waiver,
 };
 
 use exec::{
@@ -174,6 +179,8 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
         }
         if run.workflow.stages[run.cursor].fan_out.is_some() {
             execute_fan_out(run, cancel, &mut emit)?;
+        } else if run.workflow.stages[run.cursor].delegation.is_some() {
+            delegate::drive_stage(run, cancel, None, &mut emit)?;
         } else {
             execute_stage(run, cancel, None, &mut emit)?;
         }
@@ -210,12 +217,21 @@ pub fn run_interactive(
     stop_orphans(run, &mut emit)?;
     refuse_unproven(run)?;
     crate::trust::authorize_run(run)?;
-    execute_stage(
-        run,
-        cancel,
-        Some((session, &[&lock, &workspace_lock])),
-        &mut emit,
-    )?;
+    if run.workflow.stages[run.cursor].delegation.is_some() {
+        delegate::drive_stage(
+            run,
+            cancel,
+            Some((session, &[&lock, &workspace_lock])),
+            &mut emit,
+        )?;
+    } else {
+        execute_stage(
+            run,
+            cancel,
+            Some((session, &[&lock, &workspace_lock])),
+            &mut emit,
+        )?;
+    }
     if matches!(
         run.status,
         Status::Failed | Status::Blocked | Status::Cancelled
@@ -260,11 +276,19 @@ pub fn preview(
             ));
             continue;
         }
+        // A delegating stage's launch carries the bridge; its socket and
+        // token file are made per turn.
+        let mcp = stage.delegation.as_ref().map(|_| adapters::McpLaunch {
+            program: PathBuf::from("<model-router>"),
+            sock: PathBuf::from("<orch>/orch-<id>.sock"),
+            token_file: PathBuf::from("<orch>/orch-<id>.token"),
+        });
         let paths = ContextPaths {
             workspace: project,
             attempt_dir: temp.path(),
             prompt_file: Path::new("<attempt>/prompt.md"),
             handoff_file: Path::new("<workspace>/.model-router/handoffs/<run>/<stage>.json"),
+            mcp: mcp.as_ref(),
         };
         let command = adapters::build(
             stage,
@@ -288,6 +312,59 @@ pub fn preview(
         ));
         if let Some(sandbox) = crate::sandbox::preview(workflow, stage) {
             text.push_str(&format!("   {sandbox}\n"));
+        }
+        if let Some(delegation) = &stage.delegation {
+            text.push_str(&format!(
+                "   delegation: tools through `model-router __mcp-bridge`; {} task(s) at most, {} at a time, {} wake turn(s)\n",
+                delegation.max_tasks, delegation.max_parallel, delegation.max_wake_turns
+            ));
+            for name in &delegation.delegates {
+                let Some(delegate) = settings.delegates.get(name) else {
+                    continue;
+                };
+                let task = crate::delegation::config::delegate_stage(
+                    name,
+                    delegate,
+                    stage,
+                    Role::Research,
+                );
+                let paths = ContextPaths {
+                    workspace: project,
+                    attempt_dir: temp.path(),
+                    prompt_file: Path::new("<task turn>/prompt.md"),
+                    handoff_file: Path::new("<task turn>/handoff.json"),
+                    mcp: None,
+                };
+                match adapters::build(
+                    &task,
+                    &settings.adapters,
+                    &settings.providers,
+                    "<task brief>",
+                    &paths,
+                ) {
+                    Ok(command) => text.push_str(&format!(
+                        "   delegate {name}: {}{}\n",
+                        command.display(),
+                        if command.stdin.is_some() {
+                            " < <task turn>/prompt.md"
+                        } else {
+                            ""
+                        }
+                    )),
+                    Err(error) => text.push_str(&format!("   delegate {name}: {error:#}\n")),
+                }
+            }
+            if !delegation.harnesses.is_empty() {
+                text.push_str(&format!(
+                    "   ad-hoc targets: harnesses {:?}{}\n",
+                    delegation.harnesses,
+                    if delegation.models.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", models {:?}", delegation.models)
+                    }
+                ));
+            }
         }
         if let Some(stall) = stage.stall_timeout_seconds {
             // Only unattended output is watched; an interactive stage is
@@ -1106,6 +1183,9 @@ mod tests {
             terminal: None,
             handoff_source: None,
             worktree: None,
+            tasks: vec![],
+            turns: vec![],
+            launched_runs: vec![],
         });
         run.retry(false, None).unwrap();
         assert_eq!(run.status, Status::Pending);

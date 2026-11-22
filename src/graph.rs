@@ -31,6 +31,8 @@ pub fn parallel_safe(workflow: &Workflow, index: usize) -> bool {
     };
     stage.mode == Mode::Unattended
         && stage.role != Role::Ship
+        // A delegating stage runs alone: its owner loop serves its tools.
+        && stage.delegation.is_none()
         && judged_by(workflow, index).is_none()
         && (stage.fan_out.is_some() || read_only(stage.role))
 }

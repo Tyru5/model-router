@@ -465,6 +465,43 @@ pub(crate) fn stage_estimate_params(run: &Run, index: usize) -> (Option<&str>, B
     (routed, billing)
 }
 
+/// Routed provider and billing for a delegated task: its own target's, not
+/// the stage's.
+pub(crate) fn task_estimate_params<'a>(
+    run: &'a Run,
+    task: &'a crate::delegation::records::TaskState,
+) -> (Option<&'a str>, Billing) {
+    let target = &task.target;
+    let routed = providers::route(&target.harness, &target.provider, &run.providers)
+        .is_some()
+        .then_some(target.provider.as_str());
+    let explicit = target
+        .delegate
+        .as_ref()
+        .and_then(|name| run.delegates.get(name))
+        .and_then(|d| d.billing);
+    (
+        routed,
+        billing_for(explicit, routed.is_some(), &target.harness, &run.adapters),
+    )
+}
+
+/// A delegated task turn's estimate, priced under the task's target.
+pub fn task_turn_estimate(
+    run: &Run,
+    task: &crate::delegation::records::TaskState,
+    turn: &crate::delegation::records::TaskTurn,
+    pricing: &Pricing,
+) -> Estimate {
+    let (provider, billing) = task_estimate_params(run, task);
+    let model = if turn.model.is_empty() {
+        &task.target.model
+    } else {
+        &turn.model
+    };
+    estimate_with_billing(turn.usage.as_ref(), model, provider, billing, pricing)
+}
+
 pub fn attempt_estimate(run: &Run, index: usize, attempt: &Attempt, pricing: &Pricing) -> Estimate {
     let (provider, billing) = stage_estimate_params(run, index);
     estimate_with_billing(
@@ -643,7 +680,9 @@ pub fn stage_totals(run: &Run, pricing: &Pricing) -> Vec<CostTotal> {
         .map(|(index, state)| {
             let (provider, billing) = stage_estimate_params(run, index);
             let mut total = CostTotal::default();
-            for attempt in &state.attempts {
+            // Every candidate's spend counts, as in `report`.
+            let candidates = state.candidate_attempts().map(|(_, a)| a);
+            for attempt in state.attempts.iter().chain(candidates) {
                 total.add(&estimate_with_billing(
                     attempt.usage.as_ref(),
                     &attempt.model,
@@ -651,6 +690,10 @@ pub fn stage_totals(run: &Run, pricing: &Pricing) -> Vec<CostTotal> {
                     billing,
                     pricing,
                 ));
+            }
+            // Delegated tasks spend under their own targets.
+            for (task, turn) in state.task_turns() {
+                total.add(&task_turn_estimate(run, task, turn, pricing));
             }
             total
         })
@@ -682,14 +725,51 @@ pub enum BudgetCheck {
 
 /// Evaluates budget caps honoring `on_exceed` (`stop` vs `warn`).
 pub fn check_budget_action(run: &Run) -> BudgetCheck {
-    if !has_budget(run) {
+    // A launched run answers to its launcher's caps too (which count every
+    // run it launched); a cleaned launcher leaves only the run's own.
+    let launcher = run
+        .launched_by
+        .as_ref()
+        .and_then(|by| crate::engine::load(&run.project, &by.run).ok())
+        .filter(has_budget);
+    if !has_budget(run) && launcher.is_none() {
         return BudgetCheck::Ok;
     }
-    check_budget_action_with(run, &Pricing::load(&run.project))
+    let pricing = Pricing::load(&run.project);
+    let own = if has_budget(run) {
+        check_budget_action_with(run, &pricing)
+    } else {
+        BudgetCheck::Ok
+    };
+    if matches!(own, BudgetCheck::Stop(_)) {
+        return own;
+    }
+    match launcher.map(|l| (check_budget_action_with(&l, &pricing), l.id)) {
+        Some((BudgetCheck::Stop(reason), id)) => BudgetCheck::Stop(format!(
+            "{reason} (launcher run {id}, counting the runs it launched)"
+        )),
+        Some((BudgetCheck::Warn(warning), _)) if own == BudgetCheck::Ok => {
+            BudgetCheck::Warn(warning)
+        }
+        _ => own,
+    }
+}
+
+/// Per-stage spend including the runs each stage's agent launched.
+fn totals_with_launched(run: &Run, pricing: &Pricing) -> Vec<CostTotal> {
+    let mut stages = stage_totals(run, pricing);
+    for (index, state) in run.stages.iter().enumerate() {
+        for launched in state.attempts.iter().flat_map(|a| &a.launched_runs) {
+            if let Ok(child) = crate::engine::load(&run.project, &launched.id) {
+                stages[index].merge(&run_total(&child, pricing));
+            }
+        }
+    }
+    stages
 }
 
 pub fn check_budget_action_with(run: &Run, pricing: &Pricing) -> BudgetCheck {
-    let stages = stage_totals(run, pricing);
+    let stages = totals_with_launched(run, pricing);
     let mut total = CostTotal::default();
     let mut stop_reason = None;
     let mut warn_reason = None;
@@ -1063,10 +1143,44 @@ pub fn aggregate<'a>(
         usage: Usage::default(),
         total: CostTotal::default(),
     };
+    let mut add =
+        |run: &Run, harness: &str, model: &str, usage: Option<Usage>, estimate: Estimate| {
+            let model = if model.is_empty() {
+                "default".to_owned()
+            } else {
+                model.to_owned()
+            };
+            let (row, ids) = rows
+                .entry((harness.to_owned(), model.clone()))
+                .or_insert_with(|| {
+                    (
+                        Row {
+                            harness: harness.to_owned(),
+                            model,
+                            runs: 0,
+                            usage: Usage::default(),
+                            cost: CostTotal::default(),
+                        },
+                        BTreeSet::new(),
+                    )
+                });
+            ids.insert(run.id.clone());
+            row.cost.add(&estimate);
+            summary.total.add(&estimate);
+            if let Some(usage) = usage {
+                row.usage = row.usage + usage;
+                summary.usage = summary.usage + usage;
+            }
+        };
     for run in runs {
         for (index, (stage, state)) in run.workflow.stages.iter().zip(&run.stages).enumerate() {
             let (provider, billing) = stage_estimate_params(run, index);
-            for attempt in &state.attempts {
+            // Candidates count under their own harness.
+            let candidates = state
+                .candidate_attempts()
+                .map(|(c, a)| (c.harness.as_str(), a));
+            let own = state.attempts.iter().map(|a| (stage.harness.as_str(), a));
+            for (harness, attempt) in own.chain(candidates) {
                 if since.is_some_and(|since| attempt.started_at < since) {
                     continue;
                 }
@@ -1077,32 +1191,20 @@ pub fn aggregate<'a>(
                     billing,
                     pricing,
                 );
-                let model = if attempt.model.is_empty() {
-                    "default".to_owned()
-                } else {
-                    attempt.model.clone()
-                };
-                let (row, ids) = rows
-                    .entry((stage.harness.clone(), model.clone()))
-                    .or_insert_with(|| {
-                        (
-                            Row {
-                                harness: stage.harness.clone(),
-                                model,
-                                runs: 0,
-                                usage: Usage::default(),
-                                cost: CostTotal::default(),
-                            },
-                            BTreeSet::new(),
-                        )
-                    });
-                ids.insert(run.id.clone());
-                row.cost.add(&estimate);
-                summary.total.add(&estimate);
-                if let Some(usage) = attempt.usage {
-                    row.usage = row.usage + usage;
-                    summary.usage = summary.usage + usage;
+                add(run, harness, &attempt.model, attempt.usage, estimate);
+            }
+            // Delegated tasks count under their own targets.
+            for (task, turn) in state.task_turns() {
+                if since.is_some_and(|since| turn.started_at < since) {
+                    continue;
                 }
+                let estimate = task_turn_estimate(run, task, turn, pricing);
+                let model = if turn.model.is_empty() {
+                    &task.target.model
+                } else {
+                    &turn.model
+                };
+                add(run, &task.target.harness, model, turn.usage, estimate);
             }
         }
     }

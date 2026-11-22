@@ -113,6 +113,19 @@ nothing from the stage still runs: a process it detached into its own session
 outlives the harness (the sandbox has no process namespace), keeps the stage's
 write access, and could race those writes.
 
+In every mode a sandboxed stage cannot change the workspace's Git config, its
+`config.worktree`, or its hooks directory (created when missing), nor, in a
+linked worktree, its `.git` file, `commondir`, or `gitdir`. Under
+`workspace-write` the `.git` directory stays writable but cannot be renamed
+or replaced, and a stage refuses to start while its Git config,
+`config.worktree`, or hooks entry is a symbolic link it could replace. The
+router runs Git in the workspace outside the sandbox after
+each stage, and Git runs commands its config and hooks name (fsmonitor,
+filters, diff drivers). A stage refuses to start when a Git config file the
+router reads, or the target of an `include.path` or `includeIf.*.path`,
+lies in a path the stage may write. The router's own Git commands also pass
+`-c core.fsmonitor=false -c core.hooksPath=/dev/null`.
+
 A stage cannot reach a terminal host (see below), whose harness runs outside
 the sandbox, through the usual socket directories: `$XDG_RUNTIME_DIR/model-router`,
 `/run/user/<uid>/model-router`, `/tmp/model-router-<uid>`, and the temp
@@ -132,6 +145,43 @@ created after the stage started.
 - Limits: harness state directories stay writable, so a harness can change its
   own settings. A project config replaces your global one, so set the sandbox
   there too.
+
+## Delegation
+
+A delegating stage's agent reaches the router only through its own turn's
+broker ([delegation.md](delegation.md)).
+
+- Each parent turn gets a new Unix socket and a 32-byte token file in a
+  private 0700 directory (`model-router-orch` beside the terminal host's).
+  The harness's `model-router __mcp-bridge` presents the token; one live
+  connection per turn; both files are removed when the turn ends. The
+  environment, argv, `mcp.json`, and previews hold only their paths.
+- Every sandboxed stage has every orchestration directory hidden (bubblewrap
+  tmpfs; Seatbelt denies reads, writes, and connects). A delegating turn gets
+  back only its own socket and token file, after every deny. Other launches
+  drop inherited `MODEL_ROUTER_ORCH_*` variables.
+- Tasks always run in their own OS sandbox (`shared`: read-only; `worktree`:
+  writable inside its worktree, Git's shared refs, hooks, and config
+  read-only; `objects/` and its own `worktrees/<name>/` stay writable) and
+  are refused when no backend works. A task, launched run, or schedule never
+  exceeds its creator on write access, native permissions (`extra_args` or an
+  escalating setting count as escalated), network, sandbox enforcement, or
+  `sandbox_writable` paths outside the creator's.
+- A worktree task's patch is sealed by the router after the task ends,
+  hashed in `run.json`, re-checked against `protected_paths` and for `.git`
+  or `.model-router` paths, and applied only by `task_apply`, with a journal
+  that crash recovery settles.
+- `delegation` and `[delegates.*]` need project trust and enter the run's
+  approval digest; untrusted, they are ignored.
+- Runs an agent launches get their own worktree, may not exceed the
+  launcher's ceiling (router checks and a secret scanner count as unsandboxed
+  commands), launch no runs or schedules, and count toward the launcher's
+  budget. A ship stage in a run an agent or schedule created always asks for
+  confirmation.
+- Schedules fire only with an approval receipt in
+  `<config dir>/schedule-approvals`, bound to everything the schedule would
+  run; any edit, pause, or enable forgets it, and `trust --revoke` forgets
+  them all. Sandboxed stages cannot write `<config dir>`.
 
 ## Secrets and redaction
 
@@ -262,4 +312,5 @@ Some guarantees depend on the harness or OS rather than the router itself:
 | Detached processes | The router sandbox has no PID namespace. A process a harness detaches into a new session outlives the stage's process group and keeps its sandbox permissions. |
 | Custom `TMPDIR` / `XDG_RUNTIME_DIR` | Terminal-host socket hiding covers standard runtime/temp socket paths; a concurrent `mr` launched with a custom `TMPDIR` or `XDG_RUNTIME_DIR` puts its sockets elsewhere. |
 | Built-in secret scan | Pattern matching catches high-confidence token formats only; pair with an external `secret_scanner` (e.g. `gitleaks`) when broader coverage is required. |
+| Unsandboxed delegating stages | With `sandbox = "off"`, any process of your user can read a running turn's token file and reach its broker, as it could anything else you run. |
 | Live spend caps | Budgets check after each attempt completes; an in-progress attempt is not stopped mid-stream (use `timeout_seconds` and `stall_timeout_seconds` to bound runaways). |

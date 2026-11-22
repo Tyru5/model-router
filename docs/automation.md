@@ -332,6 +332,24 @@ claude mcp add model-router -- model-router serve --mcp -C /path/to/project
 
 Tools, Codex setup, HTTP routes: [serve.md](serve.md).
 
+## Schedules
+
+Schedules a delegating stage's agent created (`schedule_task`; see
+[delegation.md](delegation.md)). A schedule fires only after you approve it,
+and again after any edit, pause, or enable.
+
+| Command | Effect |
+| --- | --- |
+| `schedules` / `schedules list [--json]` | Each schedule: approval state, trigger, workflow, task, pause reason. |
+| `schedules approve ID` | Approve the schedule as it stands now (the project config must be trusted). |
+| `schedules pause ID` | Pause it; its approval is forgotten. |
+| `schedules enable ID` | Enable it again; it needs approval. |
+| `schedules delete ID` | Delete it. |
+| `schedules tick` | Fire every approved, due schedule and drive its runs to an end; exits non-zero when one failed. For cron or systemd/launchd timers. |
+
+`serve` fires due schedules every 30 s and drives their runs; `serve --http`
+adds `POST /schedules/<id>/trigger` for webhook schedules.
+
 ## Scripting notes
 
 - Without a terminal, `run`/`resume` stop at interactive stages (resume from a

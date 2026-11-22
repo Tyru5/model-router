@@ -74,6 +74,33 @@ pub struct StageReport {
     /// A fork reused this stage's handoff from its source run without running it.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub inherited: bool,
+    /// Tasks the latest attempt's agent delegated.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<TaskReport>,
+    /// Runs the stage's agent launched (`run_launch`), across attempts.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub launched_runs: Vec<String>,
+}
+
+/// One delegated task, as a report shows it.
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskReport {
+    pub id: String,
+    /// The named delegate, or the ad-hoc harness.
+    pub target: String,
+    pub harness: String,
+    pub model: String,
+    pub role: Role,
+    pub isolation: String,
+    pub status: String,
+    pub turns: usize,
+    pub summary: Option<String>,
+    pub verdict: Option<String>,
+    /// Sealed patch revisions, and which reached the checkout.
+    pub patches: usize,
+    pub applied: usize,
+    pub usage: UsageTotal,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -405,14 +432,8 @@ pub fn usage_total_with(run: &Run, pricing: &Pricing) -> UsageTotal {
     let mut sum = UsageTotal::default();
     for (index, state) in run.stages.iter().enumerate() {
         let (provider, billing) = cost::stage_estimate_params(run, index);
-        let attempts = state.attempts.iter().chain(
-            state
-                .fan_out
-                .iter()
-                .flat_map(|f| &f.candidates)
-                .flat_map(|c| &c.attempts),
-        );
-        for attempt in attempts {
+        let candidates = state.candidate_attempts().map(|(_, a)| a);
+        for attempt in state.attempts.iter().chain(candidates) {
             let estimate = cost::estimate_with_billing(
                 attempt.usage.as_ref(),
                 &attempt.model,
@@ -423,6 +444,16 @@ pub fn usage_total_with(run: &Run, pricing: &Pricing) -> UsageTotal {
             sum.attempts += 1;
             sum.cost.add(&estimate);
             if let Some(usage) = attempt.usage {
+                sum.reported += 1;
+                sum.cost_reported += usize::from(usage.cost_usd.is_some());
+                sum.sum = sum.sum + usage;
+            }
+        }
+        for (task, turn) in state.task_turns() {
+            let estimate = cost::task_turn_estimate(run, task, turn, pricing);
+            sum.attempts += 1;
+            sum.cost.add(&estimate);
+            if let Some(usage) = turn.usage {
                 sum.reported += 1;
                 sum.cost_reported += usize::from(usage.cost_usd.is_some());
                 sum.sum = sum.sum + usage;
@@ -440,21 +471,30 @@ pub fn build(run: &Run) -> RunReport {
 pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
     let mut estimates: Vec<Vec<cost::Estimate>> = Vec::with_capacity(run.stages.len());
     let mut candidate_estimates: Vec<Vec<cost::Estimate>> = Vec::with_capacity(run.stages.len());
+    // Delegated tasks' turns, with their usage, priced under each task's target.
+    let task_estimates: Vec<Vec<(Option<crate::handoff::Usage>, cost::Estimate)>> = run
+        .stages
+        .iter()
+        .map(|state| {
+            state
+                .task_turns()
+                .map(|(task, turn)| {
+                    (
+                        turn.usage,
+                        cost::task_turn_estimate(run, task, turn, pricing),
+                    )
+                })
+                .collect()
+        })
+        .collect();
     for (index, state) in run.stages.iter().enumerate() {
         let (provider, billing) = cost::stage_estimate_params(run, index);
         let est = |a: &Attempt| {
             cost::estimate_with_billing(a.usage.as_ref(), &a.model, provider, billing, pricing)
         };
         estimates.push(state.attempts.iter().map(est).collect());
-        candidate_estimates.push(
-            state
-                .fan_out
-                .iter()
-                .flat_map(|f| &f.candidates)
-                .flat_map(|c| &c.attempts)
-                .map(est)
-                .collect(),
-        );
+        // The current round's candidates first: `FanOutReport` slices them.
+        candidate_estimates.push(state.candidate_attempts().map(|(_, a)| est(a)).collect());
     }
     // Only an unfinished attempt reads the clock.
     let now = Utc::now();
@@ -474,13 +514,14 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
     let mut reported_files: Vec<String> = vec![];
     let mut seen_files: HashSet<String> = HashSet::new();
     let mut stages = vec![];
-    for (((stage, state), estimates), candidate_estimates) in run
+    for (stage_index, (((stage, state), estimates), candidate_estimates)) in run
         .workflow
         .stages
         .iter()
         .zip(&run.stages)
         .zip(&estimates)
         .zip(&candidate_estimates)
+        .enumerate()
     {
         let last = state.attempts.last();
         let mut checks: Vec<_> = last
@@ -622,11 +663,7 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
                 applied: fan.selection.as_ref().is_some_and(|s| s.applied),
             }
         });
-        let candidate_attempts = state
-            .fan_out
-            .iter()
-            .flat_map(|f| &f.candidates)
-            .flat_map(|c| &c.attempts);
+        let candidate_attempts = state.candidate_attempts().map(|(_, a)| a);
         stages.push(StageReport {
             name: stage.name.clone(),
             role: stage.role,
@@ -636,13 +673,15 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
             attempts: state.attempts.len(),
             retries: state.attempts.len().saturating_sub(1),
             active_seconds: state.attempts.iter().map(seconds).sum(),
-            // Spend counts every candidate's.
-            usage: total(
+            // Spend counts every candidate's and every delegated task's.
+            usage: usage_sum(
                 state
                     .attempts
                     .iter()
                     .zip(estimates)
-                    .chain(candidate_attempts.zip(candidate_estimates)),
+                    .chain(candidate_attempts.zip(candidate_estimates))
+                    .map(|(a, e)| (a.usage, e))
+                    .chain(task_estimates[stage_index].iter().map(|(u, e)| (*u, e))),
             ),
             budget: stage.budget,
             checks,
@@ -650,6 +689,58 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
             handoff_source: last.and_then(|a| a.handoff_source),
             fan_out,
             inherited: state.inherited.is_some(),
+            tasks: state
+                .attempts
+                .last()
+                .map(|attempt| {
+                    attempt
+                        .tasks
+                        .iter()
+                        .map(|task| {
+                            let estimates: Vec<cost::Estimate> = task
+                                .turns
+                                .iter()
+                                .map(|turn| cost::task_turn_estimate(run, task, turn, pricing))
+                                .collect();
+                            let handoff = task.latest_handoff.as_ref().or(task.handoff.as_ref());
+                            TaskReport {
+                                id: task.id.clone(),
+                                target: task
+                                    .target
+                                    .delegate
+                                    .clone()
+                                    .unwrap_or_else(|| task.target.harness.clone()),
+                                harness: task.target.harness.clone(),
+                                model: task.target.model.clone(),
+                                role: task.role,
+                                isolation: task.isolation.label().into(),
+                                status: task.status.label().into(),
+                                turns: task.turns.len(),
+                                summary: handoff.map(|h| h.summary.clone()),
+                                verdict: handoff.map(|h| format!("{:?}", h.verdict).to_lowercase()),
+                                patches: task.patches.len(),
+                                applied: task
+                                    .patches
+                                    .iter()
+                                    .filter(|p| {
+                                        p.apply.as_ref().is_some_and(|a| a.applied_at.is_some())
+                                    })
+                                    .count(),
+                                usage: usage_sum(
+                                    task.turns.iter().map(|t| t.usage).zip(estimates.iter()),
+                                ),
+                                error: task.error.clone(),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            launched_runs: state
+                .attempts
+                .iter()
+                .flat_map(|a| &a.launched_runs)
+                .map(|l| l.id.clone())
+                .collect(),
         });
     }
     // Stable, so each kind keeps stage order.
@@ -670,7 +761,7 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
         retries: stages.iter().map(|s| s.retries).sum(),
         repair_passes: run.repair_passes,
         max_repair_passes: run.workflow.max_repair_passes,
-        usage: total(
+        usage: usage_sum(
             run.stages
                 .iter()
                 .zip(&estimates)
@@ -679,14 +770,10 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
                     run.stages
                         .iter()
                         .zip(&candidate_estimates)
-                        .flat_map(|(s, e)| {
-                            s.fan_out
-                                .iter()
-                                .flat_map(|f| &f.candidates)
-                                .flat_map(|c| &c.attempts)
-                                .zip(e)
-                        }),
-                ),
+                        .flat_map(|(s, e)| s.candidate_attempts().map(|(_, a)| a).zip(e)),
+                )
+                .map(|(a, e)| (a.usage, e))
+                .chain(task_estimates.iter().flatten().map(|(u, e)| (*u, e))),
         ),
         budget: run.workflow.budget,
         prices_as_of: cost::table_as_of().into(),
@@ -708,11 +795,22 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
 }
 
 fn total<'a>(attempts: impl IntoIterator<Item = (&'a Attempt, &'a cost::Estimate)>) -> UsageTotal {
+    usage_sum(
+        attempts
+            .into_iter()
+            .map(|(attempt, estimate)| (attempt.usage, estimate)),
+    )
+}
+
+/// Sums processes' usage and estimates: stage attempts, candidates, tasks.
+fn usage_sum<'a>(
+    processes: impl IntoIterator<Item = (Option<crate::handoff::Usage>, &'a cost::Estimate)>,
+) -> UsageTotal {
     let mut total = UsageTotal::default();
-    for (attempt, estimate) in attempts {
+    for (usage, estimate) in processes {
         total.attempts += 1;
         total.cost.add(estimate);
-        if let Some(usage) = attempt.usage {
+        if let Some(usage) = usage {
             total.reported += 1;
             total.cost_reported += usize::from(usage.cost_usd.is_some());
             total.sum = total.sum + usage;
@@ -1113,8 +1211,56 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
                 let _ = writeln!(text, "    {line}");
             }
         }
+        for task in &stage.tasks {
+            let _ = writeln!(text, "    {}", task_text(task));
+        }
+        if !stage.launched_runs.is_empty() {
+            let _ = writeln!(
+                text,
+                "    launched runs: {}",
+                stage.launched_runs.join(", ")
+            );
+        }
     }
     text
+}
+
+/// A delegated task in one line: target, status, verdict, patches, spend.
+pub fn task_text(task: &TaskReport) -> String {
+    let mut line = format!(
+        "task {} {} ({}, {}) {}",
+        task.id,
+        task.target,
+        task.role.label(),
+        task.isolation,
+        task.status
+    );
+    if let Some(verdict) = &task.verdict {
+        let _ = write!(line, " · {verdict}");
+    }
+    if task.patches > 0 {
+        let _ = write!(
+            line,
+            " · {} patch(es), {} applied",
+            task.patches, task.applied
+        );
+    }
+    let _ = write!(
+        line,
+        " · {}",
+        cost_text(&task.usage.cost, &Budget::default())
+    );
+    if let Some(summary) = &task.summary {
+        let _ = write!(
+            line,
+            " · {}",
+            crate::storage::truncate(summary.lines().next().unwrap_or(""), 100)
+        );
+    }
+    if let Some(error) = &task.error {
+        let _ = write!(line, " · {}", crate::storage::truncate(error, 100));
+    }
+    line
 }
 
 /// A best-of-N stage's judge, choice, and candidates, one line each.

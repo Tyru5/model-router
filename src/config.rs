@@ -183,6 +183,9 @@ pub struct Stage {
     /// Best-of-N: candidates run in their own worktrees and a judge picks one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fan_out: Option<FanOut>,
+    /// The stage's agent may delegate tasks; see `delegation`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<crate::delegation::Delegation>,
 }
 fn is_true(value: &bool) -> bool {
     *value
@@ -304,6 +307,7 @@ impl Default for Stage {
             ship: None,
             after: vec![],
             fan_out: None,
+            delegation: None,
         }
     }
 }
@@ -528,6 +532,11 @@ pub struct CustomAdapter {
     /// `prompt_stdin`), `"arg"`, or `{ flag = "-p" }`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<CustomPrompt>,
+    /// Arguments that hand a delegating stage's harness the router's MCP
+    /// server; `{mcp_config}` is a Claude-format MCP config file. Without
+    /// them the adapter cannot delegate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_config_args: Option<Vec<String>>,
 }
 
 /// A custom adapter's output parser, named after the built-in formats.
@@ -602,6 +611,9 @@ impl CustomAdapter {
         }
         if let Some(args) = &self.follow_up_args {
             fields.push(("follow-up", args.clone()));
+        }
+        if let Some(args) = &self.mcp_config_args {
+            fields.push(("mcp config", args.clone()));
         }
         for (name, flag) in [
             ("model flag", &self.model_flag),
@@ -693,6 +705,9 @@ pub struct Settings {
     /// Price overrides by model ID, USD per million tokens; see `cost`.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub pricing: BTreeMap<String, crate::cost::Price>,
+    /// Named delegate targets for stages' `delegation`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub delegates: BTreeMap<String, crate::delegation::Delegate>,
     /// Load notes: unknown fields, migrations, effort levels, trust. Not saved.
     #[serde(skip)]
     pub warnings: Vec<String>,
@@ -714,6 +729,7 @@ impl Default for Settings {
             adapters: BTreeMap::new(),
             providers: BTreeMap::new(),
             pricing: BTreeMap::new(),
+            delegates: BTreeMap::new(),
             warnings: vec![],
             ignored: None,
             explicit_config: None,
@@ -790,6 +806,13 @@ fn known_keys() -> &'static KnownKeys {
             cache_write: Some(1.0),
         };
         sample.pricing.insert("m".into(), price);
+        sample.delegates.insert(
+            "d".into(),
+            crate::delegation::Delegate {
+                harness: "codex".into(),
+                ..crate::delegation::Delegate::default()
+            },
+        );
         let budget = keys(&Budget {
             max_usd: Some(1.0),
             max_tokens: Some(1),
@@ -802,6 +825,7 @@ fn known_keys() -> &'static KnownKeys {
             session: Some(CustomSession::default()),
             resume_args: Some(vec![]),
             follow_up_args: Some(vec![]),
+            mcp_config_args: Some(vec![]),
             model_flag: Some(String::new()),
             effort_flag: Some(String::new()),
             prompt: Some(CustomPrompt::Mode(PromptMode::Arg)),
@@ -1139,6 +1163,12 @@ impl Settings {
         for (name, provider) in &self.providers {
             crate::providers::validate(name, provider)?;
         }
+        crate::delegation::config::validate(
+            &self.workflows,
+            &self.delegates,
+            &self.adapters,
+            &self.providers,
+        )?;
         for (model, price) in &self.pricing {
             ensure!(
                 price.is_valid(),

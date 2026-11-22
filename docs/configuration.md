@@ -71,6 +71,7 @@ version = 2
 [adapters.NAME]      # custom harnesses
 [providers.NAME]     # OpenAI-compatible endpoints
 [pricing."MODEL"]    # token prices
+[delegates.NAME]     # targets a delegating stage's agent may hand tasks to
 ```
 
 ## `[[workflows]]`
@@ -116,6 +117,7 @@ version = 2
 | `ship` | defaults | Ship options; `ship` role only. Below. |
 | `after` | `[]` | Stage IDs this stage waits for. Any `after` makes the workflow a graph. |
 | `fan_out` | none | Best-of-N candidates and judge. Below. |
+| `delegation` | none | The stage's agent may delegate tasks, launch runs, and schedule work. Below. Needs trust in a project config. |
 
 ### `checks`
 
@@ -145,6 +147,35 @@ fan_out = { judge = "judge", candidates = [
 | --- | --- | --- |
 | `candidates` | required | 2–8 of `{ id?, harness, model?, provider?, effort? }`. IDs (letters, digits, `-`, `_`) default to `c1`, `c2`, … A candidate on another harness drops the stage's `harness_settings` and `extra_args`. |
 | `judge` | `"auto"` | `auto` or the ID of a review stage that runs after this one. |
+
+### `delegation`
+
+```toml
+[workflows.stages.delegation]
+delegates = ["codex-review"]     # named targets ([delegates.NAME])
+harnesses = ["opencode"]         # ad-hoc targets the model may pick
+models = ["openrouter/*"]        # globs ad-hoc models must match
+max_tasks = 12
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `delegates` | `[]` | Named targets this stage may use. |
+| `harnesses` | `[]` | Harnesses the model may pick ad hoc. Empty allows named targets only. |
+| `models` | `[]` | Globs (`*`, `?`) ad-hoc models must match. Empty: the harness's catalog, or any model for a harness with manual entry. |
+| `providers` | `[]` | Router providers ad-hoc targets may use. |
+| `max_tasks` | `12` | `delegate_task` calls per attempt (1–64). |
+| `max_parallel` | `3` | Task processes at a time (1–16). |
+| `max_wake_turns` | `8` | Follow-up turns that hand results to the parent (1–32). |
+| `runs` | `false` | Run tools (`run_launch`, …). |
+| `max_runs` | `4` | Runs one attempt may launch (0–20). |
+| `schedules` | `false` | Schedule tools (`schedule_task`, …). |
+
+The stage's harness must accept the router's MCP server: Claude Code, Codex,
+OpenCode, or a custom adapter with `mcp_config_args`. A delegating stage's
+`stall_timeout_seconds` must be at least 60, since a tool call waits up to 45 s
+without output. Not on fan-out, ship, or summary stages. See
+[delegation.md](delegation.md).
 
 ### `budget`
 
@@ -193,12 +224,39 @@ Custom harnesses. A project's adapters need trust.
 | `model_flag` | none | Appends `FLAG model` after `args` when the stage sets a model. |
 | `effort_flag` | none | Appends `FLAG effort`. |
 | `prompt` | none | `"stdin"`, `"arg"`, or `{ flag = "-p" }`. |
+| `mcp_config_args` | none | Arguments that hand a delegating stage's harness the router's MCP server; `{mcp_config}` is a Claude-format config file. Appended unless the template uses `{mcp_config}` itself. Without it the adapter cannot delegate. Enters the trust digest. |
 
 Argument order: `args`, model flag, effort flag, extra arguments, prompt.
 Placeholders: `{prompt}`, `{prompt_file}`, `{handoff_file}`, `{model}`,
 `{provider}`, `{effort}`, `{workspace}`, `{run_dir}`, `{session}`, plus
 `{base_url}` and `{api_key_env}` for a configured `[providers.NAME]`. No shell
 evaluates them. See [harnesses.md](harnesses.md#custom-adapters).
+
+## `[delegates.NAME]`
+
+A named target for stages' `delegation`, in the same file as the workflows
+that name it (config files do not merge). Needs trust in a project config.
+
+```toml
+[delegates.codex-review]
+harness = "codex"
+model = "gpt-6.2-sol"
+effort = "high"
+harness_settings = { sandbox = "read-only" }
+isolation = "shared"
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `harness` | required | Built-in name or an `[adapters.NAME]` key. |
+| `model`, `provider`, `effort` | `""` | As for a stage. |
+| `harness_settings` | `{}` | Native settings; may not exceed a stage that names it. |
+| `timeout_seconds`, `stall_timeout_seconds` | the stage's | Per task turn. |
+| `isolation` | by role | `shared` (read-only in the parent's checkout) or `worktree`. |
+| `billing` | unset | As for a stage. |
+
+No `extra_args`, `sandbox*`, `mode`, `checks`, or `budget`: tasks run
+unattended, in their own OS sandbox.
 
 ## `[providers.NAME]`
 
@@ -278,6 +336,8 @@ harness = "codex"
 | `MODEL_ROUTER_HARNESS_VERSIONS` | Override detected versions, e.g. `opencode=1.4.0`. |
 | `MODEL_ROUTER_FRAME_MARKER=1`, `MODEL_ROUTER_FRAME_FILE` | Test hook: smoke tests wait on frames written to this file. |
 | `MODEL_ROUTER_GROUP` | Set by the router on every harness and check it launches: a random marker that crash recovery uses to recognise the process group. Not read from your environment. |
+| `MODEL_ROUTER_ORCH_SOCK`, `MODEL_ROUTER_ORCH_TOKEN_FILE` | Set by the router on a delegating turn's harness: its broker socket and token file, which `model-router __mcp-bridge` reads. Removed from every other launch. |
+| `MODEL_ROUTER_BRIDGE_PROGRAM` | Test hook: the program delegating harnesses start as the bridge (default: this `model-router`). |
 | `MODEL_ROUTER_SHIP_FILES` | Set by the router on `ship.secret_scanner`: newline-separated repository-relative paths of the planned ship files. Not read from your environment. |
 | `NO_COLOR` | Disables TUI colours (crossterm). Harnesses are always launched with `NO_COLOR=1`. |
 | `TERM=dumb` | Skips the startup animation. |

@@ -57,6 +57,7 @@ fn build(
         attempt_dir: dir.path(),
         prompt_file: dir.path(),
         handoff_file: dir.path(),
+        mcp: None,
     };
     adapters::build(stage, adapters, &BTreeMap::new(), "task", &paths)
 }
@@ -124,6 +125,7 @@ fn new_fields_drive_prompt_model_effort_output_session_and_resume() {
         attempt_dir: dir.path(),
         prompt_file: dir.path(),
         handoff_file: dir.path(),
+        mcp: None,
     };
     let resumed = adapters::resume(
         &stage("spec", Mode::Unattended),

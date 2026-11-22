@@ -336,3 +336,130 @@ pub fn ship(project: &Path, id: &str, push: bool, draft_pr: bool, yes: bool) -> 
     }
     Ok(())
 }
+
+/// What `model-router schedules` does.
+pub enum SchedulesCommand {
+    List { json: bool },
+    Approve(String),
+    Pause(String),
+    Enable(String),
+    Delete(String),
+    Tick,
+}
+
+/// `model-router schedules`: the schedules a stage's agent created.
+pub fn schedules(
+    project: &Path,
+    command: SchedulesCommand,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    use model_router::delegation::schedules;
+    match command {
+        SchedulesCommand::List { json } => {
+            let store = schedules::load(project)?;
+            let settings = schedules::trusted_settings(project).ok();
+            let now = chrono::Utc::now();
+            if json {
+                let rows: Vec<serde_json::Value> = store
+                    .schedules
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "schedule": s,
+                            "approved": settings.as_ref().is_some_and(|c| schedules::approved(project, s, c)),
+                            "next_due": schedules::next_due(s, now),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+                return Ok(());
+            }
+            if store.schedules.is_empty() {
+                println!("No schedules.");
+                return Ok(());
+            }
+            for s in &store.schedules {
+                let approved = settings
+                    .as_ref()
+                    .is_some_and(|c| schedules::approved(project, s, c));
+                let state = match (s.enabled, approved) {
+                    (false, _) => "paused",
+                    (true, true) => "approved",
+                    (true, false) => "needs approval",
+                };
+                println!(
+                    "{}  {state}  {}  workflow {}  task: {}{}",
+                    s.id,
+                    s.trigger.describe(),
+                    s.workflow.as_deref().unwrap_or("(default)"),
+                    model_router::storage::truncate(&s.task, 80),
+                    s.paused_reason
+                        .as_ref()
+                        .map(|r| format!("  ({r})"))
+                        .unwrap_or_default()
+                );
+            }
+            Ok(())
+        }
+        SchedulesCommand::Approve(id) => {
+            let schedule = schedules::approve(project, &id)?;
+            println!(
+                "Approved {}: {} runs workflow {} with task: {}",
+                schedule.id,
+                schedule.trigger.describe(),
+                schedule.workflow.as_deref().unwrap_or("(default)"),
+                schedule.task
+            );
+            Ok(())
+        }
+        SchedulesCommand::Pause(id) => {
+            schedules::set_enabled(project, &id, false)?;
+            println!("Paused {id}; enabling it again needs approval.");
+            Ok(())
+        }
+        SchedulesCommand::Enable(id) => {
+            schedules::set_enabled(project, &id, true)?;
+            println!("Enabled {id}; approve it with: model-router schedules approve {id}");
+            Ok(())
+        }
+        SchedulesCommand::Delete(id) => {
+            schedules::delete(project, &id)?;
+            println!("Deleted {id}.");
+            Ok(())
+        }
+        SchedulesCommand::Tick => {
+            let fired = schedules::fire_due(project, chrono::Utc::now(), None)?;
+            let mut failed = 0;
+            for item in fired {
+                let Some(mut run) = item.run else {
+                    failed += 1;
+                    eprintln!(
+                        "{}: launch failed: {}",
+                        item.schedule,
+                        item.error.unwrap_or_default()
+                    );
+                    continue;
+                };
+                // `tick` is its own run host: it drives each run to an end.
+                let action = model_router::engine::drive(&mut run, cancel, |_| {});
+                match action {
+                    Ok(action) => println!("{}: run {} {:?}", item.schedule, run.id, action),
+                    Err(error) => {
+                        failed += 1;
+                        eprintln!("{}: run {}: {error:#}", item.schedule, run.id);
+                    }
+                }
+                if matches!(
+                    run.status,
+                    model_router::engine::Status::Failed
+                        | model_router::engine::Status::Blocked
+                        | model_router::engine::Status::Cancelled
+                ) {
+                    failed += 1;
+                }
+            }
+            ensure!(failed == 0, "{failed} scheduled occurrence(s) failed");
+            Ok(())
+        }
+    }
+}

@@ -56,7 +56,7 @@ paths all read it. An entry declares:
 | Field | Meaning |
 | --- | --- |
 | `programs`, `identity` | Executable candidates; a shared name (Cursor's `agent`) is accepted only when its path or `--help` identifies it. |
-| `args` | Per-mode templates of `Part`s, in order: `Args(&[..])` literals (`{final_file}` expands), `Schema`, `Model`, `Provider`, `Effort`, `Extra` (permission settings, then extra arguments), `Prompt`, `ModelEnv`. |
+| `args` | Per-mode templates of `Part`s, in order: `Args(&[..])` literals (`{final_file}` expands), `Schema`, `Model`, `Provider`, `Effort`, `Extra` (permission settings, then extra arguments), `Prompt`, `ModelEnv`, `Mcp` (a delegating stage's MCP server; nothing otherwise). |
 | `prompt` | Per mode: `Stdin`, `StdinArg("-")`, `Arg`, `Flag("-p")`, `AtFile`, `MessageFile(flag)`, `ReadAndLoad` (Aider's command file). |
 | `model`, `effort`, `efforts` | `Flag`/`Qualified` (provider/model)/`Mode`; effort `Flag`, `ConfigKv`, `ModelSuffix('#')`, or `None`, plus documented levels. |
 | `provider`, `routing` | How a native provider name is passed, and how a `[providers.NAME]` entry is injected: `OwnAccount`, `Registry`, `OpenAiEnv { .. }`, or the custom `CodexConfig`/`OpencodeJson` strategies. |
@@ -91,6 +91,26 @@ receives the prompt the same way an unattended launch does, requires `session`
 (`assign` or `reported`), and enters the project trust digest only when set.
 `resume_args` enables interactive takeover; `follow_up_args` enables
 `handoff_repair`.
+
+## Delegation MCP injection
+
+A delegating stage's harness receives the router's MCP server for one launch,
+never by editing user or project config (`HarnessSpec::mcp`, rendered by
+`Part::Mcp`). Every launch also gets `MODEL_ROUTER_ORCH_SOCK` and
+`MODEL_ROUTER_ORCH_TOKEN_FILE`.
+
+| Harness | Injection | Wake (follow-up) |
+| --- | --- | --- |
+| Claude Code | `--mcp-config <turn>/mcp.json --allowedTools=mcp__model-router__*` | `--resume` |
+| Codex | `--config mcp_servers.model-router.{command,args,env,tool_timeout_sec=120}` (TOML-quoted) | `exec resume` (not with `ollama`/`lmstudio`) |
+| OpenCode | `mcp.model-router` (`type = "local"`) in `OPENCODE_CONFIG_CONTENT` | `run --session` |
+| Custom | `mcp_config_args` with `{mcp_config}` (Claude format) | `follow_up_args` |
+
+Pi, omp, Cursor, Gemini, Goose, Aider, Amp, and Copilot cannot be delegating
+parents: no per-launch MCP option, or (Amp) one whose format could not be
+confirmed offline. Every harness can run tasks. `doctor` probes the
+injection flags; `tests/fixtures/adapter-golden/delegation.json` records the
+exact launches.
 
 ## Native structured output
 
