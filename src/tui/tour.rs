@@ -112,22 +112,44 @@ fn saved(path: &Path) -> Option<Outcome> {
 /// Where the user is on the way to a completed run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Step {
-    /// Harnesses has not shown which agent CLIs are installed yet.
+    /// Harnesses has not shown which agent CLIs are installed yet, e.g. for
+    /// a project just opened.
     Harnesses,
     /// Checks found no installed harness.
     NoHarness,
     /// Away from Workflow before a run started.
     Workflow,
-    /// An enabled stage uses a harness that is not installed.
+    /// Every stage is off, so no run can start.
+    NoStage,
+    /// An enabled stage, or one of its fan-out candidates, uses a harness
+    /// that is not installed.
     Stage {
         name: String,
         harness: String,
     },
     Task,
     Start,
-    /// The followed run is under way, in this state.
-    Watch(Status),
+    /// The followed run is under way.
+    Watch(Watch),
     Done,
+}
+
+/// What the followed run needs, as far as the tour can tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Watch {
+    /// Runs is not shown.
+    Away,
+    /// Runs shows another run, which the run keys would act on.
+    Unselected,
+    Running,
+    Interactive,
+    Handoff,
+    /// Its USD budget stopped it; retrying stops again.
+    Budget,
+    /// Its repair limit stopped it.
+    Repair,
+    /// Failed, blocked, or cancelled for another reason.
+    Stopped,
 }
 
 impl Step {
@@ -135,7 +157,7 @@ impl Step {
     fn number(&self) -> usize {
         match self {
             Self::Harnesses | Self::NoHarness => 1,
-            Self::Workflow | Self::Stage { .. } => 2,
+            Self::Workflow | Self::NoStage | Self::Stage { .. } => 2,
             Self::Task => 3,
             Self::Start => 4,
             Self::Watch(_) => 5,
@@ -145,7 +167,7 @@ impl Step {
     fn title(&self) -> &'static str {
         match self {
             Self::Harnesses | Self::NoHarness => "Harnesses",
-            Self::Workflow | Self::Stage { .. } => "Stages",
+            Self::Workflow | Self::NoStage | Self::Stage { .. } => "Stages",
             Self::Task => "Task",
             Self::Start => "Start",
             Self::Watch(_) => "Your run",
@@ -154,6 +176,90 @@ impl Step {
     }
 }
 const STEPS: usize = 6;
+
+/// The panel's text width at the minimum 65-column screen. Every step's
+/// last line, the one naming the next key, fits it, so a short panel that
+/// keeps only that line never clips it.
+#[cfg(test)]
+const ACTION_WIDTH: usize = 59;
+
+/// The step's text, ending with the next action; `[key]` marks a key.
+fn text(step: &Step, page: Page) -> Vec<String> {
+    let lines: &[&str] = match step {
+        Step::Harnesses if page == Page::Harnesses => &["Checking which harnesses are installed…"],
+        Step::Harnesses => &[
+            "Model Router runs one task through a workflow of stages. Each stage runs an agent CLI (a harness) with one model, and hands its findings to the next.",
+            "Press [3] to see which harnesses are installed.",
+        ],
+        Step::NoHarness if page == Page::Harnesses => &[
+            "No harness is installed. Install one (Claude Code, Codex, Gemini, OpenCode, …) and log in to it.",
+            "Then press [r] to check again.",
+        ],
+        Step::NoHarness => &[
+            "No harness is installed. Install one and log in to it.",
+            "Then press [3], then [r] to check again.",
+        ],
+        Step::Workflow => &[
+            "✓ marks installed harnesses.",
+            "Press [1] to set up your first run on Workflow.",
+        ],
+        Step::NoStage => &[
+            "Every stage is off, so the run has nothing to do.",
+            "Select one with [←] [→] and press [o] to turn it on.",
+        ],
+        Step::Stage { name, harness } => {
+            return vec![
+                format!(
+                    "Stage “{name}” uses {harness}, which is not installed. Select it with [←] [→]."
+                ),
+                "[h] picks an installed harness; [o] turns it off.".into(),
+            ];
+        }
+        Step::Task => &[
+            "The strip shows this workflow's stages, run left to right. [e] edits the selected stage; [w] switches workflow or adds a preset.",
+            "Press [t], describe a small task, then [Ctrl+S].",
+        ],
+        Step::Start => &[
+            "[P] previews the exact commands without calling a model. Each stage runs your harness with its own login, so it may use paid requests.",
+            "Press [r] to start the run.",
+        ],
+        Step::Watch(Watch::Away) => &["Your run has started.", "Press [2] to follow it on Runs."],
+        Step::Watch(Watch::Unselected) => &[
+            "Another run is selected, and run keys act on it.",
+            "Select yours with [↑] [↓], or [L] lists runs.",
+        ],
+        Step::Watch(Watch::Running) => &[
+            "Each stage's output streams into the feed; [PgUp] [PgDn] scroll and [C] cancels the stage.",
+            "A card appears here when the run needs you.",
+        ],
+        Step::Watch(Watch::Interactive) => &[
+            "This stage is interactive. Work with the harness in its terminal, then exit it (/exit) to hand off to the next stage.",
+            "Press [t] to open the harness's terminal.",
+        ],
+        Step::Watch(Watch::Handoff) => &[
+            "The stage finished and wrote a handoff for the next one.",
+            "[h] inspects it; [a] accepts it and moves on.",
+        ],
+        Step::Watch(Watch::Budget) => &[
+            "The run reached its USD budget; a retry would stop again.",
+            "[B] raises the cap and continues.",
+        ],
+        Step::Watch(Watch::Repair) => &[
+            "Review asked for more repairs than the workflow allows.",
+            "[R] allows one more repair pass; [h] shows the review.",
+        ],
+        Step::Watch(Watch::Stopped) => &[
+            "The run stopped; [h] shows why.",
+            "[y] retries, [m] changes model, [i] retries interactively.",
+        ],
+        Step::Done => &[
+            "Your first run is complete. The brief shows what changed, the checks, and the cost; [d] shows the diff.",
+            "On Workflow [1], [w] adds presets; [?] lists every key.",
+            "[F1] closes the tour.",
+        ],
+    };
+    lines.iter().map(|line| (*line).to_owned()).collect()
+}
 
 impl App {
     /// Shows or hides the tour. Hiding an unfinished tour saves that, so it
@@ -199,23 +305,20 @@ impl App {
     }
 
     pub(super) fn tour_step(&self) -> Step {
-        let followed = self.tour.run.as_ref().and_then(|id| {
-            self.session
-                .runs
-                .iter()
-                .find(|slot| &slot.run.id == id)
-                .map(|slot| slot.run.status)
-        });
-        if let Some(status) = followed {
-            return match status {
-                Status::Complete => Step::Done,
-                status => Step::Watch(status),
-            };
-        }
-        if !self.tour.seen_harnesses {
-            return Step::Harnesses;
+        let followed = self
+            .tour
+            .run
+            .as_ref()
+            .and_then(|id| self.session.runs.iter().find(|slot| &slot.run.id == id));
+        if let Some(slot) = followed {
+            return self.watch(&slot.run);
         }
         let checks = &self.harnesses.checks;
+        // A project switch clears the checks; until Harnesses checks again,
+        // nothing is known about the new project.
+        if !self.tour.seen_harnesses || checks.reports.is_empty() {
+            return Step::Harnesses;
+        }
         if !checks.reports.iter().any(|report| report.installed()) {
             return Step::NoHarness;
         }
@@ -223,15 +326,35 @@ impl App {
             return Step::Workflow;
         }
         let workflow = &self.editor.settings.workflows[self.editor.workflow];
-        let missing = workflow.stages.iter().filter(|s| s.enabled).find(|stage| {
-            checks
-                .report(&stage.harness)
-                .is_some_and(|report| !report.installed())
-        });
-        if let Some(stage) = missing {
+        if !workflow.stages.iter().any(|stage| stage.enabled) {
+            return Step::NoStage;
+        }
+        // The harnesses run creation requires: ship stages run in the router,
+        // and a fan-out stage runs its candidates instead of its own harness.
+        let missing = workflow
+            .stages
+            .iter()
+            .filter(|stage| stage.enabled && stage.role != config::Role::Ship)
+            .flat_map(|stage| {
+                let harnesses: Vec<String> = match &stage.fan_out {
+                    Some(fan) => fan
+                        .candidates
+                        .iter()
+                        .map(|candidate| candidate.stage(stage).harness)
+                        .collect(),
+                    None => vec![stage.harness.clone()],
+                };
+                harnesses.into_iter().map(move |harness| (stage, harness))
+            })
+            .find(|(_, harness)| {
+                checks
+                    .report(harness)
+                    .is_some_and(|report| !report.installed())
+            });
+        if let Some((stage, harness)) = missing {
             return Step::Stage {
                 name: stage.name.clone(),
-                harness: stage.harness.clone(),
+                harness,
             };
         }
         if self.editor.task.trim().is_empty() {
@@ -241,58 +364,31 @@ impl App {
         }
     }
 
-    /// The step's text; `[key]` marks a key.
-    fn tour_text(&self, step: &Step) -> Vec<String> {
-        let page = self.ui.page;
-        match step {
-            Step::Harnesses if page == Page::Harnesses => vec![
-                "Checking which harnesses are installed…".into(),
-            ],
-            Step::Harnesses => vec![
-                "Model Router runs one task through a workflow of stages. Each stage runs an agent CLI (a harness) with one model, and hands its findings to the next.".into(),
-                "Press [3] to see which harnesses are installed.".into(),
-            ],
-            Step::NoHarness if page == Page::Harnesses => vec![
-                "No harness is installed. Install one (Claude Code, Codex, Gemini, OpenCode, …) and log in to it, then press [r] to check again.".into(),
-            ],
-            Step::NoHarness => vec![
-                "No harness is installed. Install one and log in to it, then press [3] and [r] to check again.".into(),
-            ],
-            Step::Workflow => vec![
-                "✓ marks installed harnesses. Press [1] to set up your first run on Workflow.".into(),
-            ],
-            Step::Stage { name, harness } => vec![
-                format!("Stage “{name}” uses {harness}, which is not installed."),
-                "Select it with [←] [→], then press [h] to pick an installed harness, or [o] to turn the stage off.".into(),
-            ],
-            Step::Task => vec![
-                "The strip shows this workflow's stages, run left to right. [e] edits the selected stage; [w] switches workflow or adds a preset.".into(),
-                "Press [t], describe a small task, then [Ctrl+S].".into(),
-            ],
-            Step::Start => vec![
-                "[P] previews the exact commands without calling a model. Each stage runs your harness with its own login, so it may use paid requests.".into(),
-                "Press [r] to start the run.".into(),
-            ],
-            Step::Watch(_) if page != Page::Runs => vec![
-                "Your run has started. Press [2] to follow it on Runs.".into(),
-            ],
-            Step::Watch(Status::Interactive) => vec![
-                "This stage is interactive: [t] opens the harness in this terminal. Work with it there, then exit the harness (/exit) to hand off to the next stage.".into(),
-            ],
-            Step::Watch(Status::AwaitingConfirmation) => vec![
-                "The stage finished and wrote a handoff for the next one. [h] inspects it; [a] accepts it and moves on.".into(),
-            ],
-            Step::Watch(Status::Failed | Status::Blocked | Status::Cancelled) => vec![
-                "The run stopped. [h] shows why. [y] retries the stage, [m] retries it on another model, [i] retries it interactively.".into(),
-            ],
-            Step::Watch(_) => vec![
-                "Each stage's output streams into the feed. [PgUp] [PgDn] scroll; [C] cancels the stage. A card appears here when the run needs you.".into(),
-            ],
-            Step::Done => vec![
-                "Your first run is complete. The brief shows what changed, the checks, and the cost; [d] shows the diff.".into(),
-                "Next: on Workflow [1], [w] switches workflow or adds a preset. [?] lists every key; [F1] closes the tour.".into(),
-            ],
+    /// The step for the followed run.
+    fn watch(&self, run: &crate::engine::Run) -> Step {
+        if run.status == Status::Complete {
+            return Step::Done;
         }
+        if self.ui.page != Page::Runs {
+            return Step::Watch(Watch::Away);
+        }
+        if !self.monitoring() || self.session.run().is_none_or(|shown| shown.id != run.id) {
+            return Step::Watch(Watch::Unselected);
+        }
+        Step::Watch(match run.status {
+            Status::Interactive => Watch::Interactive,
+            Status::AwaitingConfirmation => Watch::Handoff,
+            Status::Failed | Status::Blocked | Status::Cancelled => {
+                if crate::cost::usd_budget_blocked(run) {
+                    Watch::Budget
+                } else if run.repair_blocked() {
+                    Watch::Repair
+                } else {
+                    Watch::Stopped
+                }
+            }
+            _ => Watch::Running,
+        })
     }
 }
 
@@ -320,7 +416,7 @@ pub(super) fn lines(app: &App, palette: Palette) -> Vec<Line<'static>> {
     if !app.tour.open {
         return vec![];
     }
-    app.tour_text(&app.tour_step())
+    text(&app.tour_step(), app.ui.page)
         .iter()
         .map(|text| keyed(text, palette))
         .collect()
@@ -341,7 +437,7 @@ pub(super) fn fit(
             return (lines, height);
         }
         if lines.len() == 1 {
-            // Too narrow for even the action: it is cut, not dropped.
+            // Only below the minimum width: actions fit `ACTION_WIDTH`.
             return (lines, max);
         }
         lines.remove(0);
@@ -398,6 +494,46 @@ mod tests {
         assert_eq!(saved(&path), Some(Outcome::Offered));
         assert_eq!(launch_at(&path, false), Launch::Quiet);
         assert_eq!(launch_at(&path, true), Launch::Quiet);
+    }
+
+    #[test]
+    fn every_step_ends_with_an_action_that_fits_the_narrowest_panel() {
+        use unicode_width::UnicodeWidthStr;
+        let watches = [
+            Watch::Away,
+            Watch::Unselected,
+            Watch::Running,
+            Watch::Interactive,
+            Watch::Handoff,
+            Watch::Budget,
+            Watch::Repair,
+            Watch::Stopped,
+        ];
+        let steps = [
+            Step::Harnesses,
+            Step::NoHarness,
+            Step::Workflow,
+            Step::NoStage,
+            Step::Stage {
+                name: "A stage with a long name".into(),
+                harness: "opencode".into(),
+            },
+            Step::Task,
+            Step::Start,
+            Step::Done,
+        ]
+        .into_iter()
+        .chain(watches.map(Step::Watch));
+        for step in steps {
+            for page in Page::ALL {
+                let lines = text(&step, page);
+                let action = lines.last().unwrap();
+                assert!(
+                    action.width() <= ACTION_WIDTH,
+                    "{step:?} on {page:?}: {action}"
+                );
+            }
+        }
     }
 
     #[test]

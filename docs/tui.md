@@ -44,17 +44,17 @@ run) returns to its step:
 
 | Step | Advances when |
 | --- | --- |
-| 1 Harnesses | Harnesses (`3`) has shown its checks and one harness is installed |
-| 2 Stages | You are on Workflow (`1`) and every enabled stage's harness is installed (`h` picks another, `o` turns a stage off) |
+| 1 Harnesses | Harnesses (`3`) has shown its checks and one harness is installed; again after switching projects |
+| 2 Stages | You are on Workflow (`1`), a stage is on, and every harness the run needs is installed: each enabled stage's, or a fan-out stage's candidates', ship stages excepted (`h` picks another, `o` turns a stage off or on) |
 | 3 Task | The task is not empty (`t`, `Ctrl+S`) |
 | 4 Start | A run starts (`r`); `P` previews it without model calls |
-| 5 Your run | The run completes; the panel names the keys for its state: `2` to follow it, `t` for an interactive stage, `h`/`a` at a handoff, `h`/`y`/`m`/`i` when it stops |
+| 5 Your run | The run completes; the panel names the keys for its state: `2` to follow it, `↑`/`↓` or `L` when another run is selected, `t` for an interactive stage, `h`/`a` at a handoff, `B` when its USD budget stopped it, `R` when its repair limit did, `h`/`y`/`m`/`i` for other stops |
 | 6 Done | `F1` closes it |
 
 The tour follows the first run started while it is open. Starting runs
 uses your harnesses' logins as usual; the tour starts nothing itself. On
-short terminals the panel keeps its last line, the next key, and drops
-the explanation above it.
+short terminals the panel keeps its last line, the next key, which fits a
+65-column screen, and drops the explanation above it.
 
 It opens by itself on the first TUI launch on the machine: no
 `<config dir>/tour.json` and no recent projects. With recent projects but no
