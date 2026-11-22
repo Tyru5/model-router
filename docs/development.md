@@ -98,10 +98,13 @@ One-time setup:
 
 ## Website
 
-`site/` is the landing page: one static `index.html` and `icon.png`, no build
-step. The Vercel project `model-router` (team Tirus) is linked to this
-repository with root directory `site`, so a push to `main` that changes `site/`
-deploys it to production and other branches get preview deployments.
+`site/` is the landing page at `https://model-router.dev`: one static
+`index.html` and `icon.png`, no build step. The Vercel project `model-router`
+(team Tirus) is linked to this repository with root directory `site`, so a push
+to `main` that changes `site/` deploys it to production and other branches get
+preview deployments. The domain is registered through Vercel and uses Vercel
+DNS; `www.model-router.dev` redirects (308) to the apex. The installer stays on
+the R2 domain, `model-router.tiru5.me`.
 
 ## Amp orbs
 
