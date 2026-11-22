@@ -45,7 +45,7 @@ run) returns to its step:
 | Step | Advances when |
 | --- | --- |
 | 1 Harnesses | Harnesses (`3`) has shown its checks and one harness is installed; again after switching projects |
-| 2 Stages | You are on Workflow (`1`), a stage is on, and every harness the run needs is installed: each enabled stage's, or a fan-out stage's candidates', ship stages excepted (`h` picks another, `o` turns a stage off or on) |
+| 2 Stages | You are on Workflow (`1`), a stage is on, and every harness the run needs is installed: each enabled stage's, or a fan-out stage's candidates', ship stages excepted (`h` picks another, or `e` and Fan-out candidates for a candidate's; `o` turns a stage off or on) |
 | 3 Task | The task is not empty (`t`, `Ctrl+S`) |
 | 4 Start | A run starts (`r`); `P` previews it without model calls |
 | 5 Your run | The run completes; the panel names the keys for its state: `2` to follow it, `↑`/`↓` or `L` when another run is selected, `t` for an interactive stage, `h`/`a` at a handoff, `B` when its USD budget stopped it, `R` when its repair limit did, `h`/`y`/`m`/`i` for other stops |

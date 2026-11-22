@@ -3218,7 +3218,8 @@ fn the_tour_follows_the_user_from_harnesses_to_a_completed_run() {
         app.tour_step(),
         Step::Stage {
             name: missing.clone(),
-            harness: "codex".into()
+            harness: "codex".into(),
+            candidate: false,
         }
     );
     assert!(rows(&mut app, 100, 30).join("\n").contains(&missing));
@@ -3330,8 +3331,15 @@ fn the_tour_checks_the_harnesses_a_run_needs_and_at_least_one_stage() {
         app.tour_step(),
         Step::Stage {
             name,
-            harness: "gemini".into()
+            harness: "gemini".into(),
+            candidate: true,
         }
+    );
+    // [h] would change the stage, not the candidate: the panel says [e].
+    assert!(
+        rows(&mut app, 100, 30)
+            .join("\n")
+            .contains("Fan-out candidates")
     );
     // Turning every stage off, as the advice allows, is no way to start.
     for stage in &mut app.editor.settings.workflows[0].stages {

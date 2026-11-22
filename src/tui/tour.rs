@@ -126,6 +126,8 @@ pub(super) enum Step {
     Stage {
         name: String,
         harness: String,
+        /// A fan-out candidate uses it, which `[h]` does not change.
+        candidate: bool,
     },
     Task,
     Start,
@@ -207,12 +209,24 @@ fn text(step: &Step, page: Page) -> Vec<String> {
             "Every stage is off, so the run has nothing to do.",
             "Select one with [←] [→] and press [o] to turn it on.",
         ],
-        Step::Stage { name, harness } => {
+        Step::Stage {
+            name,
+            harness,
+            candidate,
+        } => {
+            let (uses, action) = if *candidate {
+                (
+                    "has a fan-out candidate on",
+                    "[e], then Fan-out candidates; or [o] turns it off.",
+                )
+            } else {
+                ("uses", "[h] picks an installed harness; [o] turns it off.")
+            };
             return vec![
                 format!(
-                    "Stage “{name}” uses {harness}, which is not installed. Select it with [←] [→]."
+                    "Stage “{name}” {uses} {harness}, which is not installed. Select it with [←] [→]."
                 ),
-                "[h] picks an installed harness; [o] turns it off.".into(),
+                action.into(),
             ];
         }
         Step::Task => &[
@@ -344,17 +358,21 @@ impl App {
                         .collect(),
                     None => vec![stage.harness.clone()],
                 };
-                harnesses.into_iter().map(move |harness| (stage, harness))
+                let candidate = stage.fan_out.is_some();
+                harnesses
+                    .into_iter()
+                    .map(move |harness| (stage, harness, candidate))
             })
-            .find(|(_, harness)| {
+            .find(|(_, harness, _)| {
                 checks
                     .report(harness)
                     .is_some_and(|report| !report.installed())
             });
-        if let Some((stage, harness)) = missing {
+        if let Some((stage, harness, candidate)) = missing {
             return Step::Stage {
                 name: stage.name.clone(),
                 harness,
+                candidate,
             };
         }
         if self.editor.task.trim().is_empty() {
@@ -517,6 +535,12 @@ mod tests {
             Step::Stage {
                 name: "A stage with a long name".into(),
                 harness: "opencode".into(),
+                candidate: false,
+            },
+            Step::Stage {
+                name: "A stage with a long name".into(),
+                harness: "opencode".into(),
+                candidate: true,
             },
             Step::Task,
             Step::Start,
