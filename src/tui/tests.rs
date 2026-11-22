@@ -3656,7 +3656,8 @@ fn fork_run_from_stage_checkpoint_launches_worktree_fork_into_session() {
     use crate::config::{CustomAdapter, Mode};
     let project = tempfile::tempdir().unwrap();
     init_git_repo(project.path());
-    let mut app = theme_app(project.path());
+    // Runs record the canonical project path (macOS temp dirs are symlinked).
+    let mut app = theme_app(&std::fs::canonicalize(project.path()).unwrap());
     let mut settings = Settings::default();
     settings.adapters.insert(
         "fake".into(),
@@ -3796,7 +3797,8 @@ fn ad_hoc_ship_shows_preview_and_never_commits_without_confirmation() {
     use crate::config::{CustomAdapter, Mode};
     let project = tempfile::tempdir().unwrap();
     init_git_repo(project.path());
-    let mut app = theme_app(project.path());
+    // Runs record the canonical project path (macOS temp dirs are symlinked).
+    let mut app = theme_app(&std::fs::canonicalize(project.path()).unwrap());
     let mut settings = Settings::default();
     settings.adapters.insert(
         "fake".into(),
