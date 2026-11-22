@@ -91,6 +91,8 @@ fn parent(script: &Path, follow_up: bool) -> CustomAdapter {
     ]);
     CustomAdapter {
         command: "python3".into(),
+        // The scripted parent runs the same way in a terminal.
+        interactive_args: Some(base.clone()),
         args: base,
         session: Some(CustomSession {
             assign: Some("--session-id".into()),
@@ -668,5 +670,47 @@ fn an_agent_s_schedule_fires_only_after_approval_and_once_per_occurrence() {
         schedules::fire_due(project, much_later, None)
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn an_interactive_parent_that_exits_with_tasks_running_is_resumed_unattended() {
+    if !setup() {
+        return;
+    }
+    let turns = json!({
+        "turns": [
+            [{"call": "delegate_task", "args": {"task": "Look around"}}],
+            [{"call": "task_status", "args": {"task_id": "t1"}}]
+        ],
+        "handoffs": {"1": {"summary": "waiting on tasks", "verdict": "blocked"}, "2": {"summary": "final", "verdict": "complete"}}
+    });
+    let mut case = case(turns, true, helper("m"), |stage| {
+        stage.mode = model_router::config::Mode::Interactive;
+    });
+    model_router::process::host::use_program(env!("CARGO_BIN_EXE_model-router").into());
+    assert_eq!(drive(&mut case.run), Action::Interactive);
+    engine::authorize_replay(&mut case.run, None, |_| {}).unwrap_or(());
+    let session = model_router::process::InteractiveSession::new(100, 30);
+    let cancel = AtomicBool::new(false);
+    engine::run_interactive(&mut case.run, &cancel, &session, |_| {}).unwrap();
+    let calls = calls(&case.script);
+    assert_eq!(
+        call(&calls, 2, "task_status")[0]["result"]["status"],
+        "completed"
+    );
+    let state = &case.run.stages[0];
+    assert_eq!(
+        state.handoff.as_ref().map(|h| h.summary.as_str()),
+        Some("final"),
+        "{:?}",
+        case.run.error
+    );
+    let attempt = &state.attempts[0];
+    assert_eq!(attempt.turns.len(), 1, "one unattended wake");
+    // The stage keeps its interactive mode once the wake concluded.
+    assert_eq!(
+        case.run.workflow.stages[0].mode,
+        model_router::config::Mode::Interactive
     );
 }

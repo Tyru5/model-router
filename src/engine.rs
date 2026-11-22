@@ -180,7 +180,7 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
         if run.workflow.stages[run.cursor].fan_out.is_some() {
             execute_fan_out(run, cancel, &mut emit)?;
         } else if run.workflow.stages[run.cursor].delegation.is_some() {
-            delegate::drive_stage(run, cancel, &mut emit)?;
+            delegate::drive_stage(run, cancel, None, &mut emit)?;
         } else {
             execute_stage(run, cancel, None, &mut emit)?;
         }
@@ -217,12 +217,21 @@ pub fn run_interactive(
     stop_orphans(run, &mut emit)?;
     refuse_unproven(run)?;
     crate::trust::authorize_run(run)?;
-    execute_stage(
-        run,
-        cancel,
-        Some((session, &[&lock, &workspace_lock])),
-        &mut emit,
-    )?;
+    if run.workflow.stages[run.cursor].delegation.is_some() {
+        delegate::drive_stage(
+            run,
+            cancel,
+            Some((session, &[&lock, &workspace_lock])),
+            &mut emit,
+        )?;
+    } else {
+        execute_stage(
+            run,
+            cancel,
+            Some((session, &[&lock, &workspace_lock])),
+            &mut emit,
+        )?;
+    }
     if matches!(
         run.status,
         Status::Failed | Status::Blocked | Status::Cancelled

@@ -2,7 +2,7 @@
 //! harness turns, the tasks it delegates, and the wake turns that hand it
 //! their results. A delegating stage is never parallel-safe, so while this
 //! loop runs it is the only thing in flight and the only writer of the run.
-use super::exec::Prepared;
+use super::exec::{Prepared, left_running, lock_paths};
 use super::*;
 use crate::delegation::{
     Isolation,
@@ -53,6 +53,8 @@ fn harness_settings_local(stage: &Stage, configured: &BTreeMap<String, Provider>
 /// What a worker reports.
 enum Msg {
     Spawned(Who, process::Group),
+    /// An interactive parent's terminal host socket.
+    Terminal(PathBuf),
     Output(Who, String),
     ParentDone(Result<process::Outcome>, DateTime<Utc>),
     TaskDone(String, Result<process::Outcome>, DateTime<Utc>),
@@ -73,6 +75,9 @@ enum Phase {
     Running(usize),
     /// Its turn ended with tasks unread; it waits for them.
     Awaiting,
+    /// The interactive parent was left running in its terminal host: live
+    /// tasks are being cancelled before the host takes the run's locks.
+    Releasing,
     /// The stage concluded or stopped.
     Done,
 }
@@ -109,12 +114,20 @@ struct Owner<'a> {
     cancel: &'a AtomicBool,
     /// Catalog model IDs per harness, read once per stage.
     catalogs: std::cell::RefCell<HashMap<String, Vec<String>>>,
+    /// An interactive parent's terminal session and the locks it may hand
+    /// over to its terminal host.
+    interactive: Option<(&'a process::InteractiveSession, &'a [&'a storage::FileLock])>,
+    /// The parent turn released to its terminal host; nothing may write the
+    /// run after the hand-over.
+    released: Option<Result<process::Outcome>>,
+    handed_over: bool,
 }
 
 /// Runs the current stage, which delegates, to its end.
 pub(super) fn drive_stage(
     run: &mut Run,
     cancel: &AtomicBool,
+    interactive: Option<(&process::InteractiveSession, &[&storage::FileLock])>,
     emit: &mut impl FnMut(Event),
 ) -> Result<()> {
     let index = run.cursor;
@@ -150,6 +163,9 @@ pub(super) fn drive_stage(
         journal: &journal,
         cancel,
         catalogs: Default::default(),
+        interactive,
+        released: None,
+        handed_over: false,
     };
     // Turn 1: the broker exists before the launch that names it.
     owner.open_broker(run)?;
@@ -202,7 +218,10 @@ pub(super) fn drive_stage(
                 Err(_) => break,
             }
         }
-        let _ = run.persist();
+        // After a hand-over the terminal host owns the run's locks.
+        if !owner.handed_over {
+            let _ = run.persist();
+        }
         looped
     })
 }
@@ -405,6 +424,36 @@ impl<'a> Owner<'a> {
             .filter(|_| adapters::streams(&self.stage.harness, &run.adapters))
             .map(Duration::from_secs);
         self.labels.insert(Who::Parent, self.stage.name.clone());
+        if let (Some((session, _)), Phase::Running(1)) = (self.interactive, self.phase) {
+            // An interactive first turn runs in its terminal host.
+            let (tx, journal, cancel) = (self.tx.clone(), self.journal, self.cancel);
+            let locks = lock_paths(run).unwrap_or_default();
+            let (invocation, cwd, directory, sandbox) = (
+                prepared.invocation.clone(),
+                run.workspace.clone(),
+                prepared.directory.clone(),
+                prepared.sandbox.clone(),
+            );
+            scope.spawn(move || {
+                let outcome = process::interactive(
+                    &invocation,
+                    &cwd,
+                    &directory,
+                    cancel,
+                    session,
+                    sandbox.as_ref(),
+                    &locks,
+                    |group, socket| {
+                        let _ = journal.add(&group);
+                        let _ = tx.send(Msg::Terminal(socket.to_path_buf()));
+                        let _ = tx.send(Msg::Spawned(Who::Parent, group));
+                    },
+                );
+                let _ = tx.send(Msg::ParentDone(outcome, Utc::now()));
+            });
+            self.turn = Some(prepared);
+            return;
+        }
         self.spawn_process(
             scope,
             Who::Parent,
@@ -453,6 +502,10 @@ impl<'a> Owner<'a> {
                         self.journal.recorded(pgid);
                     }
                 }
+                Msg::Terminal(socket) => {
+                    self.attempt_mut(run).terminal = Some(socket);
+                    let _ = run.persist();
+                }
                 Msg::Output(who, lines) => self.emit_lines(who, lines, emit),
                 Msg::Call(call) => {
                     let reply = self.handle(scope, run, call.request);
@@ -460,6 +513,10 @@ impl<'a> Owner<'a> {
                 }
                 Msg::TaskDone(id, outcome, ended) => {
                     self.task_done(run, &id, outcome, ended)?;
+                    if self.phase == Phase::Releasing {
+                        self.finish_release(run, emit)?;
+                        continue;
+                    }
                     self.launch_queued(scope, run)?;
                     emit(Event::State(Box::new(run.clone())));
                     if self.phase == Phase::Awaiting {
@@ -503,8 +560,29 @@ impl<'a> Owner<'a> {
                 };
                 self.stop_stage(run, status, message, emit)?;
             }
-            Phase::Done => {}
+            Phase::Releasing | Phase::Done => {}
         }
+        Ok(())
+    }
+
+    /// Hands a released interactive parent to its terminal host once every
+    /// task it started has stopped: the host then holds the run's locks, so
+    /// this loop never writes the run again.
+    fn finish_release(&mut self, run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
+        if !self.running.is_empty() {
+            return Ok(());
+        }
+        let Some(outcome) = self.released.take() else {
+            return Ok(());
+        };
+        let (session, held) = self.interactive.context("Not interactive")?;
+        emit(Event::Output(
+            "Delegation closed: the stage's tools stop with the release, and its tasks were cancelled\n"
+                .into(),
+        ));
+        left_running(run, &outcome, session, held, emit)?;
+        self.handed_over = true;
+        self.phase = Phase::Done;
         Ok(())
     }
 
@@ -567,6 +645,15 @@ impl<'a> Owner<'a> {
         let prepared = self.turn.take().context("No parent turn")?;
         // Calls in flight answer parent_not_active from here on.
         self.close_broker();
+        if matches!(&outcome, Ok(o) if o.released) {
+            // Left running in its terminal host: its tools close for good and
+            // its tasks are cancelled before the host takes the locks.
+            self.cancel_live(run);
+            self.released = Some(outcome);
+            self.phase = Phase::Releasing;
+            run.persist()?;
+            return self.finish_release(run, emit);
+        }
         let succeeded = outcome
             .as_ref()
             .is_ok_and(|o| o.success() && !o.cancelled && !o.timed_out && !o.stalled);
@@ -666,7 +753,22 @@ impl<'a> Owner<'a> {
         emit: &mut impl FnMut(Event),
     ) -> Result<()> {
         run.cursor = self.index;
-        conclude(run, prepared, outcome, self.cancel, emit)?;
+        // A wake turn of an interactive stage is an unattended follow-up:
+        // its exit, handoff, and repair are judged as unattended.
+        let woke = self.stage.mode == Mode::Interactive && !self.attempt(run).turns.is_empty();
+        if woke {
+            run.workflow.stages[self.index].mode = Mode::Unattended;
+            self.attempt_mut(run).mode = Mode::Unattended;
+        }
+        let concluded = conclude(run, prepared, outcome, self.cancel, emit);
+        if woke {
+            run.workflow.stages[self.index].mode = Mode::Interactive;
+            if let Some(attempt) = run.stages[self.index].attempts.last_mut() {
+                attempt.mode = Mode::Interactive;
+            }
+            run.persist()?;
+        }
+        concluded?;
         // `classify_exit` counted only this turn; earlier turns count too.
         if self.earlier_usage.is_some() {
             if let Some(attempt) = run.stages[self.index].attempts.last_mut() {
