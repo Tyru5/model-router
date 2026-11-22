@@ -226,7 +226,8 @@ retry = { max_attempts = 2, base_delay_seconds = 5, max_delay_seconds = 60 }
 Retries unattended stage failures matching transient provider or network errors
 (HTTP 429/502/503/504/529, rate limits, overloaded, connection reset/timeout)
 on the same harness and model with capped exponential backoff (`max_attempts`
-`0`–`5`, `base_delay_seconds` `1`–`600`, `max_delay_seconds >= base_delay_seconds`).
+`0`–`5`, `base_delay_seconds` `1`–`600`, `max_delay_seconds` from
+`base_delay_seconds` to `3600`).
 Permanent auth, permission, and invalid-request errors are not retried.
 
 ### `hooks`
@@ -240,7 +241,7 @@ on_failure   = [{ command = ["scripts/notify-fail.sh"] }]
 ```
 
 Each hook entry has `command` (non-empty argv, no shell) and `timeout_seconds`
-(default `120`, max `3600`), run in its own process group with
+(`1`–`3600`, default `120`), run in its own process group with
 `MODEL_ROUTER_HOOK`, `MODEL_ROUTER_RUN_ID`, `MODEL_ROUTER_WORKFLOW`,
 `MODEL_ROUTER_STAGE_ID`, `MODEL_ROUTER_STAGE_ROLE`, and
 `MODEL_ROUTER_STAGE_STATUS`. `before_stage` and `before_ship` abort on non-zero

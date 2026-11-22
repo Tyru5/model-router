@@ -356,11 +356,11 @@ fn field_hint(index: usize) -> &'static str {
     }
 }
 
-/// Formats a positive USD budget for an editor field without trailing noise.
+/// Formats a USD budget for an editor field. `Display` gives the shortest
+/// text that parses back to the same `f64`, with no exponent or trailing
+/// zeros, so saving an unedited field never changes the cap.
 pub(super) fn format_usd_field(usd: f64) -> String {
-    let text = format!("{usd:.4}");
-    let trimmed = text.trim_end_matches('0').trim_end_matches('.');
-    trimmed.to_owned()
+    usd.to_string()
 }
 
 /// Parses a positive token count: plain integer (commas/underscores allowed)
@@ -466,4 +466,21 @@ fn field_preview(field: &InputField<'_>, max_chars: usize) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_usd_field, parse_budget};
+
+    #[test]
+    fn usd_budget_fields_round_trip_without_rounding() {
+        for usd in [0.00001, 0.123456789, 2.5, 5.0, 1234.56789, 1e-9, 1e12] {
+            let text = format_usd_field(usd);
+            let budget = parse_budget(&text, "", "stop", "Workflow").unwrap();
+            assert_eq!(budget.max_usd, Some(usd), "{text}");
+        }
+        assert_eq!(format_usd_field(5.0), "5");
+        assert_eq!(format_usd_field(2.5), "2.5");
+        assert_eq!(format_usd_field(0.00001), "0.00001");
+    }
 }

@@ -421,8 +421,10 @@ fn doctor_reports_versions_and_flags_from_help_without_running_a_model() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let reports: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+    let doc: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let reports = doc["harnesses"].as_array().unwrap();
     assert_eq!(reports.len(), BUILTINS.len() + 1);
+    assert_eq!(doc["providers"], serde_json::json!([]));
     let report = |name: &str| reports.iter().find(|r| r["harness"] == name).unwrap();
     let codex = report("codex");
     assert_eq!(codex["version"], "codex-cli 0.160.0");
@@ -460,7 +462,7 @@ fn doctor_reports_versions_and_flags_from_help_without_running_a_model() {
     assert_eq!(mine["summary"], "not declared");
     assert_eq!(mine["capabilities"], Value::Null);
     assert_eq!(mine["version"], Value::Null);
-    for r in &reports {
+    for r in reports {
         assert!(
             r["notes"][0]
                 .as_str()

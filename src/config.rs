@@ -377,12 +377,12 @@ impl Retry {
             "{scope} retry max_attempts must be 0–5"
         );
         ensure!(
-            self.base_delay_seconds <= 3600,
-            "{scope} retry base_delay_seconds must be at most 3600"
+            (1..=600).contains(&self.base_delay_seconds),
+            "{scope} retry base_delay_seconds must be 1–600"
         );
         ensure!(
-            self.max_delay_seconds <= 3600,
-            "{scope} retry max_delay_seconds must be at most 3600"
+            (self.base_delay_seconds..=3600).contains(&self.max_delay_seconds),
+            "{scope} retry max_delay_seconds must be at least base_delay_seconds and at most 3600"
         );
         Ok(())
     }
@@ -464,8 +464,8 @@ impl Hooks {
                     "{scope} {event} hook commands cannot contain NUL"
                 );
                 ensure!(
-                    hook.timeout_seconds > 0,
-                    "{scope} needs a positive {event} hook timeout"
+                    (1..=3600).contains(&hook.timeout_seconds),
+                    "{scope} {event} hook timeout_seconds must be 1–3600"
                 );
             }
         }
@@ -1473,12 +1473,12 @@ impl Settings {
                 }
                 stage.hooks.validate(&format!("Stage {}", stage.name))?;
                 ensure!(
-                    stage.when_changed.len() <= 64
+                    stage.when_changed.len() <= 32
                         && stage
                             .when_changed
                             .iter()
                             .all(|p| !p.trim().is_empty() && !p.contains('\0')),
-                    "Stage {} when_changed must contain at most 64 non-empty patterns without NUL",
+                    "Stage {} when_changed must contain at most 32 non-empty patterns without NUL",
                     stage.name
                 );
                 ensure!(
@@ -1631,13 +1631,20 @@ impl Settings {
     /// Saves at the current version. Sections ignored because the project
     /// was untrusted are written back unchanged. Unmodified entries layered
     /// from the user's global `config.toml` are omitted so saving a project
-    /// config never copies global definitions into the repository.
+    /// config never copies global definitions into the repository. Saving to
+    /// the global `config.toml` itself keeps them, since they came from there.
     pub fn save(&self, path: &Path) -> Result<()> {
+        self.save_as(path, !is_global_config(path))
+    }
+
+    /// Writes `path`, omitting unmodified global entries when `project` is set.
+    fn save_as(&self, path: &Path, project: bool) -> Result<()> {
         let restored = crate::trust::restore_cow(self);
-        let needs_strip = restored
-            .global_layer
-            .as_ref()
-            .is_some_and(|layer| !layer.is_empty());
+        let needs_strip = project
+            && restored
+                .global_layer
+                .as_ref()
+                .is_some_and(|layer| !layer.is_empty());
         if restored.version == VERSION && !needs_strip {
             restored.validate()?;
             return crate::storage::atomic_write(
@@ -1648,7 +1655,7 @@ impl Settings {
         let mut saved = restored.into_owned();
         saved.version = VERSION;
         saved.validate()?;
-        if let Some(layer) = saved.global_layer.take() {
+        if let Some(layer) = saved.global_layer.take().filter(|_| needs_strip) {
             saved
                 .adapters
                 .retain(|k, v| layer.adapters.get(k) != Some(v));
@@ -1684,6 +1691,16 @@ impl Settings {
         }
         warnings
     }
+}
+
+/// Whether `path` is the user's global `config.toml`.
+fn is_global_config(path: &Path) -> bool {
+    let global = config_dir().join("config.toml");
+    path == global
+        || matches!(
+            (fs::canonicalize(path), fs::canonicalize(&global)),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 /// The user's config directory. `MODEL_ROUTER_CONFIG_DIR` overrides it, for
@@ -2495,6 +2512,25 @@ model = "global-model"
         );
         assert_eq!(saved.delegates["shared_del"].model, "project-shared-m");
         assert_eq!(saved.pricing["shared-model"].input, 5.0);
+
+        // Saving as global templates keeps the global entries in config.toml.
+        let global_path = dir.path().join("config.toml");
+        project.save_as(&global_path, false).unwrap();
+        let saved_raw = fs::read_to_string(&global_path).unwrap();
+        let saved = parse(&saved_raw).unwrap();
+        assert_eq!(saved.adapters["global_only"].command, "global-bin");
+        assert!(saved.providers.contains_key("global_gw"), "{saved_raw}");
+        assert!(saved.delegates.contains_key("global_del"), "{saved_raw}");
+        assert!(saved.pricing.contains_key("global-model"), "{saved_raw}");
+        assert_eq!(saved.adapters["shared"].command, "project-shared-bin");
+    }
+
+    #[test]
+    fn save_treats_only_the_global_config_toml_as_global() {
+        assert!(is_global_config(&config_dir().join("config.toml")));
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_global_config(&dir.path().join(".model-router.toml")));
+        assert!(!is_global_config(&dir.path().join("config.toml")));
     }
 
     #[test]
@@ -2567,6 +2603,45 @@ on_failure = [{ command = ["echo", "stage-fail"] }]
         let mut bad = settings.clone();
         bad.workflows[0].retry.max_attempts = 6;
         assert!(bad.validate().unwrap_err().to_string().contains("0–5"));
+
+        // Documented limits: base 1–600, base <= max <= 3600, hooks 1–3600 s,
+        // at most 32 when_changed patterns.
+        let error = |edit: &dyn Fn(&mut Settings)| {
+            let mut bad = settings.clone();
+            edit(&mut bad);
+            bad.validate().map_err(|e| e.to_string()).err()
+        };
+        let retry = |base, max| {
+            move |s: &mut Settings| {
+                s.workflows[0].retry.base_delay_seconds = base;
+                s.workflows[0].retry.max_delay_seconds = max;
+            }
+        };
+        assert_eq!(error(&retry(1, 1)), None);
+        assert_eq!(error(&retry(600, 3600)), None);
+        for (base, max) in [(0, 1), (601, 3600), (10, 5), (5, 3601)] {
+            let message = error(&retry(base, max)).unwrap_or_default();
+            assert!(message.contains("delay_seconds"), "{base}/{max}: {message}");
+        }
+        let stage_retry = |s: &mut Settings| {
+            s.workflows[0].stages[0]
+                .retry
+                .as_mut()
+                .unwrap()
+                .base_delay_seconds = 0
+        };
+        assert!(error(&stage_retry).unwrap().contains("base_delay_seconds"));
+        let hook = |secs| {
+            move |s: &mut Settings| s.workflows[0].hooks.before_stage[0].timeout_seconds = secs
+        };
+        assert_eq!(error(&hook(3600)), None);
+        assert!(error(&hook(3601)).unwrap().contains("1–3600"));
+        assert!(error(&hook(0)).unwrap().contains("1–3600"));
+        let patterns = |n: usize| {
+            move |s: &mut Settings| s.workflows[0].stages[0].when_changed = vec!["src/**".into(); n]
+        };
+        assert_eq!(error(&patterns(32)), None);
+        assert!(error(&patterns(33)).unwrap().contains("at most 32"));
 
         let mut bad_quorum = settings.clone();
         bad_quorum.workflows[0].review_quorum = Some(0);

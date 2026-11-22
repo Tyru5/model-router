@@ -146,7 +146,7 @@ handoff_path.write_text(json.dumps({
     };
     s.retry = Some(Retry {
         max_attempts: 3,
-        base_delay_seconds: 0,
+        base_delay_seconds: 1,
         max_delay_seconds: 1,
     });
     let wf = Workflow::new("RetryFlow", vec![s]);
@@ -234,7 +234,7 @@ else:
     );
     wf_auth.retry = Retry {
         max_attempts: 3,
-        base_delay_seconds: 0,
+        base_delay_seconds: 1,
         max_delay_seconds: 1,
     };
     let mut run_auth =

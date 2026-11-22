@@ -336,12 +336,26 @@ esac
     // --json carries version_pin, version_pin_ok, and auth_hint on the codex report.
     let ok_json = run_doctor(&["--json"], Some(secret));
     assert!(ok_json.status.success());
-    let reports: Vec<Value> = serde_json::from_slice(&ok_json.stdout).unwrap();
+    assert!(!String::from_utf8_lossy(&ok_json.stdout).contains(secret));
+    let doc: Value = serde_json::from_slice(&ok_json.stdout).unwrap();
+    assert_eq!(
+        doc["providers"],
+        serde_json::json!([
+            {"name": "openrouter", "api_key_env": "OPENROUTER_API_KEY", "status": "set"}
+        ])
+    );
+    let reports = doc["harnesses"].as_array().unwrap();
     let codex = reports.iter().find(|r| r["harness"] == "codex").unwrap();
     assert_eq!(codex["version_pin"], ">=0.160.0");
     assert_eq!(codex["version_pin_ok"], true);
     assert_eq!(codex["auth_hint"]["status"], "ready");
     assert_eq!(codex["auth_hint"]["signals"][0], "~/.codex/auth.json");
+
+    // --json reports the missing key that --strict fails on.
+    let missing_json = run_doctor(&["--json"], None);
+    assert!(missing_json.status.success());
+    let doc: Value = serde_json::from_slice(&missing_json.stdout).unwrap();
+    assert_eq!(doc["providers"][0]["status"], "missing");
 
     // Missing OPENROUTER_API_KEY causes --strict to fail.
     let missing_key = run_doctor(&["--strict"], None);

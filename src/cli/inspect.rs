@@ -64,7 +64,8 @@ pub fn doctor_command(project: &Path, settings: &Settings, json: bool, strict: b
     let providers = doctor::inspect_providers(settings);
     let reports = if json {
         let reports = doctor::inspect_all(settings, project);
-        println!("{}", serde_json::to_string_pretty(&reports)?);
+        let value = serde_json::json!({ "harnesses": &reports, "providers": &providers });
+        println!("{}", serde_json::to_string_pretty(&value)?);
         reports
     } else {
         let (reports, sandbox, tools) = std::thread::scope(|scope| {

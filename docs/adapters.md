@@ -242,8 +242,10 @@ Authentication is not checked: that needs a model request. Log in through each h
   login/config files exist on disk (never reads file contents or makes network
   calls). Advisory only: live token validity is never checked offline.
 
-`doctor --json` prints the full reports (including each flag, `version_pin`,
-`version_pin_ok`, and `auth_hint`). `doctor --strict` exits non-zero when an
+`doctor --json` prints an object with `harnesses`, the full reports (including
+each flag, `version_pin`, `version_pin_ok`, and `auth_hint`), and `providers`,
+one `{name, api_key_env, status}` per configured provider with `status` one of
+`set`, `missing`, or `not_required`. `doctor --strict` exits non-zero when an
 installed harness lacks a flag, any `[harness_versions]` pin mismatches (or
 the pinned harness is missing), or any configured `[providers.*]` required
 `api_key_env` is unset. Probes run in parallel and finish within about 10 seconds.
