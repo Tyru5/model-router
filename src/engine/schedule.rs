@@ -28,6 +28,11 @@ pub(super) enum Job {
     /// A fan-out candidate's transient retry backoff.
     CandidateRetryWait(usize, usize),
 }
+
+/// The job's key in the scheduler's shared live spend.
+fn spend_key(job: Job) -> String {
+    format!("{job:?}")
+}
 pub(super) enum Message {
     Spawned(Job, process::Group),
     /// Formatted lines, as the worker's formatter produced them.
@@ -83,6 +88,7 @@ struct CandidateJob {
     run_id: String,
     protected_paths: Vec<String>,
     policies: Vec<crate::policy::DiffPolicy>,
+    live_budget: Option<crate::cost::LiveBudgetMonitor>,
 }
 
 enum WorkerJob {
@@ -274,6 +280,8 @@ pub(super) fn schedule(
     let wake = &wake;
     let journal = SpawnJournal::new(run);
     let journal = &journal;
+    // Every live monitor counts the spend of all workers running alongside.
+    let live_spend = crate::cost::LiveSpend::new();
     let result = thread::scope(|scope| -> Result<()> {
         let (tx, rx) = mpsc::channel::<Message>();
         let result = (|| -> Result<()> {
@@ -384,8 +392,11 @@ pub(super) fn schedule(
                             match start_stage_inner(run, cancel, first_attempt, emit)? {
                                 Some(mut prepared) => {
                                     prepared.retry_from = Some(retry_from);
-                                    let live_budget =
-                                        crate::cost::LiveBudgetMonitor::for_stage(run, index);
+                                    let live_budget = live_spend.monitor(
+                                        run,
+                                        index,
+                                        &spend_key(Job::Stage(index)),
+                                    );
                                     let worker = WorkerJob::Stage(Box::new(StageJob {
                                         index,
                                         invocation: prepared.invocation.clone(),
@@ -421,6 +432,12 @@ pub(super) fn schedule(
                                     .last()
                                     .and_then(|a| a.worktree.clone())
                                     .context("No worktree")?;
+                                let live_budget = live_spend.candidate_monitor(
+                                    run,
+                                    index,
+                                    &candidate.model,
+                                    &spend_key(Job::Candidate(index, c)),
+                                );
                                 let worker = WorkerJob::Candidate(Box::new(CandidateJob {
                                     index,
                                     c,
@@ -432,6 +449,7 @@ pub(super) fn schedule(
                                     run_id: run.id.clone(),
                                     protected_paths: run.workflow.protected_paths.clone(),
                                     policies: run.workflow.policies.clone(),
+                                    live_budget,
                                 }));
                                 (Job::Candidate(index, c), None, worker)
                             }
@@ -520,7 +538,7 @@ pub(super) fn schedule(
                                 &cand.cwd,
                                 &cand.prepared.directory,
                                 cand.prepared.sandbox.as_ref(),
-                                None,
+                                cand.live_budget.as_ref(),
                             ),
                         };
                         let spawned = std::cell::Cell::new(None);
@@ -530,6 +548,9 @@ pub(super) fn schedule(
                         let mut usage_tracker = handoff::UsageTracker::new(invocation.kind);
                         let budget_abort = AtomicBool::new(false);
                         let mut budget_exceeded: Option<String> = None;
+                        // A cap a sibling's usage crossed stops this one too.
+                        let mut abort_flags = vec![abort, &budget_abort];
+                        abort_flags.extend(live_budget.map(|m| m.stop_flag()));
                         let outcome_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 process::capture_with_controls(
@@ -539,7 +560,7 @@ pub(super) fn schedule(
                                     timeout,
                                     stall_timeout,
                                     cancel,
-                                    &[abort, &budget_abort],
+                                    &abort_flags,
                                     sandbox,
                                     |group| {
                                         // Durable before this worker reports it;
@@ -588,6 +609,9 @@ pub(super) fn schedule(
                                 Err(anyhow::anyhow!("The harness supervisor panicked"))
                             });
                         let ended = Utc::now();
+                        if budget_exceeded.is_none() {
+                            budget_exceeded = live_budget.and_then(|m| m.stopped());
+                        }
                         if let Some(rest) = formatter.finish() {
                             let _ = worker_tx.send(Message::Output(job, rest));
                         }
@@ -618,7 +642,20 @@ pub(super) fn schedule(
                                 let exited = outcome_result
                                     .as_ref()
                                     .is_ok_and(|o| !o.cancelled && !o.timed_out && !o.stalled);
-                                let post =
+                                // As in `conclude_inner`: a harness that exited on
+                                // its own is judged as usual; the cap gates after.
+                                let budget_stop = budget_exceeded.filter(|_| {
+                                    outcome_result.as_ref().is_ok_and(|o| o.cancelled)
+                                        && !cancel.load(Ordering::Relaxed)
+                                });
+                                let post = if let Some(reason) = budget_stop {
+                                    Ok(run::budget_stopped_candidate(
+                                        &cand.prepared,
+                                        outcome_result.ok().and_then(|o| o.code),
+                                        live_usage,
+                                        reason,
+                                    ))
+                                } else {
                                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                         run::post_process_candidate(
                                             &cand.candidate,
@@ -648,7 +685,8 @@ pub(super) fn schedule(
                                     .map(|mut post| {
                                         post.exited = exited;
                                         post
-                                    });
+                                    })
+                                };
                                 let _ = worker_tx.send(Message::CandidateDone(
                                     cand.index,
                                     cand.c,
@@ -836,6 +874,7 @@ pub(super) fn schedule(
                             cancel,
                             emit,
                         )?;
+                        live_spend.settle(run, &spend_key(job));
                         let retry = run.workflow.stages[index].effective_retry(&run.workflow);
                         let (retries_done, stage_started, retry_from) = stage_retries
                             .get(&index)
@@ -957,6 +996,7 @@ pub(super) fn schedule(
                         let exited = post_result.as_ref().as_ref().is_ok_and(|p| p.exited);
                         let survivor_pgid =
                             run.apply_candidate_post((index, c), *post_result, ended)?;
+                        live_spend.settle(run, &spend_key(job));
                         let retry = run.workflow.stages[index].effective_retry(&run.workflow);
                         let (retries_done, started) = candidate_retries
                             .get(&(index, c))
@@ -1322,8 +1362,15 @@ pub(super) fn drive_graph(
             .all(|s| matches!(s.status, Status::Complete | Status::Skipped))
         {
             run.cursor = run.stages.len();
-            if let Err(error) = run.check_review_quorum() {
-                run.stop(Status::Blocked, format!("{error:#}"), Actor::Engine, false)?;
+            // Nothing gates after the last stage but this: spend that crossed a
+            // stop cap blocks the run instead of completing it.
+            let blocked = run
+                .check_review_quorum()
+                .err()
+                .map(|error| format!("{error:#}"))
+                .or_else(|| crate::cost::check_budget(run));
+            if let Some(reason) = blocked {
+                run.stop(Status::Blocked, reason, Actor::Engine, false)?;
                 run.persist()?;
                 save_changes(run);
                 emit(Event::State(Box::new(run.clone())));

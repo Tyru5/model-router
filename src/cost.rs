@@ -21,7 +21,10 @@ use std::{
     fmt::Write,
     fs,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
 };
 
 const PRICES: &str = include_str!("cost/prices.toml");
@@ -841,13 +844,239 @@ fn exceeded(budget: &Budget, spent: &CostTotal, scope: &str) -> Option<String> {
     None
 }
 
+/// Spend that the live monitors of one scheduler share: the run's recorded
+/// per-stage totals plus the latest streamed estimate of every process still
+/// running, so a run or stage cap counts all concurrent workers, not only the
+/// one checking.
+///
+/// The owner of the run calls [`LiveSpend::settle`] after it records a
+/// finished process's usage on the run: that re-reads the recorded totals
+/// and drops the process's live estimate in one step, so nothing is counted
+/// twice or missed.
+#[derive(Debug, Clone, Default)]
+pub struct LiveSpend(Arc<Mutex<LiveSpendState>>);
+
+#[derive(Debug, Default)]
+struct LiveSpendState {
+    pricing: Option<Pricing>,
+    recorded: Vec<CostTotal>,
+    /// Running process key -> its stage, latest estimate, and stop signal.
+    live: HashMap<String, LiveEntry>,
+}
+
+#[derive(Debug)]
+struct LiveEntry {
+    stage: usize,
+    spent: CostTotal,
+    stop: Arc<StopSignal>,
+}
+
+/// Set when a cap a process answers to was exceeded, by it or by another
+/// process counted with it.
+#[derive(Debug, Default)]
+struct StopSignal {
+    flag: AtomicBool,
+    reason: Mutex<Option<String>>,
+}
+
+impl StopSignal {
+    fn raise(&self, reason: &str) {
+        let mut slot = self.reason.lock().unwrap_or_else(|e| e.into_inner());
+        slot.get_or_insert_with(|| reason.to_owned());
+        self.flag.store(true, AtomicOrdering::SeqCst);
+    }
+}
+
+impl LiveSpend {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Prices estimates with `pricing` instead of the project's files.
+    pub fn with_pricing(pricing: Pricing) -> Self {
+        let spend = Self::default();
+        spend.state().pricing = Some(pricing);
+        spend
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, LiveSpendState> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn pricing(&self, run: &Run) -> Pricing {
+        let mut state = self.state();
+        state
+            .pricing
+            .get_or_insert_with(|| Pricing::load(&run.project))
+            .clone()
+    }
+
+    /// A monitor for an attempt of stage `index`, or `None` without an active
+    /// `on_exceed = "stop"` cap. `key` names the process until it settles.
+    pub fn monitor(&self, run: &Run, index: usize, key: &str) -> Option<LiveBudgetMonitor> {
+        let model = run.workflow.stages.get(index)?.model.clone();
+        let (provider, billing) = stage_estimate_params(run, index);
+        let provider = provider.map(str::to_owned);
+        self.register(run, index, key, model, provider, billing)
+    }
+
+    /// A monitor for a fan-out candidate of stage `index` running `model`,
+    /// priced as `stage_totals` prices candidate attempts.
+    pub fn candidate_monitor(
+        &self,
+        run: &Run,
+        index: usize,
+        model: &str,
+        key: &str,
+    ) -> Option<LiveBudgetMonitor> {
+        let (provider, billing) = stage_estimate_params(run, index);
+        let provider = provider.map(str::to_owned);
+        self.register(run, index, key, model.to_owned(), provider, billing)
+    }
+
+    /// A monitor for a delegated task turn of stage `index` running `model`,
+    /// priced under the task's own target as `task_turn_estimate` does.
+    pub fn task_monitor(
+        &self,
+        run: &Run,
+        index: usize,
+        task: &crate::delegation::records::TaskState,
+        model: &str,
+        key: &str,
+    ) -> Option<LiveBudgetMonitor> {
+        let (provider, billing) = task_estimate_params(run, task);
+        let provider = provider.map(str::to_owned);
+        let model = if model.is_empty() {
+            task.target.model.clone()
+        } else {
+            model.to_owned()
+        };
+        self.register(run, index, key, model, provider, billing)
+    }
+
+    fn register(
+        &self,
+        run: &Run,
+        index: usize,
+        key: &str,
+        model: String,
+        provider: Option<String>,
+        billing: Billing,
+    ) -> Option<LiveBudgetMonitor> {
+        let stage = run.workflow.stages.get(index)?;
+        let run_budget = (!run.workflow.budget.is_empty()
+            && run.workflow.budget.on_exceed == BudgetAction::Stop)
+            .then_some(run.workflow.budget);
+        let stage_budget = (!stage.budget.is_empty()
+            && stage.budget.on_exceed == BudgetAction::Stop)
+            .then_some(stage.budget);
+        if run_budget.is_none() && stage_budget.is_none() {
+            return None;
+        }
+        let pricing = self.pricing(run);
+        let recorded = totals_with_launched(run, &pricing);
+        let stop = Arc::new(StopSignal::default());
+        {
+            let mut state = self.state();
+            state.recorded = recorded;
+            state.live.insert(
+                key.to_owned(),
+                LiveEntry {
+                    stage: index,
+                    spent: CostTotal::default(),
+                    stop: stop.clone(),
+                },
+            );
+        }
+        Some(LiveBudgetMonitor {
+            spend: self.clone(),
+            stop,
+            key: key.to_owned(),
+            stage: index,
+            run_budget,
+            stage_budget,
+            stage_name: stage.name.clone(),
+            model,
+            provider,
+            billing,
+            pricing,
+            project: run.project.clone(),
+            run_id: run.id.clone(),
+        })
+    }
+
+    /// Process `key` ended and its usage is now recorded on `run`: re-reads
+    /// the recorded totals and drops its live estimate together. A no-op for
+    /// a process without a monitor.
+    pub fn settle(&self, run: &Run, key: &str) {
+        if !self.state().live.contains_key(key) {
+            return;
+        }
+        let pricing = self.pricing(run);
+        let recorded = totals_with_launched(run, &pricing);
+        let mut state = self.state();
+        state.recorded = recorded;
+        state.live.remove(key);
+    }
+
+    /// Records `monitor`'s latest estimate and checks its caps against
+    /// spend that counts every live process. An exceeded stage cap stops
+    /// every live process of that stage; an exceeded run cap stops them all.
+    fn update(&self, monitor: &LiveBudgetMonitor, estimate: CostTotal) -> Option<String> {
+        let mut state = self.state();
+        if let Some(entry) = state.live.get_mut(&monitor.key) {
+            entry.spent = estimate;
+        }
+        let stage = monitor.stage;
+        let mut stage_spent = state.recorded.get(stage).copied().unwrap_or_default();
+        let mut run_spent = CostTotal::default();
+        for total in &state.recorded {
+            run_spent.merge(total);
+        }
+        for entry in state.live.values() {
+            if entry.stage == stage {
+                stage_spent.merge(&entry.spent);
+            }
+            run_spent.merge(&entry.spent);
+        }
+        let (reason, whole_run) = match monitor.stage_budget.as_ref().and_then(|budget| {
+            exceeded(
+                budget,
+                &stage_spent,
+                &format!(" in stage {}", monitor.stage_name),
+            )
+        }) {
+            Some(reason) => (reason, false),
+            None => (
+                exceeded(monitor.run_budget.as_ref()?, &run_spent, "")?,
+                true,
+            ),
+        };
+        let reason = format!(
+            "{reason}. Inspect the run, then raise the cap to continue: model-router -C {} resume {} --budget-usd N (or --budget-tokens N)",
+            monitor.project.display(),
+            monitor.run_id
+        );
+        for entry in state.live.values() {
+            if whole_run || entry.stage == stage {
+                entry.stop.raise(&reason);
+            }
+        }
+        monitor.stop.raise(&reason);
+        Some(reason)
+    }
+}
+
 /// Checks streamed mid-attempt usage against configured `on_exceed = "stop"`
 /// run and stage budget caps so an unattended harness can be terminated cleanly
-/// the moment cumulative spend or tokens exceed the cap.
+/// the moment cumulative spend or tokens exceed the cap. Spend of other
+/// processes running at the same time counts through the shared [`LiveSpend`].
 #[derive(Debug, Clone)]
 pub struct LiveBudgetMonitor {
-    prior_run: CostTotal,
-    prior_stage: CostTotal,
+    spend: LiveSpend,
+    stop: Arc<StopSignal>,
+    key: String,
+    stage: usize,
     run_budget: Option<Budget>,
     stage_budget: Option<Budget>,
     stage_name: String,
@@ -861,50 +1090,14 @@ pub struct LiveBudgetMonitor {
 
 impl LiveBudgetMonitor {
     /// Builds a live monitor for stage `index` if the run or stage has an active
-    /// `on_exceed = "stop"` cap. Returns `None` otherwise (zero overhead).
+    /// `on_exceed = "stop"` cap. Returns `None` otherwise (zero overhead). It
+    /// shares spend with no other process.
     pub fn for_stage(run: &Run, index: usize) -> Option<Self> {
-        let stage = run.workflow.stages.get(index)?;
-        let run_stop =
-            !run.workflow.budget.is_empty() && run.workflow.budget.on_exceed == BudgetAction::Stop;
-        let stage_stop = !stage.budget.is_empty() && stage.budget.on_exceed == BudgetAction::Stop;
-        if !run_stop && !stage_stop {
-            return None;
-        }
-        let pricing = Pricing::load(&run.project);
-        Self::for_stage_with(run, index, pricing)
+        LiveSpend::new().monitor(run, index, "stage")
     }
 
     pub fn for_stage_with(run: &Run, index: usize, pricing: Pricing) -> Option<Self> {
-        let stage = run.workflow.stages.get(index)?;
-        let run_budget = (!run.workflow.budget.is_empty()
-            && run.workflow.budget.on_exceed == BudgetAction::Stop)
-            .then_some(run.workflow.budget);
-        let stage_budget = (!stage.budget.is_empty()
-            && stage.budget.on_exceed == BudgetAction::Stop)
-            .then_some(stage.budget);
-        if run_budget.is_none() && stage_budget.is_none() {
-            return None;
-        }
-        let stages = totals_with_launched(run, &pricing);
-        let prior_stage = stages.get(index).copied().unwrap_or_default();
-        let mut prior_run = CostTotal::default();
-        for total in &stages {
-            prior_run.merge(total);
-        }
-        let (provider, billing) = stage_estimate_params(run, index);
-        Some(Self {
-            prior_run,
-            prior_stage,
-            run_budget,
-            stage_budget,
-            stage_name: stage.name.clone(),
-            model: stage.model.clone(),
-            provider: provider.map(str::to_owned),
-            billing,
-            pricing,
-            project: run.project.clone(),
-            run_id: run.id.clone(),
-        })
+        LiveSpend::with_pricing(pricing).monitor(run, index, "stage")
     }
 
     /// Evaluates cumulative spend/tokens with the running attempt's latest
@@ -917,28 +1110,25 @@ impl LiveBudgetMonitor {
             self.billing,
             &self.pricing,
         );
-        let reason = if let Some(budget) = &self.stage_budget {
-            let mut stage_spent = self.prior_stage;
-            stage_spent.add(&est);
-            exceeded(
-                budget,
-                &stage_spent,
-                &format!(" in stage {}", self.stage_name),
-            )
-        } else {
-            None
-        }
-        .or_else(|| {
-            let budget = self.run_budget.as_ref()?;
-            let mut run_spent = self.prior_run;
-            run_spent.add(&est);
-            exceeded(budget, &run_spent, "")
-        })?;
-        Some(format!(
-            "{reason}. Inspect the run, then raise the cap to continue: model-router -C {} resume {} --budget-usd N (or --budget-tokens N)",
-            self.project.display(),
-            self.run_id
-        ))
+        let mut own = CostTotal::default();
+        own.add(&est);
+        self.spend.update(self, own)
+    }
+
+    /// Raised once a cap this process answers to is exceeded, by its own
+    /// usage or another live process's: pass it to the capture as an abort
+    /// flag so a quiet sibling stops too.
+    pub fn stop_flag(&self) -> &AtomicBool {
+        &self.stop.flag
+    }
+
+    /// The budget reason that stopped this process, if any.
+    pub fn stopped(&self) -> Option<String> {
+        self.stop
+            .reason
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -1804,5 +1994,79 @@ mod tests {
             })
             .unwrap();
         assert!(reason.starts_with(EXCEEDED), "{reason}");
+    }
+
+    fn tokens(input: u64) -> Usage {
+        Usage {
+            input_tokens: Some(input),
+            ..Usage::default()
+        }
+    }
+
+    #[test]
+    fn live_monitors_count_every_concurrent_process_toward_the_run_cap() {
+        // sample() records 2,400 tokens; 1,000 more are allowed.
+        let mut run = crate::report::tests::sample();
+        run.workflow.budget = Budget {
+            max_tokens: Some(3_400),
+            on_exceed: BudgetAction::Stop,
+            ..Budget::default()
+        };
+        let spend = LiveSpend::with_pricing(Pricing::default());
+        let a = spend.monitor(&run, 1, "a").unwrap();
+        let b = spend.monitor(&run, 2, "b").unwrap();
+        assert_eq!(a.check(tokens(600)), None);
+        assert!(a.stopped().is_none());
+        // Alone each is under the cap; together they exceed it.
+        let reason = b.check(tokens(600)).unwrap();
+        assert!(reason.starts_with(EXCEEDED), "{reason}");
+        // The quiet sibling is told to stop too, with the same reason.
+        assert!(a.stop_flag().load(AtomicOrdering::SeqCst));
+        assert_eq!(a.stopped(), Some(reason));
+    }
+
+    #[test]
+    fn settling_a_finished_process_counts_its_usage_once() {
+        let mut run = crate::report::tests::sample();
+        run.workflow.budget = Budget {
+            max_tokens: Some(3_900),
+            on_exceed: BudgetAction::Stop,
+            ..Budget::default()
+        };
+        let spend = LiveSpend::with_pricing(Pricing::default());
+        let a = spend.monitor(&run, 1, "a").unwrap();
+        let b = spend.monitor(&run, 2, "b").unwrap();
+        assert_eq!(a.check(tokens(600)), None);
+        // `a` ends: its 600 tokens are recorded on the run, then settled.
+        run.stages[1].attempts[0].usage = Some(Usage {
+            input_tokens: Some(1_400),
+            output_tokens: Some(100),
+            ..Usage::default()
+        });
+        spend.settle(&run, "a");
+        // 3,000 recorded + 600 live: under 3,900 unless `a` counted twice.
+        assert_eq!(b.check(tokens(600)), None);
+        assert!(b.check(tokens(1_000)).is_some());
+    }
+
+    #[test]
+    fn a_stage_cap_counts_every_live_process_of_that_stage_only() {
+        let mut run = crate::report::tests::sample();
+        run.workflow.stages[2].budget = Budget {
+            max_tokens: Some(1_000),
+            on_exceed: BudgetAction::Stop,
+            ..Budget::default()
+        };
+        let spend = LiveSpend::with_pricing(Pricing::default());
+        let one = spend.candidate_monitor(&run, 2, "m1", "one").unwrap();
+        let two = spend.candidate_monitor(&run, 2, "m2", "two").unwrap();
+        assert!(
+            spend.monitor(&run, 1, "other").is_none(),
+            "no cap on stage 1"
+        );
+        assert_eq!(one.check(tokens(600)), None);
+        let reason = two.check(tokens(600)).unwrap();
+        assert!(reason.contains("in stage Review"), "{reason}");
+        assert!(one.stopped().is_some());
     }
 }

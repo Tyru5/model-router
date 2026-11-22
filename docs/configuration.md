@@ -212,8 +212,9 @@ budget = { max_usd = 2.0, max_tokens = 2_000_000, on_exceed = "stop" }
 ```
 
 `max_usd` and `max_tokens` are optional and must be positive. `on_exceed` is
-`"stop"` (default: block before the next stage, or abort an unattended streaming
-stage mid-stream as soon as streamed usage exceeds the cap) or `"warn"` (log a
+`"stop"` (default: block before the next stage or instead of completing, or
+abort an unattended streaming stage, candidate, or delegated task mid-stream as
+soon as streamed usage exceeds the cap) or `"warn"` (log a
 warning and continue). `max_tokens` counts input, output, and cache writes (not
 cache reads). See [cost.md](cost.md#budgets).
 

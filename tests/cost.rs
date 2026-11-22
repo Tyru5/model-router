@@ -226,11 +226,24 @@ fn stage_caps_and_table_prices_gate_too() {
     // Raising lifts the exceeded stage cap with the run's.
     cost::raise_budget(&mut run, Some(1.0), None).unwrap();
     assert_eq!(run.workflow.stages[0].budget.max_usd, Some(1.0));
+    // The last stage keeps its result, but $1.15 over the $1.00 run cap
+    // blocks the run instead of completing it.
+    assert_eq!(drive(&mut run), Action::Stopped);
+    assert_eq!(run.stages[1].status, Status::Complete);
+    assert!(cost::budget_blocked(&run), "{:?}", run.error);
+    let error = run.error.clone().unwrap();
+    assert!(
+        error.starts_with("Budget exceeded: ~$1.15 of $1.00"),
+        "{error}"
+    );
+    assert_eq!(launches(dir.path()), ["claude-haiku-5-5", "cost-1"]);
+    cost::raise_budget(&mut run, Some(2.0), None).unwrap();
     assert_eq!(drive(&mut run), Action::Complete);
+    assert_eq!(launches(dir.path()).len(), 2, "nothing reruns");
     let text = report::render(&report::build(&run), None);
     assert!(
         text.contains(
-            "(reported $1.00 + table $0.15) · budget $1.00 · table prices are estimates as of"
+            "(reported $1.00 + table $0.15) · budget $2.00 · table prices are estimates as of"
         ),
         "{text}"
     );

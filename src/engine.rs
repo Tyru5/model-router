@@ -126,8 +126,15 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
             run.cursor += 1;
         }
         if run.cursor == run.stages.len() {
-            if let Err(error) = run.check_review_quorum() {
-                run.stop(Status::Blocked, format!("{error:#}"), Actor::Engine, false)?;
+            // Nothing gates after the last stage but this: spend that crossed a
+            // stop cap blocks the run instead of completing it.
+            let blocked = run
+                .check_review_quorum()
+                .err()
+                .map(|error| format!("{error:#}"))
+                .or_else(|| crate::cost::check_budget(run));
+            if let Some(reason) = blocked {
+                run.stop(Status::Blocked, reason, Actor::Engine, false)?;
                 run.persist()?;
                 save_changes(run);
                 emit(Event::State(Box::new(run.clone())));

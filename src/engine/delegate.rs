@@ -105,6 +105,8 @@ enum Msg {
     Output(Who, String),
     ParentDone(Result<process::Outcome>, DateTime<Utc>),
     TaskDone(String, Result<process::Outcome>, DateTime<Utc>),
+    /// A process's live budget monitor saw a stop cap exceeded.
+    BudgetStop(String),
     Call(Call),
     Tick,
 }
@@ -168,6 +170,10 @@ struct Owner<'a> {
     /// run after the hand-over.
     released: Option<Result<process::Outcome>>,
     handed_over: bool,
+    /// Live spend shared by the parent's and the tasks' budget monitors.
+    live_spend: crate::cost::LiveSpend,
+    /// Why a live budget monitor stopped the stage.
+    budget_stop: Option<String>,
 }
 
 /// Runs the current stage, which delegates, to its end.
@@ -213,6 +219,8 @@ pub(super) fn drive_stage(
         interactive,
         released: None,
         handed_over: false,
+        live_spend: crate::cost::LiveSpend::new(),
+        budget_stop: None,
     };
     // Turn 1: the broker exists before the launch that names it.
     owner.open_broker(run)?;
@@ -272,6 +280,14 @@ pub(super) fn drive_stage(
         }
         looped
     })
+}
+
+/// The parent turn's key in the stage's live spend.
+const PARENT_SPEND: &str = "parent";
+
+/// Task `id`'s key in the stage's live spend.
+fn task_spend(id: &str) -> String {
+    format!("task:{id}")
 }
 
 fn not_active() -> ToolError {
@@ -400,6 +416,7 @@ impl<'a> Owner<'a> {
         timeout: Duration,
         stall: Option<Duration>,
         abort: Arc<AtomicBool>,
+        monitor: Option<crate::cost::LiveBudgetMonitor>,
     ) where
         'a: 's,
     {
@@ -408,6 +425,8 @@ impl<'a> Owner<'a> {
         let cancel = self.cancel;
         scope.spawn(move || {
             let mut formatter = events::Formatter::new(invocation.kind);
+            let mut usage_tracker = handoff::UsageTracker::new(invocation.kind);
+            let mut budget_stopped = false;
             let spawned = std::cell::Cell::new(None);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 process::capture_with_stall_and_abort(
@@ -429,6 +448,16 @@ impl<'a> Owner<'a> {
                         let lines = if err {
                             Some(format!("[stderr] {}", storage::clean_terminal(text)))
                         } else {
+                            if let (Some(monitor), false) = (&monitor, budget_stopped) {
+                                let reason = usage_tracker
+                                    .push(text)
+                                    .and_then(|usage| monitor.check(usage));
+                                if let Some(reason) = reason {
+                                    budget_stopped = true;
+                                    abort.store(true, Ordering::SeqCst);
+                                    let _ = tx.send(Msg::BudgetStop(reason));
+                                }
+                            }
                             formatter.push(text)
                         };
                         if let Some(lines) = lines {
@@ -512,6 +541,7 @@ impl<'a> Owner<'a> {
             self.remaining(),
             stall,
             self.parent_abort.clone(),
+            self.live_spend.monitor(run, self.index, PARENT_SPEND),
         );
         self.turn = Some(prepared);
     }
@@ -581,8 +611,34 @@ impl<'a> Owner<'a> {
                 Msg::ParentDone(outcome, ended) => {
                     self.parent_done(scope, run, outcome, ended, emit)?;
                 }
+                Msg::BudgetStop(reason) => self.budget_stopped(run, reason, emit)?,
                 Msg::Tick => self.tick(scope, run, emit)?,
             }
+        }
+        Ok(())
+    }
+
+    /// A live budget monitor saw a stop cap exceeded: every task stops, and
+    /// the stage stops blocked once no parent turn runs.
+    fn budget_stopped(
+        &mut self,
+        run: &mut Run,
+        reason: String,
+        emit: &mut impl FnMut(Event),
+    ) -> Result<()> {
+        if self.budget_stop.is_some() {
+            return Ok(());
+        }
+        emit(Event::Output(format!("\n{reason}\n")));
+        self.budget_stop = Some(reason.clone());
+        match self.phase {
+            Phase::Running(_) => {
+                self.cancel_live(run);
+                self.parent_abort.store(true, Ordering::SeqCst);
+                let _ = run.persist();
+            }
+            Phase::Awaiting => self.stop_stage(run, Status::Blocked, reason, emit)?,
+            Phase::Releasing | Phase::Done => {}
         }
         Ok(())
     }
@@ -769,6 +825,27 @@ impl<'a> Owner<'a> {
             run.persist()?;
             return self.finish_release(run, emit);
         }
+        if let Some(reason) = self.budget_stop.clone() {
+            // Stopped on a cap, whether or not the parent needed a signal.
+            keep_survivor(run, &outcome);
+            let turn_usage = handoff::usage_file(
+                &prepared.directory.join("stdout.log"),
+                prepared.invocation.kind,
+            );
+            self.earlier_usage = add_usage(self.earlier_usage, turn_usage);
+            let exit_code = outcome.as_ref().ok().and_then(|o| o.code);
+            if turn_number > 1 {
+                if let Some(turn) = self.attempt_mut(run).turns.last_mut() {
+                    turn.finished_at = Some(ended);
+                    turn.exit_code = exit_code;
+                    turn.usage = turn_usage;
+                }
+            } else {
+                self.attempt_mut(run).exit_code = exit_code;
+            }
+            self.attempt_mut(run).set_group(None);
+            return self.stop_stage(run, Status::Blocked, reason, emit);
+        }
         let succeeded = outcome
             .as_ref()
             .is_ok_and(|o| o.success() && !o.cancelled && !o.timed_out && !o.stalled);
@@ -808,6 +885,7 @@ impl<'a> Owner<'a> {
         // Budget admission (tasks, wakes) reads the attempt's usage; the
         // final turn's conclusion replaces it with that turn's plus these.
         self.attempt_mut(run).usage = self.earlier_usage;
+        self.live_spend.settle(run, PARENT_SPEND);
         if turn_number > 1 {
             if let Some(turn) = self.attempt_mut(run).turns.last_mut() {
                 turn.usage = turn_usage;
@@ -1081,6 +1159,9 @@ impl<'a> Owner<'a> {
     {
         if !self.phase_running() {
             return Err(not_active());
+        }
+        if let Some(reason) = &self.budget_stop {
+            return Err(ToolError::new("budget_exceeded", reason.clone()));
         }
         match request {
             Request::Capabilities { search } => Ok(self.capabilities(run, search.as_deref())),
@@ -1502,7 +1583,7 @@ impl<'a> Owner<'a> {
     where
         'a: 's,
     {
-        if self.phase == Phase::Done {
+        if self.phase == Phase::Done || self.budget_stop.is_some() {
             return Ok(());
         }
         // Follow-ups first: their tasks already hold the parent's attention.
@@ -1738,6 +1819,8 @@ impl<'a> Owner<'a> {
             timeout,
             stall,
             abort.clone(),
+            self.live_spend
+                .task_monitor(run, self.index, &task, &stage.model, &task_spend(id)),
         );
         self.running.insert(
             id.to_owned(),
@@ -1819,6 +1902,8 @@ impl<'a> Owner<'a> {
                 TaskStatus::Cancelled,
                 Some(if cancelled_by_parent {
                     "Cancelled by the parent".into()
+                } else if let Some(reason) = &self.budget_stop {
+                    format!("budget_exceeded: {reason}")
                 } else {
                     "Cancelled".into()
                 }),
@@ -1902,6 +1987,7 @@ impl<'a> Owner<'a> {
             self.seal_patch(run, id)?;
         }
         run.persist()?;
+        self.live_spend.settle(run, &task_spend(id));
         self.changed.bump();
         Ok(())
     }

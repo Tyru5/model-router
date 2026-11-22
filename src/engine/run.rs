@@ -1650,6 +1650,20 @@ impl Run {
     pub(super) fn settle_fan_out(&mut self, index: usize, cancelled: bool) -> Result<()> {
         self.cursor = index;
         let stage = self.workflow.stages[index].clone();
+        // A live budget monitor stopped a candidate: stop here while a cap is
+        // still exceeded.
+        let budget_stop = self.stages[index]
+            .fan_out
+            .as_ref()
+            .is_some_and(|f| {
+                f.candidates.iter().any(|c| {
+                    c.error
+                        .as_deref()
+                        .is_some_and(|e| e.starts_with(crate::cost::EXCEEDED))
+                })
+            })
+            .then(|| crate::cost::check_budget(self))
+            .flatten();
         let state = self.stages[index].fan_out.as_ref().context("No fan-out")?;
         let complete = state
             .candidates
@@ -1695,6 +1709,13 @@ impl Run {
                 stage.id
             );
             self.stop(Status::Cancelled, message, Actor::Engine, true)?;
+            finish(self);
+            return Ok(());
+        }
+        if let Some(reason) = budget_stop {
+            // No winner is applied past a cap; `resume --budget-*` raises it
+            // and settles again with the candidates that finished.
+            self.stop(Status::Blocked, reason, Actor::Engine, true)?;
             finish(self);
             return Ok(());
         }
@@ -2054,6 +2075,27 @@ pub(super) struct CandidatePost {
     pub(super) survivor: Option<process::Group>,
     /// The harness exited on its own: not cancelled, timed out, or stalled.
     pub(super) exited: bool,
+}
+
+/// A candidate its live budget monitor stopped mid-stream: blocked with the
+/// budget reason and its usage kept. Nothing else of its output is evaluated.
+pub(super) fn budget_stopped_candidate(
+    prepared: &Prepared,
+    exit_code: Option<i32>,
+    live_usage: Option<handoff::Usage>,
+    reason: String,
+) -> CandidatePost {
+    let mut post = CandidatePost {
+        exit_code,
+        ..CandidatePost::default()
+    };
+    post.usage = handoff::usage_file(
+        &prepared.directory.join("stdout.log"),
+        prepared.invocation.kind,
+    )
+    .or(live_usage);
+    post.stop = Some((Status::Blocked, reason));
+    post
 }
 
 /// Runs candidate post-processing in the worker thread: exit normalization,

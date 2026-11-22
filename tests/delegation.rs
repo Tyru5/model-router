@@ -5,7 +5,11 @@
 mod common;
 
 use model_router::{
-    config::{CustomAdapter, CustomSession, Role, Settings, Stage, Workflow},
+    config::{
+        Budget, BudgetAction, CustomAdapter, CustomOutput, CustomSession, Role, Settings, Stage,
+        Workflow,
+    },
+    cost,
     delegation::{Delegate, Delegation, Isolation, records::TaskStatus},
     engine::{self, Action, Run, Status},
     report, sandbox,
@@ -137,6 +141,32 @@ fn task_adapter(writes: Option<&str>) -> CustomAdapter {
     }
 }
 
+/// A Codex-JSONL harness that reports 1,200 tokens, then waits 30 s before
+/// writing its handoff. It accepts the router's MCP config, so it can be a
+/// delegating parent too.
+fn streamer() -> CustomAdapter {
+    let code = r#"import json, sys, time
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1200, "output_tokens": 0}}), flush=True)
+time.sleep(30)
+open(sys.argv[1], "w").write(json.dumps({"schema_version": 2, "summary": "done", "verdict": "complete"}))
+"#;
+    CustomAdapter {
+        command: "python3".into(),
+        args: vec!["-c".into(), code.into(), "{handoff_file}".into()],
+        output: Some(CustomOutput::CodexJsonl),
+        mcp_config_args: Some(vec!["--mcp-config".into(), "{mcp_config}".into()]),
+        ..CustomAdapter::default()
+    }
+}
+
+fn token_cap(tokens: u64) -> Budget {
+    Budget {
+        max_tokens: Some(tokens),
+        on_exceed: BudgetAction::Stop,
+        ..Budget::default()
+    }
+}
+
 struct Case {
     dir: tempfile::TempDir,
     script: PathBuf,
@@ -170,6 +200,7 @@ fn case(turns: Value, follow_up: bool, delegate: Delegate, tweak: impl FnOnce(&m
             ("parent".into(), parent(&script, follow_up)),
             ("task".into(), task_adapter(None)),
             ("writer".into(), task_adapter(Some("added.txt"))),
+            ("streamer".into(), streamer()),
         ]),
         delegates: BTreeMap::from([("helper".into(), delegate)]),
         ..Settings::default()
@@ -471,6 +502,70 @@ fn a_cancelled_task_needs_no_wake() {
     assert_eq!(task.status, TaskStatus::Cancelled);
     assert!(task.cancelled_by_parent);
     assert!(case.run.stages[0].attempts[0].turns.is_empty());
+}
+
+#[test]
+fn a_delegated_task_s_streamed_usage_stops_the_stage_at_its_cap() {
+    if !setup() {
+        return;
+    }
+    let turns = json!({
+        "turns": [[
+            {"call": "delegate_task", "args": {"task": "Look around", "client_request_id": "costly"}}
+        ]],
+        "handoffs": {"1": {"summary": "waiting on tasks", "verdict": "blocked"}}
+    });
+    let costly = Delegate {
+        harness: "streamer".into(),
+        model: "m".into(),
+        ..Delegate::default()
+    };
+    let mut case = case(turns, true, costly, |stage| stage.budget = token_cap(1000));
+    let started = std::time::Instant::now();
+    assert_eq!(
+        drive(&mut case.run),
+        Action::Stopped,
+        "{:?}",
+        case.run.error
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "took {elapsed:?}"
+    );
+    assert_eq!(case.run.status, Status::Blocked);
+    assert!(cost::budget_blocked(&case.run), "{:?}", case.run.error);
+    let task = &case.run.stages[0].attempts[0].tasks[0];
+    assert_eq!(task.status, TaskStatus::Cancelled, "{:?}", task.error);
+    assert!(task.turns[0].usage.is_some());
+}
+
+#[test]
+fn a_delegating_parent_s_streamed_usage_stops_the_stage_at_its_cap() {
+    if !setup() {
+        return;
+    }
+    let mut case = case(json!({"turns": []}), true, helper("m"), |stage| {
+        stage.harness = "streamer".into();
+        stage.model = "m".into();
+        stage.budget = token_cap(1000);
+    });
+    let started = std::time::Instant::now();
+    assert_eq!(
+        drive(&mut case.run),
+        Action::Stopped,
+        "{:?}",
+        case.run.error
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "took {elapsed:?}"
+    );
+    assert!(cost::budget_blocked(&case.run), "{:?}", case.run.error);
+    let attempt = &case.run.stages[0].attempts[0];
+    assert_eq!(attempt.status, Status::Blocked);
+    assert!(attempt.usage.is_some());
 }
 
 #[test]

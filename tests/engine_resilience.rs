@@ -874,6 +874,167 @@ with open(handoff_path, "w") as f:
     assert_eq!(run.status, Status::Pending);
 }
 
+/// A Codex-JSONL harness that reports `tokens` once, then waits `sleep`
+/// seconds and writes a complete handoff (or writes it first with
+/// `handoff_first`, exiting right after the usage line).
+fn streamer(dir: &Path, tokens: u64, sleep: u64, handoff_first: bool) -> CustomAdapter {
+    let script = dir.join(format!("streamer-{tokens}-{sleep}-{handoff_first}.py"));
+    let handoff = r#"open(sys.argv[1], "w").write(json.dumps({"schema_version": 2, "summary": "done", "verdict": "complete"}))"#;
+    let usage = format!(
+        r#"print(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens": {tokens}, "output_tokens": 0}}}}), flush=True)"#
+    );
+    let body = if handoff_first {
+        format!("{handoff}\n{usage}\n")
+    } else {
+        format!("{usage}\ntime.sleep({sleep})\n{handoff}\n")
+    };
+    fs::write(&script, format!("import json, sys, time\n{body}")).unwrap();
+    CustomAdapter {
+        command: "python3".into(),
+        args: vec![script.display().to_string(), "{handoff_file}".into()],
+        output: Some(CustomOutput::CodexJsonl),
+        ..CustomAdapter::default()
+    }
+}
+
+fn token_cap(tokens: u64) -> Budget {
+    Budget {
+        max_tokens: Some(tokens),
+        on_exceed: BudgetAction::Stop,
+        ..Budget::default()
+    }
+}
+
+fn streaming_stage(id: &str, role: Role, harness: &str) -> Stage {
+    Stage {
+        id: id.into(),
+        name: id.into(),
+        role,
+        harness: harness.into(),
+        model: "gpt-5.4".into(),
+        billing: Some(Billing::Api),
+        timeout_seconds: 60,
+        ..Stage::default()
+    }
+}
+
+#[test]
+fn a_final_stage_over_the_cap_blocks_the_run_instead_of_completing_it() {
+    init_test_config_dir();
+    let dir = common::tempdir();
+    let settings = Settings {
+        adapters: BTreeMap::from([
+            ("small".into(), streamer(dir.path(), 100, 0, true)),
+            ("quick".into(), streamer(dir.path(), 1200, 0, true)),
+        ]),
+        ..Settings::default()
+    };
+    // The harness exits right after the usage line that crosses the cap, so
+    // the live monitor never needs to signal it; sequential and graph runs.
+    let last = streaming_stage("quick", Role::Implementation, "quick");
+    let graph = vec![
+        streaming_stage("pre", Role::Research, "small"),
+        Stage {
+            after: vec!["pre".into()],
+            ..last.clone()
+        },
+    ];
+    for stages in [vec![last.clone()], graph] {
+        let wf = Workflow {
+            budget: token_cap(1000),
+            ..Workflow::new("QuickCap", stages)
+        };
+        let mut run = Run::create(dir.path(), &settings, &wf, "quick cap".into(), false).unwrap();
+        assert_eq!(drive(&mut run), Action::Stopped, "{:?}", run.error);
+        assert_eq!(run.status, Status::Blocked);
+        assert!(cost::budget_blocked(&run), "{:?}", run.error);
+        let state = run.stages.last().unwrap();
+        assert_eq!(state.status, Status::Complete, "the stage keeps its result");
+        assert!(state.attempts[0].usage.is_some());
+        // Raising the cap completes the run without rerunning anything.
+        cost::raise_budget(&mut run, None, Some(5000)).unwrap();
+        assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+        assert_eq!(run.stages.last().unwrap().attempts.len(), 1);
+    }
+}
+
+#[test]
+fn live_run_cap_counts_parallel_stages_together() {
+    init_test_config_dir();
+    let dir = common::tempdir();
+    let settings = Settings {
+        adapters: BTreeMap::from([("slow".into(), streamer(dir.path(), 600, 30, false))]),
+        ..Settings::default()
+    };
+    let join = Stage {
+        after: vec!["a".into(), "b".into()],
+        ..streaming_stage("join", Role::Summary, "slow")
+    };
+    let wf = Workflow {
+        budget: token_cap(1000),
+        ..Workflow::new(
+            "ParallelCap",
+            vec![
+                streaming_stage("a", Role::Research, "slow"),
+                streaming_stage("b", Role::Planning, "slow"),
+                join,
+            ],
+        )
+    };
+    let mut run = Run::create(dir.path(), &settings, &wf, "parallel cap".into(), false).unwrap();
+    let started = Instant::now();
+    assert_eq!(drive(&mut run), Action::Stopped, "{:?}", run.error);
+    let elapsed = started.elapsed();
+    assert!(cost::budget_blocked(&run), "{:?}", run.error);
+    // 600 + 600 tokens cross the 1,000-token cap: both stop, neither sleeps out.
+    assert!(elapsed < Duration::from_secs(20), "took {elapsed:?}");
+    for state in &run.stages[..2] {
+        assert_eq!(state.status, Status::Blocked, "{:?}", state.attempts);
+        assert!(state.attempts[0].usage.is_some());
+    }
+    assert!(run.stages[2].attempts.is_empty(), "the join never starts");
+}
+
+#[test]
+fn live_stage_cap_stops_fan_out_candidates() {
+    init_test_config_dir();
+    let dir = common::tempdir();
+    init_git(dir.path());
+    let settings = Settings {
+        adapters: BTreeMap::from([("slow".into(), streamer(dir.path(), 600, 30, false))]),
+        ..Settings::default()
+    };
+    let candidate = |id: &str| model_router::config::Candidate {
+        id: id.into(),
+        harness: "slow".into(),
+        model: "gpt-5.4".into(),
+        ..Default::default()
+    };
+    let fan = Stage {
+        budget: token_cap(1000),
+        fan_out: Some(model_router::config::FanOut {
+            candidates: vec![candidate("c1"), candidate("c2")],
+            judge: "auto".into(),
+        }),
+        ..streaming_stage("impl", Role::Implementation, "slow")
+    };
+    let wf = Workflow::new("FanOutCap", vec![fan]);
+    let mut run = Run::create(dir.path(), &settings, &wf, "fan-out cap".into(), false).unwrap();
+    let started = Instant::now();
+    assert_eq!(drive(&mut run), Action::Stopped, "{:?}", run.error);
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(20), "took {elapsed:?}");
+    assert!(cost::budget_blocked(&run), "{:?}", run.error);
+    assert_eq!(run.stages[0].status, Status::Blocked);
+    let fan_state = run.stages[0].fan_out.as_ref().unwrap();
+    assert!(fan_state.selection.is_none(), "no winner past the cap");
+    for c in &fan_state.candidates {
+        assert_eq!(c.status, Status::Blocked, "{:?}", c.error);
+        assert!(c.error.as_deref().unwrap().starts_with(cost::EXCEEDED));
+        assert!(c.attempts[0].usage.is_some());
+    }
+}
+
 #[test]
 fn fanout_candidate_diff_policy_blocks_offending_candidate() {
     init_test_config_dir();
