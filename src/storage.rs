@@ -5,7 +5,6 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
-    process::Command,
 };
 
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
@@ -304,7 +303,7 @@ pub fn git_readonly(project: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn git_with(project: &Path, args: &[&str], no_optional_locks: bool) -> Result<String> {
-    let mut command = Command::new("git");
+    let mut command = crate::snapshot::git_command();
     command.args(args).current_dir(project);
     if no_optional_locks {
         command.env("GIT_OPTIONAL_LOCKS", "0");
@@ -381,6 +380,7 @@ pub fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[cfg(unix)]
     #[test]

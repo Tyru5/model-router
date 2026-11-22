@@ -113,6 +113,17 @@ nothing from the stage still runs: a process it detached into its own session
 outlives the harness (the sandbox has no process namespace), keeps the stage's
 write access, and could race those writes.
 
+In every mode a sandboxed stage cannot change the workspace's Git config, its
+`config.worktree`, or its hooks directory (created when missing), nor, in a
+linked worktree, its `.git` file, `commondir`, or `gitdir`. Under
+`workspace-write` the `.git` directory stays writable but cannot be renamed
+or replaced. The router runs Git in the workspace outside the sandbox after
+each stage, and Git runs commands its config and hooks name (fsmonitor,
+filters, diff drivers). A stage refuses to start when a Git config file the
+router reads, or the target of an `include.path` or `includeIf.*.path`,
+lies in a path the stage may write. The router's own Git commands also pass
+`-c core.fsmonitor=false -c core.hooksPath=/dev/null`.
+
 A stage cannot reach a terminal host (see below), whose harness runs outside
 the sandbox, through the usual socket directories: `$XDG_RUNTIME_DIR/model-router`,
 `/run/user/<uid>/model-router`, `/tmp/model-router-<uid>`, and the temp

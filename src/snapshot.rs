@@ -50,8 +50,24 @@ pub struct FileChange {
     pub removed: Option<u64>,
 }
 
-fn git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
+/// `git` for the router's own commands in a workspace or checkout. A stage
+/// may have written the repository's config or hooks before the router
+/// runs Git there, outside the stage's sandbox: hooks and an fsmonitor
+/// command never run. (Sandboxed stages cannot write Git config or hooks;
+/// see `sandbox::git_locks`.)
+pub(crate) fn git_command() -> Command {
     let mut command = Command::new("git");
+    command.args([
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+    ]);
+    command
+}
+
+fn git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
+    let mut command = crate::snapshot::git_command();
     command.args(args).current_dir(dir).stdin(Stdio::null());
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
@@ -127,7 +143,7 @@ pub fn materialize(workspace: &Path, tree: &str) -> Result<()> {
         let scratch = tempfile::tempdir().context("Create a scratch directory")?;
         let patch = scratch.path().join("snapshot.patch");
         let file = fs::File::create(&patch)?;
-        let status = Command::new("git")
+        let status = crate::snapshot::git_command()
             .args([
                 "--no-pager",
                 "diff",
@@ -205,7 +221,7 @@ pub fn forget(project: &Path, run: &str) {
     if commands.is_empty() {
         return;
     }
-    let child = Command::new("git")
+    let child = crate::snapshot::git_command()
         .args(["update-ref", "--stdin"])
         .current_dir(project)
         .stdin(Stdio::piped())
@@ -321,7 +337,7 @@ fn number(field: &[u8]) -> Option<u64> {
 /// `git diff` between two trees, cut after `max` bytes with a note.
 pub fn patch(dir: &Path, from: &str, to: &str, max: usize) -> Result<String> {
     const STDERR_LIMIT: u64 = 64 * 1024;
-    let mut child = Command::new("git")
+    let mut child = crate::snapshot::git_command()
         .args([
             "--no-pager",
             "-c",
@@ -426,7 +442,7 @@ pub fn patch_lines(dir: &Path, from: &str, to: &str, mut each: impl FnMut(&str))
     const LINE_CHUNK_LIMIT: usize = 1024 * 1024;
     const OVERLAP: usize = 256;
     const STDERR_LIMIT: u64 = 64 * 1024;
-    let mut child = Command::new("git")
+    let mut child = crate::snapshot::git_command()
         .args([
             "--no-pager",
             "-c",

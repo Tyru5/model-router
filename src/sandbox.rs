@@ -69,6 +69,18 @@ pub struct Plan {
     /// another run's host could type into a harness outside its sandbox.
     #[serde(skip)]
     hidden: Vec<PathBuf>,
+    /// Git config and hooks (and a linked worktree's `.git` file and
+    /// `commondir`): read-only for every sandboxed stage. The router runs Git
+    /// in the workspace outside the sandbox, and Git runs commands its
+    /// config names (fsmonitor, filters, diff drivers) and hooks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub git_locked: Vec<PathBuf>,
+    /// The workspace's `.git` directory under `workspace-write`: writable,
+    /// but never renamed or replaced, so a stage cannot swap in a Git
+    /// directory of its own (bubblewrap binds it onto itself; Seatbelt
+    /// denies writes to the directory entry).
+    #[serde(skip)]
+    git_pinned: Vec<PathBuf>,
 }
 
 /// Paths of one attempt.
@@ -329,7 +341,14 @@ pub fn plan_with(
         .filter_map(|dir| Some(canonical(dir.parent()?).join(dir.file_name()?)))
         .collect();
     tidy(&mut hidden);
-    Ok(Some(Plan {
+    let (mut git_pinned, mut git_locked) = if backend.is_some() {
+        git_locks(stage, mode, paths.workspace)?
+    } else {
+        (vec![], vec![])
+    };
+    tidy(&mut git_pinned);
+    tidy(&mut git_locked);
+    let plan = Plan {
         mode,
         backend,
         program,
@@ -342,7 +361,167 @@ pub fn plan_with(
         readable,
         pinned,
         hidden,
-    }))
+        git_locked,
+        git_pinned,
+    };
+    if plan.backend.is_some() {
+        refuse_writable_git_config(&plan, stage, paths.workspace, home)?;
+    }
+    Ok(Some(plan))
+}
+
+/// The Git files a sandboxed stage must not change, and (under
+/// `workspace-write`) the `.git` directory to pin: config, `config.worktree`
+/// and hooks of the workspace's Git directories, and a linked worktree's
+/// `.git` file, `commondir`, and `gitdir`. A missing hooks directory is
+/// created so it can be locked; so is a missing `config.worktree` when the
+/// repository enables per-worktree config.
+fn git_locks(
+    stage: &Stage,
+    mode: Sandbox,
+    workspace: &Path,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let dot_git = workspace.join(".git");
+    let Ok(meta) = fs::symlink_metadata(&dot_git) else {
+        // Not a repository root; a repository above the workspace is
+        // outside every writable path.
+        return Ok((vec![], vec![]));
+    };
+    ensure!(
+        !(meta.file_type().is_symlink() && mode == Sandbox::WorkspaceWrite),
+        "Stage {} cannot use the workspace-write sandbox while {} is a symbolic link: the stage could point it at a Git directory of its own",
+        stage.id,
+        dot_git.display()
+    );
+    let (mut pinned, mut locked, dirs) = if meta.is_dir() {
+        let gitdir = canonical(&dot_git);
+        let pinned = if mode == Sandbox::WorkspaceWrite {
+            vec![gitdir.clone()]
+        } else {
+            vec![]
+        };
+        (pinned, vec![], vec![gitdir])
+    } else if meta.is_file() {
+        let dirs = git_dirs(workspace);
+        let mut locked = vec![canonical(&dot_git)];
+        if let Some(gitdir) = dirs.first() {
+            locked.extend(
+                ["commondir", "gitdir"]
+                    .iter()
+                    .map(|name| gitdir.join(name))
+                    .filter(|path| path.exists()),
+            );
+        }
+        (vec![], locked, dirs)
+    } else {
+        (vec![], vec![], vec![])
+    };
+    for dir in &dirs {
+        let config = dir.join("config");
+        let hooks = dir.join("hooks");
+        if !hooks.exists() && dir.join("HEAD").is_file() {
+            fs::create_dir(&hooks).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })?;
+        }
+        let worktree_config = dir.join("config.worktree");
+        let enables_worktree_config = read_regular_file(&config, 64 * 1024)
+            .is_some_and(|text| text.to_ascii_lowercase().contains("worktreeconfig"));
+        if enables_worktree_config && !worktree_config.exists() {
+            storage_create_empty(&worktree_config)?;
+        }
+        locked.extend(
+            [config, worktree_config, hooks]
+                .into_iter()
+                .filter(|path| path.exists())
+                .map(|path| canonical(&path)),
+        );
+    }
+    // A linked worktree's own Git directory holds its `config.worktree`.
+    pinned.retain(|p| !locked.contains(p));
+    Ok((pinned, locked))
+}
+
+fn storage_create_empty(path: &Path) -> Result<()> {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Refuses a sandboxed stage that could write a Git config file the router
+/// reads when it runs Git in the workspace after the stage: every file
+/// `git config --list --show-origin` names, and every `include.path` and
+/// `includeIf.*.path` target, which Git does not list when it is empty or
+/// missing.
+fn refuse_writable_git_config(
+    plan: &Plan,
+    stage: &Stage,
+    workspace: &Path,
+    home: Option<&Path>,
+) -> Result<()> {
+    let Ok(output) = crate::snapshot::git_command()
+        .args(["config", "--list", "--show-origin", "-z"])
+        .current_dir(workspace)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return Ok(());
+    };
+    if !output.status.success() {
+        return Ok(());
+    }
+    for path in git_config_sources(&output.stdout, workspace, home) {
+        ensure!(
+            !plan.stage_can_write(&path),
+            "Stage {} cannot be sandboxed: Git reads config from {}, which the stage could write, and the router runs Git in the workspace outside the sandbox. Move that file or include out of the stage's writable paths",
+            stage.id,
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Config files and include targets from `git config --list --show-origin -z`
+/// output (`file:PATH\0KEY\nVALUE\0` entries; relative paths are relative
+/// to `cwd`, include paths to their own file's directory).
+fn git_config_sources(output: &[u8], cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let text = String::from_utf8_lossy(output);
+    let mut fields = text.split('\0');
+    let mut sources = vec![];
+    while let (Some(origin), Some(entry)) = (fields.next(), fields.next()) {
+        let Some(file) = origin.strip_prefix("file:") else {
+            continue;
+        };
+        let file = cwd.join(file);
+        let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
+        let key = key.to_ascii_lowercase();
+        let include =
+            key == "include.path" || (key.starts_with("includeif.") && key.ends_with(".path"));
+        if include && !value.is_empty() {
+            let target = match (value.strip_prefix("~/"), home) {
+                (Some(rest), Some(home)) => home.join(rest),
+                (Some(_), None) => continue,
+                _ => file.parent().unwrap_or(cwd).join(value),
+            };
+            sources.push(target);
+        }
+        sources.push(file);
+    }
+    sources.sort();
+    sources.dedup();
+    sources
 }
 
 fn tidy(paths: &mut Vec<PathBuf>) {
@@ -550,6 +729,28 @@ fn git_dirs_inner(workspace: &Path) -> Option<Vec<PathBuf>> {
 }
 
 impl Plan {
+    /// Whether the sandboxed stage could change `path`: under a writable
+    /// grant, and not under a Git lock or a deeper protected path.
+    pub fn stage_can_write(&self, path: &Path) -> bool {
+        let path = canonical(path);
+        if self.git_locked.iter().any(|l| path.starts_with(l)) {
+            return false;
+        }
+        let depth = |list: &[PathBuf]| {
+            list.iter()
+                .filter(|w| path.starts_with(w))
+                .map(|w| w.components().count())
+                .max()
+        };
+        let Some(granted) = depth(&self.writable).max(depth(&self.writable_if_present)) else {
+            return false;
+        };
+        !self
+            .protected
+            .iter()
+            .any(|p| path.starts_with(p) && p.components().count() > granted)
+    }
+
     /// The program and arguments that run `program args` inside the sandbox.
     pub fn wrap(&self, program: &str, args: &[String]) -> (String, Vec<String>) {
         let (Some(backend), Some(sandbox)) = (self.backend, &self.program) else {
@@ -588,11 +789,18 @@ impl Plan {
             )
             .chain(self.writable.iter().map(|p| (p, "--bind")))
             .chain(self.writable_if_present.iter().map(|p| (p, "--bind-try")))
+            .chain(self.git_pinned.iter().map(|p| (p, "--bind")))
             .collect();
         binds.sort_by_key(|(p, _)| p.components().count());
         for (path, flag) in binds {
             let path = path.display().to_string();
             args.extend([flag.to_owned(), path.clone(), path]);
+        }
+        // After every grant, so no writable parent re-exposes them; a bind
+        // mount also cannot be renamed or replaced.
+        for path in &self.git_locked {
+            let path = path.display().to_string();
+            args.extend(["--ro-bind".to_owned(), path.clone(), path]);
         }
         // After every bind, so none of them exposes these again.
         for path in &self.hidden {
@@ -639,6 +847,27 @@ impl Plan {
                 }
                 text.push_str(")\n");
             }
+        }
+        // After the re-allow above, so no grant reaches them.
+        if !self.git_locked.is_empty() {
+            text.push_str("(deny file-write*");
+            for path in &self.git_locked {
+                text.push_str(&format!(
+                    "\n    (subpath {})",
+                    sbpl_string(&path.display().to_string())
+                ));
+            }
+            text.push_str(")\n");
+        }
+        if !self.git_pinned.is_empty() {
+            text.push_str("(deny file-write*");
+            for path in &self.git_pinned {
+                text.push_str(&format!(
+                    "\n    (literal {})",
+                    sbpl_string(&path.display().to_string())
+                ));
+            }
+            text.push_str(")\n");
         }
         // `subpath` also matches the directory itself, which could then be
         // removed and replaced with a link.
@@ -889,6 +1118,148 @@ mod tests {
         );
     }
 
+    fn git_init(dir: &Path) {
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// The router runs Git in the workspace outside the sandbox after a
+    /// stage, so a stage that wrote `.git/config` (fsmonitor, a filter) or a
+    /// hook could run commands unsandboxed.
+    #[test]
+    fn git_config_and_hooks_stay_read_only_under_workspace_write() {
+        let d = dirs();
+        git_init(&d.workspace);
+        fs::remove_dir_all(d.workspace.join(".git/hooks")).unwrap();
+        let stage = Stage {
+            role: Role::Implementation,
+            ..Stage::default()
+        };
+        let plan = plan_for(&d, &stage, Sandbox::ByRole, bwrap())
+            .unwrap()
+            .unwrap();
+        let git = d.workspace.join(".git");
+        assert_eq!(plan.git_locked, vec![git.join("config"), git.join("hooks")]);
+        assert!(
+            git.join("hooks").is_dir(),
+            "a missing hooks directory is created to lock it"
+        );
+        assert_eq!(plan.git_pinned, vec![git.clone()]);
+        assert!(!plan.stage_can_write(&git.join("config")));
+        assert!(!plan.stage_can_write(&git.join("hooks/pre-commit")));
+        assert!(plan.stage_can_write(&git.join("index")));
+        let argv = plan.bwrap_args();
+        let at = |flag: &str, p: &Path| {
+            argv.windows(3)
+                .position(|w| w[0] == flag && w[1] == p.display().to_string())
+                .unwrap_or_else(|| panic!("{flag} {p:?} in {argv:?}"))
+        };
+        // The locks come after every grant, including the workspace's.
+        assert!(at("--bind", &d.workspace) < at("--bind", &git));
+        assert!(at("--bind", &git) < at("--ro-bind", &git.join("config")));
+        assert!(at("--bind", &d.attempt) < at("--ro-bind", &git.join("hooks")));
+        let seatbelt = Plan {
+            backend: Some(Backend::SandboxExec),
+            ..plan.clone()
+        };
+        let profile = seatbelt.profile();
+        let config = profile
+            .find(&format!(
+                "(subpath {})",
+                sbpl_string(&git.join("config").display().to_string())
+            ))
+            .unwrap();
+        let workspace = profile
+            .find(&format!(
+                "(subpath {})",
+                sbpl_string(&d.workspace.display().to_string())
+            ))
+            .unwrap();
+        assert!(workspace < config, "{profile}");
+        assert!(
+            profile.contains(&format!(
+                "(literal {})",
+                sbpl_string(&git.display().to_string())
+            )),
+            "{profile}"
+        );
+    }
+
+    #[test]
+    fn read_only_stages_lock_git_files_without_pinning_a_writable_git_dir() {
+        let d = dirs();
+        git_init(&d.workspace);
+        let stage = Stage {
+            role: Role::Research,
+            ..Stage::default()
+        };
+        let plan = plan_for(&d, &stage, Sandbox::ByRole, bwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.mode, Sandbox::ReadOnly);
+        assert!(plan.git_pinned.is_empty());
+        assert!(plan.git_locked.contains(&d.workspace.join(".git/config")));
+        let git = d.workspace.join(".git").display().to_string();
+        assert!(
+            !plan
+                .bwrap_args()
+                .windows(2)
+                .any(|w| w[0] == "--bind" && w[1] == git),
+            "a read-only stage's Git directory is never bound writable"
+        );
+    }
+
+    #[test]
+    fn a_git_include_the_stage_could_write_refuses_the_sandbox() {
+        let d = dirs();
+        git_init(&d.workspace);
+        let config = d.workspace.join(".git/config");
+        let mut text = fs::read_to_string(&config).unwrap();
+        // Missing targets are not listed by `--show-origin`; still refused.
+        text.push_str("[include]\n\tpath = ../planted.gitconfig\n");
+        fs::write(&config, text).unwrap();
+        let stage = Stage {
+            id: "implement".into(),
+            role: Role::Implementation,
+            ..Stage::default()
+        };
+        let error = plan_for(&d, &stage, Sandbox::ByRole, bwrap()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("planted.gitconfig"), "{message}");
+        assert!(
+            message.contains("Stage implement cannot be sandboxed"),
+            "{message}"
+        );
+        // Read-only, the workspace is not writable, so the include is safe.
+        let research = Stage {
+            role: Role::Research,
+            ..Stage::default()
+        };
+        assert!(plan_for(&d, &research, Sandbox::ByRole, bwrap()).is_ok());
+    }
+
+    #[test]
+    fn git_config_sources_include_origins_and_include_targets() {
+        let cwd = Path::new("/w");
+        let home = Path::new("/h");
+        let output =
+            b"file:.git/config\0core.bare\nfalse\0file:.git/config\0include.path\nextra.cfg\0\
+file:/h/.gitconfig\0includeIf.gitdir:/w/.path\n~/more.cfg\0command line:\0core.x\ny\0";
+        assert_eq!(
+            git_config_sources(output, cwd, Some(home)),
+            vec![
+                PathBuf::from("/h/.gitconfig"),
+                PathBuf::from("/h/more.cfg"),
+                PathBuf::from("/w/.git/config"),
+                PathBuf::from("/w/.git/extra.cfg"),
+            ]
+        );
+    }
+
     #[test]
     fn workspace_write_includes_a_linked_worktrees_git_dirs() {
         let d = dirs();
@@ -1011,6 +1382,8 @@ mod tests {
             readable: vec![],
             pinned: vec![],
             hidden: vec![],
+            git_locked: vec![],
+            git_pinned: vec![],
         };
         let profile = plan.profile();
         assert!(!profile.contains("(deny file-write*)\n(deny network*)"));

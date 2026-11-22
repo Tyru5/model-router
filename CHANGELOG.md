@@ -7,6 +7,18 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ## [Unreleased]
 
+### Security
+
+- Sandboxed stages can no longer make the router run commands outside the
+  sandbox through Git. A `workspace-write` stage could write `.git/config`
+  (an fsmonitor or filter command), add a hook, or swap in its own `.git`,
+  and the router's unsandboxed `git add -A` after the stage would run it.
+  Git config, `config.worktree`, and hooks are now read-only in every
+  sandbox mode, the `.git` directory (or a linked worktree's `.git` file and
+  `commondir`) cannot be replaced, a stage refuses to start when a Git config
+  file or include target it could write would be read, and the router's own
+  Git commands disable fsmonitor and hooks.
+
 ### Fixed
 
 - Budgets now count fan-out candidate spend. `cost::stage_totals` summed only
