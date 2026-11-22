@@ -335,6 +335,23 @@ pub fn plan_with(
             vec![]
         }
     };
+    // model-router's own config directory (trust, run and schedule
+    // approvals) is never the stage's to write: created now so it can be
+    // bound read-only, and refused as a grant.
+    if backend.is_some() {
+        let config = crate::config::config_dir();
+        let _ = fs::create_dir_all(&config);
+        let config = canonical(&config);
+        ensure!(
+            !all.iter().any(|w| w.starts_with(&config)),
+            "Stage {} cannot be sandboxed: a writable path lies inside model-router's config directory {}",
+            stage.id,
+            config.display()
+        );
+        if config.is_dir() && all.iter().any(|w| config.starts_with(w) && *w != config) {
+            protected.push(config);
+        }
+    }
     tidy(&mut protected);
     // Only paths hidden by the private /tmp need re-exposing.
     readable

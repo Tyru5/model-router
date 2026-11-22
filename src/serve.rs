@@ -112,6 +112,31 @@ impl Server {
     }
 
     /// Resolves the project, verifies trust, and returns its settings in one load.
+    /// Fires the server project's due schedules (or, with `only`, that
+    /// webhook schedule) and drives their runs. Returns the runs started.
+    pub(crate) fn fire_schedules(&self, only: Option<&str>) -> Result<Vec<String>> {
+        let fired =
+            crate::delegation::schedules::fire_due(&self.project, chrono::Utc::now(), only)?;
+        let mut started = vec![];
+        for item in fired {
+            match item.run {
+                Some(run) => {
+                    let id = run.id.clone();
+                    match self.runs.drive(&self.project, run) {
+                        Ok(()) => started.push(id),
+                        Err(error) => log(format!("schedule {}: {error:#}", item.schedule)),
+                    }
+                }
+                None => log(format!(
+                    "schedule {}: launch failed: {}",
+                    item.schedule,
+                    item.error.unwrap_or_default()
+                )),
+            }
+        }
+        Ok(started)
+    }
+
     fn project_and_settings(&self, requested: Option<&str>) -> Result<(PathBuf, config::Settings)> {
         let (project, explicit) = self.check_project_root(requested)?;
         let loaded = config::load_config(&project, explicit)?;
@@ -162,6 +187,23 @@ pub fn run(
     let server = Arc::new(Server::new(project, config, &args.allow_roots)?);
     // Runs a stage's agent launches (and schedules fire) are driven here.
     crate::engine::set_run_host(Arc::new(tools::ServeHost(server.clone())));
+    // Fires the server project's approved, due schedules.
+    {
+        let (server, stop) = (server.clone(), shutdown.clone());
+        std::thread::spawn(move || {
+            let mut last = std::time::Instant::now() - Duration::from_secs(60);
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(500));
+                if last.elapsed() < Duration::from_secs(30) {
+                    continue;
+                }
+                last = std::time::Instant::now();
+                if let Err(error) = server.fire_schedules(None) {
+                    log(format!("schedules: {error:#}"));
+                }
+            }
+        });
+    }
     if let Some(addr) = args.http {
         ensure!(
             args.allow_remote || addr.ip().is_loopback(),

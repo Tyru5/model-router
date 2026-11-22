@@ -488,7 +488,17 @@ fn connection(
             };
             events(stream, server, id, &request.query, stop)
         }
-        (_, ["tools"] | ["tools", _] | ["runs", _, "events"]) => {
+        // A webhook schedule's trigger; the bearer token guards it like every route.
+        ("POST", ["schedules", id, "trigger"]) => match server.fire_schedules(Some(id)) {
+            Ok(runs) if runs.is_empty() => respond(
+                &mut stream,
+                409,
+                &json!({"error": format!("Schedule {id} is not an approved, enabled webhook schedule")}),
+            ),
+            Ok(runs) => respond(&mut stream, 200, &json!({"result": {"runs": runs}})),
+            Err(error) => respond(&mut stream, 400, &json!({"error": format!("{error:#}")})),
+        },
+        (_, ["tools"] | ["tools", _] | ["runs", _, "events"] | ["schedules", _, "trigger"]) => {
             respond(&mut stream, 405, &json!({"error": "Method not allowed"}))
         }
         _ => respond(&mut stream, 404, &json!({"error": "Not found"})),

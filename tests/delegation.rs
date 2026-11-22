@@ -584,3 +584,89 @@ fn launched_runs_get_their_own_worktree_and_answer_to_their_launcher() {
     let attempt = &case.run.stages[0].attempts[0];
     assert_eq!(attempt.launched_runs.len(), 1);
 }
+
+#[test]
+fn an_agent_s_schedule_fires_only_after_approval_and_once_per_occurrence() {
+    use model_router::delegation::schedules;
+    if !setup() {
+        return;
+    }
+    let turns = json!({
+        "turns": [[
+            {"call": "schedule_task", "args": {"workflow": "Plain", "task": "Nightly look", "every": "6h", "client_request_id": "n1"}},
+            {"call": "schedule_task", "args": {"workflow": "Plain", "task": "On push", "webhook": true}},
+            {"call": "list_scheduled_tasks"}
+        ]],
+        "handoffs": {"1": {"summary": "final", "verdict": "complete"}}
+    });
+    let mut case = case(turns, true, helper("m"), |stage| {
+        stage.delegation.as_mut().unwrap().schedules = true;
+    });
+    save_project_config(&case, &case.settings.clone());
+    assert_eq!(
+        drive(&mut case.run),
+        Action::Complete,
+        "{:?}",
+        case.run.error
+    );
+    let calls = calls(&case.script);
+    let created = &call(&calls, 1, "schedule_task")[0]["result"];
+    assert_eq!(created["schedule_id"], "s1", "{created}");
+    assert_eq!(created["approved"], false);
+    assert!(
+        created["approve"]
+            .as_str()
+            .unwrap()
+            .contains("schedules approve s1")
+    );
+    let project = case.dir.path();
+    let store = schedules::load(project).unwrap();
+    assert_eq!(store.schedules.len(), 2);
+    let created_at = store.schedules[0].created_at;
+    let later = created_at + chrono::Duration::hours(7);
+    // Unapproved: nothing fires.
+    assert!(
+        schedules::fire_due(project, later, None)
+            .unwrap()
+            .is_empty()
+    );
+    schedules::approve(project, "s1").unwrap();
+    let approved_at = schedules::load(project).unwrap().schedules[0]
+        .approved_at
+        .unwrap();
+    let due = approved_at + chrono::Duration::hours(7);
+    let fired = schedules::fire_due(project, due, None).unwrap();
+    assert_eq!(fired.len(), 1);
+    let run = fired[0].run.as_ref().unwrap();
+    assert_eq!(run.creation_source.label(), "schedule");
+    assert!(run.worktree);
+    // The occurrence is claimed: firing again at the same time does nothing.
+    assert!(schedules::fire_due(project, due, None).unwrap().is_empty());
+    // A pause forgets the approval; enabling again needs a new one.
+    schedules::set_enabled(project, "s1", false).unwrap();
+    schedules::set_enabled(project, "s1", true).unwrap();
+    let much_later = due + chrono::Duration::days(2);
+    assert!(
+        schedules::fire_due(project, much_later, None)
+            .unwrap()
+            .is_empty()
+    );
+    // A webhook schedule fires only on its trigger, once approved.
+    assert!(
+        schedules::fire_due(project, much_later, Some("s2"))
+            .unwrap()
+            .is_empty()
+    );
+    schedules::approve(project, "s2").unwrap();
+    assert_eq!(
+        schedules::fire_due(project, much_later, Some("s2"))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        schedules::fire_due(project, much_later, None)
+            .unwrap()
+            .is_empty()
+    );
+}

@@ -49,7 +49,26 @@ pub(super) fn run_tool(
             "Run tools are not enabled for this stage (delegation.runs), or this run was itself launched",
         ));
     }
+    if tool.contains("schedule") {
+        let allowed = launcher.delegation.schedules
+            && run.launched_by.is_none()
+            && run.creation_source.is_user();
+        if !allowed {
+            return Err(error(
+                "capability_denied",
+                "Schedule tools are not enabled for this stage (delegation.schedules), or this run was itself launched or scheduled",
+            ));
+        }
+    }
     match tool {
+        "schedule_task" => schedule_task(run, launcher, arguments),
+        "list_scheduled_tasks" => list_schedules(run),
+        "delete_scheduled_task" => {
+            let id = arg_str(arguments, "schedule_id")?;
+            crate::delegation::schedules::delete(&run.project, id)
+                .map_err(|e| error("schedule_not_found", format!("{e:#}")))?;
+            Ok(json!({"deleted": id}))
+        }
         "run_launch" => launch(run, launcher, arguments),
         "run_list" => list(run, arguments),
         "run_read" => read(run, arguments),
@@ -389,4 +408,147 @@ fn cancel(
             .map_err(internal)?;
     }
     status(run, &json!({"run_id": id}))
+}
+
+fn schedule_view(project: &Path, schedule: &crate::delegation::schedules::Schedule) -> Value {
+    use crate::delegation::schedules;
+    let approved = schedules::trusted_settings(project)
+        .is_ok_and(|settings| schedules::approved(project, schedule, &settings));
+    json!({
+        "schedule_id": schedule.id,
+        "workflow": schedule.workflow,
+        "task": storage::truncate(&schedule.task, 500),
+        "trigger": schedule.trigger.describe(),
+        "enabled": schedule.enabled,
+        "approved": approved,
+        "approve": (!approved && schedule.enabled).then(|| format!(
+            "The user approves it with: model-router -C {} schedules approve {}",
+            shell_words::quote(&project.display().to_string()),
+            schedule.id
+        )),
+        "next_due": schedules::next_due(schedule, Utc::now()),
+        "paused_reason": schedule.paused_reason,
+        "last": schedule.occurrences.last(),
+        "executors": "mr serve runs a scheduler; mr schedules tick fires due schedules for cron or systemd timers",
+    })
+}
+
+fn list_schedules(run: &Run) -> std::result::Result<Value, ToolError> {
+    let store = crate::delegation::schedules::load(&run.project).map_err(internal)?;
+    let views: Vec<Value> = store
+        .schedules
+        .iter()
+        .map(|s| schedule_view(&run.project, s))
+        .collect();
+    Ok(json!({ "schedules": views }))
+}
+
+fn schedule_task(
+    run: &Run,
+    launcher: &Launcher<'_>,
+    arguments: &Value,
+) -> std::result::Result<Value, ToolError> {
+    use crate::delegation::schedules::{self, Schedule};
+    let text = |name: &str| {
+        arguments
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+    };
+    let trigger_given = text("every").is_some()
+        || text("at").is_some()
+        || arguments.get("webhook").and_then(Value::as_bool) == Some(true);
+    let trigger = trigger_given
+        .then(|| {
+            schedules::parse_trigger(
+                text("every"),
+                text("at"),
+                arguments.get("webhook").and_then(Value::as_bool) == Some(true),
+            )
+        })
+        .transpose()
+        .map_err(|e| error("invalid_request", format!("{e:#}")))?;
+    let settings = schedules::trusted_settings(&run.project)
+        .map_err(|e| error("workflow_not_launchable", format!("{e:#}")))?;
+    let workflow = text("workflow").map(str::to_owned);
+    if let Some(task) = text("task") {
+        crate::config::validate_task(task)
+            .map_err(|e| error("invalid_request", format!("{e:#}")))?;
+    }
+    let key = text("client_request_id").map(str::to_owned);
+    let created_by = format!("{}/{}", run.id, launcher.stage.id);
+    let ceiling = launcher.ceiling.clone();
+    let id = text("schedule_id").map(str::to_owned);
+    let schedule = schedules::update(&run.project, |store| {
+        let now = Utc::now();
+        // An update: the schedule this request names, or the one its key made.
+        let existing = store.schedules.iter_mut().find(|s| {
+            id.as_deref() == Some(s.id.as_str())
+                || (id.is_none() && key.as_deref().is_some_and(|k| k == s.client_request_id))
+        });
+        let schedule = match existing {
+            Some(schedule) => {
+                if let Some(workflow) = &workflow {
+                    schedule.workflow = Some(workflow.clone());
+                }
+                if let Some(task) = text("task") {
+                    schedule.task = task.to_owned();
+                }
+                if let Some(trigger) = &trigger {
+                    schedule.trigger = trigger.clone();
+                }
+                if let Some(enabled) = arguments.get("enabled").and_then(Value::as_bool) {
+                    schedule.enabled = enabled;
+                }
+                schedule.ceiling = ceiling.clone();
+                schedule.revision += 1;
+                schedule.updated_at = now;
+                schedule.approved_at = None;
+                schedule.clone()
+            }
+            None => {
+                if id.is_some() {
+                    anyhow::bail!("No schedule {}", id.as_deref().unwrap_or_default());
+                }
+                let task = text("task").context("task is required for a new schedule")?;
+                let trigger = trigger
+                    .clone()
+                    .context("Give one of every, at, or webhook")?;
+                let number = store
+                    .schedules
+                    .iter()
+                    .filter_map(|s| s.id.strip_prefix('s')?.parse::<usize>().ok())
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                let schedule = Schedule {
+                    id: format!("s{number}"),
+                    workflow: workflow.clone(),
+                    task: task.to_owned(),
+                    trigger,
+                    enabled: arguments
+                        .get("enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true),
+                    created_by: created_by.clone(),
+                    ceiling: ceiling.clone(),
+                    client_request_id: key.clone().unwrap_or_default(),
+                    revision: 1,
+                    created_at: now,
+                    updated_at: now,
+                    approved_at: None,
+                    paused_reason: None,
+                    occurrences: vec![],
+                };
+                store.schedules.push(schedule.clone());
+                schedule
+            }
+        };
+        schedules::check_launchable(&settings, schedule.workflow.as_deref(), &schedule.ceiling)?;
+        Ok(schedule)
+    })
+    .map_err(|e| error("invalid_request", format!("{e:#}")))?;
+    // Any edit needs approval again.
+    schedules::revoke(&run.project, &schedule.id);
+    Ok(schedule_view(&run.project, &schedule))
 }

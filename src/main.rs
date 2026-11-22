@@ -38,6 +38,26 @@ struct Cli {
     command: Option<Commands>,
 }
 
+#[derive(Subcommand, Clone)]
+enum SchedulesAction {
+    /// This project's schedules, with approval and next due time.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Approve a schedule as it stands now; any later edit asks again.
+    Approve { id: String },
+    /// Pause a schedule (its approval is forgotten).
+    Pause { id: String },
+    /// Enable a paused schedule; it then needs approval again.
+    Enable { id: String },
+    /// Delete a schedule permanently.
+    Delete { id: String },
+    /// Fire every approved schedule that is due and drive its runs to an
+    /// end; exits non-zero when one failed.
+    Tick,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Write an editable starter or preset workflow (reviews disabled).
@@ -332,6 +352,12 @@ enum Commands {
         #[arg(long, conflicts_with = "yes")]
         revoke: bool,
     },
+    /// Schedules a stage's agent created: list, approve, pause, enable,
+    /// delete, or fire the due ones (`tick`, for cron or systemd timers).
+    Schedules {
+        #[command(subcommand)]
+        action: Option<SchedulesAction>,
+    },
     /// Check harness executables, versions, and flags without a model request.
     Doctor {
         /// Print machine-readable JSON.
@@ -455,6 +481,35 @@ fn main_result() -> Result<()> {
         Some(Commands::Trust { yes, revoke }) => {
             return cli::manage::trust(&project, cli.config.as_deref(), *yes, *revoke);
         }
+        Some(Commands::Schedules { action }) => {
+            return cli::manage::schedules(
+                &project,
+                action
+                    .clone()
+                    .map_or(
+                        cli::manage::SchedulesCommand::List { json: false },
+                        |a| match a {
+                            SchedulesAction::List { json } => {
+                                cli::manage::SchedulesCommand::List { json }
+                            }
+                            SchedulesAction::Approve { id } => {
+                                cli::manage::SchedulesCommand::Approve(id)
+                            }
+                            SchedulesAction::Pause { id } => {
+                                cli::manage::SchedulesCommand::Pause(id)
+                            }
+                            SchedulesAction::Enable { id } => {
+                                cli::manage::SchedulesCommand::Enable(id)
+                            }
+                            SchedulesAction::Delete { id } => {
+                                cli::manage::SchedulesCommand::Delete(id)
+                            }
+                            SchedulesAction::Tick => cli::manage::SchedulesCommand::Tick,
+                        },
+                    ),
+                &cancel,
+            );
+        }
         _ => {}
     }
     if let Some(Commands::Serve(args)) = cli.command {
@@ -515,6 +570,7 @@ fn main_result() -> Result<()> {
             | Commands::Presets
             | Commands::Completions { .. }
             | Commands::Trust { .. }
+            | Commands::Schedules { .. }
             | Commands::Serve(_),
         ) => unreachable!(),
         Some(Commands::Validate) => cli::manage::validate(&settings, &config_path, review.as_ref()),

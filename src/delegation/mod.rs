@@ -6,6 +6,7 @@ pub mod config;
 pub mod instructions;
 pub mod policy;
 pub mod records;
+pub mod schedules;
 pub mod tools;
 
 pub use config::{Delegate, Delegation, Isolation};

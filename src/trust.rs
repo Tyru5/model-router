@@ -539,6 +539,8 @@ pub fn revoke(project: &Path) -> Result<bool> {
     if had_runs {
         fs::remove_dir_all(approvals)?;
     }
+    // Schedules agents created fire only under the trust they were approved in.
+    crate::delegation::schedules::revoke_all(project);
     Ok(removed || had_runs)
 }
 
