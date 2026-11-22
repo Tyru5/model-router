@@ -117,7 +117,9 @@ In every mode a sandboxed stage cannot change the workspace's Git config, its
 `config.worktree`, or its hooks directory (created when missing), nor, in a
 linked worktree, its `.git` file, `commondir`, or `gitdir`. Under
 `workspace-write` the `.git` directory stays writable but cannot be renamed
-or replaced. The router runs Git in the workspace outside the sandbox after
+or replaced, and a stage refuses to start while its Git config,
+`config.worktree`, or hooks entry is a symbolic link it could replace. The
+router runs Git in the workspace outside the sandbox after
 each stage, and Git runs commands its config and hooks name (fsmonitor,
 filters, diff drivers). A stage refuses to start when a Git config file the
 router reads, or the target of an `include.path` or `includeIf.*.path`,
@@ -160,9 +162,11 @@ broker ([delegation.md](delegation.md)).
   drop inherited `MODEL_ROUTER_ORCH_*` variables.
 - Tasks always run in their own OS sandbox (`shared`: read-only; `worktree`:
   writable inside its worktree, Git's shared refs, hooks, and config
-  read-only) and are refused when no backend works. A task never exceeds its
-  parent on write access, native permissions (`extra_args` or an escalating
-  setting count as escalated), network, or sandbox enforcement.
+  read-only; `objects/` and its own `worktrees/<name>/` stay writable) and
+  are refused when no backend works. A task, launched run, or schedule never
+  exceeds its creator on write access, native permissions (`extra_args` or an
+  escalating setting count as escalated), network, sandbox enforcement, or
+  `sandbox_writable` paths outside the creator's.
 - A worktree task's patch is sealed by the router after the task ends,
   hashed in `run.json`, re-checked against `protected_paths` and for `.git`
   or `.model-router` paths, and applied only by `task_apply`, with a journal

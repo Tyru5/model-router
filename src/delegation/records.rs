@@ -204,6 +204,10 @@ pub struct TaskState {
     /// `task_send` messages waiting for the current turn to end.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_messages: Vec<String>,
+    /// Accepted `task_send` calls with a `client_request_id`, so a retry
+    /// queues nothing twice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sends: Vec<SendKey>,
     pub created_at: DateTime<Utc>,
 }
 impl TaskState {
@@ -216,12 +220,23 @@ impl TaskState {
     }
 }
 
+/// One accepted `task_send`: its idempotency key and payload digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendKey {
+    pub client_request_id: String,
+    pub fingerprint: String,
+}
+
 /// A run an agent launched with `run_launch`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchedRun {
     pub id: String,
     pub client_request_id: String,
     pub fingerprint: String,
+    /// Its place in the `runs` list of its call, so a retry after a partial
+    /// failure creates only the runs still missing.
+    #[serde(default)]
+    pub offset: usize,
 }
 
 /// A parent's wake turn: one `follow_up` process.

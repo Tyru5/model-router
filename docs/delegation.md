@@ -95,9 +95,9 @@ schedules = false      # schedule tools
   Named delegates must be in the same file as the workflow that names them.
 - Ad-hoc targets: with `harnesses` non-empty, the model may pass
   `{harness, model?, effort?, provider?}`. The harness must be installed
-  (cached `doctor` probe). The model must match `models` when set, and be in
-  the harness catalog unless `models` names it literally
-  (`CatalogSource::Manual` harnesses need a literal). Providers must be
+  (cached `doctor` probe). With `models` set, the model is required and must
+  match one of its globs; without it, a given model must be in the harness
+  catalog (any model for `CatalogSource::Manual` harnesses). Providers must be
   listed in `providers` and configured. Ad-hoc targets take no
   `harness_settings`. The router never substitutes a model.
 - Stage `extra_args` never cross to a task.
@@ -624,12 +624,10 @@ tasks`).
   (`builtins.rs`).
 - Worktree tasks: Git's common directory is read-only except `objects/` and
   the task's own `worktrees/<name>/`, so a task can commit on its detached
-  HEAD but cannot change refs, hooks, or config shared with the parent.
-  (`sandbox::plan` grants the whole common directory today, `sandbox.rs:234`;
-  the worktree-task plan narrows it, and adds the parent checkout and the
-  common directory to `Plan::protected` when they lie under a writable or
-  optional path such as `TMPDIR`.) `objects/` stays writable: a task can
-  add or delete objects, which a parent at write level `workspace` can
+  HEAD but cannot change refs, hooks, or config shared with the parent
+  (`Plan::confine_shared_git` drops the common directory from the writable
+  paths and adds it to `Plan::protected`). `objects/` stays writable: a task
+  can add or delete objects, which a parent at write level `workspace` can
   already do.
 - Git command policy for every Git command delegation triggers (task
   worktree creation, snapshots, sealed patches, `task_apply`, launched-run
@@ -928,56 +926,34 @@ TUI task line, `scripts/smoke_delegation.py`, docs.
 
 ## Tests
 
-All offline.
+All offline, against `examples/mock_harness.py`. Its `--script` mode starts
+`mr __mcp-bridge` from `--mcp-config` and replays a JSON list of tool calls
+per turn; model `ask` makes a task ask a question on its first turn, `slow`
+keeps it running.
 
-- `examples/mock_harness.py` gains a scripted MCP client mode: it starts
-  `mr __mcp-bridge` from its environment and replays a JSON script of tool
-  calls per turn (delegate, end turn, read results, apply, answer), so parent
-  behaviour runs without a model. A mock task mode returns a question on its
-  first turn.
-- `tests/delegation.rs` on `tests/common/mod.rs` (`tempdir()` with a space and
-  non-ASCII), with `MODEL_ROUTER_CONFIG_DIR` set:
-  - capabilities; target resolution; ceiling refusals; untrusted config ignored;
-  - async cohort and a single wake; wake prompt contents; provisional handoff
-    set aside and never resolved; final turn without handoff fails;
-  - question → wake → `task_send` answer → completion; unanswered question
-    settles `blocked`; no deadlock with a waiting task in the cohort;
-  - `wait` timeout without cancel; wait-only parent loop; parent exiting with
-    live tasks; interactive parent exiting with live tasks, then waking;
-  - idempotent retry and `request_conflict`; wrong token; second connection;
-    reconnect after a closed one; stale socket after the turn;
-  - caps, budget refusal of a task and of a wake, deadline while waiting;
-  - cancel; failed parent cancels tasks; cancel flag wakes an idle owner;
-    crash recovery of task and wake groups;
-  - worktree task, sealed patch, `task_apply` success, conflict, protected
-    path, `.model-router` path, double apply, tampered patch, crash mid-apply
-    (`apply_unknown` and both clean outcomes), shared Git refs unwritable;
-  - `run_launch` from a CLI run (pending + resume hint), own worktree,
-    `runs` off inside, `run_cancel` of a foreign run refused, `run_wait` on an
-    undriven run, launched spend in the launcher's budget also after resume,
-    workflow whose router checks exceed the caller refused, `run_read`
-    through a swapped ancestor directory refused;
-  - schedule approval receipt, receipt deleted on pause or edit (approve,
-    pause, re-enable, nothing fires until approved again),
-    `tick` and a concurrent claim firing once, `tick` driving a fired mock run
-    to completion, failed launch after a claim recorded.
-  - sandboxed parent refused a workflow with an unsandboxed stage or router
-    checks; `run_retry` from a narrower stage refused; queued task refused by
-    budget settles `failed` and wakes the cohort; second patch revision listed
-    and applied without disturbing the first's record; task rewriting its
-    worktree `.git` runs nothing.
-  - delivery: reading a result with `task_status` empties the cohort, so the
-    turn concludes without a wake; a timed-out wait delivers nothing; a wake
-    turn that exits without reading announced results stops `blocked`;
-    broker threads blocked in `accept` do not hang shutdown.
-- Unit tables: target resolution, the four ceiling axes, `supports_wake`.
-- `sandbox::Plan` tests for both backends; a socket connectivity test inside
-  real bwrap (Linux) and Seatbelt (macOS CI).
-- `tests/adapter_golden.rs` cases per v1 parent;
-  `MODEL_ROUTER_UPDATE_GOLDEN=1` and a read of the diff.
-- `scripts/smoke_delegation.py`: task panel, interactive release prompt,
-  schedule approval key; frame markers, no sleeps.
-- `cargo +1.85 check --all-targets --locked`.
+- `tests/delegation.rs` (`tests/common/mod.rs` temp dirs,
+  `MODEL_ROUTER_CONFIG_DIR` set): a shared task wakes the parent once and its
+  result is read, with `delegate_task` retry and `request_conflict`; a
+  question answered with `task_send`, a retried send queued once, a changed
+  send refused; a read but unanswered question settles `blocked`; a wake that
+  ends without reading its results stops `blocked`; a parent with no
+  `follow_up` waits in its tool call; a cancelled task needs no wake; a
+  worktree task's patch reaches the checkout only through `task_apply`
+  (applied, already applied, stale revision); unlisted targets and unknown
+  tasks refused; launched runs get their own worktree, retry by key, and
+  answer to their launcher; a schedule fires only after approval and once per
+  occurrence, with retry and `request_conflict`; an interactive parent that
+  exits with tasks running is resumed unattended.
+- Unit tests: delegation config validation (`src/delegation/config.rs`), the
+  ceiling axes and extra writable paths (`policy.rs`), schedule triggers and
+  receipt ids (`schedules.rs`), and `sandbox` plans: Git locks, symlinked Git
+  config refused, a worktree task's shared Git directory read-only.
+- `tests/sandbox.rs`: a `workspace-write` stage cannot make the router run
+  Git commands.
+- `tests/adapter_golden.rs`: the delegation argv for each supported parent
+  (`tests/fixtures/adapter-golden/delegation.json`).
+- `scripts/smoke_delegation.py`: the Runs page task line, and cancelling the
+  stage cancels its task. Skipped without bubblewrap or `sandbox-exec`.
 
 ## Decided
 

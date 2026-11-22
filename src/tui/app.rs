@@ -62,6 +62,8 @@ pub(super) struct App {
     pub(super) starting: bool,
     /// Background work and the channel its results arrive on.
     pub(super) tasks: Tasks,
+    /// Launched runs an agent cancelled before this session adopted them.
+    pub(super) cancel_on_adopt: std::collections::HashSet<String>,
 }
 
 /// Git facts for the project, refreshed in the background.
@@ -132,6 +134,7 @@ impl App {
             repo: Repo::new(repo),
             starting: false,
             tasks: Tasks::default(),
+            cancel_on_adopt: Default::default(),
         }
     }
     pub(super) fn choose_theme(&mut self) {

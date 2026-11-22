@@ -468,6 +468,12 @@ Do not edit any project files or run destructive commands. Emit ONLY a valid han
     run.persist()?;
     // Recorded like the stage's own harness, so a later drive can stop the
     // follow-up's group if mr dies meanwhile.
+    // The repair gets no delegation tools: a delegating turn's broker is
+    // closed by now, and its socket and token are gone.
+    let sandbox = prepared.sandbox.clone().map(|mut plan| {
+        plan.orch = None;
+        plan
+    });
     let outcome = process::capture_with_stall(
         &invocation,
         &workspace,
@@ -475,7 +481,7 @@ Do not edit any project files or run destructive commands. Emit ONLY a valid han
         timeout,
         stall,
         cancel,
-        prepared.sandbox.as_ref(),
+        sandbox.as_ref(),
         |group| {
             if let Some(attempt) = run.stages[index].attempts.last_mut() {
                 attempt.set_group(Some(group));

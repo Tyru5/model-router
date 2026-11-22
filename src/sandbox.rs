@@ -470,6 +470,18 @@ fn git_locks(
         if enables_worktree_config && !worktree_config.exists() {
             storage_create_empty(&worktree_config)?;
         }
+        // Locks protect a link's target, not the link: a stage that can
+        // write the Git directory could replace the link with its own file.
+        if mode == Sandbox::WorkspaceWrite {
+            for entry in [&config, &worktree_config, &hooks] {
+                ensure!(
+                    !fs::symlink_metadata(entry).is_ok_and(|m| m.file_type().is_symlink()),
+                    "Stage {} cannot use the workspace-write sandbox while {} is a symbolic link: the stage could replace it with Git config or hooks of its own. Make it a regular file or directory",
+                    stage.id,
+                    entry.display()
+                );
+            }
+        }
         locked.extend(
             [config, worktree_config, hooks]
                 .into_iter()
@@ -583,6 +595,20 @@ pub fn harness_dirs(harness: &str) -> Vec<String> {
     let extra = crate::harness::get(harness).map_or(&[][..], |spec| spec.state_dirs);
     dirs.extend(extra.iter().map(|d| (*d).to_owned()));
     dirs
+}
+
+/// The stage's `sandbox_writable` grants as the sandbox resolves them; a
+/// path that cannot be expanded is kept as written (the plan refuses it).
+pub fn writable_grants(stage: &Stage) -> Vec<PathBuf> {
+    let home = home();
+    stage
+        .sandbox_writable
+        .iter()
+        .map(|raw| match expand(raw, home.as_deref()) {
+            Ok(path) => canonical(&path),
+            Err(_) => PathBuf::from(raw),
+        })
+        .collect()
 }
 
 /// `~/x` against `home`; other paths must be absolute.
@@ -765,6 +791,24 @@ fn git_dirs_inner(workspace: &Path) -> Option<Vec<PathBuf>> {
 }
 
 impl Plan {
+    /// Keeps a linked worktree's own Git directory (HEAD, index) and the
+    /// object store writable, so a worktree task can commit on its detached
+    /// HEAD, but makes the rest of the repository's shared one (refs, other
+    /// worktrees, packed-refs) read-only: a worktree task changes the main
+    /// checkout only through `task_apply`.
+    pub fn confine_shared_git(&mut self, workspace: &Path) {
+        if let [_, common] = git_dirs(workspace).as_slice() {
+            self.writable.retain(|p| p != common);
+            let objects = common.join("objects");
+            if objects.is_dir() && !self.writable.contains(&objects) {
+                self.writable.push(objects);
+            }
+            if !self.protected.contains(common) {
+                self.protected.push(common.clone());
+            }
+        }
+    }
+
     /// Lets a delegating turn reach its own broker: the socket, the token
     /// file, and the bridge program, after every directory that hides them.
     pub fn allow_orch(&mut self, sock: &Path, token_file: &Path, program: &Path) {
@@ -1280,6 +1324,30 @@ mod tests {
     }
 
     #[test]
+    fn a_symlinked_git_config_refuses_workspace_write() {
+        let d = dirs();
+        git_init(&d.workspace);
+        let config = d.workspace.join(".git/config");
+        let outside = d.root.join("outside.gitconfig");
+        fs::rename(&config, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &config).unwrap();
+        let stage = Stage {
+            id: "implement".into(),
+            role: Role::Implementation,
+            ..Stage::default()
+        };
+        let error = plan_for(&d, &stage, Sandbox::ByRole, bwrap()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("is a symbolic link"), "{message}");
+        // Read-only, the Git directory is not writable, so the link stays.
+        let research = Stage {
+            role: Role::Research,
+            ..stage
+        };
+        assert!(plan_for(&d, &research, Sandbox::ByRole, bwrap()).is_ok());
+    }
+
+    #[test]
     fn a_git_include_the_stage_could_write_refuses_the_sandbox() {
         let d = dirs();
         git_init(&d.workspace);
@@ -1368,6 +1436,37 @@ file:/h/.gitconfig\0includeIf.gitdir:/w/.path\n~/more.cfg\0command line:\0core.x
                 .unwrap()
         };
         assert!(at(&d.workspace) < at(&d.attempt));
+
+        // A worktree task: its own Git directory stays writable, re-bound
+        // after the shared one is made read-only.
+        let mut plan = plan;
+        plan.confine_shared_git(&d.workspace);
+        assert!(!plan.writable.contains(&common), "{:?}", plan.writable);
+        assert!(plan.protected.contains(&common), "{:?}", plan.protected);
+        let args = plan.bwrap_args();
+        let bind = |flag: &str, p: &Path| {
+            let p = p.display().to_string();
+            args.windows(3)
+                .position(|w| w[0] == flag && w[1] == p && w[2] == p)
+                .unwrap_or_else(|| panic!("{flag} {p} missing: {args:?}"))
+        };
+        assert!(
+            bind("--ro-bind", &common) < bind("--bind", &gitdir),
+            "{args:?}"
+        );
+        let objects = common.join("objects");
+        assert!(
+            bind("--ro-bind", &common) < bind("--bind", &objects),
+            "{args:?}"
+        );
+        let profile = plan.profile();
+        let deny = profile
+            .find(&format!("(subpath \"{}\")", common.display()))
+            .expect(&profile);
+        assert!(
+            profile[deny..].contains(&format!("(subpath \"{}\")", gitdir.display())),
+            "{profile}"
+        );
     }
 
     #[test]

@@ -59,8 +59,15 @@ pub struct Schedule {
     /// rechecks the workflow against it.
     pub created_by: String,
     pub ceiling: Ceiling,
+    /// The latest `schedule_task` call with a `client_request_id`: its key,
+    /// the stage that sent it, and a digest of its payload. A retry of that
+    /// call from the same stage changes nothing.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_request_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub requested_by: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub request_fingerprint: String,
     /// Bumped on every edit and enable or pause.
     pub revision: u64,
     pub created_at: DateTime<Utc>,
@@ -152,13 +159,25 @@ fn approvals_dir(project: &Path) -> PathBuf {
         .join(crate::trust::digest(&[key]))
 }
 
-fn receipt(project: &Path, id: &str) -> PathBuf {
-    approvals_dir(project).join(id)
+/// Whether `id` is a schedule id the router could have made: a receipt
+/// path is joined from it, so anything else (a path, `..`) is refused.
+fn safe_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn receipt(project: &Path, id: &str) -> Option<PathBuf> {
+    safe_id(id).then(|| approvals_dir(project).join(id))
 }
 
 /// Forgets a schedule's approval (on any pause or edit).
 pub fn revoke(project: &Path, id: &str) {
-    let _ = fs::remove_file(receipt(project, id));
+    if let Some(path) = receipt(project, id) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 /// Forgets every schedule approval of `project` (`trust --revoke`).
@@ -201,7 +220,8 @@ pub fn approved(project: &Path, schedule: &Schedule, settings: &Settings) -> boo
     let Ok(expected) = digest(project, schedule, settings) else {
         return false;
     };
-    fs::read_to_string(receipt(project, &schedule.id)).is_ok_and(|text| text.trim() == expected)
+    receipt(project, &schedule.id)
+        .is_some_and(|path| fs::read_to_string(path).is_ok_and(|text| text.trim() == expected))
 }
 
 /// The project's config, refused unless trusted.
@@ -226,9 +246,9 @@ pub fn approve(project: &Path, id: &str) -> Result<Schedule> {
         ensure!(schedule.enabled, "Schedule {id} is paused; enable it first");
         check_launchable(&settings, schedule.workflow.as_deref(), &schedule.ceiling)?;
         let digest = digest(project, schedule, &settings)?;
-        let dir = approvals_dir(project);
-        fs::create_dir_all(&dir)?;
-        crate::storage::atomic_write(&dir.join(id), digest.as_bytes())?;
+        let path = receipt(project, id).with_context(|| format!("Invalid schedule id {id}"))?;
+        fs::create_dir_all(approvals_dir(project))?;
+        crate::storage::atomic_write(&path, digest.as_bytes())?;
         schedule.approved_at = Some(Utc::now());
         schedule.paused_reason = None;
         Ok(schedule.clone())
@@ -237,13 +257,13 @@ pub fn approve(project: &Path, id: &str) -> Result<Schedule> {
 
 /// Pauses (or enables) schedule `id`; either way it needs approval again.
 pub fn set_enabled(project: &Path, id: &str, enabled: bool) -> Result<Schedule> {
-    revoke(project, id);
     update(project, |store| {
         let schedule = store
             .schedules
             .iter_mut()
             .find(|s| s.id == id)
             .with_context(|| format!("No schedule {id}"))?;
+        revoke(project, id);
         schedule.enabled = enabled;
         schedule.revision += 1;
         schedule.updated_at = Utc::now();
@@ -253,11 +273,11 @@ pub fn set_enabled(project: &Path, id: &str, enabled: bool) -> Result<Schedule> 
 }
 
 pub fn delete(project: &Path, id: &str) -> Result<()> {
-    revoke(project, id);
     update(project, |store| {
         let before = store.schedules.len();
         store.schedules.retain(|s| s.id != id);
         ensure!(store.schedules.len() < before, "No schedule {id}");
+        revoke(project, id);
         Ok(())
     })
 }
@@ -443,6 +463,8 @@ mod tests {
             created_by: "run/stage".into(),
             ceiling: policy::UNSANDBOXED_COMMAND,
             client_request_id: String::new(),
+            requested_by: String::new(),
+            request_fingerprint: String::new(),
             revision: 1,
             created_at: at,
             updated_at: at,
@@ -485,5 +507,25 @@ mod tests {
         });
         assert_eq!(next_due(&s, start), Some(start + Duration::hours(12)));
         assert_eq!(next_due(&schedule(Trigger::Webhook), start), None);
+    }
+
+    #[test]
+    fn an_unknown_or_path_like_id_touches_no_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join(".model-router")).unwrap();
+        let victim = temp.path().join("victim");
+        fs::write(&victim, "keep").unwrap();
+        let id = victim.display().to_string();
+        assert!(delete(&project, &id).is_err());
+        assert!(set_enabled(&project, &id, false).is_err());
+        assert!(
+            victim.is_file(),
+            "deleting an unknown schedule removed a file"
+        );
+        for bad in ["", "..", "a/b", "../x", &id] {
+            assert!(receipt(&project, bad).is_none(), "{bad}");
+        }
+        assert!(receipt(&project, "s12").is_some());
     }
 }

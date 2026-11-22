@@ -348,7 +348,9 @@ fn a_question_is_answered_with_task_send_and_the_answer_comes_back() {
             [{"call": "delegate_task", "args": {"task": "Write the function"}}],
             [
                 {"call": "task_status", "args": {"task_id": "t1"}},
-                {"call": "task_send", "args": {"task_id": "t1", "message": "Name it add"}}
+                {"call": "task_send", "args": {"task_id": "t1", "message": "Name it add", "client_request_id": "a1"}},
+                {"call": "task_send", "args": {"task_id": "t1", "message": "Name it add", "client_request_id": "a1"}},
+                {"call": "task_send", "args": {"task_id": "t1", "message": "Name it sum", "client_request_id": "a1"}}
             ],
             [{"call": "task_status", "args": {"task_id": "t1"}}]
         ],
@@ -365,6 +367,10 @@ fn a_question_is_answered_with_task_send_and_the_answer_comes_back() {
     let asked = &call(&calls, 2, "task_status")[0]["result"];
     assert_eq!(asked["status"], "waiting");
     assert_eq!(asked["questions"][0], "Which name should the function get?");
+    // A retried send queues nothing; a changed payload under its key is refused.
+    let sends = call(&calls, 2, "task_send");
+    assert!(sends[1]["result"]["error"].is_null(), "{}", sends[1]);
+    assert_eq!(sends[2]["result"]["error"]["code"], "request_conflict");
     let answered = &call(&calls, 3, "task_status")[0]["result"];
     assert_eq!(answered["status"], "completed");
     assert_eq!(answered["latest_turn_summary"], "answered: Name it add");
@@ -375,6 +381,30 @@ fn a_question_is_answered_with_task_send_and_the_answer_comes_back() {
         "one wake for the question, one for the answer"
     );
     assert_eq!(attempt.tasks[0].turns.len(), 2);
+}
+
+#[test]
+fn a_question_read_but_never_answered_is_blocked_when_the_stage_ends() {
+    if !setup() {
+        return;
+    }
+    let turns = json!({
+        "turns": [
+            [{"call": "delegate_task", "args": {"task": "Write the function"}}],
+            [{"call": "task_status", "args": {"task_id": "t1"}}]
+        ],
+        "handoffs": {"2": {"summary": "final", "verdict": "complete"}}
+    });
+    let mut case = case(turns, true, helper("ask"), |_| {});
+    assert_eq!(
+        drive(&mut case.run),
+        Action::Complete,
+        "{:?}",
+        case.run.error
+    );
+    let task = &case.run.stages[0].attempts[0].tasks[0];
+    assert_eq!(task.status, TaskStatus::Blocked);
+    assert_eq!(task.error.as_deref(), Some("Unanswered: the stage ended"));
 }
 
 #[test]
@@ -602,6 +632,8 @@ fn an_agent_s_schedule_fires_only_after_approval_and_once_per_occurrence() {
     let turns = json!({
         "turns": [[
             {"call": "schedule_task", "args": {"workflow": "Plain", "task": "Nightly look", "every": "6h", "client_request_id": "n1"}},
+            {"call": "schedule_task", "args": {"workflow": "Plain", "task": "Nightly look", "every": "6h", "client_request_id": "n1"}},
+            {"call": "schedule_task", "args": {"workflow": "Plain", "task": "Hourly look", "every": "6h", "client_request_id": "n1"}},
             {"call": "schedule_task", "args": {"workflow": "Plain", "task": "On push", "webhook": true}},
             {"call": "list_scheduled_tasks"}
         ]],
@@ -627,9 +659,15 @@ fn an_agent_s_schedule_fires_only_after_approval_and_once_per_occurrence() {
             .unwrap()
             .contains("schedules approve s1")
     );
+    // A retry changes nothing; a changed payload under its key is refused.
+    let retried = &call(&calls, 1, "schedule_task")[1]["result"];
+    assert_eq!(retried["schedule_id"], "s1", "{retried}");
+    let conflict = &call(&calls, 1, "schedule_task")[2]["result"];
+    assert_eq!(conflict["error"]["code"], "request_conflict", "{conflict}");
     let project = case.dir.path();
     let store = schedules::load(project).unwrap();
     assert_eq!(store.schedules.len(), 2);
+    assert_eq!(store.schedules[0].revision, 1);
     let created_at = store.schedules[0].created_at;
     let later = created_at + chrono::Duration::hours(7);
     // Unapproved: nothing fires.

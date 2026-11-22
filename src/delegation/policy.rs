@@ -5,6 +5,7 @@ use super::config::{Delegate, Isolation};
 use crate::config::{Sandbox, Stage, Workflow};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// What the process may change on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -48,6 +49,10 @@ pub struct Ceiling {
     pub native: Native,
     pub network: Network,
     pub enforcement: Enforcement,
+    /// Paths an enforced sandbox grants beyond the workspace
+    /// (`sandbox_writable`), resolved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writable: Vec<PathBuf>,
 }
 
 /// The native axis of a stage: escalated by any extra argument or an
@@ -93,6 +98,11 @@ pub fn stage_ceiling(workflow: &Workflow, stage: &Stage, backend: bool) -> Ceili
         } else {
             Enforcement::None
         },
+        writable: if enforced {
+            crate::sandbox::writable_grants(stage)
+        } else {
+            vec![]
+        },
     }
 }
 
@@ -108,6 +118,8 @@ pub fn task_ceiling(task: &Stage, isolation: Isolation, parent: &Ceiling) -> Cei
         native: native(task),
         network: parent.network,
         enforcement: Enforcement::Enforced,
+        // Tasks run with no `sandbox_writable`.
+        writable: vec![],
     }
 }
 
@@ -119,6 +131,7 @@ pub const UNSANDBOXED_COMMAND: Ceiling = Ceiling {
     native: Native::Default,
     network: Network::Open,
     enforcement: Enforcement::None,
+    writable: Vec::new(),
 };
 
 /// The ceilings everything a workflow would run needs: each enabled stage,
@@ -177,6 +190,19 @@ pub fn exceeds(child: &Ceiling, parent: &Ceiling) -> Option<String> {
     }
     if child.enforcement > parent.enforcement {
         return Some("it would run unsandboxed under a sandboxed parent".into());
+    }
+    // An unsandboxed parent can already write anywhere.
+    if parent.enforcement == Enforcement::Enforced {
+        if let Some(path) = child
+            .writable
+            .iter()
+            .find(|c| !parent.writable.iter().any(|p| c.starts_with(p)))
+        {
+            return Some(format!(
+                "it could write {}, which its parent cannot",
+                path.display()
+            ));
+        }
     }
     None
 }
@@ -258,12 +284,14 @@ mod tests {
             native: Native::Default,
             network: Network::Restricted,
             enforcement: Enforcement::Enforced,
+            writable: vec![],
         };
         let shared = Ceiling {
             write: Write::ReadOnly,
             native: Native::Default,
             network: Network::Restricted,
             enforcement: Enforcement::Enforced,
+            writable: vec![],
         };
         assert_eq!(exceeds(&shared, &parent), None);
         let escalated = Ceiling {
@@ -290,7 +318,19 @@ mod tests {
             native: Native::Default,
             network: Network::Restricted,
             enforcement: Enforcement::Enforced,
+            writable: vec![],
         };
         assert!(exceeds(&worktree, &read_only_parent).is_some());
+        // Extra sandbox grants must lie within the parent's.
+        let granted = Ceiling {
+            writable: vec![PathBuf::from("/data/sub")],
+            ..read_only_parent.clone()
+        };
+        assert!(exceeds(&granted, &read_only_parent).is_some());
+        let wider_parent = Ceiling {
+            writable: vec![PathBuf::from("/data")],
+            ..read_only_parent
+        };
+        assert_eq!(exceeds(&granted, &wider_parent), None);
     }
 }

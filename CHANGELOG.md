@@ -38,8 +38,10 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   Git config, `config.worktree`, and hooks are now read-only in every
   sandbox mode, the `.git` directory (or a linked worktree's `.git` file and
   `commondir`) cannot be replaced, a stage refuses to start when a Git config
-  file or include target it could write would be read, and the router's own
-  Git commands disable fsmonitor and hooks.
+  file or include target it could write would be read, a `workspace-write`
+  stage refuses to start while its Git config or hooks entry is a symbolic
+  link it could replace, and the router's own Git commands disable fsmonitor
+  and hooks.
 
 ### Fixed
 

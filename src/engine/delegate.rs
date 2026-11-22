@@ -10,7 +10,7 @@ use crate::delegation::{
     config::{Delegation, MAX_TASK_SENDS, TASK_ROLES, delegate_stage, glob_match},
     instructions::{self, ParentKind},
     policy::{self, Ceiling},
-    records::{ResolvedTarget, TaskState, TaskStatus, TaskTurn, Turn},
+    records::{ResolvedTarget, SendKey, TaskState, TaskStatus, TaskTurn, Turn},
     tools::{Call, Changed, DelegationTools, Reply, Request},
 };
 use crate::serve::mcp::ToolError;
@@ -621,7 +621,8 @@ impl<'a> Owner<'a> {
         Ok(())
     }
 
-    /// Cancels every task still queued or running.
+    /// Cancels every task still queued or running, and blocks those left
+    /// waiting on a question no parent can answer any more.
     fn cancel_live(&mut self, run: &mut Run) {
         for job in self.running.values() {
             job.abort.store(true, Ordering::SeqCst);
@@ -630,6 +631,12 @@ impl<'a> Owner<'a> {
             if let Some(task) = self.task_mut(run, &id) {
                 task.status = TaskStatus::Cancelled;
                 task.error = Some("Cancelled: the stage ended".into());
+            }
+        }
+        for task in &mut self.attempt_mut(run).tasks {
+            if task.status == TaskStatus::Waiting {
+                task.status = TaskStatus::Blocked;
+                task.error = Some("Unanswered: the stage ended".into());
             }
         }
         self.changed.bump();
@@ -679,9 +686,9 @@ impl<'a> Owner<'a> {
             .collect();
         if !succeeded || undelivered.is_empty() {
             // The final turn, or a failure: conclude it as any stage attempt.
-            if !succeeded {
-                self.cancel_live(run);
-            }
+            // Nothing outlives it: a task whose question was read but not
+            // answered is blocked.
+            self.cancel_live(run);
             return self.conclude_turn(run, &prepared, outcome, emit);
         }
         // Results a wake announced must be read in that wake.
@@ -697,6 +704,9 @@ impl<'a> Owner<'a> {
             prepared.invocation.kind,
         );
         self.earlier_usage = add_usage(self.earlier_usage, turn_usage);
+        // Budget admission (tasks, wakes) reads the attempt's usage; the
+        // final turn's conclusion replaces it with that turn's plus these.
+        self.attempt_mut(run).usage = self.earlier_usage;
         if turn_number > 1 {
             if let Some(turn) = self.attempt_mut(run).turns.last_mut() {
                 turn.usage = turn_usage;
@@ -1146,6 +1156,17 @@ impl<'a> Owner<'a> {
             ));
         }
         let (model, provider, effort) = (field("model"), field("provider"), field("effort"));
+        // The harness's default model is unknown here, so a restricted list
+        // needs the model named.
+        if model.is_empty() && !self.delegation.models.is_empty() {
+            return Err(ToolError::new(
+                "model_unavailable",
+                format!(
+                    "target.model is required: this stage allows only models matching {}",
+                    self.delegation.models.join(", ")
+                ),
+            ));
+        }
         if !model.is_empty() {
             let globbed = self.delegation.models.iter().any(|g| glob_match(g, &model));
             let catalogued = self.models(run, &harness).contains(&model);
@@ -1356,6 +1377,7 @@ impl<'a> Owner<'a> {
             announced: false,
             cancelled_by_parent: false,
             queued_messages: vec![],
+            sends: vec![],
             created_at: Utc::now(),
         };
         self.attempt_mut(run).tasks.push(task);
@@ -1391,30 +1413,63 @@ impl<'a> Owner<'a> {
             .collect();
         for id in sends {
             if self.running.len() >= self.delegation.max_parallel as usize {
-                return Ok(());
+                break;
+            }
+            let Some(task) = self.task(run, &id) else {
+                continue;
+            };
+            let refusal = if task.turns.len() > MAX_TASK_SENDS {
+                Some(format!(
+                    "task_limit_exceeded: a task takes at most {MAX_TASK_SENDS} follow-ups"
+                ))
+            } else if let crate::cost::BudgetCheck::Stop(reason) =
+                crate::cost::check_budget_action(run)
+            {
+                Some(format!("budget_exceeded: {reason}"))
+            } else {
+                None
+            };
+            if let Some(reason) = refusal {
+                self.fail_task(run, &id, reason);
+                continue;
             }
             let message = match self.task_mut(run, &id) {
                 Some(task) => task.queued_messages.remove(0),
                 None => continue,
             };
-            self.launch_turn(scope, run, &id, Some(message))?;
+            if let Err(error) = self.launch_turn(scope, run, &id, Some(message)) {
+                self.fail_task(
+                    run,
+                    &id,
+                    format!("The follow-up could not start: {error:#}"),
+                );
+            }
         }
         while self.running.len() < self.delegation.max_parallel as usize {
             let Some(id) = self.queue.pop_front() else {
                 break;
             };
             if let crate::cost::BudgetCheck::Stop(reason) = crate::cost::check_budget_action(run) {
-                if let Some(task) = self.task_mut(run, &id) {
-                    task.status = TaskStatus::Failed;
-                    task.error = Some(format!("budget_exceeded: {reason}"));
-                }
-                self.changed.bump();
+                self.fail_task(run, &id, format!("budget_exceeded: {reason}"));
                 continue;
             }
-            self.launch_turn(scope, run, &id, None)?;
+            if let Err(error) = self.launch_turn(scope, run, &id, None) {
+                self.fail_task(run, &id, format!("The task could not start: {error:#}"));
+            }
         }
         run.persist()?;
         Ok(())
+    }
+
+    /// Ends a task that cannot start its next turn, so nothing waits on it.
+    fn fail_task(&mut self, run: &mut Run, id: &str, reason: String) {
+        if let Some(task) = self.task_mut(run, id) {
+            task.status = TaskStatus::Failed;
+            task.error = Some(reason);
+            task.queued_messages.clear();
+            task.delivered = false;
+        }
+        self.changed.bump();
     }
 
     /// Launches a task's first turn, or (with `message`) a follow-up turn on
@@ -1501,7 +1556,7 @@ impl<'a> Owner<'a> {
             sandbox_writable: vec![],
             ..stage.clone()
         };
-        let sandbox = crate::sandbox::plan(
+        let mut sandbox = crate::sandbox::plan(
             &run.workflow,
             &sandbox_stage,
             &crate::sandbox::Paths {
@@ -1511,6 +1566,11 @@ impl<'a> Owner<'a> {
                 program: &invocation.program,
             },
         )?;
+        if task.isolation == Isolation::Worktree {
+            if let Some(plan) = &mut sandbox {
+                plan.confine_shared_git(&cwd);
+            }
+        }
         storage::write_json_fast(
             &turn_dir.join("command.json"),
             &json!({
@@ -1866,6 +1926,26 @@ impl<'a> Owner<'a> {
             .task(run, &id)
             .ok_or_else(|| ToolError::new("task_not_found", format!("No task {id}")))?
             .clone();
+        let key = arguments
+            .get("client_request_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let fingerprint = crate::trust::digest(&[serde_json::to_string(&json!({
+            "message": message,
+            "restart": restart,
+        }))
+        .unwrap_or_default()]);
+        if let Some(key) = &key {
+            if let Some(existing) = task.sends.iter().find(|s| &s.client_request_id == key) {
+                if existing.fingerprint != fingerprint {
+                    return Err(ToolError::new(
+                        "request_conflict",
+                        format!("client_request_id {key} was used for a different message"),
+                    ));
+                }
+                return Ok(self.view(run, &task));
+            }
+        }
         let has_session = task.turns.iter().any(|t| t.session.is_some());
         if !adapters::has_follow_up(&task.target.harness, &run.adapters) || !has_session {
             return Err(ToolError::new(
@@ -1882,13 +1962,23 @@ impl<'a> Owner<'a> {
                 "The task was cancelled",
             ));
         }
-        if task.turns.len() > MAX_TASK_SENDS {
+        // Follow-ups started (every turn after the first) plus those queued.
+        if task.turns.len() + task.queued_messages.len() > MAX_TASK_SENDS {
             return Err(ToolError::new(
                 "task_limit_exceeded",
                 format!("A task takes at most {MAX_TASK_SENDS} follow-ups"),
             ));
         }
+        if let crate::cost::BudgetCheck::Stop(reason) = crate::cost::check_budget_action(run) {
+            return Err(ToolError::new("budget_exceeded", reason));
+        }
         if let Some(t) = self.task_mut(run, &id) {
+            if let Some(key) = key {
+                t.sends.push(SendKey {
+                    client_request_id: key,
+                    fingerprint,
+                });
+            }
             t.queued_messages.push(message);
             t.delivered = false;
             t.status = if t.status.is_live() {

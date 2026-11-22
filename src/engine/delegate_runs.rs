@@ -10,6 +10,7 @@ use crate::delegation::{
 };
 use crate::serve::mcp::ToolError;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 /// The launcher's side of a run tool call.
 pub(super) struct Launcher<'a> {
@@ -102,29 +103,34 @@ fn launch(
         .attempts
         .last()
         .ok_or_else(|| error("parent_not_active", "No attempt"))?;
+    // A retry finishes what its first call left: runs it created are
+    // returned as they are, and only the missing ones are created.
+    let mut done: BTreeMap<usize, String> = BTreeMap::new();
     if let Some(key) = &key {
         let earlier: Vec<&LaunchedRun> = attempt
             .launched_runs
             .iter()
             .filter(|l| &l.client_request_id == key)
             .collect();
-        if !earlier.is_empty() {
-            if earlier.iter().any(|l| l.fingerprint != fingerprint) {
-                return Err(error(
-                    "request_conflict",
-                    format!("client_request_id {key} was used for a different request"),
-                ));
-            }
-            let runs: Vec<Value> = earlier
-                .iter()
-                .map(|l| launched_value(&run.project, &l.id))
+        if earlier.iter().any(|l| l.fingerprint != fingerprint) {
+            return Err(error(
+                "request_conflict",
+                format!("client_request_id {key} was used for a different request"),
+            ));
+        }
+        done.extend(earlier.iter().map(|l| (l.offset, l.id.clone())));
+        if done.len() >= requests.len() {
+            let runs: Vec<Value> = done
+                .values()
+                .map(|id| launched_value(&run.project, id))
                 .collect();
             return Ok(json!({ "runs": runs }));
         }
     }
     let used = attempt.launched_runs.len();
+    let missing = requests.len() - done.len();
     let limit = launcher.delegation.max_runs as usize;
-    if used + requests.len() > limit {
+    if used + missing > limit {
         return Err(error(
             "run_limit_exceeded",
             format!("This stage may launch at most {limit} runs ({used} launched)"),
@@ -191,6 +197,10 @@ fn launch(
     let attempt_number = attempt.number;
     let mut launched = vec![];
     for (offset, (workflow, task)) in plans.into_iter().enumerate() {
+        if let Some(id) = done.get(&offset) {
+            launched.push(launched_value(&run.project, id));
+            continue;
+        }
         let mut created = Run::create_at(
             &run.project,
             &loaded.settings,
@@ -214,13 +224,21 @@ fn launch(
                     .clone()
                     .unwrap_or_else(|| format!("generated-{id}-{offset}")),
                 fingerprint: fingerprint.clone(),
+                offset,
             });
         }
         run.persist().map_err(internal)?;
+        let mut value = launched_value(&run.project, &id);
+        // The run exists either way; a host that cannot drive it leaves it
+        // pending for `model-router resume`, and says so for this run.
         if let Some(host) = run_host() {
-            host.drive(&run.project, &id).map_err(internal)?;
+            if let Err(e) = host.drive(&run.project, &id) {
+                value["driven"] = json!(false);
+                value["resume"] = json!(resume_hint(&run.project, &id));
+                value["error"] = json!(format!("{e:#}"));
+            }
         }
-        launched.push(launched_value(&run.project, &id));
+        launched.push(value);
     }
     Ok(json!({ "runs": launched }))
 }
@@ -230,8 +248,15 @@ fn launched_value(project: &Path, id: &str) -> Value {
     json!({
         "run_id": id,
         "driven": driven,
-        "resume": (!driven).then(|| format!("model-router -C {} resume {id}", shell_words::quote(&project.display().to_string()))),
+        "resume": (!driven).then(|| resume_hint(project, id)),
     })
+}
+
+fn resume_hint(project: &Path, id: &str) -> String {
+    format!(
+        "model-router -C {} resume {id}",
+        shell_words::quote(&project.display().to_string())
+    )
 }
 
 fn list(run: &Run, arguments: &Value) -> std::result::Result<Value, ToolError> {
@@ -479,13 +504,43 @@ fn schedule_task(
     let created_by = format!("{}/{}", run.id, launcher.stage.id);
     let ceiling = launcher.ceiling.clone();
     let id = text("schedule_id").map(str::to_owned);
+    // Keys scope to (run, stage, attempt), like every tool's.
+    let attempt = run.stages[launcher.index].attempts.len();
+    let requester = format!("{created_by}/{attempt}");
+    let fingerprint = crate::trust::digest(&[serde_json::to_string(&json!({
+        "schedule_id": id,
+        "workflow": workflow,
+        "task": text("task"),
+        "every": text("every"),
+        "at": text("at"),
+        "webhook": arguments.get("webhook"),
+        "enabled": arguments.get("enabled"),
+    }))
+    .unwrap_or_default()]);
+    // A key is this stage's: a retry returns what the first call made.
+    if let Some(key) = &key {
+        let store = schedules::load(&run.project)
+            .map_err(|e| error("orchestration_error", format!("{e:#}")))?;
+        if let Some(earlier) = store
+            .schedules
+            .iter()
+            .find(|s| &s.client_request_id == key && s.requested_by == requester)
+        {
+            if earlier.request_fingerprint != fingerprint {
+                return Err(error(
+                    "request_conflict",
+                    format!("client_request_id {key} was used for a different request"),
+                ));
+            }
+            return Ok(schedule_view(&run.project, earlier));
+        }
+    }
     let schedule = schedules::update(&run.project, |store| {
         let now = Utc::now();
-        // An update: the schedule this request names, or the one its key made.
-        let existing = store.schedules.iter_mut().find(|s| {
-            id.as_deref() == Some(s.id.as_str())
-                || (id.is_none() && key.as_deref().is_some_and(|k| k == s.client_request_id))
-        });
+        let existing = store
+            .schedules
+            .iter_mut()
+            .find(|s| id.as_deref() == Some(s.id.as_str()));
         let schedule = match existing {
             Some(schedule) => {
                 if let Some(workflow) = &workflow {
@@ -504,6 +559,11 @@ fn schedule_task(
                 schedule.revision += 1;
                 schedule.updated_at = now;
                 schedule.approved_at = None;
+                if let Some(key) = &key {
+                    schedule.client_request_id = key.clone();
+                    schedule.requested_by = requester.clone();
+                    schedule.request_fingerprint = fingerprint.clone();
+                }
                 schedule.clone()
             }
             None => {
@@ -533,6 +593,11 @@ fn schedule_task(
                     created_by: created_by.clone(),
                     ceiling: ceiling.clone(),
                     client_request_id: key.clone().unwrap_or_default(),
+                    requested_by: key.as_ref().map(|_| requester.clone()).unwrap_or_default(),
+                    request_fingerprint: key
+                        .as_ref()
+                        .map(|_| fingerprint.clone())
+                        .unwrap_or_default(),
                     revision: 1,
                     created_at: now,
                     updated_at: now,
