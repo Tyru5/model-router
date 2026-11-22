@@ -443,10 +443,13 @@ fn emit_added_tail(
 /// The whole `git diff` between two trees, one line at a time and never
 /// cut, for scans that must see all of it. `--text` shows files Git would
 /// call binary, so their added lines are read too. Very long lines are streamed
-/// in bounded 1 MiB chunks with a 256-byte overlap on added lines.
+/// in bounded 1 MiB chunks with a 2 KiB overlap on added lines.
 pub fn patch_lines(dir: &Path, from: &str, to: &str, mut each: impl FnMut(&str)) -> Result<()> {
     const LINE_CHUNK_LIMIT: usize = 1024 * 1024;
-    const OVERLAP: usize = 256;
+    // More than any text a workflow policy pattern (at most 512 bytes) can
+    // match, even case-insensitively where lowercasing changes byte lengths,
+    // so a match across a chunk boundary is whole in one chunk.
+    const OVERLAP: usize = 2048;
     const STDERR_LIMIT: u64 = 64 * 1024;
     let mut child = crate::snapshot::git_command()
         .args([
@@ -798,5 +801,31 @@ mod tests {
         assert!(seen_plus_header, "expected canonical b/ header");
         assert_eq!(scan.hits().len(), 1);
         assert_eq!(scan.hits()[0].file, "big.txt");
+    }
+
+    #[test]
+    fn patch_lines_keeps_the_longest_policy_pattern_whole_across_chunks() {
+        let Some(dir) = repository() else { return };
+        let workspace = dir.path();
+        let run_dir = run_dir(workspace);
+        let from = tree(workspace, &run_dir).unwrap();
+        // A 510-byte literal (the most a policy pattern holds after `i:`)
+        // that straddles the first 1 MiB chunk boundary.
+        let banned = format!("BANNED{}", "z".repeat(504));
+        let mut line = "x".repeat(1024 * 1024 - 400);
+        line.push_str(&banned);
+        line.push_str(" tail\n");
+        fs::write(workspace.join("big.txt"), line.as_bytes()).unwrap();
+        let to = tree(workspace, &run_dir).unwrap();
+        let policies = vec![crate::policy::DiffPolicy {
+            name: "no-banned".into(),
+            action: crate::policy::PolicyAction::Block,
+            pattern: format!("i:{}", banned.to_lowercase()),
+            paths: vec![],
+            message: "No banned text".into(),
+        }];
+        let mut scan = crate::policy::PolicyScan::new(&policies);
+        patch_lines(workspace, &from, &to, |line| scan.line(line)).unwrap();
+        assert_eq!(scan.hits().len(), 1, "{:?}", scan.hits());
     }
 }

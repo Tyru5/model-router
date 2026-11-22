@@ -668,6 +668,17 @@ impl Run {
         if stage.when_changed.is_empty() {
             return None;
         }
+        // A judge with candidates waiting always runs: their changes are in
+        // their own worktrees, not the workspace, until it chooses one, and
+        // skipping it would apply none.
+        let judging = graph::judged_by(&self.workflow, index)
+            .and_then(|fan| self.stages[fan].fan_out.as_ref())
+            .is_some_and(|round| {
+                !round.candidates.is_empty() && round.selection.as_ref().is_none_or(|s| !s.applied)
+            });
+        if judging {
+            return None;
+        }
         let from = self.baseline.as_deref()?;
         if !snapshot::is_repository(&self.workspace) {
             return None;
@@ -1817,13 +1828,28 @@ impl Run {
                 "Candidate {id} modified protected path(s): {detail}. The workspace is unchanged. Choose another candidate, or update workflow protected_paths and retry this stage"
             )));
         }
-        if let Err(error) = crate::policy::scan_patch_file_policies(
-            &self.workflow.policies,
-            &changes.patch,
-            &format!(" in candidate {id}"),
-            "refusing to apply; the workspace is unchanged",
-        ) {
-            return Ok(Err(format!("{error:#}")));
+        if crate::policy::has_block_policies(&self.workflow.policies) {
+            let refusing = "refusing to apply; the workspace is unchanged";
+            let Some(tree) = candidate
+                .attempts
+                .last()
+                .and_then(|a| a.tree_after.as_deref())
+            else {
+                return Ok(Err(format!(
+                    "Candidate {id}'s worktree snapshot was not recorded, so workflow policies cannot be verified; {refusing}"
+                )));
+            };
+            // Its patch was made from the base to this tree, whose objects
+            // the workspace's repository shares.
+            if let Err(error) = crate::policy::scan_tree_policies(
+                &self.workflow.policies,
+                &self.workspace,
+                (&state.base, tree),
+                &format!(" in candidate {id}"),
+                refusing,
+            ) {
+                return Ok(Err(format!("{error:#}")));
+            }
         }
         let current = snapshot::tree(&self.workspace, &self.directory)
             .context("Snapshot the workspace before applying the candidate")?;
@@ -2132,9 +2158,12 @@ pub(super) fn post_process_candidate(
     fanout::write_patch(worktree, base, &tree, &patch)?;
     let (files, added, removed) = fanout::stat(worktree, base, &tree)?;
     let protected = crate::policy::protected_detail(protected_paths, &files);
-    let policy_err = crate::policy::scan_patch_file_policies(
+    // The text diff, not the `git apply` patch: that one is `--binary` and
+    // quotes non-ASCII paths.
+    let policy_err = crate::policy::scan_tree_policies(
         policies,
-        &patch,
+        worktree,
+        (base, &tree),
         " in candidate",
         "its worktree is retained",
     )

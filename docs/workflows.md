@@ -87,7 +87,8 @@ unattended stage failures matching transient provider or network errors (HTTP
 automatically retry the same harness and model with capped exponential backoff
 before stopping. Stages with `when_changed` globs skip (`skipped`) in a Git
 repository when no files changed so far in the run match any pattern (outside
-Git, they run normally). Retries keep filesystem changes and get their own
+Git, they run normally). A fan-out judge with candidates waiting for its choice
+never skips. Retries keep filesystem changes and get their own
 attempt logs. Completed stages are never replayed. Runs snapshot their
 workflow: editing templates never changes an existing run.
 

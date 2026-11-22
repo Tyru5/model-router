@@ -4,8 +4,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::File,
-    io::{BufRead, BufReader, Read},
+    io::Read,
     path::Path,
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -166,24 +165,16 @@ impl DiffPolicy {
     }
 }
 
-/// Maximum byte length of a single diff line inspected by line pattern matching.
-const MAX_POLICY_LINE_BYTES: usize = 16 * 1024;
-
 /// Matches an added diff line against a declarative policy `pattern`.
-/// Bounded and non-backtracking (no regex engine, zero ReDoS).
+///
+/// Reads the whole line: a match anywhere in it counts. No regex engine, so
+/// no catastrophic backtracking: literal modes are linear in the line, and
+/// `word:` and `glob:` are at most linear in the line times the pattern's
+/// length, which comes from the workflow, not from the diff.
 pub fn matches_line_pattern(pattern: &str, line: &str) -> bool {
     if pattern.is_empty() {
         return false;
     }
-    let line = if line.len() > MAX_POLICY_LINE_BYTES {
-        let mut cut = MAX_POLICY_LINE_BYTES;
-        while cut > 0 && !line.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        &line[..cut]
-    } else {
-        line
-    };
     if let Some(rest) = pattern.strip_prefix("i:") {
         if rest.is_empty() {
             return false;
@@ -232,6 +223,52 @@ fn contains_word(line: &str, word: &str) -> bool {
         offset = start + step;
     }
     false
+}
+
+/// A path from a diff header as the repository names it. Git C-quotes a path
+/// with a `"`, `\`, or control character (and, unless `core.quotePath` is
+/// false, any non-ASCII byte); this undoes that quoting so `paths` globs see
+/// the real path. An unquoted path is returned as is.
+fn unquote_diff_path(raw: &str) -> String {
+    let Some(inner) = raw
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return raw.to_owned();
+    };
+    let mut out = Vec::with_capacity(inner.len());
+    let mut bytes = inner.bytes().peekable();
+    while let Some(byte) = bytes.next() {
+        if byte != b'\\' {
+            out.push(byte);
+            continue;
+        }
+        let Some(escaped) = bytes.next() else {
+            out.push(b'\\');
+            break;
+        };
+        match escaped {
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            b'0'..=b'7' => {
+                let mut value = u32::from(escaped - b'0');
+                for _ in 0..2 {
+                    let Some(digit) = bytes.next_if(|d| matches!(d, b'0'..=b'7')) else {
+                        break;
+                    };
+                    value = value * 8 + u32::from(digit - b'0');
+                }
+                out.push((value & 0xff) as u8);
+            }
+            other => out.push(other),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// One declarative diff policy match on an added diff line.
@@ -313,7 +350,8 @@ impl<'a> PolicyScan<'a> {
             DiffState::Header => {
                 if let Some(rest) = raw.strip_prefix("+++ ") {
                     let rest = rest.strip_suffix('\t').unwrap_or(rest);
-                    self.file = rest.strip_prefix("b/").unwrap_or(rest).to_owned();
+                    let path = unquote_diff_path(rest);
+                    self.file = path.strip_prefix("b/").unwrap_or(&path).to_owned();
                 }
             }
             DiffState::Hunk => {
@@ -379,43 +417,23 @@ pub fn scan_diff_policies(policies: &[DiffPolicy], diff: &str) -> Vec<PolicyHit>
     scan.hits
 }
 
-/// Streams a saved patch file through `PolicyScan`, failing closed if the file
-/// cannot be read.
-pub fn scan_patch_file_policies(
+/// Scans the text diff between Git trees `from` and `to` in repository `dir`
+/// against blocking `policies`, failing closed if the diff cannot be read.
+/// Reads it as `snapshot::patch_lines` does for stage, apply, and ship scans:
+/// files Git calls binary as text, and non-ASCII paths unquoted.
+pub fn scan_tree_policies(
     policies: &[DiffPolicy],
-    patch: &Path,
+    dir: &Path,
+    (from, to): (&str, &str),
     found_in: &str,
     refusing: &str,
 ) -> Result<()> {
     if !has_block_policies(policies) {
         return Ok(());
     }
-    let file = File::open(patch).with_context(|| {
-        format!(
-            "Read patch {} to verify workflow policies; {refusing}",
-            patch.display()
-        )
-    })?;
-    let mut reader = BufReader::new(file);
     let mut scan = PolicyScan::new(policies);
-    let mut buf = Vec::new();
-    loop {
-        buf.clear();
-        let read = reader.read_until(b'\n', &mut buf).with_context(|| {
-            format!(
-                "Read patch {} to verify workflow policies; {refusing}",
-                patch.display()
-            )
-        })?;
-        if read == 0 {
-            break;
-        }
-        if buf.last() == Some(&b'\n') {
-            buf.pop();
-        }
-        let line = String::from_utf8_lossy(&buf);
-        scan.line(&line);
-    }
+    crate::snapshot::patch_lines(dir, from, to, |line| scan.line(line))
+        .with_context(|| format!("Read the diff to verify workflow policies; {refusing}"))?;
     scan.ensure_clean(found_in, refusing)
 }
 
@@ -1094,6 +1112,67 @@ new file mode 100644
     }
 
     #[test]
+    fn line_patterns_match_past_16_kib_of_a_long_line() {
+        let filler = "x".repeat(64 * 1024);
+        let line = format!("{filler} BANNED_CALL(é);");
+        for pattern in [
+            "BANNED_CALL(",
+            "i:banned_call(",
+            "word:BANNED_CALL",
+            "any:nope|BANNED_CALL(",
+            "glob:*BANNED_CALL(*",
+        ] {
+            assert!(matches_line_pattern(pattern, &line), "{pattern}");
+        }
+        assert!(!matches_line_pattern("word:BANNED", &line));
+        // A long hostile line stays fast with a hostile glob.
+        let started = Instant::now();
+        let evil_pat = format!("glob:{}x", "*a".repeat(25));
+        assert!(!matches_line_pattern(&evil_pat, &"a".repeat(256 * 1024)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let policies = vec![DiffPolicy {
+            name: "no-banned".into(),
+            action: PolicyAction::Block,
+            pattern: "BANNED_CALL(".into(),
+            paths: vec![],
+            message: "No banned calls".into(),
+        }];
+        let diff = format!("+++ b/min.js\n@@ -0,0 +1 @@\n+{line}\n");
+        assert_eq!(scan_diff_policies(&policies, &diff).len(), 1);
+    }
+
+    #[test]
+    fn diff_policy_scan_decodes_quoted_paths() {
+        assert_eq!(unquote_diff_path("b/src/lib.rs"), "b/src/lib.rs");
+        assert_eq!(
+            unquote_diff_path(r#""b/src/caf\303\251.rs""#),
+            "b/src/café.rs"
+        );
+        assert_eq!(
+            unquote_diff_path(r#""b/a \"q\" \\ \t\n\0018.rs""#),
+            "b/a \"q\" \\ \t\n\u{1}8.rs"
+        );
+        let policies = vec![DiffPolicy {
+            name: "no-banned".into(),
+            action: PolicyAction::Block,
+            pattern: "BANNED".into(),
+            paths: vec!["src/**".into()],
+            message: "No banned calls".into(),
+        }];
+        let diff = "\
+diff --git \"a/src/caf\\303\\251.rs\" \"b/src/caf\\303\\251.rs\"
+--- /dev/null
++++ \"b/src/caf\\303\\251.rs\"
+@@ -0,0 +1 @@
++BANNED();
+";
+        let hits = scan_diff_policies(&policies, diff);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].file, "src/café.rs");
+    }
+
+    #[test]
     fn diff_policy_scan_checks_added_lines_and_path_globs() {
         let policies = vec![
             DiffPolicy {
@@ -1143,7 +1222,7 @@ diff --git a/tests/helper.rs b/tests/helper.rs
     }
 
     #[test]
-    fn scan_patch_file_fails_closed_when_unreadable() {
+    fn scan_tree_fails_closed_when_the_diff_is_unreadable() {
         let dir = tempfile::tempdir().unwrap();
         let policies = vec![DiffPolicy {
             name: "no-dbg".into(),
@@ -1152,9 +1231,10 @@ diff --git a/tests/helper.rs b/tests/helper.rs
             paths: vec![],
             message: "Remove dbg!".into(),
         }];
-        let err = scan_patch_file_policies(
+        let err = scan_tree_policies(
             &policies,
-            &dir.path().join("missing.patch"),
+            dir.path(),
+            ("missing-from", "missing-to"),
             " in candidate",
             "refusing to apply",
         )

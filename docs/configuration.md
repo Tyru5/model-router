@@ -145,7 +145,7 @@ comma-separated ranges (`">=0.160.0, <0.200.0"`).
 | `context_files` | `[]` | Extra repo-relative paths or globs injected into this stage's prompt after the workflow's `context_files` (same 32-file / 32 KiB total limit and workspace-only safety checks). |
 | `retry` | unset | Overrides workflow `retry` for this stage (`{ max_attempts, base_delay_seconds, max_delay_seconds }`). |
 | `hooks` | `{}` | Stage lifecycle hooks (`before_stage`, `after_stage`, `before_ship`, `on_failure`), run after workflow hooks. Needs trust in a project config. |
-| `when_changed` | `[]` | Repo-relative globs (`*`, `**`, `?`, up to 32). In a Git repository, skips the stage (`skipped`) when no files changed so far in the run match any pattern; outside Git, runs normally. |
+| `when_changed` | `[]` | Repo-relative globs (`*`, `**`, `?`, up to 32). In a Git repository, skips the stage (`skipped`) when no files changed so far in the run match any pattern; outside Git, runs normally. A fan-out judge with candidates waiting for its choice never skips. |
 
 ### `checks`
 
@@ -269,7 +269,12 @@ message = "Verify rollback safety and lock duration"
 Non-backtracking line matcher (`literal`, `i:<case-insensitive>`, `word:<token>`,
 `any:<a|b>`, `glob:<pattern>`). `block` scans added diff lines of matching
 `paths` at stage end, fan-out candidate post-processing and selection, `apply`,
-and `ship`, failing closed if the diff cannot be read. `advise` injects
+and `ship`, failing closed if the diff cannot be read. Every scan reads the
+text diff between Git trees: whole lines with no length cutoff, files Git
+treats as binary read as text, and quoted paths (non-ASCII, `"`, `\`, control
+characters) decoded before `paths` matching. Lines over 1 MiB are read in 1 MiB
+pieces overlapping by 2 KiB, so a literal pattern (at most 512 bytes) is never
+split; a `glob:` pattern matches each piece as a whole line. `advise` injects
 `message` into review stage prompts (`POLICY ADVISORIES`) when changed files
 (and optional `pattern`) match.
 

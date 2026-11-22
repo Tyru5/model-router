@@ -350,6 +350,54 @@ fn a_judge_stage_chooses_candidate_two_and_dependents_wait_for_it() {
 }
 
 #[test]
+fn a_judge_with_when_changed_still_chooses_a_waiting_candidate() {
+    // Candidates change out.txt only in their own worktrees, so the
+    // workspace matches nothing when the judge comes up; it runs anyway.
+    for graph in [false, true] {
+        let after = |id: &str| {
+            if graph { vec![id.to_owned()] } else { vec![] }
+        };
+        let implement = Stage {
+            after: after("research"),
+            ..fan_out(
+                &[("implement", "lines-1"), ("implement", "lines-3")],
+                "judge",
+            )
+        };
+        let judge = Stage {
+            after: after("implement"),
+            when_changed: vec!["src/**".into()],
+            extra_args: vec!["--select".into(), "c2".into()],
+            ..stage("judge", Role::Review)
+        };
+        let Some((dir, mut run)) =
+            git_run(vec![stage("research", Role::Research), implement, judge])
+        else {
+            return;
+        };
+        assert_eq!(run.graph(), graph);
+        assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+        assert_eq!(run.stages[2].status, Status::Complete);
+        let selection = run.stages[1]
+            .fan_out
+            .as_ref()
+            .unwrap()
+            .selection
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            (
+                selection.candidate.as_str(),
+                selection.by.as_str(),
+                selection.applied
+            ),
+            ("c2", "judge", true)
+        );
+        assert_eq!(lines(&dir.path().join("out.txt")).len(), 3);
+    }
+}
+
+#[test]
 fn a_fan_out_receipt_reports_the_chosen_candidates_failed_checks() {
     use model_router::report::{Basis, receipts};
     let mut implement = fan_out(&[("a", "test-model"), ("b", "test-model")], "auto");

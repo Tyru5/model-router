@@ -965,3 +965,106 @@ handoff_path.write_text(json.dumps({
     assert_eq!(fan_state.selection.as_ref().unwrap().candidate, "c_good");
     fan_stage.fan_out = None;
 }
+
+#[test]
+fn fanout_candidate_diff_policy_reads_binary_files_and_non_ascii_paths() {
+    init_test_config_dir();
+    let dir = common::tempdir();
+    let scripts = common::tempdir();
+    init_git(dir.path());
+
+    // Candidates' banned text sits in a file Git calls binary and in a file
+    // whose path Git quotes; both must stop blocked.
+    let cand_script = scripts.path().join("cand.py");
+    fs::write(
+        &cand_script,
+        r#"import json, pathlib, sys
+mode = sys.argv[1]
+handoff_path = pathlib.Path(sys.argv[2])
+src = pathlib.Path("src")
+src.mkdir(exist_ok=True)
+if mode == "binary":
+    (src / "blob.bin").write_bytes(b"\x00\x01BLOCKED_API\x00\n")
+elif mode == "path":
+    (src / "café.rs").write_text("fn main() { BLOCKED_API(); }\n")
+else:
+    (src / "app.rs").write_text("fn main() { safe_api(); }\n")
+handoff_path.write_text(json.dumps({
+    "schema_version": 2,
+    "summary": f"candidate {mode}",
+    "verdict": "complete",
+    "findings": [],
+    "tests": [],
+    "files_changed": [],
+    "unresolved": []
+}))
+"#,
+    )
+    .unwrap();
+    let cand_adapter = |mode: &str| CustomAdapter {
+        command: "python3".into(),
+        args: vec![
+            cand_script.display().to_string(),
+            mode.into(),
+            "{handoff_file}".into(),
+        ],
+        ..CustomAdapter::default()
+    };
+    let settings = Settings {
+        adapters: BTreeMap::from([
+            ("binary_cand".into(), cand_adapter("binary")),
+            ("path_cand".into(), cand_adapter("path")),
+            ("good_cand".into(), cand_adapter("good")),
+        ]),
+        ..Settings::default()
+    };
+    let candidate = |id: &str, harness: &str| config::Candidate {
+        id: id.into(),
+        harness: harness.into(),
+        ..Default::default()
+    };
+    let fan_stage = Stage {
+        id: "impl".into(),
+        name: "Implement".into(),
+        role: Role::Implementation,
+        harness: "good_cand".into(),
+        fan_out: Some(config::FanOut {
+            candidates: vec![
+                candidate("c_binary", "binary_cand"),
+                candidate("c_path", "path_cand"),
+                candidate("c_good", "good_cand"),
+            ],
+            judge: "auto".into(),
+        }),
+        ..Stage::default()
+    };
+    let mut wf = Workflow::new("FanOutPolicyText", vec![fan_stage]);
+    wf.policies.push(DiffPolicy {
+        name: "no-blocked-api".into(),
+        action: PolicyAction::Block,
+        pattern: "BLOCKED_API".into(),
+        paths: vec!["src/**".into()],
+        message: "BLOCKED_API is not permitted".into(),
+    });
+    let mut run = Run::create(dir.path(), &settings, &wf, "fanout text".into(), false).unwrap();
+    assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+    let fan_state = run.stages[0].fan_out.as_ref().unwrap();
+    for (candidate, file) in fan_state.candidates[..2]
+        .iter()
+        .zip(["blob.bin", "café.rs"])
+    {
+        let error = candidate.error.as_deref().unwrap_or("");
+        assert_eq!(
+            candidate.status,
+            Status::Blocked,
+            "{}: {error}",
+            candidate.id
+        );
+        assert!(
+            error.contains("no-blocked-api") && error.contains(&format!("src/{file}")),
+            "{error}"
+        );
+    }
+    assert_eq!(fan_state.candidates[2].status, Status::Complete);
+    assert_eq!(fan_state.selection.as_ref().unwrap().candidate, "c_good");
+}
