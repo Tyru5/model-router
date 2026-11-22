@@ -405,14 +405,8 @@ pub fn usage_total_with(run: &Run, pricing: &Pricing) -> UsageTotal {
     let mut sum = UsageTotal::default();
     for (index, state) in run.stages.iter().enumerate() {
         let (provider, billing) = cost::stage_estimate_params(run, index);
-        let attempts = state.attempts.iter().chain(
-            state
-                .fan_out
-                .iter()
-                .flat_map(|f| &f.candidates)
-                .flat_map(|c| &c.attempts),
-        );
-        for attempt in attempts {
+        let candidates = state.candidate_attempts().map(|(_, a)| a);
+        for attempt in state.attempts.iter().chain(candidates) {
             let estimate = cost::estimate_with_billing(
                 attempt.usage.as_ref(),
                 &attempt.model,
@@ -446,15 +440,8 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
             cost::estimate_with_billing(a.usage.as_ref(), &a.model, provider, billing, pricing)
         };
         estimates.push(state.attempts.iter().map(est).collect());
-        candidate_estimates.push(
-            state
-                .fan_out
-                .iter()
-                .flat_map(|f| &f.candidates)
-                .flat_map(|c| &c.attempts)
-                .map(est)
-                .collect(),
-        );
+        // The current round's candidates first: `FanOutReport` slices them.
+        candidate_estimates.push(state.candidate_attempts().map(|(_, a)| est(a)).collect());
     }
     // Only an unfinished attempt reads the clock.
     let now = Utc::now();
@@ -622,11 +609,7 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
                 applied: fan.selection.as_ref().is_some_and(|s| s.applied),
             }
         });
-        let candidate_attempts = state
-            .fan_out
-            .iter()
-            .flat_map(|f| &f.candidates)
-            .flat_map(|c| &c.attempts);
+        let candidate_attempts = state.candidate_attempts().map(|(_, a)| a);
         stages.push(StageReport {
             name: stage.name.clone(),
             role: stage.role,
@@ -679,13 +662,7 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
                     run.stages
                         .iter()
                         .zip(&candidate_estimates)
-                        .flat_map(|(s, e)| {
-                            s.fan_out
-                                .iter()
-                                .flat_map(|f| &f.candidates)
-                                .flat_map(|c| &c.attempts)
-                                .zip(e)
-                        }),
+                        .flat_map(|(s, e)| s.candidate_attempts().map(|(_, a)| a).zip(e)),
                 ),
         ),
         budget: run.workflow.budget,

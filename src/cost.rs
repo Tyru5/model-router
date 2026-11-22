@@ -643,7 +643,9 @@ pub fn stage_totals(run: &Run, pricing: &Pricing) -> Vec<CostTotal> {
         .map(|(index, state)| {
             let (provider, billing) = stage_estimate_params(run, index);
             let mut total = CostTotal::default();
-            for attempt in &state.attempts {
+            // Every candidate's spend counts, as in `report`.
+            let candidates = state.candidate_attempts().map(|(_, a)| a);
+            for attempt in state.attempts.iter().chain(candidates) {
                 total.add(&estimate_with_billing(
                     attempt.usage.as_ref(),
                     &attempt.model,
@@ -1066,7 +1068,12 @@ pub fn aggregate<'a>(
     for run in runs {
         for (index, (stage, state)) in run.workflow.stages.iter().zip(&run.stages).enumerate() {
             let (provider, billing) = stage_estimate_params(run, index);
-            for attempt in &state.attempts {
+            // Candidates count under their own harness.
+            let candidates = state
+                .candidate_attempts()
+                .map(|(c, a)| (c.harness.as_str(), a));
+            let own = state.attempts.iter().map(|a| (stage.harness.as_str(), a));
+            for (harness, attempt) in own.chain(candidates) {
                 if since.is_some_and(|since| attempt.started_at < since) {
                     continue;
                 }
@@ -1083,11 +1090,11 @@ pub fn aggregate<'a>(
                     attempt.model.clone()
                 };
                 let (row, ids) = rows
-                    .entry((stage.harness.clone(), model.clone()))
+                    .entry((harness.to_owned(), model.clone()))
                     .or_insert_with(|| {
                         (
                             Row {
-                                harness: stage.harness.clone(),
+                                harness: harness.to_owned(),
                                 model,
                                 runs: 0,
                                 usage: Usage::default(),

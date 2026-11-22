@@ -250,6 +250,7 @@ impl Run {
                     waiver: None,
                     fan_out: None,
                     inherited: None,
+                    discarded: vec![],
                 })
                 .collect(),
             orphan_groups: vec![],
@@ -636,13 +637,16 @@ impl Run {
 
     pub(super) fn clear_fan_out(&mut self, stage: usize) {
         if let Some(round) = self.stages[stage].fan_out.take() {
-            self.orphan_groups.extend(
-                round
-                    .candidates
-                    .into_iter()
-                    .flat_map(|candidate| candidate.attempts)
-                    .filter_map(|mut attempt| attempt.take_group()),
-            );
+            for mut candidate in round.candidates {
+                self.orphan_groups.extend(
+                    candidate
+                        .attempts
+                        .iter_mut()
+                        .filter_map(Attempt::take_group),
+                );
+                // Its spend still counts.
+                self.stages[stage].discarded.push(candidate);
+            }
         }
     }
 

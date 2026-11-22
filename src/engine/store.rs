@@ -29,7 +29,8 @@ pub(super) fn recorded_paths(run: &mut Run) -> Vec<&mut PathBuf> {
     let mut paths: Vec<&mut PathBuf> = run.resume.iter_mut().map(|r| &mut r.handoff_file).collect();
     for state in &mut run.stages {
         let mut attempts: Vec<&mut Attempt> = state.attempts.iter_mut().collect();
-        for candidate in state.fan_out.iter_mut().flat_map(|f| &mut f.candidates) {
+        let candidates = state.fan_out.iter_mut().flat_map(|f| &mut f.candidates);
+        for candidate in candidates.chain(&mut state.discarded) {
             attempts.extend(&mut candidate.attempts);
             paths.extend(candidate.changes.as_mut().map(|changes| &mut changes.patch));
         }
@@ -102,13 +103,10 @@ pub fn load(project: &Path, id: &str) -> Result<Run> {
     };
     let attempts = || {
         run.stages.iter().flat_map(|state| {
-            state.attempts.iter().chain(
-                state
-                    .fan_out
-                    .iter()
-                    .flat_map(|f| &f.candidates)
-                    .flat_map(|c| &c.attempts),
-            )
+            state
+                .attempts
+                .iter()
+                .chain(state.candidate_attempts().map(|(_, a)| a))
         })
     };
     ensure!(
@@ -147,6 +145,21 @@ pub fn load(project: &Path, id: &str) -> Result<Run> {
             state.attempts.iter().all(|a| a.worktree.is_none()),
             "Invalid or unsupported run record: a stage attempt names a worktree"
         );
+        // A discarded round's checkouts sit beside the current round's.
+        let checkouts = base.join("candidates").join(id).join(&stage.id);
+        for attempt in state.discarded.iter().flat_map(|c| &c.attempts) {
+            let Some(worktree) = &attempt.worktree else {
+                continue;
+            };
+            ensure!(
+                stage.fan_out.is_some()
+                    && worktree.parent() == Some(checkouts.as_path())
+                    && worktree.file_name().is_some(),
+                "Invalid or unsupported run record: stage {} has a misplaced discarded candidate",
+                stage.id
+            );
+            worktrees.push(worktree.clone());
+        }
         let Some(fan_out) = &state.fan_out else {
             continue;
         };

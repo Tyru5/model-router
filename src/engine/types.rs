@@ -237,8 +237,21 @@ pub struct StageState {
     /// stage reused without running; see `history::fork`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherited: Option<PathBuf>,
+    /// Candidates of fan-out rounds that a rewind discarded, oldest first.
+    /// Kept so their spend still counts toward reports and budgets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discarded: Vec<CandidateState>,
 }
 impl StageState {
+    /// Every fan-out candidate attempt with its candidate: the current
+    /// round's first, in order, then discarded rounds'.
+    pub fn candidate_attempts(&self) -> impl Iterator<Item = (&CandidateState, &Attempt)> {
+        self.fan_out
+            .iter()
+            .flat_map(|f| &f.candidates)
+            .chain(&self.discarded)
+            .flat_map(|c| c.attempts.iter().map(move |a| (c, a)))
+    }
     /// The attempt whose router checks stand for the stage: the latest one,
     /// or for a fan-out stage whose winner reached the workspace, that
     /// candidate's latest one, since candidates run the checks and the

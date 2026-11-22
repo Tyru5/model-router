@@ -7,6 +7,15 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ## [Unreleased]
 
+### Fixed
+
+- Budgets now count fan-out candidate spend. `cost::stage_totals` summed only
+  a stage's own attempts, so run and stage caps never saw candidate spend, and
+  `model-router cost` left candidates out of its history. A repair rewind past
+  a fan-out stage also dropped the round's candidates from `run.json`, and
+  their spend with them; they are now kept as the stage's `discarded`
+  candidates and count in budgets, `report`, and `cost`.
+
 ## [0.2.1] - 2026-11-21
 
 ### Added

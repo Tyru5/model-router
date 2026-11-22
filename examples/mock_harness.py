@@ -28,6 +28,12 @@ parser.add_argument(
 parser.add_argument(
     "--select", metavar="CANDIDATE", help="Judge a fan-out: choose CANDIDATE"
 )
+parser.add_argument(
+    "--cost",
+    type=float,
+    metavar="USD",
+    help="Report USD spent, as a Claude stream-json result line",
+)
 args = parser.parse_args()
 
 root = Path(".model-router/mock")
@@ -93,3 +99,7 @@ if args.select:
 if not args.no_handoff:
     Path(args.handoff_file).write_text(json.dumps(handoff))
 print("<router-handoff>" + json.dumps(handoff) + "</router-handoff>", flush=True)
+if args.cost is not None:
+    usage = {"input_tokens": 10, "output_tokens": 10}
+    result = {"type": "result", "total_cost_usd": args.cost, "usage": usage}
+    print(json.dumps(result), flush=True)

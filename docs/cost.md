@@ -59,7 +59,7 @@ The router does not detect how a harness is signed in: set stage
 - Run header and a finished run's brief: amounts with sources.
 - `model-router report RUN_ID` (`--json` for data).
 - `model-router cost [--since 7d] [--json]`: history summed by harness and
-  model, with a **Billing** split between billed API spend and subscription
+  model (a fan-out candidate counts under its own harness), with a **Billing** split between billed API spend and subscription
   API-equivalent estimates, plus a note listing attempts with unknown cost
   (never counted as `$0`). `--since` accepts e.g. `12h`, `7d`, `2w`.
 - `model-router stats`: reported tokens and cost per assignment.
@@ -80,6 +80,9 @@ budget = { max_usd = 2.0, on_exceed = "warn" }
   stage cap stops, **blocked**, before its next stage (or logs a warning and
   continues when `on_exceed = "warn"`). In a stage graph, stages already
   running side by side finish first.
+- A fan-out stage's spend includes every candidate attempt, also those of a
+  round that a repair rewind discarded (kept in `run.json` as the stage's
+  `discarded` candidates).
 - A running stage is never killed (live caps on streamed usage are future
   work).
 - `max_tokens` counts input, output, and cache writes; cache reads are
