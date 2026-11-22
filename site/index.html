@@ -155,6 +155,20 @@ table.h td{padding:3px 8px 3px 0}
 .modes h3{margin:0 0 6px;font-size:21px;font-weight:900;letter-spacing:-.01em}
 .modes p{margin:0;font-size:16px;color:#B6CBBF}
 
+/* ---------- Delegation ---------- */
+.deleg{display:grid;grid-template-columns:.85fr 1.15fr;gap:56px;align-items:start}
+.deleg>*{min-width:0}
+.points{list-style:none;margin:0;padding:0;border-top:2px solid var(--rule)}
+.points li{border-bottom:2px solid var(--rule);padding:16px 0}
+.points h3{margin:0 0 4px;font-size:19px;font-weight:900;letter-spacing:-.01em}
+.points p{margin:0;font-size:16px;color:var(--muted)}
+.deleg .note{margin:22px 0 0;font-size:15px;color:var(--muted)}
+.deleg .stack{display:flex;flex-direction:column;gap:18px}
+.deleg .screen{min-height:0;font-size:13px;padding:14px 12px 10px}
+.feed{overflow-x:auto}
+.feed div{white-space:pre}
+.deleg pre.cli{font-size:14px}
+
 /* ---------- Interlocks ---------- */
 .frame{background:var(--green);color:#EEF2EC}
 .frame .intro{color:#BCD0C4}
@@ -184,7 +198,7 @@ footer a{margin-left:22px}
   .readout{contain:none;max-height:420px}
 }
 @media (max-width:900px){
-  .lede,.board{grid-template-columns:1fr;gap:32px}
+  .lede,.board,.deleg{grid-template-columns:1fr;gap:32px}
   nav ul{display:none}
   .diagram{overflow-x:auto}
   .diagram svg{min-width:680px}
@@ -231,6 +245,7 @@ footer a{margin-left:22px}
       <ul>
         <li><a href="#line">Set the line</a></li>
         <li><a href="#drive">Keyboard</a></li>
+        <li><a href="#delegate">Delegation</a></li>
         <li><a href="#safety">Safety</a></li>
         <li><a href="#cli">CLI</a></li>
       </ul>
@@ -369,6 +384,55 @@ footer a{margin-left:22px}
     </div>
   </section>
 
+  <section id="delegate">
+    <div class="wrap deleg">
+      <div>
+        <h2>Let a stage hand work to other agents</h2>
+        <p class="intro">Turn on delegation for a stage and its agent can pass self-contained tasks to other harnesses and models in the middle of a run. The router launches every task, so it owns the process, the sandbox, and the spend. The agent only asks.</p>
+        <ul class="points">
+          <li><h3>Read-only or in a worktree</h3><p>A shared task reads the parent's checkout and can't write to it. A worktree task works on a copy and returns a patch the parent applies with <code>task_apply</code>.</p></li>
+          <li><h3>Never above the parent</h3><p>Each task runs unattended in its own OS sandbox and can't get more write access, native permissions, or network than the stage that started it.</p></li>
+          <li><h3>Woken, not polling</h3><p>When its tasks finish, the router starts a follow-up turn of the parent with their results.</p></li>
+          <li><h3>Schedules wait for you</h3><p>An agent can propose a recurring run. It fires only after you approve it with <code>model-router schedules approve</code>.</p></li>
+        </ul>
+        <p class="note">Claude Code, Codex, OpenCode, and custom adapters can delegate, including from interactive stages. Any harness can take a task. Delegates in a repo's config need <code>model-router trust</code>.</p>
+      </div>
+      <div class="stack">
+        <pre class="cli" aria-label="Delegation configuration"><span class="c"># .model-router.toml</span>
+<span class="k">[delegates.codex-review]</span>
+harness = "codex"
+model = "gpt-6.2-sol"
+effort = "high"
+
+<span class="k">[delegates.claude-impl]</span>
+harness = "claude"
+model = "claude-opus-5-5"
+isolation = "worktree"
+
+<span class="k">[[workflows.stages]]</span>
+id = "implement"
+harness = "claude"
+<span class="k">[workflows.stages.delegation]</span>
+delegates = ["codex-review", "claude-impl"]
+max_parallel = 3</pre>
+        <div class="term" aria-label="Runs view while the Implement stage delegates two tasks">
+          <div class="chrome"><i></i><i></i><i></i><span>mr ~/src/payments-api</span></div>
+          <div class="screen feed">
+            <div class="t-mut">Implement tasks  <span style="color:var(--t-fg)">↳ t1 · codex-review</span> <span class="t-acc">✓</span>  <span style="color:var(--t-fg)">↳ t2 · claude-impl</span> <span class="t-acc">✓</span>  · 1 wake(s)</div>
+            <div> </div>
+            <div class="t-mut">── Implement · task t1 (codex-review) ──</div>
+            <div>  <span class="t-acc">handoff</span> verdict=pass, no blocking findings</div>
+            <div class="t-mut">── Implement · task t2 (claude-impl) ──</div>
+            <div>  <span class="t-acc">handoff</span> verdict=complete, 2 files changed</div>
+            <div class="t-mut">── Implement · wake turn 2: tasks t1, t2 ──</div>
+            <div>  task_apply t2  <span class="t-acc">applied</span>, 2 files</div>
+            <div>  <span class="t-acc">handoff</span> verdict=complete, checks passed</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <section id="safety" class="frame">
     <div class="wrap">
       <h2>Interlocks you can't pull past</h2>
@@ -377,9 +441,9 @@ footer a{margin-left:22px}
         <div class="lever"><svg viewBox="0 0 40 48" aria-hidden="true"><use href="#lever"/></svg><div><h3>No commits by default</h3><p>Only a ship stage commits, on a new branch, after you confirm a preview.</p></div></div>
         <div class="lever"><svg viewBox="0 0 40 48" aria-hidden="true"><use href="#lever"/></svg><div><h3>Your logins stay yours</h3><p>No stored credentials. Provider keys are read from your environment at launch and redacted in every record.</p></div></div>
         <div class="lever"><svg viewBox="0 0 40 48" aria-hidden="true"><use href="#lever"/></svg><div><h3>Native permissions</h3><p>Each harness keeps its own approval rules unless a stage explicitly overrides them.</p></div></div>
-        <div class="lever"><svg viewBox="0 0 40 48" aria-hidden="true"><use href="#lever"/></svg><div><h3>Trust before commands</h3><p>A repo's config can't run checks or custom adapters until you run <code>model-router trust</code>.</p></div></div>
+        <div class="lever"><svg viewBox="0 0 40 48" aria-hidden="true"><use href="#lever"/></svg><div><h3>Trust before commands</h3><p>A repo's config can't run checks, custom adapters, or delegates until you run <code>model-router trust</code>.</p></div></div>
         <div class="lever"><svg viewBox="0 0 40 48" aria-hidden="true"><use href="#lever"/></svg><div><h3>No silent model swaps</h3><p>A failed stage stops and offers retry, a replacement model, or resume.</p></div></div>
-        <div class="lever"><svg viewBox="0 0 40 48" aria-hidden="true"><use href="#lever"/></svg><div><h3>Clean exits</h3><p>Every harness process group ends with its stage. Optional bubblewrap or sandbox-exec per stage.</p></div></div>
+        <div class="lever"><svg viewBox="0 0 40 48" aria-hidden="true"><use href="#lever"/></svg><div><h3>Clean exits</h3><p>Every harness process group ends with its stage. An optional bubblewrap or sandbox-exec sandbox per stage keeps Git config and hooks read-only.</p></div></div>
       </div>
     </div>
   </section>
@@ -411,6 +475,9 @@ cargo run -- --config examples/demo.toml
 
 <span class="c"># read the brief and the diff</span>
 <span class="k">model-router</span> report r-0418 --diff
+
+<span class="c"># approve a schedule an agent proposed</span>
+<span class="k">model-router</span> schedules approve s1
 
 <span class="c"># let other agents drive it</span>
 <span class="k">model-router</span> serve --mcp</pre>
