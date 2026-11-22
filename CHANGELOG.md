@@ -21,6 +21,9 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Fixed
 
+- Handoff repair saves the run before its follow-up starts, so `run.json` no
+  longer names the finished harness's process group while the follow-up
+  runs (a crash then could leave a stale group recorded).
 - Budgets now count fan-out candidate spend. `cost::stage_totals` summed only
   a stage's own attempts, so run and stage caps never saw candidate spend, and
   `model-router cost` left candidates out of its history. A repair rewind past

@@ -451,6 +451,12 @@ Do not edit any project files or run destructive commands. Emit ONLY a valid han
         .filter(|_| adapters::streams(&stage.harness, &run.adapters))
         .map(|s| Duration::from_secs(s.min(120)));
     let workspace = run.workspace.clone();
+    // The first harness has ended; save that before the follow-up starts, so
+    // the record never names its finished group while the follow-up runs.
+    if let Some(attempt) = run.stages[index].attempts.last_mut() {
+        attempt.set_group(None);
+    }
+    run.persist()?;
     // Recorded like the stage's own harness, so a later drive can stop the
     // follow-up's group if mr dies meanwhile.
     let outcome = process::capture_with_stall(
