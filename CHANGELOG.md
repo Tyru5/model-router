@@ -32,7 +32,9 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 - Schedules: `schedule_task` writes `.model-router/schedules.json`; a
   schedule fires only after `mr schedules approve ID`. `mr schedules
   list|approve|pause|enable|delete|tick`; `serve` fires due schedules and
-  accepts `POST /schedules/<id>/trigger`.
+  accepts `POST /schedules/<id>/trigger`. `approve --digest D` (and the TUI
+  confirm dialog) refuse a schedule changed after it was shown; `list --json`
+  includes `digest`.
 - Reports, previews, history, and the Runs page show tasks, wake turns, and
   their cost.
 - Global and project config layering: loading `<project>/.model-router.toml`
@@ -40,7 +42,7 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   `[delegates.*]`, and `[pricing.*]` underneath project entries (project keys
   win on collision). Global entries stay trusted while project-defined and
   shadowing entries require `model-router trust`; saving a project config omits
-  unmodified global entries.
+  unmodified global entries, and saving the global `config.toml` keeps them.
 - Built-in pricing table entries for `gpt-6`, `gpt-6-astra`, and `gpt-6.2-sol`
   in `src/cost/prices.toml`.
 - Prompt `context_files` (`Vec<String>` on workflows and stages, up to 32
@@ -49,30 +51,44 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   (`handoff_budget_bytes` default `14000`, `handoff_each_bytes` default `5000`,
   validated in `1024..=200000`), shown in `preview` and `handoffs`.
 - Transient stage retries (`[workflows.retry]` and `[workflows.stages.retry]`
-  with `max_attempts` `0..=5`, `base_delay_seconds`, `max_delay_seconds`) that
+  with `max_attempts` `0..=5`, `base_delay_seconds` `1..=600`,
+  `max_delay_seconds` from the base to `3600`) that
   retry unattended transient provider or network errors (HTTP
   429/502/503/504/529, rate limits, overloaded, connection reset/timeout) on
   the same harness and model with interruptible capped exponential backoff.
+  Fan-out candidates retry in a fresh worktree; a stage `retry` on a
+  delegating stage is a config error. Policy checks cover edits left by failed
+  attempts, and a retried run writes one `run_end` metric.
 - Trust-gated lifecycle hooks (`[workflows.hooks]` and
   `[workflows.stages.hooks]` with `before_stage`, `after_stage`, `before_ship`,
   `on_failure`), executed as argument vectors in their own process group with
   `MODEL_ROUTER_HOOK` and stage context environment variables, and included in
-  project trust and run approval digests.
+  project trust and run approval digests. `timeout_seconds` is `1..=3600`.
+  Stage hooks run once around a fan-out round, and edits from `after_stage`
+  and `on_failure` hooks are captured in the stage's changes.
 - Declarative diff policies (`[[workflows.policies]]` with
   `action = "block" | "advise"`, non-backtracking `pattern`, `paths`,
   `message`) that block prohibited added lines at stage end, fan-out candidate
   post-processing and selection, `apply`, and `ship` (failing closed), or
-  inject path/diff advisories into review prompts.
+  inject path/diff advisories into review prompts. Whole added lines are
+  scanned; candidates are scanned as text diffs (binary-looking files read as
+  text, non-ASCII and quoted paths decoded).
 - Conditional stage execution (`when_changed` repo-relative globs on stages,
-  skipping unmatched stages in Git repositories) and multi-review quorum gating
+  up to 32, skipping unmatched stages in Git repositories; a fan-out judge with
+  candidates waiting never skips) and multi-review quorum gating
   (`review_quorum` on workflows).
 - Live mid-stream budget enforcement for unattended streaming stages with
   `on_exceed = "stop"`, terminating the harness process group as soon as
-  streamed usage exceeds stage or run USD/token caps.
+  streamed usage exceeds stage or run USD/token caps. Caps count every live
+  worker (parallel stages, fan-out candidates, delegating parents and their
+  tasks), and a run whose recorded spend is over a stop cap when its last
+  stage finishes ends Blocked.
 - `model-router schedules add` CLI (`--workflow`, `--task`/`--task-file`,
   `--every`/`--at`/`--cron`/`--webhook`, `--tz`, trust-gated `--approve`), plus
-  5-field cron expressions (`cron`) and timezone support (`tz`: `"local"`,
-  `"UTC"`, or `"±HH:MM"`) across the CLI and `schedule_task` MCP tool.
+  5-field cron expressions (`cron`; day-of-month OR day-of-week when both are
+  set) and timezone support (`tz`: `"local"`, `"UTC"`, or `"±HH:MM"`) across
+  the CLI and `schedule_task` MCP tool. A `tz`-only `schedule_task` edit
+  updates an `at` or `cron` trigger and is refused for `every` and webhooks.
 - `model-router doctor` checks for `[harness_versions]` pins (`--strict` fails
   on drift), `[providers.*]` API key variable presence, and offline harness
   auth-readiness hints without reading secret contents or making network
@@ -99,6 +115,9 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Changed
 
+- `model-router doctor --json` prints an object,
+  `{"harnesses": [...], "providers": [{name, api_key_env, status}]}`, instead
+  of a bare array of harness reports.
 - Built-in starter workflow and stage/workflow presets now leave stage `model`
   blank (`""`) where `gpt-6-astra` was previously hardcoded, so stages inherit
   each harness's native default model out of the box.
