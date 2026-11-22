@@ -209,6 +209,26 @@ impl App {
         );
         Ok((Placement::WorktreeFromHead, Some(holder)))
     }
+    /// Drives `run` (one an agent launched or retried) in this session
+    /// without moving focus off the run being watched.
+    pub(super) fn drive_in_background(&mut self, run: Run) -> Result<()> {
+        let watched = self.session.focused().map(|slot| slot.run.id.clone());
+        match self.session.runs.iter().position(|s| s.run.id == run.id) {
+            Some(index) => {
+                self.session.focus(index);
+                if let Some(slot) = self.session.focused_mut() {
+                    slot.run = run;
+                }
+            }
+            None => self.session.adopt(run),
+        }
+        let started = self.start_driver();
+        if let Some(id) = watched {
+            self.session.focus_run(&id);
+        }
+        self.runs.stale = true;
+        started
+    }
     pub(super) fn start_driver(&mut self) -> Result<()> {
         let slot = self.session.focused_mut().context("No run selected")?;
         ensure!(slot.worker.is_none(), "A stage is still running");

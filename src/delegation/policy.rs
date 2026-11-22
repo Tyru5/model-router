@@ -111,6 +111,53 @@ pub fn task_ceiling(task: &Stage, isolation: Isolation, parent: &Ceiling) -> Cei
     }
 }
 
+/// An unsandboxed command the user configured (a router check, a ship
+/// stage's secret scanner): it writes the workspace, with the user's
+/// network and no OS sandbox.
+pub const UNSANDBOXED_COMMAND: Ceiling = Ceiling {
+    write: Write::Workspace,
+    native: Native::Default,
+    network: Network::Open,
+    enforcement: Enforcement::None,
+};
+
+/// The ceilings everything a workflow would run needs: each enabled stage,
+/// each fan-out candidate, each router check, and a ship stage's secret
+/// scanner. A launched run's plan must stay within its launcher's.
+pub fn workflow_ceilings(workflow: &Workflow, backend: bool) -> Vec<(String, Ceiling)> {
+    let mut out = vec![];
+    for stage in workflow.stages.iter().filter(|s| s.enabled) {
+        out.push((
+            format!("stage {}", stage.id),
+            stage_ceiling(workflow, stage, backend),
+        ));
+        for candidate in stage.fan_out.iter().flat_map(|f| &f.candidates) {
+            let candidate = candidate.stage(stage);
+            out.push((
+                format!("candidate {} of stage {}", candidate.harness, stage.id),
+                stage_ceiling(workflow, &candidate, backend),
+            ));
+        }
+        if !stage.checks.is_empty() {
+            out.push((
+                format!("router checks of stage {}", stage.id),
+                UNSANDBOXED_COMMAND,
+            ));
+        }
+        if stage
+            .ship
+            .as_ref()
+            .is_some_and(|ship| !ship.secret_scanner.is_empty())
+        {
+            out.push((
+                format!("secret scanner of stage {}", stage.id),
+                UNSANDBOXED_COMMAND,
+            ));
+        }
+    }
+    out
+}
+
 /// Why `child` exceeds `parent`, or `None` when it stays within it.
 pub fn exceeds(child: &Ceiling, parent: &Ceiling) -> Option<String> {
     if child.write > parent.write {

@@ -1282,6 +1282,7 @@ impl Run {
             worktree: None,
             tasks: vec![],
             turns: vec![],
+            launched_runs: vec![],
         });
         let reason = format!("Fan-out round {number} started: {pending} candidate(s)");
         self.resume = None;
@@ -1450,6 +1451,7 @@ impl Run {
             worktree: Some(worktree),
             tasks: vec![],
             turns: vec![],
+            launched_runs: vec![],
         });
         let reason = format!(
             "Candidate {id} attempt {number} started: {} {}",

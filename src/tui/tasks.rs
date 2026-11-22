@@ -83,12 +83,70 @@ pub(super) enum Msg {
         harness: String,
         result: Result<super::harnesses::TestOutcome, String>,
     },
+    /// A run an agent launched (or retried) for this session to drive in the
+    /// background, or one to cancel; applies after a project switch too.
+    Hosted(Result<Hosted, String>),
     /// Routing stats of `project`; `ticket` is the Stats dialog's wait, if any.
     Stats {
         project: PathBuf,
         ticket: Option<u64>,
         result: Result<Arc<Stats>, String>,
     },
+}
+
+/// What the session's run host asks of the app.
+pub(super) enum Hosted {
+    Drive(Box<crate::engine::Run>),
+    Cancel(String),
+}
+
+/// The TUI as the run host: launched runs join this session and are driven
+/// in the background, without taking focus.
+pub(super) struct TuiHost(pub(super) std::sync::Mutex<Spawner>);
+impl crate::engine::RunHost for TuiHost {
+    fn drive(&self, project: &std::path::Path, id: &str) -> anyhow::Result<()> {
+        let (project, id) = (project.to_path_buf(), id.to_owned());
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).spawn(
+            "Adopting a launched run stopped unexpectedly.",
+            move || {
+                crate::engine::load(&project, &id)
+                    .map(|run| Hosted::Drive(Box::new(run)))
+                    .map_err(|e| format!("{e:#}"))
+            },
+            Msg::Hosted,
+        );
+        Ok(())
+    }
+    fn retry(&self, project: &std::path::Path, id: &str) -> anyhow::Result<()> {
+        let (project, id) = (project.to_path_buf(), id.to_owned());
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).spawn(
+            "Retrying a launched run stopped unexpectedly.",
+            move || {
+                crate::engine::command(
+                    &project,
+                    &id,
+                    None,
+                    crate::engine::Cmd::Retry {
+                        interactive: false,
+                        model: None,
+                    },
+                )
+                .map(|run| Hosted::Drive(Box::new(run)))
+                .map_err(|e| format!("{e:#}"))
+            },
+            Msg::Hosted,
+        );
+        Ok(())
+    }
+    fn cancel(&self, id: &str) -> bool {
+        let id = id.to_owned();
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).spawn(
+            "Cancelling a launched run stopped unexpectedly.",
+            move || Ok(Hosted::Cancel(id)),
+            Msg::Hosted,
+        );
+        true
+    }
 }
 
 /// A fresh number identifying a task's result, e.g. for the dialog waiting on it.
@@ -203,6 +261,22 @@ impl App {
                     .and_then(|started| self.begin(*started));
                 if let Err(error) = started {
                     self.ui.error(format!("{error:#}"));
+                }
+            }
+            Msg::Hosted(result) => {
+                self.ui.redraw = true;
+                match result {
+                    Ok(Hosted::Drive(run)) => {
+                        if let Err(error) = self.drive_in_background(*run) {
+                            self.ui.error(format!("{error:#}"));
+                        }
+                    }
+                    Ok(Hosted::Cancel(id)) => {
+                        if let Some(slot) = self.session.runs.iter().find(|s| s.run.id == id) {
+                            slot.cancel.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    Err(error) => self.ui.error(error),
                 }
             }
             Msg::Changes { run, key, result } => {

@@ -139,6 +139,7 @@ struct Case {
     dir: tempfile::TempDir,
     script: PathBuf,
     run: Run,
+    settings: Settings,
 }
 
 fn case(turns: Value, follow_up: bool, delegate: Delegate, tweak: impl FnOnce(&mut Stage)) -> Case {
@@ -180,7 +181,36 @@ fn case(turns: Value, follow_up: bool, delegate: Delegate, tweak: impl FnOnce(&m
         false,
     )
     .unwrap();
-    Case { dir, script, run }
+    Case {
+        dir,
+        script,
+        run,
+        settings,
+    }
+}
+
+/// Saves `case`'s settings, plus an unattended `Plain` workflow, as the
+/// project's own trusted config, which `run_launch` reads.
+fn save_project_config(case: &Case, settings: &Settings) {
+    let mut settings = settings.clone();
+    settings.workflows.push(Workflow::new(
+        "Plain",
+        vec![Stage {
+            id: "look".into(),
+            name: "Look".into(),
+            role: Role::Research,
+            harness: "task".into(),
+            model: "m".into(),
+            ..Stage::default()
+        }],
+    ));
+    settings
+        .save(&case.dir.path().join(".model-router.toml"))
+        .unwrap();
+    let loaded = model_router::config::load_config(case.dir.path(), None).unwrap();
+    if let Some(review) = loaded.review() {
+        model_router::trust::approve(review).unwrap();
+    }
 }
 
 fn helper(model: &str) -> Delegate {
@@ -490,4 +520,67 @@ fn an_unlisted_target_or_an_unknown_task_is_refused() {
         "task_not_found"
     );
     assert!(case.run.stages[0].attempts[0].tasks.is_empty());
+}
+
+#[test]
+fn launched_runs_get_their_own_worktree_and_answer_to_their_launcher() {
+    if !setup() {
+        return;
+    }
+    let turns = json!({
+        "turns": [[
+            {"call": "run_launch", "args": {"runs": [{"workflow": "Plain", "task": "Look at README"}], "client_request_id": "l1"}},
+            {"call": "run_launch", "args": {"runs": [{"workflow": "Plain", "task": "Look at README"}], "client_request_id": "l1"}},
+            {"call": "run_launch", "args": {"runs": [{"workflow": "Plain", "task": "a"}, {"workflow": "Plain", "task": "b"}]}},
+            {"call": "run_list"}
+        ]],
+        "handoffs": {"1": {"summary": "final", "verdict": "complete"}}
+    });
+    let mut case = case(turns, true, helper("m"), |stage| {
+        let delegation = stage.delegation.as_mut().unwrap();
+        delegation.runs = true;
+        delegation.max_runs = 2;
+    });
+    save_project_config(&case, &case.settings.clone());
+    assert_eq!(
+        drive(&mut case.run),
+        Action::Complete,
+        "{:?}",
+        case.run.error
+    );
+    let calls = calls(&case.script);
+    let launches = call(&calls, 1, "run_launch");
+    let first = &launches[0]["result"]["runs"][0];
+    assert_eq!(
+        first["driven"], false,
+        "no host drives runs in tests: {first}"
+    );
+    assert!(first["resume"].as_str().unwrap().contains("resume"));
+    let id = first["run_id"].as_str().unwrap().to_owned();
+    // The same key returns the same run.
+    assert_eq!(launches[1]["result"]["runs"][0]["run_id"], id);
+    // Two more would exceed max_runs = 2 (one launched).
+    assert_eq!(launches[2]["result"]["error"]["code"], "run_limit_exceeded");
+    let listed = &call(&calls, 1, "run_list")[0]["result"]["runs"];
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["run_id"] == id.as_str())
+    );
+    let launched = engine::load(case.dir.path(), &id).unwrap();
+    assert!(
+        launched.worktree,
+        "a launched run works in its own worktree"
+    );
+    assert_eq!(launched.creation_source.label(), "agent");
+    let by = launched.launched_by.as_ref().unwrap();
+    assert_eq!(
+        (by.run.as_str(), by.stage.as_str()),
+        (case.run.id.as_str(), "implement")
+    );
+    assert_eq!(launched.status, Status::Pending);
+    let attempt = &case.run.stages[0].attempts[0];
+    assert_eq!(attempt.launched_runs.len(), 1);
 }

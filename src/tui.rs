@@ -212,6 +212,10 @@ pub fn run(
 ) -> Result<()> {
     let _hook = PanicHook::install();
     let mut app = App::new(project, settings, config_path, cancel);
+    // Runs a stage's agent launches (and schedules fire) join this session.
+    crate::engine::set_run_host(std::sync::Arc::new(tasks::TuiHost(std::sync::Mutex::new(
+        app.tasks.spawner(),
+    ))));
     if let Some(cwd) = detected_from {
         app.ui.message = format!(
             "Project: {} (detected above {}). p changes it.",

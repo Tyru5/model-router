@@ -172,6 +172,34 @@ impl DelegationTools {
     }
 }
 
+impl DelegationTools {
+    /// Polls a run's saved status until it leaves pending/running, nothing
+    /// drives it, or `limit` passes.
+    fn wait_run(&self, id: &str, limit: Duration, cancel: Option<&AtomicBool>) -> Reply {
+        let deadline = Instant::now() + limit.min(MAX_WAIT);
+        loop {
+            let mut status = self.ask(Request::Other {
+                tool: "run_status".into(),
+                arguments: json!({"run_id": id}),
+            })?;
+            let running = matches!(status["status"].as_str(), Some("pending" | "running"));
+            let driven = status["driven"].as_bool().unwrap_or(true);
+            if !running || !driven {
+                status["timed_out"] = json!(false);
+                return Ok(status);
+            }
+            if Instant::now() >= deadline || cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                status["timed_out"] = json!(true);
+                return Ok(status);
+            }
+            if self.close.load(Ordering::SeqCst) {
+                return Err(self.closed());
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+}
+
 /// A task view that a wait returns for: terminal or waiting.
 fn ready_view(view: &Value) -> bool {
     matches!(
@@ -304,6 +332,8 @@ impl ToolSet for DelegationTools {
             "task_apply" => self.ask(Request::Apply {
                 arguments: arguments.clone(),
             }),
+            "run_wait" => string_arg(arguments, "run_id")
+                .and_then(|id| self.wait_run(&id, timeout_arg(arguments), cancel)),
             name if RUN_TOOLS.contains(&name) || SCHEDULE_TOOLS.contains(&name) => {
                 self.ask(Request::Other {
                     tool: name.to_owned(),

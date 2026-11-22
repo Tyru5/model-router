@@ -868,10 +868,17 @@ impl<'a> Owner<'a> {
             Request::Cancel { id, reason } => self.cancel_task(run, &id, reason),
             Request::Send { arguments } => self.send(scope, run, &arguments),
             Request::Apply { arguments } => self.apply(run, &arguments),
-            Request::Other { tool, .. } => Err(ToolError::new(
-                "capability_denied",
-                format!("{tool} is not enabled for this stage"),
-            )),
+            Request::Other { tool, arguments } => super::delegate_runs::run_tool(
+                run,
+                &super::delegate_runs::Launcher {
+                    index: self.index,
+                    stage: &self.stage,
+                    ceiling: &self.ceiling,
+                    delegation: &self.delegation,
+                },
+                &tool,
+                &arguments,
+            ),
         }
     }
 

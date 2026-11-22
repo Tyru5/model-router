@@ -203,6 +203,9 @@ pub struct Attempt {
     /// A delegating attempt's wake turns after its first process.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub turns: Vec<crate::delegation::records::Turn>,
+    /// Runs this attempt's agent launched (`run_launch`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launched_runs: Vec<crate::delegation::records::LaunchedRun>,
 }
 impl Attempt {
     /// The recorded process group, with its identity.

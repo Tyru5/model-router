@@ -26,7 +26,9 @@ use std::{
 mod apply;
 mod delegate;
 mod delegate_apply;
+mod delegate_runs;
 mod exec;
+mod host;
 mod prompt;
 mod recovery;
 mod run;
@@ -36,6 +38,7 @@ mod types;
 
 pub use apply::{ApplyPlan, apply_worktree, apply_worktree_plan};
 pub use exec::detached_terminal;
+pub use host::{RunHost, cancel_pending, run_host, set_run_host};
 pub use prompt::{
     FieldView, HandoffView, Inspection, Kept, PRIOR_BUDGET, PRIOR_EACH, inspect_handoffs, prompt,
 };
@@ -44,8 +47,8 @@ pub use recovery::{
 };
 pub use store::{command, history, load};
 pub use types::{
-    Action, Attempt, CandidateChanges, CandidateState, Cmd, Event, FanOutState, Fork, Placement,
-    Resume, Run, Selection, StageState, Status, Transition, Waiver,
+    Action, Attempt, CandidateChanges, CandidateState, Cmd, CreationSource, Event, FanOutState,
+    Fork, LaunchedBy, Placement, Resume, Run, Selection, StageState, Status, Transition, Waiver,
 };
 
 use exec::{
@@ -1113,6 +1116,7 @@ mod tests {
             worktree: None,
             tasks: vec![],
             turns: vec![],
+            launched_runs: vec![],
         });
         run.retry(false, None).unwrap();
         assert_eq!(run.status, Status::Pending);

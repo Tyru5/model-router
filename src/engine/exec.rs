@@ -116,6 +116,7 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
         worktree: None,
         tasks: vec![],
         turns: vec![],
+        launched_runs: vec![],
     });
     let reason = format!(
         "Attempt {number} started: {} {} ({})",

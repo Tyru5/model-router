@@ -725,14 +725,51 @@ pub enum BudgetCheck {
 
 /// Evaluates budget caps honoring `on_exceed` (`stop` vs `warn`).
 pub fn check_budget_action(run: &Run) -> BudgetCheck {
-    if !has_budget(run) {
+    // A launched run answers to its launcher's caps too (which count every
+    // run it launched); a cleaned launcher leaves only the run's own.
+    let launcher = run
+        .launched_by
+        .as_ref()
+        .and_then(|by| crate::engine::load(&run.project, &by.run).ok())
+        .filter(has_budget);
+    if !has_budget(run) && launcher.is_none() {
         return BudgetCheck::Ok;
     }
-    check_budget_action_with(run, &Pricing::load(&run.project))
+    let pricing = Pricing::load(&run.project);
+    let own = if has_budget(run) {
+        check_budget_action_with(run, &pricing)
+    } else {
+        BudgetCheck::Ok
+    };
+    if matches!(own, BudgetCheck::Stop(_)) {
+        return own;
+    }
+    match launcher.map(|l| (check_budget_action_with(&l, &pricing), l.id)) {
+        Some((BudgetCheck::Stop(reason), id)) => BudgetCheck::Stop(format!(
+            "{reason} (launcher run {id}, counting the runs it launched)"
+        )),
+        Some((BudgetCheck::Warn(warning), _)) if own == BudgetCheck::Ok => {
+            BudgetCheck::Warn(warning)
+        }
+        _ => own,
+    }
+}
+
+/// Per-stage spend including the runs each stage's agent launched.
+fn totals_with_launched(run: &Run, pricing: &Pricing) -> Vec<CostTotal> {
+    let mut stages = stage_totals(run, pricing);
+    for (index, state) in run.stages.iter().enumerate() {
+        for launched in state.attempts.iter().flat_map(|a| &a.launched_runs) {
+            if let Ok(child) = crate::engine::load(&run.project, &launched.id) {
+                stages[index].merge(&run_total(&child, pricing));
+            }
+        }
+    }
+    stages
 }
 
 pub fn check_budget_action_with(run: &Run, pricing: &Pricing) -> BudgetCheck {
-    let stages = stage_totals(run, pricing);
+    let stages = totals_with_launched(run, pricing);
     let mut total = CostTotal::default();
     let mut stop_reason = None;
     let mut warn_reason = None;

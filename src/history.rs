@@ -1252,6 +1252,7 @@ mod tests {
             worktree: None,
             tasks: vec![],
             turns: vec![],
+            launched_runs: vec![],
         });
         run.stages[2].status = Status::Failed;
         run.stages[2].attempts.push(Attempt {
@@ -1278,6 +1279,7 @@ mod tests {
             worktree: None,
             tasks: vec![],
             turns: vec![],
+            launched_runs: vec![],
         });
 
         // Stage b started before checkpoint c and crashed (tree_after: None).
@@ -1306,6 +1308,7 @@ mod tests {
             worktree: None,
             tasks: vec![],
             turns: vec![],
+            launched_runs: vec![],
         });
         run.persist().unwrap();
         let err = fork(dir.path(), &settings, &run.id, "c", None)

@@ -160,6 +160,8 @@ pub fn run(
         "Choose --mcp, --http ADDR, or both"
     );
     let server = Arc::new(Server::new(project, config, &args.allow_roots)?);
+    // Runs a stage's agent launches (and schedules fire) are driven here.
+    crate::engine::set_run_host(Arc::new(tools::ServeHost(server.clone())));
     if let Some(addr) = args.http {
         ensure!(
             args.allow_remote || addr.ip().is_loopback(),

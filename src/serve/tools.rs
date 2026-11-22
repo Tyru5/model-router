@@ -578,6 +578,30 @@ fn get_report(server: &Server, a: RunArgs) -> Result<Value> {
 
 /// Reloads after the engine's last save and atomically reserves and resumes a
 /// run this server is not already driving.
+/// `serve` as the run host for runs agents launch and schedules fire.
+pub struct ServeHost(pub std::sync::Arc<Server>);
+impl engine::RunHost for ServeHost {
+    fn drive(&self, project: &Path, id: &str) -> Result<()> {
+        let run = engine::load(project, id)?;
+        self.0.runs.drive(project, run)
+    }
+    fn retry(&self, project: &Path, id: &str) -> Result<()> {
+        let project = project.display().to_string();
+        resume_idle_run(&self.0, Some(&project), id, |run| {
+            ensure!(
+                run.status != Status::Complete && run.cursor < run.stages.len(),
+                "Run {} is complete",
+                run.id
+            );
+            run.retry(false, None)
+        })
+        .map(|_| ())
+    }
+    fn cancel(&self, id: &str) -> bool {
+        self.0.runs.cancel(id)
+    }
+}
+
 fn resume_idle_run(
     server: &Server,
     project: Option<&str>,

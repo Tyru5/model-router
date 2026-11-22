@@ -216,6 +216,14 @@ impl TaskState {
     }
 }
 
+/// A run an agent launched with `run_launch`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchedRun {
+    pub id: String,
+    pub client_request_id: String,
+    pub fingerprint: String,
+}
+
 /// A parent's wake turn: one `follow_up` process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Turn {
