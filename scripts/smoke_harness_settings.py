@@ -203,8 +203,10 @@ mode = "interactive"
                 "Saved settings did not reopen",
             )
             terminal.send(NEXT * 5)
-            assert "workspace-write" in terminal.text(), (
-                "Saved sandbox was not restored"
+            # send() waits for one redraw; the five keys may take several.
+            terminal.wait_for(
+                lambda: "workspace-write" in terminal.text(),
+                "Saved sandbox was not restored",
             )
             assert "[Ctrl+S] apply" in terminal.text(), (
                 "Apply hint hidden at minimum size"

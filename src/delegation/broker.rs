@@ -175,7 +175,7 @@ impl Broker {
             let _ = wake.write_all(b"x");
         }
         if let Some(stream) = self.active.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+            end(&stream);
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -259,16 +259,24 @@ fn accept_loop<T: ToolSet>(
                     let _ = call.join();
                 }
                 // The harness closed its end; close ours so the bridge exits.
-                let _ = ending.shutdown(std::net::Shutdown::Both);
+                end(&ending);
             })
             .ok();
     }
     if let Some(stream) = active.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        let _ = stream.shutdown(std::net::Shutdown::Both);
+        end(&stream);
     }
     if let Some(connection) = connection {
         let _ = connection.join();
     }
+}
+
+/// Shuts both directions of a session socket, one at a time: macOS refuses
+/// `Shutdown::Both` (ENOTCONN, writing side left open) once the bridge has
+/// shut its own writing side, and the bridge then never sees EOF.
+fn end(stream: &UnixStream) {
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.shutdown(std::net::Shutdown::Read);
 }
 
 /// The bridge's first line is the token; a wrong or slow one is dropped.

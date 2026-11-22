@@ -1536,11 +1536,20 @@ file:/h/.gitconfig\0includeIf.gitdir:/w/.path\n~/more.cfg\0command line:\0core.x
         let plan = plan_for(&d, &stage, Sandbox::Off, detected)
             .unwrap()
             .unwrap();
-        assert_eq!(plan.protected, vec![d.workspace.clone()]);
+        // Seatbelt grants $TMPDIR, so the test config directory under it is
+        // protected too.
+        let config = canonical(&crate::config::config_dir());
+        let protected: Vec<&PathBuf> = plan.protected.iter().filter(|p| **p != config).collect();
+        assert_eq!(protected, vec![&d.workspace]);
         let profile = plan.profile();
         let quoted = |p: &Path| format!("(subpath \"{}\")", p.display());
+        let denied: String = plan
+            .protected
+            .iter()
+            .map(|p| format!("\n    {}", quoted(p)))
+            .collect();
         let deny = profile
-            .rfind(&format!("(deny file-write*\n    {}", quoted(&d.workspace)))
+            .rfind(&format!("(deny file-write*{denied})"))
             .expect(&profile);
         let reallow = profile[deny..].find("(allow file-write*").expect(&profile) + deny;
         assert!(
