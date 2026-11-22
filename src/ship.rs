@@ -12,6 +12,8 @@ use crate::{
     config::Role,
     engine::{Attempt, Event, Run, Status, Transition, Waiver},
     handoff::{Handoff, TestStatus},
+    hooks::{self, HookContext, HookEvent},
+    policy::{DiffPolicy, PolicyAction, PolicyScan},
     report,
     snapshot::{self, FileChange},
     storage,
@@ -27,6 +29,7 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::atomic::AtomicBool,
 };
 
 /// A ship stage's settings (`[workflows.stages.ship]`).
@@ -169,6 +172,9 @@ pub struct Plan {
     /// External secret scanner command verified before commit.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secret_scanner: Vec<String>,
+    /// Blocking diff policies verified against the staged tree before commit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub block_policies: Vec<DiffPolicy>,
 }
 fn default_true() -> bool {
     true
@@ -504,6 +510,7 @@ fn run_range(run: &Run) -> Result<(String, String)> {
 /// reasons it cannot ship, e.g. files changed before and during the run.
 pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
     options.validate()?;
+    run.check_review_quorum()?;
     let dir = run.workspace.as_path();
     ensure!(
         dir.is_dir() && snapshot::is_repository(dir),
@@ -610,7 +617,14 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
                 .join(", ")
         );
     }
-    if options.secret_scan || !options.secret_scanner.is_empty() {
+    let block_policies: Vec<DiffPolicy> = run
+        .workflow
+        .policies
+        .iter()
+        .filter(|p| p.action == PolicyAction::Block && !p.pattern.is_empty())
+        .cloned()
+        .collect();
+    if options.secret_scan || !options.secret_scanner.is_empty() || !block_policies.is_empty() {
         // The same private index the commit is built from, in a scratch
         // directory: the scans see exactly the planned files as they would
         // be committed now, not skipped files or the user's own index.
@@ -630,6 +644,7 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
             },
             options.secret_scan,
             &options.secret_scanner,
+            &block_policies,
             ("", "refusing to ship"),
         )?;
     }
@@ -728,6 +743,7 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
         pr,
         secret_scan: options.secret_scan,
         secret_scanner: options.secret_scanner.clone(),
+        block_policies,
     })
 }
 
@@ -917,13 +933,25 @@ fn scan_staged(
     staged: &Staged<'_>,
     builtin: bool,
     scanner: &[String],
+    block_policies: &[DiffPolicy],
     (found_in, refusing): (&str, &str),
 ) -> Result<()> {
-    if builtin {
-        let mut scan = crate::policy::SecretScan::default();
-        snapshot::patch_lines(work, staged.head, staged.tree, |line| scan.line(line))
-            .context("Read the ship diff for the secret scan; refusing to ship unscanned")?;
-        scan.ensure_clean(found_in, refusing)?;
+    if builtin || !block_policies.is_empty() {
+        let mut secrets = crate::policy::SecretScan::default();
+        let mut policies = PolicyScan::new(block_policies);
+        snapshot::patch_lines(work, staged.head, staged.tree, |line| {
+            if builtin {
+                secrets.line(line);
+            }
+            if !policies.is_empty_rules() {
+                policies.line(line);
+            }
+        })
+        .context("Read the ship diff for policy and secret checks; refusing to ship unscanned")?;
+        if builtin {
+            secrets.ensure_clean(found_in, refusing)?;
+        }
+        policies.ensure_clean(found_in, refusing)?;
     }
     if !scanner.is_empty() {
         let file_paths: Vec<String> = staged.files.iter().map(|f| f.path.clone()).collect();
@@ -966,6 +994,7 @@ fn apply_steps(
         },
         plan.secret_scan,
         &plan.secret_scanner,
+        &plan.block_policies,
         (" in staged changes", "refusing to commit"),
     )?;
     drop(index);
@@ -1066,10 +1095,91 @@ fn approval(digest: &str) -> String {
     format!("Ship plan {digest} confirmed")
 }
 
+/// Runs configured `before_ship` hooks (workflow + optional ship stage) in the
+/// run's workspace before committing. Aborts on non-zero exit, timeout, or cancel.
+pub fn run_before_ship_hooks(
+    run: &Run,
+    stage: Option<&crate::config::Stage>,
+    log_root: &Path,
+    cancel: &AtomicBool,
+    record_group: impl FnMut(Option<crate::process::Group>) -> Result<()>,
+    output: impl FnMut(String),
+) -> Result<hooks::HookRun> {
+    let configured = run.workflow.hooks_for(stage, HookEvent::BeforeShip);
+    let ctx = HookContext {
+        run_id: run.id.clone(),
+        workflow: run.workflow.name.clone(),
+        stage_id: stage.map(|s| s.id.clone()),
+        stage_role: stage.map(|s| s.role.label().into()),
+        stage_status: None,
+    };
+    hooks::run(
+        HookEvent::BeforeShip,
+        &configured,
+        &ctx,
+        &run.workspace,
+        log_root,
+        cancel,
+        None,
+        record_group,
+        output,
+    )
+}
+
+fn run_ship_stage_hooks(
+    run: &mut Run,
+    index: usize,
+    event: HookEvent,
+    directory: &Path,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(Event),
+) -> Result<hooks::HookRun> {
+    let stage = run.workflow.stages[index].clone();
+    let configured = run.workflow.hooks_for(Some(&stage), event);
+    if configured.is_empty() {
+        return Ok(hooks::HookRun::default());
+    }
+    let ctx = HookContext {
+        run_id: run.id.clone(),
+        workflow: run.workflow.name.clone(),
+        stage_id: Some(stage.id.clone()),
+        stage_role: Some(stage.role.label().into()),
+        stage_status: matches!(event, HookEvent::AfterStage | HookEvent::OnFailure)
+            .then(|| run.stages[index].status.as_str().into()),
+    };
+    let workspace = run.workspace.clone();
+    let result = hooks::run(
+        event,
+        &configured,
+        &ctx,
+        &workspace,
+        directory,
+        cancel,
+        None,
+        |group| {
+            let is_some = group.is_some();
+            if let Some(attempt) = run.stages[index].attempts.last_mut() {
+                attempt.set_group(group);
+            }
+            if is_some {
+                run.persist()?;
+            }
+            Ok(())
+        },
+        |text| emit(Event::Output(text)),
+    )?;
+    if let Some(group) = &result.survivor {
+        if run.retained_groups.iter().all(|g| g.pgid != group.pgid) {
+            run.retained_groups.push(group.clone());
+        }
+    }
+    Ok(result)
+}
+
 /// Runs the current ship stage in place of a harness. Without a matching
 /// confirmation (and with `confirm`), plans and waits at the checkpoint;
 /// otherwise ships and advances, or blocks with the failure.
-pub fn execute(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
+pub fn execute(run: &mut Run, cancel: &AtomicBool, emit: &mut impl FnMut(Event)) -> Result<()> {
     let index = run.cursor;
     let stage = run.workflow.stages[index].clone();
     let options = stage.ship.clone().unwrap_or_default();
@@ -1133,6 +1243,28 @@ pub fn execute(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
         "── {} · attempt {number} · router ship ──\n",
         stage.name
     )));
+    let before =
+        run_ship_stage_hooks(run, index, HookEvent::BeforeStage, &directory, cancel, emit)?;
+    if before.cancelled {
+        run.stages[index].waiver = None;
+        run.stop(
+            Status::Cancelled,
+            "Ship cancelled during before_stage hook".into(),
+            Actor::User,
+            true,
+        )?;
+        run.persist()?;
+        emit(Event::State(Box::new(run.clone())));
+        return Ok(());
+    }
+    if let Some(error) = before.failed {
+        run.stages[index].waiver = None;
+        run.stop(Status::Blocked, error, Actor::Engine, true)?;
+        let _ = run_ship_stage_hooks(run, index, HookEvent::OnFailure, &directory, cancel, emit);
+        run.persist()?;
+        emit(Event::State(Box::new(run.clone())));
+        return Ok(());
+    }
     let planned = plan(run, &options).and_then(|plan| {
         save_plan(&plan, &directory)?;
         Ok(plan)
@@ -1142,6 +1274,8 @@ pub fn execute(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
         Err(error) => {
             run.stages[index].waiver = None;
             run.stop(Status::Blocked, format!("{error:#}"), Actor::Engine, true)?;
+            let _ =
+                run_ship_stage_hooks(run, index, HookEvent::OnFailure, &directory, cancel, emit);
             run.persist()?;
             emit(Event::State(Box::new(run.clone())));
             return Ok(());
@@ -1188,6 +1322,28 @@ pub fn execute(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
         emit(Event::State(Box::new(run.clone())));
         return Ok(());
     }
+    let before_ship =
+        run_ship_stage_hooks(run, index, HookEvent::BeforeShip, &directory, cancel, emit)?;
+    if before_ship.cancelled {
+        run.stages[index].waiver = None;
+        run.stop(
+            Status::Cancelled,
+            "Ship cancelled during before_ship hook".into(),
+            Actor::User,
+            true,
+        )?;
+        run.persist()?;
+        emit(Event::State(Box::new(run.clone())));
+        return Ok(());
+    }
+    if let Some(error) = before_ship.failed {
+        run.stages[index].waiver = None;
+        run.stop(Status::Blocked, error, Actor::Engine, true)?;
+        let _ = run_ship_stage_hooks(run, index, HookEvent::OnFailure, &directory, cancel, emit);
+        run.persist()?;
+        emit(Event::State(Box::new(run.clone())));
+        return Ok(());
+    }
     let outcome = apply(&plan, &directory, |line| emit(Event::Output(line)));
     let lines = outcome.lines();
     let state = &mut run.stages[index];
@@ -1215,8 +1371,16 @@ pub fn execute(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
                 ));
             }
             run.stop(Status::Blocked, message, Actor::Engine, true)?;
+            let _ =
+                run_ship_stage_hooks(run, index, HookEvent::AfterStage, &directory, cancel, emit);
+            let _ =
+                run_ship_stage_hooks(run, index, HookEvent::OnFailure, &directory, cancel, emit);
         }
-        None => run.advance(Actor::Engine)?,
+        None => {
+            run.advance(Actor::Engine)?;
+            let _ =
+                run_ship_stage_hooks(run, index, HookEvent::AfterStage, &directory, cancel, emit);
+        }
     }
     run.persist()?;
     emit(Event::State(Box::new(run.clone())));

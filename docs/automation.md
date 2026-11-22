@@ -12,6 +12,7 @@ Accepted before or after any subcommand.
 | `-C, --project DIR` | Project directory. Default: nearest parent with `.model-router.toml`, else the Git root, else the current directory. |
 | `--config FILE` | Use this config instead of project/global ([precedence](configuration.md#files-and-precedence)). |
 | `--no-animation` | Open the TUI without the startup animation. |
+| `--metrics-file PATH` | Append structured JSONL metrics (`run_start`, `run_end`, `attempt_start`, `attempt_end`) to `PATH`. Also `MODEL_ROUTER_METRICS_FILE`. |
 | `-h, --help` / `-V, --version` | Help / version. |
 
 ## Run and recover
@@ -216,6 +217,7 @@ Estimated spend over saved runs, by harness and model ([cost.md](cost.md)).
 | Option | Meaning |
 | --- | --- |
 | `--since AGE` | Only attempts started within `AGE`, e.g. `7d`, `12h`, `2w`. |
+| `--all-projects` | Include every recent project, skipping missing or unreadable projects and reporting project count. |
 | `--json` | JSON. |
 
 ## Stats
@@ -304,7 +306,7 @@ and `.md` (success, checks, repairs, duration, usage per variant and run).
 | `harnesses` | Built-in and custom harnesses | `--spec [NAME]` (resolved spec JSON) |
 | `providers [NAME]` | Router providers, or `NAME`'s `/models` (one listing request) | |
 | `trust` | Trust this project's dangerous config sections | `--yes`, `--revoke` |
-| `doctor` | Harness executables, versions, flags; sandbox backend | `--json`, `--strict` |
+| `doctor` | Harness executables, versions, pins, provider keys, offline auth hints, flags; sandbox backend | `--json`, `--strict` |
 | `completions SHELL` | Completion script for `bash`, `zsh`, `fish`, `elvish`, or `powershell`; works outside a project | `--bin NAME` (default `model-router`; `mr` for the alias) |
 
 ```sh
@@ -334,13 +336,14 @@ Tools, Codex setup, HTTP routes: [serve.md](serve.md).
 
 ## Schedules
 
-Schedules a delegating stage's agent created (`schedule_task`; see
-[delegation.md](delegation.md)). A schedule fires only after you approve it,
-and again after any edit, pause, or enable.
+Schedules created from the CLI (`schedules add`) or by a delegating stage's
+agent (`schedule_task`; see [delegation.md](delegation.md)). A schedule fires
+only after approval, and again after any edit, pause, or enable.
 
 | Command | Effect |
 | --- | --- |
 | `schedules` / `schedules list [--json]` | Each schedule: approval state, trigger, workflow, task, pause reason. |
+| `schedules add` | Create a schedule from the CLI: `--task TEXT` or `--task-file FILE`, optional `-w/--workflow NAME`, one trigger (`--every DUR`, `--at HH:MM`, `--cron "M H DOM MON DOW"`, or `--webhook`), optional `--tz` (`local` default, `UTC`, or `±HH:MM` for `--at`/`--cron`), optional `--id ID`, and `--approve` (approves immediately if the project is trusted). |
 | `schedules approve ID` | Approve the schedule as it stands now (the project config must be trusted). |
 | `schedules pause ID` | Pause it; its approval is forgotten. |
 | `schedules enable ID` | Enable it again; it needs approval. |
@@ -349,6 +352,20 @@ and again after any edit, pause, or enable.
 
 `serve` fires due schedules every 30 s and drives their runs; `serve --http`
 adds `POST /schedules/<id>/trigger` for webhook schedules.
+
+## Metrics export
+
+Set `MODEL_ROUTER_METRICS_FILE=/path/to/metrics.jsonl` or pass
+`--metrics-file PATH` to append one JSON object per line for `run_start`,
+`run_end`, `attempt_start`, and `attempt_end` events. Appends are serialized
+with an advisory file lock (`flock` on Unix) and written in a single `O_APPEND`
+write so concurrent CI jobs or `bench --jobs` runs never interleave lines. Each
+record includes `schema_version`, `event`, `timestamp`, `run_id`, `workflow`,
+`project`, and `status`, plus stage/attempt fields (`stage_id`, `stage_name`,
+`attempt`, `candidate`, `harness`, `model`, `role`, `mode`, `duration_ms`,
+`tokens`, `input_tokens`, `output_tokens`, `cache_read_tokens`,
+`cache_write_tokens`, `estimated_usd`, `exit_code`) where applicable. No
+prompts, task text, or credentials are written.
 
 ## Scripting notes
 

@@ -49,8 +49,15 @@ impl Status {
 /// Whether a run, stage, or attempt may move from `from` to `to`. One status
 /// type serves all three, so each level admits only its own values: a run is
 /// never skipped, a stage never waits for a terminal, and an attempt only runs
-/// and ends. `enabled` is the stage's switch; disabled stages are skipped.
-pub(super) fn legal(level: Level, from: Status, to: Status, enabled: bool) -> bool {
+/// and ends. `enabled` is the stage's switch; disabled stages are skipped, and
+/// `conditional` (`when_changed`) stages may move from `Pending` to `Skipped`.
+pub(super) fn legal(
+    level: Level,
+    from: Status,
+    to: Status,
+    enabled: bool,
+    conditional: bool,
+) -> bool {
     use Status::*;
     match level {
         Level::Run => match from {
@@ -69,7 +76,7 @@ pub(super) fn legal(level: Level, from: Status, to: Status, enabled: bool) -> bo
         },
         Level::Stage => match (from, to) {
             (_, Interactive) => false,
-            (_, Skipped) => !enabled,
+            (_, Skipped) => !enabled || (conditional && from == Pending),
             (_, Pending) => enabled,
             (Pending, Running | Failed | Blocked | Cancelled) => true,
             (Running, Complete | AwaitingConfirmation | Failed | Blocked | Cancelled) => true,
@@ -250,6 +257,9 @@ pub struct StageState {
     /// Kept so their spend still counts toward reports and budgets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discarded: Vec<CandidateState>,
+    /// Why an enabled stage was skipped (e.g. `when_changed` matched no files).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_reason: Option<String>,
 }
 impl StageState {
     /// Every turn of every task the stage's attempts delegated.

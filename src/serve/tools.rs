@@ -158,6 +158,82 @@ pub fn list() -> Vec<Value> {
                 &["run_id"],
             ),
         ),
+        tool(
+            "fork_run",
+            "Fork a saved run in a new Git worktree from a stage checkpoint, reusing completed upstream handoffs without rerunning them. Starts the fork in the background unless no_run is true.",
+            schema(
+                json!({
+                    "run_id": run_id_prop(),
+                    "stage": {"type": "string", "description": "Stage ID, name, or 1-based number to fork from."},
+                    "model": {"type": "string", "description": "Model override for the forked stage. Default: keep the stage's model."},
+                    "force_unattended": force,
+                    "no_run": {"type": "boolean", "description": "Create the fork without starting it. Default: false."}
+                }),
+                &["run_id", "stage"],
+            ),
+        ),
+        tool(
+            "apply_run",
+            "Check or apply a finished worktree run's changes back into the project checkout without committing. Defaults to check_only: true (dry run); pass check_only: false to apply.",
+            schema(
+                json!({
+                    "run_id": run_id_prop(),
+                    "check_only": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "When true (default), only check whether the patch applies cleanly or via 3-way merge without modifying the checkout. Pass false to apply uncommitted changes."
+                    }
+                }),
+                &["run_id"],
+            ),
+        ),
+        tool(
+            "get_handoffs",
+            "Return the handoff budget, truncation, and field-loss report for what a stage receives from upstream stages (same data as `model-router handoffs --json`).",
+            schema(
+                json!({
+                    "run_id": run_id_prop(),
+                    "stage": {"type": "string", "description": "Stage ID, name, or 1-based number. Default: current stage (required when the run is complete)."},
+                    "include_prompt": {"type": "boolean", "description": "Include the rendered downstream prompt text. Default: false."}
+                }),
+                &["run_id"],
+            ),
+        ),
+        tool(
+            "get_cost",
+            "Return the project's cost and token usage summary across saved runs (same data as `model-router cost --json`).",
+            schema(
+                json!({
+                    "since": {"type": "string", "description": "Optional lookback window such as 7d, 12h, 30m, or 2w."}
+                }),
+                &[],
+            ),
+        ),
+        tool(
+            "get_stats",
+            "Return per-(role, harness, model) routing statistics across saved runs (same data as `model-router stats --json`).",
+            schema(
+                json!({
+                    "role": {
+                        "type": "string",
+                        "enum": ["research", "planning", "implementation", "review", "test", "summary", "ship", "custom"],
+                        "description": "Filter metrics and shortlist to one role."
+                    },
+                    "min_pass": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": "Include an advisory cost-quality shortlist of assignments whose required router checks passed at least this fraction (0 to 1)."
+                    }
+                }),
+                &[],
+            ),
+        ),
+        tool(
+            "list_schedules",
+            "List the project's schedules with their approval status, next due time, and recent occurrences (same data as `model-router schedules list --json`).",
+            schema(json!({}), &[]),
+        ),
     ]
 }
 
@@ -173,10 +249,21 @@ const TOOL_NAMES: &[&str] = &[
     "get_report",
     "confirm_stage",
     "retry_stage",
+    "fork_run",
+    "apply_run",
+    "get_handoffs",
+    "get_cost",
+    "get_stats",
+    "list_schedules",
 ];
 
 pub fn exists(name: &str) -> bool {
     TOOL_NAMES.contains(&name)
+}
+
+#[cfg(test)]
+pub(super) fn tool_names() -> &'static [&'static str] {
+    TOOL_NAMES
 }
 
 /// Whether a call to the tool can hold its thread for a long time
@@ -272,6 +359,57 @@ struct RetryArgs {
     force_unattended: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForkArgs {
+    project: Option<String>,
+    run_id: String,
+    stage: String,
+    model: Option<String>,
+    #[serde(default)]
+    force_unattended: bool,
+    #[serde(default)]
+    no_run: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyArgs {
+    project: Option<String>,
+    run_id: String,
+    #[serde(default = "default_true")]
+    check_only: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HandoffsArgs {
+    project: Option<String>,
+    run_id: String,
+    stage: Option<String>,
+    #[serde(default)]
+    include_prompt: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CostArgs {
+    project: Option<String>,
+    since: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatsArgs {
+    project: Option<String>,
+    role: Option<crate::config::Role>,
+    min_pass: Option<f64>,
+}
+
 /// Runs a tool with optional cancellation and progress reporting (for MCP/HTTP).
 /// Errors become `isError` results (MCP) or 400s (HTTP).
 pub fn call_with(
@@ -297,6 +435,12 @@ pub fn call_with(
         "get_report" => get_report(server, args(arguments)?),
         "confirm_stage" => confirm_stage(server, args(arguments)?),
         "retry_stage" => retry_stage(server, args(arguments)?),
+        "fork_run" => fork_run(server, args(arguments)?),
+        "apply_run" => apply_run(server, args(arguments)?),
+        "get_handoffs" => get_handoffs(server, args(arguments)?),
+        "get_cost" => get_cost(server, args(arguments)?),
+        "get_stats" => get_stats(server, args(arguments)?),
+        "list_schedules" => list_schedules(server, args(arguments)?),
         _ => bail!("Unknown tool {name:?}"),
     }
 }
@@ -683,6 +827,185 @@ fn retry_stage(server: &Server, a: RetryArgs) -> Result<Value> {
         run.retry(false, model)
     })?;
     Ok(status_value(&run, &server.runs.info(&run.id)))
+}
+
+fn fork_run(server: &Server, a: ForkArgs) -> Result<Value> {
+    let (project, settings) = server.project_and_settings(a.project.as_deref())?;
+    let source = load_in_project(server, &project, &a.run_id)?;
+    let index = stage_index(&source, &a.stage)?;
+    let stage_id = source.workflow.stages[index].id.clone();
+    if !a.no_run {
+        let order = source.order();
+        let interactive: Vec<&str> = source
+            .workflow
+            .stages
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| s.enabled && s.mode == Mode::Interactive && !order.precedes(*i, index))
+            .map(|(_, s)| s.id.as_str())
+            .collect();
+        if !interactive.is_empty() {
+            ensure!(
+                a.force_unattended,
+                "Workflow {} has enabled interactive stages ({}). The server runs unattended only; pass force_unattended: true to run them unattended, or no_run: true to create the fork without starting it",
+                source.workflow.name,
+                interactive.join(", ")
+            );
+        }
+    }
+    let model = a.model.filter(|m| !m.trim().is_empty());
+    let mut run = history::fork(&project, &settings, &a.run_id, &stage_id, model)?;
+    if a.force_unattended {
+        for stage in &mut run.workflow.stages {
+            stage.mode = Mode::Unattended;
+        }
+        run.persist()?;
+    }
+    if !a.no_run {
+        server.runs.drive(&project, run.clone())?;
+        super::log(format!(
+            "started fork {} of {} in {}",
+            run.id,
+            a.run_id,
+            run.workspace.display()
+        ));
+    }
+    let mut value = status_value(&run, &server.runs.info(&run.id));
+    value["artifacts"] = json!(run.directory);
+    value["fork_of"] = json!(run.fork_of);
+    value["started"] = json!(!a.no_run);
+    Ok(value)
+}
+
+fn apply_run(server: &Server, a: ApplyArgs) -> Result<Value> {
+    let (run, info) = load(server, a.project.as_deref(), &a.run_id)?;
+    ensure!(
+        !info.active,
+        "Run {} is still active in this server; wait for it to finish before applying its worktree changes",
+        run.id
+    );
+    let (plan, outcome) = engine::apply_worktree(&run, a.check_only)?;
+    let (outcome_label, conflicts) = match outcome {
+        crate::fanout::Applied::Clean => ("clean", vec![]),
+        crate::fanout::Applied::Merged => ("merged", vec![]),
+        crate::fanout::Applied::Conflict(files) => {
+            if !a.check_only {
+                bail!(
+                    "Could not apply run {} (conflicts in {}); checkout was left unchanged",
+                    plan.run_id,
+                    files.join(", ")
+                );
+            }
+            ("conflict", files)
+        }
+    };
+    Ok(json!({
+        "run_id": plan.run_id,
+        "project": plan.project,
+        "workspace": plan.workspace,
+        "check_only": a.check_only,
+        "applied": !a.check_only,
+        "outcome": outcome_label,
+        "conflicts": conflicts,
+        "files": plan.files,
+        "preview": plan.preview(),
+    }))
+}
+
+fn get_handoffs(server: &Server, a: HandoffsArgs) -> Result<Value> {
+    let (run, _) = load(server, a.project.as_deref(), &a.run_id)?;
+    let stage_id = match a.stage.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(stage) => {
+            let index = stage_index(&run, stage)?;
+            Some(run.workflow.stages[index].id.clone())
+        }
+        None => None,
+    };
+    let inspection = engine::inspect_handoffs(&run, stage_id.as_deref())?;
+    let mut value = serde_json::to_value(&inspection)?;
+    if !a.include_prompt {
+        if let Some(obj) = value.as_object_mut() {
+            obj.remove("prompt");
+        }
+    }
+    value["run_id"] = json!(run.id);
+    value["budget_total"] = json!(inspection.budget_bytes);
+    value["budget_each"] = json!(inspection.each_bytes);
+    Ok(value)
+}
+
+fn get_cost(server: &Server, a: CostArgs) -> Result<Value> {
+    let project = server.project(a.project.as_deref())?;
+    let since = a
+        .since
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(crate::cost::parse_since)
+        .transpose()?
+        .map(|age| Utc::now() - age);
+    let runs = engine::history(&project)?;
+    let summary = crate::cost::aggregate(&runs, since, &crate::cost::Pricing::load(&project));
+    let mut value = serde_json::to_value(&summary)?;
+    value["project"] = json!(project);
+    Ok(value)
+}
+
+fn get_stats(server: &Server, a: StatsArgs) -> Result<Value> {
+    use crate::stats::{self, Stats};
+    let project = server.project(a.project.as_deref())?;
+    if let Some(threshold) = a.min_pass {
+        ensure!(
+            threshold.is_finite() && (0.0..=1.0).contains(&threshold),
+            "min_pass must be a fraction from 0 to 1, e.g. 0.8"
+        );
+    }
+    let stats = Stats::collect(&[project]);
+    let shortlist = a.min_pass.map(|threshold| {
+        let rows: Vec<stats::Tradeoff> = stats
+            .metrics
+            .iter()
+            .filter(|m| a.role.is_none_or(|r| m.role == r))
+            .map(stats::Tradeoff::from)
+            .collect();
+        stats::shortlist(&rows, threshold)
+    });
+    let mut value = serde_json::to_value(&stats)?;
+    if let Some(role) = a.role {
+        value["metrics"] = serde_json::to_value(
+            stats
+                .metrics
+                .iter()
+                .filter(|m| m.role == role)
+                .collect::<Vec<_>>(),
+        )?;
+    }
+    if let Some(shortlist) = &shortlist {
+        value["shortlist"] = serde_json::to_value(shortlist)?;
+    }
+    Ok(value)
+}
+
+fn list_schedules(server: &Server, a: ProjectArgs) -> Result<Value> {
+    use crate::delegation::schedules;
+    let project = server.project(a.project.as_deref())?;
+    let store = schedules::load(&project)?;
+    let settings = schedules::trusted_settings(&project).ok();
+    let now = Utc::now();
+    let rows: Vec<Value> = store
+        .schedules
+        .iter()
+        .map(|s| {
+            json!({
+                "schedule": s,
+                "approved": settings.as_ref().is_some_and(|c| schedules::approved(&project, s, c)),
+                "next_due": schedules::next_due(s, now),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "project": project,
+        "schedules": rows,
+    }))
 }
 
 /// What a client needs to follow a run, in `run_status`, `wait_run`, and

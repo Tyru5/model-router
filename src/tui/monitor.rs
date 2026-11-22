@@ -263,16 +263,26 @@ impl App {
             }
             ActionId::RaiseBudget => {
                 let run = self.session.run().context("No run selected")?;
-                let (cap, spent) = crate::cost::raise_floor(run)?;
-                self.input(
-                    &format!(
-                        "New USD budget (cap {}, spent {})",
-                        crate::report::dollars(cap),
-                        spent.amount()
+                match budget_raise_floor(run)? {
+                    BudgetRaiseFloor::Usd { cap, spent } => self.input(
+                        &format!(
+                            "New USD budget (cap {}, spent {})",
+                            crate::report::dollars(cap),
+                            spent.amount()
+                        ),
+                        InputTarget::Budget,
+                        "",
                     ),
-                    InputTarget::Budget,
-                    "",
-                );
+                    BudgetRaiseFloor::Tokens { cap, spent } => self.input(
+                        &format!(
+                            "New token budget (cap {}, spent {} tokens)",
+                            crate::report::tokens(cap),
+                            crate::report::tokens(spent.tokens)
+                        ),
+                        InputTarget::BudgetTokens,
+                        "",
+                    ),
+                }
             }
             ActionId::ReplaceModel => {
                 let run = self.session.run().context("No run")?;
@@ -348,6 +358,54 @@ impl App {
             })?;
         Some(attempt.directory.join("stdout.log"))
     }
+}
+
+/// Floor that a raised budget cap must exceed for a budget-blocked run.
+pub(super) enum BudgetRaiseFloor {
+    Usd {
+        cap: f64,
+        spent: crate::cost::CostTotal,
+    },
+    Tokens {
+        cap: u64,
+        spent: crate::cost::CostTotal,
+    },
+}
+
+/// Computes the cap and spend floor for a run blocked by either a USD or token budget.
+pub(super) fn budget_raise_floor(run: &engine::Run) -> Result<BudgetRaiseFloor> {
+    ensure!(
+        crate::cost::budget_blocked(run),
+        "Only a run stopped by its budget can raise it"
+    );
+    if crate::cost::usd_budget_blocked(run) {
+        let (cap, spent) = crate::cost::raise_floor(run)?;
+        return Ok(BudgetRaiseFloor::Usd { cap, spent });
+    }
+    let pricing = crate::cost::Pricing::load(&run.project);
+    let stages = crate::cost::stage_totals(run, &pricing);
+    let mut total = crate::cost::CostTotal::default();
+    let mut exceeded = None::<u64>;
+    for (stage, spent) in run.workflow.stages.iter().zip(&stages) {
+        total.merge(spent);
+        if let Some(cap) = stage.budget.max_tokens.filter(|&cap| spent.tokens > cap) {
+            exceeded = Some(exceeded.map_or(cap, |e| e.max(cap)));
+        }
+    }
+    let run_cap = run.workflow.budget.max_tokens;
+    if let Some(cap) = run_cap.filter(|&cap| total.tokens > cap) {
+        exceeded = Some(exceeded.map_or(cap, |e| e.max(cap)));
+    }
+    if let Some(cap) = exceeded {
+        let floor = run_cap.map_or(cap, |rc| rc.max(cap));
+        return Ok(BudgetRaiseFloor::Tokens {
+            cap: floor,
+            spent: total,
+        });
+    }
+    // Fall back to USD raise_floor if error text didn't start with $ but USD cap is exceeded.
+    let (cap, spent) = crate::cost::raise_floor(run)?;
+    Ok(BudgetRaiseFloor::Usd { cap, spent })
 }
 
 /// Stopped candidates the run can retry, with their stage's index: those of

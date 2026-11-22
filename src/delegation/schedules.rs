@@ -8,7 +8,10 @@ use super::policy::{self, Ceiling};
 use crate::config::{Mode, Settings, Workflow};
 use crate::engine::{CreationSource, Placement, Run};
 use anyhow::{Context, Result, bail, ensure};
-use chrono::{DateTime, Duration, Local, NaiveTime, Utc};
+use chrono::{
+    DateTime, Datelike, Duration, FixedOffset, Local, MappedLocalTime, NaiveDate, NaiveDateTime,
+    NaiveTime, TimeZone, Timelike, Utc,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -21,8 +24,18 @@ use std::{
 pub enum Trigger {
     /// Every this many seconds after the last firing (or approval).
     Every { seconds: i64, text: String },
-    /// Daily at this local time, `HH:MM`.
-    At { time: String },
+    /// Daily at this time (`HH:MM`) in `tz` (default local).
+    At {
+        time: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tz: Option<String>,
+    },
+    /// Standard 5-field cron expression (`M H DOM MON DOW`) in `tz` (default local).
+    Cron {
+        expr: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tz: Option<String>,
+    },
     /// On each `POST /schedules/<id>/trigger` to `serve --http`.
     Webhook,
 }
@@ -30,7 +43,12 @@ impl Trigger {
     pub fn describe(&self) -> String {
         match self {
             Self::Every { text, .. } => format!("every {text}"),
-            Self::At { time } => format!("daily at {time} (local)"),
+            Self::At { time, tz } => {
+                format!("daily at {time} ({})", tz.as_deref().unwrap_or("local"))
+            }
+            Self::Cron { expr, tz } => {
+                format!("cron {expr} ({})", tz.as_deref().unwrap_or("local"))
+            }
             Self::Webhook => "on webhook".into(),
         }
     }
@@ -123,10 +141,317 @@ pub fn update<T>(project: &Path, change: impl FnOnce(&mut Store) -> Result<T>) -
     Ok(value)
 }
 
-/// Parses `every` (`30m`, `6h`, `1d`, `2w`), `at` (`HH:MM`), or a webhook.
-pub fn parse_trigger(every: Option<&str>, at: Option<&str>, webhook: bool) -> Result<Trigger> {
-    match (every, at, webhook) {
-        (Some(every), None, false) => {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TzSpec {
+    Local,
+    Fixed(FixedOffset),
+}
+
+/// Parses a schedule timezone: `None` or `"local"` (case-insensitive) for
+/// local time, `"UTC"` / `"Z"` for UTC, or a fixed offset like `"+02:00"` /
+/// `"-07:00"`. Returns the canonical stored label (`None` for local) and the
+/// resolved offset spec.
+fn parse_tz(tz: Option<&str>) -> Result<(Option<String>, TzSpec)> {
+    let Some(raw) = tz.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok((None, TzSpec::Local));
+    };
+    if raw.eq_ignore_ascii_case("local") {
+        return Ok((None, TzSpec::Local));
+    }
+    if raw.eq_ignore_ascii_case("utc") || raw.eq_ignore_ascii_case("z") {
+        let offset = FixedOffset::east_opt(0).expect("UTC offset");
+        return Ok((Some("UTC".into()), TzSpec::Fixed(offset)));
+    }
+    let bytes = raw.as_bytes();
+    if bytes.len() == 6 && (bytes[0] == b'+' || bytes[0] == b'-') && bytes[3] == b':' {
+        let hours: i32 = raw[1..3]
+            .parse()
+            .with_context(|| format!("Invalid timezone offset {raw:?}"))?;
+        let mins: i32 = raw[4..6]
+            .parse()
+            .with_context(|| format!("Invalid timezone offset {raw:?}"))?;
+        if (0..=23).contains(&hours) && (0..=59).contains(&mins) {
+            let secs = hours * 3600 + mins * 60;
+            let offset = if bytes[0] == b'+' {
+                FixedOffset::east_opt(secs)
+            } else {
+                FixedOffset::west_opt(secs)
+            };
+            if let Some(offset) = offset {
+                let sign = raw.as_bytes()[0] as char;
+                return Ok((
+                    Some(format!("{sign}{hours:02}:{mins:02}")),
+                    TzSpec::Fixed(offset),
+                ));
+            }
+        }
+    }
+    bail!("tz must be local, UTC, or a fixed offset like +02:00 or -07:00, not {raw:?}");
+}
+
+/// Standard 5-field cron expression (`M H DOM MON DOW`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CronExpr {
+    minutes: [bool; 60],
+    hours: [bool; 24],
+    doms: [bool; 32],
+    months: [bool; 13],
+    dows: [bool; 7],
+    dom_wild: bool,
+    dow_wild: bool,
+}
+
+fn parse_cron_field(
+    field: &str,
+    name: &str,
+    min: usize,
+    max: usize,
+    sunday_is_seven: bool,
+    out: &mut [bool],
+) -> Result<()> {
+    ensure!(!field.is_empty(), "cron {name} field is empty");
+    for item in field.split(',') {
+        ensure!(
+            !item.is_empty(),
+            "cron {name} field has an empty list entry: {field:?}"
+        );
+        let (range_part, step_part) = match item.split_once('/') {
+            Some((left, right)) => {
+                ensure!(
+                    !right.contains('/'),
+                    "cron {name} item {item:?} has multiple '/' steps"
+                );
+                let step: usize = right
+                    .parse()
+                    .with_context(|| format!("cron {name} step must be a number in {item:?}"))?;
+                ensure!(step >= 1, "cron {name} step must be at least 1 in {item:?}");
+                (left, Some(step))
+            }
+            None => (item, None),
+        };
+        let step = step_part.unwrap_or(1);
+        let (start, end) = if range_part == "*" {
+            (min, max)
+        } else if let Some((a, b)) = range_part.split_once('-') {
+            ensure!(
+                !b.contains('-'),
+                "cron {name} range {range_part:?} has multiple '-'"
+            );
+            let start: usize = a
+                .parse()
+                .with_context(|| format!("cron {name} value must be a number in {item:?}"))?;
+            let end: usize = b
+                .parse()
+                .with_context(|| format!("cron {name} value must be a number in {item:?}"))?;
+            ensure!(
+                start >= min && end <= max && start <= end,
+                "cron {name} range {start}-{end} must be within {min}..={max}"
+            );
+            (start, end)
+        } else {
+            let value: usize = range_part
+                .parse()
+                .with_context(|| format!("cron {name} value must be a number in {item:?}"))?;
+            ensure!(
+                value >= min && value <= max,
+                "cron {name} value {value} must be within {min}..={max}"
+            );
+            if step_part.is_some() {
+                (value, max)
+            } else {
+                (value, value)
+            }
+        };
+        let mut value = start;
+        while value <= end {
+            let slot = if sunday_is_seven && value == 7 {
+                0
+            } else {
+                value
+            };
+            out[slot] = true;
+            value = match value.checked_add(step) {
+                Some(next) => next,
+                None => break,
+            };
+        }
+    }
+    Ok(())
+}
+
+fn max_days_in_month(month: usize) -> usize {
+    match month {
+        2 => 29,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+fn parse_cron(expr: &str) -> Result<(String, CronExpr)> {
+    let parts: Vec<&str> = expr.split_whitespace().collect();
+    ensure!(
+        parts.len() == 5,
+        "cron expression must have 5 fields (M H DOM MON DOW), got {}: {expr:?}",
+        parts.len()
+    );
+    let mut cron = CronExpr {
+        minutes: [false; 60],
+        hours: [false; 24],
+        doms: [false; 32],
+        months: [false; 13],
+        dows: [false; 7],
+        dom_wild: parts[2] == "*",
+        dow_wild: parts[4] == "*",
+    };
+    parse_cron_field(parts[0], "minute", 0, 59, false, &mut cron.minutes)?;
+    parse_cron_field(parts[1], "hour", 0, 23, false, &mut cron.hours)?;
+    parse_cron_field(parts[2], "day-of-month", 1, 31, false, &mut cron.doms)?;
+    parse_cron_field(parts[3], "month", 1, 12, false, &mut cron.months)?;
+    parse_cron_field(parts[4], "day-of-week", 0, 7, true, &mut cron.dows)?;
+    if !cron.dom_wild {
+        let feasible = (1..=12)
+            .filter(|&m| cron.months[m])
+            .any(|m| (1..=max_days_in_month(m)).any(|d| cron.doms[d]));
+        ensure!(
+            feasible,
+            "cron expression {expr:?} matches no valid calendar date"
+        );
+    }
+    Ok((parts.join(" "), cron))
+}
+
+fn resolve_datetime_after(
+    naive: NaiveDateTime,
+    tz: TzSpec,
+    after: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    match tz {
+        TzSpec::Fixed(offset) => offset
+            .from_local_datetime(&naive)
+            .single()
+            .map(|dt| dt.with_timezone(&Utc))
+            .filter(|dt| *dt > after),
+        TzSpec::Local => match Local.from_local_datetime(&naive) {
+            MappedLocalTime::Single(dt) => {
+                let utc = dt.with_timezone(&Utc);
+                (utc > after).then_some(utc)
+            }
+            MappedLocalTime::Ambiguous(early, late) => {
+                let early = early.with_timezone(&Utc);
+                if early > after {
+                    Some(early)
+                } else {
+                    let late = late.with_timezone(&Utc);
+                    (late > after).then_some(late)
+                }
+            }
+            MappedLocalTime::None => None,
+        },
+    }
+}
+
+fn resolve_date_time(date: NaiveDate, time: NaiveTime, tz: TzSpec) -> Option<DateTime<Utc>> {
+    let naive = date.and_time(time);
+    match tz {
+        TzSpec::Fixed(offset) => offset
+            .from_local_datetime(&naive)
+            .single()
+            .map(|dt| dt.with_timezone(&Utc)),
+        TzSpec::Local => match Local.from_local_datetime(&naive) {
+            MappedLocalTime::Single(dt) => Some(dt.with_timezone(&Utc)),
+            MappedLocalTime::Ambiguous(early, _) => Some(early.with_timezone(&Utc)),
+            MappedLocalTime::None => {
+                // Spring-forward DST gap: advance to the first valid minute on that date.
+                let mut cur = naive;
+                for _ in 0..180 {
+                    cur += Duration::minutes(1);
+                    if let MappedLocalTime::Single(dt) = Local.from_local_datetime(&cur) {
+                        return Some(dt.with_timezone(&Utc));
+                    }
+                }
+                None
+            }
+        },
+    }
+}
+
+impl CronExpr {
+    fn day_matches(&self, date: NaiveDate) -> bool {
+        let dom = date.day() as usize;
+        let dow = date.weekday().num_days_from_sunday() as usize;
+        match (self.dom_wild, self.dow_wild) {
+            (true, true) => true,
+            (false, true) => self.doms[dom],
+            (true, false) => self.dows[dow],
+            (false, false) => self.doms[dom] || self.dows[dow],
+        }
+    }
+
+    /// Earliest firing time strictly after `after` in `tz`.
+    fn next_after(&self, after: DateTime<Utc>, tz: TzSpec) -> Option<DateTime<Utc>> {
+        let after_naive = match tz {
+            TzSpec::Local => after.with_timezone(&Local).naive_local(),
+            TzSpec::Fixed(offset) => after.with_timezone(&offset).naive_local(),
+        };
+        let mut cur =
+            after_naive
+                .date()
+                .and_hms_opt(after_naive.hour(), after_naive.minute(), 0)?;
+        if matches!(tz, TzSpec::Fixed(_)) {
+            cur += Duration::minutes(1);
+        }
+        let max_year = cur.year() + 8;
+        while cur.year() <= max_year {
+            let month = cur.month() as usize;
+            if !self.months[month] {
+                let (next_year, next_month) = if month == 12 {
+                    (cur.year() + 1, 1)
+                } else {
+                    (cur.year(), (month + 1) as u32)
+                };
+                cur = NaiveDate::from_ymd_opt(next_year, next_month, 1)?.and_hms_opt(0, 0, 0)?;
+                continue;
+            }
+            if !self.day_matches(cur.date()) {
+                cur = cur.date().succ_opt()?.and_hms_opt(0, 0, 0)?;
+                continue;
+            }
+            let hour = cur.hour() as usize;
+            if !self.hours[hour] {
+                let hour_start = cur.date().and_hms_opt(cur.hour(), 0, 0)?;
+                cur = hour_start + Duration::hours(1);
+                continue;
+            }
+            let minute = cur.minute() as usize;
+            if !self.minutes[minute] {
+                cur += Duration::minutes(1);
+                continue;
+            }
+            if let Some(utc) = resolve_datetime_after(cur, tz, after) {
+                return Some(utc);
+            }
+            cur += Duration::minutes(1);
+        }
+        None
+    }
+}
+
+/// Parses `every` (`30m`, `6h`, `1d`, `2w`), `at` (`HH:MM`), `cron` (5-field
+/// `M H DOM MON DOW`), or a webhook, with an optional `tz` for `at`/`cron`.
+pub fn parse_trigger(
+    every: Option<&str>,
+    at: Option<&str>,
+    cron: Option<&str>,
+    webhook: bool,
+    tz: Option<&str>,
+) -> Result<Trigger> {
+    let tz_nonempty = tz.map(str::trim).filter(|s| !s.is_empty());
+    match (every, at, cron, webhook) {
+        (Some(every), None, None, false) => {
+            ensure!(
+                tz_nonempty.is_none(),
+                "tz applies only to at or cron triggers"
+            );
             let duration = crate::cost::parse_since(every)?;
             ensure!(
                 duration >= Duration::minutes(5),
@@ -137,15 +462,31 @@ pub fn parse_trigger(every: Option<&str>, at: Option<&str>, webhook: bool) -> Re
                 text: every.trim().to_owned(),
             })
         }
-        (None, Some(at), false) => {
+        (None, Some(at), None, false) => {
             NaiveTime::parse_from_str(at.trim(), "%H:%M")
                 .with_context(|| format!("at must be HH:MM, not {at:?}"))?;
+            let (tz_label, _) = parse_tz(tz_nonempty)?;
             Ok(Trigger::At {
                 time: at.trim().to_owned(),
+                tz: tz_label,
             })
         }
-        (None, None, true) => Ok(Trigger::Webhook),
-        _ => bail!("Give exactly one of every, at, or webhook"),
+        (None, None, Some(cron), false) => {
+            let (normalized, _) = parse_cron(cron)?;
+            let (tz_label, _) = parse_tz(tz_nonempty)?;
+            Ok(Trigger::Cron {
+                expr: normalized,
+                tz: tz_label,
+            })
+        }
+        (None, None, None, true) => {
+            ensure!(
+                tz_nonempty.is_none(),
+                "tz applies only to at or cron triggers"
+            );
+            Ok(Trigger::Webhook)
+        }
+        _ => bail!("Give exactly one of every, at, cron, or webhook"),
     }
 }
 
@@ -232,6 +573,91 @@ pub fn trusted_settings(project: &Path) -> Result<Settings> {
         "The project config is untrusted; run `model-router trust` first"
     );
     Ok(loaded.settings)
+}
+
+/// Options for creating a schedule from the CLI (`mr schedules add`).
+#[derive(Debug, Clone)]
+pub struct AddOptions {
+    pub id: Option<String>,
+    pub workflow: Option<String>,
+    pub task: String,
+    pub trigger: Trigger,
+    pub approve: bool,
+}
+
+/// Creates a user-authored schedule in `.model-router/schedules.json`.
+/// When `options.approve` is true, requires a trusted project config and writes
+/// the approval receipt atomically so the schedule can fire right away.
+pub fn add(project: &Path, options: AddOptions) -> Result<(Schedule, bool)> {
+    crate::config::validate_task(&options.task)?;
+    if let Some(id) = &options.id {
+        ensure!(
+            safe_id(id),
+            "Invalid schedule id {id:?}: use 1–64 ASCII letters, digits, '-' or '_'"
+        );
+    }
+    let settings = if options.approve {
+        trusted_settings(project)?
+    } else {
+        let loaded = crate::config::load_config(project, None)?;
+        match loaded.trust {
+            crate::trust::Trust::Trusted => loaded.settings,
+            crate::trust::Trust::Untrusted(_) => loaded.safe(),
+        }
+    };
+    let ceiling = policy::USER_CEILING;
+    check_launchable(&settings, options.workflow.as_deref(), &ceiling)?;
+    let schedule = update(project, |store| {
+        let id = match &options.id {
+            Some(id) => {
+                ensure!(
+                    !store.schedules.iter().any(|s| s.id == *id),
+                    "Schedule {id} already exists"
+                );
+                id.clone()
+            }
+            None => {
+                let number = store
+                    .schedules
+                    .iter()
+                    .filter_map(|s| s.id.strip_prefix('s')?.parse::<usize>().ok())
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                format!("s{number}")
+            }
+        };
+        let now = Utc::now();
+        let mut schedule = Schedule {
+            id: id.clone(),
+            workflow: options.workflow.clone(),
+            task: options.task.clone(),
+            trigger: options.trigger.clone(),
+            enabled: true,
+            created_by: "user".into(),
+            ceiling: ceiling.clone(),
+            client_request_id: String::new(),
+            requested_by: String::new(),
+            request_fingerprint: String::new(),
+            revision: 1,
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            paused_reason: None,
+            occurrences: vec![],
+        };
+        if options.approve {
+            let digest = digest(project, &schedule, &settings)?;
+            let path =
+                receipt(project, &id).with_context(|| format!("Invalid schedule id {id}"))?;
+            fs::create_dir_all(approvals_dir(project))?;
+            crate::storage::atomic_write(&path, digest.as_bytes())?;
+            schedule.approved_at = Some(now);
+        }
+        store.schedules.push(schedule.clone());
+        Ok(schedule)
+    })?;
+    Ok((schedule, options.approve))
 }
 
 /// Approves schedule `id` as it stands now (`mr schedules approve`).
@@ -322,21 +748,27 @@ pub fn next_due(schedule: &Schedule, now: DateTime<Utc>) -> Option<DateTime<Utc>
             let from = last.or(schedule.approved_at).unwrap_or(schedule.created_at);
             Some(from + Duration::seconds(*seconds))
         }
-        Trigger::At { time } => {
+        Trigger::At { time, tz } => {
             let time = NaiveTime::parse_from_str(time, "%H:%M").ok()?;
-            let local_now = now.with_timezone(&Local);
-            let today = local_now
-                .date_naive()
-                .and_time(time)
-                .and_local_timezone(Local)
-                .single()?
-                .with_timezone(&Utc);
+            let (_, tz_spec) = parse_tz(tz.as_deref()).ok()?;
+            let today_date = match tz_spec {
+                TzSpec::Local => now.with_timezone(&Local).date_naive(),
+                TzSpec::Fixed(offset) => now.with_timezone(&offset).date_naive(),
+            };
+            let today = resolve_date_time(today_date, time, tz_spec)?;
             let after = last.unwrap_or(schedule.approved_at.unwrap_or(schedule.created_at));
             if today > after {
                 Some(today)
             } else {
-                Some(today + Duration::days(1))
+                let tomorrow = today_date.succ_opt()?;
+                resolve_date_time(tomorrow, time, tz_spec)
             }
+        }
+        Trigger::Cron { expr, tz } => {
+            let (_, cron) = parse_cron(expr).ok()?;
+            let (_, tz_spec) = parse_tz(tz.as_deref()).ok()?;
+            let after = last.or(schedule.approved_at).unwrap_or(schedule.created_at);
+            cron.next_after(after, tz_spec)
         }
         Trigger::Webhook => None,
     }
@@ -474,29 +906,74 @@ mod tests {
         }
     }
 
+    fn utc(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
     #[test]
     fn triggers_parse_and_refuse_ambiguity() {
         assert!(matches!(
-            parse_trigger(Some("6h"), None, false).unwrap(),
+            parse_trigger(Some("6h"), None, None, false, None).unwrap(),
             Trigger::Every { seconds: 21600, .. }
         ));
         assert!(
-            parse_trigger(Some("1m"), None, false).is_err(),
+            parse_trigger(Some("1m"), None, None, false, None).is_err(),
             "more often than every 5 minutes"
         );
-        assert!(matches!(
-            parse_trigger(None, Some("09:30"), false).unwrap(),
-            Trigger::At { .. }
-        ));
-        assert!(parse_trigger(None, Some("9.30"), false).is_err());
-        assert!(parse_trigger(Some("6h"), Some("09:30"), false).is_err());
-        assert!(parse_trigger(None, None, false).is_err());
-        assert_eq!(parse_trigger(None, None, true).unwrap(), Trigger::Webhook);
+        assert_eq!(
+            parse_trigger(None, Some("09:30"), None, false, None).unwrap(),
+            Trigger::At {
+                time: "09:30".into(),
+                tz: None,
+            }
+        );
+        assert_eq!(
+            parse_trigger(None, Some("09:30"), None, false, Some("utc")).unwrap(),
+            Trigger::At {
+                time: "09:30".into(),
+                tz: Some("UTC".into()),
+            }
+        );
+        assert_eq!(
+            parse_trigger(None, Some("09:30"), None, false, Some("+02:00")).unwrap(),
+            Trigger::At {
+                time: "09:30".into(),
+                tz: Some("+02:00".into()),
+            }
+        );
+        assert_eq!(
+            parse_trigger(None, Some("09:30"), None, false, Some("local")).unwrap(),
+            Trigger::At {
+                time: "09:30".into(),
+                tz: None,
+            }
+        );
+        assert_eq!(
+            parse_trigger(None, None, Some("0 9 * * 1-5"), false, Some("-07:00")).unwrap(),
+            Trigger::Cron {
+                expr: "0 9 * * 1-5".into(),
+                tz: Some("-07:00".into()),
+            }
+        );
+        assert!(parse_trigger(None, Some("9.30"), None, false, None).is_err());
+        assert!(parse_trigger(Some("6h"), Some("09:30"), None, false, None).is_err());
+        assert!(parse_trigger(None, Some("09:30"), Some("0 9 * * *"), false, None).is_err());
+        assert!(parse_trigger(Some("6h"), None, None, false, Some("UTC")).is_err());
+        assert!(parse_trigger(None, None, None, true, Some("UTC")).is_err());
+        assert!(parse_trigger(None, Some("09:30"), None, false, Some("Mars/Olympus")).is_err());
+        assert!(parse_trigger(None, Some("09:30"), None, false, Some("+25:00")).is_err());
+        assert!(parse_trigger(None, None, None, false, None).is_err());
+        assert_eq!(
+            parse_trigger(None, None, None, true, None).unwrap(),
+            Trigger::Webhook
+        );
     }
 
     #[test]
     fn every_counts_from_the_last_due_time() {
-        let mut s = schedule(parse_trigger(Some("6h"), None, false).unwrap());
+        let mut s = schedule(parse_trigger(Some("6h"), None, None, false, None).unwrap());
         let start = s.approved_at.unwrap();
         assert_eq!(next_due(&s, start), Some(start + Duration::hours(6)));
         s.occurrences.push(Occurrence {
@@ -507,6 +984,100 @@ mod tests {
         });
         assert_eq!(next_due(&s, start), Some(start + Duration::hours(12)));
         assert_eq!(next_due(&schedule(Trigger::Webhook), start), None);
+    }
+
+    #[test]
+    fn at_trigger_respects_utc_and_fixed_offsets() {
+        // 09:00 +02:00 is 07:00 UTC.
+        let mut s =
+            schedule(parse_trigger(None, Some("09:00"), None, false, Some("+02:00")).unwrap());
+        let now = utc("2026-01-01T06:00:00Z");
+        assert_eq!(next_due(&s, now), Some(utc("2026-01-01T07:00:00Z")));
+        s.occurrences.push(Occurrence {
+            due: utc("2026-01-01T07:00:00Z"),
+            fired_at: utc("2026-01-01T07:00:05Z"),
+            run: None,
+            error: None,
+        });
+        assert_eq!(next_due(&s, now), Some(utc("2026-01-02T07:00:00Z")));
+
+        // Legacy Trigger::At JSON without tz deserializes cleanly as local.
+        let legacy: Trigger = serde_json::from_str(r#"{"at":{"time":"08:15"}}"#).unwrap();
+        assert_eq!(
+            legacy,
+            Trigger::At {
+                time: "08:15".into(),
+                tz: None
+            }
+        );
+        assert_eq!(legacy.describe(), "daily at 08:15 (local)");
+    }
+
+    #[test]
+    fn cron_expressions_validate_and_compute_next_due() {
+        // Every 15 minutes in UTC.
+        let mut s =
+            schedule(parse_trigger(None, None, Some("*/15 * * * *"), false, Some("UTC")).unwrap());
+        assert_eq!(s.trigger.describe(), "cron */15 * * * * (UTC)");
+        assert_eq!(
+            next_due(&s, utc("2026-01-01T00:00:00Z")),
+            Some(utc("2026-01-01T00:15:00Z"))
+        );
+
+        // Weekdays at 09:30 in -07:00 (= 16:30 UTC). 2026-01-02 is Friday; next weekday is Mon 2026-01-05.
+        s.trigger = parse_trigger(None, None, Some("30 9 * * 1-5"), false, Some("-07:00")).unwrap();
+        s.approved_at = Some(utc("2026-01-02T17:00:00Z"));
+        assert_eq!(
+            next_due(&s, utc("2026-01-02T17:00:00Z")),
+            Some(utc("2026-01-05T16:30:00Z"))
+        );
+
+        // Comma lists and Sunday as 7. 2026-01-04 is Sunday.
+        s.trigger = parse_trigger(None, None, Some("0,30 8,20 * * 7"), false, Some("UTC")).unwrap();
+        s.approved_at = Some(utc("2026-01-03T12:00:00Z"));
+        assert_eq!(
+            next_due(&s, utc("2026-01-03T12:00:00Z")),
+            Some(utc("2026-01-04T08:00:00Z"))
+        );
+
+        // Leap day: 2026-01-01 -> 2028-02-29 00:00 UTC.
+        s.trigger = parse_trigger(None, None, Some("0 0 29 2 *"), false, Some("UTC")).unwrap();
+        s.approved_at = Some(utc("2026-01-01T00:00:00Z"));
+        assert_eq!(
+            next_due(&s, utc("2026-01-01T00:00:00Z")),
+            Some(utc("2028-02-29T00:00:00Z"))
+        );
+
+        // Vixie cron: when both DOM and DOW are restricted, either matches.
+        // 2026-01-01 is Thursday (4); 15th or Sunday (0) matches Sun Jan 4 first.
+        s.trigger = parse_trigger(None, None, Some("0 0 15 * 0"), false, Some("UTC")).unwrap();
+        s.approved_at = Some(utc("2026-01-01T00:00:00Z"));
+        assert_eq!(
+            next_due(&s, utc("2026-01-01T00:00:00Z")),
+            Some(utc("2026-01-04T00:00:00Z"))
+        );
+
+        // Invalid cron expressions.
+        for bad in [
+            "",
+            "* * * *",
+            "* * * * * *",
+            "60 * * * *",
+            "* 24 * * *",
+            "* * 0 * *",
+            "* * 32 * *",
+            "* * * 13 *",
+            "* * * * 8",
+            "*/0 * * * *",
+            "10-5 * * * *",
+            "1,,2 * * * *",
+            "0 0 31 2 *",
+        ] {
+            assert!(
+                parse_trigger(None, None, Some(bad), false, Some("UTC")).is_err(),
+                "expected invalid cron: {bad:?}"
+            );
+        }
     }
 
     #[test]

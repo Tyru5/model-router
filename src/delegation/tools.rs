@@ -507,7 +507,9 @@ pub fn schedule_tools() -> Vec<Value> {
                 "workflow": {"type": "string"},
                 "task": {"type": "string"},
                 "every": {"type": "string", "description": "e.g. 30m, 6h, 1d"},
-                "at": {"type": "string", "description": "HH:MM daily, server local time"},
+                "at": {"type": "string", "description": "HH:MM daily (in tz, default local)"},
+                "cron": {"type": "string", "description": "5-field cron: M H DOM MON DOW (e.g. 0 9 * * 1-5)"},
+                "tz": {"type": "string", "description": "Timezone for at/cron: local (default), UTC, or ±HH:MM (e.g. +02:00, -07:00)"},
                 "webhook": {"type": "boolean"},
                 "enabled": {"type": "boolean"},
                 "client_request_id": client_request_id()

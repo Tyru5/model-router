@@ -718,6 +718,47 @@ fn an_agent_s_schedule_fires_only_after_approval_and_once_per_occurrence() {
 }
 
 #[test]
+fn schedule_task_mcp_tool_supports_cron_and_tz() {
+    use model_router::delegation::schedules;
+    if !setup() {
+        return;
+    }
+    let turns = json!({
+        "turns": [[
+            {"call": "schedule_task", "args": {"workflow": "Plain", "task": "Weekday cron", "cron": "0 9 * * 1-5", "tz": "UTC", "client_request_id": "c1"}},
+            {"call": "schedule_task", "args": {"workflow": "Plain", "task": "Weekday cron", "cron": "0 9 * * 1-5", "tz": "+02:00", "client_request_id": "c1"}},
+            {"call": "list_scheduled_tasks"}
+        ]],
+        "handoffs": {"1": {"summary": "final", "verdict": "complete"}}
+    });
+    let mut case = case(turns, true, helper("m"), |stage| {
+        stage.delegation.as_mut().unwrap().schedules = true;
+    });
+    save_project_config(&case, &case.settings.clone());
+    assert_eq!(
+        drive(&mut case.run),
+        Action::Complete,
+        "{:?}",
+        case.run.error
+    );
+    let calls = calls(&case.script);
+    let created = &call(&calls, 1, "schedule_task")[0]["result"];
+    assert_eq!(created["schedule_id"], "s1", "{created}");
+    assert_eq!(created["trigger"], "cron 0 9 * * 1-5 (UTC)", "{created}");
+    assert!(created["next_due"].as_str().is_some(), "{created}");
+    let conflict = &call(&calls, 1, "schedule_task")[1]["result"];
+    assert_eq!(conflict["error"]["code"], "request_conflict", "{conflict}");
+
+    let project = case.dir.path();
+    let approved = schedules::approve(project, "s1").unwrap();
+    let next = schedules::next_due(&approved, chrono::Utc::now()).unwrap();
+    let fired = schedules::fire_due(project, next, None).unwrap();
+    assert_eq!(fired.len(), 1);
+    assert!(fired[0].run.is_some());
+    assert!(schedules::fire_due(project, next, None).unwrap().is_empty());
+}
+
+#[test]
 fn an_interactive_parent_that_exits_with_tasks_running_is_resumed_unattended() {
     if !setup() {
         return;

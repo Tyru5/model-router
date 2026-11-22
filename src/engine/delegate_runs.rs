@@ -482,13 +482,16 @@ fn schedule_task(
     };
     let trigger_given = text("every").is_some()
         || text("at").is_some()
+        || text("cron").is_some()
         || arguments.get("webhook").and_then(Value::as_bool) == Some(true);
     let trigger = trigger_given
         .then(|| {
             schedules::parse_trigger(
                 text("every"),
                 text("at"),
+                text("cron"),
                 arguments.get("webhook").and_then(Value::as_bool) == Some(true),
+                text("tz"),
             )
         })
         .transpose()
@@ -513,6 +516,8 @@ fn schedule_task(
         "task": text("task"),
         "every": text("every"),
         "at": text("at"),
+        "cron": text("cron"),
+        "tz": text("tz"),
         "webhook": arguments.get("webhook"),
         "enabled": arguments.get("enabled"),
     }))
@@ -573,7 +578,7 @@ fn schedule_task(
                 let task = text("task").context("task is required for a new schedule")?;
                 let trigger = trigger
                     .clone()
-                    .context("Give one of every, at, or webhook")?;
+                    .context("Give one of every, at, cron, or webhook")?;
                 let number = store
                     .schedules
                     .iter()

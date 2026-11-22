@@ -1413,3 +1413,158 @@ fn handoff_inspector_matches_the_real_prompt_and_reports_losses() {
     let sent = fs::read_to_string(attempt.directory.join("prompt.md")).unwrap();
     assert_eq!(sent, inspection.prompt);
 }
+
+#[test]
+fn context_files_and_tunable_handoff_budgets_flow_through_cli_preview_run_and_handoffs() {
+    let dir = common::tempdir();
+    let outside = common::tempdir();
+    let config_home = common::tempdir();
+    let mock = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/mock_harness.py");
+
+    fs::write(
+        outside.path().join("secret.txt"),
+        "OUTSIDE_SECRET_DO_NOT_READ",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("docs")).unwrap();
+    fs::create_dir_all(dir.path().join(".git")).unwrap();
+    fs::write(dir.path().join("AGENTS.md"), "WORKFLOW_CONTEXT_RULE\n").unwrap();
+    fs::write(dir.path().join("docs/guide.md"), "DOCS_GUIDE_CONTENT\n").unwrap();
+    fs::write(dir.path().join("stage-note.txt"), "STAGE_ONLY_NOTE\n").unwrap();
+    fs::write(dir.path().join(".git/config"), "GIT_CONFIG_SECRET\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        outside.path().join("secret.txt"),
+        dir.path().join("docs/linked.md"),
+    )
+    .unwrap();
+
+    let cfg = format!(
+        r#"version = 2
+
+[adapters.mock]
+command = "python3"
+args = ["{mock}", "--role", "{{provider}}", "--prompt-file", "{{prompt_file}}", "--handoff-file", "{{handoff_file}}"]
+
+[[workflows]]
+name = "Context workflow"
+max_repair_passes = 0
+handoff_budget_bytes = 24000
+handoff_each_bytes = 8000
+context_files = ["AGENTS.md", "docs/*.md"]
+
+[[workflows.stages]]
+id = "research"
+name = "Research"
+role = "research"
+harness = "mock"
+provider = "research"
+model = "offline-test"
+
+[[workflows.stages]]
+id = "implement"
+name = "Implement"
+role = "implementation"
+harness = "mock"
+provider = "implementation"
+model = "offline-test"
+context_files = ["stage-note.txt"]
+"#
+    );
+    let config_path = dir.path().join("workflow.toml");
+    fs::write(&config_path, cfg).unwrap();
+
+    let run_cli = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_model-router"))
+            .arg("-C")
+            .arg(dir.path())
+            .arg("--config")
+            .arg(&config_path)
+            .args(args)
+            .env("MODEL_ROUTER_CONFIG_DIR", config_home.path())
+            .output()
+            .unwrap()
+    };
+
+    // 1. Validate produces no unknown-field warnings.
+    let val = run_cli(&["validate"]);
+    assert!(
+        val.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&val.stdout),
+        String::from_utf8_lossy(&val.stderr)
+    );
+    let val_out = String::from_utf8_lossy(&val.stdout);
+    assert!(!val_out.contains("Warning:"), "{val_out}");
+
+    // 2. Preview shows tuned handoff budget and resolved context files per stage.
+    let prev = run_cli(&["preview", "--task", "Check context"]);
+    assert!(prev.status.success());
+    let prev_out = String::from_utf8_lossy(&prev.stdout);
+    assert!(
+        prev_out.contains("Handoff budget: 24000 bytes total, 8000 each"),
+        "{prev_out}"
+    );
+    assert!(prev_out.contains("AGENTS.md"), "{prev_out}");
+    assert!(prev_out.contains("docs/guide.md"), "{prev_out}");
+    assert!(prev_out.contains("stage-note.txt"), "{prev_out}");
+    assert!(
+        !prev_out.contains("OUTSIDE_SECRET_DO_NOT_READ"),
+        "{prev_out}"
+    );
+
+    // 3. Running injects context files into actual stage prompts.
+    let run_out = run_cli(&["run", "--task", "Check context"]);
+    assert!(
+        run_out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&run_out.stdout),
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    let run_dir = fs::read_dir(dir.path().join(".model-router/runs"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let run_id = run_dir.file_name().unwrap().to_str().unwrap().to_owned();
+    let research_prompt =
+        fs::read_to_string(run_dir.join("01-research/attempt-001/prompt.md")).unwrap();
+    let implement_prompt =
+        fs::read_to_string(run_dir.join("02-implement/attempt-001/prompt.md")).unwrap();
+    assert!(research_prompt.contains("WORKFLOW_CONTEXT_RULE"));
+    assert!(research_prompt.contains("DOCS_GUIDE_CONTENT"));
+    assert!(!research_prompt.contains("STAGE_ONLY_NOTE"));
+    assert!(implement_prompt.contains("WORKFLOW_CONTEXT_RULE"));
+    assert!(implement_prompt.contains("DOCS_GUIDE_CONTENT"));
+    assert!(implement_prompt.contains("STAGE_ONLY_NOTE"));
+    for secret in ["OUTSIDE_SECRET_DO_NOT_READ", "GIT_CONFIG_SECRET"] {
+        assert!(!research_prompt.contains(secret));
+        assert!(!implement_prompt.contains(secret));
+    }
+
+    // 4. `handoffs --stage implement --prompt` and `--json` show context files and tuned budget.
+    let ho = run_cli(&["handoffs", &run_id, "--stage", "implement", "--prompt"]);
+    assert!(ho.status.success());
+    let ho_out = String::from_utf8_lossy(&ho.stdout);
+    assert!(ho_out.contains("Context files:"), "{ho_out}");
+    assert!(ho_out.contains("stage-note.txt"), "{ho_out}");
+    assert!(
+        ho_out.contains("Budget: 24000 bytes of prior handoffs, at most 8000 each"),
+        "{ho_out}"
+    );
+    assert!(ho_out.contains("PROJECT CONTEXT FILES"), "{ho_out}");
+    assert!(ho_out.contains("STAGE_ONLY_NOTE"), "{ho_out}");
+
+    let ho_json = run_cli(&["handoffs", &run_id, "--stage", "implement", "--json"]);
+    assert!(ho_json.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&ho_json.stdout).unwrap();
+    assert_eq!(parsed["budget_bytes"], 24000);
+    assert_eq!(parsed["each_bytes"], 8000);
+    let files = parsed["context_files"].as_array().unwrap();
+    assert!(
+        files
+            .iter()
+            .any(|f| f["path"] == "stage-note.txt" && f["included"] == true)
+    );
+}

@@ -99,6 +99,12 @@ pub fn apply_worktree_plan(run: &Run) -> Result<ApplyPlan> {
                 .join(", ")
         );
     }
+    if crate::policy::has_block_policies(&run.workflow.policies) {
+        let mut scan = crate::policy::PolicyScan::new(&run.workflow.policies);
+        snapshot::patch_lines(&workspace, &from, &to, |line| scan.line(line))
+            .context("Read the worktree diff to verify workflow policies; refusing to apply")?;
+        scan.ensure_clean(" in worktree changes", "refusing to apply")?;
+    }
     Ok(ApplyPlan {
         run_id: run.id.clone(),
         project,

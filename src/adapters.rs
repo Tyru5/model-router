@@ -332,6 +332,29 @@ pub fn harness_version(harness: &str, program: &str) -> Option<String> {
     line
 }
 
+/// Returns the detected or overridden version for `(harness, program)` to
+/// record in attempt `command.json`. Built-in harnesses use the cached
+/// `harness_version` lookup (at most one `--version` probe per process);
+/// custom adapters are never probed and only read overrides or cached entries.
+pub fn detected_version(harness: &str, program: &str) -> Option<String> {
+    if harness::get(harness).is_some() {
+        return harness_version(harness, program);
+    }
+    if let Ok(overrides) = env::var("MODEL_ROUTER_HARNESS_VERSIONS") {
+        if let Some(version) = overrides.split(',').find_map(|pair| {
+            let (name, version) = pair.split_once('=')?;
+            (name.trim() == harness).then(|| version.trim().to_owned())
+        }) {
+            return Some(version);
+        }
+    }
+    versions()
+        .lock()
+        .ok()
+        .and_then(|v| v.get(program).cloned())
+        .flatten()
+}
+
 /// The major version in a `--version` line, e.g. 2 in `opencode v2.0.22`.
 pub fn major_version(line: &str) -> Option<u64> {
     line.split(|c: char| c.is_whitespace() || matches!(c, '/' | '(' | ')' | ','))

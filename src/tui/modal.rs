@@ -2,22 +2,27 @@ use super::input::InputField;
 use super::{
     actions::{self, ActionId, Group, Scope},
     app::App,
+    delegation_view::{DelegatedAction, DelegatedTasksView},
     diff_view::{DiffAction, DiffView},
     external,
     handoff_view::{HandoffAction, HandoffView},
     harness_editor::HarnessEditor,
-    history::{Compare, Confirm},
+    history::{Compare, Confirm, ShipConfirm, apply_ad_hoc_ship},
+    monitor::{BudgetRaiseFloor, budget_raise_floor},
     path_picker::{PathPicker, PickerAction},
     run_slot::RunSlot,
+    schedules_view::{SchedulesAction, SchedulesView},
     session::draw_notifications,
     task_importer::{ImportAction, TaskImporter},
     theme::{self, Palette, Theme},
     widgets::{content, menu_key, popup, textarea},
+    workflow_editor::{WorkflowEditor, parse_token_count},
     workflow_page::{StageEditor, StageRequest},
 };
 use crate::{
     catalog::{self, Model},
     config::{self, Stage},
+    delegation::schedules,
     engine, notify, presets, storage,
 };
 use anyhow::{Context, Result, ensure};
@@ -45,6 +50,10 @@ pub(super) enum InputTarget {
     NotifyUrl,
     /// A new USD cap for the focused run its budget stopped.
     Budget,
+    /// A new token cap for the focused run its budget stopped.
+    BudgetTokens,
+    /// Optional model override when forking a run from a stage checkpoint.
+    ForkModel,
 }
 #[derive(Clone)]
 pub(super) enum PickValue {
@@ -57,6 +66,14 @@ pub(super) enum PickValue {
     Theme(Theme),
     Action(ActionId),
     Compare(Compare),
+    /// A stage checkpoint to fork a run from.
+    ForkStage {
+        run: String,
+        stage_id: String,
+        stage_name: String,
+        current_model: String,
+        fan_out: bool,
+    },
     /// A stopped fan-out candidate to retry: stage ID and candidate ID.
     Candidate {
         stage: String,
@@ -138,6 +155,7 @@ pub(super) enum Modal {
         editor: Box<StageEditor>,
         insert_at: Option<usize>,
     },
+    Workflow(Box<WorkflowEditor>),
     Harness(Box<HarnessEditor>),
     Repositories(Box<PathPicker>),
     Import(Box<TaskImporter>),
@@ -160,6 +178,12 @@ pub(super) enum Modal {
     Diff(Box<DiffView>),
     /// A stage's handoff, with its changed files.
     Handoff(Box<HandoffView>),
+    /// Scrollable ad-hoc ship preview requiring explicit confirmation.
+    ShipConfirm(Box<ShipConfirm>),
+    /// Delegated tasks inspector for a run.
+    DelegatedTasks(Box<DelegatedTasksView>),
+    /// Project schedules manager (`.model-router/schedules.json`).
+    Schedules(Box<SchedulesView>),
     Confirm(Box<Confirm>),
     /// A yes/no question before something hard to take back.
     Ask(Box<Ask>),
@@ -215,6 +239,35 @@ pub(super) enum Ask {
         usd: f64,
         cap: f64,
         spent: String,
+    },
+    /// Raise this run's token cap from `cap` to `tokens` and continue.
+    RaiseBudgetTokens {
+        run: String,
+        tokens: u64,
+        cap: u64,
+        spent: String,
+    },
+    /// Confirm forking a fan-out stage checkpoint (no model override).
+    ForkRun {
+        run: String,
+        stage_id: String,
+        stage_name: String,
+    },
+    /// Cancel a single delegated task without cancelling its parent stage.
+    CancelDelegatedTask {
+        run: String,
+        task: String,
+    },
+    /// Approve a scheduled run after checking project trust.
+    ApproveSchedule {
+        id: String,
+        workflow: String,
+        trigger: String,
+        task: String,
+    },
+    /// Permanently delete a schedule from `.model-router/schedules.json`.
+    DeleteSchedule {
+        id: String,
     },
     DeleteWorkflow {
         index: usize,
@@ -283,6 +336,56 @@ impl Ask {
                     crate::report::dollars(*usd),
                 ),
                 YES_NO,
+            ),
+            Self::RaiseBudgetTokens {
+                run,
+                tokens,
+                cap,
+                spent,
+            } => (
+                "Raise token budget",
+                format!(
+                    "Raise the token budget of {run} from {} to {} tokens and continue? Spent so far: {spent}. Exceeded stage token caps rise to the same amount.",
+                    crate::report::tokens(*cap),
+                    crate::report::tokens(*tokens),
+                ),
+                YES_NO,
+            ),
+            Self::ForkRun {
+                run, stage_name, ..
+            } => (
+                "Fork run",
+                format!(
+                    "Fork {run} at stage “{stage_name}” in a new isolated Git worktree, reusing completed upstream handoffs?"
+                ),
+                YES_NO,
+            ),
+            Self::CancelDelegatedTask { run, task } => (
+                "Cancel delegated task",
+                format!(
+                    "Cancel delegated task {task} of {run}? Its parent stage keeps running and receives the cancellation."
+                ),
+                YES_NO,
+            ),
+            Self::ApproveSchedule {
+                id,
+                workflow,
+                trigger,
+                task,
+            } => (
+                "Approve schedule",
+                format!(
+                    "Approve schedule {id}?\nTrigger: {trigger}\nWorkflow: {workflow}\nTask: {}",
+                    storage::truncate(task, 160)
+                ),
+                &[("y / Enter", "approve"), ("n / Esc", "cancel")],
+            ),
+            Self::DeleteSchedule { id } => (
+                "Delete schedule",
+                format!(
+                    "Permanently delete schedule {id} from .model-router/schedules.json and revoke its approval?"
+                ),
+                &[("y / Enter", "delete"), ("n / Esc", "cancel")],
             ),
             Self::DeleteWorkflow { index } => (
                 "Delete workflow",
@@ -420,6 +523,7 @@ impl Modal {
     fn changed(&self) -> bool {
         match self {
             Self::Stage { editor, .. } => editor.changed(),
+            Self::Workflow(editor) => editor.changed(),
             Self::Harness(editor) => editor.changed(),
             _ => false,
         }
@@ -427,7 +531,10 @@ impl Modal {
     /// Shows a failed key's error in the dialogs that have room for it.
     fn show_error(&mut self, error: &anyhow::Error) {
         match self {
+            Self::Workflow(editor) => editor.error = format!("{error:#}"),
             Self::Harness(editor) => editor.error = format!("{error:#}"),
+            Self::DelegatedTasks(view) => view.error = format!("{error:#}"),
+            Self::Schedules(view) => view.error = format!("{error:#}"),
             Self::Diff(view) => view.note = storage::clean_terminal(&format!("{error:#}")),
             Self::Picker { note, .. } => {
                 *note = storage::clean_terminal(&format!(
@@ -442,6 +549,7 @@ impl Modal {
             Self::Input { text, .. } => Some(text),
             Self::Picker { filter, .. } => Some(filter),
             Self::Stage { editor, .. } => editor.active_input(),
+            Self::Workflow(editor) => editor.active_input(),
             Self::Harness(editor) => editor.active_input(),
             Self::Repositories(picker) => Some(picker.active_input()),
             Self::Import(importer) => importer.active_input(),
@@ -544,6 +652,35 @@ impl App {
                 self.perform(id)?;
             }
             PickValue::Compare(choice) => self.show_comparison(&choice)?,
+            PickValue::ForkStage {
+                run,
+                stage_id,
+                stage_name,
+                current_model,
+                fan_out,
+            } => {
+                if fan_out {
+                    self.ui.open(Modal::Ask(Box::new(Ask::ForkRun {
+                        run,
+                        stage_id,
+                        stage_name,
+                    })));
+                } else {
+                    self.pending_fork = Some((run.clone(), stage_id));
+                    let current = if current_model.is_empty() {
+                        "harness default"
+                    } else {
+                        current_model.as_str()
+                    };
+                    self.input(
+                        &format!(
+                            "Fork {run} at {stage_name} · model override (blank keeps {current})"
+                        ),
+                        InputTarget::ForkModel,
+                        "",
+                    );
+                }
+            }
             PickValue::Candidate { stage, candidate } => {
                 self.session
                     .run_mut()
@@ -608,6 +745,16 @@ impl App {
                 engine::edit_handoff(self.session.run_mut().context("No run")?, value)?
             }
             InputTarget::Budget => self.ask_raise_budget(&value)?,
+            InputTarget::BudgetTokens => self.ask_raise_budget_tokens(&value)?,
+            InputTarget::ForkModel => {
+                let (run, stage) = self
+                    .pending_fork
+                    .take()
+                    .context("No stage checkpoint selected for fork")?;
+                let trimmed = value.trim();
+                let model = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+                self.start_fork(&run, &stage, model)?;
+            }
             InputTarget::NotifyUrl => {
                 let url = value.trim().to_owned();
                 ensure!(
@@ -709,6 +856,47 @@ impl App {
                     crate::report::dollars(*usd)
                 );
             }
+            Ask::RaiseBudgetTokens { run, tokens, .. } => {
+                self.idle(run)?.command(engine::Cmd::RaiseBudget {
+                    usd: None,
+                    tokens: Some(*tokens),
+                })?;
+                self.start_driver()?;
+                self.ui.message = format!(
+                    "Token budget raised to {} tokens; continuing…",
+                    crate::report::tokens(*tokens)
+                );
+            }
+            Ask::ForkRun { run, stage_id, .. } => {
+                self.start_fork(run, stage_id, None)?;
+            }
+            Ask::CancelDelegatedTask { run, task } => {
+                if engine::cancel_delegated_task(run, task) {
+                    self.ui.message = format!(
+                        "Cancelling delegated task {task} of {run} (parent keeps running)…"
+                    );
+                } else {
+                    self.ui.message = format!(
+                        "Task {task} of {run} is no longer running in a live delegating stage."
+                    );
+                }
+            }
+            Ask::ApproveSchedule { id, .. } => {
+                schedules::approve(&self.project, id)?;
+                if let Some(Modal::Schedules(view)) = self.ui.dialog_mut() {
+                    let _ = view.reload(&self.project);
+                    view.status = format!("Approved schedule {id}.");
+                }
+                self.ui.message = format!("Approved schedule {id}.");
+            }
+            Ask::DeleteSchedule { id } => {
+                schedules::delete(&self.project, id)?;
+                if let Some(Modal::Schedules(view)) = self.ui.dialog_mut() {
+                    let _ = view.reload(&self.project);
+                    view.status = format!("Deleted schedule {id}.");
+                }
+                self.ui.message = format!("Deleted schedule {id}.");
+            }
             Ask::DeleteWorkflow { index } => {
                 let index = *index;
                 ensure!(
@@ -793,6 +981,29 @@ impl App {
         })));
         Ok(())
     }
+    /// Checks a new token cap for the focused run its budget stopped, then
+    /// asks to apply it.
+    fn ask_raise_budget_tokens(&mut self, value: &str) -> Result<()> {
+        let run = self.session.run().context("No run")?;
+        let BudgetRaiseFloor::Tokens { cap, spent } = budget_raise_floor(run)? else {
+            anyhow::bail!("A USD cap stopped this run; raise the USD budget instead");
+        };
+        let tokens = parse_token_count(value)?;
+        ensure!(
+            tokens > cap && tokens > spent.tokens,
+            "Enter more than {} tokens: the cap is {} and {} tokens are spent",
+            crate::report::tokens(cap.max(spent.tokens)),
+            crate::report::tokens(cap),
+            crate::report::tokens(spent.tokens),
+        );
+        self.ui.open(Modal::Ask(Box::new(Ask::RaiseBudgetTokens {
+            run: run.id.clone(),
+            tokens,
+            cap,
+            spent: format!("{} tokens", crate::report::tokens(spent.tokens)),
+        })));
+        Ok(())
+    }
     /// The focused run's slot when it is `id` and still has a worker.
     fn running(&mut self, id: &str) -> Option<&mut RunSlot> {
         self.session
@@ -831,9 +1042,16 @@ impl App {
             DialogResult::Emit(Effect::Exit) => exit = true,
         }
         match error {
-            // Validation is shown in the harness draft, so it cannot leave a
+            // Validation is shown inside the editor, so it cannot leave a
             // stale error behind the dialog once the field is corrected.
-            Some(_) if matches!(self.ui.dialog(), Some(Modal::Harness(_))) => Ok(exit),
+            Some(_)
+                if matches!(
+                    self.ui.dialog(),
+                    Some(Modal::Harness(_) | Modal::Workflow(_))
+                ) =>
+            {
+                Ok(exit)
+            }
             Some(error) => Err(error),
             None => Ok(exit),
         }
@@ -900,6 +1118,20 @@ impl App {
                     }
                     StageRequest::None => {}
                 }
+                Stay
+            }
+            Modal::Workflow(editor) if save => {
+                let workflow = editor.finish()?;
+                let mut candidate = self.editor.settings.clone();
+                candidate.workflows[self.editor.workflow] = workflow;
+                candidate.validate()?;
+                self.editor.settings = candidate;
+                self.editor.dirty = true;
+                self.ui.message = "Workflow settings applied. [s] saves to disk.".into();
+                Close
+            }
+            Modal::Workflow(editor) => {
+                editor.key(key);
                 Stay
             }
             Modal::Harness(editor) if save => {
@@ -1019,6 +1251,93 @@ impl App {
                     Stay
                 }
             },
+            Modal::ShipConfirm(confirm) => {
+                let last = u16::try_from(confirm.preview.lines().count().saturating_sub(1))
+                    .unwrap_or(u16::MAX);
+                match key.code {
+                    Key::Up | Key::Char('k') => confirm.scroll = confirm.scroll.saturating_sub(1),
+                    Key::Down | Key::Char('j') => {
+                        confirm.scroll = confirm.scroll.saturating_add(1).min(last)
+                    }
+                    Key::PageUp => confirm.scroll = confirm.scroll.saturating_sub(12),
+                    Key::PageDown => confirm.scroll = confirm.scroll.saturating_add(12).min(last),
+                    Key::Home => confirm.scroll = 0,
+                    Key::End => confirm.scroll = last,
+                    Key::Char('n') if key.modifiers - Mods::SHIFT == Mods::NONE => {
+                        self.ui.message = "Nothing shipped.".into();
+                        return Ok(Close);
+                    }
+                    Key::Char('y') if key.modifiers - Mods::SHIFT == Mods::NONE => {
+                        let loading = Loading::new("Shipping changes on a new branch…");
+                        let ticket = loading.ticket;
+                        let project = self.project.clone();
+                        let run = confirm.run.clone();
+                        let msg_run = run.clone();
+                        let plan = (*confirm.plan).clone();
+                        let dir = confirm.dir.clone();
+                        self.tasks.spawn(
+                            "Shipping changes stopped unexpectedly",
+                            move || {
+                                apply_ad_hoc_ship(&project, &run, &plan, &dir)
+                                    .map_err(|e| format!("{e:#}"))
+                            },
+                            move |result| super::tasks::Msg::Shipped {
+                                ticket,
+                                run: msg_run,
+                                result,
+                            },
+                        );
+                        return Ok(DialogResult::Replace(Modal::Loading(loading)));
+                    }
+                    _ => {}
+                }
+                Stay
+            }
+            Modal::DelegatedTasks(view) => match view.key(key) {
+                DelegatedAction::Stay => Stay,
+                DelegatedAction::Close => Close,
+                DelegatedAction::Handoff { stage, handoff } => {
+                    DialogResult::Push(Modal::Handoff(Box::new(HandoffView::new(*handoff, stage))))
+                }
+                DelegatedAction::Patch { patch } => {
+                    DialogResult::Push(Modal::Diff(Box::new(DiffView::new(patch))))
+                }
+                DelegatedAction::CancelTask { run, task } => {
+                    DialogResult::Push(Modal::Ask(Box::new(Ask::CancelDelegatedTask { run, task })))
+                }
+            },
+            Modal::Schedules(view) => match view.key(key) {
+                SchedulesAction::Stay => Stay,
+                SchedulesAction::Close => Close,
+                SchedulesAction::Refresh => {
+                    view.reload(&self.project)?;
+                    view.status = "Reloaded schedules.".into();
+                    Stay
+                }
+                SchedulesAction::Approve(schedule) => {
+                    DialogResult::Push(Modal::Ask(Box::new(Ask::ApproveSchedule {
+                        id: schedule.id,
+                        workflow: schedule.workflow.unwrap_or_else(|| "(default)".into()),
+                        trigger: schedule.trigger.describe(),
+                        task: schedule.task,
+                    })))
+                }
+                SchedulesAction::Pause(id) => {
+                    schedules::set_enabled(&self.project, &id, false)?;
+                    view.reload(&self.project)?;
+                    view.status = format!("Paused {id}; enabling it again needs approval.");
+                    Stay
+                }
+                SchedulesAction::Enable(id) => {
+                    schedules::set_enabled(&self.project, &id, true)?;
+                    view.reload(&self.project)?;
+                    view.status = format!("Enabled {id}; press [a] to approve.");
+                    Stay
+                }
+                SchedulesAction::Delete(id) => {
+                    DialogResult::Push(Modal::Ask(Box::new(Ask::DeleteSchedule { id })))
+                }
+            },
             Modal::Menu { scope, group } => match (key.code, *group) {
                 _ if key.modifiers.intersects(Mods::CONTROL | Mods::ALT) => Stay,
                 (Key::Char(' '), _) => Close,
@@ -1059,6 +1378,7 @@ impl App {
                 field.insert_str(text);
             }
             Some(Modal::Stage { editor, .. }) => editor.paste(text),
+            Some(Modal::Workflow(editor)) => editor.paste(text),
             Some(Modal::Picker {
                 filter, selected, ..
             }) => {
@@ -1085,12 +1405,16 @@ pub(super) fn draw_modal(
         return draw_menu(frame, *scope, *group, palette);
     }
     let (width, height) = match modal {
-        Modal::Stage { .. } => (100, 35),
+        Modal::Stage { .. } | Modal::Workflow(_) => (100, 35),
         // As large as the screen allows.
         Modal::Diff(_) => (u16::MAX, u16::MAX),
-        Modal::Handoff(_) => (100, 32),
+        Modal::Handoff(_)
+        | Modal::ShipConfirm(_)
+        | Modal::DelegatedTasks(_)
+        | Modal::Schedules(_) => (100, 32),
         Modal::Loading(_) => (64, 7),
         Modal::Ask(ask) if matches!(**ask, Ask::ApplyWorktree { .. }) => (80, 22),
+        Modal::Ask(ask) if matches!(**ask, Ask::ApproveSchedule { .. }) => (80, 14),
         Modal::Ask(_) => (72, 9),
         _ => (95, 26),
     };
@@ -1099,8 +1423,12 @@ pub(super) fn draw_modal(
     match modal {
         Modal::Repositories(picker) => picker.draw(frame, rect, palette),
         Modal::Import(importer) => importer.draw(frame, rect, palette),
+        Modal::Workflow(editor) => editor.draw(frame, rect, palette),
         Modal::Harness(editor) => editor.draw(frame, rect, palette),
         Modal::Confirm(dialog) => dialog.draw(frame, rect, palette),
+        Modal::ShipConfirm(dialog) => dialog.draw(frame, rect, palette),
+        Modal::DelegatedTasks(view) => view.draw(frame, rect, palette),
+        Modal::Schedules(view) => view.draw(frame, rect, palette),
         Modal::Diff(view) => view.draw(frame, rect, palette),
         Modal::Handoff(view) => view.draw(frame, rect, palette),
         Modal::Notifications {

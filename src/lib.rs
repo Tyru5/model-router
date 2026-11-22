@@ -14,6 +14,7 @@ pub mod handoff;
 pub mod harness;
 pub mod harness_settings;
 pub mod history;
+pub mod hooks;
 pub mod notify;
 pub mod policy;
 pub mod presets;

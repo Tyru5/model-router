@@ -841,6 +841,107 @@ fn exceeded(budget: &Budget, spent: &CostTotal, scope: &str) -> Option<String> {
     None
 }
 
+/// Checks streamed mid-attempt usage against configured `on_exceed = "stop"`
+/// run and stage budget caps so an unattended harness can be terminated cleanly
+/// the moment cumulative spend or tokens exceed the cap.
+#[derive(Debug, Clone)]
+pub struct LiveBudgetMonitor {
+    prior_run: CostTotal,
+    prior_stage: CostTotal,
+    run_budget: Option<Budget>,
+    stage_budget: Option<Budget>,
+    stage_name: String,
+    model: String,
+    provider: Option<String>,
+    billing: Billing,
+    pricing: Pricing,
+    project: PathBuf,
+    run_id: String,
+}
+
+impl LiveBudgetMonitor {
+    /// Builds a live monitor for stage `index` if the run or stage has an active
+    /// `on_exceed = "stop"` cap. Returns `None` otherwise (zero overhead).
+    pub fn for_stage(run: &Run, index: usize) -> Option<Self> {
+        let stage = run.workflow.stages.get(index)?;
+        let run_stop =
+            !run.workflow.budget.is_empty() && run.workflow.budget.on_exceed == BudgetAction::Stop;
+        let stage_stop = !stage.budget.is_empty() && stage.budget.on_exceed == BudgetAction::Stop;
+        if !run_stop && !stage_stop {
+            return None;
+        }
+        let pricing = Pricing::load(&run.project);
+        Self::for_stage_with(run, index, pricing)
+    }
+
+    pub fn for_stage_with(run: &Run, index: usize, pricing: Pricing) -> Option<Self> {
+        let stage = run.workflow.stages.get(index)?;
+        let run_budget = (!run.workflow.budget.is_empty()
+            && run.workflow.budget.on_exceed == BudgetAction::Stop)
+            .then_some(run.workflow.budget);
+        let stage_budget = (!stage.budget.is_empty()
+            && stage.budget.on_exceed == BudgetAction::Stop)
+            .then_some(stage.budget);
+        if run_budget.is_none() && stage_budget.is_none() {
+            return None;
+        }
+        let stages = totals_with_launched(run, &pricing);
+        let prior_stage = stages.get(index).copied().unwrap_or_default();
+        let mut prior_run = CostTotal::default();
+        for total in &stages {
+            prior_run.merge(total);
+        }
+        let (provider, billing) = stage_estimate_params(run, index);
+        Some(Self {
+            prior_run,
+            prior_stage,
+            run_budget,
+            stage_budget,
+            stage_name: stage.name.clone(),
+            model: stage.model.clone(),
+            provider: provider.map(str::to_owned),
+            billing,
+            pricing,
+            project: run.project.clone(),
+            run_id: run.id.clone(),
+        })
+    }
+
+    /// Evaluates cumulative spend/tokens with the running attempt's latest
+    /// streamed `usage`. Returns the user-facing stop reason if a cap is exceeded.
+    pub fn check(&self, live_usage: Usage) -> Option<String> {
+        let est = estimate_with_billing(
+            Some(&live_usage),
+            &self.model,
+            self.provider.as_deref(),
+            self.billing,
+            &self.pricing,
+        );
+        let reason = if let Some(budget) = &self.stage_budget {
+            let mut stage_spent = self.prior_stage;
+            stage_spent.add(&est);
+            exceeded(
+                budget,
+                &stage_spent,
+                &format!(" in stage {}", self.stage_name),
+            )
+        } else {
+            None
+        }
+        .or_else(|| {
+            let budget = self.run_budget.as_ref()?;
+            let mut run_spent = self.prior_run;
+            run_spent.add(&est);
+            exceeded(budget, &run_spent, "")
+        })?;
+        Some(format!(
+            "{reason}. Inspect the run, then raise the cap to continue: model-router -C {} resume {} --budget-usd N (or --budget-tokens N)",
+            self.project.display(),
+            self.run_id
+        ))
+    }
+}
+
 /// Whether the run stopped on a budget cap.
 pub fn budget_blocked(run: &Run) -> bool {
     run.status == Status::Blocked
@@ -1124,9 +1225,124 @@ pub struct Row {
 pub struct Summary {
     pub since: Option<DateTime<Utc>>,
     pub prices_as_of: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projects: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_projects: Option<usize>,
     pub rows: Vec<Row>,
     pub usage: Usage,
     pub total: CostTotal,
+}
+
+type RowEntry = (Row, BTreeSet<(usize, String)>);
+
+#[derive(Default)]
+struct Accumulator {
+    rows: BTreeMap<(String, String), RowEntry>,
+    usage: Usage,
+    total: CostTotal,
+}
+
+impl Accumulator {
+    fn fold_runs<'a>(
+        &mut self,
+        project_idx: usize,
+        runs: impl IntoIterator<Item = &'a Run>,
+        since: Option<DateTime<Utc>>,
+        pricing: &Pricing,
+    ) {
+        let mut add =
+            |run: &Run, harness: &str, model: &str, usage: Option<Usage>, estimate: Estimate| {
+                let model = if model.is_empty() {
+                    "default".to_owned()
+                } else {
+                    model.to_owned()
+                };
+                let (row, ids) = self
+                    .rows
+                    .entry((harness.to_owned(), model.clone()))
+                    .or_insert_with(|| {
+                        (
+                            Row {
+                                harness: harness.to_owned(),
+                                model,
+                                runs: 0,
+                                usage: Usage::default(),
+                                cost: CostTotal::default(),
+                            },
+                            BTreeSet::new(),
+                        )
+                    });
+                ids.insert((project_idx, run.id.clone()));
+                row.cost.add(&estimate);
+                self.total.add(&estimate);
+                if let Some(usage) = usage {
+                    row.usage = row.usage + usage;
+                    self.usage = self.usage + usage;
+                }
+            };
+        for run in runs {
+            for (index, (stage, state)) in run.workflow.stages.iter().zip(&run.stages).enumerate() {
+                let (provider, billing) = stage_estimate_params(run, index);
+                // Candidates count under their own harness.
+                let candidates = state
+                    .candidate_attempts()
+                    .map(|(c, a)| (c.harness.as_str(), a));
+                let own = state.attempts.iter().map(|a| (stage.harness.as_str(), a));
+                for (harness, attempt) in own.chain(candidates) {
+                    if since.is_some_and(|since| attempt.started_at < since) {
+                        continue;
+                    }
+                    let estimate = estimate_with_billing(
+                        attempt.usage.as_ref(),
+                        &attempt.model,
+                        provider,
+                        billing,
+                        pricing,
+                    );
+                    add(run, harness, &attempt.model, attempt.usage, estimate);
+                }
+                // Delegated tasks count under their own targets.
+                for (task, turn) in state.task_turns() {
+                    if since.is_some_and(|since| turn.started_at < since) {
+                        continue;
+                    }
+                    let estimate = task_turn_estimate(run, task, turn, pricing);
+                    let model = if turn.model.is_empty() {
+                        &task.target.model
+                    } else {
+                        &turn.model
+                    };
+                    add(run, &task.target.harness, model, turn.usage, estimate);
+                }
+            }
+        }
+    }
+
+    fn finish(
+        self,
+        since: Option<DateTime<Utc>>,
+        projects: Option<usize>,
+        skipped_projects: Option<usize>,
+    ) -> Summary {
+        let rows = self
+            .rows
+            .into_values()
+            .map(|(mut row, ids)| {
+                row.runs = ids.len();
+                row
+            })
+            .collect();
+        Summary {
+            since,
+            prices_as_of: table_as_of().into(),
+            projects,
+            skipped_projects,
+            rows,
+            usage: self.usage,
+            total: self.total,
+        }
+    }
 }
 
 /// Spend of attempts started at or after `since`, by harness and model.
@@ -1135,87 +1351,43 @@ pub fn aggregate<'a>(
     since: Option<DateTime<Utc>>,
     pricing: &Pricing,
 ) -> Summary {
-    let mut rows: BTreeMap<(String, String), (Row, BTreeSet<String>)> = BTreeMap::new();
-    let mut summary = Summary {
-        since,
-        prices_as_of: table_as_of().into(),
-        rows: vec![],
-        usage: Usage::default(),
-        total: CostTotal::default(),
-    };
-    let mut add =
-        |run: &Run, harness: &str, model: &str, usage: Option<Usage>, estimate: Estimate| {
-            let model = if model.is_empty() {
-                "default".to_owned()
-            } else {
-                model.to_owned()
-            };
-            let (row, ids) = rows
-                .entry((harness.to_owned(), model.clone()))
-                .or_insert_with(|| {
-                    (
-                        Row {
-                            harness: harness.to_owned(),
-                            model,
-                            runs: 0,
-                            usage: Usage::default(),
-                            cost: CostTotal::default(),
-                        },
-                        BTreeSet::new(),
-                    )
-                });
-            ids.insert(run.id.clone());
-            row.cost.add(&estimate);
-            summary.total.add(&estimate);
-            if let Some(usage) = usage {
-                row.usage = row.usage + usage;
-                summary.usage = summary.usage + usage;
-            }
-        };
-    for run in runs {
-        for (index, (stage, state)) in run.workflow.stages.iter().zip(&run.stages).enumerate() {
-            let (provider, billing) = stage_estimate_params(run, index);
-            // Candidates count under their own harness.
-            let candidates = state
-                .candidate_attempts()
-                .map(|(c, a)| (c.harness.as_str(), a));
-            let own = state.attempts.iter().map(|a| (stage.harness.as_str(), a));
-            for (harness, attempt) in own.chain(candidates) {
-                if since.is_some_and(|since| attempt.started_at < since) {
-                    continue;
-                }
-                let estimate = estimate_with_billing(
-                    attempt.usage.as_ref(),
-                    &attempt.model,
-                    provider,
-                    billing,
-                    pricing,
-                );
-                add(run, harness, &attempt.model, attempt.usage, estimate);
-            }
-            // Delegated tasks count under their own targets.
-            for (task, turn) in state.task_turns() {
-                if since.is_some_and(|since| turn.started_at < since) {
-                    continue;
-                }
-                let estimate = task_turn_estimate(run, task, turn, pricing);
-                let model = if turn.model.is_empty() {
-                    &task.target.model
-                } else {
-                    &turn.model
-                };
-                add(run, &task.target.harness, model, turn.usage, estimate);
-            }
+    let mut acc = Accumulator::default();
+    acc.fold_runs(0, runs, since, pricing);
+    acc.finish(since, None, None)
+}
+
+/// Spend across multiple projects (`cost --all-projects`), using each project's
+/// own pricing overrides and cached provider prices. Missing or unreadable
+/// projects are skipped gracefully and counted in `skipped_projects`.
+pub fn aggregate_projects(
+    projects: &[PathBuf],
+    since: Option<DateTime<Utc>>,
+    refresh_prices: bool,
+) -> Summary {
+    let mut acc = Accumulator::default();
+    let mut included = 0usize;
+    let mut skipped = 0usize;
+    for (idx, project) in projects.iter().enumerate() {
+        if !project.is_dir() {
+            skipped += 1;
+            continue;
         }
+        let Ok(runs) = crate::engine::history(project) else {
+            skipped += 1;
+            continue;
+        };
+        included += 1;
+        if refresh_prices {
+            let mut routed = BTreeMap::new();
+            for run in &runs {
+                routed.extend(routed_providers(run));
+            }
+            refresh_provider_prices(project, &routed);
+        }
+        let pricing = Pricing::load(project);
+        acc.fold_runs(idx, &runs, since, &pricing);
     }
-    summary.rows = rows
-        .into_values()
-        .map(|(mut row, ids)| {
-            row.runs = ids.len();
-            row
-        })
-        .collect();
-    summary
+    acc.finish(since, Some(included), (skipped > 0).then_some(skipped))
 }
 
 /// "7d", "12h", "30m", or "2w".
@@ -1239,9 +1411,14 @@ pub fn parse_since(text: &str) -> Result<Duration> {
 
 pub fn render_summary(summary: &Summary) -> String {
     let mut text = String::new();
+    let scope = match (summary.projects, summary.skipped_projects) {
+        (Some(n), Some(skipped)) => format!(" across {n} project(s) ({skipped} skipped)"),
+        (Some(n), None) => format!(" across {n} project(s)"),
+        (None, _) => String::new(),
+    };
     let _ = writeln!(
         text,
-        "Spend {} · prices are estimates (table as of {}); verify with your provider",
+        "Spend {}{scope} · prices are estimates (table as of {}); verify with your provider",
         summary.since.map_or_else(
             || "over all history".into(),
             |since| format!("since {}", since.format("%Y-%m-%d %H:%M UTC"))
@@ -1382,10 +1559,12 @@ mod tests {
         assert_eq!(table_price("claude-sonnet-4-5").map(|p| p.0), Some(3.0));
         assert_eq!(table_price("gpt-5-mini").map(|p| p.0), Some(0.25));
         assert_eq!(table_price("gpt-5.1-codex-max").map(|p| p.0), Some(1.25));
+        assert_eq!(table_price("gpt-6-astra"), Some((2.0, 12.0, Source::Table)));
+        assert_eq!(table_price("gpt-6.2-sol"), Some((2.5, 15.0, Source::Table)));
         assert_eq!(table_price("haiku").map(|p| p.1), Some(0.5));
         // Family matching respects segment boundaries and never invents a price.
         assert_eq!(table_price("o30"), None);
-        assert_eq!(table_price("gpt-6-astra"), None);
+        assert_eq!(table_price("nonexistent-model-xyz"), None);
         assert_eq!(table_price(""), None);
     }
 
@@ -1600,5 +1779,30 @@ mod tests {
         let (family, _) = pricing.lookup("gpt-5-mini-20260101", None).unwrap();
         assert_eq!(family.input, 2.0);
         assert_eq!(pricing.lookup("o-missing", None), None);
+    }
+
+    #[test]
+    fn live_budget_monitor_triggers_on_stop_caps_and_ignores_warn_caps() {
+        let mut run = crate::report::tests::sample();
+        run.workflow.budget = Budget {
+            max_tokens: Some(500),
+            on_exceed: BudgetAction::Warn,
+            ..Budget::default()
+        };
+        assert!(
+            LiveBudgetMonitor::for_stage_with(&run, 0, Pricing::default()).is_none(),
+            "warn caps never abort mid-stream"
+        );
+        run.workflow.budget.on_exceed = BudgetAction::Stop;
+        let monitor = LiveBudgetMonitor::for_stage_with(&run, 0, Pricing::default()).unwrap();
+        // sample() already has prior token spend on stage 0; adding 500 tokens exceeds 500.
+        let reason = monitor
+            .check(Usage {
+                input_tokens: Some(400),
+                output_tokens: Some(200),
+                ..Usage::default()
+            })
+            .unwrap();
+        assert!(reason.starts_with(EXCEEDED), "{reason}");
     }
 }

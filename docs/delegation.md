@@ -428,7 +428,7 @@ Enabled by `delegation.schedules = true`.
   Any edit to the schedule, its workflow, or a trusted config section changes
   the digest, so the schedule waits for approval again. Agents cannot write
   `config_dir()` from a sandbox; unsandboxed, the same-user caveat applies.
-  `model-router schedules approve ID` or `a` on the TUI Runs page approves.
+  `model-router schedules approve ID` or `u` (Schedules dialog) → `a` on the TUI Runs page approves.
 - Firing rechecks approval, trust, and the ceiling. A failed check pauses the
   schedule with the reason.
 - Executors: `mr serve` runs a scheduler thread and drives fired runs as its
@@ -804,10 +804,10 @@ be a leaf task.
 - Native output schema stays on (`--output-schema`, `--json-schema`); both
   follow-up templates pass `Part::Schema`, so the final turn is
   schema-checked.
-- Before Codex ships as a parent, `docs/adapters.md` records, from
-  `codex exec --help` and config docs, whether `codex exec` runs MCP tools
-  without approval under each sandbox setting, and whether Code Mode yields
-  long tool calls (if it does, `mode: "wait"` is capped at 25 s for Codex).
+- Codex parent MCP approval behavior per sandbox mode and Code Mode tool call
+  timeout behavior are tracked in
+  [adapters.md](adapters.md#codex-mcp-approval-and-timeout-verification-status)
+  (offline-verified CLI/config overrides vs items requiring live verification).
 
 ## Records
 

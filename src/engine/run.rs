@@ -266,6 +266,7 @@ impl Run {
                     fan_out: None,
                     inherited: None,
                     discarded: vec![],
+                    skipped_reason: None,
                 })
                 .collect(),
             orphan_groups: vec![],
@@ -316,6 +317,7 @@ impl Run {
             self.updated_at = prev_updated;
             return result;
         }
+        crate::events::emit_run_metrics(self, prev_revision == 0, &self.journal);
         self.journal.clear();
         Ok(())
     }
@@ -330,8 +332,8 @@ impl Run {
             actor,
             reason,
         } = change;
-        let (level, stage_index, enabled) = match target {
-            Target::Run => (Level::Run, None, true),
+        let (level, stage_index, enabled, conditional) = match target {
+            Target::Run => (Level::Run, None, true, false),
             Target::Stage(i)
             | Target::Attempt(i)
             | Target::Candidate(i, _)
@@ -346,7 +348,12 @@ impl Run {
                     Target::Candidate(..) => Level::Candidate,
                     _ => Level::Attempt,
                 };
-                (level, Some(i), stage.enabled)
+                (
+                    level,
+                    Some(i),
+                    stage.enabled,
+                    !stage.when_changed.is_empty(),
+                )
             }
         };
         let (slot, attempt, candidate) = match target {
@@ -382,7 +389,7 @@ impl Run {
             return Ok(());
         }
         ensure!(
-            legal(level, from, to, enabled),
+            legal(level, from, to, enabled, conditional),
             "Illegal {} transition{}{}: {} → {} ({reason})",
             level.label(),
             stage_index.map_or_else(String::new, |i| format!(" in stage {}", i + 1)),
@@ -630,6 +637,7 @@ impl Run {
             state.handoff = None;
             state.waiver = None;
             state.inherited = None;
+            state.skipped_reason = None;
         }
         // A graph's dependents may come earlier in the list.
         if self.graph() {
@@ -645,8 +653,76 @@ impl Run {
                 state.handoff = None;
                 state.waiver = None;
                 state.inherited = None;
+                state.skipped_reason = None;
             }
         }
+        Ok(())
+    }
+
+    /// Evaluates stage `index`'s `when_changed` globs. Returns `Some(reason)`
+    /// when the stage should be skipped in a Git repo because no files changed
+    /// so far in the run match any glob. Outside Git (or if snapshots cannot be
+    /// inspected), returns `None` so the stage runs normally (fail-safe).
+    pub(crate) fn should_skip_when_changed(&self, index: usize) -> Option<String> {
+        let stage = self.workflow.stages.get(index)?;
+        if stage.when_changed.is_empty() {
+            return None;
+        }
+        let from = self.baseline.as_deref()?;
+        if !snapshot::is_repository(&self.workspace) {
+            return None;
+        }
+        let to = match snapshot::current_tree(&self.workspace) {
+            Ok(Some(tree)) => tree,
+            Ok(None) => return None,
+            Err(_) => self.change_range().ok()?.1.to_owned(),
+        };
+        let changed = if from == to {
+            vec![]
+        } else {
+            snapshot::changed_paths(&self.workspace, from, &to).ok()?
+        };
+        let matched = changed.iter().any(|path| {
+            stage
+                .when_changed
+                .iter()
+                .any(|pat| crate::policy::matches_glob(pat, path))
+        });
+        if matched {
+            None
+        } else {
+            Some(format!(
+                "Skipped (when_changed): {} changed file(s) matched none of {}",
+                changed.len(),
+                stage.when_changed.join(", ")
+            ))
+        }
+    }
+
+    /// Enforces `workflow.review_quorum` when > 1: requires at least N distinct
+    /// enabled non-judge review stages to have completed. No-op when unset or 1.
+    pub fn check_review_quorum(&self) -> Result<()> {
+        let required = self.workflow.review_quorum.unwrap_or(1);
+        if required <= 1 {
+            return Ok(());
+        }
+        let mut enabled_reviews = 0usize;
+        let mut passed_reviews = 0usize;
+        for (i, (stage, state)) in self.workflow.stages.iter().zip(&self.stages).enumerate() {
+            if stage.enabled
+                && stage.role == Role::Review
+                && graph::judged_by(&self.workflow, i).is_none()
+            {
+                enabled_reviews += 1;
+                if state.status == Status::Complete {
+                    passed_reviews += 1;
+                }
+            }
+        }
+        ensure!(
+            passed_reviews >= required,
+            "Review quorum not met: {passed_reviews} of {required} distinct review stage(s) passed ({enabled_reviews} enabled). Enable and pass at least {required} distinct review stages"
+        );
         Ok(())
     }
 
@@ -1415,9 +1491,10 @@ impl Run {
                 program: &invocation.program,
             },
         )?;
+        let harness_version = adapters::detected_version(&candidate.harness, &invocation.program);
         storage::write_json_fast(
             &directory.join("command.json"),
-            &serde_json::json!({ "program": invocation.program, "args": invocation.args, "stdin_from": invocation.stdin.as_ref().map(|_| "prompt.md"), "env": invocation.env.iter().map(|(name, _)| name).collect::<Vec<_>>(), "workspace": cwd, "model": candidate.model, "provider": candidate.provider, "effort": candidate.effort, "mode": candidate.mode, "candidate": id, "sandbox": sandbox }),
+            &serde_json::json!({ "program": invocation.program, "harness_version": harness_version, "args": invocation.args, "stdin_from": invocation.stdin.as_ref().map(|_| "prompt.md"), "env": invocation.env.iter().map(|(name, _)| name).collect::<Vec<_>>(), "workspace": cwd, "model": candidate.model, "provider": candidate.provider, "effort": candidate.effort, "mode": candidate.mode, "candidate": id, "sandbox": sandbox }),
         )?;
         let state = self.candidate_mut(index, c);
         state.harness = config.harness.clone();
@@ -1740,6 +1817,14 @@ impl Run {
                 "Candidate {id} modified protected path(s): {detail}. The workspace is unchanged. Choose another candidate, or update workflow protected_paths and retry this stage"
             )));
         }
+        if let Err(error) = crate::policy::scan_patch_file_policies(
+            &self.workflow.policies,
+            &changes.patch,
+            &format!(" in candidate {id}"),
+            "refusing to apply; the workspace is unchanged",
+        ) {
+            return Ok(Err(format!("{error:#}")));
+        }
         let current = snapshot::tree(&self.workspace, &self.directory)
             .context("Snapshot the workspace before applying the candidate")?;
         let scratch = self.stages[fan]
@@ -1953,6 +2038,7 @@ pub(super) fn post_process_candidate(
     base: &str,
     run_id: &str,
     protected_paths: &[String],
+    policies: &[crate::policy::DiffPolicy],
     outcome_result: Result<process::Outcome>,
     journal: &SpawnJournal,
     cancel: &AtomicBool,
@@ -2046,6 +2132,13 @@ pub(super) fn post_process_candidate(
     fanout::write_patch(worktree, base, &tree, &patch)?;
     let (files, added, removed) = fanout::stat(worktree, base, &tree)?;
     let protected = crate::policy::protected_detail(protected_paths, &files);
+    let policy_err = crate::policy::scan_patch_file_policies(
+        policies,
+        &patch,
+        " in candidate",
+        "its worktree is retained",
+    )
+    .err();
     post.tree_after = Some(tree);
     post.changes = Some(CandidateChanges {
         files,
@@ -2060,6 +2153,8 @@ pub(super) fn post_process_candidate(
                 "Candidate modified protected path(s): {detail}. Its worktree is retained; update workflow protected_paths or retry the stage"
             ),
         ));
+    } else if let Some(error) = policy_err {
+        post.stop = Some((Status::Blocked, format!("{error:#}")));
     }
     Ok(post)
 }

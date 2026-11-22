@@ -186,6 +186,20 @@ pub struct Stage {
     /// The stage's agent may delegate tasks; see `delegation`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delegation: Option<crate::delegation::Delegation>,
+    /// Extra repository-relative paths or globs whose contents are injected
+    /// into this stage's prompt, after the workflow's `context_files`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub context_files: Vec<String>,
+    /// Transient retry settings overriding the workflow's `retry` when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<Retry>,
+    /// Lifecycle hooks scoped to this stage; require project trust.
+    #[serde(default, skip_serializing_if = "Hooks::is_empty")]
+    pub hooks: Hooks,
+    /// Repo-relative globs: in a Git repo, skip this stage if no files changed
+    /// so far in the run match any pattern. Outside Git, runs normally.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub when_changed: Vec<String>,
 }
 fn is_true(value: &bool) -> bool {
     *value
@@ -205,6 +219,10 @@ impl Stage {
         self.sandbox
             .unwrap_or(workflow.sandbox_default)
             .resolve(self.role)
+    }
+    /// Transient retry settings for this stage: its own override, else the workflow's.
+    pub fn effective_retry(&self, workflow: &Workflow) -> Retry {
+        self.retry.unwrap_or(workflow.retry)
     }
 }
 
@@ -308,7 +326,150 @@ impl Default for Stage {
             after: vec![],
             fan_out: None,
             delegation: None,
+            context_files: vec![],
+            retry: None,
+            hooks: Hooks::default(),
+            when_changed: vec![],
         }
+    }
+}
+
+/// Automatic transient retry policy with capped exponential backoff.
+/// Only unattended stage failures matching transient provider errors retry;
+/// the same harness and model are always reused (no silent model substitution).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Retry {
+    /// Maximum automatic retry attempts after the initial failure (0..=5, default 0).
+    pub max_attempts: u32,
+    /// Initial backoff delay in seconds before the first retry (default 5).
+    pub base_delay_seconds: u64,
+    /// Maximum capped backoff delay in seconds (default 60).
+    pub max_delay_seconds: u64,
+}
+impl Default for Retry {
+    fn default() -> Self {
+        Self {
+            max_attempts: 0,
+            base_delay_seconds: 5,
+            max_delay_seconds: 60,
+        }
+    }
+}
+impl Retry {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+    /// Backoff delay for 1-based `retry_number` (1, 2, …):
+    /// `min(base_delay_seconds * 2^(retry_number - 1), max_delay_seconds)`.
+    pub fn delay_for(&self, retry_number: u32) -> std::time::Duration {
+        let shift = retry_number.saturating_sub(1).min(16);
+        let factor = 1u64 << shift;
+        let secs = self
+            .base_delay_seconds
+            .saturating_mul(factor)
+            .min(self.max_delay_seconds);
+        std::time::Duration::from_secs(secs)
+    }
+    fn validate(&self, scope: &str) -> Result<()> {
+        ensure!(
+            self.max_attempts <= 5,
+            "{scope} retry max_attempts must be 0–5"
+        );
+        ensure!(
+            self.base_delay_seconds <= 3600,
+            "{scope} retry base_delay_seconds must be at most 3600"
+        );
+        ensure!(
+            self.max_delay_seconds <= 3600,
+            "{scope} retry max_delay_seconds must be at most 3600"
+        );
+        Ok(())
+    }
+}
+
+/// A lifecycle hook command executed as an argument vector; no shell evaluates it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Hook {
+    pub command: Vec<String>,
+    pub timeout_seconds: u64,
+}
+impl Default for Hook {
+    fn default() -> Self {
+        Self {
+            command: vec![],
+            timeout_seconds: 120,
+        }
+    }
+}
+
+/// Lifecycle hooks on a workflow or stage. All hooks require project trust.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Hooks {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub before_stage: Vec<Hook>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after_stage: Vec<Hook>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub before_ship: Vec<Hook>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_failure: Vec<Hook>,
+}
+impl Hooks {
+    pub fn is_empty(&self) -> bool {
+        self.before_stage.is_empty()
+            && self.after_stage.is_empty()
+            && self.before_ship.is_empty()
+            && self.on_failure.is_empty()
+    }
+    pub fn for_event(&self, event: crate::hooks::HookEvent) -> &[Hook] {
+        match event {
+            crate::hooks::HookEvent::BeforeStage => &self.before_stage,
+            crate::hooks::HookEvent::AfterStage => &self.after_stage,
+            crate::hooks::HookEvent::BeforeShip => &self.before_ship,
+            crate::hooks::HookEvent::OnFailure => &self.on_failure,
+        }
+    }
+    pub fn all_entries(&self) -> impl Iterator<Item = (crate::hooks::HookEvent, &Hook)> {
+        use crate::hooks::HookEvent::*;
+        self.before_stage
+            .iter()
+            .map(|h| (BeforeStage, h))
+            .chain(self.after_stage.iter().map(|h| (AfterStage, h)))
+            .chain(self.before_ship.iter().map(|h| (BeforeShip, h)))
+            .chain(self.on_failure.iter().map(|h| (OnFailure, h)))
+    }
+    fn validate(&self, scope: &str) -> Result<()> {
+        for (event, list) in [
+            ("before_stage", &self.before_stage),
+            ("after_stage", &self.after_stage),
+            ("before_ship", &self.before_ship),
+            ("on_failure", &self.on_failure),
+        ] {
+            ensure!(
+                list.len() <= 16,
+                "{scope} {event} hooks can have at most 16 commands"
+            );
+            for hook in list {
+                ensure!(
+                    hook.command
+                        .first()
+                        .is_some_and(|program| !program.trim().is_empty()),
+                    "{scope} has a {event} hook without a command"
+                );
+                ensure!(
+                    !hook.command.iter().any(|arg| arg.contains('\0')),
+                    "{scope} {event} hook commands cannot contain NUL"
+                );
+                ensure!(
+                    hook.timeout_seconds > 0,
+                    "{scope} needs a positive {event} hook timeout"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -400,6 +561,40 @@ impl Default for Check {
     }
 }
 
+/// Default total bytes of prior stage handoffs carried in a downstream prompt.
+pub const DEFAULT_HANDOFF_BUDGET_BYTES: usize = 14_000;
+/// Default maximum bytes of any single prior stage handoff in a downstream prompt.
+pub const DEFAULT_HANDOFF_EACH_BYTES: usize = 5_000;
+/// Minimum allowed value for `handoff_budget_bytes` and `handoff_each_bytes`.
+pub const MIN_HANDOFF_BUDGET_BYTES: usize = 1_024;
+/// Maximum allowed value for `handoff_budget_bytes` and `handoff_each_bytes`.
+pub const MAX_HANDOFF_BUDGET_BYTES: usize = 200_000;
+/// Maximum number of context files (and patterns per list) injected into a prompt.
+pub const MAX_CONTEXT_FILES: usize = 32;
+/// Maximum total bytes of context file contents injected into a prompt (32 KiB).
+pub const MAX_CONTEXT_BYTES: usize = 32 * 1024;
+
+/// Whether `pattern` is a valid repo-relative path or glob for `context_files`:
+/// non-empty, no NUL or backslashes, not absolute or `~/`, no trailing `/`,
+/// and no `.`, `..`, `.git`, or `.model-router` segments.
+pub fn is_valid_context_pattern(pattern: &str) -> bool {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty()
+        || pattern.contains('\0')
+        || pattern.contains('\\')
+        || trimmed.starts_with('/')
+        || trimmed.starts_with("~/")
+        || trimmed.ends_with('/')
+    {
+        return false;
+    }
+    let segments: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
+    !segments.is_empty()
+        && !segments
+            .iter()
+            .any(|&seg| matches!(seg, "." | ".." | ".git" | ".model-router"))
+}
+
 /// Unknown fields here are warnings (see `unknown_fields`), so a newer
 /// binary's additions do not break older ones; stages and checks stay strict.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -426,6 +621,31 @@ pub struct Workflow {
     /// follow-up asking only for valid handoff JSON before failing.
     #[serde(default, skip_serializing_if = "is_false")]
     pub handoff_repair: bool,
+    /// Total bytes of prior stage handoffs carried in a downstream prompt.
+    /// Unset uses `DEFAULT_HANDOFF_BUDGET_BYTES` (14000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_budget_bytes: Option<usize>,
+    /// Maximum bytes of any single prior stage handoff in a downstream prompt.
+    /// Unset uses `DEFAULT_HANDOFF_EACH_BYTES` (5000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_each_bytes: Option<usize>,
+    /// Repository-relative paths or globs whose contents are injected into
+    /// every stage's prompt (bounded, workspace-only, UTF-8 text).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_files: Vec<String>,
+    /// Default transient retry policy for unattended stages in this workflow.
+    #[serde(default, skip_serializing_if = "Retry::is_empty")]
+    pub retry: Retry,
+    /// Workflow-level lifecycle hooks; require project trust.
+    #[serde(default, skip_serializing_if = "Hooks::is_empty")]
+    pub hooks: Hooks,
+    /// Declarative diff policies (`block` and `advise`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policies: Vec<crate::policy::DiffPolicy>,
+    /// Minimum distinct enabled review stages that must pass before the
+    /// workflow considers review satisfied (default None / 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_quorum: Option<usize>,
 }
 fn two() -> u32 {
     2
@@ -446,7 +666,36 @@ impl Workflow {
             budget: Budget::default(),
             protected_paths: vec![],
             handoff_repair: false,
+            handoff_budget_bytes: None,
+            handoff_each_bytes: None,
+            context_files: vec![],
+            retry: Retry::default(),
+            hooks: Hooks::default(),
+            policies: vec![],
+            review_quorum: None,
         }
+    }
+    /// Effective total byte budget for prior stage handoffs in downstream prompts.
+    pub fn effective_handoff_budget_bytes(&self) -> usize {
+        self.handoff_budget_bytes
+            .unwrap_or(DEFAULT_HANDOFF_BUDGET_BYTES)
+            .clamp(MIN_HANDOFF_BUDGET_BYTES, MAX_HANDOFF_BUDGET_BYTES)
+    }
+    /// Effective per-stage byte budget for prior handoffs in downstream prompts.
+    pub fn effective_handoff_each_bytes(&self) -> usize {
+        let total = self.effective_handoff_budget_bytes();
+        self.handoff_each_bytes
+            .unwrap_or(DEFAULT_HANDOFF_EACH_BYTES)
+            .clamp(MIN_HANDOFF_BUDGET_BYTES, MAX_HANDOFF_BUDGET_BYTES)
+            .min(total)
+    }
+    /// Workflow hooks followed by stage hooks (when `stage` is Some) for `event`.
+    pub fn hooks_for(&self, stage: Option<&Stage>, event: crate::hooks::HookEvent) -> Vec<Hook> {
+        let mut combined = self.hooks.for_event(event).to_vec();
+        if let Some(stage) = stage {
+            combined.extend(stage.hooks.for_event(event).iter().cloned());
+        }
+        combined
     }
     /// Appends the review summary unless a stage already has the summary role.
     /// Run once, by the v1→v2 migration: deleting the stage later opts out.
@@ -487,19 +736,19 @@ impl Workflow {
 }
 impl Default for Workflow {
     fn default() -> Self {
-        Self { name: "Feature development".into(), max_repair_passes: 2, sandbox_default: Sandbox::Off, budget: Budget::default(), max_parallel: 2, protected_paths: vec![], handoff_repair: false, stages: vec![
-        Stage { id: "research".into(), name: "Investigate".into(), role: Role::Research, model: "gpt-6-astra".into(),
+        Self { name: "Feature development".into(), max_repair_passes: 2, sandbox_default: Sandbox::Off, budget: Budget::default(), max_parallel: 2, protected_paths: vec![], handoff_repair: false, handoff_budget_bytes: None, handoff_each_bytes: None, context_files: vec![], retry: Retry::default(), hooks: Hooks::default(), policies: vec![], review_quorum: None, stages: vec![
+        Stage { id: "research".into(), name: "Investigate".into(), role: Role::Research,
             instructions: "Investigate the task and relevant project files. Explain the root cause or requirements, cite evidence, and propose a concrete implementation plan. Do not change project code.".into(), ..Stage::default() },
         Stage { id: "implement".into(), name: "Implement".into(), role: Role::Implementation, harness: "claude".into(), model: "sonnet".into(), mode: Mode::Interactive,
             instructions: "Implement the task using the prior findings. Follow project conventions, run appropriate checks, and report what changed and any remaining issues.".into(), ..Stage::default() },
-        Stage { id: "review".into(), name: "Review (optional)".into(), role: Role::Review, enabled: false, model: "gpt-6-astra".into(),
+        Stage { id: "review".into(), name: "Review (optional)".into(), role: Role::Review, enabled: false,
             instructions: "Review the implementation and test evidence. Do not modify code. Distinguish blocking correctness issues and failed required checks from advisory suggestions. Give an explicit pass or needs_changes verdict.".into(), ..Stage::default() },
         crate::presets::stage("summary").build(),
     ] }
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CustomAdapter {
     pub command: String,
@@ -693,6 +942,35 @@ impl CustomAdapter {
 /// The config format this binary writes. Older files migrate on load.
 pub const VERSION: u32 = 2;
 
+/// Entries layered from the user's global `config.toml` underneath a project
+/// `.model-router.toml`. Kept only for keys not defined by the project; those
+/// entries stay trusted and are omitted when saving the project config unless
+/// edited locally. Never accepted from TOML.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GlobalLayer {
+    pub adapters: BTreeMap<String, CustomAdapter>,
+    pub providers: BTreeMap<String, Provider>,
+    pub delegates: BTreeMap<String, crate::delegation::Delegate>,
+    pub pricing: BTreeMap<String, crate::cost::Price>,
+}
+impl GlobalLayer {
+    pub fn is_empty(&self) -> bool {
+        self.adapters.is_empty()
+            && self.providers.is_empty()
+            && self.delegates.is_empty()
+            && self.pricing.is_empty()
+    }
+    pub fn has_adapter(&self, name: &str, adapter: &CustomAdapter) -> bool {
+        self.adapters.get(name) == Some(adapter)
+    }
+    pub fn has_provider(&self, name: &str, provider: &Provider) -> bool {
+        self.providers.get(name) == Some(provider)
+    }
+    pub fn has_delegate(&self, name: &str, delegate: &crate::delegation::Delegate) -> bool {
+        self.delegates.get(name) == Some(delegate)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -708,12 +986,18 @@ pub struct Settings {
     /// Named delegate targets for stages' `delegation`.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub delegates: BTreeMap<String, crate::delegation::Delegate>,
+    /// Optional harness version pins checked by `doctor` (e.g. `codex = "0.167.0"` or `">=0.160.0"`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub harness_versions: BTreeMap<String, String>,
     /// Load notes: unknown fields, migrations, effort levels, trust. Not saved.
     #[serde(skip)]
     pub warnings: Vec<String>,
     /// Sections an untrusted project config had ignored; restored on save.
     #[serde(skip)]
     pub ignored: Option<Box<crate::trust::Ignored>>,
+    /// Global entries layered underneath a project config. Never accepted from TOML.
+    #[serde(skip)]
+    pub global_layer: Option<Box<GlobalLayer>>,
     /// Explicit approval source selected by the caller. Never accepted from TOML.
     #[serde(skip)]
     pub explicit_config: Option<PathBuf>,
@@ -730,8 +1014,10 @@ impl Default for Settings {
             providers: BTreeMap::new(),
             pricing: BTreeMap::new(),
             delegates: BTreeMap::new(),
+            harness_versions: BTreeMap::new(),
             warnings: vec![],
             ignored: None,
+            global_layer: None,
             explicit_config: None,
             loaded_approval: None,
         }
@@ -813,6 +1099,9 @@ fn known_keys() -> &'static KnownKeys {
                 ..crate::delegation::Delegate::default()
             },
         );
+        sample
+            .harness_versions
+            .insert("codex".into(), "0.167.0".into());
         let budget = keys(&Budget {
             max_usd: Some(1.0),
             max_tokens: Some(1),
@@ -846,6 +1135,28 @@ fn known_keys() -> &'static KnownKeys {
             },
             protected_paths: vec!["x".into()],
             handoff_repair: true,
+            handoff_budget_bytes: Some(DEFAULT_HANDOFF_BUDGET_BYTES),
+            handoff_each_bytes: Some(DEFAULT_HANDOFF_EACH_BYTES),
+            context_files: vec!["x".into()],
+            retry: Retry {
+                max_attempts: 1,
+                ..Retry::default()
+            },
+            hooks: Hooks {
+                before_stage: vec![Hook {
+                    command: vec!["true".into()],
+                    ..Hook::default()
+                }],
+                ..Hooks::default()
+            },
+            policies: vec![crate::policy::DiffPolicy {
+                name: "p".into(),
+                action: crate::policy::PolicyAction::Block,
+                pattern: "x".into(),
+                paths: vec!["*".into()],
+                message: "m".into(),
+            }],
+            review_quorum: Some(2),
             ..Workflow::default()
         });
         KnownKeys {
@@ -986,6 +1297,12 @@ impl Settings {
             workflow
                 .budget
                 .validate(&format!("Workflow {}", workflow.name))?;
+            workflow
+                .retry
+                .validate(&format!("Workflow {}", workflow.name))?;
+            workflow
+                .hooks
+                .validate(&format!("Workflow {}", workflow.name))?;
             ensure!(
                 workflow.protected_paths.len() <= 64
                     && workflow
@@ -996,9 +1313,100 @@ impl Settings {
                 workflow.name
             );
             ensure!(
+                workflow.policies.len() <= 64,
+                "Workflow {} can have at most 64 policies",
+                workflow.name
+            );
+            for policy in &workflow.policies {
+                ensure!(
+                    !policy.name.trim().is_empty() && !policy.name.contains('\0'),
+                    "Workflow {} policy needs a non-empty name without NUL",
+                    workflow.name
+                );
+                ensure!(
+                    !policy.message.trim().is_empty() && !policy.message.contains('\0'),
+                    "Workflow {} policy {} needs a non-empty message without NUL",
+                    workflow.name,
+                    policy.name
+                );
+                ensure!(
+                    !policy.pattern.contains('\0') && policy.pattern.len() <= 512,
+                    "Workflow {} policy {} pattern must be at most 512 bytes without NUL",
+                    workflow.name,
+                    policy.name
+                );
+                ensure!(
+                    policy.paths.len() <= 64
+                        && policy
+                            .paths
+                            .iter()
+                            .all(|p| !p.trim().is_empty() && !p.contains('\0')),
+                    "Workflow {} policy {} paths must contain at most 64 non-empty patterns without NUL",
+                    workflow.name,
+                    policy.name
+                );
+                match policy.action {
+                    crate::policy::PolicyAction::Block => {
+                        ensure!(
+                            !policy.pattern.is_empty(),
+                            "Workflow {} block policy {} requires a non-empty pattern",
+                            workflow.name,
+                            policy.name
+                        );
+                    }
+                    crate::policy::PolicyAction::Advise => {
+                        ensure!(
+                            !policy.pattern.is_empty() || !policy.paths.is_empty(),
+                            "Workflow {} advise policy {} requires a pattern or at least one path glob",
+                            workflow.name,
+                            policy.name
+                        );
+                    }
+                }
+            }
+            ensure!(
+                workflow.review_quorum.is_none_or(|n| (1..=64).contains(&n)),
+                "Workflow {} review_quorum must be 1–64",
+                workflow.name
+            );
+            ensure!(
                 (1..=16).contains(&workflow.max_parallel),
                 "Workflow {} max_parallel must be 1–16",
                 workflow.name
+            );
+            if let Some(total) = workflow.handoff_budget_bytes {
+                ensure!(
+                    (MIN_HANDOFF_BUDGET_BYTES..=MAX_HANDOFF_BUDGET_BYTES).contains(&total),
+                    "Workflow {} handoff_budget_bytes must be {}–{}",
+                    workflow.name,
+                    MIN_HANDOFF_BUDGET_BYTES,
+                    MAX_HANDOFF_BUDGET_BYTES
+                );
+            }
+            if let Some(each) = workflow.handoff_each_bytes {
+                ensure!(
+                    (MIN_HANDOFF_BUDGET_BYTES..=MAX_HANDOFF_BUDGET_BYTES).contains(&each),
+                    "Workflow {} handoff_each_bytes must be {}–{}",
+                    workflow.name,
+                    MIN_HANDOFF_BUDGET_BYTES,
+                    MAX_HANDOFF_BUDGET_BYTES
+                );
+                let total = workflow.effective_handoff_budget_bytes();
+                ensure!(
+                    each <= total,
+                    "Workflow {} handoff_each_bytes ({each}) cannot exceed handoff_budget_bytes ({total})",
+                    workflow.name
+                );
+            }
+            ensure!(
+                workflow.context_files.len() <= MAX_CONTEXT_FILES
+                    && workflow
+                        .context_files
+                        .iter()
+                        .all(|p| is_valid_context_pattern(p)),
+                "Workflow {} context_files must contain at most {} repo-relative paths or globs outside .git and .model-router",
+                workflow.name,
+                MAX_CONTEXT_FILES
             );
             let mut ids = HashSet::new();
             for stage in &workflow.stages {
@@ -1060,6 +1468,19 @@ impl Settings {
                     stage.harness
                 );
                 stage.budget.validate(&format!("Stage {}", stage.name))?;
+                if let Some(retry) = &stage.retry {
+                    retry.validate(&format!("Stage {}", stage.name))?;
+                }
+                stage.hooks.validate(&format!("Stage {}", stage.name))?;
+                ensure!(
+                    stage.when_changed.len() <= 64
+                        && stage
+                            .when_changed
+                            .iter()
+                            .all(|p| !p.trim().is_empty() && !p.contains('\0')),
+                    "Stage {} when_changed must contain at most 64 non-empty patterns without NUL",
+                    stage.name
+                );
                 ensure!(
                     stage.checks.len() <= 16,
                     "Stage {} can have at most 16 checks",
@@ -1072,6 +1493,16 @@ impl Settings {
                         }),
                     "Stage {} sandbox_writable paths must be absolute or start with ~/ (at most 32)",
                     stage.name
+                );
+                ensure!(
+                    stage.context_files.len() <= MAX_CONTEXT_FILES
+                        && stage
+                            .context_files
+                            .iter()
+                            .all(|p| is_valid_context_pattern(p)),
+                    "Stage {} context_files must contain at most {} repo-relative paths or globs outside .git and .model-router",
+                    stage.name,
+                    MAX_CONTEXT_FILES
                 );
                 for check in &stage.checks {
                     ensure!(
@@ -1175,6 +1606,14 @@ impl Settings {
                 "Pricing for {model} must use finite, non-negative USD per million tokens"
             );
         }
+        for (harness, pin) in &self.harness_versions {
+            ensure!(
+                is_id(harness),
+                "harness_versions key {harness:?} must be a harness name (letters, digits, '-' and '_')"
+            );
+            crate::doctor::validate_version_pin(pin)
+                .with_context(|| format!("Invalid version pin for harness {harness}"))?;
+        }
         Ok(())
     }
 
@@ -1190,10 +1629,16 @@ impl Settings {
     }
 
     /// Saves at the current version. Sections ignored because the project
-    /// was untrusted are written back unchanged.
+    /// was untrusted are written back unchanged. Unmodified entries layered
+    /// from the user's global `config.toml` are omitted so saving a project
+    /// config never copies global definitions into the repository.
     pub fn save(&self, path: &Path) -> Result<()> {
         let restored = crate::trust::restore_cow(self);
-        if restored.version == VERSION {
+        let needs_strip = restored
+            .global_layer
+            .as_ref()
+            .is_some_and(|layer| !layer.is_empty());
+        if restored.version == VERSION && !needs_strip {
             restored.validate()?;
             return crate::storage::atomic_write(
                 path,
@@ -1203,6 +1648,18 @@ impl Settings {
         let mut saved = restored.into_owned();
         saved.version = VERSION;
         saved.validate()?;
+        if let Some(layer) = saved.global_layer.take() {
+            saved
+                .adapters
+                .retain(|k, v| layer.adapters.get(k) != Some(v));
+            saved
+                .providers
+                .retain(|k, v| layer.providers.get(k) != Some(v));
+            saved
+                .delegates
+                .retain(|k, v| layer.delegates.get(k) != Some(v));
+            saved.pricing.retain(|k, v| layer.pricing.get(k) != Some(v));
+        }
         crate::storage::atomic_write(path, toml::to_string_pretty(&saved)?.as_bytes())
     }
 
@@ -1338,8 +1795,41 @@ fn read_config_file(path: &Path, required: bool) -> Result<Option<String>> {
     Ok(Some(text))
 }
 
-/// Loads `explicit`, else the project's config, else the global one, and
-/// checks the project's trust.
+fn layer_global(settings: &mut Settings, global: Settings) {
+    use std::collections::btree_map::Entry;
+    let mut layer = GlobalLayer::default();
+    for (name, adapter) in global.adapters {
+        if let Entry::Vacant(slot) = settings.adapters.entry(name) {
+            layer.adapters.insert(slot.key().clone(), adapter.clone());
+            slot.insert(adapter);
+        }
+    }
+    for (name, provider) in global.providers {
+        if let Entry::Vacant(slot) = settings.providers.entry(name) {
+            layer.providers.insert(slot.key().clone(), provider.clone());
+            slot.insert(provider);
+        }
+    }
+    for (name, delegate) in global.delegates {
+        if let Entry::Vacant(slot) = settings.delegates.entry(name) {
+            layer.delegates.insert(slot.key().clone(), delegate.clone());
+            slot.insert(delegate);
+        }
+    }
+    for (model, price) in global.pricing {
+        if let Entry::Vacant(slot) = settings.pricing.entry(model) {
+            layer.pricing.insert(slot.key().clone(), price);
+            slot.insert(price);
+        }
+    }
+    if !layer.is_empty() {
+        settings.global_layer = Some(Box::new(layer));
+    }
+}
+
+/// Loads `explicit`, else the project's config (with global `[providers]`,
+/// `[adapters]`, `[delegates]`, and `[pricing]` layered underneath), else the
+/// global config, and checks the project's trust.
 pub fn load_config(project: &Path, explicit: Option<&Path>) -> Result<Loaded> {
     let project_path = project.join(".model-router.toml");
     let global = config_dir().join("config.toml");
@@ -1350,7 +1840,7 @@ pub fn load_config(project: &Path, explicit: Option<&Path>) -> Result<Loaded> {
     } else if let Some(text) = read_config_file(&project_path, false)? {
         (Some(project_path.clone()), Origin::Project, Some(text))
     } else if let Some(text) = read_config_file(&global, false)? {
-        (Some(global), Origin::Global, Some(text))
+        (Some(global.clone()), Origin::Global, Some(text))
     } else {
         (None, Origin::Default, None)
     };
@@ -1360,6 +1850,13 @@ pub fn load_config(project: &Path, explicit: Option<&Path>) -> Result<Loaded> {
         }
         _ => Settings::default(),
     };
+    if origin == Origin::Project {
+        if let Some(global_text) = read_config_file(&global, false)? {
+            let global_settings =
+                parse(&global_text).with_context(|| format!("Parse {}", global.display()))?;
+            layer_global(&mut settings, global_settings);
+        }
+    }
     settings.explicit_config = explicit.map(Path::to_path_buf);
     settings.validate()?;
     settings.loaded_approval = Some(crate::trust::settings_approval(&settings));
@@ -1723,5 +2220,372 @@ checks = [
             let err = load_config(dir.path(), None).unwrap_err();
             assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
         }
+    }
+
+    #[test]
+    fn starter_workflow_and_presets_use_native_default_model_instead_of_gpt6_astra() {
+        let starter = Workflow::default();
+        for stage in &starter.stages {
+            assert_ne!(stage.model, "gpt-6-astra", "stage {}", stage.id);
+        }
+        assert!(starter.stages[0].model.is_empty());
+        assert!(starter.stages[2].model.is_empty());
+        assert!(starter.stages[3].model.is_empty());
+        for preset in crate::presets::STAGES {
+            let built = preset.build();
+            assert_ne!(built.model, "gpt-6-astra", "stage preset {}", preset.key);
+        }
+        for preset in crate::presets::WORKFLOWS {
+            let built = preset.build();
+            for stage in &built.stages {
+                assert_ne!(
+                    stage.model, "gpt-6-astra",
+                    "workflow preset {} stage {}",
+                    preset.key, stage.id
+                );
+                if let Some(fan) = &stage.fan_out {
+                    for cand in &fan.candidates {
+                        assert_ne!(
+                            cand.model, "gpt-6-astra",
+                            "workflow preset {} candidate {}",
+                            preset.key, cand.harness
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn handoff_budget_and_context_files_parse_validate_roundtrip_and_stay_out_of_default() {
+        let plain = toml::to_string_pretty(&Settings::default()).unwrap();
+        for field in [
+            "handoff_budget_bytes",
+            "handoff_each_bytes",
+            "context_files",
+        ] {
+            assert!(!plain.contains(field), "{field}: {plain}");
+        }
+        let text = CHECKS
+            .replace(
+                "name = \"Verify\"",
+                "name = \"Verify\"\nhandoff_budget_bytes = 24000\nhandoff_each_bytes = 8000\ncontext_files = [\"AGENTS.md\", \"docs/*.md\"]",
+            )
+            .replace(
+                "role = \"test\"",
+                "role = \"test\"\ncontext_files = [\"src/**/*.rs\"]",
+            );
+        let settings = parse(&text).unwrap();
+        settings.validate().unwrap();
+        assert!(settings.warnings.is_empty(), "{:?}", settings.warnings);
+        let wf = &settings.workflows[0];
+        assert_eq!(wf.handoff_budget_bytes, Some(24_000));
+        assert_eq!(wf.handoff_each_bytes, Some(8_000));
+        assert_eq!(wf.effective_handoff_budget_bytes(), 24_000);
+        assert_eq!(wf.effective_handoff_each_bytes(), 8_000);
+        assert_eq!(wf.context_files, ["AGENTS.md", "docs/*.md"]);
+        assert_eq!(wf.stages[0].context_files, ["src/**/*.rs"]);
+        let roundtrip = parse(&toml::to_string_pretty(&settings).unwrap()).unwrap();
+        assert_eq!(roundtrip.workflows[0].handoff_budget_bytes, Some(24_000));
+        assert_eq!(roundtrip.workflows[0].handoff_each_bytes, Some(8_000));
+        assert_eq!(
+            roundtrip.workflows[0].context_files,
+            ["AGENTS.md", "docs/*.md"]
+        );
+        assert_eq!(
+            roundtrip.workflows[0].stages[0].context_files,
+            ["src/**/*.rs"]
+        );
+
+        // Lowering only handoff_budget_bytes clamps effective per-stage budget cleanly.
+        let mut small_total = parse(CHECKS).unwrap();
+        small_total.workflows[0].handoff_budget_bytes = Some(2_048);
+        small_total.validate().unwrap();
+        assert_eq!(
+            small_total.workflows[0].effective_handoff_each_bytes(),
+            2_048
+        );
+
+        let invalid = |edit: fn(&mut Settings)| {
+            let mut s = parse(CHECKS).unwrap();
+            edit(&mut s);
+            s.validate().unwrap_err().to_string()
+        };
+        assert!(
+            invalid(|s| s.workflows[0].handoff_budget_bytes = Some(512))
+                .contains("handoff_budget_bytes")
+        );
+        assert!(
+            invalid(|s| s.workflows[0].handoff_budget_bytes = Some(250_000))
+                .contains("handoff_budget_bytes")
+        );
+        assert!(
+            invalid(|s| s.workflows[0].handoff_each_bytes = Some(512))
+                .contains("handoff_each_bytes")
+        );
+        assert!(
+            invalid(|s| s.workflows[0].handoff_each_bytes = Some(250_000))
+                .contains("handoff_each_bytes")
+        );
+        assert!(
+            invalid(|s| s.workflows[0].handoff_each_bytes = Some(16_000)).contains("cannot exceed")
+        );
+        assert!(
+            invalid(|s| {
+                s.workflows[0].handoff_budget_bytes = Some(4_000);
+                s.workflows[0].handoff_each_bytes = Some(5_000);
+            })
+            .contains("cannot exceed")
+        );
+
+        for bad in [
+            "",
+            "   ",
+            "/etc/passwd",
+            "~/secret.txt",
+            "../outside.md",
+            "docs/../secret.md",
+            "./AGENTS.md",
+            ".git/config",
+            ".model-router/runs/1/run.json",
+            "nested/.git/HEAD",
+            "docs/",
+            "a\\b.md",
+            "a\0b.md",
+        ] {
+            let mut s = parse(CHECKS).unwrap();
+            s.workflows[0].context_files = vec![bad.into()];
+            assert!(s.validate().is_err(), "workflow accepted {bad:?}");
+            let mut s = parse(CHECKS).unwrap();
+            s.workflows[0].stages[0].context_files = vec![bad.into()];
+            assert!(s.validate().is_err(), "stage accepted {bad:?}");
+        }
+        assert!(
+            invalid(|s| s.workflows[0].context_files = vec!["a.md".into(); MAX_CONTEXT_FILES + 1])
+                .contains("context_files")
+        );
+        assert!(
+            invalid(|s| {
+                s.workflows[0].stages[0].context_files = vec!["a.md".into(); MAX_CONTEXT_FILES + 1];
+            })
+            .contains("context_files")
+        );
+    }
+
+    #[test]
+    fn global_layering_prefers_project_keys_and_save_omits_unmodified_global_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join(".model-router.toml");
+        let global = parse(
+            r#"
+version = 2
+
+[adapters.global_only]
+command = "global-bin"
+
+[adapters.shared]
+command = "global-shared-bin"
+
+[providers.global_gw]
+base_url = "https://global.example/v1"
+api_key_env = "GLOBAL_KEY"
+
+[providers.shared_gw]
+base_url = "https://global-shared.example/v1"
+
+[delegates.global_del]
+harness = "codex"
+model = "global-m"
+
+[delegates.shared_del]
+harness = "codex"
+model = "global-shared-m"
+
+[pricing."global-model"]
+input = 1.0
+output = 2.0
+
+[pricing."shared-model"]
+input = 1.0
+output = 2.0
+"#,
+        )
+        .unwrap();
+
+        let mut project = parse(
+            r#"
+version = 2
+
+[adapters.shared]
+command = "project-shared-bin"
+
+[providers.shared_gw]
+base_url = "https://project-shared.example/v1"
+
+[delegates.shared_del]
+harness = "claude"
+model = "project-shared-m"
+
+[pricing."shared-model"]
+input = 5.0
+output = 10.0
+
+[[workflows]]
+name = "Layered"
+[[workflows.stages]]
+id = "s1"
+name = "Stage 1"
+harness = "global_only"
+provider = "global_gw"
+model = "global-model"
+"#,
+        )
+        .unwrap();
+
+        layer_global(&mut project, global);
+        project.validate().unwrap();
+
+        // Project keys win on collision; non-colliding global keys are layered underneath.
+        assert_eq!(project.adapters["global_only"].command, "global-bin");
+        assert_eq!(project.adapters["shared"].command, "project-shared-bin");
+        assert_eq!(
+            project.providers["global_gw"].base_url,
+            "https://global.example/v1"
+        );
+        assert_eq!(
+            project.providers["shared_gw"].base_url,
+            "https://project-shared.example/v1"
+        );
+        assert_eq!(project.delegates["global_del"].model, "global-m");
+        assert_eq!(project.delegates["shared_del"].model, "project-shared-m");
+        assert_eq!(project.pricing["global-model"].input, 1.0);
+        assert_eq!(project.pricing["shared-model"].input, 5.0);
+
+        // Only global-only keys live in global_layer; shadowed keys belong to project.
+        let layer = project.global_layer.as_ref().unwrap();
+        assert!(layer.adapters.contains_key("global_only"));
+        assert!(!layer.adapters.contains_key("shared"));
+        assert!(layer.providers.contains_key("global_gw"));
+        assert!(!layer.providers.contains_key("shared_gw"));
+        assert!(layer.delegates.contains_key("global_del"));
+        assert!(!layer.delegates.contains_key("shared_del"));
+        assert!(layer.pricing.contains_key("global-model"));
+        assert!(!layer.pricing.contains_key("shared-model"));
+
+        // Even after ignoring untrusted project sections, saving restores project
+        // sections and omits unmodified global entries without failing validation.
+        crate::trust::ignore(&mut project);
+        assert_eq!(project.adapters["global_only"].command, "global-bin");
+        assert_eq!(
+            project.adapters["shared"].command,
+            crate::trust::BLOCKED_COMMAND
+        );
+        project.save(&project_path).unwrap();
+
+        let saved_raw = fs::read_to_string(&project_path).unwrap();
+        let saved = parse(&saved_raw).unwrap();
+        assert!(!saved.adapters.contains_key("global_only"), "{saved_raw}");
+        assert!(!saved.providers.contains_key("global_gw"), "{saved_raw}");
+        assert!(!saved.delegates.contains_key("global_del"), "{saved_raw}");
+        assert!(!saved.pricing.contains_key("global-model"), "{saved_raw}");
+        assert_eq!(saved.adapters["shared"].command, "project-shared-bin");
+        assert_eq!(
+            saved.providers["shared_gw"].base_url,
+            "https://project-shared.example/v1"
+        );
+        assert_eq!(saved.delegates["shared_del"].model, "project-shared-m");
+        assert_eq!(saved.pricing["shared-model"].input, 5.0);
+    }
+
+    #[test]
+    fn retry_hooks_policies_when_changed_and_quorum_roundtrip_and_validate() {
+        let toml = r#"
+version = 2
+[[workflows]]
+name = "Resilient"
+review_quorum = 2
+retry = { max_attempts = 3, base_delay_seconds = 2, max_delay_seconds = 10 }
+[workflows.hooks]
+before_stage = [{ command = ["echo", "wf-before"], timeout_seconds = 30 }]
+before_ship = [{ command = ["echo", "wf-ship"] }]
+[[workflows.policies]]
+name = "no-dbg"
+action = "block"
+pattern = "dbg!("
+paths = ["src/**/*.rs"]
+message = "Remove dbg! macro calls"
+[[workflows.policies]]
+name = "review-migrations"
+action = "advise"
+paths = ["migrations/**"]
+message = "Check migration safety"
+[[workflows.stages]]
+id = "impl"
+name = "Implement"
+role = "implementation"
+when_changed = ["src/**"]
+retry = { max_attempts = 1, base_delay_seconds = 1, max_delay_seconds = 5 }
+[workflows.stages.hooks]
+after_stage = [{ command = ["echo", "stage-after"] }]
+on_failure = [{ command = ["echo", "stage-fail"] }]
+"#;
+        let settings = parse(toml).unwrap();
+        settings.validate().unwrap();
+        assert!(settings.warnings.is_empty(), "{:?}", settings.warnings);
+        let wf = &settings.workflows[0];
+        assert_eq!(wf.review_quorum, Some(2));
+        assert_eq!(wf.retry.max_attempts, 3);
+        assert_eq!(wf.retry.delay_for(1).as_secs(), 2);
+        assert_eq!(wf.retry.delay_for(2).as_secs(), 4);
+        assert_eq!(wf.retry.delay_for(3).as_secs(), 8);
+        assert_eq!(wf.retry.delay_for(4).as_secs(), 10);
+        assert_eq!(wf.stages[0].effective_retry(wf).max_attempts, 1);
+        assert_eq!(wf.stages[0].when_changed, vec!["src/**"]);
+        assert_eq!(wf.policies.len(), 2);
+
+        let saved = parse(&toml::to_string_pretty(&settings).unwrap()).unwrap();
+        assert_eq!(saved.workflows[0].retry, wf.retry);
+        assert_eq!(saved.workflows[0].hooks, wf.hooks);
+        assert_eq!(saved.workflows[0].policies, wf.policies);
+        assert_eq!(saved.workflows[0].review_quorum, wf.review_quorum);
+        assert_eq!(
+            saved.workflows[0].stages[0].when_changed,
+            wf.stages[0].when_changed
+        );
+
+        let plain = toml::to_string_pretty(&Settings::default()).unwrap();
+        for omitted in [
+            "retry",
+            "hooks",
+            "policies",
+            "review_quorum",
+            "when_changed",
+        ] {
+            assert!(!plain.contains(omitted), "{omitted} in {plain}");
+        }
+
+        let mut bad = settings.clone();
+        bad.workflows[0].retry.max_attempts = 6;
+        assert!(bad.validate().unwrap_err().to_string().contains("0–5"));
+
+        let mut bad_quorum = settings.clone();
+        bad_quorum.workflows[0].review_quorum = Some(0);
+        assert!(
+            bad_quorum
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("review_quorum")
+        );
+
+        let mut bad_policy = settings.clone();
+        bad_policy.workflows[0].policies[0].pattern.clear();
+        assert!(
+            bad_policy
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("non-empty pattern")
+        );
     }
 }

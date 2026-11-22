@@ -11,13 +11,13 @@ structured handoff for the next. Field reference:
 
 | Stage | Role | Harness / model | Mode | Enabled |
 | --- | --- | --- | --- | --- |
-| Investigate | research | Codex / `gpt-6-astra` | unattended | yes |
+| Investigate | research | Codex (default) | unattended | yes |
 | Implement | implementation | Claude Code / `sonnet` | interactive | yes |
-| Review (optional) | review | Codex / `gpt-6-astra` | unattended | no |
-| Review summary | summary | Codex | unattended | yes |
+| Review (optional) | review | Codex (default) | unattended | no |
+| Review summary | summary | Codex (default) | unattended | yes |
 
-The Astra ID came from the account used during design; pick another if yours
-differs. Every stage is editable, movable, repeatable, and optional.
+Stages with a blank model inherit their harness's native default model. Every
+stage is editable, movable, repeatable, and optional.
 
 ## Roles
 
@@ -56,8 +56,8 @@ the harness permissions and the optional [router sandbox](safety.md#sandboxing).
 | Ship (commit + draft PR) | `ship` | ship |
 | Custom stage | `custom` | custom |
 
-Analysis, verification, and review presets start as unattended Codex/Astra;
-implementation and documentation as interactive Claude/Sonnet; custom stages
+Analysis, verification, and review presets start as unattended Codex (default
+model); implementation and documentation as interactive Claude/Sonnet; custom stages
 use Codex's default model.
 
 | Workflow preset | Key | Enabled sequence |
@@ -81,7 +81,13 @@ the model (`m`). CLI: `resume RUN_ID --advance`, `--interactive`, `--retry`,
 
 Failures, cancellation, malformed review verdicts, timeouts, and stall timeouts
 (`stall_timeout_seconds` on unattended streaming stages; ignored while
-interactive) stop the run. Retries keep filesystem changes and get their own
+interactive) stop the run. When `retry` is configured (`max_attempts` `1`–`5`),
+unattended stage failures matching transient provider or network errors (HTTP
+429/502/503/504/529, rate limits, overloaded, connection reset/timeout)
+automatically retry the same harness and model with capped exponential backoff
+before stopping. Stages with `when_changed` globs skip (`skipped`) in a Git
+repository when no files changed so far in the run match any pattern (outside
+Git, they run normally). Retries keep filesystem changes and get their own
 attempt logs. Completed stages are never replayed. Runs snapshot their
 workflow: editing templates never changes an existing run.
 
@@ -236,6 +242,10 @@ a repair; advisory findings do not.
   review; it is dropped once that review passes.
 - `run --with-review` enables existing review stages for one run; it does not
   add one.
+- When `review_quorum` is set (`> 1`), at least that many distinct enabled
+  non-judge review stages must pass before the run completes or ships.
+- `[[workflows.policies]]` with `action = "advise"` injects matching path/diff
+  advisories (`POLICY ADVISORIES`) into review stage prompts.
 
 ## Verification
 
@@ -325,14 +335,18 @@ optionally opens a draft PR with `gh`.
   no trailers or attribution.
 - Any Git or `gh` failure blocks the stage with its exact error and what was
   already done.
-- `ship` refuses files matching workflow `protected_paths`, and runs pre-ship
+- `ship` refuses files matching workflow `protected_paths` or violating any
+  `block` diff policy (`[[workflows.policies]]`), runs `before_ship` lifecycle
+  hooks if configured, and runs pre-ship
   secret scanning (`secret_scan = true` by default, plus optional
   `secret_scanner`) at plan time and again right before committing, using a
   private index (planning writes blob objects to Git's object database; your
   own index is never read or written). See
   [safety.md](safety.md#protected-paths-and-secret-scanning).
 - Branch, commit, push, and PR URL appear in the handoff and `report`.
-- After the fact: `model-router ship RUN_ID [--push] [--draft-pr] [--yes]`.
+- After the fact: `model-router ship RUN_ID [--push] [--draft-pr] [--yes]`, or
+  `S` on the TUI Runs page (previews and commits only on explicit `y`
+  confirmation).
 
 Options: [configuration.md](configuration.md#ship). TUI: **Ship options**
 field (TOML).

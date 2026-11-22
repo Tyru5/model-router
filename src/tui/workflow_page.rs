@@ -11,10 +11,15 @@ use super::{
         StripStage, content, fit, focus_textarea, kv, or_default, rows_for, stage_strip, textarea,
         wrapped_textarea,
     },
+    workflow_editor::{WorkflowEditor, format_usd_field, parse_budget, parse_nonempty_lines},
 };
 use crate::{
     adapters, catalog,
-    config::{Candidate, Check, FanOut, Mode, Role, Sandbox, Stage},
+    config::{
+        Billing, BudgetAction, Candidate, Check, FanOut, Mode, Role, Sandbox, SandboxFallback,
+        Stage,
+    },
+    delegation::Delegation,
     engine::{self, Run},
     harness_settings, presets, storage,
 };
@@ -38,25 +43,63 @@ const FIELDS: &[&str] = &[
     "Provider (blank = native config)",
     "Reasoning effort",
     "Execution",
+    "Billing (default = infer)",
     "Timeout (seconds)",
+    "Stage budget max USD (blank = none)",
+    "Stage budget max tokens (blank = none)",
+    "Stage budget on exceed",
     "Review repair target (stage ID; blank = nearest)",
     "Extra arguments (shell quoting; no shell execution)",
     "Run after (stage IDs, comma separated; blank = list order)",
     "Fan-out candidates (one per line: [id:] harness [model] [provider] [effort])",
     "Router checks (one per line; ? prefix = optional)",
+    "Require router checks (test stages only)",
     "Router sandbox (inherit = workflow default)",
+    "Sandbox writable paths (one per line; ~/ expands)",
+    "Sandbox network access",
+    "Sandbox fallback",
+    "Delegation (TOML; blank = off)",
     "Stage instructions",
     "Ship options (TOML; ship role only)",
 ];
-const AFTER: usize = 10;
+const BILLING: usize = 7;
+const TIMEOUT: usize = 8;
+const BUDGET_USD: usize = 9;
+const BUDGET_TOKENS: usize = 10;
+const BUDGET_ACTION: usize = 11;
+const REPAIR_TARGET: usize = 12;
+const EXTRA_ARGS: usize = 13;
+const AFTER: usize = 14;
 /// Multiline fields, where Enter inserts a newline.
-const FAN_OUT: usize = 11;
-const CHECKS: usize = 12;
-const SANDBOX: usize = 13;
-const INSTRUCTIONS: usize = 14;
-const SHIP: usize = 15;
-const MULTILINE: [usize; 4] = [CHECKS, INSTRUCTIONS, FAN_OUT, SHIP];
-const CHOICES: [usize; 4] = [1, 2, 6, SANDBOX];
+const FAN_OUT: usize = 15;
+const CHECKS: usize = 16;
+const REQUIRE_CHECKS: usize = 17;
+const SANDBOX: usize = 18;
+const SANDBOX_WRITABLE: usize = 19;
+const SANDBOX_NETWORK: usize = 20;
+const SANDBOX_FALLBACK: usize = 21;
+const DELEGATION: usize = 22;
+const INSTRUCTIONS: usize = 23;
+const SHIP: usize = 24;
+const MULTILINE: [usize; 6] = [
+    CHECKS,
+    SANDBOX_WRITABLE,
+    DELEGATION,
+    INSTRUCTIONS,
+    FAN_OUT,
+    SHIP,
+];
+const CHOICES: [usize; 9] = [
+    1,
+    2,
+    6,
+    BILLING,
+    BUDGET_ACTION,
+    REQUIRE_CHECKS,
+    SANDBOX,
+    SANDBOX_NETWORK,
+    SANDBOX_FALLBACK,
+];
 /// The sandbox choice that keeps the workflow's `sandbox_default`.
 const INHERIT: &str = "inherit";
 /// The model field: chosen from the harness catalog, typed only on request.
@@ -77,6 +120,7 @@ pub(super) struct StageEditor {
     stage: Stage,
     pub(super) fields: Vec<InputField<'static>>,
     selected: usize,
+    list_state: ListState,
     harnesses: Vec<String>,
     /// The model field accepts typing until the next catalog pick.
     typing_model: bool,
@@ -111,7 +155,33 @@ impl StageEditor {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        let billing = stage.billing.map_or("default", Billing::label).to_owned();
+        let budget_usd = stage
+            .budget
+            .max_usd
+            .map(format_usd_field)
+            .unwrap_or_default();
+        let budget_tokens = stage
+            .budget
+            .max_tokens
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        let budget_action = stage.budget.on_exceed.label().to_owned();
+        let require_checks = if stage.require_router_checks {
+            "on"
+        } else {
+            "off"
+        }
+        .to_owned();
         let sandbox = stage.sandbox.map_or(INHERIT, Sandbox::label).to_owned();
+        let sandbox_writable = stage.sandbox_writable.join("\n");
+        let sandbox_network = if stage.sandbox_network { "on" } else { "off" }.to_owned();
+        let sandbox_fallback = match stage.sandbox_fallback {
+            SandboxFallback::Refuse => "refuse",
+            SandboxFallback::Warn => "warn",
+        }
+        .to_owned();
+        let delegation = delegation_text(&stage);
         let ship = ship_text(&stage);
         let after = stage.after.join(", ");
         let fan_out = stage.fan_out.as_ref().map(fan_out_text).unwrap_or_default();
@@ -123,23 +193,35 @@ impl StageEditor {
             &stage.provider,
             &stage.effort,
             stage.mode.label(),
+            &billing,
             &stage.timeout_seconds.to_string(),
+            &budget_usd,
+            &budget_tokens,
+            &budget_action,
             &stage.repair_target,
             &args,
             &after,
             &fan_out,
             &checks,
+            &require_checks,
             &sandbox,
+            &sandbox_writable,
+            &sandbox_network,
+            &sandbox_fallback,
+            &delegation,
             &stage.instructions,
             &ship,
         ]
         .into_iter()
         .map(textarea)
         .collect();
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
         Self {
             stage,
             fields,
             selected: 0,
+            list_state,
             harnesses,
             typing_model: false,
             catalog: None,
@@ -179,10 +261,18 @@ impl StageEditor {
                 levels.insert(0, String::new());
                 levels
             }
+            BILLING => vec!["default".into(), "api".into(), "subscription".into()],
+            BUDGET_ACTION => vec![
+                BudgetAction::Stop.label().into(),
+                BudgetAction::Warn.label().into(),
+            ],
+            REQUIRE_CHECKS => vec!["off".into(), "on".into()],
             SANDBOX => std::iter::once(INHERIT)
                 .chain(Sandbox::ALL.map(Sandbox::label))
                 .map(String::from)
                 .collect(),
+            SANDBOX_NETWORK => vec!["on".into(), "off".into()],
+            SANDBOX_FALLBACK => vec!["refuse".into(), "warn".into()],
             _ => vec!["unattended".into(), "interactive".into()],
         }
     }
@@ -205,17 +295,37 @@ impl StageEditor {
         } else {
             Mode::Unattended
         };
-        stage.timeout_seconds = content(&self.fields[7])
+        stage.billing = match content(&self.fields[BILLING]).trim() {
+            "api" => Some(Billing::Api),
+            "subscription" => Some(Billing::Subscription),
+            _ => None,
+        };
+        stage.timeout_seconds = content(&self.fields[TIMEOUT])
             .trim()
             .parse()
             .context("Timeout must be a positive number of seconds")?;
-        stage.repair_target = content(&self.fields[8]).trim().into();
-        stage.extra_args = shell_words::split(&content(&self.fields[9]))
+        stage.budget = parse_budget(
+            &content(&self.fields[BUDGET_USD]),
+            &content(&self.fields[BUDGET_TOKENS]),
+            &content(&self.fields[BUDGET_ACTION]),
+            "Stage",
+        )?;
+        stage.repair_target = content(&self.fields[REPAIR_TARGET]).trim().into();
+        stage.extra_args = shell_words::split(&content(&self.fields[EXTRA_ARGS]))
             .context("Extra arguments have unmatched quotes")?;
         stage.checks = parse_checks(&content(&self.fields[CHECKS]), &self.stage.checks)?;
+        stage.require_router_checks = content(&self.fields[REQUIRE_CHECKS]) == "on";
         stage.instructions = content(&self.fields[INSTRUCTIONS]);
         let sandbox = content(&self.fields[SANDBOX]);
         stage.sandbox = Sandbox::ALL.into_iter().find(|s| s.label() == sandbox);
+        stage.sandbox_writable = parse_nonempty_lines(&content(&self.fields[SANDBOX_WRITABLE]));
+        stage.sandbox_network = content(&self.fields[SANDBOX_NETWORK]) != "off";
+        stage.sandbox_fallback = if content(&self.fields[SANDBOX_FALLBACK]) == "warn" {
+            SandboxFallback::Warn
+        } else {
+            SandboxFallback::Refuse
+        };
+        stage.delegation = parse_delegation(&content(&self.fields[DELEGATION]))?;
         stage.ship = parse_ship(stage.role, &content(&self.fields[SHIP]))?;
         // A ship stage without options already means the defaults.
         if self.stage.ship.is_none() && stage.ship == Some(crate::ship::Options::default()) {
@@ -232,6 +342,7 @@ impl StageEditor {
     }
     fn focus(&mut self, index: usize) {
         self.selected = index;
+        self.list_state.select(Some(index));
         self.typing_model = false;
         focus_textarea(&mut self.fields[index]);
     }
@@ -325,8 +436,9 @@ impl StageEditor {
         }
     }
     pub(super) fn draw(&mut self, frame: &mut Frame<'_>, rect: Rect, palette: Palette) {
+        let title = format!("Edit stage ({}/{})", self.selected + 1, FIELDS.len());
         let block = palette.modal(
-            "Edit stage",
+            &title,
             &[("↑/↓ / Tab", "switch field"), ("←/→", "cycle choice")],
         );
         let inner = block.inner(rect);
@@ -335,30 +447,35 @@ impl StageEditor {
         let halves = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(chunks[0]);
         let value_width = halves[0].width.saturating_sub(4) as usize;
-        let rows = FIELDS.iter().enumerate().map(|(i, label)| {
-            let limit = value_width;
-            let value = field_preview(&self.fields[i], limit);
-            let choice = self.is_choice(i) || (i == MODEL && !self.typing_model);
-            ListItem::new(vec![
-                Line::styled(*label, Style::default().fg(palette.muted)),
-                if value.is_empty() {
-                    Line::styled("—", Style::default().fg(palette.line))
-                } else if choice {
-                    Line::styled(
-                        format!(
-                            "‹ {} ›",
-                            storage::truncate(&value, value_width.saturating_sub(4))
-                        ),
-                        Style::default().fg(palette.fg),
-                    )
-                } else {
-                    Line::styled(
-                        storage::truncate(&value, value_width),
-                        Style::default().fg(palette.fg),
-                    )
-                },
-            ])
-        });
+        let rows: Vec<ListItem<'static>> = FIELDS
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let limit = value_width;
+                let value = field_preview(&self.fields[i], limit);
+                let choice = self.is_choice(i) || (i == MODEL && !self.typing_model);
+                ListItem::new(vec![
+                    Line::styled(*label, Style::default().fg(palette.muted)),
+                    if value.is_empty() {
+                        Line::styled("—", Style::default().fg(palette.line))
+                    } else if choice {
+                        Line::styled(
+                            format!(
+                                "‹ {} ›",
+                                storage::truncate(&value, value_width.saturating_sub(4))
+                            ),
+                            Style::default().fg(palette.fg),
+                        )
+                    } else {
+                        Line::styled(
+                            storage::truncate(&value, value_width),
+                            Style::default().fg(palette.fg),
+                        )
+                    },
+                ])
+            })
+            .collect();
+        self.list_state.select(Some(self.selected));
         frame.render_stateful_widget(
             List::new(rows)
                 .highlight_style(palette.highlight_style())
@@ -366,7 +483,7 @@ impl StageEditor {
                 .highlight_spacing(HighlightSpacing::Always)
                 .block(Block::default().padding(Padding::right(2))),
             halves[0],
-            &mut ListState::default().with_selected(Some(self.selected)),
+            &mut self.list_state,
         );
         if self.selected == MODEL && !self.typing_model {
             let harness = self.harness();
@@ -449,6 +566,31 @@ impl StageEditor {
                 .style(Style::default().fg(palette.muted)),
                 panes[1],
             );
+        } else if self.is_choice(self.selected) {
+            let choices = self.choices(self.selected);
+            let current = content(&self.fields[self.selected]);
+            let index = choices.iter().position(|v| *v == current).unwrap_or(0);
+            let list_height =
+                (choices.len() as u16 + 2).min(halves[1].height.saturating_sub(2).max(3));
+            let panes = Layout::vertical([Constraint::Length(list_height), Constraint::Min(1)])
+                .split(halves[1]);
+            frame.render_stateful_widget(
+                List::new(choices.iter().map(|v| ListItem::new(Line::raw(v.clone()))))
+                    .block(
+                        palette
+                            .panel(format!(" {} ", FIELDS[self.selected]))
+                            .border_style(Style::default().fg(palette.accent)),
+                    )
+                    .highlight_style(palette.selected_style()),
+                panes[0],
+                &mut ListState::default().with_selected(Some(index)),
+            );
+            frame.render_widget(
+                Paragraph::new(stage_choice_help(self.selected))
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().fg(palette.muted)),
+                panes[1],
+            );
         } else {
             let field = &mut self.fields[self.selected];
             palette.style_textarea(field);
@@ -465,6 +607,16 @@ impl StageEditor {
         keys.spans.push(Span::styled(
             if self.selected == CHECKS {
                 "   ·  argv per line, no shell; edit timeout_seconds in TOML"
+            } else if self.selected == REQUIRE_CHECKS {
+                "   ·  test stages only: requires a passing router check instead of model-reported pass"
+            } else if self.selected == BILLING {
+                "   ·  default infers api for routed providers, subscription for native harnesses"
+            } else if self.selected == BUDGET_USD || self.selected == BUDGET_TOKENS {
+                "   ·  caps spend across this stage's attempts; blank disables"
+            } else if self.selected == SANDBOX_WRITABLE {
+                "   ·  one writable path per line (~/ expands); requires project trust"
+            } else if self.selected == DELEGATION {
+                "   ·  TOML: delegates, harnesses, models, providers, max_tasks, runs, schedules; blank = off"
             } else if self.selected == SHIP {
                 "   ·  e.g. push = true, draft_pr = true; blank = defaults (commit only, confirm)"
             } else if self.selected == AFTER {
@@ -485,6 +637,47 @@ impl StageEditor {
             chunks[1],
         );
     }
+}
+
+fn stage_choice_help(index: usize) -> &'static str {
+    match index {
+        BILLING => {
+            "default infers api for routed providers, subscription for native accounts. ←/→ or Space cycles."
+        }
+        BUDGET_ACTION => {
+            "stop blocks before the next stage when a cap is exceeded; warn logs a warning and continues."
+        }
+        REQUIRE_CHECKS => {
+            "When on (test stages only), model-reported passes never satisfy the gate without a passing required router check."
+        }
+        SANDBOX => "inherit uses the workflow's sandbox_default. ←/→ or Space cycles.",
+        SANDBOX_NETWORK => "off cuts the sandboxed harness off the network. ←/→ or Space cycles.",
+        SANDBOX_FALLBACK => {
+            "refuse fails if the sandbox cannot be set up; warn runs unsandboxed with a warning (requires trust)."
+        }
+        _ => "←/→ or Space cycles through options.",
+    }
+}
+
+/// A stage's delegation policy as TOML lines; blank when delegation is off.
+fn delegation_text(stage: &Stage) -> String {
+    let Some(delegation) = &stage.delegation else {
+        return String::new();
+    };
+    toml::to_string(delegation)
+        .unwrap_or_default()
+        .trim_end()
+        .to_owned()
+}
+
+/// Parses the delegation TOML block; blank disables delegation.
+fn parse_delegation(text: &str) -> Result<Option<Delegation>> {
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let delegation: Delegation =
+        toml::from_str(text).map_err(|e| anyhow::anyhow!("Delegation: {}", e.message()))?;
+    Ok(Some(delegation))
 }
 
 /// Single-line prefix of `field` without copying the full multiline buffer.
@@ -740,6 +933,11 @@ impl App {
                     .name
                     .clone(),
             ),
+            ActionId::WorkflowSettings => {
+                let workflow = self.editor.settings.workflows[self.editor.workflow].clone();
+                self.ui
+                    .open(Modal::Workflow(Box::new(WorkflowEditor::new(workflow))));
+            }
             ActionId::RepairLimit => self.input(
                 "Maximum automatic repair passes (0 disables repairs)",
                 InputTarget::RepairLimit,
@@ -1233,6 +1431,55 @@ fn draw_stage_detail(
     ]);
     if !stage.after.is_empty() {
         facts.push(kv(palette, "After", &stage.after.join(", "), true));
+    }
+    if let Some(billing) = stage.billing {
+        facts.push(kv(palette, "Billing", billing.label(), true));
+    }
+    if !stage.budget.is_empty() {
+        let mut parts = vec![];
+        if let Some(usd) = stage.budget.max_usd {
+            parts.push(crate::report::dollars(usd));
+        }
+        if let Some(tokens) = stage.budget.max_tokens {
+            parts.push(format!("{} tok", crate::report::tokens(tokens)));
+        }
+        parts.push(stage.budget.on_exceed.label().to_owned());
+        facts.push(kv(palette, "Budget", &parts.join(" · "), true));
+    }
+    if stage.require_router_checks {
+        facts.push(kv(palette, "Checks", "router required", true));
+    }
+    if !stage.sandbox_network
+        || stage.sandbox_fallback == SandboxFallback::Warn
+        || !stage.sandbox_writable.is_empty()
+    {
+        let mut opts = vec![];
+        if !stage.sandbox_network {
+            opts.push("no network".to_owned());
+        }
+        if stage.sandbox_fallback == SandboxFallback::Warn {
+            opts.push("fallback warn".to_owned());
+        }
+        if !stage.sandbox_writable.is_empty() {
+            opts.push(format!("+{} writable", stage.sandbox_writable.len()));
+        }
+        facts.push(kv(palette, "Sandbox+", &opts.join(", "), true));
+    }
+    if let Some(delegation) = &stage.delegation {
+        let mut targets = vec![];
+        if !delegation.delegates.is_empty() {
+            targets.push(format!("{} delegate(s)", delegation.delegates.len()));
+        }
+        if !delegation.harnesses.is_empty() {
+            targets.push(format!("{} harness(es)", delegation.harnesses.len()));
+        }
+        if delegation.runs {
+            targets.push("runs".into());
+        }
+        if delegation.schedules {
+            targets.push("schedules".into());
+        }
+        facts.push(kv(palette, "Delegate", &targets.join(", "), true));
     }
     if let Some(fan) = &stage.fan_out {
         facts.push(kv(palette, "Judge", &fan.judge.to_string(), true));

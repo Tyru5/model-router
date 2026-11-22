@@ -6,7 +6,9 @@
 //! so any change to a dangerous section asks again. The user's global config
 //! and an explicit `--config` file are always trusted.
 use crate::{
-    config::{self, Check, CustomAdapter, Sandbox, SandboxFallback, Settings, Stage, Workflow},
+    config::{
+        self, Check, CustomAdapter, Hooks, Sandbox, SandboxFallback, Settings, Stage, Workflow,
+    },
     delegation::Delegate,
     harness_settings,
     providers::{self, Provider},
@@ -119,13 +121,15 @@ fn quoted(args: &[String]) -> String {
 }
 
 /// Dangerous items in `settings`, described with their full values, so the
-/// digest changes whenever any of them does.
+/// digest changes whenever any of them does. Entries layered unchanged from
+/// the user's global `config.toml` are already trusted and excluded.
 pub fn dangerous(settings: &Settings) -> Vec<String> {
     dangerous_parts(
         &settings.workflows,
         &settings.adapters,
         &settings.providers,
         &settings.delegates,
+        settings.global_layer.as_deref(),
     )
 }
 
@@ -134,14 +138,21 @@ fn dangerous_parts(
     adapters: &BTreeMap<String, CustomAdapter>,
     providers: &BTreeMap<String, Provider>,
     delegates: &BTreeMap<String, Delegate>,
+    global: Option<&config::GlobalLayer>,
 ) -> Vec<String> {
     let mut items = vec![];
     // Delegation launches harnesses and spends money; every target and limit
     // is in the digest.
     for (name, delegate) in delegates {
+        if global.is_some_and(|g| g.has_delegate(name, delegate)) {
+            continue;
+        }
         items.push(format!("delegate {name}: {}", delegate.describe()));
     }
     for (name, adapter) in adapters {
+        if global.is_some_and(|g| g.has_adapter(name, adapter)) {
+            continue;
+        }
         let mut line = format!("custom adapter {name}: {}", quoted(&adapter_argv(adapter)));
         if let Some(args) = &adapter.interactive_args {
             line.push_str(&format!("; interactive: {}", quoted(args)));
@@ -157,8 +168,25 @@ fn dangerous_parts(
         items.push(line);
     }
     for workflow in workflows {
+        for (event, hook) in workflow.hooks.all_entries() {
+            items.push(format!(
+                "hook {} in {}: {} ({}s)",
+                event.label(),
+                workflow.name,
+                quoted(&hook.command),
+                hook.timeout_seconds
+            ));
+        }
         for stage in &workflow.stages {
             let at = format!("{} / {}", workflow.name, stage.id);
+            for (event, hook) in stage.hooks.all_entries() {
+                items.push(format!(
+                    "hook {} in {at}: {} ({}s)",
+                    event.label(),
+                    quoted(&hook.command),
+                    hook.timeout_seconds
+                ));
+            }
             for check in &stage.checks {
                 items.push(format!("check in {at}: {}", quoted(&check.command)));
             }
@@ -200,6 +228,9 @@ fn dangerous_parts(
         }
     }
     for (name, provider) in providers {
+        if global.is_some_and(|g| g.has_provider(name, provider)) {
+            continue;
+        }
         if provider_needs_trust(name, provider) {
             let url = if provider.base_url.is_empty() {
                 providers::resolve(name, providers)
@@ -396,7 +427,7 @@ fn snapshot_items_parts(
     providers: &BTreeMap<String, Provider>,
     delegates: &BTreeMap<String, Delegate>,
 ) -> Vec<String> {
-    let mut items = dangerous_parts(workflows, adapters, providers, delegates);
+    let mut items = dangerous_parts(workflows, adapters, providers, delegates, None);
     for workflow in workflows {
         for stage in &workflow.stages {
             items.push(format!(
@@ -551,11 +582,13 @@ pub struct Ignored {
     adapters: BTreeMap<String, CustomAdapter>,
     providers: BTreeMap<String, Provider>,
     delegates: BTreeMap<String, Delegate>,
+    workflows: BTreeMap<String, Hooks>,
     stages: BTreeMap<(String, String), IgnoredStage>,
 }
 #[derive(Debug, Clone, Default)]
 struct IgnoredStage {
     checks: Vec<Check>,
+    hooks: Hooks,
     extra_args: Vec<String>,
     settings: BTreeMap<String, String>,
     sandbox: Option<Sandbox>,
@@ -576,7 +609,11 @@ struct IgnoredStage {
 /// untrusted providers are dropped for this session.
 pub fn ignore(settings: &mut Settings) {
     let mut ignored = Ignored::default();
+    let global = settings.global_layer.as_deref();
     for (name, adapter) in &mut settings.adapters {
+        if global.is_some_and(|g| g.has_adapter(name, adapter)) {
+            continue;
+        }
         ignored.adapters.insert(name.clone(), adapter.clone());
         // Only the shape stays (which modes exist, how output and sessions
         // work); the blocked command never runs.
@@ -593,7 +630,10 @@ pub fn ignore(settings: &mut Settings) {
     let names: Vec<String> = settings
         .providers
         .iter()
-        .filter(|(name, provider)| provider_needs_trust(name, provider))
+        .filter(|(name, provider)| {
+            !global.is_some_and(|g| g.has_provider(name, provider))
+                && provider_needs_trust(name, provider)
+        })
         .map(|(name, _)| name.clone())
         .collect();
     for name in names {
@@ -601,8 +641,23 @@ pub fn ignore(settings: &mut Settings) {
             ignored.providers.insert(name, provider);
         }
     }
-    ignored.delegates = std::mem::take(&mut settings.delegates);
+    let delegate_names: Vec<String> = settings
+        .delegates
+        .iter()
+        .filter(|(name, delegate)| !global.is_some_and(|g| g.has_delegate(name, delegate)))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in delegate_names {
+        if let Some(delegate) = settings.delegates.remove(&name) {
+            ignored.delegates.insert(name, delegate);
+        }
+    }
     for workflow in &mut settings.workflows {
+        if !workflow.hooks.is_empty() {
+            ignored
+                .workflows
+                .insert(workflow.name.clone(), std::mem::take(&mut workflow.hooks));
+        }
         let default = workflow.sandbox_default;
         for stage in &mut workflow.stages {
             let escalated: BTreeMap<String, String> = harness_settings::escalations(stage)
@@ -619,6 +674,7 @@ pub fn ignore(settings: &mut Settings) {
                     .as_ref()
                     .is_some_and(|s| !s.secret_scanner.is_empty());
             if stage.checks.is_empty()
+                && stage.hooks.is_empty()
                 && stage.extra_args.is_empty()
                 && escalated.is_empty()
                 && !downgraded
@@ -650,6 +706,7 @@ pub fn ignore(settings: &mut Settings) {
                 (workflow.name.clone(), stage.id.clone()),
                 IgnoredStage {
                     checks: std::mem::take(&mut stage.checks),
+                    hooks: std::mem::take(&mut stage.hooks),
                     extra_args: std::mem::take(&mut stage.extra_args),
                     settings: escalated,
                     // The stage inherits the stricter workflow default instead.
@@ -669,7 +726,7 @@ pub fn ignore(settings: &mut Settings) {
         }
     }
     settings.warnings.push(
-        "Project config is untrusted: its custom adapters, checks, extra arguments, escalated permissions, sandbox loosening, delegation, and custom providers are ignored, and its ship stages ask for confirmation, this session. Run `model-router trust` to use them.".into(),
+        "Project config is untrusted: its custom adapters, checks, hooks, extra arguments, escalated permissions, sandbox loosening, delegation, and custom providers are ignored, and its ship stages ask for confirmation, this session. Run `model-router trust` to use them.".into(),
     );
     settings.ignored = Some(Box::new(ignored));
 }
@@ -700,6 +757,11 @@ pub(crate) fn restore_cow(settings: &Settings) -> Cow<'_, Settings> {
             .or_insert_with(|| delegate.clone());
     }
     for workflow in &mut saved.workflows {
+        if workflow.hooks.is_empty() {
+            if let Some(original) = ignored.workflows.get(&workflow.name) {
+                workflow.hooks = original.clone();
+            }
+        }
         for stage in &mut workflow.stages {
             let Some(original) = ignored
                 .stages
@@ -709,6 +771,9 @@ pub(crate) fn restore_cow(settings: &Settings) -> Cow<'_, Settings> {
             };
             if stage.checks.is_empty() {
                 stage.checks = original.checks.clone();
+            }
+            if stage.hooks.is_empty() {
+                stage.hooks = original.hooks.clone();
             }
             if stage.extra_args.is_empty() {
                 stage.extra_args = original.extra_args.clone();
@@ -1063,5 +1128,155 @@ mod tests {
         let result = approve_at(&store, &lock, &review);
         assert!(result.is_err());
         assert_eq!(fs::read_to_string(&store).unwrap(), "{not valid json");
+    }
+
+    #[test]
+    fn global_layer_entries_stay_trusted_while_project_and_shadowed_entries_need_trust() {
+        let mut settings = Settings::default();
+        let glob_adapter = CustomAdapter {
+            command: "global-tool".into(),
+            args: vec!["--flag".into()],
+            ..CustomAdapter::default()
+        };
+        let glob_provider = Provider {
+            base_url: "https://global.example/v1".into(),
+            api_key_env: "GLOBAL_KEY".into(),
+            ..Provider::default()
+        };
+        let glob_delegate = Delegate {
+            harness: "codex".into(),
+            model: "m".into(),
+            ..Delegate::default()
+        };
+        settings
+            .adapters
+            .insert("glob_a".into(), glob_adapter.clone());
+        settings
+            .providers
+            .insert("glob_p".into(), glob_provider.clone());
+        settings
+            .delegates
+            .insert("glob_d".into(), glob_delegate.clone());
+        settings.global_layer = Some(Box::new(config::GlobalLayer {
+            adapters: BTreeMap::from([("glob_a".into(), glob_adapter.clone())]),
+            providers: BTreeMap::from([("glob_p".into(), glob_provider.clone())]),
+            delegates: BTreeMap::from([("glob_d".into(), glob_delegate.clone())]),
+            pricing: BTreeMap::new(),
+        }));
+
+        // Global entries alone require no project trust.
+        assert!(
+            dangerous(&settings).is_empty(),
+            "{:?}",
+            dangerous(&settings)
+        );
+
+        // Add project-owned entries (including one that could shadow a global key).
+        let proj_adapter = CustomAdapter {
+            command: "./proj.sh".into(),
+            ..CustomAdapter::default()
+        };
+        let proj_provider = Provider {
+            base_url: "https://evil.example/v1".into(),
+            api_key_env: "LEAK_KEY".into(),
+            ..Provider::default()
+        };
+        let proj_delegate = Delegate {
+            harness: "claude".into(),
+            ..Delegate::default()
+        };
+        settings
+            .adapters
+            .insert("proj_a".into(), proj_adapter.clone());
+        settings
+            .providers
+            .insert("proj_p".into(), proj_provider.clone());
+        settings
+            .delegates
+            .insert("proj_d".into(), proj_delegate.clone());
+
+        let items = dangerous(&settings).join("\n");
+        assert!(items.contains("custom adapter proj_a"), "{items}");
+        assert!(items.contains("provider proj_p"), "{items}");
+        assert!(items.contains("delegate proj_d"), "{items}");
+        assert!(!items.contains("glob_a"), "{items}");
+        assert!(!items.contains("glob_p"), "{items}");
+        assert!(!items.contains("glob_d"), "{items}");
+
+        // Ignoring strips only project entries and leaves global entries intact.
+        let mut ignored = settings.clone();
+        ignore(&mut ignored);
+        assert_eq!(ignored.adapters["glob_a"], glob_adapter);
+        assert_eq!(ignored.adapters["proj_a"].command, BLOCKED_COMMAND);
+        assert_eq!(ignored.providers["glob_p"], glob_provider);
+        assert!(!ignored.providers.contains_key("proj_p"));
+        assert_eq!(ignored.delegates["glob_d"], glob_delegate);
+        assert!(!ignored.delegates.contains_key("proj_d"));
+
+        // Restoring brings back project entries without losing global entries.
+        let restored = restore(&ignored);
+        assert_eq!(restored.adapters["glob_a"], glob_adapter);
+        assert_eq!(restored.adapters["proj_a"], proj_adapter);
+        assert_eq!(restored.providers["glob_p"], glob_provider);
+        assert_eq!(restored.providers["proj_p"], proj_provider);
+        assert_eq!(restored.delegates["glob_d"], glob_delegate);
+        assert_eq!(restored.delegates["proj_d"], proj_delegate);
+
+        // Mutating a global entry in-memory no longer matches global_layer, so trust flags it.
+        let mut mutated = settings;
+        mutated.adapters.get_mut("glob_a").unwrap().command = "./tampered.sh".into();
+        let mutated_items = dangerous(&mutated).join("\n");
+        assert!(
+            mutated_items.contains("custom adapter glob_a: ./tampered.sh"),
+            "{mutated_items}"
+        );
+    }
+
+    #[test]
+    fn workflow_and_stage_hooks_require_trust_and_restore_on_save() {
+        let mut settings = Settings::default();
+        settings.workflows[0]
+            .hooks
+            .before_ship
+            .push(crate::config::Hook {
+                command: vec!["./pre-ship.sh".into()],
+                timeout_seconds: 90,
+            });
+        settings.workflows[0].stages[0]
+            .hooks
+            .before_stage
+            .push(crate::config::Hook {
+                command: vec!["./pre-stage.sh".into(), "--check".into()],
+                timeout_seconds: 45,
+            });
+        let items = dangerous(&settings);
+        let text = items.join("\n");
+        assert!(
+            text.contains("hook before_ship in Feature development: ./pre-ship.sh (90s)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "hook before_stage in Feature development / research: ./pre-stage.sh --check (45s)"
+            ),
+            "{text}"
+        );
+        let before_digest = digest(&items);
+        settings.workflows[0].stages[0].hooks.before_stage[0].timeout_seconds = 60;
+        assert_ne!(before_digest, digest(&dangerous(&settings)));
+
+        let original = settings.clone();
+        let mut untrusted = settings;
+        ignore(&mut untrusted);
+        assert!(untrusted.workflows[0].hooks.is_empty());
+        assert!(untrusted.workflows[0].stages[0].hooks.is_empty());
+        assert!(dangerous(&untrusted).is_empty());
+
+        let restored = restore(&untrusted);
+        assert_eq!(restored.workflows[0].hooks, original.workflows[0].hooks);
+        assert_eq!(
+            restored.workflows[0].stages[0].hooks,
+            original.workflows[0].stages[0].hooks
+        );
     }
 }

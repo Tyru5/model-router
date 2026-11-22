@@ -37,10 +37,12 @@ mod store;
 mod types;
 
 pub use apply::{ApplyPlan, apply_worktree, apply_worktree_plan};
+pub use delegate::cancel_delegated_task;
 pub use exec::detached_terminal;
 pub use host::{RunHost, cancel_pending, run_host, set_run_host};
 pub use prompt::{
-    FieldView, HandoffView, Inspection, Kept, PRIOR_BUDGET, PRIOR_EACH, inspect_handoffs, prompt,
+    ContextFileView, FieldView, HandoffView, Inspection, Kept, MAX_CONTEXT_BYTES,
+    MAX_CONTEXT_FILES, PRIOR_BUDGET, PRIOR_EACH, inspect_handoffs, prompt,
 };
 pub use recovery::{
     authorize_replay, refuse_unproven, refuse_unproven_in_checkout, release_groups,
@@ -52,8 +54,10 @@ pub use types::{
 };
 
 use exec::{
-    Exit, INTERRUPTED, Prepared, Resolved, candidate_index, conclude, evaluate_outcome,
-    execute_stage, keep_survivor, read_head, reattach_stage, resolve_handoff, start_stage,
+    Exit, INTERRUPTED, Prepared, Resolved, candidate_index, conclude, conclude_inner,
+    evaluate_outcome, execute_stage, keep_survivor, read_head, reattach_stage, resolve_handoff,
+    run_post_stage_hooks, should_transient_retry, sleep_interruptible, start_stage,
+    start_stage_inner,
 };
 #[cfg(test)]
 use exec::{finish, prepare};
@@ -122,6 +126,13 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
             run.cursor += 1;
         }
         if run.cursor == run.stages.len() {
+            if let Err(error) = run.check_review_quorum() {
+                run.stop(Status::Blocked, format!("{error:#}"), Actor::Engine, false)?;
+                run.persist()?;
+                save_changes(run);
+                emit(Event::State(Box::new(run.clone())));
+                return Ok(Action::Stopped);
+            }
             run.set(
                 Target::Run,
                 Status::Complete,
@@ -145,6 +156,17 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
             save_changes(run);
             return Ok(Action::Stopped);
         }
+        if let Some(reason) = run.should_skip_when_changed(run.cursor) {
+            let idx = run.cursor;
+            let name = run.workflow.stages[idx].name.clone();
+            run.stages[idx].skipped_reason = Some(reason.clone());
+            run.set(Target::Stage(idx), Status::Skipped, Actor::Engine, &reason)?;
+            run.cursor += 1;
+            run.persist()?;
+            emit(Event::Output(format!("── {name} · {reason} ──\n")));
+            emit(Event::State(Box::new(run.clone())));
+            continue;
+        }
         // Spend is recorded per attempt; a cap stops or warns before more.
         match crate::cost::check_budget_action(run) {
             crate::cost::BudgetCheck::Ok => {}
@@ -164,7 +186,7 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
             refuse_own_unproven(run)?;
         }
         if run.workflow.stages[run.cursor].role == Role::Ship {
-            crate::ship::execute(run, &mut emit)?;
+            crate::ship::execute(run, cancel, &mut emit)?;
             continue;
         }
         if run.workflow.stages[run.cursor].mode == Mode::Interactive {
@@ -256,11 +278,55 @@ pub fn preview(
     settings.validate()?;
     let temp = tempfile::tempdir()?;
     let mut text = format!(
-        "{}\nProject: {}\nTask: {}\n\n",
+        "{}\nProject: {}\nTask: {}\n",
         workflow.name,
         project.display(),
         task
     );
+    if workflow.handoff_budget_bytes.is_some() || workflow.handoff_each_bytes.is_some() {
+        text.push_str(&format!(
+            "Handoff budget: {} bytes total, {} each\n",
+            workflow.effective_handoff_budget_bytes(),
+            workflow.effective_handoff_each_bytes()
+        ));
+    }
+    if let Some(quorum) = workflow.review_quorum.filter(|&n| n > 1) {
+        text.push_str(&format!("Review quorum: {quorum} distinct reviews\n"));
+    }
+    if workflow.retry.max_attempts > 0 {
+        text.push_str(&format!(
+            "Default retry: up to {} transient attempt(s) (base {}s, max {}s)\n",
+            workflow.retry.max_attempts,
+            workflow.retry.base_delay_seconds,
+            workflow.retry.max_delay_seconds
+        ));
+    }
+    for (event, hook) in workflow.hooks.all_entries() {
+        text.push_str(&format!(
+            "Workflow hook ({}): {} ({}s)\n",
+            event.label(),
+            shell_words::join(&hook.command),
+            hook.timeout_seconds
+        ));
+    }
+    for policy in &workflow.policies {
+        let paths = if policy.paths.is_empty() {
+            "*".to_owned()
+        } else {
+            policy.paths.join(", ")
+        };
+        text.push_str(&format!(
+            "Policy [{}] ({}): paths={paths}{}\n",
+            policy.name,
+            policy.action.label(),
+            if policy.pattern.is_empty() {
+                String::new()
+            } else {
+                format!(", pattern={:?}", policy.pattern)
+            }
+        ));
+    }
+    text.push('\n');
     for (index, stage) in workflow.stages.iter().enumerate() {
         if !stage.enabled {
             text.push_str(&format!("{}. {} [disabled]\n", index + 1, stage.name));
@@ -274,6 +340,20 @@ pub fn preview(
                 stage.name,
                 options.describe()
             ));
+            if !stage.when_changed.is_empty() {
+                text.push_str(&format!(
+                    "   when_changed: {}\n",
+                    stage.when_changed.join(", ")
+                ));
+            }
+            for (event, hook) in stage.hooks.all_entries() {
+                text.push_str(&format!(
+                    "   hook ({}): {} ({}s)\n",
+                    event.label(),
+                    shell_words::join(&hook.command),
+                    hook.timeout_seconds
+                ));
+            }
             continue;
         }
         // A delegating stage's launch carries the bridge; its socket and
@@ -312,6 +392,9 @@ pub fn preview(
         ));
         if let Some(sandbox) = crate::sandbox::preview(workflow, stage) {
             text.push_str(&format!("   {sandbox}\n"));
+        }
+        if let Some(context) = prompt::preview_context_files(project, workflow, stage) {
+            text.push_str(&format!("   {context}\n"));
         }
         if let Some(delegation) = &stage.delegation {
             text.push_str(&format!(
@@ -388,6 +471,26 @@ pub fn preview(
                     "optional"
                 },
                 check.timeout_seconds
+            ));
+        }
+        if !stage.when_changed.is_empty() {
+            text.push_str(&format!(
+                "   when_changed: {}\n",
+                stage.when_changed.join(", ")
+            ));
+        }
+        if let Some(retry) = &stage.retry {
+            text.push_str(&format!(
+                "   retry: up to {} transient attempt(s) (base {}s, max {}s)\n",
+                retry.max_attempts, retry.base_delay_seconds, retry.max_delay_seconds
+            ));
+        }
+        for (event, hook) in stage.hooks.all_entries() {
+            text.push_str(&format!(
+                "   hook ({}): {} ({}s)\n",
+                event.label(),
+                shell_words::join(&hook.command),
+                hook.timeout_seconds
             ));
         }
     }
@@ -1410,5 +1513,283 @@ mod tests {
             oldest.reason.as_deref(),
             Some("prior handoff budget exhausted")
         );
+    }
+
+    #[test]
+    fn tunable_handoff_budgets_control_prompt_and_inspection() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = |id: &str| Stage {
+            id: id.into(),
+            name: id.into(),
+            role: Role::Research,
+            harness: "mock".into(),
+            ..Stage::default()
+        };
+        let mut workflow = Workflow::new("Tunable", vec![stage("s1"), stage("s2")]);
+        workflow.handoff_budget_bytes = Some(2_048);
+        workflow.handoff_each_bytes = Some(1_500);
+        let settings = Settings {
+            workflows: vec![workflow.clone()],
+            adapters: BTreeMap::from([(
+                "mock".into(),
+                CustomAdapter {
+                    command: "python3".into(),
+                    ..CustomAdapter::default()
+                },
+            )]),
+            ..Settings::default()
+        };
+        let mut run = Run::create(dir.path(), &settings, &workflow, "Task".into(), false).unwrap();
+        let mut large = Handoff::unstructured("alpha ".repeat(1_200));
+        large.decisions = (0..10)
+            .map(|i| format!("decision {i}: {}", "d".repeat(60)))
+            .collect();
+        run.stages[0].status = Status::Complete;
+        run.stages[0].handoff = Some(large);
+        run.stages[0].inherited = Some(run.directory.join("01-s1"));
+        run.cursor = 1;
+
+        let small = inspect_handoffs(&run, None).unwrap();
+        assert_eq!((small.budget_bytes, small.each_bytes), (2_048, 1_500));
+        assert!(small.handoffs[0].sent);
+        assert_eq!(small.handoffs[0].budget, 1_500);
+        assert!(!small.handoffs[0].fields.is_empty());
+        assert!(
+            small
+                .text()
+                .contains("Budget: 2048 bytes of prior handoffs, at most 1500 each"),
+            "{}",
+            small.text()
+        );
+
+        // Raising the budget keeps the same large handoff whole.
+        run.workflow.handoff_budget_bytes = Some(30_000);
+        run.workflow.handoff_each_bytes = Some(15_000);
+        let large_view = inspect_handoffs(&run, None).unwrap();
+        assert_eq!(
+            (large_view.budget_bytes, large_view.each_bytes),
+            (30_000, 15_000)
+        );
+        assert_eq!(large_view.handoffs[0].budget, 15_000);
+        assert!(
+            large_view.handoffs[0].fields.is_empty(),
+            "{:?}",
+            large_view.handoffs[0]
+        );
+    }
+
+    #[test]
+    fn context_files_inject_globs_dedup_bounds_and_block_symlinks_binary_and_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), "TOP_SECRET_OUTSIDE").unwrap();
+        fs::create_dir_all(dir.path().join("docs/sub")).unwrap();
+        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        fs::create_dir_all(dir.path().join(".model-router")).unwrap();
+        fs::write(dir.path().join("AGENTS.md"), "Follow project rules.\n").unwrap();
+        fs::write(dir.path().join("docs/a.md"), "Doc A\n").unwrap();
+        fs::write(dir.path().join("docs/b.md"), "Doc B\n").unwrap();
+        fs::write(dir.path().join("docs/sub/c.md"), "Doc C\n").unwrap();
+        fs::write(dir.path().join("binary.bin"), [0xff, 0xfe, 0x00, b'x']).unwrap();
+        fs::write(dir.path().join(".git/config"), "GIT_METADATA_SECRET").unwrap();
+        fs::write(dir.path().join(".model-router/secret.txt"), "MR_SECRET").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                outside.path().join("secret.txt"),
+                dir.path().join("link_file.md"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(outside.path(), dir.path().join("docs/link_dir")).unwrap();
+        }
+
+        let mut stage = Stage {
+            id: "research".into(),
+            name: "Research".into(),
+            role: Role::Research,
+            harness: "mock".into(),
+            context_files: vec![
+                "AGENTS.md".into(),
+                "docs/**/*.md".into(),
+                "binary.bin".into(),
+                "link_file.md".into(),
+                "missing.md".into(),
+            ],
+            ..Stage::default()
+        };
+        let mut workflow = Workflow::new("Context", vec![stage.clone()]);
+        workflow.context_files = vec!["AGENTS.md".into(), "docs/*.md".into()];
+        let settings = Settings {
+            workflows: vec![workflow.clone()],
+            adapters: BTreeMap::from([(
+                "mock".into(),
+                CustomAdapter {
+                    command: "python3".into(),
+                    ..CustomAdapter::default()
+                },
+            )]),
+            ..Settings::default()
+        };
+
+        let preview_text = preview(&settings, &workflow, dir.path(), "Task").unwrap();
+        assert!(preview_text.contains("context files:"), "{preview_text}");
+        assert!(preview_text.contains("AGENTS.md"), "{preview_text}");
+        assert!(preview_text.contains("docs/sub/c.md"), "{preview_text}");
+        assert!(
+            preview_text.contains("binary.bin (non-UTF-8 or binary file)"),
+            "{preview_text}"
+        );
+        assert!(
+            preview_text.contains("missing.md (not found)"),
+            "{preview_text}"
+        );
+        #[cfg(unix)]
+        assert!(
+            preview_text.contains("link_file.md (symlink not allowed)"),
+            "{preview_text}"
+        );
+
+        let run = Run::create(dir.path(), &settings, &workflow, "Task".into(), false).unwrap();
+        let inspection = inspect_handoffs(&run, None).unwrap();
+        // Deduplicated: AGENTS.md appears once, docs/a.md, docs/b.md, docs/sub/c.md included.
+        assert_eq!(
+            inspection.prompt.matches("--- AGENTS.md ---").count(),
+            1,
+            "{}",
+            inspection.prompt
+        );
+        for expected in ["Follow project rules.", "Doc A", "Doc B", "Doc C"] {
+            assert!(
+                inspection.prompt.contains(expected),
+                "missing {expected} in {}",
+                inspection.prompt
+            );
+        }
+        for forbidden in ["TOP_SECRET_OUTSIDE", "GIT_METADATA_SECRET", "MR_SECRET"] {
+            assert!(
+                !inspection.prompt.contains(forbidden),
+                "leaked {forbidden} in {}",
+                inspection.prompt
+            );
+        }
+        assert!(
+            inspection.text().contains("Context files:"),
+            "{}",
+            inspection.text()
+        );
+
+        // Even a broad `**/*` glob never reads `.git`, `.model-router`, or symlinks.
+        stage.context_files = vec!["**/*".into()];
+        let broad_wf = Workflow::new("Broad", vec![stage]);
+        let broad_run =
+            Run::create(dir.path(), &settings, &broad_wf, "Task".into(), false).unwrap();
+        let broad = inspect_handoffs(&broad_run, None).unwrap();
+        for forbidden in ["TOP_SECRET_OUTSIDE", "GIT_METADATA_SECRET", "MR_SECRET"] {
+            assert!(
+                !broad.prompt.contains(forbidden),
+                "broad glob leaked {forbidden}"
+            );
+        }
+
+        // File count cap (max 32 files).
+        fs::create_dir_all(dir.path().join("many")).unwrap();
+        for i in 0..40 {
+            fs::write(
+                dir.path().join(format!("many/f{i:02}.txt")),
+                format!("v{i}\n"),
+            )
+            .unwrap();
+        }
+        let many_wf = Workflow {
+            context_files: vec!["many/*.txt".into()],
+            ..Workflow::new(
+                "Many",
+                vec![Stage {
+                    id: "r".into(),
+                    name: "R".into(),
+                    harness: "mock".into(),
+                    ..Stage::default()
+                }],
+            )
+        };
+        let many_run = Run::create(dir.path(), &settings, &many_wf, "Task".into(), false).unwrap();
+        let many = inspect_handoffs(&many_run, None).unwrap();
+        let included_count = many.context_files.iter().filter(|f| f.included).count();
+        assert_eq!(included_count, MAX_CONTEXT_FILES);
+        assert!(
+            many.context_files
+                .iter()
+                .any(|f| !f.included && f.path == "(8 more)")
+        );
+
+        // Total byte cap (max 32 KiB) with multi-byte UTF-8 boundary truncation.
+        fs::create_dir_all(dir.path().join("big")).unwrap();
+        fs::write(dir.path().join("big/01.txt"), "a".repeat(30_000)).unwrap();
+        // Multi-byte 'é' (2 bytes) crosses the remaining 2768-byte boundary cleanly.
+        fs::write(dir.path().join("big/02.txt"), "é".repeat(3_000)).unwrap();
+        fs::write(dir.path().join("big/03.txt"), "never included").unwrap();
+        let big_wf = Workflow {
+            context_files: vec!["big/*.txt".into()],
+            ..Workflow::new(
+                "Big",
+                vec![Stage {
+                    id: "r".into(),
+                    name: "R".into(),
+                    harness: "mock".into(),
+                    ..Stage::default()
+                }],
+            )
+        };
+        let big_run = Run::create(dir.path(), &settings, &big_wf, "Task".into(), false).unwrap();
+        let big = inspect_handoffs(&big_run, None).unwrap();
+        let total_bytes: usize = big
+            .context_files
+            .iter()
+            .filter(|f| f.included)
+            .map(|f| f.bytes)
+            .sum();
+        assert!(total_bytes <= MAX_CONTEXT_BYTES, "{total_bytes}");
+        assert!(
+            big.context_files
+                .iter()
+                .any(|f| f.path == "big/02.txt" && f.truncated)
+        );
+        assert!(
+            big.prompt
+                .contains("[truncated; full file in workspace at big/02.txt]")
+        );
+        assert!(!big.prompt.contains("never included"));
+        assert!(big.context_files.iter().any(|f| {
+            !f.included
+                && f.reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("byte limit"))
+        }));
+    }
+
+    #[test]
+    fn transient_error_classifier_matches_provider_limits_and_rejects_auth_or_line_numbers() {
+        use super::exec::is_transient_error;
+        assert!(is_transient_error("HTTP 429 Too Many Requests", ""));
+        assert!(is_transient_error("API Error: 529 overloaded_error", ""));
+        assert!(is_transient_error(
+            "Harness exited with code 1.",
+            "503 Service Unavailable"
+        ));
+        assert!(is_transient_error("connection reset by peer", ""));
+        assert!(is_transient_error("rate_limit_error: try again later", ""));
+        assert!(!is_transient_error(
+            "Invalid API key · Please run /login",
+            "429"
+        ));
+        assert!(!is_transient_error(
+            "authentication_error: 401 unauthorized",
+            ""
+        ));
+        assert!(!is_transient_error("syntax error at line 429, col 503", ""));
+        assert!(!is_transient_error(
+            "Process exited with code 1",
+            "file not found"
+        ));
     }
 }

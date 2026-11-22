@@ -2,7 +2,16 @@
 //! Display only: the raw events stay in stdout.log, and handoffs never come
 //! from these lines.
 use crate::{adapters::OutputKind, storage};
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+};
 
 /// Longest tool argument or result excerpt shown on one line.
 const EXCERPT: usize = 160;
@@ -528,6 +537,368 @@ fn opencode(event: &Value) -> Vec<String> {
     }
 }
 
+// Structured JSONL metrics export ---------------------------------------------
+
+/// Environment variable naming a JSONL file to append structured run and
+/// stage-attempt metrics to (for CI, dashboards, or OTLP collectors).
+pub const METRICS_FILE_ENV: &str = "MODEL_ROUTER_METRICS_FILE";
+pub const METRICS_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricRecord {
+    pub schema_version: u32,
+    /// `"run_start"`, `"run_end"`, `"attempt_start"`, or `"attempt_end"`.
+    pub event: String,
+    pub timestamp: DateTime<Utc>,
+    pub run_id: String,
+    pub workflow: String,
+    pub project: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+fn metrics_file_slot() -> &'static Mutex<Option<PathBuf>> {
+    static PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    PATH.get_or_init(|| Mutex::new(None))
+}
+
+fn metrics_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Sets (or clears) the process-wide metrics JSONL path (`--metrics-file`).
+pub fn set_metrics_file(path: Option<PathBuf>) {
+    if let Ok(mut slot) = metrics_file_slot().lock() {
+        *slot = path;
+    }
+}
+
+/// Effective metrics JSONL path: explicit `--metrics-file` wins over
+/// `MODEL_ROUTER_METRICS_FILE`.
+pub fn metrics_file() -> Option<PathBuf> {
+    if let Some(path) = metrics_file_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+    {
+        return Some(path);
+    }
+    std::env::var_os(METRICS_FILE_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Appends JSONL metric records safely under an in-process mutex and (on Unix)
+/// an exclusive `flock` on the target file, writing the complete batch in one
+/// `O_APPEND` write so concurrent processes never interleave partial lines.
+pub fn append_metrics(path: &Path, records: &[MetricRecord]) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let mut payload = Vec::new();
+    for record in records {
+        serde_json::to_writer(&mut payload, record)?;
+        payload.push(b'\n');
+    }
+    let _guard = metrics_write_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Create directory for {}", path.display()))?;
+        }
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("Open metrics file {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        loop {
+            // SAFETY: `file` is a valid open file descriptor.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc == 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(err).with_context(|| format!("Lock metrics file {}", path.display()));
+            }
+        }
+    }
+    let write_res = file.write_all(&payload).and_then(|()| file.flush());
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `file` is still open and locked by us.
+        unsafe {
+            libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+    write_res.with_context(|| format!("Write metrics file {}", path.display()))
+}
+
+fn run_usage(run: &crate::engine::Run) -> crate::handoff::Usage {
+    let mut total = crate::handoff::Usage::default();
+    for state in &run.stages {
+        let candidates = state.candidate_attempts().map(|(_, a)| a);
+        for attempt in state.attempts.iter().chain(candidates) {
+            if let Some(usage) = attempt.usage {
+                total = total + usage;
+            }
+        }
+        for (_, turn) in state.task_turns() {
+            if let Some(usage) = turn.usage {
+                total = total + usage;
+            }
+        }
+    }
+    total
+}
+
+fn is_terminal(status: crate::engine::Status) -> bool {
+    matches!(
+        status,
+        crate::engine::Status::Complete
+            | crate::engine::Status::Failed
+            | crate::engine::Status::Blocked
+            | crate::engine::Status::Cancelled
+    )
+}
+
+/// Builds structured metric records for a `Run::persist()` commit.
+pub fn collect_run_metrics(
+    run: &crate::engine::Run,
+    started: bool,
+    records: &[crate::transitions::Record],
+) -> Vec<MetricRecord> {
+    use crate::{cost, engine::Status, transitions::Level};
+    let mut out = Vec::new();
+    let base = |event: &str, timestamp: DateTime<Utc>, status: &str| MetricRecord {
+        schema_version: METRICS_SCHEMA_VERSION,
+        event: event.into(),
+        timestamp,
+        run_id: run.id.clone(),
+        workflow: run.workflow.name.clone(),
+        project: run.project.display().to_string(),
+        status: status.into(),
+        stage_id: None,
+        stage_name: None,
+        attempt: None,
+        candidate: None,
+        harness: None,
+        model: None,
+        role: None,
+        mode: None,
+        duration_ms: None,
+        tokens: None,
+        input_tokens: None,
+        output_tokens: None,
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        estimated_usd: None,
+        exit_code: None,
+    };
+    if started {
+        out.push(base("run_start", run.created_at, run.status.as_str()));
+    }
+    let mut pricing: Option<cost::Pricing> = None;
+    for rec in records {
+        match rec.level {
+            Level::Attempt if rec.to == Status::Running => {
+                let Some(idx) = rec.stage_index else {
+                    continue;
+                };
+                let Some(stage) = run.workflow.stages.get(idx) else {
+                    continue;
+                };
+                let Some(state) = run.stages.get(idx) else {
+                    continue;
+                };
+                let (harness, attempt_opt) = if let Some(cand_id) = rec.candidate.as_deref() {
+                    let cand = state
+                        .fan_out
+                        .as_ref()
+                        .and_then(|f| f.candidates.iter().find(|c| c.id == cand_id));
+                    match cand {
+                        Some(c) => {
+                            let att = rec
+                                .attempt
+                                .and_then(|n| c.attempts.iter().find(|a| a.number == n))
+                                .or_else(|| c.attempts.last());
+                            (c.harness.clone(), att)
+                        }
+                        None => continue,
+                    }
+                } else {
+                    let att = rec
+                        .attempt
+                        .and_then(|n| state.attempts.iter().find(|a| a.number == n))
+                        .or_else(|| state.attempts.last());
+                    (stage.harness.clone(), att)
+                };
+                let mut item = base("attempt_start", rec.at, rec.to.as_str());
+                item.stage_id = Some(stage.id.clone());
+                item.stage_name = Some(stage.name.clone());
+                item.attempt = rec.attempt.or_else(|| attempt_opt.map(|a| a.number));
+                item.candidate = rec.candidate.clone();
+                item.harness = Some(harness);
+                item.model = Some(
+                    attempt_opt
+                        .map(|a| a.model.clone())
+                        .unwrap_or_else(|| stage.model.clone()),
+                );
+                item.role = Some(stage.role.label().into());
+                item.mode = Some(
+                    attempt_opt
+                        .map(|a| a.mode.label().into())
+                        .unwrap_or_else(|| stage.mode.label().into()),
+                );
+                out.push(item);
+            }
+            Level::Attempt if is_terminal(rec.to) => {
+                let Some(idx) = rec.stage_index else {
+                    continue;
+                };
+                let Some(stage) = run.workflow.stages.get(idx) else {
+                    continue;
+                };
+                let Some(state) = run.stages.get(idx) else {
+                    continue;
+                };
+                let (harness, attempt_opt) = if let Some(cand_id) = rec.candidate.as_deref() {
+                    let cand = state
+                        .fan_out
+                        .as_ref()
+                        .and_then(|f| f.candidates.iter().find(|c| c.id == cand_id));
+                    match cand {
+                        Some(c) => {
+                            let att = rec
+                                .attempt
+                                .and_then(|n| c.attempts.iter().find(|a| a.number == n))
+                                .or_else(|| c.attempts.last());
+                            (c.harness.clone(), att)
+                        }
+                        None => continue,
+                    }
+                } else {
+                    let att = rec
+                        .attempt
+                        .and_then(|n| state.attempts.iter().find(|a| a.number == n))
+                        .or_else(|| state.attempts.last());
+                    (stage.harness.clone(), att)
+                };
+                let pricing_ref = pricing.get_or_insert_with(|| cost::Pricing::load(&run.project));
+                let mut item = base("attempt_end", rec.at, rec.to.as_str());
+                item.stage_id = Some(stage.id.clone());
+                item.stage_name = Some(stage.name.clone());
+                item.attempt = rec.attempt.or_else(|| attempt_opt.map(|a| a.number));
+                item.candidate = rec.candidate.clone();
+                item.harness = Some(harness);
+                item.role = Some(stage.role.label().into());
+                if let Some(att) = attempt_opt {
+                    item.model = Some(att.model.clone());
+                    item.mode = Some(att.mode.label().into());
+                    let ended = att.finished_at.unwrap_or(rec.at);
+                    item.duration_ms = Some((ended - att.started_at).num_milliseconds().max(0));
+                    item.exit_code = att.exit_code;
+                    let estimate = cost::attempt_estimate(run, idx, att, pricing_ref);
+                    if let Some(usage) = att.usage {
+                        item.tokens = Some(estimate.tokens);
+                        item.input_tokens = usage.input_tokens;
+                        item.output_tokens = usage.output_tokens;
+                        item.cache_read_tokens = usage.cache_read_tokens;
+                        item.cache_write_tokens = usage.cache_write_tokens;
+                    }
+                    item.estimated_usd = estimate.usd;
+                } else {
+                    item.model = Some(stage.model.clone());
+                    item.mode = Some(stage.mode.label().into());
+                }
+                out.push(item);
+            }
+            Level::Run if is_terminal(rec.to) => {
+                let pricing_ref = pricing.get_or_insert_with(|| cost::Pricing::load(&run.project));
+                let total = cost::run_total(run, pricing_ref);
+                let usage = run_usage(run);
+                let mut item = base("run_end", rec.at, rec.to.as_str());
+                item.duration_ms = Some((rec.at - run.created_at).num_milliseconds().max(0));
+                if total.tokens > 0 || usage.input_tokens.is_some() || usage.output_tokens.is_some()
+                {
+                    item.tokens = Some(total.tokens);
+                    item.input_tokens = usage.input_tokens;
+                    item.output_tokens = usage.output_tokens;
+                    item.cache_read_tokens = usage.cache_read_tokens;
+                    item.cache_write_tokens = usage.cache_write_tokens;
+                }
+                item.estimated_usd = total.known().then_some(total.usd);
+                out.push(item);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Emits structured JSONL metrics for a persisted run commit if a metrics file
+/// is configured (`--metrics-file` or `MODEL_ROUTER_METRICS_FILE`). Best-effort:
+/// write errors warn on stderr and never fail the run.
+pub fn emit_run_metrics(
+    run: &crate::engine::Run,
+    started: bool,
+    records: &[crate::transitions::Record],
+) {
+    let Some(path) = metrics_file() else {
+        return;
+    };
+    let batch = collect_run_metrics(run, started, records);
+    if batch.is_empty() {
+        return;
+    }
+    if let Err(error) = append_metrics(&path, &batch) {
+        let _ = writeln!(
+            std::io::stderr(),
+            "Warning: could not append metrics to {}: {error:#}",
+            path.display()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,5 +1032,57 @@ mod tests {
         assert_eq!(excerpt("  one   two\tthree  ", 7), "one two…");
         assert_eq!(excerpt("🦀🦀🦀", 3), "🦀🦀🦀");
         assert_eq!(excerpt("🦀🦀🦀🦀", 3), "🦀🦀🦀…");
+    }
+
+    #[test]
+    fn append_metrics_writes_valid_jsonl_under_concurrent_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("metrics.jsonl");
+        let threads = 4usize;
+        let per_thread = 25usize;
+        std::thread::scope(|scope| {
+            for t in 0..threads {
+                let path = path.clone();
+                scope.spawn(move || {
+                    for i in 0..per_thread {
+                        let rec = MetricRecord {
+                            schema_version: METRICS_SCHEMA_VERSION,
+                            event: "attempt_end".into(),
+                            timestamp: Utc::now(),
+                            run_id: format!("run-{t}-{i}"),
+                            workflow: "wf".into(),
+                            project: "/proj".into(),
+                            status: "complete".into(),
+                            stage_id: Some("implement".into()),
+                            stage_name: Some("Implement".into()),
+                            attempt: Some(1),
+                            candidate: None,
+                            harness: Some("codex".into()),
+                            model: Some("gpt-5".into()),
+                            role: Some("implementation".into()),
+                            mode: Some("unattended".into()),
+                            duration_ms: Some(1234),
+                            tokens: Some(500),
+                            input_tokens: Some(400),
+                            output_tokens: Some(100),
+                            cache_read_tokens: None,
+                            cache_write_tokens: None,
+                            estimated_usd: Some(0.01),
+                            exit_code: Some(0),
+                        };
+                        append_metrics(&path, &[rec]).unwrap();
+                    }
+                });
+            }
+        });
+        let raw = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), threads * per_thread);
+        for line in lines {
+            let parsed: MetricRecord = serde_json::from_str(line).unwrap();
+            assert_eq!(parsed.schema_version, METRICS_SCHEMA_VERSION);
+            assert_eq!(parsed.event, "attempt_end");
+            assert_eq!(parsed.exit_code, Some(0));
+        }
     }
 }

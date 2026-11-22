@@ -4,11 +4,12 @@
 use super::{
     app::{App, Opened, Started},
     completion::{CompletionKey, Loaded},
+    history::ShipConfirm,
     modal::{Ask, Modal},
     path_picker::FolderEntry,
 };
 use crate::{
-    catalog::Catalog, doctor::Report, engine::ApplyPlan, fanout::Applied, history::Entry,
+    catalog::Catalog, doctor::Report, engine::ApplyPlan, fanout::Applied, history::Entry, ship,
     stats::Stats, storage::RepoInfo,
 };
 use std::{
@@ -65,6 +66,18 @@ pub(super) enum Msg {
         run: String,
         files: usize,
         result: Result<Applied, String>,
+    },
+    /// Planned ad-hoc ship for confirmation; `ticket` guards cancellation.
+    ShipPlan {
+        ticket: u64,
+        run: String,
+        result: Result<(Box<ship::Plan>, PathBuf), String>,
+    },
+    /// Completed ad-hoc ship; `ticket` guards cancellation.
+    Shipped {
+        ticket: u64,
+        run: String,
+        result: Result<ship::Outcome, String>,
     },
     /// A folder read for the path picker reading with `ticket`.
     Folder {
@@ -383,6 +396,45 @@ impl App {
                                 "Could not apply {run} (conflicts in {}); checkout left unchanged",
                                 paths.join(", ")
                             ));
+                        }
+                        Err(error) => self.ui.error(error),
+                    }
+                }
+            }
+            Msg::ShipPlan {
+                ticket,
+                run,
+                result,
+            } => {
+                if self.ui.take_loading(ticket) {
+                    self.ui.redraw = true;
+                    match result {
+                        Ok((plan, dir)) => self.ui.open(Modal::ShipConfirm(Box::new(
+                            ShipConfirm::new(run, *plan, dir),
+                        ))),
+                        Err(error) => self.ui.error(error),
+                    }
+                }
+            }
+            Msg::Shipped {
+                ticket,
+                run,
+                result,
+            } => {
+                if self.ui.take_loading(ticket) {
+                    self.ui.redraw = true;
+                    self.repo.checked = None;
+                    self.runs.stale = true;
+                    match result {
+                        Ok(outcome) => {
+                            let summary = outcome.lines().join(" · ");
+                            if let Some(error) = outcome.error {
+                                self.ui.error(format!("Ship of {run} stopped: {error}"));
+                            } else if summary.is_empty() {
+                                self.ui.message = format!("Shipped {run}.");
+                            } else {
+                                self.ui.message = format!("Shipped {run}: {summary}");
+                            }
                         }
                         Err(error) => self.ui.error(error),
                     }

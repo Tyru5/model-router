@@ -17,9 +17,56 @@ use crate::serve::mcp::ToolError;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
     time::Instant,
 };
+
+static TASK_CANCELS: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+
+/// Requests cancellation of a single delegated task of a live delegating stage
+/// without cancelling the parent stage. Returns `true` if a live delegating
+/// stage for `run_id` accepted the request.
+pub fn cancel_delegated_task(run_id: &str, task_id: &str) -> bool {
+    let map = TASK_CANCELS.get_or_init(Default::default);
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(queue) = guard.get_mut(run_id) {
+        if !queue.iter().any(|id| id == task_id) {
+            queue.push(task_id.to_owned());
+        }
+        true
+    } else {
+        false
+    }
+}
+
+struct TaskCancelRegistration(String);
+impl TaskCancelRegistration {
+    fn register(run_id: &str) -> Self {
+        let map = TASK_CANCELS.get_or_init(Default::default);
+        let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+        guard.entry(run_id.to_owned()).or_default();
+        Self(run_id.to_owned())
+    }
+}
+impl Drop for TaskCancelRegistration {
+    fn drop(&mut self) {
+        if let Some(map) = TASK_CANCELS.get() {
+            let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+            guard.remove(&self.0);
+        }
+    }
+}
+
+fn take_task_cancels(run_id: &str) -> Vec<String> {
+    let Some(map) = TASK_CANCELS.get() else {
+        return vec![];
+    };
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .get_mut(run_id)
+        .map(std::mem::take)
+        .unwrap_or_default()
+}
 
 /// How a parent learns of finished tasks: woken through `follow_up`,
 /// waiting in tool calls, or (interactive) told by the user.
@@ -170,12 +217,13 @@ pub(super) fn drive_stage(
     // Turn 1: the broker exists before the launch that names it.
     owner.open_broker(run)?;
     run.mcp = owner.broker.as_ref().map(mcp_launch);
-    let started = start_stage(run, emit);
+    let started = start_stage(run, cancel, emit);
     run.mcp = None;
     let Some(prepared) = started? else {
         owner.close_broker();
         return Ok(());
     };
+    let _cancel_reg = TaskCancelRegistration::register(&run.id);
     let stop_ticker = Arc::new(AtomicBool::new(false));
     thread::scope(|scope| -> Result<()> {
         // Ticks wake an idle owner for the deadline and for cancellation.
@@ -533,13 +581,24 @@ impl<'a> Owner<'a> {
                 Msg::ParentDone(outcome, ended) => {
                     self.parent_done(scope, run, outcome, ended, emit)?;
                 }
-                Msg::Tick => self.tick(run, emit)?,
+                Msg::Tick => self.tick(scope, run, emit)?,
             }
         }
         Ok(())
     }
 
-    fn tick(&mut self, run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
+    fn tick<'s, 'e>(
+        &mut self,
+        scope: &'s thread::Scope<'s, 'e>,
+        run: &mut Run,
+        emit: &mut impl FnMut(Event),
+    ) -> Result<()>
+    where
+        'a: 's,
+    {
+        for task_id in take_task_cancels(&run.id) {
+            self.cancel_user_task(scope, run, &task_id, emit)?;
+        }
         let cancelled = self.cancel.load(Ordering::Relaxed);
         let late = self.deadline.is_some_and(|d| Instant::now() >= d);
         if !cancelled && !late {
@@ -568,6 +627,48 @@ impl<'a> Owner<'a> {
                 self.stop_stage(run, status, message, emit)?;
             }
             Phase::Releasing | Phase::Done => {}
+        }
+        Ok(())
+    }
+
+    /// Cancels a single delegated task requested by the user (e.g. from the TUI)
+    /// without cancelling the parent stage.
+    fn cancel_user_task<'s, 'e>(
+        &mut self,
+        scope: &'s thread::Scope<'s, 'e>,
+        run: &mut Run,
+        id: &str,
+        emit: &mut impl FnMut(Event),
+    ) -> Result<()>
+    where
+        'a: 's,
+    {
+        let Some(task) = self.task(run, id) else {
+            return Ok(());
+        };
+        if task.status.is_terminal() {
+            return Ok(());
+        }
+        if let Some(job) = self.running.get(id) {
+            job.abort.store(true, Ordering::SeqCst);
+        }
+        self.queue.retain(|q| q != id);
+        if let Some(task) = self.task_mut(run, id) {
+            task.queued_messages.clear();
+            task.error = Some("Cancelled by user".into());
+            if !task.status.is_live() || task.status == TaskStatus::Queued {
+                task.status = TaskStatus::Cancelled;
+                task.delivered = false;
+            }
+        }
+        emit(Event::Output(format!(
+            "Delegation: cancelling task {id} (requested by user)\n"
+        )));
+        let _ = run.persist();
+        self.changed.bump();
+        emit(Event::State(Box::new(run.clone())));
+        if self.phase == Phase::Awaiting {
+            self.maybe_wake(scope, run, emit)?;
         }
         Ok(())
     }
@@ -1571,10 +1672,12 @@ impl<'a> Owner<'a> {
                 plan.confine_shared_git(&cwd);
             }
         }
+        let harness_version = adapters::detected_version(&stage.harness, &invocation.program);
         storage::write_json_fast(
             &turn_dir.join("command.json"),
             &json!({
                 "program": invocation.program,
+                "harness_version": harness_version,
                 "args": invocation.args,
                 "env": invocation.env.iter().map(|(n, _)| n).collect::<Vec<_>>(),
                 "workspace": cwd,
@@ -1790,7 +1893,10 @@ impl<'a> Owner<'a> {
         } else {
             task.delivered = false;
         }
-        if task.isolation == Isolation::Worktree && !task.cancelled_by_parent {
+        if task.isolation == Isolation::Worktree
+            && !task.cancelled_by_parent
+            && task.status != TaskStatus::Cancelled
+        {
             self.seal_patch(run, id)?;
         }
         run.persist()?;
@@ -2149,5 +2255,3 @@ fn task_prompt(
         handoff::contract(task.role, handoff_file, schema_file)
     )
 }
-
-use std::sync::Mutex;

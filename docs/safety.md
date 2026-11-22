@@ -15,7 +15,8 @@ These sections take effect only after you trust the file:
 
 - custom adapters (`[adapters.*]`, including spec fields that reach the
   executable; `follow_up_args` enters the trust digest only when set);
-- stage `checks` and `extra_args`;
+- stage `checks`, `extra_args`, and workflow or stage lifecycle `hooks`
+  (`before_stage`, `after_stage`, `before_ship`, `on_failure`);
 - permission settings that loosen a harness (`danger-full-access`,
   `bypassPermissions`, `yolo`, Cursor sandbox `disabled`, Aider `yes-always`,
   Goose `auto`, Copilot `allow-all-tools`);
@@ -313,4 +314,4 @@ Some guarantees depend on the harness or OS rather than the router itself:
 | Custom `TMPDIR` / `XDG_RUNTIME_DIR` | Terminal-host socket hiding covers standard runtime/temp socket paths; a concurrent `mr` launched with a custom `TMPDIR` or `XDG_RUNTIME_DIR` puts its sockets elsewhere. |
 | Built-in secret scan | Pattern matching catches high-confidence token formats only; pair with an external `secret_scanner` (e.g. `gitleaks`) when broader coverage is required. |
 | Unsandboxed delegating stages | With `sandbox = "off"`, any process of your user can read a running turn's token file and reach its broker, as it could anything else you run. |
-| Live spend caps | Budgets check after each attempt completes; an in-progress attempt is not stopped mid-stream (use `timeout_seconds` and `stall_timeout_seconds` to bound runaways). |
+| Non-streaming or unpriced spend caps | Unattended streaming harnesses (`codex-jsonl`, `claude-stream`, `pi`, `opencode`, `amp-stream`, `cursor-stream`) abort mid-stream on `on_exceed = "stop"` as soon as streamed usage exceeds a USD or token cap; interactive stages and harnesses that report usage only at exit check after the attempt completes. |

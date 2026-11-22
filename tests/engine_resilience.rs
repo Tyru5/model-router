@@ -1,0 +1,967 @@
+//! Integration tests for Track 2 engine resilience features:
+//! 1. Transient retry with capped exponential backoff
+//! 2. Trust-gated lifecycle hooks (`before_stage`, `after_stage`, `before_ship`, `on_failure`)
+//! 3. Declarative diff policies (`block` and `advise`)
+//! 4. Conditional stages (`when_changed`) and review quorum (`review_quorum`)
+//! 5. Live mid-stream budget enforcement
+mod common;
+
+use common::{drive, stage};
+use model_router::{
+    config::{
+        self, Billing, Budget, BudgetAction, CustomAdapter, CustomOutput, Hook, Hooks, Retry, Role,
+        Settings, Stage, Workflow,
+    },
+    cost,
+    engine::{self, Action, Event, Run, Status},
+    policy::{DiffPolicy, PolicyAction},
+    ship, transitions, trust,
+};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+fn init_test_config_dir() -> PathBuf {
+    static DIR: Mutex<Option<tempfile::TempDir>> = Mutex::new(None);
+    extern "C" fn cleanup() {
+        if let Ok(mut guard) = DIR.lock() {
+            guard.take();
+        }
+    }
+    let mut guard = DIR.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        let temp = tempfile::tempdir().expect("test config dir");
+        // SAFETY: initialized once under the mutex before tests run, and
+        // `cleanup` is a plain extern "C" function.
+        unsafe {
+            std::env::set_var("MODEL_ROUTER_CONFIG_DIR", temp.path());
+            libc::atexit(cleanup);
+        }
+        *guard = Some(temp);
+    }
+    guard.as_ref().unwrap().path().to_path_buf()
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn init_git(dir: &Path) {
+    git(dir, &["init", "-b", "main"]);
+    git(dir, &["config", "user.name", "Test User"]);
+    git(dir, &["config", "user.email", "test@example.com"]);
+    fs::write(dir.join("README.md"), "hello\n").unwrap();
+    git(dir, &["add", "."]);
+    git(
+        dir,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "initial",
+        ],
+    );
+}
+
+// -----------------------------------------------------------------------------
+// 1. Transient retry with capped exponential backoff
+// -----------------------------------------------------------------------------
+
+#[test]
+fn transient_retry_succeeds_after_provider_errors_preserving_model_and_transitions() {
+    init_test_config_dir();
+    let dir = common::tempdir();
+    let script = dir.path().join("transient.py");
+    fs::write(
+        &script,
+        r#"import json, pathlib, sys
+count_file = pathlib.Path(sys.argv[1])
+model = sys.argv[2]
+handoff_path = pathlib.Path(sys.argv[3])
+n = int(count_file.read_text()) if count_file.exists() else 0
+n += 1
+count_file.write_text(str(n))
+if n == 1:
+    sys.stderr.write("Error: HTTP 429 Too Many Requests (rate_limit_error)\n")
+    sys.exit(1)
+if n == 2:
+    sys.stderr.write("API Error: 529 overloaded_error\n")
+    sys.exit(1)
+handoff_path.write_text(json.dumps({
+    "schema_version": 2,
+    "summary": f"Recovered on attempt {n} with model {model}",
+    "verdict": "complete",
+    "findings": [],
+    "tests": [],
+    "files_changed": [],
+    "unresolved": []
+}))
+"#,
+    )
+    .unwrap();
+
+    let count_file = dir.path().join("attempts.count");
+    let adapter = CustomAdapter {
+        command: "python3".into(),
+        args: vec![
+            script.display().to_string(),
+            count_file.display().to_string(),
+            "{model}".into(),
+            "{handoff_file}".into(),
+        ],
+        ..CustomAdapter::default()
+    };
+    let settings = Settings {
+        adapters: BTreeMap::from([("flaky".into(), adapter)]),
+        ..Settings::default()
+    };
+    let mut s = Stage {
+        id: "impl".into(),
+        name: "Implement".into(),
+        role: Role::Implementation,
+        harness: "flaky".into(),
+        model: "pinned-model-v1".into(),
+        ..Stage::default()
+    };
+    s.retry = Some(Retry {
+        max_attempts: 3,
+        base_delay_seconds: 0,
+        max_delay_seconds: 1,
+    });
+    let wf = Workflow::new("RetryFlow", vec![s]);
+    let mut run = Run::create(dir.path(), &settings, &wf, "test retry".into(), false).unwrap();
+    let mut output = String::new();
+    let action = engine::drive(&mut run, &AtomicBool::new(false), |ev| {
+        if let Event::Output(text) = ev {
+            output.push_str(&text);
+        }
+    })
+    .unwrap();
+    assert_eq!(action, Action::Complete);
+    assert_eq!(run.status, Status::Complete);
+    assert_eq!(run.stages[0].attempts.len(), 3);
+    assert_eq!(run.stages[0].attempts[0].status, Status::Failed);
+    assert_eq!(run.stages[0].attempts[1].status, Status::Failed);
+    assert_eq!(run.stages[0].attempts[2].status, Status::Complete);
+    // No silent model substitution: every attempt used the exact configured model.
+    for attempt in &run.stages[0].attempts {
+        assert_eq!(attempt.model, "pinned-model-v1");
+    }
+    assert!(
+        output.contains("Transient failure") && output.contains("retrying 1/3"),
+        "{output}"
+    );
+    assert!(output.contains("retrying 2/3"), "{output}");
+
+    let records = transitions::read(&run.directory).unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|r| r.reason.contains("Transient error retry 1/3")),
+        "{records:?}"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r.reason.contains("Transient error retry 2/3")),
+        "{records:?}"
+    );
+}
+
+#[test]
+fn non_transient_errors_do_not_retry_and_cancel_interrupts_backoff() {
+    init_test_config_dir();
+    let dir = common::tempdir();
+    let script = dir.path().join("auth_fail.py");
+    fs::write(
+        &script,
+        r#"import sys
+mode = sys.argv[1]
+if mode == "auth":
+    sys.stderr.write("Error 401: Invalid API key provided\n")
+    sys.exit(1)
+else:
+    sys.stderr.write("HTTP 503 Service Unavailable\n")
+    sys.exit(1)
+"#,
+    )
+    .unwrap();
+
+    let adapter = |mode: &str| CustomAdapter {
+        command: "python3".into(),
+        args: vec![script.display().to_string(), mode.into()],
+        ..CustomAdapter::default()
+    };
+    let settings = Settings {
+        adapters: BTreeMap::from([
+            ("auth".into(), adapter("auth")),
+            ("503".into(), adapter("503")),
+        ]),
+        ..Settings::default()
+    };
+
+    // 1. Auth error fails on attempt 1 despite max_attempts = 3.
+    let mut wf_auth = Workflow::new(
+        "AuthFail",
+        vec![Stage {
+            id: "s".into(),
+            name: "Auth".into(),
+            role: Role::Implementation,
+            harness: "auth".into(),
+            ..Stage::default()
+        }],
+    );
+    wf_auth.retry = Retry {
+        max_attempts: 3,
+        base_delay_seconds: 0,
+        max_delay_seconds: 1,
+    };
+    let mut run_auth =
+        Run::create(dir.path(), &settings, &wf_auth, "test auth".into(), false).unwrap();
+    assert_eq!(drive(&mut run_auth), Action::Stopped);
+    assert_eq!(run_auth.status, Status::Failed);
+    assert_eq!(run_auth.stages[0].attempts.len(), 1);
+
+    // 2. Cancel during backoff interrupts promptly without waiting out a 30s delay.
+    let mut wf_cancel = Workflow::new(
+        "CancelBackoff",
+        vec![Stage {
+            id: "s".into(),
+            name: "Transient".into(),
+            role: Role::Implementation,
+            harness: "503".into(),
+            ..Stage::default()
+        }],
+    );
+    wf_cancel.retry = Retry {
+        max_attempts: 2,
+        base_delay_seconds: 30,
+        max_delay_seconds: 60,
+    };
+    let mut run_cancel = Run::create(
+        dir.path(),
+        &settings,
+        &wf_cancel,
+        "test cancel".into(),
+        false,
+    )
+    .unwrap();
+    let cancel = AtomicBool::new(false);
+    let started = Instant::now();
+    let action = engine::drive(&mut run_cancel, &cancel, |ev| {
+        if let Event::Output(text) = ev {
+            if text.contains("Transient failure") {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
+    })
+    .unwrap();
+    assert_eq!(action, Action::Stopped);
+    assert_eq!(run_cancel.status, Status::Cancelled);
+    assert_eq!(run_cancel.stages[0].attempts.len(), 1);
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+// -----------------------------------------------------------------------------
+// 2. Trust-gated lifecycle hooks
+// -----------------------------------------------------------------------------
+
+#[test]
+fn lifecycle_hooks_are_gated_by_trust_run_in_order_and_enforce_abort_rules() {
+    init_test_config_dir();
+    let dir = common::tempdir();
+    init_git(dir.path());
+    let marker = dir.path().join("hooks.log");
+    let append_py = format!(
+        "import os, pathlib, sys; p = pathlib.Path({:?}); p.write_text((p.read_text() if p.exists() else '') + sys.argv[1] + ':' + os.environ.get('MODEL_ROUTER_HOOK', '') + '\\n')",
+        marker.display().to_string()
+    );
+
+    let mock_path = format!("{}/examples/mock_harness.py", env!("CARGO_MANIFEST_DIR"));
+    let toml_text = format!(
+        r#"version = 2
+
+[adapters.mock]
+command = "python3"
+args = [{mock_path:?}, "--role", "{{provider}}", "--model", "{{model}}", "--prompt-file", "{{prompt_file}}", "--handoff-file", "{{handoff_file}}"]
+
+[[workflows]]
+name = "Hooked"
+max_repair_passes = 0
+
+[workflows.hooks]
+before_stage = [{{ command = ["python3", "-c", {append_py:?}, "wf-before"], timeout_seconds = 10 }}]
+after_stage = [{{ command = ["python3", "-c", {append_py:?}, "wf-after"], timeout_seconds = 10 }}]
+
+[[workflows.stages]]
+id = "impl"
+name = "Implement"
+role = "implementation"
+harness = "mock"
+provider = "implementation"
+model = "test-model"
+
+[workflows.stages.hooks]
+before_stage = [{{ command = ["python3", "-c", {append_py:?}, "stage-before"], timeout_seconds = 10 }}]
+after_stage = [
+  {{ command = ["python3", "-c", {append_py:?}, "stage-after"], timeout_seconds = 10 }},
+  {{ command = ["python3", "-c", "import sys; sys.exit(3)"], timeout_seconds = 10 }},
+]
+"#
+    );
+    fs::write(dir.path().join(".model-router.toml"), &toml_text).unwrap();
+
+    // 1. Untrusted project config flags the hooks and neutralizes them in `.safe()`.
+    let loaded = config::load_config(dir.path(), None).unwrap();
+    let review = loaded.review().expect("hooks require project trust");
+    let review_text = review.items.join("\n");
+    assert!(
+        review_text.contains("hook before_stage in Hooked:"),
+        "{review_text}"
+    );
+    assert!(
+        review_text.contains("hook after_stage in Hooked / impl:"),
+        "{review_text}"
+    );
+    let safe_settings = loaded.clone().safe();
+    assert!(safe_settings.workflows[0].hooks.is_empty());
+    assert!(safe_settings.workflows[0].stages[0].hooks.is_empty());
+
+    // 2. Preview shows the hooks once trusted.
+    trust::approve(review).unwrap();
+    let trusted = config::load_config(dir.path(), None).unwrap();
+    assert_eq!(trusted.trust, trust::Trust::Trusted);
+    let preview = engine::preview(
+        &trusted.settings,
+        &trusted.settings.workflows[0],
+        dir.path(),
+        "preview hooks",
+    )
+    .unwrap();
+    assert!(
+        preview.contains("Workflow hook (before_stage):"),
+        "{preview}"
+    );
+    assert!(preview.contains("hook (after_stage):"), "{preview}");
+
+    // 3. Running executes workflow + stage hooks; failing `after_stage` hook logs
+    // without masking the stage's Complete outcome.
+    let mut run = Run::create(
+        dir.path(),
+        &trusted.settings,
+        &trusted.settings.workflows[0],
+        "run hooks".into(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(drive(&mut run), Action::Complete);
+    assert_eq!(run.status, Status::Complete);
+    let log = fs::read_to_string(&marker).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "wf-before:before_stage",
+            "stage-before:before_stage",
+            "wf-after:after_stage",
+            "stage-after:after_stage",
+        ]
+    );
+
+    // 4. Tampering with a hook in saved run.json invalidates run approval digest!
+    let mut tampered = run.clone();
+    tampered.workflow.hooks.before_stage[0]
+        .command
+        .push("--tampered".into());
+    let err = trust::authorize_run(&tampered).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("changed since this run was approved"),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn before_stage_and_before_ship_abort_on_failure_and_trigger_on_failure() {
+    init_test_config_dir();
+    let dir = common::tempdir();
+    init_git(dir.path());
+    let fail_marker = dir.path().join("on_failure.log");
+    let record_fail = Hook {
+        command: vec![
+            "python3".into(),
+            "-c".into(),
+            format!(
+                "import os, pathlib; pathlib.Path({:?}).write_text(os.environ.get('MODEL_ROUTER_STAGE_ID', '') + ':' + os.environ.get('MODEL_ROUTER_STAGE_STATUS', ''))",
+                fail_marker.display().to_string()
+            ),
+        ],
+        timeout_seconds: 10,
+    };
+
+    // 1. Failing `before_stage` aborts before the harness ever runs, and runs `on_failure`.
+    let mut s = stage("impl", Role::Implementation);
+    s.hooks = Hooks {
+        before_stage: vec![Hook {
+            command: vec![
+                "python3".into(),
+                "-c".into(),
+                "import sys; sys.stderr.write('precheck failed\\n'); sys.exit(2)".into(),
+            ],
+            timeout_seconds: 10,
+        }],
+        on_failure: vec![record_fail.clone()],
+        ..Hooks::default()
+    };
+    let wf = Workflow::new("AbortBeforeStage", vec![s]);
+    let settings = common::settings(&wf);
+    let mut run = Run::create(dir.path(), &settings, &wf, "abort stage".into(), false).unwrap();
+    assert_eq!(drive(&mut run), Action::Stopped);
+    assert_eq!(run.status, Status::Failed);
+    assert_eq!(common::count(dir.path(), "impl"), 0, "harness must not run");
+    assert_eq!(fs::read_to_string(&fail_marker).unwrap(), "impl:failed");
+
+    // 2. Failing `before_ship` aborts ship before any commit or branch is created.
+    let mut impl_ok = stage("impl", Role::Implementation);
+    impl_ok.provider = "implementation".into();
+    impl_ok.hooks.before_stage.push(Hook {
+        command: vec![
+            "python3".into(),
+            "-c".into(),
+            "import pathlib; pathlib.Path('README.md').write_text('updated\\n')".into(),
+        ],
+        timeout_seconds: 10,
+    });
+    let mut ship_stage = Stage {
+        id: "ship".into(),
+        name: "Ship".into(),
+        role: Role::Ship,
+        ship: Some(ship::Options {
+            confirm: false,
+            branch: "mr/hook-blocked".into(),
+            ..ship::Options::default()
+        }),
+        hooks: Hooks {
+            before_ship: vec![Hook {
+                command: vec![
+                    "python3".into(),
+                    "-c".into(),
+                    "import sys; sys.exit(4)".into(),
+                ],
+                timeout_seconds: 10,
+            }],
+            on_failure: vec![record_fail],
+            ..Hooks::default()
+        },
+        ..Stage::default()
+    };
+    let wf_ship = Workflow::new("AbortBeforeShip", vec![impl_ok, ship_stage.clone()]);
+    let settings_ship = common::settings(&wf_ship);
+    let mut run_ship = Run::create(
+        dir.path(),
+        &settings_ship,
+        &wf_ship,
+        "abort ship".into(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(drive(&mut run_ship), Action::Stopped);
+    assert_eq!(run_ship.status, Status::Blocked);
+    assert!(
+        run_ship
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("before_ship"),
+        "{:?}",
+        run_ship.error
+    );
+    let branches = git(dir.path(), &["branch", "--list", "mr/hook-blocked"]);
+    assert!(
+        branches.is_empty(),
+        "branch must not be created: {branches}"
+    );
+    assert_eq!(fs::read_to_string(&fail_marker).unwrap(), "ship:blocked");
+    ship_stage.hooks.before_ship.clear();
+}
+
+// -----------------------------------------------------------------------------
+// 3. Declarative diff policies (`block` and `advise`)
+// -----------------------------------------------------------------------------
+
+#[test]
+fn declarative_diff_policies_block_stage_fanout_apply_and_ship_and_advise_reviews() {
+    init_test_config_dir();
+    let dir = common::tempdir();
+    let scripts = common::tempdir();
+    init_git(dir.path());
+
+    let writer = scripts.path().join("writer.py");
+    fs::write(
+        &writer,
+        r#"import json, pathlib, sys
+target = pathlib.Path(sys.argv[1])
+content = sys.argv[2]
+prompt_path = pathlib.Path(sys.argv[3])
+handoff_path = pathlib.Path(sys.argv[4])
+verdict = sys.argv[5]
+if content != "READONLY":
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content + "\n")
+prompt_text = prompt_path.read_text()
+handoff_path.write_text(json.dumps({
+    "schema_version": 2,
+    "summary": "PROMPT_HAS_ADVISORY=" + str("Verify backwards compatibility" in prompt_text),
+    "verdict": verdict,
+    "findings": [],
+    "tests": [],
+    "files_changed": [str(target.name)],
+    "unresolved": []
+}))
+"#,
+    )
+    .unwrap();
+
+    let make_adapter = |rel: &str, content: &str, verdict: &str| CustomAdapter {
+        command: "python3".into(),
+        args: vec![
+            writer.display().to_string(),
+            rel.into(),
+            content.into(),
+            "{prompt_file}".into(),
+            "{handoff_file}".into(),
+            verdict.into(),
+        ],
+        ..CustomAdapter::default()
+    };
+
+    let policies = vec![
+        DiffPolicy {
+            name: "no-forbidden-token".into(),
+            action: PolicyAction::Block,
+            pattern: "word:FORBIDDEN_CALL".into(),
+            paths: vec!["src/**/*.rs".into()],
+            message: "Do not use FORBIDDEN_CALL in src/".into(),
+        },
+        DiffPolicy {
+            name: "migration-advisory".into(),
+            action: PolicyAction::Advise,
+            pattern: String::new(),
+            paths: vec!["migrations/**".into()],
+            message: "Verify backwards compatibility of schema changes".into(),
+        },
+    ];
+
+    let settings = Settings {
+        adapters: BTreeMap::from([
+            (
+                "bad_src".into(),
+                make_adapter("src/lib.rs", "fn f() { FORBIDDEN_CALL(); }", "complete"),
+            ),
+            (
+                "ok_migration".into(),
+                make_adapter(
+                    "migrations/001.sql",
+                    "ALTER TABLE t ADD COLUMN c INT;",
+                    "complete",
+                ),
+            ),
+            (
+                "review_pass".into(),
+                make_adapter("migrations/001.sql", "READONLY", "pass"),
+            ),
+        ]),
+        ..Settings::default()
+    };
+
+    // 1. Stage adding FORBIDDEN_CALL in src/lib.rs is blocked at stage end.
+    let mut wf_block = Workflow::new(
+        "PolicyBlock",
+        vec![Stage {
+            id: "impl".into(),
+            name: "Implement".into(),
+            role: Role::Implementation,
+            harness: "bad_src".into(),
+            ..Stage::default()
+        }],
+    );
+    wf_block.policies = policies.clone();
+    let mut run_block =
+        Run::create(dir.path(), &settings, &wf_block, "test block".into(), false).unwrap();
+    assert_eq!(drive(&mut run_block), Action::Stopped);
+    assert_eq!(run_block.status, Status::Blocked);
+    let err = run_block.error.as_deref().unwrap_or("");
+    assert!(
+        err.contains("no-forbidden-token") && err.contains("src/lib.rs:1"),
+        "{err}"
+    );
+    // Clean workspace for next run.
+    let _ = fs::remove_dir_all(dir.path().join("src"));
+
+    // 2. Stage touching migrations/001.sql passes block policy and injects
+    // `advise` message into the review stage prompt.
+    let mut wf_advise = Workflow::new(
+        "PolicyAdvise",
+        vec![
+            Stage {
+                id: "impl".into(),
+                name: "Implement".into(),
+                role: Role::Implementation,
+                harness: "ok_migration".into(),
+                ..Stage::default()
+            },
+            Stage {
+                id: "rev".into(),
+                name: "Review".into(),
+                role: Role::Review,
+                harness: "review_pass".into(),
+                ..Stage::default()
+            },
+        ],
+    );
+    wf_advise.policies = policies.clone();
+    let mut run_advise = Run::create(
+        dir.path(),
+        &settings,
+        &wf_advise,
+        "test advise".into(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(drive(&mut run_advise), Action::Complete);
+    let rev_summary = &run_advise.stages[1].handoff.as_ref().unwrap().summary;
+    assert_eq!(rev_summary, "PROMPT_HAS_ADVISORY=True");
+    let _ = fs::remove_dir_all(dir.path().join("migrations"));
+
+    // 3. Worktree `apply` and `ship::plan` also enforce `block` policies.
+    let mut wf_wt = Workflow::new(
+        "WorktreePolicy",
+        vec![Stage {
+            id: "impl".into(),
+            name: "Implement".into(),
+            role: Role::Implementation,
+            harness: "ok_migration".into(),
+            ..Stage::default()
+        }],
+    );
+    let mut run_wt = Run::create(dir.path(), &settings, &wf_wt, "wt apply".into(), true).unwrap();
+    assert_eq!(drive(&mut run_wt), Action::Complete);
+    // Now add a policy that blocks `ALTER TABLE` before applying/shipping the finished run.
+    let block_alter = DiffPolicy {
+        name: "no-alter".into(),
+        action: PolicyAction::Block,
+        pattern: "ALTER TABLE".into(),
+        paths: vec!["migrations/**".into()],
+        message: "ALTER TABLE is blocked".into(),
+    };
+    run_wt.workflow.policies = vec![block_alter.clone()];
+    let apply_err = engine::apply_worktree_plan(&run_wt).unwrap_err();
+    assert!(
+        format!("{apply_err:#}").contains("no-alter"),
+        "{apply_err:#}"
+    );
+    let ship_err = ship::plan(&run_wt, &ship::Options::default()).unwrap_err();
+    assert!(format!("{ship_err:#}").contains("no-alter"), "{ship_err:#}");
+    wf_wt.policies.push(block_alter);
+}
+
+// -----------------------------------------------------------------------------
+// 4. Conditional stages (`when_changed`) & review quorum (`review_quorum`)
+// -----------------------------------------------------------------------------
+
+#[test]
+fn when_changed_skips_unmatched_stages_in_git_and_runs_outside_git() {
+    init_test_config_dir();
+    let dir = common::tempdir();
+    init_git(dir.path());
+
+    let mut s_impl = stage("impl", Role::Implementation);
+    s_impl.provider = "implementation".into();
+    s_impl.hooks.before_stage.push(Hook {
+        command: vec![
+            "python3".into(),
+            "-c".into(),
+            "import pathlib; pathlib.Path('notes.txt').write_text('changed\\n')".into(),
+        ],
+        timeout_seconds: 10,
+    });
+    let mut s_rust_only = stage("rust_check", Role::Custom);
+    s_rust_only.when_changed = vec!["src/**/*.rs".into()];
+    let mut s_txt_only = stage("txt_check", Role::Custom);
+    s_txt_only.when_changed = vec!["*.txt".into()];
+
+    let wf = Workflow::new(
+        "Conditional",
+        vec![s_impl.clone(), s_rust_only.clone(), s_txt_only.clone()],
+    );
+    let settings = common::settings(&wf);
+    let mut run = Run::create(dir.path(), &settings, &wf, "conditional".into(), false).unwrap();
+    assert_eq!(drive(&mut run), Action::Complete);
+    assert_eq!(run.stages[0].status, Status::Complete);
+    assert_eq!(run.stages[1].status, Status::Skipped);
+    assert!(
+        run.stages[1]
+            .skipped_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("when_changed"),
+        "{:?}",
+        run.stages[1].skipped_reason
+    );
+    assert_eq!(run.stages[2].status, Status::Complete);
+
+    // Outside Git: fail-safe runs all conditional stages normally.
+    let non_git = common::tempdir();
+    let mut run_non_git =
+        Run::create(non_git.path(), &settings, &wf, "non-git".into(), false).unwrap();
+    assert_eq!(drive(&mut run_non_git), Action::Complete);
+    assert_eq!(run_non_git.stages[1].status, Status::Complete);
+    assert_eq!(run_non_git.stages[2].status, Status::Complete);
+}
+
+#[test]
+fn review_quorum_requires_n_distinct_passing_reviews_and_blocks_otherwise() {
+    init_test_config_dir();
+    let dir = common::tempdir();
+    init_git(dir.path());
+
+    let mut s_impl = stage("impl", Role::Implementation);
+    s_impl.provider = "implementation".into();
+    let mut r1 = stage("review_1", Role::Review);
+    r1.provider = "review_pass".into();
+    let mut r2 = stage("review_2", Role::Review);
+    r2.provider = "review_pass".into();
+
+    // 1. Two passing reviews satisfy review_quorum = 2 (in a parallel dependency graph!).
+    let mut r1_graph = r1.clone();
+    r1_graph.after = vec!["impl".into()];
+    let mut r2_graph = r2.clone();
+    r2_graph.after = vec!["impl".into()];
+    let mut wf_ok = Workflow::new("QuorumPass", vec![s_impl.clone(), r1_graph, r2_graph]);
+    wf_ok.review_quorum = Some(2);
+    let settings_ok = common::settings(&wf_ok);
+    let mut run_ok = Run::create(
+        dir.path(),
+        &settings_ok,
+        &wf_ok,
+        "quorum pass".into(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(drive(&mut run_ok), Action::Complete);
+    assert_eq!(run_ok.status, Status::Complete);
+
+    // 2. When one of the two reviews is skipped by `when_changed`, only 1 review
+    // passed (< quorum 2), so the run blocks!
+    let mut r2_skipped = r2;
+    r2_skipped.when_changed = vec!["nonexistent_dir/**".into()];
+    let mut wf_short = Workflow::new("QuorumShort", vec![s_impl, r1, r2_skipped]);
+    wf_short.review_quorum = Some(2);
+    let settings_short = common::settings(&wf_short);
+    let mut run_short = Run::create(
+        dir.path(),
+        &settings_short,
+        &wf_short,
+        "quorum short".into(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(drive(&mut run_short), Action::Stopped);
+    assert_eq!(run_short.status, Status::Blocked);
+    assert!(
+        run_short
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Review quorum not met: 1 of 2"),
+        "{:?}",
+        run_short.error
+    );
+}
+
+// -----------------------------------------------------------------------------
+// 5. Live mid-stream budget enforcement
+// -----------------------------------------------------------------------------
+
+#[test]
+fn live_mid_stream_budget_stops_streaming_stage_immediately_when_exceeded() {
+    init_test_config_dir();
+    let dir = common::tempdir();
+    let streamer = dir.path().join("streamer.py");
+    fs::write(
+        &streamer,
+        r#"import json, sys, time
+handoff_path = sys.argv[1]
+# Emit turn 1 (400 tokens)
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 300, "output_tokens": 100}}), flush=True)
+time.sleep(0.05)
+# Emit turn 2 (700 more tokens -> 1100 total, exceeding 800 cap!)
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 500, "output_tokens": 200}}), flush=True)
+# Sleep long enough that only mid-stream termination finishes quickly
+time.sleep(30)
+with open(handoff_path, "w") as f:
+    json.dump({"schema_version": 2, "summary": "should not finish", "verdict": "complete"}, f)
+"#,
+    )
+    .unwrap();
+
+    let adapter = CustomAdapter {
+        command: "python3".into(),
+        args: vec![streamer.display().to_string(), "{handoff_file}".into()],
+        output: Some(CustomOutput::CodexJsonl),
+        ..CustomAdapter::default()
+    };
+    let settings = Settings {
+        adapters: BTreeMap::from([("streamer".into(), adapter)]),
+        ..Settings::default()
+    };
+    let mut s = Stage {
+        id: "stream".into(),
+        name: "Stream".into(),
+        role: Role::Implementation,
+        harness: "streamer".into(),
+        model: "gpt-5.4".into(),
+        billing: Some(Billing::Api),
+        timeout_seconds: 60,
+        budget: Budget {
+            max_tokens: Some(800),
+            on_exceed: BudgetAction::Stop,
+            ..Budget::default()
+        },
+        ..Stage::default()
+    };
+    let wf = Workflow::new("LiveCap", vec![s.clone()]);
+    let mut run = Run::create(dir.path(), &settings, &wf, "live cap".into(), false).unwrap();
+    let started = Instant::now();
+    let action = drive(&mut run);
+    let elapsed = started.elapsed();
+    assert_eq!(action, Action::Stopped);
+    assert_eq!(run.status, Status::Blocked);
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "process group should be terminated mid-stream without waiting 30s (took {elapsed:?})"
+    );
+    assert!(cost::budget_blocked(&run), "{:?}", run.error);
+    let usage = run.stages[0].attempts[0]
+        .usage
+        .expect("streamed usage recorded on aborted attempt");
+    assert_eq!(cost::counted_tokens(&usage), 1100);
+
+    // Raising the token budget unblocks the run.
+    s.budget.max_tokens = Some(2000);
+    cost::raise_budget(&mut run, None, Some(2000)).unwrap();
+    assert_eq!(run.status, Status::Pending);
+}
+
+#[test]
+fn fanout_candidate_diff_policy_blocks_offending_candidate_and_graph_retries_transiently() {
+    init_test_config_dir();
+    let dir = common::tempdir();
+    let scripts = common::tempdir();
+    init_git(dir.path());
+
+    // 1. Fan-out candidate that writes a blocked pattern is stopped as Blocked,
+    // while the clean candidate wins auto-judgement.
+    let cand_script = scripts.path().join("cand.py");
+    fs::write(
+        &cand_script,
+        r#"import json, pathlib, sys
+mode = sys.argv[1]
+handoff_path = pathlib.Path(sys.argv[2])
+if mode == "bad":
+    pathlib.Path("app.rs").write_text("fn main() { BLOCKED_API(); }\n")
+else:
+    pathlib.Path("app.rs").write_text("fn main() { safe_api(); }\n")
+handoff_path.write_text(json.dumps({
+    "schema_version": 2,
+    "summary": f"candidate {mode}",
+    "verdict": "complete",
+    "findings": [],
+    "tests": [],
+    "files_changed": ["app.rs"],
+    "unresolved": []
+}))
+"#,
+    )
+    .unwrap();
+    let cand_adapter = |mode: &str| CustomAdapter {
+        command: "python3".into(),
+        args: vec![
+            cand_script.display().to_string(),
+            mode.into(),
+            "{handoff_file}".into(),
+        ],
+        ..CustomAdapter::default()
+    };
+    let settings = Settings {
+        adapters: BTreeMap::from([
+            ("bad_cand".into(), cand_adapter("bad")),
+            ("good_cand".into(), cand_adapter("good")),
+        ]),
+        ..Settings::default()
+    };
+    let mut fan_stage = Stage {
+        id: "impl".into(),
+        name: "Implement".into(),
+        role: Role::Implementation,
+        harness: "good_cand".into(),
+        fan_out: Some(model_router::config::FanOut {
+            candidates: vec![
+                model_router::config::Candidate {
+                    id: "c_bad".into(),
+                    harness: "bad_cand".into(),
+                    ..Default::default()
+                },
+                model_router::config::Candidate {
+                    id: "c_good".into(),
+                    harness: "good_cand".into(),
+                    ..Default::default()
+                },
+            ],
+            judge: "auto".into(),
+        }),
+        ..Stage::default()
+    };
+    let mut wf = Workflow::new("FanOutPolicy", vec![fan_stage.clone()]);
+    wf.policies.push(DiffPolicy {
+        name: "no-blocked-api".into(),
+        action: PolicyAction::Block,
+        pattern: "BLOCKED_API".into(),
+        paths: vec!["*.rs".into()],
+        message: "BLOCKED_API is not permitted".into(),
+    });
+    let mut run = Run::create(dir.path(), &settings, &wf, "fanout policy".into(), false).unwrap();
+    assert_eq!(drive(&mut run), Action::Complete);
+    let fan_state = run.stages[0].fan_out.as_ref().unwrap();
+    assert_eq!(fan_state.candidates[0].status, Status::Blocked);
+    assert!(
+        fan_state.candidates[0]
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("no-blocked-api")
+    );
+    assert_eq!(fan_state.candidates[1].status, Status::Complete);
+    assert_eq!(fan_state.selection.as_ref().unwrap().candidate, "c_good");
+    fan_stage.fan_out = None;
+}

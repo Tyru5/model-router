@@ -24,13 +24,22 @@ pub(super) fn auto_pick(state: &FanOutState) -> Option<usize> {
 pub(super) enum Job {
     Stage(usize),
     Candidate(usize, usize),
+    RetryWait(usize),
 }
 pub(super) enum Message {
     Spawned(Job, process::Group),
     /// Formatted lines, as the worker's formatter produced them.
     Output(Job, String),
-    /// A stage supervisor's result and when the harness ended.
-    StageDone(usize, Result<process::Outcome>, DateTime<Utc>),
+    /// A stage supervisor's result, live usage, optional mid-stream budget stop, and end time.
+    StageDone(
+        usize,
+        Result<process::Outcome>,
+        Option<handoff::Usage>,
+        Option<String>,
+        DateTime<Utc>,
+    ),
+    /// A transient retry backoff delay finished (or was interrupted).
+    RetryReady(usize, bool),
     /// A candidate worker's post-processed result and when the harness ended.
     CandidateDone(usize, usize, Box<Result<run::CandidatePost>>, DateTime<Utc>),
 }
@@ -55,6 +64,8 @@ struct StageJob {
     sandbox: Option<crate::sandbox::Plan>,
     directory: PathBuf,
     cwd: PathBuf,
+    live_budget: Option<crate::cost::LiveBudgetMonitor>,
+    timeout: Duration,
 }
 
 struct CandidateJob {
@@ -67,6 +78,7 @@ struct CandidateJob {
     base: String,
     run_id: String,
     protected_paths: Vec<String>,
+    policies: Vec<crate::policy::DiffPolicy>,
 }
 
 enum WorkerJob {
@@ -263,6 +275,10 @@ pub(super) fn schedule(
             let mut deferred_settle: Vec<usize> = vec![];
             let mut labels = std::collections::HashMap::new();
             let mut speaking = None;
+            let mut stage_retries: std::collections::HashMap<usize, (u32, std::time::Instant)> =
+                std::collections::HashMap::new();
+            let mut retry_reason: std::collections::HashMap<usize, String> =
+                std::collections::HashMap::new();
             loop {
                 while !halted(run) && deferred_settle.is_empty() {
                     let (launch, waiting) = next_launch(run, only);
@@ -276,13 +292,28 @@ pub(super) fn schedule(
                     let Some(launch) = launch else {
                         break;
                     };
-                    // As in `drive`, a cap stops or warns before another stage
-                    // starts; stages already running finish.
                     if let Launch::Stage(index)
                     | Launch::FanOut(index)
                     | Launch::Interactive(index)
                     | Launch::Ship(index) = launch
                     {
+                        if let Some(reason) = run.should_skip_when_changed(index) {
+                            let name = run.workflow.stages[index].name.clone();
+                            run.stages[index].skipped_reason = Some(reason.clone());
+                            run.set(
+                                Target::Stage(index),
+                                Status::Skipped,
+                                Actor::Engine,
+                                &reason,
+                            )?;
+                            run.persist()?;
+                            emit(Event::Output(format!("── {name} · {reason} ──\n")));
+                            emit(Event::State(Box::new(run.clone())));
+                            started += 1;
+                            continue;
+                        }
+                        // As in `drive`, a cap stops or warns before another stage
+                        // starts; stages already running finish.
                         match crate::cost::check_budget_action(run) {
                             crate::cost::BudgetCheck::Ok => {}
                             crate::cost::BudgetCheck::Warn(warning) => {
@@ -332,14 +363,28 @@ pub(super) fn schedule(
                         }
                         Launch::Stage(index) => {
                             run.cursor = index;
-                            match start_stage(run, emit)? {
+                            let entry = stage_retries
+                                .entry(index)
+                                .or_insert_with(|| (0, std::time::Instant::now()));
+                            let first_attempt = entry.0 == 0;
+                            let stage_started = entry.1;
+                            let stage_timeout =
+                                Duration::from_secs(run.workflow.stages[index].timeout_seconds);
+                            let remaining_timeout = stage_timeout
+                                .saturating_sub(stage_started.elapsed())
+                                .max(Duration::from_secs(1));
+                            match start_stage_inner(run, cancel, first_attempt, emit)? {
                                 Some(prepared) => {
+                                    let live_budget =
+                                        crate::cost::LiveBudgetMonitor::for_stage(run, index);
                                     let worker = WorkerJob::Stage(Box::new(StageJob {
                                         index,
                                         invocation: prepared.invocation.clone(),
                                         sandbox: prepared.sandbox.clone(),
                                         directory: prepared.directory.clone(),
                                         cwd: run.workspace.clone(),
+                                        live_budget,
+                                        timeout: remaining_timeout,
                                     }));
                                     (Job::Stage(index), Some(prepared), worker)
                                 }
@@ -374,6 +419,7 @@ pub(super) fn schedule(
                                     base,
                                     run_id: run.id.clone(),
                                     protected_paths: run.workflow.protected_paths.clone(),
+                                    policies: run.workflow.policies.clone(),
                                 }));
                                 (Job::Candidate(index, c), None, worker)
                             }
@@ -426,7 +472,12 @@ pub(super) fn schedule(
                     };
                     speaking = Some(job);
                     labels.insert(job, label);
-                    let timeout = Duration::from_secs(run.workflow.stages[index].timeout_seconds);
+                    let timeout = match &worker_job {
+                        WorkerJob::Stage(stage) => stage.timeout,
+                        WorkerJob::Candidate(_) => {
+                            Duration::from_secs(run.workflow.stages[index].timeout_seconds)
+                        }
+                    };
                     // As in `execute_stage`: never for output that
                     // arrives only at exit.
                     let stall_timeout = run.workflow.stages[index]
@@ -435,34 +486,39 @@ pub(super) fn schedule(
                         .map(Duration::from_secs);
                     let worker_tx = tx.clone();
                     scope.spawn(move || {
-                        let (invocation, cwd, directory, sandbox) = match &worker_job {
+                        let (invocation, cwd, directory, sandbox, live_budget) = match &worker_job {
                             WorkerJob::Stage(stage) => (
                                 &stage.invocation,
                                 &stage.cwd,
                                 &stage.directory,
                                 stage.sandbox.as_ref(),
+                                stage.live_budget.as_ref(),
                             ),
                             WorkerJob::Candidate(cand) => (
                                 &cand.prepared.invocation,
                                 &cand.cwd,
                                 &cand.prepared.directory,
                                 cand.prepared.sandbox.as_ref(),
+                                None,
                             ),
                         };
                         let spawned = std::cell::Cell::new(None);
                         // Formatting here keeps it off the scheduler, which
                         // also runs checks, and sends lines, not raw output.
                         let mut formatter = events::Formatter::new(invocation.kind);
+                        let mut usage_tracker = handoff::UsageTracker::new(invocation.kind);
+                        let budget_abort = AtomicBool::new(false);
+                        let mut budget_exceeded: Option<String> = None;
                         let outcome_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                process::capture_with_stall_and_abort(
+                                process::capture_with_controls(
                                     invocation,
                                     cwd,
                                     directory,
                                     timeout,
                                     stall_timeout,
                                     cancel,
-                                    Some(abort),
+                                    &[abort, &budget_abort],
                                     sandbox,
                                     |group| {
                                         // Durable before this worker reports it;
@@ -479,6 +535,26 @@ pub(super) fn schedule(
                                                 storage::clean_terminal(text)
                                             ))
                                         } else {
+                                            if let Some(monitor) = live_budget {
+                                                if budget_exceeded.is_none() {
+                                                    if let Some(live_usage) =
+                                                        usage_tracker.push(text)
+                                                    {
+                                                        if let Some(reason) =
+                                                            monitor.check(live_usage)
+                                                        {
+                                                            budget_exceeded = Some(reason.clone());
+                                                            budget_abort
+                                                                .store(true, Ordering::Relaxed);
+                                                            let _ =
+                                                                worker_tx.send(Message::Output(
+                                                                    job,
+                                                                    format!("\n{reason}\n"),
+                                                                ));
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             formatter.push(text)
                                         };
                                         if let Some(lines) = lines {
@@ -506,11 +582,14 @@ pub(super) fn schedule(
                                 journal.recorded(pgid);
                             }
                         }
+                        let live_usage = usage_tracker.current();
                         match worker_job {
                             WorkerJob::Stage(stage) => {
                                 let _ = worker_tx.send(Message::StageDone(
                                     stage.index,
                                     outcome_result,
+                                    live_usage,
+                                    budget_exceeded,
                                     ended,
                                 ));
                             }
@@ -525,6 +604,7 @@ pub(super) fn schedule(
                                             &cand.base,
                                             &cand.run_id,
                                             &cand.protected_paths,
+                                            &cand.policies,
                                             outcome_result,
                                             journal,
                                             cancel,
@@ -577,6 +657,7 @@ pub(super) fn schedule(
                         let attempt = match job {
                             Job::Stage(i) => run.stages[i].attempts.last_mut(),
                             Job::Candidate(i, c) => run.candidate_mut(i, c).attempts.last_mut(),
+                            Job::RetryWait(_) => None,
                         };
                         let pgid = group.pgid;
                         if let Some(attempt) = attempt {
@@ -596,7 +677,45 @@ pub(super) fn schedule(
                         }
                         emit(Event::Output(lines));
                     }
-                    Message::StageDone(index, done_result, ended) => {
+                    Message::RetryReady(index, interrupted) => {
+                        let job = Job::RetryWait(index);
+                        if let Some(position) = flight.iter().position(|(j, _)| *j == job) {
+                            flight.swap_remove(position);
+                        }
+                        let reason = retry_reason
+                            .remove(&index)
+                            .unwrap_or_else(|| "Transient error retry".into());
+                        if interrupted
+                            || cancel.load(Ordering::Relaxed)
+                            || abort.load(Ordering::Relaxed)
+                        {
+                            run.cursor = index;
+                            let _ = run.set(
+                                Target::Stage(index),
+                                Status::Pending,
+                                Actor::User,
+                                "Cancelled during retry backoff",
+                            );
+                            run.stop(
+                                Status::Cancelled,
+                                "Stage cancelled during transient retry backoff. Filesystem changes are retained; retry explicitly".into(),
+                                Actor::User,
+                                false,
+                            )?;
+                            run.persist()?;
+                            emit(Event::State(Box::new(run.clone())));
+                        } else {
+                            run.set(
+                                Target::Stage(index),
+                                Status::Pending,
+                                Actor::Engine,
+                                &reason,
+                            )?;
+                            run.persist()?;
+                            emit(Event::State(Box::new(run.clone())));
+                        }
+                    }
+                    Message::StageDone(index, done_result, live_usage, budget_exceeded, ended) => {
                         let job = Job::Stage(index);
                         let Some(position) = flight.iter().position(|(j, _)| *j == job) else {
                             continue;
@@ -611,6 +730,10 @@ pub(super) fn schedule(
                             .err()
                             .and_then(|e| e.downcast_ref::<process::Survivor>())
                             .map(|s| s.group.pgid);
+                        let outcome_ok_not_aborted = done_result
+                            .as_ref()
+                            .is_ok_and(|o| !o.cancelled && !o.timed_out && !o.stalled);
+                        let had_budget_exceed = budget_exceeded.is_some();
                         // When the harness ended, not when this got to it.
                         if let (Some(attempt), true) =
                             (run.stages[index].attempts.last_mut(), done_result.is_ok())
@@ -618,9 +741,119 @@ pub(super) fn schedule(
                             attempt.finished_at = Some(ended);
                         }
                         run.cursor = index;
-                        conclude(run, &prepared, done_result, cancel, emit)?;
+                        conclude_inner(
+                            run,
+                            &prepared,
+                            done_result,
+                            live_usage,
+                            budget_exceeded,
+                            false,
+                            cancel,
+                            emit,
+                        )?;
                         if let Some(pgid) = survivor_pgid {
                             journal.recorded(pgid);
+                        }
+                        let retry = run.workflow.stages[index].effective_retry(&run.workflow);
+                        let (retries_done, stage_started) = stage_retries
+                            .get(&index)
+                            .copied()
+                            .unwrap_or((0, std::time::Instant::now()));
+                        let stage_timeout =
+                            Duration::from_secs(run.workflow.stages[index].timeout_seconds);
+                        let mut scheduled_retry = false;
+                        if should_transient_retry(
+                            run,
+                            index,
+                            &prepared,
+                            outcome_ok_not_aborted,
+                            retries_done,
+                            retry,
+                            had_budget_exceed,
+                            cancel,
+                        ) {
+                            let budget_ok = match crate::cost::check_budget_action(run) {
+                                crate::cost::BudgetCheck::Ok => true,
+                                crate::cost::BudgetCheck::Warn(warning) => {
+                                    emit(Event::Output(format!("{warning}\n")));
+                                    true
+                                }
+                                crate::cost::BudgetCheck::Stop(reason) => {
+                                    if let Some(hold) = &mut run.hold {
+                                        hold.stops.retain(|(i, _)| *i != index);
+                                    }
+                                    run.set(
+                                        Target::Stage(index),
+                                        Status::Pending,
+                                        Actor::Engine,
+                                        "Budget check before retry",
+                                    )?;
+                                    run.stop(Status::Blocked, reason, Actor::Engine, false)?;
+                                    false
+                                }
+                            };
+                            if budget_ok {
+                                let next_retry = retries_done + 1;
+                                let delay = retry.delay_for(next_retry);
+                                let remaining =
+                                    stage_timeout.saturating_sub(stage_started.elapsed());
+                                if !remaining.is_zero() && (delay.is_zero() || delay < remaining) {
+                                    if let Some(hold) = &mut run.hold {
+                                        hold.stops.retain(|(i, _)| *i != index);
+                                    }
+                                    let stage = &run.workflow.stages[index];
+                                    let err_summary =
+                                        run.error.as_deref().unwrap_or("transient error");
+                                    emit(Event::Output(format!(
+                                        "Transient failure ({}); retrying {next_retry}/{} in {}s with {}{}{}\n",
+                                        storage::truncate(
+                                            err_summary.lines().next().unwrap_or(""),
+                                            160
+                                        ),
+                                        retry.max_attempts,
+                                        delay.as_secs(),
+                                        stage.harness,
+                                        if stage.model.is_empty() { "" } else { " " },
+                                        stage.model
+                                    )));
+                                    stage_retries.insert(index, (next_retry, stage_started));
+                                    retry_reason.insert(
+                                        index,
+                                        format!(
+                                            "Transient error retry {next_retry}/{} after {}s backoff",
+                                            retry.max_attempts,
+                                            delay.as_secs()
+                                        ),
+                                    );
+                                    let sleeper_tx = tx.clone();
+                                    scope.spawn(move || {
+                                        let interrupted =
+                                            sleep_interruptible(delay, cancel, Some(abort));
+                                        let _ = sleeper_tx
+                                            .send(Message::RetryReady(index, interrupted));
+                                    });
+                                    flight.push((Job::RetryWait(index), None));
+                                    scheduled_retry = true;
+                                } else {
+                                    emit(Event::Output(format!(
+                                        "Transient retry {next_retry}/{} skipped: stage timeout budget exhausted\n",
+                                        retry.max_attempts
+                                    )));
+                                }
+                            }
+                        }
+                        if !scheduled_retry {
+                            stage_retries.remove(&index);
+                            run_post_stage_hooks(
+                                run,
+                                index,
+                                &prepared.directory,
+                                prepared.reattached,
+                                cancel,
+                                emit,
+                            );
+                            run.persist()?;
+                            emit(Event::State(Box::new(run.clone())));
                         }
                     }
                     Message::CandidateDone(index, c, post_result, ended) => {
@@ -663,7 +896,7 @@ pub(super) fn schedule(
             let mut survivors_added = false;
             while let Ok(message) = rx.recv() {
                 match message {
-                    Message::StageDone(_, done_result, _) => {
+                    Message::StageDone(_, done_result, _, _, _) => {
                         let before = run.retained_groups.len();
                         keep_survivor(run, &done_result);
                         if run.retained_groups.len() > before {
@@ -787,6 +1020,13 @@ pub(super) fn drive_graph(
             .all(|s| matches!(s.status, Status::Complete | Status::Skipped))
         {
             run.cursor = run.stages.len();
+            if let Err(error) = run.check_review_quorum() {
+                run.stop(Status::Blocked, format!("{error:#}"), Actor::Engine, false)?;
+                run.persist()?;
+                save_changes(run);
+                emit(Event::State(Box::new(run.clone())));
+                return Ok(Action::Stopped);
+            }
             run.set(
                 Target::Run,
                 Status::Complete,
@@ -825,7 +1065,7 @@ pub(super) fn drive_graph(
             match next {
                 Some(Next::Ship(index)) => {
                     run.cursor = index;
-                    crate::ship::execute(run, emit)?;
+                    crate::ship::execute(run, cancel, emit)?;
                     continue;
                 }
                 Some(Next::Interactive(index)) => {

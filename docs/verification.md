@@ -4,14 +4,14 @@ Verified locally on Linux with Rust 1.100.0 (and MSRV 1.85).
 
 | Check | Result |
 | --- | --- |
-| `cargo test --locked --no-fail-fast` | 541 tests passed (0 failed, 2 ignored helper tests) |
+| `cargo test --locked --no-fail-fast` | 691 tests passed (0 failed, 2 ignored helper tests) |
 | `cargo clippy --all-targets --locked -- -D warnings` | Passed |
 | `cargo fmt --check` | Passed |
 | `cargo +1.85 check --all-targets --locked` (MSRV) | Passed |
 | `python3 scripts/smoke_shutdown.py` | 8/8 real-PTY disconnect and signal scenarios passed |
 | `presets` | 15 stage presets and 5 workflow presets; `init --preset` and `init --detect` verified |
 | `themes` | 14 themes covered by unit tests (contrast, rendering in all views/dialogs) and `smoke_themes.py` |
-| Guardrails & server (`tests/guardrails.rs`, `tests/serve.rs`) | Stall timeouts, `protected_paths`, pre-ship secret scanning, trust gates, `handoff_repair`, worktree `apply`, budget `on_exceed = "warn"`, billing API/subscription split, MCP line/worker bounds, `notifications/cancelled`, `notifications/progress`, and finished-run handle eviction passed |
+| Guardrails, resilience, schedules & server (`tests/guardrails.rs`, `tests/engine_resilience.rs`, `tests/schedules_doctor_metrics.rs`, `tests/serve.rs`) | Stall timeouts, `protected_paths`, pre-ship secret scanning, trust gates, global config layering, `context_files`, tunable handoff budgets, transient retries, lifecycle hooks, `block`/`advise` diff policies, `when_changed`, `review_quorum`, live streaming budget caps, cron/timezone schedules, `doctor` version pins & auth hints, `cost --all-projects`, JSONL metrics export, MCP/HTTP tool & resource parity, `GET /health`, and TUI parity modals passed |
 | Previous PTY smoke runs (requiring `uv` / `pyte`) | Workflow, repository browser, task import, stage presets, theme selection, harness settings, startup animation, detach/reattach, and diff review scripts pass offline in CI (`ubuntu-latest`) |
 
 The tests cover original-task preservation, cross-stage handoffs, disabled reviews,

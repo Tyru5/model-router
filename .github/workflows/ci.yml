@@ -61,8 +61,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     # All scripts are portable (PTY/termios only, /proc checks gated to Linux).
-    # macOS stays advisory until it has a record of green runs.
-    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     env:
       SMOKE: uv run --with-requirements scripts/requirements-smoke.txt python
     steps:

@@ -1,4 +1,6 @@
 use super::*;
+use std::collections::HashSet;
+use std::io::Read;
 
 pub(super) struct PromptTarget<'a> {
     pub(super) cursor: usize,
@@ -27,14 +29,14 @@ pub fn prompt(run: &Run, handoff_path: &Path, schema_path: &Path) -> String {
 }
 
 /// The prompt, and when `collect_views` is true, what it carried of each
-/// upstream handoff.
+/// upstream handoff and each configured context file.
 pub(super) fn prompt_for(
     run: &Run,
     target: PromptTarget<'_>,
     handoff_path: &Path,
     schema_path: &Path,
     collect_views: bool,
-) -> (String, Vec<HandoffView>) {
+) -> (String, Vec<HandoffView>, Vec<ContextFileView>) {
     let stage = target.stage;
     let mut text = format!(
         "You are completing stage {:?} (role: {}) in a multi-stage workflow.\n\nORIGINAL USER TASK\n{}\n\nSTAGE INSTRUCTIONS\n{}\n\nWORKING DIRECTORY\n{}\n\nFollow the project's own instructions. Do not commit, merge, or push unless the original task explicitly requests it. Do not change router configuration, run state, or other stages' artifacts.\n",
@@ -44,8 +46,35 @@ pub(super) fn prompt_for(
         stage.instructions,
         target.workspace.display()
     );
+    let context = resolve_context_files(
+        target.workspace,
+        &run.workflow.context_files,
+        &stage.context_files,
+    );
+    if !context.entries.is_empty() {
+        text.push_str("\nPROJECT CONTEXT FILES\n");
+        for entry in &context.entries {
+            if entry.truncated {
+                text.push_str(&format!(
+                    "\n--- {} ({} bytes, truncated) ---\n{}\n[truncated; full file in workspace at {}]\n",
+                    entry.path,
+                    entry.content.len(),
+                    entry.content,
+                    entry.path
+                ));
+            } else {
+                text.push_str(&format!("\n--- {} ---\n{}", entry.path, entry.content));
+                if !entry.content.ends_with('\n') {
+                    text.push('\n');
+                }
+            }
+        }
+    }
+    let context_views = if collect_views { context.views } else { vec![] };
     let mut views = vec![];
-    let mut remaining = PRIOR_BUDGET;
+    let total_budget = run.workflow.effective_handoff_budget_bytes();
+    let each_budget = run.workflow.effective_handoff_each_bytes();
+    let mut remaining = total_budget;
     // Stages this one runs after; in a list, every earlier stage.
     let order = run.order();
     for (index, state) in run
@@ -79,7 +108,7 @@ pub(super) fn prompt_for(
             .or_else(|| state.inherited.clone())
             .unwrap_or_default();
         let full = directory.join("handoff.json");
-        let budget = remaining.min(PRIOR_EACH);
+        let budget = remaining.min(each_budget);
         if budget == 0 {
             if collect_views {
                 views.push(HandoffView::missing(
@@ -124,6 +153,9 @@ pub(super) fn prompt_for(
             storage::truncate(feedback, 4000)
         ));
     }
+    if stage.role == Role::Review {
+        text.push_str(&policy_advisories(run));
+    }
     if !stage.checks.is_empty() {
         text.push_str("\nROUTER CHECKS\nAfter you finish, the router runs these commands in the working directory and records their results independently of your handoff:\n");
         for check in &stage.checks {
@@ -147,12 +179,453 @@ pub(super) fn prompt_for(
         ));
     }
     text.push_str(&handoff::contract(stage.role, handoff_path, schema_path));
-    (text, views)
+    (text, views, context_views)
+}
+
+/// Advisory diff policies matching files changed so far in `run`, formatted for
+/// review stage prompts.
+fn policy_advisories(run: &Run) -> String {
+    use crate::policy::{PolicyAction, PolicyScan, advisory_matches};
+    let has_advise = run
+        .workflow
+        .policies
+        .iter()
+        .any(|p| p.action == PolicyAction::Advise);
+    if !has_advise {
+        return String::new();
+    }
+    let needs_diff = run
+        .workflow
+        .policies
+        .iter()
+        .any(|p| p.action == PolicyAction::Advise && !p.pattern.is_empty());
+    let mut changed_files = vec![];
+    let mut diff_hits = vec![];
+    if let Some(from) = run.baseline.as_deref() {
+        if snapshot::is_repository(&run.workspace) {
+            let to = snapshot::current_tree(&run.workspace)
+                .ok()
+                .flatten()
+                .or_else(|| run.change_range().ok().map(|(_, t)| t.to_owned()))
+                .unwrap_or_else(|| from.to_owned());
+            if from != to {
+                changed_files =
+                    snapshot::changed_paths(&run.workspace, from, &to).unwrap_or_default();
+                if needs_diff {
+                    let mut scan =
+                        PolicyScan::with_action(&run.workflow.policies, PolicyAction::Advise);
+                    if snapshot::patch_lines(&run.workspace, from, &to, |line| scan.line(line))
+                        .is_ok()
+                    {
+                        diff_hits = scan.hits().to_vec();
+                    }
+                }
+            }
+        }
+    } else {
+        for state in &run.stages {
+            if state.status == Status::Complete {
+                if let Some(handoff) = &state.handoff {
+                    changed_files.extend(handoff.files_changed.iter().cloned());
+                }
+            }
+        }
+    }
+    let matches = advisory_matches(&run.workflow.policies, &changed_files, &diff_hits);
+    if matches.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\nPOLICY ADVISORIES\nThe following workflow policy advisories apply to changed files in this run:\n",
+    );
+    for hit in matches {
+        out.push_str(&format!(
+            "- [{}] {} (files: {})\n",
+            hit.name,
+            hit.message,
+            hit.files.join(", ")
+        ));
+    }
+    out
 }
 
 /// Bytes of prior handoffs one prompt carries in total, and per handoff.
-pub const PRIOR_BUDGET: usize = 14000;
-pub const PRIOR_EACH: usize = 5000;
+pub const PRIOR_BUDGET: usize = crate::config::DEFAULT_HANDOFF_BUDGET_BYTES;
+pub const PRIOR_EACH: usize = crate::config::DEFAULT_HANDOFF_EACH_BYTES;
+/// Maximum context files and total context bytes injected into one prompt.
+pub const MAX_CONTEXT_FILES: usize = crate::config::MAX_CONTEXT_FILES;
+pub const MAX_CONTEXT_BYTES: usize = crate::config::MAX_CONTEXT_BYTES;
+
+const MAX_WALK_DEPTH: usize = 32;
+const MAX_WALK_ENTRIES: usize = 50_000;
+
+/// One resolved or skipped context file for a stage prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContextFileView {
+    pub path: String,
+    pub included: bool,
+    pub bytes: usize,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+struct ContextEntry {
+    path: String,
+    content: String,
+    truncated: bool,
+}
+
+struct ResolvedContext {
+    entries: Vec<ContextEntry>,
+    views: Vec<ContextFileView>,
+}
+
+fn is_forbidden_component(name: &str) -> bool {
+    matches!(name, "" | "." | ".." | ".git" | ".model-router")
+}
+
+fn classify_open_failure(workspace: &Path, rel: &str) -> &'static str {
+    let mut cur = workspace.to_path_buf();
+    let mut saw_missing = false;
+    for part in rel.split('/').filter(|s| !s.is_empty()) {
+        cur.push(part);
+        match fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => return "symlink not allowed",
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                saw_missing = true;
+                break;
+            }
+            Err(_) => return "unreadable",
+        }
+    }
+    if saw_missing {
+        return "not found";
+    }
+    match fs::symlink_metadata(workspace.join(rel)) {
+        Ok(meta) if !meta.file_type().is_file() => "not a regular file",
+        _ => "unreadable",
+    }
+}
+
+fn glob_workspace(workspace: &Path, pattern: &str) -> Vec<String> {
+    let segments: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        return vec![];
+    }
+    let has_doublestar = segments.contains(&"**");
+    let max_depth = if has_doublestar {
+        MAX_WALK_DEPTH
+    } else {
+        segments.len().saturating_sub(1).min(MAX_WALK_DEPTH)
+    };
+    let prefix_len = segments
+        .iter()
+        .take(segments.len().saturating_sub(1))
+        .take_while(|seg| !seg.contains('*') && !seg.contains('?'))
+        .count();
+    let mut start_dir = workspace.to_path_buf();
+    let mut start_rel = String::new();
+    for seg in &segments[..prefix_len] {
+        if is_forbidden_component(seg) {
+            return vec![];
+        }
+        start_dir.push(seg);
+        let Ok(meta) = fs::symlink_metadata(&start_dir) else {
+            return vec![];
+        };
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+            return vec![];
+        }
+        if !start_rel.is_empty() {
+            start_rel.push('/');
+        }
+        start_rel.push_str(seg);
+    }
+
+    let mut matched = vec![];
+    let mut stack = vec![(start_dir, start_rel, prefix_len)];
+    let mut visited = 0usize;
+    while let Some((dir, rel_prefix, depth)) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > MAX_WALK_ENTRIES {
+                return matched;
+            }
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            let os_name = entry.file_name();
+            let Some(name) = os_name.to_str() else {
+                continue;
+            };
+            if is_forbidden_component(name) {
+                continue;
+            }
+            let rel = if rel_prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{rel_prefix}/{name}")
+            };
+            if ft.is_dir() {
+                if depth < max_depth {
+                    stack.push((entry.path(), rel, depth + 1));
+                }
+            } else if ft.is_file() && crate::policy::matches_glob(pattern, &rel) {
+                matched.push(rel);
+            }
+        }
+    }
+    matched
+}
+
+fn resolve_context_files(
+    workspace: &Path,
+    workflow_patterns: &[String],
+    stage_patterns: &[String],
+) -> ResolvedContext {
+    if workflow_patterns.is_empty() && stage_patterns.is_empty() {
+        return ResolvedContext {
+            entries: vec![],
+            views: vec![],
+        };
+    }
+    let mut entries = vec![];
+    let mut views = vec![];
+    let mut seen = HashSet::new();
+    let mut total_bytes = 0usize;
+    let mut omitted_for_files = 0usize;
+    let mut omitted_for_bytes = 0usize;
+
+    for raw_pattern in workflow_patterns.iter().chain(stage_patterns.iter()) {
+        let pattern = raw_pattern.trim();
+        if !crate::config::is_valid_context_pattern(pattern) {
+            views.push(ContextFileView {
+                path: pattern.to_owned(),
+                included: false,
+                bytes: 0,
+                truncated: false,
+                reason: Some("outside workspace or forbidden path".into()),
+            });
+            continue;
+        }
+        let is_glob = pattern.contains('*') || pattern.contains('?');
+        let candidates = if is_glob {
+            let mut matched = glob_workspace(workspace, pattern);
+            matched.sort();
+            if matched.is_empty() {
+                views.push(ContextFileView {
+                    path: pattern.to_owned(),
+                    included: false,
+                    bytes: 0,
+                    truncated: false,
+                    reason: Some("no matching files".into()),
+                });
+                continue;
+            }
+            matched
+        } else {
+            let normalized = pattern
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("/");
+            vec![normalized]
+        };
+
+        for rel in candidates {
+            if !seen.insert(rel.clone()) {
+                continue;
+            }
+            if rel.split('/').any(is_forbidden_component) {
+                views.push(ContextFileView {
+                    path: rel,
+                    included: false,
+                    bytes: 0,
+                    truncated: false,
+                    reason: Some("outside workspace or forbidden path".into()),
+                });
+                continue;
+            }
+            if entries.len() >= MAX_CONTEXT_FILES {
+                omitted_for_files += 1;
+                continue;
+            }
+            let remaining = MAX_CONTEXT_BYTES.saturating_sub(total_bytes);
+            if remaining == 0 {
+                omitted_for_bytes += 1;
+                continue;
+            }
+            let file = match storage::open_beneath(workspace, Path::new(&rel)) {
+                Ok(file) => file,
+                Err(_) => {
+                    let reason = classify_open_failure(workspace, &rel);
+                    views.push(ContextFileView {
+                        path: rel,
+                        included: false,
+                        bytes: 0,
+                        truncated: false,
+                        reason: Some(reason.into()),
+                    });
+                    continue;
+                }
+            };
+            let mut buf = Vec::new();
+            if file
+                .take((remaining + 4) as u64)
+                .read_to_end(&mut buf)
+                .is_err()
+            {
+                views.push(ContextFileView {
+                    path: rel,
+                    included: false,
+                    bytes: 0,
+                    truncated: false,
+                    reason: Some("unreadable".into()),
+                });
+                continue;
+            }
+            if buf.contains(&0) {
+                views.push(ContextFileView {
+                    path: rel,
+                    included: false,
+                    bytes: 0,
+                    truncated: false,
+                    reason: Some("non-UTF-8 or binary file".into()),
+                });
+                continue;
+            }
+            let (content, truncated) = if buf.len() <= remaining {
+                match String::from_utf8(buf) {
+                    Ok(text) => (text, false),
+                    Err(_) => {
+                        views.push(ContextFileView {
+                            path: rel,
+                            included: false,
+                            bytes: 0,
+                            truncated: false,
+                            reason: Some("non-UTF-8 or binary file".into()),
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                let valid = match std::str::from_utf8(&buf) {
+                    Ok(s) => Some(s),
+                    Err(err)
+                        if err.error_len().is_none()
+                            && err.valid_up_to() >= buf.len().saturating_sub(3) =>
+                    {
+                        std::str::from_utf8(&buf[..err.valid_up_to()]).ok()
+                    }
+                    Err(_) => None,
+                };
+                let Some(valid) = valid else {
+                    views.push(ContextFileView {
+                        path: rel,
+                        included: false,
+                        bytes: 0,
+                        truncated: false,
+                        reason: Some("non-UTF-8 or binary file".into()),
+                    });
+                    continue;
+                };
+                let mut end = remaining.min(valid.len());
+                while end > 0 && !valid.is_char_boundary(end) {
+                    end -= 1;
+                }
+                if end == 0 {
+                    omitted_for_bytes += 1;
+                    continue;
+                }
+                (valid[..end].to_owned(), true)
+            };
+            let bytes = content.len();
+            total_bytes += bytes;
+            views.push(ContextFileView {
+                path: rel.clone(),
+                included: true,
+                bytes,
+                truncated,
+                reason: truncated.then(|| "context byte limit reached".into()),
+            });
+            entries.push(ContextEntry {
+                path: rel,
+                content,
+                truncated,
+            });
+        }
+    }
+
+    if omitted_for_files > 0 {
+        views.push(ContextFileView {
+            path: format!("({omitted_for_files} more)"),
+            included: false,
+            bytes: 0,
+            truncated: false,
+            reason: Some(format!("file limit reached ({MAX_CONTEXT_FILES})")),
+        });
+    }
+    if omitted_for_bytes > 0 {
+        views.push(ContextFileView {
+            path: format!("({omitted_for_bytes} more)"),
+            included: false,
+            bytes: 0,
+            truncated: false,
+            reason: Some(format!("byte limit reached ({MAX_CONTEXT_BYTES} bytes)")),
+        });
+    }
+
+    ResolvedContext { entries, views }
+}
+
+/// One-line summary of resolved context files for `model-router preview`;
+/// None when neither the workflow nor stage configures `context_files`.
+pub(super) fn preview_context_files(
+    workspace: &Path,
+    workflow: &Workflow,
+    stage: &Stage,
+) -> Option<String> {
+    if workflow.context_files.is_empty() && stage.context_files.is_empty() {
+        return None;
+    }
+    let resolved = resolve_context_files(workspace, &workflow.context_files, &stage.context_files);
+    let mut included = vec![];
+    let mut skipped = vec![];
+    for view in &resolved.views {
+        if view.included {
+            included.push(if view.truncated {
+                format!("{} ({}B, truncated)", view.path, view.bytes)
+            } else {
+                format!("{} ({}B)", view.path, view.bytes)
+            });
+        } else {
+            skipped.push(format!(
+                "{} ({})",
+                view.path,
+                view.reason.as_deref().unwrap_or("skipped")
+            ));
+        }
+    }
+    let mut line = String::from("context files: ");
+    if included.is_empty() {
+        line.push_str("none");
+    } else {
+        line.push_str(&included.join(", "));
+    }
+    if !skipped.is_empty() {
+        line.push_str(&format!("; skipped: {}", skipped.join(", ")));
+    }
+    Some(line)
+}
 
 /// How much of one handoff field reached the downstream prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -288,6 +761,10 @@ impl HandoffView {
 pub struct Inspection {
     pub stage: String,
     pub handoffs: Vec<HandoffView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_files: Vec<ContextFileView>,
+    pub budget_bytes: usize,
+    pub each_bytes: usize,
     pub prompt: String,
 }
 
@@ -320,7 +797,7 @@ pub fn inspect_handoffs(run: &Run, stage_id: Option<&str>) -> Result<Inspection>
         .join(format!("{:02}-{}", index + 1, stage.id))
         .join(format!("attempt-{number:03}"))
         .join(handoff::SCHEMA_FILE);
-    let (prompt, handoffs) = prompt_for(
+    let (prompt, handoffs, context_files) = prompt_for(
         run,
         PromptTarget {
             cursor: index,
@@ -335,6 +812,9 @@ pub fn inspect_handoffs(run: &Run, stage_id: Option<&str>) -> Result<Inspection>
     Ok(Inspection {
         stage: stage.name.clone(),
         handoffs,
+        context_files,
+        budget_bytes: run.workflow.effective_handoff_budget_bytes(),
+        each_bytes: run.workflow.effective_handoff_each_bytes(),
         prompt,
     })
 }
@@ -385,8 +865,29 @@ impl Inspection {
                 out.push_str(&format!("      warning: {warning}\n"));
             }
         }
+        if !self.context_files.is_empty() {
+            out.push_str("Context files:\n");
+            for file in &self.context_files {
+                if file.included {
+                    out.push_str(&format!(
+                        "  {} {}: {} bytes{}\n",
+                        if file.truncated { "!" } else { "✓" },
+                        file.path,
+                        file.bytes,
+                        if file.truncated { ", truncated" } else { "" }
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  - {}: skipped ({})\n",
+                        file.path,
+                        file.reason.as_deref().unwrap_or("skipped")
+                    ));
+                }
+            }
+        }
         out.push_str(&format!(
-            "Budget: {PRIOR_BUDGET} bytes of prior handoffs, at most {PRIOR_EACH} each, nearest stage first. Full handoffs stay in each attempt's handoff.json.\n"
+            "Budget: {} bytes of prior handoffs, at most {} each, nearest stage first. Full handoffs stay in each attempt's handoff.json.\n",
+            self.budget_bytes, self.each_bytes
         ));
         out
     }

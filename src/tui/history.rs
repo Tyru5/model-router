@@ -1,17 +1,20 @@
 use super::input::InputField;
 use super::{
     actions::ActionId,
-    app::{App, Page},
-    modal::{Choice, Modal, PickValue},
+    app::{App, Page, RunOrigin},
+    delegation_view::{DelegatedTasksView, collect_tasks},
+    modal::{Choice, Loading, Modal, PickValue},
     monitor::draw_run,
+    schedules_view::SchedulesView,
     theme::{Palette, Theme},
     widgets::{content, empty_state, fit, kv, menu_key, textarea},
 };
 use crate::{
     adapters::OutputKind,
+    config::Role,
     engine::{self, Run, Status},
     history::{self, Criteria, Entry, Plan, StatusFilter},
-    storage,
+    report, ship, storage,
 };
 use anyhow::{Context, Result, bail, ensure};
 use crossterm::event::{KeyCode as Key, KeyEvent, KeyModifiers as Mods};
@@ -398,10 +401,52 @@ impl App {
                     })));
                 }
             }
+            ActionId::ForkRun => {
+                if let Some(source) = self.selected_run()? {
+                    self.fork_picker(&source)?;
+                }
+            }
+            ActionId::ShipRun => {
+                if !self.on_saved() && self.session.running() {
+                    bail!("Wait for the active stage to finish before shipping");
+                }
+                if let Some(run) = self.selected_run()? {
+                    self.begin_ad_hoc_ship(&run)?;
+                }
+            }
             ActionId::CompareAttempts => {
                 if let Some(run) = self.selected_run()? {
                     self.compare_picker(&run);
                 }
+            }
+            ActionId::HandoffsView => {
+                if let Some(run) = self.selected_run()? {
+                    let body = render_handoffs_report(&run);
+                    self.text(&format!("Handoffs budget & loss · {}", run.id), body);
+                }
+            }
+            ActionId::TransitionsView => {
+                if let Some(run) = self.selected_run()? {
+                    let records = report::transitions(&run)?;
+                    let body = report::render_transitions(&run, &records);
+                    self.text(&format!("Transitions · {}", run.id), body);
+                }
+            }
+            ActionId::DelegatedTasks => {
+                let live = !self.on_saved() && self.session.running();
+                if let Some(run) = self.selected_run()? {
+                    if collect_tasks(&run).is_empty() {
+                        self.ui.message = format!("Run {} has no delegated tasks.", run.id);
+                    } else {
+                        self.ui.open(Modal::DelegatedTasks(Box::new(
+                            DelegatedTasksView::from_run(&run, live),
+                        )));
+                    }
+                }
+            }
+            ActionId::Schedules => {
+                let view = SchedulesView::load(&self.project)?;
+                self.ui.open(Modal::Schedules(Box::new(view)));
             }
             ActionId::CleanUp => {
                 ensure!(
@@ -617,8 +662,133 @@ impl App {
             move |placement| history::rerun_at(&project, &settings, &source, placement),
             worktree,
             None,
-            Some(id.to_owned()),
+            Some(RunOrigin::Rerun(id.to_owned())),
         )
+    }
+    /// Lists stage checkpoints of `run` that can be forked into an isolated worktree.
+    fn fork_picker(&mut self, run: &Run) -> Result<()> {
+        let order = run.order();
+        let mut items = vec![];
+        for (index, stage) in run.workflow.stages.iter().enumerate() {
+            if !stage.enabled
+                || stage.role == Role::Ship
+                || crate::graph::judged_by(&run.workflow, index).is_some()
+            {
+                continue;
+            }
+            let Some(state) = run.stages.get(index) else {
+                continue;
+            };
+            if state.attempts.is_empty() {
+                continue;
+            }
+            let upstream: Vec<usize> = (0..run.stages.len())
+                .filter(|&i| order.precedes(i, index))
+                .collect();
+            let upstream_ok = upstream.iter().all(|&i| {
+                let s = &run.stages[i];
+                s.status == Status::Skipped || (s.status == Status::Complete && s.handoff.is_some())
+            });
+            if !upstream_ok {
+                continue;
+            }
+            let upstream_end = upstream
+                .iter()
+                .flat_map(|&i| &run.stages[i].attempts)
+                .filter_map(|a| a.finished_at)
+                .max();
+            let Some(boundary) = state
+                .attempts
+                .iter()
+                .find(|a| upstream_end.is_none_or(|end| a.started_at >= end))
+            else {
+                continue;
+            };
+            let Some(tree) = boundary.tree_before.as_deref() else {
+                continue;
+            };
+            let short = tree.get(..10).unwrap_or(tree);
+            let model = if stage.model.is_empty() {
+                "default"
+            } else {
+                stage.model.as_str()
+            };
+            items.push(Choice {
+                label: format!(
+                    "{} ({}) · {} / {model} · attempt {} ({short})",
+                    stage.name, stage.id, stage.harness, boundary.number
+                ),
+                value: PickValue::ForkStage {
+                    run: run.id.clone(),
+                    stage_id: stage.id.clone(),
+                    stage_name: stage.name.clone(),
+                    current_model: stage.model.clone(),
+                    fan_out: stage.fan_out.is_some(),
+                },
+            });
+        }
+        ensure!(
+            !items.is_empty(),
+            "Run {} has no stage checkpoint with a Git snapshot to fork from",
+            run.id
+        );
+        self.ui.open(Modal::Picker {
+            title: format!("Fork run {} · choose stage checkpoint", run.id),
+            items,
+            selected: 0,
+            filter: textarea(""),
+            note: "Creates an isolated Git worktree at the stage's snapshot and reuses completed upstream handoffs."
+                .into(),
+        });
+        Ok(())
+    }
+    /// Starts a fork through the same background path as Workflow [r].
+    pub(super) fn start_fork(
+        &mut self,
+        id: &str,
+        stage_id: &str,
+        model: Option<String>,
+    ) -> Result<()> {
+        let (project, settings, source, stage) = (
+            self.project.clone(),
+            self.editor.settings.clone(),
+            id.to_owned(),
+            stage_id.to_owned(),
+        );
+        self.start_run(
+            move |_placement| history::fork(&project, &settings, &source, &stage, model),
+            true,
+            None,
+            Some(RunOrigin::Fork {
+                source: id.to_owned(),
+                stage: stage_id.to_owned(),
+            }),
+        )
+    }
+    /// Plans an ad-hoc ship for a completed run in the background, then opens
+    /// a preview & explicit confirmation dialog before anything is committed.
+    fn begin_ad_hoc_ship(&mut self, run: &Run) -> Result<()> {
+        ensure!(
+            run.status == Status::Complete,
+            "Only a completed run can be shipped (this one is {})",
+            run.status.label()
+        );
+        let project = self.project.clone();
+        let id = run.id.clone();
+        let msg_id = id.clone();
+        let loading = Loading::new("Planning ship preview…");
+        let ticket = loading.ticket;
+        self.tasks.spawn(
+            "Planning ship stopped unexpectedly",
+            move || plan_ad_hoc_ship(&project, &id).map_err(|e| format!("{e:#}")),
+            move |result| super::tasks::Msg::ShipPlan {
+                ticket,
+                run: msg_id,
+                result,
+            },
+        );
+        self.ui.open(Modal::Loading(loading));
+        Ok(())
     }
     fn clean_up(&mut self, plan: &Plan) -> Result<()> {
         let done = history::apply(plan);
@@ -634,6 +804,179 @@ impl App {
         self.load_runs();
         Ok(())
     }
+}
+
+/// Preview and explicit confirmation dialog for ad-hoc shipping a completed run.
+pub(super) struct ShipConfirm {
+    pub(super) run: String,
+    pub(super) plan: Box<ship::Plan>,
+    pub(super) dir: std::path::PathBuf,
+    pub(super) preview: String,
+    pub(super) scroll: u16,
+}
+
+impl ShipConfirm {
+    pub(super) fn new(run: String, plan: ship::Plan, dir: std::path::PathBuf) -> Self {
+        let preview = storage::clean_terminal(&format!(
+            "{}\nPlan saved in {}\n",
+            plan.preview(),
+            dir.display()
+        ));
+        Self {
+            run,
+            plan: Box::new(plan),
+            dir,
+            preview,
+            scroll: 0,
+        }
+    }
+
+    pub(super) fn draw(&self, frame: &mut Frame<'_>, rect: Rect, palette: Palette) {
+        let block = palette.modal(
+            &format!("Ship preview · {}", self.run),
+            &[
+                ("↑↓", "scroll"),
+                ("y", "ship as previewed"),
+                ("n / Esc", "cancel"),
+            ],
+        );
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        let [body, footer] =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).areas(inner);
+        let lines: Vec<Line<'static>> = self
+            .preview
+            .lines()
+            .skip(usize::from(self.scroll))
+            .take(usize::from(body.height))
+            .map(|l| Line::raw(l.to_owned()))
+            .collect();
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
+        let mut hints = palette.hints(&[
+            ("y", "ship as previewed"),
+            ("n / Esc", "cancel without committing"),
+        ]);
+        hints.spans.push(Span::styled(
+            "   ·  commits only on a new branch",
+            Style::default().fg(palette.muted),
+        ));
+        frame.render_widget(
+            Paragraph::new(vec![Line::raw(""), hints]).wrap(Wrap { trim: false }),
+            footer,
+        );
+    }
+}
+
+/// Plans an ad-hoc ship under `run.lock` and `workspace.lock`, mirroring `cli::manage::ship`.
+fn plan_ad_hoc_ship(
+    project: &std::path::Path,
+    id: &str,
+) -> Result<(Box<ship::Plan>, std::path::PathBuf)> {
+    let wait = std::time::Duration::from_secs(2);
+    let run = engine::load(project, id)?;
+    let _run_lock = storage::lock_wait(&run.directory.join("run.lock"), wait)?;
+    let _workspace_lock = if run.workspace.is_dir() {
+        Some(storage::lock_wait(
+            &storage::metadata_dir(&run.workspace)?.join("workspace.lock"),
+            wait,
+        )?)
+    } else {
+        None
+    };
+    let run = engine::load(project, id)?;
+    let options = ship::run_options(&run);
+    let (plan, dir) = ship::plan_completed(&run, &options)?;
+    Ok((Box::new(plan), dir))
+}
+
+/// Applies an explicitly confirmed ad-hoc ship plan under `run.lock` and `workspace.lock`.
+pub(super) fn apply_ad_hoc_ship(
+    project: &std::path::Path,
+    id: &str,
+    plan: &ship::Plan,
+    dir: &std::path::Path,
+) -> Result<ship::Outcome> {
+    let wait = std::time::Duration::from_secs(2);
+    let run = engine::load(project, id)?;
+    let _run_lock = storage::lock_wait(&run.directory.join("run.lock"), wait)?;
+    let _workspace_lock = if run.workspace.is_dir() {
+        Some(storage::lock_wait(
+            &storage::metadata_dir(&run.workspace)?.join("workspace.lock"),
+            wait,
+        )?)
+    } else {
+        None
+    };
+    let ship_stage = run
+        .workflow
+        .stages
+        .iter()
+        .rev()
+        .find(|s| s.role == crate::config::Role::Ship);
+    if !run
+        .workflow
+        .hooks_for(ship_stage, crate::hooks::HookEvent::BeforeShip)
+        .is_empty()
+    {
+        crate::trust::authorize_run(&run)?;
+        let hook_run = ship::run_before_ship_hooks(
+            &run,
+            ship_stage,
+            dir,
+            &std::sync::atomic::AtomicBool::new(false),
+            |_| Ok(()),
+            |_| {},
+        )?;
+        if let Some(error) = hook_run.failed {
+            bail!("Ship stopped: {error}");
+        }
+    }
+    Ok(ship::apply(plan, dir, |_| {}))
+}
+
+/// Renders handoff budget, truncation, and loss warnings for every stage in `run`.
+pub(super) fn render_handoffs_report(run: &Run) -> String {
+    if run.workflow.stages.is_empty() {
+        return "This run has no stages.\n".into();
+    }
+    let mut sections = Vec::new();
+    let mut warnings = 0usize;
+    for (index, stage) in run.workflow.stages.iter().enumerate() {
+        match engine::inspect_handoffs(run, Some(&stage.id)) {
+            Ok(inspection) => {
+                for view in &inspection.handoffs {
+                    warnings += view.warnings.len();
+                }
+                let mut text = inspection.text();
+                if index == run.cursor {
+                    text = text.replacen(
+                        &format!("Handoffs into {}:", inspection.stage),
+                        &format!("Handoffs into {} (current):", inspection.stage),
+                        1,
+                    );
+                }
+                sections.push(text);
+            }
+            Err(error) => {
+                sections.push(format!("Handoffs into {}: {error:#}\n", stage.name));
+            }
+        }
+    }
+    let header = if warnings == 0 {
+        format!(
+            "Run {} · {} · no truncation or loss warnings\n\n",
+            run.id, run.workflow.name
+        )
+    } else {
+        format!(
+            "Run {} · {} · {} truncation/loss warning{}\n\n",
+            run.id,
+            run.workflow.name,
+            warnings,
+            if warnings == 1 { "" } else { "s" }
+        )
+    };
+    format!("{header}{}", sections.join("\n"))
 }
 
 /// Lines of output a saved run's latest attempt left in stdout.log, formatted
