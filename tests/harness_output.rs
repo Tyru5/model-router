@@ -536,6 +536,10 @@ fn capture_script_refuses_without_confirmation_and_sanitizes_offline_output() {
     fs::create_dir(&bin).unwrap();
     fake(&bin, "claude", FAKE_CLAUDE);
     let out = dir.path().join("fixtures");
+    // Not the sanitizer's own placeholder, /home/user, which some machines
+    // use as their real home.
+    let home = dir.path().join("home");
+    fs::create_dir(&home).unwrap();
     let path = std::iter::once(bin.clone())
         .chain(std::env::split_paths(
             &std::env::var_os("PATH").unwrap_or_default(),
@@ -551,6 +555,7 @@ fn capture_script_refuses_without_confirmation_and_sanitizes_offline_output() {
             .arg("--output-dir")
             .arg(&out)
             .env("PATH", std::env::join_paths(&path).unwrap())
+            .env("HOME", &home)
             .output()
             .unwrap()
     };
@@ -566,7 +571,7 @@ fn capture_script_refuses_without_confirmation_and_sanitizes_offline_output() {
         String::from_utf8_lossy(&captured.stderr)
     );
     let text = fs::read_to_string(out.join("claude/captured-success.jsonl")).unwrap();
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home.to_str().unwrap();
     for secret in [
         "router-capture-",
         "dev@corp.example",
@@ -576,10 +581,7 @@ fn capture_script_refuses_without_confirmation_and_sanitizes_offline_output() {
     ] {
         assert!(!text.contains(secret), "{secret} survived: {text}");
     }
-    assert!(
-        home.len() < 2 || !text.contains(&home),
-        "home path survived"
-    );
+    assert!(!text.contains(home), "home path survived: {text}");
     for placeholder in ["<router prompt omitted>", "user@example.com", "<redacted>"] {
         assert!(text.contains(placeholder), "{placeholder} missing: {text}");
     }

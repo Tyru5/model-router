@@ -296,6 +296,11 @@ fn saved_executable_tampering_cannot_gain_approval_through_retry_or_rerun() {
 
 #[test]
 fn saved_replay_cannot_weaken_the_effective_sandbox_or_network_policy() {
+    // The read-only stage must launch to record an attempt.
+    if let Err(reason) = model_router::sandbox::detect() {
+        eprintln!("skipping saved replay sandbox test: {reason}");
+        return;
+    }
     let dir = project();
     let config = dir.path().join(".model-router.toml");
     let source = fs::read_to_string(&config)

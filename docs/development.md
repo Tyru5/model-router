@@ -111,9 +111,9 @@ the R2 domain, `model-router.tiru5.me`.
 ## Amp orbs
 
 `.agents/setup` prepares fresh orbs: stable Rust (rustfmt, clippy), Rust 1.85,
-Python 3.12, `uv`, `just`, Ruff; caches smoke-test dependencies; fetches
-`Cargo.lock` dependencies; warms debug/test and MSRV builds. Re-runs reuse
-installed tools. `.agents/resume` only checks tools are present. Neither
+Python 3.12, `uv`, `just`, Ruff, bubblewrap (so sandbox tests run); caches
+smoke-test dependencies; fetches `Cargo.lock` dependencies; warms debug/test
+and MSRV builds. Re-runs reuse installed tools. `.agents/resume` only checks tools are present. Neither
 authenticates harnesses or sends model requests.
 
 ## Design references
