@@ -78,12 +78,17 @@ https://github.com/Tyru5/model-router/releases/latest/download/model-router-inst
 ## Website
 
 `site/` is the landing page at `https://model-router.dev`: one static
-`index.html` and `icon.png`, no build step. The Vercel project `model-router`
-(team Tirus) is linked to this repository with root directory `site`, so a push
-to `main` that changes `site/` deploys it to production and other branches get
-preview deployments. The domain is registered through Vercel and uses Vercel
-DNS; `www.model-router.dev` redirects (308) to the apex. The page's install
-command uses the GitHub release installer.
+`index.html` plus its icons, no build step. `icon.svg` is a vector trace of
+`docs/assets/model-router-icon.png`; `favicon.ico` (16/32/48),
+`favicon-32x32.png`, and the `site.webmanifest` icons (`icon-192.png`,
+`icon-512.png`) are rendered from it. `icon.png` (180) is the Apple touch icon.
+`og.png` (1200×630) is the Open Graph and Twitter card image. The Vercel
+project `model-router` (team Tirus) is linked to this repository with root
+directory `site`, so a push to `main` that changes `site/` deploys it to
+production and other branches get preview deployments. The domain is
+registered through Vercel and uses Vercel DNS; `www.model-router.dev`
+redirects (308) to the apex. The page's install command uses the GitHub release
+installer.
 
 ## Amp orbs
 
