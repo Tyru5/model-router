@@ -433,6 +433,10 @@ pub struct Run {
     /// The fan-out candidate whose prompt `prompt` renders.
     #[serde(skip)]
     pub(super) view: Option<usize>,
+    /// The bridge of a delegating stage's next launch, which `prepare`
+    /// renders into its invocation and sandbox.
+    #[serde(skip)]
+    pub(super) mcp: Option<crate::adapters::McpLaunch>,
 }
 
 /// The parent that launched a run with `run_launch`.

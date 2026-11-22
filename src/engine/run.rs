@@ -250,6 +250,7 @@ impl Run {
                 .collect(),
             launched_by: None,
             creation_source: Default::default(),
+            mcp: None,
             stages: workflow
                 .stages
                 .iter()
@@ -1143,6 +1144,7 @@ impl Run {
     /// recovery does not replay delegation; the user retries the stage.
     pub(super) fn interrupt_tasks(&mut self, message: &str) {
         use crate::delegation::records::TaskStatus;
+        super::delegate_apply::settle_interrupted_applies(self);
         let now = Utc::now();
         for state in &mut self.stages {
             for attempt in &mut state.attempts {
@@ -1397,6 +1399,7 @@ impl Run {
             attempt_dir: &directory,
             prompt_file: &prompt_file,
             handoff_file: &handoff_file,
+            mcp: None,
         };
         let mut invocation =
             adapters::build(&candidate, &self.adapters, &self.providers, &text, &paths)?;

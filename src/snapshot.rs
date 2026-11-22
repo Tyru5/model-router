@@ -50,6 +50,12 @@ pub struct FileChange {
     pub removed: Option<u64>,
 }
 
+/// The repository's top-level directory for `dir`.
+pub(crate) fn top_level(dir: &Path) -> Result<PathBuf> {
+    let out = git(dir, None, &["rev-parse", "--show-toplevel"])?;
+    Ok(PathBuf::from(String::from_utf8_lossy(&out).trim()))
+}
+
 /// `git` for the router's own commands in a workspace or checkout. A stage
 /// may have written the repository's config or hooks before the router
 /// runs Git there, outside the stage's sandbox: hooks and an fsmonitor

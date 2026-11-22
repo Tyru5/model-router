@@ -6,7 +6,7 @@
 //! only; diagnostics go to stderr.
 
 mod http;
-mod mcp;
+pub mod mcp;
 mod runs;
 mod tools;
 

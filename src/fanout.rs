@@ -260,7 +260,7 @@ pub fn check(
     })
 }
 
-fn is_plain_repo_path(file: &str) -> bool {
+pub(crate) fn is_plain_repo_path(file: &str) -> bool {
     !file.is_empty()
         && Path::new(file).components().all(|c| match c {
             std::path::Component::Normal(part) => {

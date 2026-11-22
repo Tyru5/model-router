@@ -532,6 +532,11 @@ pub struct CustomAdapter {
     /// `prompt_stdin`), `"arg"`, or `{ flag = "-p" }`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<CustomPrompt>,
+    /// Arguments that hand a delegating stage's harness the router's MCP
+    /// server; `{mcp_config}` is a Claude-format MCP config file. Without
+    /// them the adapter cannot delegate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_config_args: Option<Vec<String>>,
 }
 
 /// A custom adapter's output parser, named after the built-in formats.
@@ -606,6 +611,9 @@ impl CustomAdapter {
         }
         if let Some(args) = &self.follow_up_args {
             fields.push(("follow-up", args.clone()));
+        }
+        if let Some(args) = &self.mcp_config_args {
+            fields.push(("mcp config", args.clone()));
         }
         for (name, flag) in [
             ("model flag", &self.model_flag),
@@ -817,6 +825,7 @@ fn known_keys() -> &'static KnownKeys {
             session: Some(CustomSession::default()),
             resume_args: Some(vec![]),
             follow_up_args: Some(vec![]),
+            mcp_config_args: Some(vec![]),
             model_flag: Some(String::new()),
             effort_flag: Some(String::new()),
             prompt: Some(CustomPrompt::Mode(PromptMode::Arg)),

@@ -130,15 +130,18 @@ impl Invocation {
         self.removed_from(env::vars_os().map(|(name, _)| name))
     }
     fn removed_from(&self, inherited: impl Iterator<Item = OsString>) -> Vec<OsString> {
-        let prefixes: Vec<&str> = self
+        let mut prefixes: Vec<&str> = self
             .env
             .iter()
             .filter(|(_, v)| *v == EnvValue::UnsetPrefix)
             .map(|(name, _)| name.as_str())
             .collect();
-        if prefixes.is_empty() {
-            return vec![];
-        }
+        // Only a delegating turn reaches a broker: every other launch drops
+        // a socket and token an outer `mr` may have passed down.
+        prefixes.extend([
+            crate::delegation::broker::SOCK_VAR,
+            crate::delegation::broker::TOKEN_VAR,
+        ]);
         inherited
             .filter(|name| {
                 let text = name.to_string_lossy();
@@ -591,6 +594,15 @@ pub fn follow_up(
     Ok(invocation)
 }
 
+/// Whether `harness` can receive the router's MCP server for one launch, so
+/// a stage on it can delegate.
+pub fn can_delegate(harness: &str, custom: &BTreeMap<String, CustomAdapter>) -> bool {
+    match custom.get(harness) {
+        Some(adapter) => adapter.mcp_config_args.is_some(),
+        None => harness::get(harness).is_some_and(|spec| spec.mcp.is_some()),
+    }
+}
+
 /// What a launch does with a session.
 #[derive(Clone, Copy)]
 enum Launch<'a> {
@@ -629,6 +641,91 @@ pub struct ContextPaths<'a> {
     pub attempt_dir: &'a Path,
     pub prompt_file: &'a Path,
     pub handoff_file: &'a Path,
+    /// A delegating turn's bridge; None for every other launch.
+    pub mcp: Option<&'a McpLaunch>,
+}
+
+/// What a delegating turn's harness needs to start the router's MCP bridge:
+/// paths only, never the token itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpLaunch {
+    pub program: PathBuf,
+    pub sock: PathBuf,
+    pub token_file: PathBuf,
+}
+impl McpLaunch {
+    fn env(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut env = serde_json::Map::new();
+        env.insert(
+            crate::delegation::broker::SOCK_VAR.into(),
+            self.sock.display().to_string().into(),
+        );
+        env.insert(
+            crate::delegation::broker::TOKEN_VAR.into(),
+            self.token_file.display().to_string().into(),
+        );
+        env
+    }
+    /// Claude Code's `--mcp-config` format, also used by custom adapters.
+    pub fn claude_config(&self) -> String {
+        serde_json::json!({
+            "mcpServers": {
+                "model-router": {
+                    "type": "stdio",
+                    "command": self.program.display().to_string(),
+                    "args": [crate::delegation::broker::BRIDGE_ARG],
+                    "env": self.env(),
+                }
+            }
+        })
+        .to_string()
+    }
+    /// Codex `--config` pairs; values are TOML (JSON strings are valid TOML
+    /// basic strings), since paths may hold spaces.
+    fn codex_args(&self) -> Result<Vec<String>> {
+        let key = "mcp_servers.model-router";
+        let quote = |text: &str| serde_json::to_string(text);
+        Ok(vec![
+            "--config".into(),
+            format!(
+                "{key}.command={}",
+                quote(&self.program.display().to_string())?
+            ),
+            "--config".into(),
+            format!(
+                "{key}.args=[{}]",
+                quote(crate::delegation::broker::BRIDGE_ARG)?
+            ),
+            "--config".into(),
+            format!(
+                "{key}.env={{{}={}, {}={}}}",
+                crate::delegation::broker::SOCK_VAR,
+                quote(&self.sock.display().to_string())?,
+                crate::delegation::broker::TOKEN_VAR,
+                quote(&self.token_file.display().to_string())?
+            ),
+            "--config".into(),
+            format!("{key}.tool_timeout_sec=120"),
+        ])
+    }
+    /// OpenCode's `mcp.model-router` entry.
+    fn opencode_entry(&self) -> String {
+        serde_json::json!({
+            "type": "local",
+            "command": [self.program.display().to_string(), crate::delegation::broker::BRIDGE_ARG],
+            "environment": self.env(),
+            "enabled": true,
+        })
+        .to_string()
+    }
+    /// The variables the bridge reads, set on the harness too.
+    fn set_env(&self, invocation: &mut Invocation) {
+        for (name, value) in self.env() {
+            if let serde_json::Value::String(value) = value {
+                invocation.env.push((name, EnvValue::Literal(value)));
+            }
+        }
+    }
 }
 
 pub fn build(
@@ -717,6 +814,20 @@ fn build_inner(
         legacy,
         launch,
     )?;
+    if let Some(mcp) = paths.mcp {
+        if spec.mcp == Some(harness::McpInjection::OpencodeConfig) {
+            invocation.env.push((
+                "OPENCODE_CONFIG_CONTENT".into(),
+                EnvValue::JsonInsert {
+                    path: vec!["mcp".into(), "model-router".into()],
+                    value: mcp.opencode_entry(),
+                },
+            ));
+        }
+        if spec.mcp.is_some() {
+            mcp.set_env(&mut invocation);
+        }
+    }
     Ok(invocation)
 }
 
@@ -934,6 +1045,22 @@ fn build_spec(
                     ]);
                 }
             },
+            Part::Mcp => match (paths.mcp, spec.mcp) {
+                (Some(mcp), Some(harness::McpInjection::ClaudeConfigFile)) => {
+                    let file = paths.attempt_dir.join("mcp.json");
+                    invocation.files.push((file.clone(), mcp.claude_config()));
+                    args.extend([
+                        "--mcp-config".to_owned(),
+                        utf8(&file, "MCP config")?,
+                        // One argument, so it cannot take a positional prompt.
+                        "--allowedTools=mcp__model-router__*".to_owned(),
+                    ]);
+                }
+                (Some(mcp), Some(harness::McpInjection::CodexConfig)) => {
+                    args.extend(mcp.codex_args()?);
+                }
+                _ => {}
+            },
             Part::ModelEnv { var, path } => {
                 if !qualified.is_empty() {
                     invocation.env.push((
@@ -1069,8 +1196,28 @@ fn build_custom(
         ("{api_key_env}", api_key_env),
         ("{session}", session),
     ];
+    // A delegating turn's MCP config, for `mcp_config_args` and `{mcp_config}`.
+    let mcp_config = match (paths.mcp, &adapter.mcp_config_args) {
+        (Some(mcp), Some(_)) => {
+            let file = paths.attempt_dir.join("mcp.json");
+            invocation.files.push((file.clone(), mcp.claude_config()));
+            mcp.set_env(invocation);
+            file.display().to_string()
+        }
+        _ => String::new(),
+    };
+    let values: Vec<(&str, &str)> = values
+        .into_iter()
+        .chain([("{mcp_config}", mcp_config.as_str())])
+        .collect();
     let a = &mut invocation.args;
     a.extend(template.iter().map(|arg| expand(arg, &values)));
+    // Unless the template places the config itself.
+    if let (false, Some(args)) = (mcp_config.is_empty(), &adapter.mcp_config_args) {
+        if !template.iter().any(|t| t.contains("{mcp_config}")) {
+            a.extend(args.iter().map(|arg| expand(arg, &values)));
+        }
+    }
     for (flag, value) in [
         (&adapter.model_flag, &stage.model),
         (&adapter.effort_flag, &stage.effort),
@@ -1264,6 +1411,7 @@ mod tests {
             attempt_dir: dir.path(),
             prompt_file: dir.path(),
             handoff_file: dir.path(),
+            mcp: None,
         };
         let i = build(
             &Stage {
@@ -1296,6 +1444,7 @@ mod tests {
             attempt_dir: dir.path(),
             prompt_file: dir.path(),
             handoff_file: dir.path(),
+            mcp: None,
         };
         build(
             &Stage {
@@ -1347,6 +1496,7 @@ mod tests {
             attempt_dir: dir.path(),
             prompt_file: &dir.path().join("prompt.md"),
             handoff_file: dir.path(),
+            mcp: None,
         };
         let stage = |harness: &str, mode| Stage {
             harness: harness.into(),
@@ -1506,6 +1656,7 @@ mod tests {
             attempt_dir: dir.path(),
             prompt_file: dir.path(),
             handoff_file: dir.path(),
+            mcp: None,
         };
         let configured = BTreeMap::from([(
             "proxy".to_string(),
@@ -1568,6 +1719,7 @@ mod tests {
             attempt_dir: dir.path(),
             prompt_file: dir.path(),
             handoff_file: dir.path(),
+            mcp: None,
         };
         let custom = BTreeMap::from([(
             "mine".to_string(),
@@ -1627,6 +1779,7 @@ mod tests {
             attempt_dir: dir.path(),
             prompt_file: dir.path(),
             handoff_file: dir.path(),
+            mcp: None,
         };
         let gateway = Provider {
             base_url: "http://gateway.local/v1".into(),
@@ -1697,6 +1850,7 @@ mod tests {
             attempt_dir: dir.path(),
             prompt_file: dir.path(),
             handoff_file: dir.path(),
+            mcp: None,
         };
         let configured = BTreeMap::from([(
             "local".to_string(),
@@ -1724,6 +1878,7 @@ mod tests {
             attempt_dir: dir,
             prompt_file: dir,
             handoff_file: dir,
+            mcp: None,
         }
     }
 

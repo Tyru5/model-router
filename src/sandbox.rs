@@ -81,6 +81,18 @@ pub struct Plan {
     /// denies writes to the directory entry).
     #[serde(skip)]
     git_pinned: Vec<PathBuf>,
+    /// A delegating turn's own socket, token file, and bridge program:
+    /// reachable although every orchestration directory is hidden.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orch: Option<OrchAccess>,
+}
+
+/// What a delegating turn may reach of its broker.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OrchAccess {
+    pub sock: PathBuf,
+    pub token_file: PathBuf,
+    pub program: PathBuf,
 }
 
 /// Paths of one attempt.
@@ -334,7 +346,13 @@ pub fn plan_with(
     // Only real private directories hold sockets: a link planted at one of
     // these names (even by an earlier stage) must not hide where it leads.
     let _ = crate::process::host::socket_dir();
+    let _ = crate::delegation::broker::orch_socket_dir();
+    // Delegation sockets and token files too: only a delegating turn's own
+    // are re-exposed (`Plan::allow_orch`).
     let mut hidden: Vec<PathBuf> = crate::process::host::socket_dirs()
+        .into_iter()
+        .chain(crate::delegation::broker::orch_socket_dirs())
+        .collect::<Vec<_>>()
         .iter()
         .filter(|_| backend.is_some())
         .filter(|dir| crate::process::host::is_private_dir(dir))
@@ -363,6 +381,7 @@ pub fn plan_with(
         hidden,
         git_locked,
         git_pinned,
+        orch: None,
     };
     if plan.backend.is_some() {
         refuse_writable_git_config(&plan, stage, paths.workspace, home)?;
@@ -729,6 +748,16 @@ fn git_dirs_inner(workspace: &Path) -> Option<Vec<PathBuf>> {
 }
 
 impl Plan {
+    /// Lets a delegating turn reach its own broker: the socket, the token
+    /// file, and the bridge program, after every directory that hides them.
+    pub fn allow_orch(&mut self, sock: &Path, token_file: &Path, program: &Path) {
+        self.orch = Some(OrchAccess {
+            sock: canonical(sock),
+            token_file: canonical(token_file),
+            program: canonical(program),
+        });
+    }
+
     /// Whether the sandboxed stage could change `path`: under a writable
     /// grant, and not under a Git lock or a deeper protected path.
     pub fn stage_can_write(&self, path: &Path) -> bool {
@@ -805,6 +834,18 @@ impl Plan {
         // After every bind, so none of them exposes these again.
         for path in &self.hidden {
             args.extend(["--tmpfs".into(), path.display().to_string()]);
+        }
+        // A delegating turn's own socket and token, after the tmpfs that hid
+        // their directory; the bridge program too when a private /tmp hid it.
+        if let Some(orch) = &self.orch {
+            let sock = orch.sock.display().to_string();
+            let token = orch.token_file.display().to_string();
+            args.extend(["--bind".into(), sock.clone(), sock]);
+            args.extend(["--ro-bind".into(), token.clone(), token]);
+            if self.private_tmp && orch.program.starts_with("/tmp") {
+                let program = orch.program.display().to_string();
+                args.extend(["--ro-bind".into(), program.clone(), program]);
+            }
         }
         args.extend(["--die-with-parent".into(), "--".into()]);
         args
@@ -883,7 +924,7 @@ impl Plan {
         }
         for path in &self.hidden {
             text.push_str(&format!(
-                "(deny file-write* network-outbound (subpath {}))\n",
+                "(deny file-read-data file-write* network-outbound (subpath {}))\n",
                 sbpl_string(&path.display().to_string())
             ));
             // Seatbelt matches paths, so renaming a writable ancestor (such
@@ -906,6 +947,14 @@ impl Plan {
         }
         if !self.network {
             text.push_str("(deny network*)\n");
+        }
+        // Last, so no deny above (hidden directories, no network) wins.
+        if let Some(orch) = &self.orch {
+            let sock = sbpl_string(&orch.sock.display().to_string());
+            text.push_str(&format!(
+                "(allow file-read-data (literal {}))\n(allow file-read-metadata (literal {sock}))\n(allow network-outbound (remote unix-socket (path-literal {sock})))\n",
+                sbpl_string(&orch.token_file.display().to_string())
+            ));
         }
         text
     }
@@ -1384,6 +1433,7 @@ file:/h/.gitconfig\0includeIf.gitdir:/w/.path\n~/more.cfg\0command line:\0core.x
             hidden: vec![],
             git_locked: vec![],
             git_pinned: vec![],
+            orch: None,
         };
         let profile = plan.profile();
         assert!(!profile.contains("(deny file-write*)\n(deny network*)"));
@@ -1669,6 +1719,57 @@ file:/h/.gitconfig\0includeIf.gitdir:/w/.path\n~/more.cfg\0command line:\0core.x
     }
 
     #[test]
+    fn a_delegating_turn_reaches_only_its_own_socket_and_token() {
+        let d = dirs();
+        let stage = Stage {
+            sandbox: Some(Sandbox::ReadOnly),
+            sandbox_network: false,
+            ..Stage::default()
+        };
+        let orch = canonical(&crate::delegation::broker::orch_socket_dir().unwrap());
+        let (sock, token) = (orch.join("orch-1.sock"), orch.join("orch-1.token"));
+        let mut plan = plan_for(&d, &stage, Sandbox::Off, bwrap())
+            .unwrap()
+            .unwrap();
+        assert!(plan.hidden.contains(&orch), "{:?}", plan.hidden);
+        plan.allow_orch(&sock, &token, Path::new("/usr/bin/mr"));
+        let argv = plan.bwrap_args();
+        let hide = argv
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == orch.display().to_string())
+            .unwrap();
+        let bind = argv
+            .windows(2)
+            .position(|w| w[0] == "--bind" && w[1] == sock.display().to_string())
+            .unwrap();
+        assert!(
+            hide < bind,
+            "the socket comes back after its directory is hidden"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--ro-bind" && w[1] == token.display().to_string())
+        );
+        let seatbelt = Plan {
+            backend: Some(Backend::SandboxExec),
+            ..plan
+        };
+        let profile = seatbelt.profile();
+        let deny = profile.find("(deny network*)").unwrap();
+        let allow = profile
+            .find("(allow network-outbound (remote unix-socket")
+            .unwrap();
+        assert!(
+            deny < allow,
+            "Seatbelt's last matching rule wins: {profile}"
+        );
+        assert!(profile.contains(&format!(
+            "(allow file-read-data (literal {}))",
+            sbpl_string(&token.display().to_string())
+        )));
+    }
+
+    #[test]
     fn stages_cannot_reach_terminal_host_sockets() {
         // Another run's host accepts keystrokes for a harness outside the
         // sandbox, so every existing socket directory is denied or hidden.
@@ -1683,11 +1784,20 @@ file:/h/.gitconfig\0includeIf.gitdir:/w/.path\n~/more.cfg\0command line:\0core.x
             .unwrap();
         let mine = canonical(&crate::process::host::socket_dir().unwrap());
         let deny = format!(
-            "(deny file-write* network-outbound (subpath {}))",
+            "(deny file-read-data file-write* network-outbound (subpath {}))",
             sbpl_string(&mine.display().to_string())
         );
         let profile = plan.profile();
         assert!(profile.contains(&deny), "{profile}");
+        // Delegation sockets and token files are hidden the same way.
+        let orch = canonical(&crate::delegation::broker::orch_socket_dir().unwrap());
+        assert!(
+            profile.contains(&format!(
+                "(deny file-read-data file-write* network-outbound (subpath {}))",
+                sbpl_string(&orch.display().to_string())
+            )),
+            "{profile}"
+        );
         let parent = mine.parent().unwrap().display().to_string();
         let pinned = format!("(literal {})", sbpl_string(&parent));
         assert!(

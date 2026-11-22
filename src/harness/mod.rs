@@ -60,6 +60,31 @@ pub enum Part {
         var: &'static str,
         path: &'static str,
     },
+    /// The delegation bridge's MCP server, per [`HarnessSpec::mcp`], when
+    /// the stage delegates; nothing otherwise.
+    Mcp,
+}
+
+/// How a delegating stage's harness receives the router's MCP server for
+/// one launch, without editing user or project config files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpInjection {
+    /// `--mcp-config FILE` (Claude's JSON format) and the tools allowed.
+    ClaudeConfigFile,
+    /// `--config mcp_servers.model-router.*` keys.
+    CodexConfig,
+    /// An `mcp.model-router` entry in `OPENCODE_CONFIG_CONTENT`.
+    OpencodeConfig,
+}
+impl McpInjection {
+    pub fn flags(self) -> &'static [&'static str] {
+        match self {
+            Self::ClaudeConfigFile => &["--mcp-config", "--allowedTools"],
+            Self::CodexConfig => &["--config"],
+            Self::OpencodeConfig => &[],
+        }
+    }
 }
 
 /// How the prompt reaches the harness.
@@ -376,6 +401,9 @@ pub struct HarnessSpec {
     /// (`cost::stage_billing`).
     pub billing: Billing,
     pub structured: Option<Structured>,
+    /// How a delegating stage hands it the router's MCP server; None when
+    /// it cannot delegate.
+    pub mcp: Option<McpInjection>,
     pub settings: &'static [Setting],
     /// The `(setting key, choice)` that keeps the harness from changing
     /// files; None when it has no such setting.
@@ -437,6 +465,9 @@ impl HarnessSpec {
         }
         if let Some(structured) = self.structured {
             flags.push(structured.flag);
+        }
+        if let Some(mcp) = self.mcp {
+            flags.extend(mcp.flags());
         }
         if let Session::Assign { flag, .. } = self.session {
             flags.push(flag);

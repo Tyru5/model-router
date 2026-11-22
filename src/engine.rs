@@ -24,6 +24,8 @@ use std::{
 };
 
 mod apply;
+mod delegate;
+mod delegate_apply;
 mod exec;
 mod prompt;
 mod recovery;
@@ -174,6 +176,8 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
         }
         if run.workflow.stages[run.cursor].fan_out.is_some() {
             execute_fan_out(run, cancel, &mut emit)?;
+        } else if run.workflow.stages[run.cursor].delegation.is_some() {
+            delegate::drive_stage(run, cancel, &mut emit)?;
         } else {
             execute_stage(run, cancel, None, &mut emit)?;
         }
@@ -265,6 +269,7 @@ pub fn preview(
             attempt_dir: temp.path(),
             prompt_file: Path::new("<attempt>/prompt.md"),
             handoff_file: Path::new("<workspace>/.model-router/handoffs/<run>/<stage>.json"),
+            mcp: None,
         };
         let command = adapters::build(
             stage,

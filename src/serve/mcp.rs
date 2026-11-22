@@ -35,6 +35,69 @@ Typical use: list_workflows, optionally preview_run, then start_run and wait_run
 and get_report. A run waiting at a checkpoint (status awaiting_confirmation) continues with confirm_stage; \
 a failed or blocked one with retry_stage.";
 
+/// The tools one MCP session serves: `serve`'s run tools, or a delegating
+/// stage's delegation tools (`delegation::tools`).
+pub trait ToolSet: Send + Sync + 'static {
+    fn instructions(&self) -> &str;
+    fn list(&self) -> Vec<Value>;
+    fn exists(&self, name: &str) -> bool;
+    /// Calls that may block for a long time get their own, smaller cap.
+    fn blocks(&self, name: &str) -> bool;
+    fn call(
+        &self,
+        name: &str,
+        arguments: &Value,
+        cancel: Option<&AtomicBool>,
+        progress: &mut dyn FnMut(&Value),
+    ) -> Result<Value>;
+}
+
+impl ToolSet for Server {
+    fn instructions(&self) -> &str {
+        INSTRUCTIONS
+    }
+    fn list(&self) -> Vec<Value> {
+        tools::list()
+    }
+    fn exists(&self, name: &str) -> bool {
+        tools::exists(name)
+    }
+    fn blocks(&self, name: &str) -> bool {
+        tools::blocks(name)
+    }
+    fn call(
+        &self,
+        name: &str,
+        arguments: &Value,
+        cancel: Option<&AtomicBool>,
+        progress: &mut dyn FnMut(&Value),
+    ) -> Result<Value> {
+        tools::call_with(self, name, arguments, cancel, progress)
+    }
+}
+
+/// A tool failure with a stable code, returned as `structuredContent.error`
+/// so the calling model can branch on it.
+#[derive(Debug, Clone)]
+pub struct ToolError {
+    pub code: &'static str,
+    pub message: String,
+}
+impl ToolError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+impl std::fmt::Display for ToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+impl std::error::Error for ToolError {}
+
 type CancelMap = HashMap<String, Vec<(u64, Arc<AtomicBool>)>>;
 
 #[derive(Default)]
@@ -191,8 +254,8 @@ fn read_line_bounded(
 /// session the same way. Tool calls run on their own threads so a long
 /// `wait_run` never blocks `cancel_run`; responses may arrive out of order.
 /// Returns the tool calls still in flight, so shutdown can let them answer.
-pub fn serve<W: Write + Send + 'static>(
-    server: Arc<Server>,
+pub fn serve<T: ToolSet, W: Write + Send + 'static>(
+    server: Arc<T>,
     mut input: impl BufRead,
     output: W,
 ) -> Vec<JoinHandle<()>> {
@@ -290,8 +353,8 @@ fn progress_notification(token: &Value, step: u64, snapshot: &Value) -> Value {
 }
 
 /// The response to send now, if any. Tool calls answer later from a thread.
-fn handle<W: Write + Send + 'static>(
-    server: &Arc<Server>,
+fn handle<T: ToolSet, W: Write + Send + 'static>(
+    server: &Arc<T>,
     output: &Arc<Mutex<W>>,
     inflight: &Arc<InFlight>,
     message: Value,
@@ -332,23 +395,23 @@ fn handle<W: Write + Send + 'static>(
                     "title": "model-router",
                     "version": env!("CARGO_PKG_VERSION"),
                 },
-                "instructions": INSTRUCTIONS,
+                "instructions": server.instructions(),
             }),
         ),
         "ping" => response(id, json!({})),
-        "tools/list" => response(id, json!({"tools": tools::list()})),
+        "tools/list" => response(id, json!({"tools": server.list()})),
         "tools/call" => {
             let Some(name) = params.get("name").and_then(Value::as_str) else {
                 return Some(error_response(id, INVALID_PARAMS, "Missing tool name"));
             };
-            if !tools::exists(name) {
+            if !server.exists(name) {
                 return Some(error_response(
                     id,
                     INVALID_PARAMS,
                     &format!("Unknown tool: {name}"),
                 ));
             }
-            let blocking = tools::blocks(name);
+            let blocking = server.blocks(name);
             let Some((slot, cancel)) = inflight.acquire(&id, blocking) else {
                 return Some(error_response(
                     id,
@@ -385,13 +448,7 @@ fn handle<W: Write + Send + 'static>(
                                 }
                             }
                         };
-                        let result = tools::call_with(
-                            &server,
-                            &name,
-                            &arguments,
-                            Some(&cancel),
-                            &mut progress,
-                        );
+                        let result = server.call(&name, &arguments, Some(&cancel), &mut progress);
                         // MCP clients expect no response for a cancelled request.
                         if !cancel.load(Ordering::Relaxed) {
                             send(&output, &response(id, tool_result(result)));
@@ -422,10 +479,17 @@ pub fn tool_result(result: Result<Value>) -> Value {
             "structuredContent": value,
             "isError": false,
         }),
-        Err(error) => json!({
-            "content": [{"type": "text", "text": format!("{error:#}")}],
-            "isError": true,
-        }),
+        Err(error) => match error.downcast_ref::<ToolError>() {
+            Some(tool) => json!({
+                "content": [{"type": "text", "text": tool.to_string()}],
+                "structuredContent": {"error": {"code": tool.code, "message": tool.message}},
+                "isError": true,
+            }),
+            None => json!({
+                "content": [{"type": "text", "text": format!("{error:#}")}],
+                "isError": true,
+            }),
+        },
     }
 }
 

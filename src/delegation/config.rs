@@ -257,6 +257,16 @@ pub fn validate(
                 delegation.has_targets(),
                 "{at} enables delegation without targets: list delegates or harnesses"
             );
+            ensure!(
+                crate::adapters::can_delegate(&stage.harness, adapters),
+                "{at} cannot delegate: {} cannot receive the router's MCP server (Claude Code, Codex, OpenCode, or a custom adapter with mcp_config_args can)",
+                stage.harness
+            );
+            // A parent prints nothing while a tool call waits (up to 45 s).
+            ensure!(
+                stage.stall_timeout_seconds.is_none_or(|s| s >= 60),
+                "{at}: a delegating stage's stall_timeout_seconds must be at least 60, since tool calls wait up to 45 seconds without output"
+            );
             for name in &delegation.delegates {
                 ensure!(
                     delegates.contains_key(name),

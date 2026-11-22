@@ -139,6 +139,13 @@ pub(super) fn prompt_for(
         }
     }
     text.push_str(&fan_out_context(run, target.cursor, target.view));
+    if let Some(delegation) = &stage.delegation {
+        text.push_str(&crate::delegation::instructions::text(
+            super::delegate::parent_kind(run, stage),
+            delegation.runs,
+            delegation.schedules,
+        ));
+    }
     text.push_str(&handoff::contract(stage.role, handoff_path, schema_path));
     (text, views)
 }

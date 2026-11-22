@@ -49,11 +49,13 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
         None => prompt(run, &handoff_file, &schema_file),
     };
     storage::atomic_write_fast(&prompt_file, text.as_bytes())?;
+    let mcp = run.mcp.clone();
     let paths = ContextPaths {
         workspace: &run.workspace,
         attempt_dir: &directory,
         prompt_file: &prompt_file,
         handoff_file: &handoff_file,
+        mcp: mcp.as_ref(),
     };
     let (invocation, session) = match &resume {
         Some(resume) => (
@@ -73,7 +75,7 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
             (invocation, session)
         }
     };
-    let sandbox = crate::sandbox::plan(
+    let mut sandbox = crate::sandbox::plan(
         &run.workflow,
         stage,
         &crate::sandbox::Paths {
@@ -83,6 +85,9 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
             program: &invocation.program,
         },
     )?;
+    if let (Some(plan), Some(mcp)) = (sandbox.as_mut(), &mcp) {
+        plan.allow_orch(&mcp.sock, &mcp.token_file, &mcp.program);
+    }
     storage::write_json_fast(
         &directory.join("command.json"),
         &serde_json::json!({ "program": invocation.program, "args": invocation.args, "stdin_from": invocation.stdin.as_ref().map(|_| "prompt.md"), "env": invocation.env.iter().map(|(name, _)| name).collect::<Vec<_>>(), "workspace": run.workspace, "model": stage.model, "provider": stage.provider, "effort": stage.effort, "mode": stage.mode, "sandbox": sandbox }),
@@ -428,6 +433,7 @@ Do not edit any project files or run destructive commands. Emit ONLY a valid han
         attempt_dir: &repair_dir,
         prompt_file: &repair_prompt_file,
         handoff_file: &prepared.handoff_file,
+        mcp: None,
     };
     let invocation = match adapters::follow_up(
         &stage,
@@ -981,6 +987,7 @@ pub(super) fn reprepare(run: &Run) -> Result<Prepared> {
         attempt_dir: &directory,
         prompt_file: &prompt_file,
         handoff_file: &attempt.handoff_file,
+        mcp: None,
     };
     let invocation = adapters::build(stage, &run.adapters, &run.providers, &text, &paths)?;
     Ok(Prepared {

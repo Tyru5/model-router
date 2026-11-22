@@ -352,6 +352,14 @@ fn main() {
     {
         process::host::main();
     }
+    // The stdio MCP bridge a delegating harness starts (see
+    // `delegation::bridge`); never typed by people either.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == model_router::delegation::broker::BRIDGE_ARG)
+    {
+        std::process::exit(model_router::delegation::bridge::run());
+    }
     if let Err(error) = main_result() {
         // Terminal loss can close stderr too; reporting it must not panic.
         let _ = writeln!(io::stderr(), "Error: {error:#}");
