@@ -16,22 +16,16 @@ run so you can inspect, retry, or rerun it.
 ## Install
 
 Prebuilt binaries for Linux (x86_64/aarch64, static) and macOS (x86_64/arm64)
-are attached to each [GitHub release](https://github.com/Tyru5/model-router/releases)
-and mirrored to `https://model-router.tiru5.me`. The installer checks the
-SHA-256 and puts `model-router` and its `mr` alias in `~/.cargo/bin`
-(`--to DIR` changes that, `--version X.Y.Z` pins a release):
-
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://model-router.tiru5.me/install.sh | sh
-```
-
-With Homebrew, once the tap is published: `brew install Tyru5/tap/model-router`.
-
-The cargo-dist installer attached to each GitHub release also works:
+are attached to each [GitHub release](https://github.com/Tyru5/model-router/releases).
+The installer checks the SHA-256 and puts `model-router` and its `mr` alias in
+`~/.cargo/bin` (`MODEL_ROUTER_INSTALL_DIR=DIR` installs to `DIR/bin`; to pin a release, use
+`releases/download/vX.Y.Z/model-router-installer.sh`):
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Tyru5/model-router/releases/latest/download/model-router-installer.sh | sh
 ```
+
+With Homebrew, once the tap is published: `brew install Tyru5/tap/model-router`.
 
 From source (Rust 1.85+):
 

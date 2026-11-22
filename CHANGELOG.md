@@ -9,11 +9,16 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Changed
 
-- The repository is public under the MIT license. Release assets on GitHub no
-  longer need a token: `model-router-installer.sh` from a release and
-  `cargo install --git https://github.com/Tyru5/model-router --locked` both
-  work. The R2 mirror and `https://model-router.tiru5.me/install.sh` stay.
+- The repository is public under the MIT license. Install with the
+  `model-router-installer.sh` attached to each GitHub release, or
+  `cargo install --git https://github.com/Tyru5/model-router --locked`.
   The landing page links the source, releases, changelog, and issues.
+
+### Removed
+
+- The R2 download mirror: `scripts/install.sh`, the **R2 downloads**
+  workflow, and `https://model-router.tiru5.me/install.sh`. GitHub release
+  assets no longer need a token, so the release installer replaces them.
 
 ### Added
 

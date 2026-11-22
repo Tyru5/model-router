@@ -65,40 +65,15 @@ cargo-dist builds Linux (x86_64/aarch64, static musl) and macOS
 `vX.Y.Z` tag is pushed. Release notes come from that version's section of
 [CHANGELOG.md](../CHANGELOG.md).
 
-Release assets on GitHub are public, and `model-router-installer.sh` on each
-release installs from them. `.github/workflows/r2.yml` also mirrors every
-release so the installer has a short URL that does not depend on GitHub. It
-runs after each successful tag release (or by hand with a tag) and copies the
-`.tar.xz` archives and their `.sha256` files to a Cloudflare R2 bucket served
-on a public domain:
+Each release has `model-router-installer.sh`, which picks the archive for the
+machine, checks its SHA-256, and installs `model-router` and an `mr` link into
+`$CARGO_HOME/bin` (default `~/.cargo/bin`). `MODEL_ROUTER_INSTALL_DIR=DIR` installs
+to `DIR/bin` and `MODEL_ROUTER_NO_MODIFY_PATH=1` leaves shell profiles alone.
+This URL always serves the newest stable release's installer:
 
 ```text
-install.sh                                    scripts/install.sh with the bucket URL filled in
-latest.txt                                    newest stable version, e.g. 0.2.0
-vX.Y.Z/model-router-<target>.tar.xz(.sha256)  one folder per release
+https://github.com/Tyru5/model-router/releases/latest/download/model-router-installer.sh
 ```
-
-Prerelease tags (`v1.0.0-rc.1`) get a folder but never move `install.sh` or
-`latest.txt`. `scripts/install.sh` picks the target from `uname`, downloads
-over HTTPS with curl or wget, checks the SHA-256, and installs `model-router`
-and an `mr` link into `$CARGO_HOME/bin` (default `~/.cargo/bin`). It accepts
-`--version X.Y.Z` and `--to DIR`, or `MODEL_ROUTER_VERSION`,
-`MODEL_ROUTER_INSTALL_DIR`, and `MODEL_ROUTER_DOWNLOAD_URL`. It leaves an
-existing `mr` that is not a link to `model-router` in place.
-
-The bucket is `model-router-downloads` in the Cloudflare account, served at
-`https://model-router.tiru5.me` (custom domain on the `tiru5.me` zone). The
-workflow defaults to that bucket, account, and URL; `R2_BUCKET` and
-`R2_ACCOUNT_ID` secrets and an `R2_PUBLIC_URL` variable override them.
-
-One-time setup:
-
-1. Cloudflare dashboard → R2 → Manage API tokens → create a token with Object
-   Read & Write on `model-router-downloads` only.
-2. Add its S3 credentials as repository secrets `R2_ACCESS_KEY_ID` and
-   `R2_SECRET_ACCESS_KEY`. The workflow skips with a notice until both are set.
-3. For a release that already exists, run the **R2 downloads** workflow by
-   hand with its tag.
 
 ## Website
 
@@ -107,8 +82,8 @@ One-time setup:
 (team Tirus) is linked to this repository with root directory `site`, so a push
 to `main` that changes `site/` deploys it to production and other branches get
 preview deployments. The domain is registered through Vercel and uses Vercel
-DNS; `www.model-router.dev` redirects (308) to the apex. The installer stays on
-the R2 domain, `model-router.tiru5.me`.
+DNS; `www.model-router.dev` redirects (308) to the apex. The page's install
+command uses the GitHub release installer.
 
 ## Amp orbs
 
