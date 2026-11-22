@@ -42,6 +42,7 @@ mod tasks;
 #[cfg(test)]
 mod tests;
 mod theme;
+mod tour;
 pub mod trust_prompt;
 mod ui;
 mod widgets;
@@ -247,6 +248,18 @@ pub fn run(
         && !startup::play(&mut screen.terminal, &app.signal, app.ui.palette())?
     {
         return Ok(());
+    }
+    // Before the project is remembered: an empty list means a first launch.
+    match tour::on_launch() {
+        tour::Launch::Open => app.tour.open = true,
+        tour::Launch::Offer => {
+            app.ui.message = if app.ui.message.is_empty() {
+                tour::OFFER.into()
+            } else {
+                format!("{} · {}", tour::OFFER, app.ui.message)
+            };
+        }
+        tour::Launch::Quiet => {}
     }
     let _ = storage::remember_project(&app.project);
     app.adopt_detached();

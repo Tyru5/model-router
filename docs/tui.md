@@ -35,6 +35,35 @@ Project detection (TUI and CLI): `-C DIR` as given; otherwise the nearest
 parent with `.model-router.toml`, else the Git root (worktrees and submodules
 included), else the current directory. The walk stops at the Git root.
 
+## Tour
+
+A panel above the status line says what to do next, from checking
+harnesses to a first completed run. Each step follows what the TUI shows,
+so it advances as you act, and going back (clearing the task, closing the
+run) returns to its step:
+
+| Step | Advances when |
+| --- | --- |
+| 1 Harnesses | Harnesses (`3`) has shown its checks and one harness is installed |
+| 2 Stages | You are on Workflow (`1`) and every enabled stage's harness is installed (`h` picks another, `o` turns a stage off) |
+| 3 Task | The task is not empty (`t`, `Ctrl+S`) |
+| 4 Start | A run starts (`r`); `P` previews it without model calls |
+| 5 Your run | The run completes; the panel names the keys for its state: `2` to follow it, `t` for an interactive stage, `h`/`a` at a handoff, `h`/`y`/`m`/`i` when it stops |
+| 6 Done | `F1` closes it |
+
+The tour follows the first run started while it is open. Starting runs
+uses your harnesses' logins as usual; the tour starts nothing itself. On
+short terminals the panel keeps its last line, the next key, and drops
+the explanation above it.
+
+It opens by itself on the first TUI launch on the machine: no
+`<config dir>/tour.json` and no recent projects. With recent projects but no
+`tour.json` (the TUI was used before the tour existed), it stays closed and
+the status line says once: `New: [F1] opens a tour that walks you to a
+completed run.` `tour.json` records `offered` then, `finished` once the
+followed run completes, or `hidden` when `F1` hides it before that; any of
+them keeps it from opening by itself. `F1` reopens it anytime.
+
 ## Everywhere
 
 | Key | Action |
@@ -44,6 +73,7 @@ included), else the current directory. The walk stops at the Git root.
 | `T` | Theme picker ([themes.md](themes.md)) |
 | `I` | Routing stats dialog |
 | `F8` | Toggle Vim motions |
+| `F1` | [Tour](#tour): show or hide it |
 | `F9` | Notifications… |
 | `L` | This session's runs |
 | `N` | Jump to the next run needing input |

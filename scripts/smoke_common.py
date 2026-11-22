@@ -140,6 +140,9 @@ class Terminal:
     args: CLI args after `-C project` (and `--config` when config=True).
     screen: render with pyte (needed for text() and frame-accurate waits).
     controlling: make the PTY the child's controlling terminal.
+    tour: let the getting-started tour open by itself, as on a first launch.
+      Otherwise the config dir records it as hidden, since every test starts
+      with a fresh config dir.
     """
 
     def __init__(
@@ -152,6 +155,7 @@ class Terminal:
         screen=True,
         controlling=True,
         config=True,
+        tour=False,
     ):
         self.project = Path(project)
         cols, rows = size
@@ -167,6 +171,10 @@ class Terminal:
             MODEL_ROUTER_FRAME_FILE=str(self.frame_file),
         )
         full_env.update(env or {})
+        tour_file = Path(full_env["MODEL_ROUTER_CONFIG_DIR"]) / "tour.json"
+        if not tour and not tour_file.exists():
+            tour_file.parent.mkdir(parents=True, exist_ok=True)
+            tour_file.write_text('{"outcome": "hidden"}')
         argv = [str(BINARY), "-C", str(self.project)]
         if config:
             argv += ["--config", str(self.project / ".model-router.toml")]

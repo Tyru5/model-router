@@ -38,6 +38,7 @@ fn theme_app(project: &std::path::Path) -> App {
         Arc::new(AtomicBool::new(false)),
     );
     app.ui.theme_path = project.join("appearance.json");
+    app.tour.path = project.join("tour.json");
     app.harnesses.checks.probe = |_, _| vec![];
     app
 }
@@ -3156,4 +3157,128 @@ fn any_disconnected_detects_peer_hangup_without_blocking() {
     assert!(!super::any_disconnected([a.as_raw_fd()]));
     drop(b);
     assert!(super::any_disconnected([a.as_raw_fd()]));
+}
+
+/// A harness check result: found on PATH or not.
+fn harness_report(harness: &str, installed: bool) -> crate::doctor::Report {
+    crate::doctor::Report {
+        harness: harness.into(),
+        builtin: true,
+        program: harness.into(),
+        path: installed.then(|| PathBuf::from(format!("/usr/bin/{harness}"))),
+        version: None,
+        tested_versions: vec![],
+        version_tested: None,
+        version_captured: false,
+        capabilities: None,
+        summary: "ok".into(),
+        notes: vec![],
+    }
+}
+
+#[test]
+fn the_tour_follows_the_user_from_harnesses_to_a_completed_run() {
+    use super::tour::Step;
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    let tour_file = app.tour.path.clone();
+    assert!(!rows(&mut app, 100, 30).join("\n").contains("Tour ·"));
+    app.key(key(Key::F(1))).unwrap();
+    let screen = rows(&mut app, 100, 30).join("\n");
+    assert!(screen.contains("Tour · 1 of 6 · Harnesses"), "{screen}");
+    assert!(screen.contains("Press [3]"), "{screen}");
+
+    // Harnesses shows its checks: codex is missing, the rest are installed.
+    app.key(key(Key::Char('3'))).unwrap();
+    app.harnesses.checks.checking = false;
+    app.harnesses.checks.reports = crate::config::BUILTINS
+        .iter()
+        .map(|name| harness_report(name, *name != "codex"))
+        .collect();
+    let screen = rows(&mut app, 100, 30).join("\n");
+    assert_eq!(app.tour_step(), Step::Workflow);
+    assert!(screen.contains("Press [1]"), "{screen}");
+
+    // A stage on a missing harness comes first.
+    app.key(key(Key::Char('1'))).unwrap();
+    let missing = app.editor.settings.workflows[0]
+        .stages
+        .iter()
+        .find(|s| s.enabled && s.harness == "codex")
+        .expect("the starter has a codex stage")
+        .name
+        .clone();
+    assert_eq!(
+        app.tour_step(),
+        Step::Stage {
+            name: missing.clone(),
+            harness: "codex".into()
+        }
+    );
+    assert!(rows(&mut app, 100, 30).join("\n").contains(&missing));
+    for stage in &mut app.editor.settings.workflows[0].stages {
+        if stage.harness == "codex" {
+            stage.harness = "claude".into();
+        }
+    }
+
+    // Then the task, then starting.
+    assert_eq!(app.tour_step(), Step::Task);
+    app.key(key(Key::Char('t'))).unwrap();
+    app.paste("Add a --version flag");
+    app.key(ctrl('s')).unwrap();
+    assert_eq!(app.tour_step(), Step::Start);
+    assert!(rows(&mut app, 100, 30).join("\n").contains("Press [r]"));
+
+    // A run started while the tour is open is followed through its states.
+    let mut run = sample_run("tour-run");
+    run.status = Status::Running;
+    app.tour_started(&run.id);
+    app.session.adopt(run);
+    assert!(rows(&mut app, 100, 30).join("\n").contains("Press [2]"));
+    app.ui.page = Page::Runs;
+    app.slot_mut().run.status = Status::AwaitingConfirmation;
+    let screen = rows(&mut app, 100, 30).join("\n");
+    assert!(screen.contains("Tour · 5 of 6"), "{screen}");
+    assert!(screen.contains("[a] accepts"), "{screen}");
+    assert!(!tour_file.exists(), "Nothing is saved before the end");
+
+    app.slot_mut().run.status = Status::Complete;
+    let screen = rows(&mut app, 100, 30).join("\n");
+    assert!(screen.contains("Tour · 6 of 6 · Done"), "{screen}");
+    assert!(
+        std::fs::read_to_string(&tour_file)
+            .unwrap()
+            .contains("finished")
+    );
+    // Hiding a finished tour keeps it finished.
+    app.key(key(Key::F(1))).unwrap();
+    assert!(!app.tour.open);
+    assert!(
+        std::fs::read_to_string(&tour_file)
+            .unwrap()
+            .contains("finished")
+    );
+    assert!(!rows(&mut app, 100, 30).join("\n").contains("Tour ·"));
+}
+
+#[test]
+fn hiding_the_tour_early_saves_it_and_small_screens_keep_the_page() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    app.key(key(Key::F(1))).unwrap();
+    // At the minimum size the page keeps its rows, and the panel keeps the
+    // line that says what to press.
+    let small = rows(&mut app, 65, 20).join("\n");
+    assert!(small.contains("Stages"), "{small}");
+    assert!(small.contains("Press [3]"), "{small}");
+    assert!(!small.contains("Model Router runs"), "{small}");
+    assert!(rows(&mut app, 80, 30).join("\n").contains("Tour · 1 of 6"));
+    app.key(key(Key::F(1))).unwrap();
+    assert!(
+        std::fs::read_to_string(&app.tour.path)
+            .unwrap()
+            .contains("hidden")
+    );
+    assert!(app.ui.message.contains("[F1] shows it again"));
 }

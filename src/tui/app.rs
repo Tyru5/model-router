@@ -64,6 +64,8 @@ pub(super) struct App {
     pub(super) tasks: Tasks,
     /// Launched runs an agent cancelled before this session adopted them.
     pub(super) cancel_on_adopt: std::collections::HashSet<String>,
+    /// The getting-started tour's panel and progress.
+    pub(super) tour: super::tour::Tour,
 }
 
 /// Git facts for the project, refreshed in the background.
@@ -135,6 +137,7 @@ impl App {
             starting: false,
             tasks: Tasks::default(),
             cancel_on_adopt: Default::default(),
+            tour: Default::default(),
         }
     }
     pub(super) fn choose_theme(&mut self) {
@@ -445,6 +448,7 @@ impl App {
             .find(|s| s.enabled)
             .is_some_and(|s| s.mode == config::Mode::Interactive);
         let (id, workspace) = (run.id.clone(), run.workspace.clone());
+        self.tour_started(&id);
         self.session.adopt(run);
         self.start_driver()?;
         self.runs.stale = true;
@@ -724,6 +728,7 @@ impl App {
             ActionId::ShowWorkflow => self.show(Page::Workflow),
             ActionId::ShowRuns => self.show(Page::Runs),
             ActionId::ShowHarnesses => self.show(Page::Harnesses),
+            ActionId::Tour => self.toggle_tour(),
             other => bail!("{other:?} is not a global action"),
         }
         Ok(false)
@@ -881,6 +886,7 @@ fn read_project(path: PathBuf) -> std::result::Result<Opened, String> {
 
 pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     app.sync_runs();
+    app.sync_tour();
     let theme = app.ui.displayed_theme();
     let palette = theme.palette();
     let can_test = app.ui.page == Page::Harnesses && app.can_test_harnesses();
@@ -1022,11 +1028,19 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let last_width = headers.last().map_or(0, Line::width);
     let beside = last_width + repo.width() + 4 <= area.width as usize;
     let header_height = headers.len() as u16 + u16::from(!beside);
+    let status_height = rows_for(&status, body_width, 2);
+    // The tour takes what the page can spare above its 10-row minimum.
+    let tour_lines = super::tour::lines(app, palette);
+    let spare = area
+        .height
+        .saturating_sub(header_height + 1 + 10 + status_height + 1);
+    let (tour_lines, tour_height) = super::tour::fit(tour_lines, body_width, spare.min(8));
     let chunks = Layout::vertical([
         Constraint::Length(header_height),
         Constraint::Length(1), // Vim toggle below the header, aligned right
         Constraint::Min(10),
-        Constraint::Length(rows_for(&status, body_width, 2)),
+        Constraint::Length(tour_height),
+        Constraint::Length(status_height),
         Constraint::Length(1),
     ])
     .split(area);
@@ -1057,19 +1071,28 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Page::Harnesses => draw_harnesses(frame, app, body, palette, can_test),
     }
     let inline = task_area.filter(|_| editing_task(app));
+    if tour_height >= 3 {
+        super::tour::draw(
+            frame,
+            app,
+            tour_lines,
+            chunks[3].inner(Margin::new(1, 0)),
+            palette,
+        );
+    }
     if !app.ui.message.is_empty() {
         frame.render_widget(
             Paragraph::new(status).wrap(Wrap { trim: false }),
-            chunks[3].inner(Margin::new(1, 0)),
+            chunks[4].inner(Margin::new(1, 0)),
         );
     }
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().bg(palette.bg)),
-        chunks[4],
+        chunks[5],
     );
     frame.render_widget(
         Paragraph::new(right).right_aligned(),
-        chunks[4].inner(Margin::new(1, 0)),
+        chunks[5].inner(Margin::new(1, 0)),
     );
     // Only the top dialog shows; those below come back as it closes.
     let ask = match app.ui.dialog() {

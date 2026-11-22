@@ -43,6 +43,9 @@ script.
 cd /path/to/project && mr
 ```
 
+The first launch opens a tour that walks these steps to a completed run;
+`F1` shows or hides it.
+
 1. `p` picks a repository (or start `mr` inside one).
 2. `t` writes the task (`Ctrl+S` applies), or `f` imports a file, URL, or GitHub issue.
 3. Check the stages; `e` edits one, `m` picks its model, `o` turns it on or off.
@@ -105,6 +108,7 @@ Replace the Astra ID if your account differs. `w` adds presets such as
 | `o` (Runs) | A finished run's brief ↔ its output |
 | `t` / `Ctrl+B` | Open or take over a session / detach from it |
 | `d` / `h` (Runs) | Diff / inspect handoff |
+| `F1` | Getting-started tour |
 | `T` / `F8` / `F9` | Theme / Vim motions / notifications |
 | `Space` | Action menu: a group letter, then an action letter |
 | `?` / `:` | Keyboard guide / command menu |
