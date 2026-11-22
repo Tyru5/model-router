@@ -197,6 +197,12 @@ pub struct Attempt {
     /// A fan-out candidate attempt's own Git worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<PathBuf>,
+    /// Tasks a delegating stage's attempt started; see `delegation`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<crate::delegation::records::TaskState>,
+    /// A delegating attempt's wake turns after its first process.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turns: Vec<crate::delegation::records::Turn>,
 }
 impl Attempt {
     /// The recorded process group, with its identity.
@@ -243,6 +249,20 @@ pub struct StageState {
     pub discarded: Vec<CandidateState>,
 }
 impl StageState {
+    /// Every turn of every task the stage's attempts delegated.
+    pub fn task_turns(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &crate::delegation::records::TaskState,
+            &crate::delegation::records::TaskTurn,
+        ),
+    > {
+        self.attempts
+            .iter()
+            .flat_map(|a| &a.tasks)
+            .flat_map(|t| t.turns.iter().map(move |turn| (t, turn)))
+    }
     /// Every fan-out candidate attempt with its candidate: the current
     /// round's first, in order, then discarded rounds'.
     pub fn candidate_attempts(&self) -> impl Iterator<Item = (&CandidateState, &Attempt)> {
@@ -367,6 +387,16 @@ pub struct Run {
     pub adapters: BTreeMap<String, CustomAdapter>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub providers: BTreeMap<String, Provider>,
+    /// The named delegates the workflow's stages may use, snapshotted at
+    /// creation so a replay never reads the current config's.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub delegates: BTreeMap<String, crate::delegation::Delegate>,
+    /// The run and stage attempt whose agent launched this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launched_by: Option<LaunchedBy>,
+    /// Who created the run: the user, an agent, or a schedule.
+    #[serde(default, skip_serializing_if = "CreationSource::is_user")]
+    pub creation_source: CreationSource,
     pub stages: Vec<StageState>,
     /// Groups from discarded fan-out rounds, awaiting cleanup under both locks.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -403,6 +433,35 @@ pub struct Run {
     /// The fan-out candidate whose prompt `prompt` renders.
     #[serde(skip)]
     pub(super) view: Option<usize>,
+}
+
+/// The parent that launched a run with `run_launch`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchedBy {
+    pub run: String,
+    pub stage: String,
+    pub attempt: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreationSource {
+    #[default]
+    User,
+    Agent,
+    Schedule,
+}
+impl CreationSource {
+    pub fn is_user(&self) -> bool {
+        *self == Self::User
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Agent => "agent",
+            Self::Schedule => "schedule",
+        }
+    }
 }
 
 /// Where a fork started: the source run, the stage it continues from, that

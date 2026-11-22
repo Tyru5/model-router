@@ -236,6 +236,20 @@ impl Run {
             workflow: workflow.clone(),
             adapters: settings.adapters.clone(),
             providers: settings.providers.clone(),
+            delegates: workflow
+                .stages
+                .iter()
+                .filter_map(|stage| stage.delegation.as_ref())
+                .flat_map(|delegation| &delegation.delegates)
+                .filter_map(|name| {
+                    settings
+                        .delegates
+                        .get(name)
+                        .map(|delegate| (name.clone(), delegate.clone()))
+                })
+                .collect(),
+            launched_by: None,
+            creation_source: Default::default(),
             stages: workflow
                 .stages
                 .iter()
@@ -1110,6 +1124,7 @@ impl Run {
     /// Marks every running fan-out candidate failed: its process died with
     /// an earlier router. Never retried silently.
     pub(super) fn interrupt_candidates(&mut self, message: &str) -> Result<()> {
+        self.interrupt_tasks(message);
         for index in 0..self.stages.len() {
             let count = self.stages[index]
                 .fan_out
@@ -1122,6 +1137,29 @@ impl Run {
             }
         }
         Ok(())
+    }
+
+    /// Marks every live delegated task, and its running turn, interrupted:
+    /// recovery does not replay delegation; the user retries the stage.
+    pub(super) fn interrupt_tasks(&mut self, message: &str) {
+        use crate::delegation::records::TaskStatus;
+        let now = Utc::now();
+        for state in &mut self.stages {
+            for attempt in &mut state.attempts {
+                for task in &mut attempt.tasks {
+                    if !task.status.is_live() {
+                        continue;
+                    }
+                    task.status = TaskStatus::Interrupted;
+                    task.error = Some(message.into());
+                    for turn in task.turns.iter_mut().filter(|t| t.status.is_live()) {
+                        turn.status = TaskStatus::Interrupted;
+                        turn.finished_at.get_or_insert(now);
+                        turn.error = Some(message.into());
+                    }
+                }
+            }
+        }
     }
 
     pub(super) fn candidate(&self, index: usize, c: usize) -> &CandidateState {
@@ -1240,6 +1278,8 @@ impl Run {
             terminal: None,
             handoff_source: None,
             worktree: None,
+            tasks: vec![],
+            turns: vec![],
         });
         let reason = format!("Fan-out round {number} started: {pending} candidate(s)");
         self.resume = None;
@@ -1405,6 +1445,8 @@ impl Run {
             terminal: None,
             handoff_source: None,
             worktree: Some(worktree),
+            tasks: vec![],
+            turns: vec![],
         });
         let reason = format!(
             "Candidate {id} attempt {number} started: {} {}",

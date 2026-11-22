@@ -1106,6 +1106,8 @@ mod tests {
             terminal: None,
             handoff_source: None,
             worktree: None,
+            tasks: vec![],
+            turns: vec![],
         });
         run.retry(false, None).unwrap();
         assert_eq!(run.status, Status::Pending);

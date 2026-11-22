@@ -321,6 +321,7 @@ fn rerun_from(
     let settings = Settings {
         adapters: source.adapters.clone(),
         providers: source.providers.clone(),
+        delegates: source.delegates.clone(),
         ..settings.clone()
     };
     let source_id = source.id.clone();
@@ -447,6 +448,7 @@ pub fn fork(
     let settings = Settings {
         adapters: source.adapters.clone(),
         providers: source.providers.clone(),
+        delegates: source.delegates.clone(),
         ..settings.clone()
     };
     let mut run =
@@ -826,6 +828,7 @@ fn artifacts(project: &Path, entry: &Entry) -> Vec<PathBuf> {
             .join(".model-router/handoffs")
             .join(id),
         root.join("candidates").join(id),
+        root.join("delegates").join(id),
     ];
     std::iter::once(entry.dir(project))
         .chain(
@@ -1040,6 +1043,11 @@ fn remove(project: &Path, item: &Item) -> Result<Item> {
         project,
         &project.join(".model-router/candidates").join(&item.id),
     ));
+    // Delegated tasks' worktrees too.
+    record(crate::fanout::remove_worktrees(
+        project,
+        &project.join(".model-router/delegates").join(&item.id),
+    ));
     let mut run_dir_removed = false;
     for (idx, (path, _)) in item.paths.iter().enumerate().rev() {
         let res = remove_path(path).with_context(|| format!("Remove {}", path.display()));
@@ -1242,6 +1250,8 @@ mod tests {
             terminal: None,
             handoff_source: None,
             worktree: None,
+            tasks: vec![],
+            turns: vec![],
         });
         run.stages[2].status = Status::Failed;
         run.stages[2].attempts.push(Attempt {
@@ -1266,6 +1276,8 @@ mod tests {
             terminal: None,
             handoff_source: None,
             worktree: None,
+            tasks: vec![],
+            turns: vec![],
         });
 
         // Stage b started before checkpoint c and crashed (tree_after: None).
@@ -1292,6 +1304,8 @@ mod tests {
             terminal: None,
             handoff_source: None,
             worktree: None,
+            tasks: vec![],
+            turns: vec![],
         });
         run.persist().unwrap();
         let err = fork(dir.path(), &settings, &run.id, "c", None)

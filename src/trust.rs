@@ -7,6 +7,7 @@
 //! and an explicit `--config` file are always trusted.
 use crate::{
     config::{self, Check, CustomAdapter, Sandbox, SandboxFallback, Settings, Stage, Workflow},
+    delegation::Delegate,
     harness_settings,
     providers::{self, Provider},
 };
@@ -120,15 +121,26 @@ fn quoted(args: &[String]) -> String {
 /// Dangerous items in `settings`, described with their full values, so the
 /// digest changes whenever any of them does.
 pub fn dangerous(settings: &Settings) -> Vec<String> {
-    dangerous_parts(&settings.workflows, &settings.adapters, &settings.providers)
+    dangerous_parts(
+        &settings.workflows,
+        &settings.adapters,
+        &settings.providers,
+        &settings.delegates,
+    )
 }
 
 fn dangerous_parts(
     workflows: &[Workflow],
     adapters: &BTreeMap<String, CustomAdapter>,
     providers: &BTreeMap<String, Provider>,
+    delegates: &BTreeMap<String, Delegate>,
 ) -> Vec<String> {
     let mut items = vec![];
+    // Delegation launches harnesses and spends money; every target and limit
+    // is in the digest.
+    for (name, delegate) in delegates {
+        items.push(format!("delegate {name}: {}", delegate.describe()));
+    }
     for (name, adapter) in adapters {
         let mut line = format!("custom adapter {name}: {}", quoted(&adapter_argv(adapter)));
         if let Some(args) = &adapter.interactive_args {
@@ -160,6 +172,9 @@ fn dangerous_parts(
                 items.push(format!("{} {key} = {value} in {at}", stage.harness));
             }
             items.extend(sandbox_loosening(workflow, stage, &at));
+            if let Some(delegation) = &stage.delegation {
+                items.push(format!("delegation in {at}: {}", delegation.describe()));
+            }
             if unconfirmed_ship(stage) {
                 let options = stage.ship.clone().unwrap_or_default();
                 items.push(format!(
@@ -367,15 +382,21 @@ fn run_approvals(project: &Path) -> PathBuf {
 }
 
 fn snapshot_items(settings: &Settings) -> Vec<String> {
-    snapshot_items_parts(&settings.workflows, &settings.adapters, &settings.providers)
+    snapshot_items_parts(
+        &settings.workflows,
+        &settings.adapters,
+        &settings.providers,
+        &settings.delegates,
+    )
 }
 
 fn snapshot_items_parts(
     workflows: &[Workflow],
     adapters: &BTreeMap<String, CustomAdapter>,
     providers: &BTreeMap<String, Provider>,
+    delegates: &BTreeMap<String, Delegate>,
 ) -> Vec<String> {
-    let mut items = dangerous_parts(workflows, adapters, providers);
+    let mut items = dangerous_parts(workflows, adapters, providers, delegates);
     for workflow in workflows {
         for stage in &workflow.stages {
             items.push(format!(
@@ -399,6 +420,7 @@ fn run_items(run: &crate::engine::Run) -> Vec<String> {
         std::slice::from_ref(&run.workflow),
         &run.adapters,
         &run.providers,
+        &run.delegates,
     )
 }
 
@@ -526,6 +548,7 @@ pub fn revoke(project: &Path) -> Result<bool> {
 pub struct Ignored {
     adapters: BTreeMap<String, CustomAdapter>,
     providers: BTreeMap<String, Provider>,
+    delegates: BTreeMap<String, Delegate>,
     stages: BTreeMap<(String, String), IgnoredStage>,
 }
 #[derive(Debug, Clone, Default)]
@@ -542,6 +565,8 @@ struct IgnoredStage {
     ship_no_secret_scan: bool,
     /// A ship stage's external `secret_scanner` command.
     ship_secret_scanner: Vec<String>,
+    /// The stage's delegation section, dropped while untrusted.
+    delegation: Option<crate::delegation::Delegation>,
 }
 
 /// Neutralizes every dangerous section: custom adapters keep their names but
@@ -574,6 +599,7 @@ pub fn ignore(settings: &mut Settings) {
             ignored.providers.insert(name, provider);
         }
     }
+    ignored.delegates = std::mem::take(&mut settings.delegates);
     for workflow in &mut settings.workflows {
         let default = workflow.sandbox_default;
         for stage in &mut workflow.stages {
@@ -599,6 +625,7 @@ pub fn ignore(settings: &mut Settings) {
                 && !ship_unconfirmed
                 && !ship_no_secret_scan
                 && !ship_has_scanner
+                && stage.delegation.is_none()
             {
                 continue;
             }
@@ -634,12 +661,13 @@ pub fn ignore(settings: &mut Settings) {
                     ship_unconfirmed,
                     ship_no_secret_scan,
                     ship_secret_scanner,
+                    delegation: stage.delegation.take(),
                 },
             );
         }
     }
     settings.warnings.push(
-        "Project config is untrusted: its custom adapters, checks, extra arguments, escalated permissions, sandbox loosening, and custom providers are ignored, and its ship stages ask for confirmation, this session. Run `model-router trust` to use them.".into(),
+        "Project config is untrusted: its custom adapters, checks, extra arguments, escalated permissions, sandbox loosening, delegation, and custom providers are ignored, and its ship stages ask for confirmation, this session. Run `model-router trust` to use them.".into(),
     );
     settings.ignored = Some(Box::new(ignored));
 }
@@ -663,6 +691,12 @@ pub(crate) fn restore_cow(settings: &Settings) -> Cow<'_, Settings> {
             .entry(name.clone())
             .or_insert_with(|| provider.clone());
     }
+    for (name, delegate) in &ignored.delegates {
+        saved
+            .delegates
+            .entry(name.clone())
+            .or_insert_with(|| delegate.clone());
+    }
     for workflow in &mut saved.workflows {
         for stage in &mut workflow.stages {
             let Some(original) = ignored
@@ -685,6 +719,9 @@ pub(crate) fn restore_cow(settings: &Settings) -> Cow<'_, Settings> {
             }
             if stage.sandbox.is_none() {
                 stage.sandbox = original.sandbox;
+            }
+            if stage.delegation.is_none() {
+                stage.delegation = original.delegation.clone();
             }
             if stage.sandbox_writable.is_empty() {
                 stage.sandbox_writable = original.sandbox_writable.clone();
@@ -768,6 +805,54 @@ mod tests {
         changed.workflows[0].stages[0].checks[0].command[1] = "https://other".into();
         assert_ne!(digest(&items), digest(&dangerous(&changed)));
         assert_eq!(digest(&items).len(), 64);
+    }
+
+    #[test]
+    fn delegation_needs_trust_and_is_restored_on_save() {
+        let mut settings = Settings::default();
+        settings.delegates.insert(
+            "rev".into(),
+            Delegate {
+                harness: "codex".into(),
+                model: "m".into(),
+                ..Delegate::default()
+            },
+        );
+        settings.workflows[0].stages[0].delegation = Some(crate::delegation::Delegation {
+            delegates: vec!["rev".into()],
+            ..crate::delegation::Delegation::default()
+        });
+        let text = dangerous(&settings).join("\n");
+        assert!(
+            text.contains("delegate rev: harness codex model m"),
+            "{text}"
+        );
+        assert!(
+            text.contains("delegation in Feature development / research"),
+            "{text}"
+        );
+        let before = digest(&dangerous(&settings));
+        settings.workflows[0].stages[0]
+            .delegation
+            .as_mut()
+            .unwrap()
+            .max_tasks = 5;
+        assert_ne!(
+            before,
+            digest(&dangerous(&settings)),
+            "limits are in the digest"
+        );
+        let mut untrusted = settings.clone();
+        ignore(&mut untrusted);
+        assert!(untrusted.delegates.is_empty());
+        assert!(untrusted.workflows[0].stages[0].delegation.is_none());
+        assert!(dangerous(&untrusted).iter().all(|i| !i.contains("deleg")));
+        let restored = restore(&untrusted);
+        assert_eq!(restored.delegates, settings.delegates);
+        assert_eq!(
+            restored.workflows[0].stages[0].delegation,
+            settings.workflows[0].stages[0].delegation
+        );
     }
 
     #[test]

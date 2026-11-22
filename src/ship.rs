@@ -1106,6 +1106,8 @@ pub fn execute(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
         terminal: None,
         handoff_source: None,
         worktree: None,
+        tasks: vec![],
+        turns: vec![],
     });
     let reason = format!(
         "Ship attempt {number} started{}",

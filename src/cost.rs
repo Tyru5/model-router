@@ -465,6 +465,43 @@ pub(crate) fn stage_estimate_params(run: &Run, index: usize) -> (Option<&str>, B
     (routed, billing)
 }
 
+/// Routed provider and billing for a delegated task: its own target's, not
+/// the stage's.
+pub(crate) fn task_estimate_params<'a>(
+    run: &'a Run,
+    task: &'a crate::delegation::records::TaskState,
+) -> (Option<&'a str>, Billing) {
+    let target = &task.target;
+    let routed = providers::route(&target.harness, &target.provider, &run.providers)
+        .is_some()
+        .then_some(target.provider.as_str());
+    let explicit = target
+        .delegate
+        .as_ref()
+        .and_then(|name| run.delegates.get(name))
+        .and_then(|d| d.billing);
+    (
+        routed,
+        billing_for(explicit, routed.is_some(), &target.harness, &run.adapters),
+    )
+}
+
+/// A delegated task turn's estimate, priced under the task's target.
+pub fn task_turn_estimate(
+    run: &Run,
+    task: &crate::delegation::records::TaskState,
+    turn: &crate::delegation::records::TaskTurn,
+    pricing: &Pricing,
+) -> Estimate {
+    let (provider, billing) = task_estimate_params(run, task);
+    let model = if turn.model.is_empty() {
+        &task.target.model
+    } else {
+        &turn.model
+    };
+    estimate_with_billing(turn.usage.as_ref(), model, provider, billing, pricing)
+}
+
 pub fn attempt_estimate(run: &Run, index: usize, attempt: &Attempt, pricing: &Pricing) -> Estimate {
     let (provider, billing) = stage_estimate_params(run, index);
     estimate_with_billing(
@@ -653,6 +690,10 @@ pub fn stage_totals(run: &Run, pricing: &Pricing) -> Vec<CostTotal> {
                     billing,
                     pricing,
                 ));
+            }
+            // Delegated tasks spend under their own targets.
+            for (task, turn) in state.task_turns() {
+                total.add(&task_turn_estimate(run, task, turn, pricing));
             }
             total
         })
@@ -1065,6 +1106,35 @@ pub fn aggregate<'a>(
         usage: Usage::default(),
         total: CostTotal::default(),
     };
+    let mut add =
+        |run: &Run, harness: &str, model: &str, usage: Option<Usage>, estimate: Estimate| {
+            let model = if model.is_empty() {
+                "default".to_owned()
+            } else {
+                model.to_owned()
+            };
+            let (row, ids) = rows
+                .entry((harness.to_owned(), model.clone()))
+                .or_insert_with(|| {
+                    (
+                        Row {
+                            harness: harness.to_owned(),
+                            model,
+                            runs: 0,
+                            usage: Usage::default(),
+                            cost: CostTotal::default(),
+                        },
+                        BTreeSet::new(),
+                    )
+                });
+            ids.insert(run.id.clone());
+            row.cost.add(&estimate);
+            summary.total.add(&estimate);
+            if let Some(usage) = usage {
+                row.usage = row.usage + usage;
+                summary.usage = summary.usage + usage;
+            }
+        };
     for run in runs {
         for (index, (stage, state)) in run.workflow.stages.iter().zip(&run.stages).enumerate() {
             let (provider, billing) = stage_estimate_params(run, index);
@@ -1084,32 +1154,20 @@ pub fn aggregate<'a>(
                     billing,
                     pricing,
                 );
-                let model = if attempt.model.is_empty() {
-                    "default".to_owned()
-                } else {
-                    attempt.model.clone()
-                };
-                let (row, ids) = rows
-                    .entry((harness.to_owned(), model.clone()))
-                    .or_insert_with(|| {
-                        (
-                            Row {
-                                harness: harness.to_owned(),
-                                model,
-                                runs: 0,
-                                usage: Usage::default(),
-                                cost: CostTotal::default(),
-                            },
-                            BTreeSet::new(),
-                        )
-                    });
-                ids.insert(run.id.clone());
-                row.cost.add(&estimate);
-                summary.total.add(&estimate);
-                if let Some(usage) = attempt.usage {
-                    row.usage = row.usage + usage;
-                    summary.usage = summary.usage + usage;
+                add(run, harness, &attempt.model, attempt.usage, estimate);
+            }
+            // Delegated tasks count under their own targets.
+            for (task, turn) in state.task_turns() {
+                if since.is_some_and(|since| turn.started_at < since) {
+                    continue;
                 }
+                let estimate = task_turn_estimate(run, task, turn, pricing);
+                let model = if turn.model.is_empty() {
+                    &task.target.model
+                } else {
+                    &turn.model
+                };
+                add(run, &task.target.harness, model, turn.usage, estimate);
             }
         }
     }

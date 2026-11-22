@@ -53,6 +53,17 @@ pub(super) fn stop_orphans(run: &mut Run, emit: &mut impl FnMut(Event)) -> Resul
                 groups.push(group);
             }
         }
+        // Delegated tasks' turns run in their own groups.
+        for turn in state
+            .attempts
+            .iter_mut()
+            .flat_map(|a| &mut a.tasks)
+            .flat_map(|t| &mut t.turns)
+        {
+            if let Some(group) = turn.take_group() {
+                groups.push(group);
+            }
+        }
     }
     // Groups a scheduler worker started but the run never recorded.
     let journal = SpawnJournal::new(run);

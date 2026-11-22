@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod checks;
 pub mod config;
 pub mod cost;
+pub mod delegation;
 pub mod doctor;
 pub mod engine;
 pub mod events;

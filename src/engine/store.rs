@@ -38,6 +38,14 @@ pub(super) fn recorded_paths(run: &mut Run) -> Vec<&mut PathBuf> {
             paths.extend([&mut attempt.directory, &mut attempt.handoff_file]);
             paths.extend(&mut attempt.worktree);
             paths.extend(attempt.checks.iter_mut().map(|check| &mut check.directory));
+            paths.extend(attempt.turns.iter_mut().map(|turn| &mut turn.directory));
+            for task in &mut attempt.tasks {
+                paths.extend(&mut task.worktree);
+                paths.extend(task.patches.iter_mut().map(|patch| &mut patch.path));
+                for turn in &mut task.turns {
+                    paths.extend([&mut turn.directory, &mut turn.handoff_file]);
+                }
+            }
         }
     }
     paths
@@ -109,6 +117,30 @@ pub fn load(project: &Path, id: &str) -> Result<Run> {
                 .chain(state.candidate_attempts().map(|(_, a)| a))
         })
     };
+    let tasks = || {
+        run.stages
+            .iter()
+            .flat_map(|state| &state.attempts)
+            .flat_map(|a| &a.tasks)
+    };
+    ensure!(
+        tasks().all(|task| {
+            crate::config::is_id(&task.id)
+                && task.base.iter().all(object)
+                && task
+                    .turns
+                    .iter()
+                    .flat_map(|t| [&t.tree_before, &t.tree_after])
+                    .flatten()
+                    .all(object)
+                && task
+                    .patches
+                    .iter()
+                    .filter_map(|p| p.apply.as_ref())
+                    .all(|a| object(&a.pre_tree) && a.expected_post_tree.iter().all(object))
+        }),
+        "Invalid or unsupported run record: a delegated task has an invalid ID or snapshot"
+    );
     ensure!(
         run.baseline.iter().all(object)
             && attempts().all(|a| {
@@ -159,6 +191,25 @@ pub fn load(project: &Path, id: &str) -> Result<Run> {
                 stage.id
             );
             worktrees.push(worktree.clone());
+        }
+        // A worktree task's checkout is exactly where the router puts it.
+        for attempt in &state.attempts {
+            for task in &attempt.tasks {
+                let Some(worktree) = &task.worktree else {
+                    continue;
+                };
+                let expected = base
+                    .join("delegates")
+                    .join(id)
+                    .join(&stage.id)
+                    .join(format!("a{:03}-{}", attempt.number, task.id));
+                ensure!(
+                    *worktree == expected,
+                    "Invalid or unsupported run record: task {} has a misplaced worktree",
+                    task.id
+                );
+                worktrees.push(expected);
+            }
         }
         let Some(fan_out) = &state.fan_out else {
             continue;
@@ -222,6 +273,7 @@ pub fn load(project: &Path, id: &str) -> Result<Run> {
     let resolved_worktrees = resolve_cached(&mut resolved_cache, &base.join("worktrees").join(id));
     let resolved_candidates =
         resolve_cached(&mut resolved_cache, &base.join("candidates").join(id));
+    let resolved_delegates = resolve_cached(&mut resolved_cache, &base.join("delegates").join(id));
     let mut inside = |path: &Path| {
         let Ok(rest) = path.strip_prefix(&base) else {
             return false;
@@ -237,7 +289,7 @@ pub fn load(project: &Path, id: &str) -> Result<Run> {
         let container = match parts[0].to_str() {
             Some("runs") if parts.len() >= 4 => resolved_runs.as_ref(),
             Some("handoffs") => resolved_handoffs.as_ref(),
-            Some("worktrees" | "candidates") => {
+            Some("worktrees" | "candidates" | "delegates") => {
                 let laid_out = parts
                     .iter()
                     .position(|part| *part == ".model-router")
@@ -247,10 +299,10 @@ pub fn load(project: &Path, id: &str) -> Result<Run> {
                 if !laid_out {
                     return false;
                 }
-                if parts[0] == std::ffi::OsStr::new("worktrees") {
-                    resolved_worktrees.as_ref()
-                } else {
-                    resolved_candidates.as_ref()
+                match parts[0].to_str() {
+                    Some("worktrees") => resolved_worktrees.as_ref(),
+                    Some("delegates") => resolved_delegates.as_ref(),
+                    _ => resolved_candidates.as_ref(),
                 }
             }
             _ => return false,
@@ -270,10 +322,12 @@ pub fn load(project: &Path, id: &str) -> Result<Run> {
             return false;
         };
         container.is_some_and(|c| path.starts_with(c))
-            || (matches!(parts[0].to_str(), Some("worktrees" | "candidates"))
-                && resolved_handoffs
-                    .as_ref()
-                    .is_some_and(|c| path.starts_with(c)))
+            || (matches!(
+                parts[0].to_str(),
+                Some("worktrees" | "candidates" | "delegates")
+            ) && resolved_handoffs
+                .as_ref()
+                .is_some_and(|c| path.starts_with(c)))
     };
     ensure!(
         recorded_paths(&mut run)

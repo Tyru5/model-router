@@ -422,6 +422,16 @@ pub fn usage_total_with(run: &Run, pricing: &Pricing) -> UsageTotal {
                 sum.sum = sum.sum + usage;
             }
         }
+        for (task, turn) in state.task_turns() {
+            let estimate = cost::task_turn_estimate(run, task, turn, pricing);
+            sum.attempts += 1;
+            sum.cost.add(&estimate);
+            if let Some(usage) = turn.usage {
+                sum.reported += 1;
+                sum.cost_reported += usize::from(usage.cost_usd.is_some());
+                sum.sum = sum.sum + usage;
+            }
+        }
     }
     sum
 }
@@ -434,6 +444,22 @@ pub fn build(run: &Run) -> RunReport {
 pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
     let mut estimates: Vec<Vec<cost::Estimate>> = Vec::with_capacity(run.stages.len());
     let mut candidate_estimates: Vec<Vec<cost::Estimate>> = Vec::with_capacity(run.stages.len());
+    // Delegated tasks' turns, with their usage, priced under each task's target.
+    let task_estimates: Vec<Vec<(Option<crate::handoff::Usage>, cost::Estimate)>> = run
+        .stages
+        .iter()
+        .map(|state| {
+            state
+                .task_turns()
+                .map(|(task, turn)| {
+                    (
+                        turn.usage,
+                        cost::task_turn_estimate(run, task, turn, pricing),
+                    )
+                })
+                .collect()
+        })
+        .collect();
     for (index, state) in run.stages.iter().enumerate() {
         let (provider, billing) = cost::stage_estimate_params(run, index);
         let est = |a: &Attempt| {
@@ -461,13 +487,14 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
     let mut reported_files: Vec<String> = vec![];
     let mut seen_files: HashSet<String> = HashSet::new();
     let mut stages = vec![];
-    for (((stage, state), estimates), candidate_estimates) in run
+    for (stage_index, (((stage, state), estimates), candidate_estimates)) in run
         .workflow
         .stages
         .iter()
         .zip(&run.stages)
         .zip(&estimates)
         .zip(&candidate_estimates)
+        .enumerate()
     {
         let last = state.attempts.last();
         let mut checks: Vec<_> = last
@@ -619,13 +646,15 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
             attempts: state.attempts.len(),
             retries: state.attempts.len().saturating_sub(1),
             active_seconds: state.attempts.iter().map(seconds).sum(),
-            // Spend counts every candidate's.
-            usage: total(
+            // Spend counts every candidate's and every delegated task's.
+            usage: usage_sum(
                 state
                     .attempts
                     .iter()
                     .zip(estimates)
-                    .chain(candidate_attempts.zip(candidate_estimates)),
+                    .chain(candidate_attempts.zip(candidate_estimates))
+                    .map(|(a, e)| (a.usage, e))
+                    .chain(task_estimates[stage_index].iter().map(|(u, e)| (*u, e))),
             ),
             budget: stage.budget,
             checks,
@@ -653,7 +682,7 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
         retries: stages.iter().map(|s| s.retries).sum(),
         repair_passes: run.repair_passes,
         max_repair_passes: run.workflow.max_repair_passes,
-        usage: total(
+        usage: usage_sum(
             run.stages
                 .iter()
                 .zip(&estimates)
@@ -663,7 +692,9 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
                         .iter()
                         .zip(&candidate_estimates)
                         .flat_map(|(s, e)| s.candidate_attempts().map(|(_, a)| a).zip(e)),
-                ),
+                )
+                .map(|(a, e)| (a.usage, e))
+                .chain(task_estimates.iter().flatten().map(|(u, e)| (*u, e))),
         ),
         budget: run.workflow.budget,
         prices_as_of: cost::table_as_of().into(),
@@ -685,11 +716,22 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
 }
 
 fn total<'a>(attempts: impl IntoIterator<Item = (&'a Attempt, &'a cost::Estimate)>) -> UsageTotal {
+    usage_sum(
+        attempts
+            .into_iter()
+            .map(|(attempt, estimate)| (attempt.usage, estimate)),
+    )
+}
+
+/// Sums processes' usage and estimates: stage attempts, candidates, tasks.
+fn usage_sum<'a>(
+    processes: impl IntoIterator<Item = (Option<crate::handoff::Usage>, &'a cost::Estimate)>,
+) -> UsageTotal {
     let mut total = UsageTotal::default();
-    for (attempt, estimate) in attempts {
+    for (usage, estimate) in processes {
         total.attempts += 1;
         total.cost.add(estimate);
-        if let Some(usage) = attempt.usage {
+        if let Some(usage) = usage {
             total.reported += 1;
             total.cost_reported += usize::from(usage.cost_usd.is_some());
             total.sum = total.sum + usage;
