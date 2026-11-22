@@ -3156,7 +3156,13 @@ fn any_disconnected_detects_peer_hangup_without_blocking() {
     let (a, b) = UnixStream::pair().unwrap();
     assert!(!super::any_disconnected([a.as_raw_fd()]));
     drop(b);
-    assert!(super::any_disconnected([a.as_raw_fd()]));
+    // A child another test forks holds a copy of `b` until it execs, so the
+    // hangup can arrive a moment after the drop.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !super::any_disconnected([a.as_raw_fd()]) {
+        assert!(std::time::Instant::now() < deadline, "no hangup after 5 s");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// A harness check result: found on PATH or not.

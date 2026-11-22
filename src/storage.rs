@@ -509,6 +509,20 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
+    /// Waits up to 5 s for `done`. A child another test forks holds copies
+    /// of this test's descriptors, and with them its locks, until it execs.
+    #[cfg(unix)]
+    fn eventually(done: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        true
+    }
+
     #[cfg(unix)]
     #[test]
     fn handed_over_lock_stays_held_after_drop_and_shared_probes_coexist() {
@@ -521,7 +535,7 @@ mod tests {
         assert!(is_locked(&path));
         assert!(lock(&path).is_err());
         drop(peer);
-        assert!(!is_locked(&path));
+        assert!(eventually(|| !is_locked(&path)));
 
         let probe_a = OpenOptions::new().read(true).open(&path).unwrap();
         let probe_b = OpenOptions::new().read(true).open(&path).unwrap();
@@ -532,7 +546,7 @@ mod tests {
         let _ = flock(&probe_b, libc::LOCK_UN);
         drop(probe_a);
         drop(probe_b);
-        assert!(lock(&path).is_ok());
+        assert!(eventually(|| lock(&path).is_ok()));
     }
 
     #[test]
