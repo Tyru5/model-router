@@ -1238,6 +1238,15 @@ fn start_round(
     } else if let Some(error) = hooks.failed {
         (Status::Failed, error, Actor::Engine)
     } else {
+        if !hooks.results.is_empty() {
+            // Candidates must see what the hooks prepared.
+            if let Err(error) = run.refresh_fan_out_base(index) {
+                run.stop(Status::Failed, format!("{error:#}"), Actor::Engine, true)?;
+                run.persist()?;
+                emit(Event::State(Box::new(run.clone())));
+                return Ok(false);
+            }
+        }
         return Ok(true);
     };
     let count = run.stages[index]

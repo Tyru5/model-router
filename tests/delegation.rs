@@ -159,6 +159,22 @@ open(sys.argv[1], "w").write(json.dumps({"schema_version": 2, "summary": "done",
     }
 }
 
+/// Like [`streamer`], in Claude's stream format: its 1,200 tokens arrive on
+/// an `assistant` event, and only a final `result` event (never written
+/// before the cap stops it) would carry them in the log.
+fn claude_streamer() -> CustomAdapter {
+    let code = r#"import json, sys, time
+print(json.dumps({"type": "assistant", "message": {"id": "m1", "role": "assistant", "usage": {"input_tokens": 1200, "output_tokens": 0}}}), flush=True)
+time.sleep(30)
+open(sys.argv[1], "w").write(json.dumps({"schema_version": 2, "summary": "done", "verdict": "complete"}))
+"#;
+    CustomAdapter {
+        output: Some(CustomOutput::ClaudeStream),
+        args: vec!["-c".into(), code.into(), "{handoff_file}".into()],
+        ..streamer()
+    }
+}
+
 fn token_cap(tokens: u64) -> Budget {
     Budget {
         max_tokens: Some(tokens),
@@ -201,6 +217,7 @@ fn case(turns: Value, follow_up: bool, delegate: Delegate, tweak: impl FnOnce(&m
             ("task".into(), task_adapter(None)),
             ("writer".into(), task_adapter(Some("added.txt"))),
             ("streamer".into(), streamer()),
+            ("claude_streamer".into(), claude_streamer()),
         ]),
         delegates: BTreeMap::from([("helper".into(), delegate)]),
         ..Settings::default()
@@ -566,6 +583,60 @@ fn a_delegating_parent_s_streamed_usage_stops_the_stage_at_its_cap() {
     let attempt = &case.run.stages[0].attempts[0];
     assert_eq!(attempt.status, Status::Blocked);
     assert!(attempt.usage.is_some());
+}
+
+#[test]
+fn budget_stopped_claude_workers_keep_their_streamed_usage() {
+    if !setup() {
+        return;
+    }
+    // A task stopped before its `result` event.
+    let turns = json!({
+        "turns": [[
+            {"call": "delegate_task", "args": {"task": "Look around", "client_request_id": "costly"}}
+        ]],
+        "handoffs": {"1": {"summary": "waiting on tasks", "verdict": "blocked"}}
+    });
+    let costly = Delegate {
+        harness: "claude_streamer".into(),
+        model: "m".into(),
+        ..Delegate::default()
+    };
+    let mut task_case = case(turns, true, costly, |stage| stage.budget = token_cap(1000));
+    assert_eq!(
+        drive(&mut task_case.run),
+        Action::Stopped,
+        "{:?}",
+        task_case.run.error
+    );
+    assert!(
+        cost::budget_blocked(&task_case.run),
+        "{:?}",
+        task_case.run.error
+    );
+    let task = &task_case.run.stages[0].attempts[0].tasks[0];
+    let usage = task.turns[0]
+        .usage
+        .expect("the task's streamed usage is kept");
+    assert_eq!(usage.input_tokens, Some(1200));
+
+    // A parent stopped before its `result` event.
+    let mut case = case(json!({"turns": []}), true, helper("m"), |stage| {
+        stage.harness = "claude_streamer".into();
+        stage.model = "m".into();
+        stage.budget = token_cap(1000);
+    });
+    assert_eq!(
+        drive(&mut case.run),
+        Action::Stopped,
+        "{:?}",
+        case.run.error
+    );
+    assert!(cost::budget_blocked(&case.run), "{:?}", case.run.error);
+    let usage = case.run.stages[0].attempts[0]
+        .usage
+        .expect("the parent's streamed usage is kept");
+    assert_eq!(usage.input_tokens, Some(1200));
 }
 
 #[test]

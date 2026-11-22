@@ -1299,6 +1299,33 @@ impl Run {
     /// Starts a round of fan-out stage `index`: a new attempt for the stage,
     /// and, unless an earlier round left candidates to retry, a base commit
     /// of the workspace and pending candidates.
+    /// Re-snapshots fan-out stage `index`'s candidate base after its
+    /// `before_stage` hooks, so candidates start from the files those hooks
+    /// prepared. Only a round whose candidates have not started yet moves:
+    /// started candidates' patches are relative to the base they saw. The
+    /// stage attempt keeps its pre-hook `tree_before`, as ordinary stages do.
+    pub(super) fn refresh_fan_out_base(&mut self, index: usize) -> Result<()> {
+        let Some(state) = self.stages[index].fan_out.as_ref() else {
+            return Ok(());
+        };
+        if state.candidates.iter().any(|c| !c.attempts.is_empty()) {
+            return Ok(());
+        }
+        let base = snapshot::tree(&self.workspace, &self.directory)
+            .context("Snapshot the workspace after before_stage hooks")?;
+        if base == state.base {
+            return Ok(());
+        }
+        let stage_id = self.workflow.stages[index].id.clone();
+        let reference = snapshot::base_ref(&self.id, &format!("{stage_id}-{:03}", state.round));
+        let base_commit = fanout::base_commit(&self.workspace, &base, &reference)?;
+        if let Some(state) = self.stages[index].fan_out.as_mut() {
+            state.base = base;
+            state.base_commit = base_commit;
+        }
+        self.persist()
+    }
+
     pub(super) fn start_fan_out(&mut self, index: usize) -> Result<()> {
         let stage = self.workflow.stages[index].clone();
         let fan = stage.fan_out.clone().context("Not a fan-out stage")?;

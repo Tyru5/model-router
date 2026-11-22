@@ -258,7 +258,8 @@ exit or timeout; `after_stage` and `on_failure` log results under
 `<attempt>/hooks/<event>/NN/` without masking the stage outcome. Files that
 `after_stage` and `on_failure` hooks change are part of the stage's recorded
 changes (`changes.diff`, worktree apply). A `fan_out` stage runs
-`before_stage` once before its candidates start (a failure cancels them) and
+`before_stage` once before its candidates start (a failure cancels them;
+candidates start from the workspace as the hooks left it) and
 `after_stage`/`on_failure` once after the round settles, all in the workspace.
 Requires project trust.
 

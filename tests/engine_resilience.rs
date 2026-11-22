@@ -1590,3 +1590,39 @@ fn fan_out_rounds_run_stage_hooks_once_and_retry_candidates_transiently() {
     }
     assert_eq!(fs::read_to_string(&log).unwrap(), "failure\n");
 }
+
+#[test]
+fn fan_out_candidates_start_from_files_before_stage_hooks_prepared() {
+    init_test_config_dir();
+    let dir = common::tempdir();
+    let scripts = common::tempdir();
+    init_git(dir.path());
+    let hooks = Hooks {
+        before_stage: vec![Hook {
+            command: vec![
+                "python3".into(),
+                "-c".into(),
+                "import pathlib; pathlib.Path('prepared.txt').write_text('ready\\n')".into(),
+            ],
+            timeout_seconds: 10,
+        }],
+        ..Hooks::default()
+    };
+    let (settings, wf) = fan_out_fixture(scripts.path(), "test-model", hooks);
+    let mut run = Run::create(dir.path(), &settings, &wf, "fan-out prep".into(), false).unwrap();
+    assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+    let fan = run.stages[0].fan_out.as_ref().unwrap();
+    // The candidates' base (and so their worktrees) holds the hook's file.
+    let listed = git(dir.path(), &["ls-tree", "--name-only", &fan.base_commit]);
+    assert!(listed.lines().any(|l| l == "prepared.txt"), "{listed}");
+    for candidate in &fan.candidates {
+        assert_eq!(
+            candidate.attempts[0].tree_before.as_deref(),
+            Some(fan.base.as_str())
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(dir.path().join("prepared.txt")).unwrap(),
+        "ready\n"
+    );
+}

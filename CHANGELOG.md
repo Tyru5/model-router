@@ -64,7 +64,8 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   `on_failure`), executed as argument vectors in their own process group with
   `MODEL_ROUTER_HOOK` and stage context environment variables, and included in
   project trust and run approval digests. `timeout_seconds` is `1..=3600`.
-  Stage hooks run once around a fan-out round, and edits from `after_stage`
+  Stage hooks run once around a fan-out round (candidates start from the
+  files `before_stage` prepared), and edits from `after_stage`
   and `on_failure` hooks are captured in the stage's changes.
 - Declarative diff policies (`[[workflows.policies]]` with
   `action = "block" | "advise"`, non-backtracking `pattern`, `paths`,
@@ -81,8 +82,9 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   `on_exceed = "stop"`, terminating the harness process group as soon as
   streamed usage exceeds stage or run USD/token caps. Caps count every live
   worker (parallel stages, fan-out candidates, delegating parents and their
-  tasks), and a run whose recorded spend is over a stop cap when its last
-  stage finishes ends Blocked.
+  tasks), an exceeded run cap stops workers in every stage, a stopped worker
+  keeps the usage it streamed, and a run whose recorded spend is over a stop
+  cap when its last stage finishes ends Blocked.
 - `model-router schedules add` CLI (`--workflow`, `--task`/`--task-file`,
   `--every`/`--at`/`--cron`/`--webhook`, `--tz`, trust-gated `--approve`), plus
   5-field cron expressions (`cron`; day-of-month OR day-of-week when both are

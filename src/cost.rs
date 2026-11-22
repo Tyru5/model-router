@@ -1039,17 +1039,21 @@ impl LiveSpend {
             }
             run_spent.merge(&entry.spent);
         }
-        let (reason, whole_run) = match monitor.stage_budget.as_ref().and_then(|budget| {
-            exceeded(
-                budget,
-                &stage_spent,
-                &format!(" in stage {}", monitor.stage_name),
-            )
-        }) {
-            Some(reason) => (reason, false),
+        // Both caps are checked: one event can cross both, and an exceeded
+        // run cap must stop workers in every stage, not just this one.
+        let run_reason = monitor
+            .run_budget
+            .as_ref()
+            .and_then(|budget| exceeded(budget, &run_spent, ""));
+        let (reason, whole_run) = match run_reason {
+            Some(reason) => (reason, true),
             None => (
-                exceeded(monitor.run_budget.as_ref()?, &run_spent, "")?,
-                true,
+                exceeded(
+                    monitor.stage_budget.as_ref()?,
+                    &stage_spent,
+                    &format!(" in stage {}", monitor.stage_name),
+                )?,
+                false,
             ),
         };
         let reason = format!(
@@ -2068,5 +2072,28 @@ mod tests {
         let reason = two.check(tokens(600)).unwrap();
         assert!(reason.contains("in stage Review"), "{reason}");
         assert!(one.stopped().is_some());
+    }
+
+    #[test]
+    fn crossing_stage_and_run_caps_at_once_stops_other_stages_too() {
+        // sample() records 2,400 tokens; the run allows 1,000 more.
+        let mut run = crate::report::tests::sample();
+        run.workflow.budget = Budget {
+            max_tokens: Some(3_400),
+            on_exceed: BudgetAction::Stop,
+            ..Budget::default()
+        };
+        run.workflow.stages[2].budget = Budget {
+            max_tokens: Some(1_000),
+            on_exceed: BudgetAction::Stop,
+            ..Budget::default()
+        };
+        let spend = LiveSpend::with_pricing(Pricing::default());
+        let quiet = spend.monitor(&run, 1, "quiet").unwrap();
+        let loud = spend.monitor(&run, 2, "loud").unwrap();
+        // One event crosses the stage cap and the run cap together.
+        let reason = loud.check(tokens(1_100)).unwrap();
+        assert!(!reason.contains("in stage"), "{reason}");
+        assert_eq!(quiet.stopped(), Some(reason));
     }
 }

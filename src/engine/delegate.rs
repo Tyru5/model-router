@@ -103,8 +103,19 @@ enum Msg {
     /// An interactive parent's terminal host socket.
     Terminal(PathBuf),
     Output(Who, String),
-    ParentDone(Result<process::Outcome>, DateTime<Utc>),
-    TaskDone(String, Result<process::Outcome>, DateTime<Utc>),
+    /// The end, with the usage the live monitor read from the stream (kept
+    /// when a budget stop ends the process before its final usage event).
+    ParentDone(
+        Result<process::Outcome>,
+        DateTime<Utc>,
+        Option<handoff::Usage>,
+    ),
+    TaskDone(
+        String,
+        Result<process::Outcome>,
+        DateTime<Utc>,
+        Option<handoff::Usage>,
+    ),
     /// A process's live budget monitor saw a stop cap exceeded.
     BudgetStop(String),
     Call(Call),
@@ -260,10 +271,10 @@ pub(super) fn drive_stage(
         drop(std::mem::replace(&mut owner.tx, mpsc::channel().0));
         while !owner.running.is_empty() || owner.phase_running() {
             match rx.recv() {
-                Ok(Msg::TaskDone(id, outcome, ended)) => {
-                    let _ = owner.task_done(run, &id, outcome, ended);
+                Ok(Msg::TaskDone(id, outcome, ended, live_usage)) => {
+                    let _ = owner.task_done(run, &id, outcome, ended, live_usage);
                 }
-                Ok(Msg::ParentDone(outcome, _)) => {
+                Ok(Msg::ParentDone(outcome, _, _)) => {
                     keep_survivor(run, &outcome);
                     owner.phase = Phase::Done;
                 }
@@ -480,9 +491,10 @@ impl<'a> Owner<'a> {
                     journal.recorded(pgid);
                 }
             }
+            let live_usage = usage_tracker.current();
             let _ = tx.send(match who {
-                Who::Parent => Msg::ParentDone(outcome, ended),
-                Who::Task(id) => Msg::TaskDone(id, outcome, ended),
+                Who::Parent => Msg::ParentDone(outcome, ended, live_usage),
+                Who::Task(id) => Msg::TaskDone(id, outcome, ended, live_usage),
             });
         });
     }
@@ -526,7 +538,7 @@ impl<'a> Owner<'a> {
                         let _ = tx.send(Msg::Spawned(Who::Parent, group));
                     },
                 );
-                let _ = tx.send(Msg::ParentDone(outcome, Utc::now()));
+                let _ = tx.send(Msg::ParentDone(outcome, Utc::now(), None));
             });
             self.turn = Some(prepared);
             return;
@@ -596,8 +608,8 @@ impl<'a> Owner<'a> {
                         emit(Event::State(Box::new(run.clone())));
                     }
                 }
-                Msg::TaskDone(id, outcome, ended) => {
-                    self.task_done(run, &id, outcome, ended)?;
+                Msg::TaskDone(id, outcome, ended, live_usage) => {
+                    self.task_done(run, &id, outcome, ended, live_usage)?;
                     if self.phase == Phase::Releasing {
                         self.finish_release(run, emit)?;
                         continue;
@@ -608,8 +620,8 @@ impl<'a> Owner<'a> {
                         self.maybe_wake(scope, run, emit)?;
                     }
                 }
-                Msg::ParentDone(outcome, ended) => {
-                    self.parent_done(scope, run, outcome, ended, emit)?;
+                Msg::ParentDone(outcome, ended, live_usage) => {
+                    self.parent_done(scope, run, outcome, ended, live_usage, emit)?;
                 }
                 Msg::BudgetStop(reason) => self.budget_stopped(run, reason, emit)?,
                 Msg::Tick => self.tick(scope, run, emit)?,
@@ -805,6 +817,7 @@ impl<'a> Owner<'a> {
         run: &mut Run,
         outcome: Result<process::Outcome>,
         ended: DateTime<Utc>,
+        live_usage: Option<handoff::Usage>,
         emit: &mut impl FnMut(Event),
     ) -> Result<()>
     where
@@ -828,10 +841,12 @@ impl<'a> Owner<'a> {
         if let Some(reason) = self.budget_stop.clone() {
             // Stopped on a cap, whether or not the parent needed a signal.
             keep_survivor(run, &outcome);
+            // Stopped before a final usage event: keep what the monitor read.
             let turn_usage = handoff::usage_file(
                 &prepared.directory.join("stdout.log"),
                 prepared.invocation.kind,
-            );
+            )
+            .or(live_usage);
             self.earlier_usage = add_usage(self.earlier_usage, turn_usage);
             let exit_code = outcome.as_ref().ok().and_then(|o| o.code);
             if turn_number > 1 {
@@ -1880,6 +1895,7 @@ impl<'a> Owner<'a> {
         id: &str,
         outcome: Result<process::Outcome>,
         ended: DateTime<Utc>,
+        live_usage: Option<handoff::Usage>,
     ) -> Result<()> {
         let Some(job) = self.running.remove(id) else {
             return Ok(());
@@ -1889,7 +1905,9 @@ impl<'a> Owner<'a> {
         }
         keep_survivor(run, &outcome);
         let stdout = job.prepared.directory.join("stdout.log");
-        let usage = handoff::usage_file(&stdout, job.prepared.invocation.kind);
+        // A task a budget stop ended before its final usage event keeps the
+        // usage its monitor read.
+        let usage = handoff::usage_file(&stdout, job.prepared.invocation.kind).or(live_usage);
         let session_reported = read_head(&stdout, 64 * 1024)
             .ok()
             .and_then(|head| handoff::session_id(&head));
