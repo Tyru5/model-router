@@ -1586,7 +1586,11 @@ file:/h/.gitconfig\0includeIf.gitdir:/w/.path\n~/more.cfg\0command line:\0core.x
             .unwrap()
             .unwrap();
         let metadata = d.workspace.join(".model-router");
-        assert_eq!(plan.protected, vec![metadata.clone()]);
+        // On macOS $TMPDIR is writable, so the test config directory under
+        // it is protected too.
+        let config = canonical(&crate::config::config_dir());
+        let protected: Vec<&PathBuf> = plan.protected.iter().filter(|p| **p != config).collect();
+        assert_eq!(protected, vec![&metadata]);
         let args = plan.bwrap_args();
         let at = |flag: &str, path: &Path| {
             let path = path.display().to_string();

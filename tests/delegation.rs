@@ -486,7 +486,13 @@ fn a_worktree_task_s_patch_reaches_the_checkout_only_through_task_apply() {
     assert!(added.is_file(), "the applied patch reached the checkout");
     let task = &case.run.stages[0].attempts[0].tasks[0];
     let worktree = task.worktree.clone().unwrap();
-    assert!(worktree.starts_with(case.dir.path().join(".model-router/delegates")));
+    // Canonical: macOS's temp directory is reached through /var -> /private/var.
+    let project = std::fs::canonicalize(case.dir.path()).unwrap();
+    assert!(
+        worktree.starts_with(project.join(".model-router/delegates")),
+        "{}",
+        worktree.display()
+    );
     let journal = task.patches[0].apply.as_ref().unwrap();
     assert!(journal.applied_at.is_some());
     // Reloads validate the worktree's layout and the patch's journal.
