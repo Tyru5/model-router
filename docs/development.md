@@ -65,10 +65,12 @@ cargo-dist builds Linux (x86_64/aarch64, static musl) and macOS
 `vX.Y.Z` tag is pushed. Release notes come from that version's section of
 [CHANGELOG.md](../CHANGELOG.md).
 
-The repository is private, so release assets on GitHub need a token.
-`.github/workflows/r2.yml` runs after each successful tag release (or by hand
-with a tag) and copies the `.tar.xz` archives and their `.sha256` files to a
-Cloudflare R2 bucket served on a public domain:
+Release assets on GitHub are public, and `model-router-installer.sh` on each
+release installs from them. `.github/workflows/r2.yml` also mirrors every
+release so the installer has a short URL that does not depend on GitHub. It
+runs after each successful tag release (or by hand with a tag) and copies the
+`.tar.xz` archives and their `.sha256` files to a Cloudflare R2 bucket served
+on a public domain:
 
 ```text
 install.sh                                    scripts/install.sh with the bucket URL filled in

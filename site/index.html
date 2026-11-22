@@ -209,7 +209,7 @@ pre.cli .k{color:var(--route)}
 
 footer{border-top:2px solid var(--rule);padding:36px 0 56px;font-size:15px;color:var(--muted)}
 footer .wrap{display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap}
-footer a{margin-left:22px}
+footer a+a{margin-left:22px}
 
 @media (max-width:1000px){
   .rack{grid-template-columns:1fr}
@@ -266,6 +266,7 @@ footer a{margin-left:22px}
         <li><a href="#delegate">Delegation</a></li>
         <li><a href="#safety">Safety</a></li>
         <li><a href="#cli">CLI</a></li>
+        <li><a href="https://github.com/Tyru5/model-router">GitHub</a></li>
       </ul>
     </nav>
 
@@ -277,7 +278,7 @@ footer a{margin-left:22px}
           <code id="cmd">curl -fsSL <span style="white-space:nowrap">https://model-router.tiru5.me/install.sh</span> | sh</code>
           <button type="button" data-copy="#cmd">Copy</button>
         </div>
-        <p class="alt">Then run <code>mr</code> in a repository. Linux and macOS.</p>
+        <p class="alt">Then run <code>mr</code> in a repository. Linux and macOS. Open source under MIT, <a href="https://github.com/Tyru5/model-router">code on GitHub</a>.</p>
         <a class="also" href="https://t3.codes"><span><small>Want something better?</small><b>T3 Code</b> is the industry-leading standard for agent orchestration.</span><em aria-hidden="true">→</em></a>
       </div>
     </div>
@@ -480,8 +481,9 @@ max_parallel = 3</pre>
           <li>omp</li><li>Your CLI <span>custom adapter</span></li>
         </ul>
       </div>
-      <pre class="cli"><span class="c"># try the whole flow offline, no model calls</span>
-cargo run -- --config examples/demo.toml
+      <pre class="cli"><span class="c"># build from source and try the whole flow offline, no model calls</span>
+git clone https://github.com/Tyru5/model-router
+cd model-router && cargo run -- --config examples/demo.toml
 
 <span class="c"># see exact commands, nothing launched</span>
 <span class="k">model-router</span> preview --task 'Respect Retry-After'
@@ -524,7 +526,8 @@ cargo run -- --config examples/demo.toml
 
 <footer>
   <div class="wrap">
-    <span>Model Router. Rust 1.85+, Linux and macOS.</span>
+    <span>Model Router. MIT licensed. Rust 1.85+, Linux and macOS.</span>
+    <span><a href="https://github.com/Tyru5/model-router">GitHub</a><a href="https://github.com/Tyru5/model-router/releases">Releases</a><a href="https://github.com/Tyru5/model-router/blob/main/CHANGELOG.md">Changelog</a><a href="https://github.com/Tyru5/model-router/issues">Issues</a></span>
   </div>
 </footer>
 

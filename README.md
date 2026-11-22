@@ -16,7 +16,8 @@ run so you can inspect, retry, or rerun it.
 ## Install
 
 Prebuilt binaries for Linux (x86_64/aarch64, static) and macOS (x86_64/arm64)
-are published to `https://model-router.tiru5.me`. The installer checks the
+are attached to each [GitHub release](https://github.com/Tyru5/model-router/releases)
+and mirrored to `https://model-router.tiru5.me`. The installer checks the
 SHA-256 and puts `model-router` and its `mr` alias in `~/.cargo/bin`
 (`--to DIR` changes that, `--version X.Y.Z` pins a release):
 
@@ -26,10 +27,17 @@ curl --proto '=https' --tlsv1.2 -LsSf https://model-router.tiru5.me/install.sh |
 
 With Homebrew, once the tap is published: `brew install Tyru5/tap/model-router`.
 
+The cargo-dist installer attached to each GitHub release also works:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Tyru5/model-router/releases/latest/download/model-router-installer.sh | sh
+```
+
 From source (Rust 1.85+):
 
 ```sh
-cargo install --path . --locked     # or: scripts/build.sh (also symlinks mr)
+cargo install --git https://github.com/Tyru5/model-router --locked
+# or, in a clone: cargo install --path . --locked, or scripts/build.sh (also symlinks mr)
 ```
 
 Install and log in to the harnesses you want separately; `model-router doctor`
@@ -174,3 +182,7 @@ project/global templates. Reference: [docs/configuration.md](docs/configuration.
 - [Development, tests, CI](docs/development.md)
 - [Related tools and ideas to borrow](docs/related.md)
 - [Build specification](docs/spec.md) · [Design decisions](docs/design-interview.md)
+
+## License
+
+MIT. See [LICENSE](LICENSE).

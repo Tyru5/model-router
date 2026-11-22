@@ -1,7 +1,7 @@
 # Mirror a finished release to the Cloudflare R2 bucket behind the public
-# downloads domain. The repository is private, so GitHub release assets need a
-# token; scripts/install.sh installs from the bucket instead. Skipped until the
-# R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY secrets are set (docs/development.md).
+# downloads domain, so scripts/install.sh has a short URL that does not depend
+# on GitHub. Skipped until the R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY
+# secrets are set (docs/development.md).
 # Bucket model-router-downloads, served at https://model-router.tiru5.me.
 #
 # Bucket layout:

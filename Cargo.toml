@@ -6,6 +6,7 @@ rust-version = "1.85"
 description = "A terminal workflow router for agentic harnesses and models"
 license = "MIT"
 repository = "https://github.com/Tyru5/model-router"
+homepage = "https://model-router.dev"
 readme = "README.md"
 keywords = ["cli", "tui", "ai", "agents", "workflow"]
 categories = ["command-line-utilities", "development-tools"]

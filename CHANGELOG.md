@@ -7,6 +7,14 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ## [Unreleased]
 
+### Changed
+
+- The repository is public under the MIT license. Release assets on GitHub no
+  longer need a token: `model-router-installer.sh` from a release and
+  `cargo install --git https://github.com/Tyru5/model-router --locked` both
+  work. The R2 mirror and `https://model-router.tiru5.me/install.sh` stay.
+  The landing page links the source, releases, changelog, and issues.
+
 ### Added
 
 - TUI tour: on the first launch, a panel above the status line walks from

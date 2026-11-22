@@ -1,8 +1,8 @@
 #!/bin/sh
 # Installs model-router and its `mr` alias on Linux or macOS from the release
-# download bucket (Cloudflare R2). The repository is private, so GitHub release
-# assets need a token; .github/workflows/r2.yml mirrors each release to the
-# bucket and uploads this script next to it.
+# download bucket (Cloudflare R2). .github/workflows/r2.yml mirrors each GitHub
+# release to the bucket and uploads this script next to it, so installs use a
+# short URL that does not depend on GitHub.
 #
 #   curl --proto '=https' --tlsv1.2 -LsSf https://DOWNLOADS/install.sh | sh
 #   curl ... | sh -s -- --version 0.2.0 --to ~/.local/bin
