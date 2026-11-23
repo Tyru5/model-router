@@ -82,7 +82,7 @@
     "mock": {
       "command": "python3",
       "args": [
-        "/home/tiru5/.t3/worktrees/model.routing.personal/t3-79aba92f/examples/mock_harness.py",
+        "{{PROJECT}}/examples/mock_harness.py",
         "--role",
         "{provider}",
         "--model",
