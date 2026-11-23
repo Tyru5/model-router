@@ -239,8 +239,9 @@ impl Registry {
         id: &str,
         prepare: impl FnOnce() -> Result<Run>,
     ) -> Result<Run> {
-        let handle = {
+        let (handle, created) = {
             let mut store = lock(&self.store);
+            let created = !store.runs.contains_key(id);
             let handle = store
                 .runs
                 .entry(id.to_owned())
@@ -256,13 +257,30 @@ impl Registry {
             state.active = true;
             state.version += 1;
             drop(state);
-            handle
+            (handle, created)
         };
         let guard = ReserveGuard {
             handle: handle.clone(),
             armed: true,
         };
-        let run = prepare()?;
+        let run = match prepare() {
+            Ok(run) => run,
+            Err(err) => {
+                // A handle this call made for a run that failed to load
+                // (wrong project, unknown ID) would otherwise stay forever
+                // and pin the run to the caller's project. It is removed while
+                // still reserved, so no other call can take it over first;
+                // dropping the guard then releases it for any waiter.
+                if created {
+                    let mut store = lock(&self.store);
+                    if store.runs.get(id).is_some_and(|h| Arc::ptr_eq(h, &handle)) {
+                        store.runs.remove(id);
+                    }
+                }
+                drop(guard);
+                return Err(err);
+            }
+        };
         let snapshot = run.clone();
         self.spawn_run(&handle, run, guard)?;
         Ok(snapshot)

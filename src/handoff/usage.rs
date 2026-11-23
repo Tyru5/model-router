@@ -44,6 +44,62 @@ impl std::ops::Add for Usage {
     }
 }
 
+/// The spend of a turn that resumed a harness session in which `earlier`
+/// was already spent, from the usage the turn reported. Some harnesses
+/// report the session's running total on a resumed turn, so adding that to
+/// `earlier` would count `earlier` twice:
+/// - Codex's `turn.completed` carries the thread's total, seeded from the
+///   session's rollout on `exec resume`.
+/// - Claude Code's `total_cost_usd` includes the resumed session's spend
+///   since 2.1.277, judged from `version`, the harness's `--version` line.
+///   An unknown version counts as current.
+///
+/// A running total is never below what the session's turns already counted,
+/// so a report below `earlier` in any field is the turn's own spend (a
+/// custom adapter's per-turn report, or a new session) and stays as is.
+pub fn follow_up_usage(
+    kind: OutputKind,
+    version: Option<&str>,
+    earlier: Option<Usage>,
+    reported: Option<Usage>,
+) -> Option<Usage> {
+    let (Some(earlier), Some(mut turn)) = (earlier, reported) else {
+        return reported;
+    };
+    let since = |now: Option<u64>, before: Option<u64>| match (now, before) {
+        (Some(now), Some(before)) => Some(now.saturating_sub(before)),
+        (now, _) => now,
+    };
+    let at_least = |now: Option<u64>, before: Option<u64>| {
+        now.zip(before).is_none_or(|(now, before)| now >= before)
+    };
+    match kind {
+        OutputKind::Codex
+            if at_least(turn.input_tokens, earlier.input_tokens)
+                && at_least(turn.output_tokens, earlier.output_tokens)
+                && at_least(turn.cache_read_tokens, earlier.cache_read_tokens)
+                && at_least(turn.cache_write_tokens, earlier.cache_write_tokens) =>
+        {
+            turn.input_tokens = since(turn.input_tokens, earlier.input_tokens);
+            turn.output_tokens = since(turn.output_tokens, earlier.output_tokens);
+            turn.cache_read_tokens = since(turn.cache_read_tokens, earlier.cache_read_tokens);
+            turn.cache_write_tokens = since(turn.cache_write_tokens, earlier.cache_write_tokens);
+        }
+        OutputKind::Claude => {
+            let totals = version
+                .and_then(crate::adapters::version_numbers)
+                .is_none_or(|v| v >= [2, 1, 277]);
+            if let (true, Some(now), Some(before)) = (totals, turn.cost_usd, earlier.cost_usd) {
+                if now >= before {
+                    turn.cost_usd = Some(now - before);
+                }
+            }
+        }
+        _ => {}
+    }
+    Some(turn)
+}
+
 /// Usage from unattended harness output; None when it reports none.
 pub fn usage(raw: &str, kind: OutputKind) -> Option<Usage> {
     if kind == OutputKind::Text {
@@ -781,6 +837,62 @@ fn meta_matches_id(event: &Value, id: &str) -> bool {
 #[cfg(test)]
 mod usage_tests {
     use super::*;
+
+    #[test]
+    fn follow_up_turns_count_only_their_own_spend() {
+        // Codex reports the session's total: 1,000 in / 100 out earlier, then
+        // 1,500 / 160 after the follow-up.
+        let earlier = tokens(1_000, 100, Some(400), None);
+        let total = tokens(1_500, 160, Some(900), None);
+        assert_eq!(
+            follow_up_usage(OutputKind::Codex, None, Some(earlier), Some(total)),
+            Some(tokens(500, 60, Some(500), None))
+        );
+        // Claude Code 2.1.277+ reports the session's cost; its tokens stay as
+        // reported. Earlier versions report each call's own cost, even one
+        // above the session's earlier spend.
+        let cost = |usd: f64| Usage {
+            cost_usd: Some(usd),
+            ..tokens(300, 20, None, None)
+        };
+        let claude = |version| {
+            follow_up_usage(
+                OutputKind::Claude,
+                version,
+                Some(cost(0.10)),
+                Some(cost(0.60)),
+            )
+            .and_then(|u| u.cost_usd)
+            .unwrap()
+        };
+        for current in [
+            Some("2.1.277 (Claude Code)"),
+            Some("2.1.318 (Claude Code)"),
+            None,
+        ] {
+            assert!((claude(current) - 0.5).abs() < 1e-9, "{current:?}");
+        }
+        assert!((claude(Some("2.1.276 (Claude Code)")) - 0.6).abs() < 1e-9);
+        // A report below what was counted is not a running total.
+        let lower = follow_up_usage(OutputKind::Claude, None, Some(cost(0.6)), Some(cost(0.1)));
+        assert_eq!(lower, Some(cost(0.1)));
+        let per_turn = tokens(600, 160, Some(900), None);
+        assert_eq!(
+            follow_up_usage(OutputKind::Codex, None, Some(earlier), Some(per_turn)),
+            Some(per_turn)
+        );
+        let turn = follow_up_usage(OutputKind::Claude, None, Some(cost(0.1)), Some(cost(0.6)));
+        assert_eq!(turn.unwrap().input_tokens, Some(300));
+        // Harnesses that report per turn, and first turns, are unchanged.
+        assert_eq!(
+            follow_up_usage(OutputKind::Pi, None, Some(earlier), Some(total)),
+            Some(total)
+        );
+        assert_eq!(
+            follow_up_usage(OutputKind::Codex, None, None, Some(total)),
+            Some(total)
+        );
+    }
 
     fn tokens(input: u64, output: u64, read: Option<u64>, write: Option<u64>) -> Usage {
         Usage {

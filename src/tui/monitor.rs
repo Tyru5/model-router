@@ -895,7 +895,7 @@ fn draw_feed(frame: &mut Frame<'_>, slot: &RunSlot, area: Rect, theme: Theme, pa
         drop(cache);
         let matches = search
             .filter(|s| !s.query.is_empty())
-            .map(|s| slot.cached_matches(&lines, width, &s.query));
+            .map(|s| slot.cached_matches(&lines, width, slot.log_version, &s.query));
         // Paused output keeps its top line as new output arrives.
         let top = lines.top(slot.log_view, visible);
         frame.render_widget(

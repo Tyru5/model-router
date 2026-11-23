@@ -411,6 +411,9 @@ pub(super) struct DiffView {
     pub(super) diff: Diff,
     /// The patch as Git produced it, for the pager.
     pub(super) patch: String,
+    /// The checkout of another run whose patch this is; None for the
+    /// focused run's changes.
+    pub(super) dir: Option<std::path::PathBuf>,
     pub(super) file: usize,
     /// First row of the file shown.
     pub(super) scroll: usize,
@@ -430,6 +433,7 @@ impl DiffView {
         Self {
             diff: Diff::parse(&patch),
             patch,
+            dir: None,
             file: 0,
             scroll: 0,
             wrap: false,

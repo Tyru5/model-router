@@ -31,12 +31,15 @@ pub(super) struct TaskItem {
 pub(super) enum DelegatedAction {
     Stay,
     Close,
+    /// `dir` is the checkout the handoff's and patch's paths name.
     Handoff {
         stage: String,
         handoff: Box<Handoff>,
+        dir: PathBuf,
     },
     Patch {
         patch: String,
+        dir: PathBuf,
     },
     CancelTask {
         run: String,
@@ -47,6 +50,8 @@ pub(super) enum DelegatedAction {
 pub(super) struct DelegatedTasksView {
     pub(super) run_id: String,
     run_dir: PathBuf,
+    /// The run's checkout, where an applied task's changes are.
+    workspace: PathBuf,
     pub(super) live: bool,
     pub(super) tasks: Vec<TaskItem>,
     pub(super) selected: usize,
@@ -65,6 +70,7 @@ impl DelegatedTasksView {
         Self {
             run_id: run.id.clone(),
             run_dir: run.directory.clone(),
+            workspace: super::completion::run_dir(run),
             live,
             tasks,
             selected: 0,
@@ -140,6 +146,7 @@ impl DelegatedTasksView {
                     Some(h) => DelegatedAction::Handoff {
                         stage: format!("{} · {}", item.stage_name, item.task.id),
                         handoff: Box::new(h.clone()),
+                        dir: files_dir(&item.task, &self.workspace),
                     },
                     None => {
                         self.error = format!("Task {} has no handoff yet.", item.task.id);
@@ -160,7 +167,10 @@ impl DelegatedTasksView {
                         self.error = format!("Task {}'s sealed patch is empty.", item.task.id);
                         DelegatedAction::Stay
                     }
-                    Ok(text) => DelegatedAction::Patch { patch: text },
+                    Ok(text) => DelegatedAction::Patch {
+                        patch: text,
+                        dir: files_dir(&item.task, &self.workspace),
+                    },
                     Err(err) => {
                         self.error = format!("Could not read sealed patch: {err:#}");
                         DelegatedAction::Stay
@@ -301,6 +311,15 @@ impl DelegatedTasksView {
             );
         }
     }
+}
+
+/// Where a task's changed files are: its worktree while it exists, else the
+/// run's checkout, which a shared task edits and an applied patch reaches.
+fn files_dir(task: &TaskState, workspace: &Path) -> PathBuf {
+    task.worktree
+        .clone()
+        .filter(|w| w.is_dir())
+        .unwrap_or_else(|| workspace.to_path_buf())
 }
 
 /// Tasks from the current stage's latest attempt, or across all stages if the

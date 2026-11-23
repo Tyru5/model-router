@@ -268,9 +268,12 @@ fn list(run: &Run, arguments: &Value) -> std::result::Result<Value, ToolError> {
         .unwrap_or(20)
         .clamp(1, 100) as usize;
     let entries = crate::history::list(&run.project).map_err(internal)?;
-    let runs: Vec<Value> = entries
+    let entries: Vec<_> = entries
         .iter()
         .filter(|e| status.is_none_or(|s| e.status_label() == s))
+        .collect();
+    let runs: Vec<Value> = entries
+        .iter()
         .skip(offset)
         .take(limit)
         .filter_map(|e| load(&run.project, e.id()).ok())
@@ -295,6 +298,9 @@ const READ_LIMIT: usize = 30_000;
 fn read(run: &Run, arguments: &Value) -> std::result::Result<Value, ToolError> {
     let id = arg_str(arguments, "run_id")?;
     let target = load(&run.project, id).map_err(|e| error("run_not_found", format!("{e:#}")))?;
+    if target.stages.is_empty() {
+        return Err(error("invalid_request", format!("Run {id} has no stages")));
+    }
     let stages: Vec<Value> = target
         .workflow
         .stages
@@ -352,18 +358,62 @@ fn read_log(
         Err(_) => return Ok((String::new(), None)),
     };
     let length = file.metadata().map(|m| m.len()).unwrap_or(0);
-    file.seek(SeekFrom::Start(cursor.min(length)))
+    let base = cursor.min(length);
+    // The up to 3 bytes before the cursor tell a cursor inside a character
+    // from stray continuation bytes, which show as U+FFFD.
+    let back = base.min(3);
+    let mut before = vec![0; back as usize];
+    file.seek(SeekFrom::Start(base - back))
+        .and_then(|_| file.read_exact(&mut before))
         .map_err(|e| internal(e.into()))?;
     let mut bytes = Vec::new();
     file.take((READ_LIMIT * 4) as u64)
         .read_to_end(&mut bytes)
         .map_err(|e| internal(e.into()))?;
-    // Skip continuation bytes a cursor inside a character points at.
-    let start = bytes.iter().take_while(|b| (**b & 0xC0) == 0x80).count();
-    let text = String::from_utf8_lossy(&bytes[start..]);
-    let text: String = text.chars().take(READ_LIMIT).collect();
-    let consumed = start as u64 + text.len() as u64;
-    let next = (cursor + consumed < length).then_some(cursor + consumed);
+    // Skip the rest of a character the cursor points inside.
+    let tail = bytes.iter().take_while(|b| (**b & 0xC0) == 0x80).count();
+    let window = [before.as_slice(), &bytes[..tail]].concat();
+    let (mut offset, mut start) = (0, 0);
+    for chunk in window.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            let end = offset + c.len_utf8();
+            if offset < before.len() && end > before.len() {
+                start = end - before.len();
+            }
+            offset = end;
+        }
+        offset += chunk.invalid().len();
+    }
+    // Count the bytes each character came from, not its decoded length: an
+    // invalid byte decodes to a 3-byte U+FFFD.
+    let mut text = String::new();
+    let mut consumed = start;
+    let mut chars = 0;
+    'chunks: for chunk in bytes[start..].utf8_chunks() {
+        for c in chunk.valid().chars() {
+            if chars == READ_LIMIT {
+                break 'chunks;
+            }
+            text.push(c);
+            consumed += c.len_utf8();
+            chars += 1;
+        }
+        let invalid = chunk.invalid();
+        if invalid.is_empty() {
+            continue;
+        }
+        // A character the read cut off (possible once a cursor inside a
+        // character spent bytes) is left for the next page.
+        let at_end = consumed + invalid.len() == bytes.len();
+        if chars == READ_LIMIT || (at_end && base + (bytes.len() as u64) < length) {
+            break;
+        }
+        text.push(char::REPLACEMENT_CHARACTER);
+        consumed += invalid.len();
+        chars += 1;
+    }
+    let consumed = consumed as u64;
+    let next = (base + consumed < length).then_some(base + consumed);
     Ok((storage::clean_terminal(&text), next))
 }
 
@@ -637,4 +687,59 @@ fn schedule_task(
     // Any edit needs approval again.
     schedules::revoke(&run.project, &schedule.id);
     Ok(schedule_view(&run.project, &schedule))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_log_pages_by_bytes_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempt = dir.path().join("stages/01/attempt-1");
+        std::fs::create_dir_all(&attempt).unwrap();
+        // An invalid byte, then more characters than one page holds, ending
+        // in a two-byte character on the second page.
+        let mut log = vec![0xFF];
+        log.extend(std::iter::repeat_n(b'x', READ_LIMIT + 5));
+        log.extend("é".as_bytes());
+        std::fs::write(attempt.join("stdout.log"), &log).unwrap();
+
+        let (mut text, mut next) = read_log(dir.path(), &attempt, 0).unwrap();
+        let mut pages = 1;
+        while let Some(cursor) = next {
+            let (more, after) = read_log(dir.path(), &attempt, cursor).unwrap();
+            text.push_str(&more);
+            next = after;
+            pages += 1;
+        }
+        assert_eq!(pages, 2);
+        assert_eq!(
+            text,
+            format!("\u{FFFD}{}é", "x".repeat(READ_LIMIT + 5)),
+            "every byte is read once"
+        );
+
+        // A stray continuation byte that starts a page shows as U+FFFD.
+        let mut log = "x".repeat(READ_LIMIT).into_bytes();
+        log.push(0x80);
+        log.push(b'A');
+        std::fs::write(attempt.join("stdout.log"), &log).unwrap();
+        let (mut text, next) = read_log(dir.path(), &attempt, 0).unwrap();
+        let (more, after) = read_log(dir.path(), &attempt, next.unwrap()).unwrap();
+        text.push_str(&more);
+        assert_eq!(after, None);
+        assert_eq!(text, format!("{}\u{FFFD}A", "x".repeat(READ_LIMIT)));
+
+        // From a cursor inside a 4-byte character, the first read ends one
+        // byte into a character, which the second page reads whole.
+        std::fs::write(attempt.join("stdout.log"), "𝄞".repeat(READ_LIMIT + 1)).unwrap();
+        let (mut text, mut next) = read_log(dir.path(), &attempt, 1).unwrap();
+        while let Some(cursor) = next {
+            let (more, after) = read_log(dir.path(), &attempt, cursor).unwrap();
+            text.push_str(&more);
+            next = after;
+        }
+        assert_eq!(text, "𝄞".repeat(READ_LIMIT));
+    }
 }

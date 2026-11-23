@@ -26,6 +26,8 @@ pub(super) struct HandoffView {
     pub(super) handoff: Handoff,
     /// The stage that wrote it.
     pub(super) stage: String,
+    /// The checkout its file paths name; None for the focused run's.
+    pub(super) dir: Option<std::path::PathBuf>,
     pub(super) selected: usize,
     pub(super) scroll: u16,
     /// How far the body can scroll, as last drawn.
@@ -48,6 +50,7 @@ impl HandoffView {
         Self {
             handoff,
             stage,
+            dir: None,
             selected: 0,
             scroll: 0,
             limit: Cell::new(u16::MAX),

@@ -175,6 +175,36 @@ open(sys.argv[1], "w").write(json.dumps({"schema_version": 2, "summary": "done",
     }
 }
 
+/// A Codex-JSONL task that asks a question, then answers it on a follow-up
+/// turn. Like Codex, it reports the session's running total: 600 tokens,
+/// then 1,100 after the follow-up, which spent 500.
+fn cumulative_asker() -> CustomAdapter {
+    let code = r#"import json, sys, time
+handoff, resumed = sys.argv[1], "--resume" in sys.argv
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1100 if resumed else 600, "output_tokens": 0}}), flush=True)
+if resumed:
+    time.sleep(2)
+    result = {"schema_version": 2, "summary": "answered", "verdict": "complete"}
+else:
+    result = {"schema_version": 2, "summary": "asks", "verdict": "blocked", "unresolved": ["Which name?"]}
+open(handoff, "w").write(json.dumps(result))
+"#;
+    let args = vec!["-c".into(), code.into(), "{handoff_file}".into()];
+    let mut follow = args.clone();
+    follow.extend(["--resume".into(), "{session}".into()]);
+    CustomAdapter {
+        command: "python3".into(),
+        args,
+        output: Some(CustomOutput::CodexJsonl),
+        session: Some(CustomSession {
+            assign: Some("--session-id".into()),
+            reported: false,
+        }),
+        follow_up_args: Some(follow),
+        ..CustomAdapter::default()
+    }
+}
+
 fn token_cap(tokens: u64) -> Budget {
     Budget {
         max_tokens: Some(tokens),
@@ -218,6 +248,7 @@ fn case(turns: Value, follow_up: bool, delegate: Delegate, tweak: impl FnOnce(&m
             ("writer".into(), task_adapter(Some("added.txt"))),
             ("streamer".into(), streamer()),
             ("claude_streamer".into(), claude_streamer()),
+            ("cumulative_asker".into(), cumulative_asker()),
         ]),
         delegates: BTreeMap::from([("helper".into(), delegate)]),
         ..Settings::default()
@@ -429,6 +460,43 @@ fn a_question_is_answered_with_task_send_and_the_answer_comes_back() {
         "one wake for the question, one for the answer"
     );
     assert_eq!(attempt.tasks[0].turns.len(), 2);
+}
+
+/// A follow-up turn that reports its session's running total counts only
+/// its own spend, live and once recorded: 600 + 500 tokens stay under a
+/// 1,200-token cap that 600 + 1,100 would cross.
+#[test]
+fn a_task_follow_up_counts_only_its_own_spend_against_the_cap() {
+    if !setup() {
+        return;
+    }
+    let turns = json!({
+        "turns": [
+            [{"call": "delegate_task", "args": {"task": "Write the function"}}],
+            [{"call": "task_send", "args": {"task_id": "t1", "message": "Name it add", "client_request_id": "a1"}}],
+            [{"call": "task_status", "args": {"task_id": "t1"}}]
+        ],
+        "handoffs": {"3": {"summary": "final", "verdict": "complete"}}
+    });
+    let asker = Delegate {
+        harness: "cumulative_asker".into(),
+        model: "m".into(),
+        ..Delegate::default()
+    };
+    let mut case = case(turns, true, asker, |stage| stage.budget = token_cap(1200));
+    assert_eq!(
+        drive(&mut case.run),
+        Action::Complete,
+        "{:?}",
+        case.run.error
+    );
+    let task = &case.run.stages[0].attempts[0].tasks[0];
+    let tokens: Vec<_> = task
+        .turns
+        .iter()
+        .map(|t| t.usage.and_then(|u| u.input_tokens))
+        .collect();
+    assert_eq!(tokens, [Some(600), Some(500)]);
 }
 
 #[test]

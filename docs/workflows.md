@@ -336,6 +336,10 @@ optionally opens a draft PR with `gh`.
   no trailers or attribution.
 - Any Git or `gh` failure blocks the stage with its exact error and what was
   already done.
+- Ship runs no Git hooks (`pre-commit`, `pre-push`, or any other): its Git
+  commands, and the ones `gh` starts, get `core.hooksPath=/dev/null` and
+  `core.fsmonitor=false`, because a stage may have written the hooks
+  directory. Run your hooks' checks as stage `checks` instead.
 - `ship` refuses files matching workflow `protected_paths` or violating any
   `block` diff policy (`[[workflows.policies]]`), runs `before_ship` lifecycle
   hooks if configured, and runs pre-ship

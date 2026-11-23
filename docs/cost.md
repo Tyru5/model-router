@@ -88,6 +88,12 @@ budget = { max_usd = 2.0, on_exceed = "warn" }
   after its last stage (or logs a warning and continues when
   `on_exceed = "warn"`). In a stage graph, stages already running side by side
   finish first.
+- A follow-up turn that resumes a harness session (handoff repair, a
+  delegation wake turn, a delegated task's follow-up) counts only its own
+  spend, live and once recorded. Codex reports the session's token totals,
+  and Claude Code 2.1.277+ its session cost (judged from the detected
+  `--version`; an unknown version counts as current), so the router
+  subtracts what the session already spent.
 - A fan-out stage's spend includes every candidate attempt, also those of a
   round that a repair rewind discarded (kept in `run.json` as the stage's
   `discarded` candidates).

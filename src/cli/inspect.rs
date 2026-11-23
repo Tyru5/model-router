@@ -384,7 +384,8 @@ pub fn cost_command(
     let since = since
         .map(cost::parse_since)
         .transpose()?
-        .map(|age| chrono::Utc::now() - age);
+        .map(cost::since_now)
+        .transpose()?;
     let summary = if all_projects {
         let projects = model_router::stats::projects(project, true);
         cost::aggregate_projects(&projects, since, true)

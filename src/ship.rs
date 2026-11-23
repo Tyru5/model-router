@@ -315,7 +315,23 @@ fn exec_with(
     envs: &[(&str, &Path)],
     stdin: Option<&[u8]>,
 ) -> Result<String> {
-    let mut command = Command::new(program);
+    // Git also gets the router's hook and fsmonitor overrides: a stage may
+    // have written the hooks directory `core.hooksPath` names.
+    let mut command = if program == "git" {
+        crate::snapshot::git_command()
+    } else {
+        Command::new(program)
+    };
+    // Git processes other programs start (gh runs `git status`) get them
+    // through the variable `-c` itself sets, which every Git version reads,
+    // after any the caller set.
+    const OVERRIDES: &str = "'core.hooksPath=/dev/null' 'core.fsmonitor=false'";
+    let mut parameters = std::env::var_os("GIT_CONFIG_PARAMETERS").unwrap_or_default();
+    if !parameters.is_empty() {
+        parameters.push(" ");
+    }
+    parameters.push(OVERRIDES);
+    command.env("GIT_CONFIG_PARAMETERS", parameters);
     command
         .args(args)
         .current_dir(dir)

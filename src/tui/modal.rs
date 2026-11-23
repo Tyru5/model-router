@@ -1242,11 +1242,20 @@ impl App {
                             Some(external::page_text(&super::diff_view::ansi(&view.patch))?)
                     }
                     DiffAction::Editor(path, line) => {
+                        let dir = match &view.dir {
+                            Some(dir) => dir.clone(),
+                            None => self.run_dir()?,
+                        };
                         // Git names files from the top of the repository.
-                        let root = super::completion::repo_root(&self.run_dir()?);
+                        let root = super::completion::repo_root(&dir);
                         self.ui.external = Some(external::edit(&root.join(path), line, &root)?);
                     }
                     DiffAction::Difftool => {
+                        // The difftool compares the focused run's commits.
+                        ensure!(
+                            view.dir.is_none(),
+                            "No difftool for a delegated task's patch"
+                        );
                         let run = self.session.run().context("No run")?;
                         let (from, to) = run
                             .change_range()
@@ -1260,7 +1269,10 @@ impl App {
                 HandoffAction::Stay => Stay,
                 HandoffAction::Close => Close,
                 HandoffAction::Edit(file) => {
-                    let dir = self.run_dir()?;
+                    let dir = match &view.dir {
+                        Some(dir) => dir.clone(),
+                        None => self.run_dir()?,
+                    };
                     self.ui.external = Some(external::edit(&dir.join(file), None, &dir)?);
                     Stay
                 }
@@ -1310,11 +1322,21 @@ impl App {
             Modal::DelegatedTasks(view) => match view.key(key) {
                 DelegatedAction::Stay => Stay,
                 DelegatedAction::Close => Close,
-                DelegatedAction::Handoff { stage, handoff } => {
-                    DialogResult::Push(Modal::Handoff(Box::new(HandoffView::new(*handoff, stage))))
+                // Paths in a task's handoff and patch name its own checkout,
+                // which is not the focused run's.
+                DelegatedAction::Handoff {
+                    stage,
+                    handoff,
+                    dir,
+                } => {
+                    let mut handoff = HandoffView::new(*handoff, stage);
+                    handoff.dir = Some(dir);
+                    DialogResult::Push(Modal::Handoff(Box::new(handoff)))
                 }
-                DelegatedAction::Patch { patch } => {
-                    DialogResult::Push(Modal::Diff(Box::new(DiffView::new(patch))))
+                DelegatedAction::Patch { patch, dir } => {
+                    let mut diff = DiffView::new(patch);
+                    diff.dir = Some(dir);
+                    DialogResult::Push(Modal::Diff(Box::new(diff)))
                 }
                 DelegatedAction::CancelTask { run, task } => {
                     DialogResult::Push(Modal::Ask(Box::new(Ask::CancelDelegatedTask { run, task })))

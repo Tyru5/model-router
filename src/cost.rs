@@ -1586,21 +1586,30 @@ pub fn aggregate_projects(
 
 /// "7d", "12h", "30m", or "2w".
 pub fn parse_since(text: &str) -> Result<Duration> {
+    const USAGE: &str = "Use a duration like 7d, 12h, 30m, or 2w";
     let text = text.trim();
-    let split = text.len().saturating_sub(1);
+    let split = text.char_indices().last().map_or(0, |(i, _)| i);
     let (number, unit) = text.split_at(split);
     let number: i64 = number
         .parse()
         .ok()
         .filter(|n| *n > 0)
-        .ok_or_else(|| anyhow::anyhow!("Use a duration like 7d, 12h, 30m, or 2w"))?;
-    Ok(match unit {
-        "m" => Duration::minutes(number),
-        "h" => Duration::hours(number),
-        "d" => Duration::days(number),
-        "w" => Duration::weeks(number),
-        _ => bail!("Use a duration like 7d, 12h, 30m, or 2w"),
-    })
+        .ok_or_else(|| anyhow::anyhow!(USAGE))?;
+    let duration = match unit {
+        "m" => Duration::try_minutes(number),
+        "h" => Duration::try_hours(number),
+        "d" => Duration::try_days(number),
+        "w" => Duration::try_weeks(number),
+        _ => bail!(USAGE),
+    };
+    duration.ok_or_else(|| anyhow::anyhow!("Duration {text} is too long"))
+}
+
+/// The time `age` before now, or an error when that predates chrono's range.
+pub fn since_now(age: Duration) -> Result<DateTime<Utc>> {
+    Utc::now()
+        .checked_sub_signed(age)
+        .context("That duration reaches too far back")
 }
 
 pub fn render_summary(summary: &Summary) -> String {
@@ -1886,7 +1895,17 @@ mod tests {
         assert_eq!(parse_since("12h").unwrap(), Duration::hours(12));
         assert_eq!(parse_since("2w").unwrap(), Duration::weeks(2));
         assert_eq!(parse_since("30m").unwrap(), Duration::minutes(30));
-        for bad in ["", "d", "0d", "-1d", "7y", "7"] {
+        for bad in [
+            "",
+            "d",
+            "0d",
+            "-1d",
+            "7y",
+            "7",
+            "7日",
+            "é",
+            "99999999999999999w",
+        ] {
             assert!(parse_since(bad).is_err(), "{bad}");
         }
     }

@@ -486,6 +486,27 @@ fn install_signal_handlers(cancel: &Arc<AtomicBool>) -> Result<()> {
     Ok(())
 }
 
+/// From here on Ctrl+C ends only child processes (Git, `gh`): the command
+/// itself finishes and reports what it already did.
+pub(crate) fn defer_interrupts() -> Result<()> {
+    install_signal_handlers(&Arc::new(AtomicBool::new(false)))
+}
+
+/// From here on the process and every child it starts ignore Ctrl+C, hangup,
+/// and SIGTERM, so a short operation that a killed child would misreport
+/// (`git apply` read as a conflict) runs to its end.
+pub(crate) fn ignore_interrupts() -> Result<()> {
+    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: SIG_IGN installs no handler code.
+        ensure!(
+            unsafe { libc::signal(sig, libc::SIG_IGN) } != libc::SIG_ERR,
+            "Ignore signal {sig}: {}",
+            io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
 fn main_result() -> Result<()> {
     let cli = Cli::parse();
     if let Some(path) = &cli.metrics_file {
@@ -509,7 +530,23 @@ fn main_result() -> Result<()> {
     // Tell the TUI when the project was found above the current directory.
     let detected_from = (cli.project.is_none() && project != cwd).then_some(cwd);
     let cancel = Arc::new(AtomicBool::new(false));
-    install_signal_handlers(&cancel)?;
+    // Only commands that watch `cancel` trade Ctrl+C's default exit for it.
+    if matches!(
+        cli.command,
+        None | Some(
+            Commands::Run { .. }
+                | Commands::Resume { .. }
+                | Commands::Rerun { .. }
+                | Commands::Fork { .. }
+                | Commands::Bench { .. }
+                | Commands::Serve(_)
+                | Commands::Schedules {
+                    action: Some(SchedulesAction::Tick)
+                }
+        )
+    ) {
+        install_signal_handlers(&cancel)?;
+    }
     match &cli.command {
         Some(Commands::Init {
             global,

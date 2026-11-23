@@ -345,6 +345,42 @@ fn mcp_runs_a_workflow_to_a_report() {
     assert!(status.success(), "{status}");
 }
 
+/// A failed `retry_stage` for another project's run, which this server has
+/// not seen yet, must not pin that run to the caller's project.
+#[test]
+fn mcp_failed_resume_leaves_other_projects_runs_readable() {
+    let owner = project();
+    let caller = project();
+    let id = {
+        let mut mcp = Mcp::spawn(owner.path(), &[]);
+        initialize(&mut mcp);
+        let started = mcp.call("start_run", json!({"workflow": "Quick", "task": "x"}));
+        let id = started["run_id"].as_str().unwrap().to_owned();
+        let done = mcp.call("wait_run", json!({"run_id": id, "timeout_seconds": 60}));
+        assert_eq!(done["status"], "complete", "{done}");
+        id
+    };
+    // The caller's server reads trust from its own config directory.
+    let trusted = Command::new(env!("CARGO_BIN_EXE_model-router"))
+        .arg("-C")
+        .arg(owner.path())
+        .args(["trust", "--yes"])
+        .env("MODEL_ROUTER_CONFIG_DIR", caller.path().join("config-home"))
+        .output()
+        .unwrap();
+    assert!(trusted.status.success(), "{trusted:?}");
+    let root = owner.path().parent().unwrap().to_str().unwrap();
+    let mut mcp = Mcp::spawn(caller.path(), &["--allow-root", root]);
+    initialize(&mut mcp);
+    let error = mcp.error("retry_stage", json!({"run_id": id}));
+    assert!(error.contains("No readable run"), "{error}");
+    let status = mcp.call(
+        "run_status",
+        json!({"run_id": id, "project": owner.path().to_str().unwrap()}),
+    );
+    assert_eq!(status["status"], "complete", "{status}");
+}
+
 #[test]
 fn mcp_reports_errors_and_cancels() {
     let dir = project();

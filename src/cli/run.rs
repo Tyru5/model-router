@@ -325,10 +325,7 @@ pub fn cli_drive(run: &mut Run, cancel: &AtomicBool, notify_flag: bool) -> Resul
                     run.id
                 );
                 print!("[a] Ship as previewed  [r] Plan again  [q] Save and stop: ");
-                io::stdout().flush()?;
-                let mut answer = String::new();
-                io::stdin().read_line(&mut answer)?;
-                match answer.trim() {
+                match prompt_answer(cancel)?.trim() {
                     "a" => run.command(Cmd::Confirm)?,
                     "r" => run.command(Cmd::Retry {
                         interactive: false,
@@ -375,10 +372,7 @@ pub fn cli_drive(run: &mut Run, cancel: &AtomicBool, notify_flag: bool) -> Resul
                         "[a] Advance  [r] Reopen stage  [q] Save and stop: "
                     }
                 );
-                io::stdout().flush()?;
-                let mut answer = String::new();
-                io::stdin().read_line(&mut answer)?;
-                match answer.trim() {
+                match prompt_answer(cancel)?.trim() {
                     "a" => run.command(Cmd::Confirm)?,
                     "r" => run.command(Cmd::Retry {
                         interactive: true,
@@ -399,6 +393,43 @@ pub fn cli_drive(run: &mut Run, cancel: &AtomicBool, notify_flag: bool) -> Resul
             engine::ensure_runnable(run)?;
         }
     }
+}
+
+/// Reads one answer to the prompt just printed. Ctrl+C while it waits counts
+/// as "save and stop" and is cleared, so the next stage does not start
+/// cancelled.
+fn prompt_answer(cancel: &AtomicBool) -> Result<String> {
+    io::stdout().flush()?;
+    // The signal handler only sets `cancel` and `read_line` retries after a
+    // signal, so wait for input here and check `cancel` while waiting.
+    loop {
+        if cancel.swap(false, Ordering::Relaxed) {
+            println!();
+            return Ok(String::new());
+        }
+        let mut stdin = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid `pollfd`, and the count says one.
+        let ready = unsafe { libc::poll(&mut stdin, 1, 100) };
+        if ready > 0 {
+            break;
+        }
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error.into());
+            }
+        }
+    }
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if cancel.swap(false, Ordering::Relaxed) {
+        answer.clear();
+    }
+    Ok(answer)
 }
 
 /// True when the harness was left running in the background (`d`).

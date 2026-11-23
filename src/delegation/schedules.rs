@@ -482,6 +482,10 @@ pub fn parse_trigger(
                 duration >= Duration::minutes(5),
                 "A schedule fires at most every 5 minutes"
             );
+            ensure!(
+                duration <= Duration::days(3650),
+                "A schedule fires at least every 10 years"
+            );
             Ok(Trigger::Every {
                 seconds: duration.num_seconds(),
                 text: every.trim().to_owned(),
@@ -779,13 +783,22 @@ pub fn check_launchable(
     Ok(workflow)
 }
 
-/// When the schedule is next due, if it is time-triggered.
+/// When the schedule is next due, if it is time-triggered. Occurrences
+/// missed while nothing fired (the server was down) collapse into the latest
+/// one at or before `now`, so a schedule catches up with one run, not one per
+/// missed occurrence.
 pub fn next_due(schedule: &Schedule, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let last = schedule.occurrences.last().map(|o| o.due);
     match &schedule.trigger {
         Trigger::Every { seconds, .. } => {
             let from = last.or(schedule.approved_at).unwrap_or(schedule.created_at);
-            Some(from + Duration::seconds(*seconds))
+            // A hand-edited schedules.json may hold any interval.
+            let due = from.checked_add_signed(Duration::try_seconds(*seconds)?)?;
+            if *seconds <= 0 || due >= now {
+                return Some(due);
+            }
+            let missed = (now - due).num_seconds() / seconds;
+            due.checked_add_signed(Duration::try_seconds(missed * seconds)?)
         }
         Trigger::At { time, tz } => {
             let time = NaiveTime::parse_from_str(time, "%H:%M").ok()?;
@@ -807,7 +820,22 @@ pub fn next_due(schedule: &Schedule, now: DateTime<Utc>) -> Option<DateTime<Utc>
             let (_, cron) = parse_cron(expr).ok()?;
             let (_, tz_spec) = parse_tz(tz.as_deref()).ok()?;
             let after = last.or(schedule.approved_at).unwrap_or(schedule.created_at);
-            cron.next_after(after, tz_spec)
+            let mut due = cron.next_after(after, tz_spec)?;
+            // Find the latest match at or before now from windows before now
+            // that double in size, so a long gap costs a few searches rather
+            // than one per missed match.
+            let mut window = Duration::hours(1);
+            while let Some(start) = now.checked_sub_signed(window).filter(|s| *s > due) {
+                if let Some(found) = cron.next_after(start, tz_spec).filter(|t| *t <= now) {
+                    due = found;
+                    break;
+                }
+                window = window * 2;
+            }
+            while let Some(later) = cron.next_after(due, tz_spec).filter(|t| *t <= now) {
+                due = later;
+            }
+            Some(due)
         }
         Trigger::Webhook => None,
     }
@@ -961,6 +989,16 @@ mod tests {
             parse_trigger(Some("1m"), None, None, false, None).is_err(),
             "more often than every 5 minutes"
         );
+        assert!(
+            parse_trigger(Some("100000000d"), None, None, false, None).is_err(),
+            "an interval past the date range"
+        );
+        // A hand-edited interval has no due time rather than a panic.
+        let huge = schedule(Trigger::Every {
+            seconds: 8_640_000_000_000,
+            text: "100000000d".into(),
+        });
+        assert_eq!(next_due(&huge, Utc::now()), None);
         assert_eq!(
             parse_trigger(None, Some("09:30"), None, false, None).unwrap(),
             Trigger::At {
@@ -1022,6 +1060,17 @@ mod tests {
             error: None,
         });
         assert_eq!(next_due(&s, start), Some(start + Duration::hours(12)));
+        // After 64 hours with nothing fired, one catch-up occurrence on the
+        // same 6-hour grid, then the next one is in the future.
+        let later = start + Duration::hours(70);
+        assert_eq!(next_due(&s, later), Some(start + Duration::hours(66)));
+        s.occurrences.push(Occurrence {
+            due: start + Duration::hours(66),
+            fired_at: later,
+            run: None,
+            error: None,
+        });
+        assert_eq!(next_due(&s, later), Some(start + Duration::hours(72)));
         assert_eq!(next_due(&schedule(Trigger::Webhook), start), None);
     }
 
@@ -1061,6 +1110,16 @@ mod tests {
         assert_eq!(
             next_due(&s, utc("2026-01-01T00:00:00Z")),
             Some(utc("2026-01-01T00:15:00Z"))
+        );
+        // Missed matches collapse into the latest one at or before now, also
+        // years later.
+        assert_eq!(
+            next_due(&s, utc("2026-01-03T10:07:00Z")),
+            Some(utc("2026-01-03T10:00:00Z"))
+        );
+        assert_eq!(
+            next_due(&s, utc("2031-06-30T23:59:59Z")),
+            Some(utc("2031-06-30T23:45:00Z"))
         );
 
         // Weekdays at 09:30 in -07:00 (= 16:30 UTC). 2026-01-02 is Friday; next weekday is Mon 2026-01-05.

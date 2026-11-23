@@ -290,20 +290,23 @@ impl RunSlot {
         Some((wrapped.clone(), self.log_visible.get().max(1)))
     }
 
+    /// Matches of `query` in `wrapped`, which was built from log `version`;
+    /// the slot's log may be newer than the lines last drawn.
     pub(super) fn cached_matches(
         &self,
         wrapped: &Wrapped,
         width: usize,
+        version: u64,
         query: &str,
     ) -> super::run_slot::SearchMatches {
         let mut cache = self.cache.borrow_mut();
         if let Some(((cw, cv, cq), matches)) = &cache.search {
-            if *cw == width && *cv == self.log_version && cq == query {
+            if *cw == width && *cv == version && cq == query {
                 return matches.clone();
             }
         }
         let matches = std::rc::Rc::new(wrapped.matches(query));
-        cache.search = Some(((width, self.log_version, query.to_owned()), matches.clone()));
+        cache.search = Some(((width, version, query.to_owned()), matches.clone()));
         matches
     }
 
@@ -404,13 +407,18 @@ impl RunSlot {
     /// above the bottom of the panel, and pauses the output there. Returns
     /// the status line when nothing matches.
     fn jump_to_match(&mut self, forward: Option<bool>) -> Option<String> {
-        let (width, wrapped, visible) = {
+        let (width, version, wrapped, visible) = {
             let cache = self.cache.borrow();
-            let ((width, _, _), wrapped) = cache.output.as_ref()?;
-            (*width, wrapped.clone(), self.log_visible.get().max(1))
+            let ((width, version, _), wrapped) = cache.output.as_ref()?;
+            (
+                *width,
+                *version,
+                wrapped.clone(),
+                self.log_visible.get().max(1),
+            )
         };
         let query = self.log_search.as_ref()?.query.clone();
-        let matches = self.cached_matches(&wrapped, width, &query);
+        let matches = self.cached_matches(&wrapped, width, version, &query);
         let search = self.log_search.as_mut()?;
         if matches.is_empty() {
             return Some(format!("No output matches “{}”.", search.query));

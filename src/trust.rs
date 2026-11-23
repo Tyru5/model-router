@@ -277,11 +277,12 @@ fn sandbox_loosening(workflow: &Workflow, stage: &Stage, at: &str) -> Vec<String
 }
 
 /// Whether the stage's own mode is looser than its workflow's default.
-/// `Sandbox` orders off < workspace-write < read-only.
+/// `Sandbox` orders off < workspace-write < read-only; both sides are
+/// resolved for the stage's role, so `by-role` compares as what it means.
 fn downgrades_sandbox(workflow_default: Sandbox, stage: &Stage) -> bool {
     stage
         .sandbox
-        .is_some_and(|mode| mode < workflow_default.resolve(stage.role))
+        .is_some_and(|mode| mode.resolve(stage.role) < workflow_default.resolve(stage.role))
 }
 
 /// A ship stage that commits (and maybe pushes) without showing its plan.
@@ -990,6 +991,21 @@ mod tests {
         let mut lowered = Settings::default();
         lowered.workflows[0].stages[0].sandbox = Some(Sandbox::WorkspaceWrite);
         assert!(dangerous(&lowered).is_empty());
+        // by-role on an implementation stage means workspace-write.
+        let mut by_role = Settings::default();
+        let workflow = &mut by_role.workflows[0];
+        workflow.sandbox_default = Sandbox::ReadOnly;
+        let implement = workflow
+            .stages
+            .iter_mut()
+            .find(|s| s.role == config::Role::Implementation)
+            .unwrap();
+        implement.sandbox = Some(Sandbox::ByRole);
+        let text = dangerous(&by_role).join("\n");
+        assert!(
+            text.contains("sandbox = workspace-write in Feature development / implement"),
+            "{text}"
+        );
 
         ignore(&mut settings);
         let stage = &settings.workflows[0].stages[0];

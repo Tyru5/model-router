@@ -942,7 +942,8 @@ fn get_cost(server: &Server, a: CostArgs) -> Result<Value> {
         .filter(|s| !s.trim().is_empty())
         .map(crate::cost::parse_since)
         .transpose()?
-        .map(|age| Utc::now() - age);
+        .map(crate::cost::since_now)
+        .transpose()?;
     let runs = engine::history(&project)?;
     let summary = crate::cost::aggregate(&runs, since, &crate::cost::Pricing::load(&project));
     let mut value = serde_json::to_value(&summary)?;

@@ -374,6 +374,8 @@ fn respond(stream: &mut TcpStream, code: u16, body: &Value) -> io::Result<()> {
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
+        500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "Error",
     };
@@ -509,7 +511,15 @@ fn connection(
                 &json!({"error": format!("Schedule {id} is not an approved, enabled webhook schedule")}),
             ),
             Ok(runs) => respond(&mut stream, 200, &json!({"result": {"runs": runs}})),
-            Err(error) => respond(&mut stream, 400, &json!({"error": format!("{error:#}")})),
+            Err(error) => respond(
+                &mut stream,
+                if error.is::<super::LaunchFailed>() {
+                    500
+                } else {
+                    400
+                },
+                &json!({"error": format!("{error:#}")}),
+            ),
         },
         (
             _,

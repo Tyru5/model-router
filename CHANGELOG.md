@@ -150,6 +150,13 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   stage refuses to start while its Git config or hooks entry is a symbolic
   link it could replace, and the router's own Git commands disable fsmonitor
   and hooks.
+- Ship's Git commands pass `-c core.fsmonitor=false -c
+  core.hooksPath=/dev/null` like the router's other Git commands, and `gh`
+  gets the same through `GIT_CONFIG_PARAMETERS`, so the Git commands it runs
+  do too. A stage could write the hooks directory a repo's
+  `core.hooksPath` names (husky's `.husky/_`, say), and ship then ran those
+  hooks outside the sandbox while planning. Your own hooks, `pre-push`
+  included, no longer run on ship.
 
 ### Fixed
 
@@ -162,6 +169,38 @@ Release notes for a `vX.Y.Z` tag come from its section below.
   a fan-out stage also dropped the round's candidates from `run.json`, and
   their spend with them; they are now kept as the stage's `discarded`
   candidates and count in budgets, `report`, and `cost`.
+- Follow-up turns that resume a harness session (handoff repair, delegation
+  wake turns, delegated task follow-ups) count only their own spend, in the
+  live budget monitor and in recorded usage. Codex reports the session's
+  token totals and Claude Code 2.1.277+ (by detected version) its session
+  cost, which the router added to what the session had already spent.
+- `cost --since`, the MCP `get_cost` tool, and schedule `--every` refuse
+  non-ASCII and out-of-range durations (`7日`, `99999999999999999w`,
+  `100000000d`) instead of panicking. `--every` takes at most 10 years, and a
+  hand-edited interval past the date range has no due time.
+- Ctrl+C ends commands that do not watch for cancellation (`trust`, `apply`,
+  `ship`, `doctor`, and others) instead of being ignored. Once `ship` is
+  confirmed, Ctrl+C ends only its Git or `gh` command, and it reports what
+  was already done; a confirmed `apply` finishes and ignores Ctrl+C. Ctrl+C at a `run` or `resume` prompt saves
+  and stops at once instead of cancelling the next stage.
+- `every` and `cron` schedules fire once after downtime, at the latest
+  missed occurrence, instead of once per missed occurrence. A cron schedule
+  finds it by searching back from now in widening windows.
+- `serve`: a `confirm_stage` or `retry_stage` that fails to load a run no
+  longer leaves the run tied to the caller's project, which made later calls
+  for it fail with "belongs to project". A webhook trigger whose run fails to
+  start answers `500` with that error instead of a 409.
+- A stage `sandbox = "by-role"` looser than the workflow's `sandbox_default`
+  needs `model-router trust`, like any other sandbox downgrade.
+- Delegation run tools: `run_list` with `status` reports `has_more` for the
+  filtered list, `run_read` pages a log with invalid UTF-8 without skipping
+  bytes, and a run record with no stages is an error instead of a panic.
+- TUI: a delegated task's handoff and patch open files in the task's
+  worktree (or its run's checkout), not the focused run's. While a folder
+  loads, the folder picker ignores moves and Enter, and `←` goes up from the
+  folder being loaded. Output search no longer caches matches from stale
+  lines, which could misplace highlights or panic.
+- `schedules tick` counts a failed occurrence once.
 
 ## [0.2.1] - 2026-11-21
 

@@ -111,9 +111,13 @@ impl Fixture {
 }
 
 const FAKE_GH: &str = r#"#!/usr/bin/env python3
-import json, os, shutil, sys
+import json, os, shutil, subprocess, sys
 args = sys.argv[1:]
 log = os.environ["FAKE_GH_LOG"]
+# The hooks directory a git that gh starts would use.
+seen = subprocess.run(["git", "config", "--get", "core.hooksPath"], capture_output=True, text=True)
+with open(log + ".hookspath", "w") as f:
+    f.write(seen.stdout.strip())
 with open(log, "a") as f:
     f.write(json.dumps(args) + "\n")
 if os.environ.get("FAKE_GH_FAIL"):
@@ -783,5 +787,67 @@ fn preview_names_the_ship_stage_without_a_harness_command() {
             "3. Ship | ship | router, no harness\n   branch mr/{run_id}-{slug} · confirm"
         ),
         "{stdout}"
+    );
+}
+
+/// Hooks in a directory `core.hooksPath` names inside the workspace (husky's
+/// `.husky/_`) are files a stage can write; ship's Git commands, and the
+/// ones `gh` starts, must not run them outside the sandbox.
+#[test]
+fn ship_runs_no_git_hooks_from_the_workspace() {
+    let options = ship::Options {
+        push: true,
+        draft_pr: true,
+        ..ship::Options::default()
+    };
+    let Some(fx) = fixture(two_writers(), Some(options)) else {
+        return;
+    };
+    let dir = fx.dir();
+    let hooks = dir.join(".husky/_");
+    fs::create_dir_all(&hooks).unwrap();
+    let marker = fx.home.path().join("hooks-ran");
+    for hook in [
+        "post-index-change",
+        "reference-transaction",
+        "pre-commit",
+        "commit-msg",
+        "post-commit",
+        "post-checkout",
+        "pre-push",
+    ] {
+        executable(
+            &hooks.join(hook),
+            &format!("#!/bin/sh\necho {hook} >> '{}'\n", marker.display()),
+        );
+    }
+    git(dir, &["add", ".husky"]);
+    git(dir, &["commit", "-qm", "Add hooks"]);
+    git(dir, &["config", "core.hooksPath", ".husky/_"]);
+
+    let output = fx.cli(&["run", "--task", "Add the new greeting file"]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let id = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("Run: "))
+        .unwrap_or_else(|| panic!("{stdout}"))
+        .to_owned();
+    let output = fx.cli(&["resume", &id, "--advance"]);
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(committed_files(dir, "HEAD"), ["other.txt", "src/new.txt"]);
+    assert!(!fx.gh_calls().is_empty());
+    assert_eq!(
+        fs::read_to_string(fx.home.path().join("gh.jsonl.hookspath")).unwrap(),
+        "/dev/null"
+    );
+    assert!(
+        !marker.exists(),
+        "hooks ran: {}",
+        fs::read_to_string(&marker).unwrap_or_default()
     );
 }

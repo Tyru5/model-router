@@ -47,6 +47,17 @@ pub const TOKEN_ENV: &str = "MODEL_ROUTER_SERVE_TOKEN";
 /// How long shutdown waits for cancelled runs to stop their harnesses.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 
+/// A claimed webhook occurrence whose run did not start: the server's
+/// failure, not the caller's.
+#[derive(Debug)]
+pub(crate) struct LaunchFailed(String);
+impl std::fmt::Display for LaunchFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for LaunchFailed {}
+
 pub struct Server {
     project: PathBuf,
     config: Option<PathBuf>,
@@ -118,21 +129,31 @@ impl Server {
         let fired =
             crate::delegation::schedules::fire_due(&self.project, chrono::Utc::now(), only)?;
         let mut started = vec![];
+        let mut failure = None;
         for item in fired {
-            match item.run {
+            let error = match item.run {
                 Some(run) => {
                     let id = run.id.clone();
                     match self.runs.drive(&self.project, run) {
-                        Ok(()) => started.push(id),
-                        Err(error) => log(format!("schedule {}: {error:#}", item.schedule)),
+                        Ok(()) => {
+                            started.push(id);
+                            continue;
+                        }
+                        Err(error) => format!("schedule {}: {error:#}", item.schedule),
                     }
                 }
-                None => log(format!(
+                None => format!(
                     "schedule {}: launch failed: {}",
                     item.schedule,
                     item.error.unwrap_or_default()
-                )),
-            }
+                ),
+            };
+            log(error.clone());
+            failure = Some(error);
+        }
+        // A webhook caller learns why its claimed occurrence did not start.
+        if let (Some(_), Some(error), true) = (only, failure, started.is_empty()) {
+            return Err(LaunchFailed(error).into());
         }
         Ok(started)
     }

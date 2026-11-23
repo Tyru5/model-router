@@ -387,6 +387,11 @@ impl<'a> Owner<'a> {
             .last_mut()
             .expect("a delegating stage has an attempt")
     }
+    /// The parent harness's `--version` line, which decides how it reports
+    /// a resumed session's usage.
+    fn harness_version(&self, prepared: &Prepared) -> Option<String> {
+        adapters::detected_version(&self.stage.harness, &prepared.invocation.program)
+    }
     fn task<'r>(&self, run: &'r Run, id: &str) -> Option<&'r TaskState> {
         self.attempt(run).tasks.iter().find(|t| t.id == id)
     }
@@ -414,7 +419,9 @@ impl<'a> Owner<'a> {
     }
 
     /// Starts a process on a worker thread; its group, output, and end come
-    /// back as messages.
+    /// back as messages. `earlier` is what the session it resumes already
+    /// spent: the live monitor and the live usage it reports count only this
+    /// turn's own spend.
     #[allow(clippy::too_many_arguments)]
     fn spawn_process<'s, 'e>(
         &self,
@@ -428,6 +435,8 @@ impl<'a> Owner<'a> {
         stall: Option<Duration>,
         abort: Arc<AtomicBool>,
         monitor: Option<crate::cost::LiveBudgetMonitor>,
+        earlier: Option<handoff::Usage>,
+        version: Option<String>,
     ) where
         'a: 's,
     {
@@ -435,6 +444,9 @@ impl<'a> Owner<'a> {
         let journal = self.journal;
         let cancel = self.cancel;
         scope.spawn(move || {
+            let own = |usage| {
+                handoff::follow_up_usage(invocation.kind, version.as_deref(), earlier, usage)
+            };
             let mut formatter = events::Formatter::new(invocation.kind);
             let mut usage_tracker = handoff::UsageTracker::new(invocation.kind);
             let mut budget_stopped = false;
@@ -460,8 +472,7 @@ impl<'a> Owner<'a> {
                             Some(format!("[stderr] {}", storage::clean_terminal(text)))
                         } else {
                             if let (Some(monitor), false) = (&monitor, budget_stopped) {
-                                let reason = usage_tracker
-                                    .push(text)
+                                let reason = own(usage_tracker.push(text))
                                     .and_then(|usage| monitor.check(usage));
                                 if let Some(reason) = reason {
                                     budget_stopped = true;
@@ -491,7 +502,7 @@ impl<'a> Owner<'a> {
                     journal.recorded(pgid);
                 }
             }
-            let live_usage = usage_tracker.current();
+            let live_usage = own(usage_tracker.current());
             let _ = tx.send(match who {
                 Who::Parent => Msg::ParentDone(outcome, ended, live_usage),
                 Who::Task(id) => Msg::TaskDone(id, outcome, ended, live_usage),
@@ -554,6 +565,8 @@ impl<'a> Owner<'a> {
             stall,
             self.parent_abort.clone(),
             self.live_spend.monitor(run, self.index, PARENT_SPEND),
+            self.earlier_usage,
+            self.harness_version(&prepared),
         );
         self.turn = Some(prepared);
     }
@@ -842,9 +855,15 @@ impl<'a> Owner<'a> {
             // Stopped on a cap, whether or not the parent needed a signal.
             keep_survivor(run, &outcome);
             // Stopped before a final usage event: keep what the monitor read.
-            let turn_usage = handoff::usage_file(
-                &prepared.directory.join("stdout.log"),
+            // The live usage already counts only this turn.
+            let turn_usage = handoff::follow_up_usage(
                 prepared.invocation.kind,
+                self.harness_version(&prepared).as_deref(),
+                self.earlier_usage,
+                handoff::usage_file(
+                    &prepared.directory.join("stdout.log"),
+                    prepared.invocation.kind,
+                ),
             )
             .or(live_usage);
             self.earlier_usage = add_usage(self.earlier_usage, turn_usage);
@@ -892,9 +911,15 @@ impl<'a> Owner<'a> {
             .filter(|t| t.announced && t.undelivered())
             .map(|t| t.id.clone())
             .collect();
-        let turn_usage = handoff::usage_file(
-            &prepared.directory.join("stdout.log"),
+        // A wake turn resumes the parent's session: count only its own spend.
+        let turn_usage = handoff::follow_up_usage(
             prepared.invocation.kind,
+            self.harness_version(&prepared).as_deref(),
+            self.earlier_usage,
+            handoff::usage_file(
+                &prepared.directory.join("stdout.log"),
+                prepared.invocation.kind,
+            ),
         );
         self.earlier_usage = add_usage(self.earlier_usage, turn_usage);
         // Budget admission (tasks, wakes) reads the attempt's usage; the
@@ -983,7 +1008,13 @@ impl<'a> Owner<'a> {
         // `classify_exit` counted only this turn; earlier turns count too.
         if self.earlier_usage.is_some() {
             if let Some(attempt) = run.stages[self.index].attempts.last_mut() {
-                attempt.usage = add_usage(self.earlier_usage, attempt.usage);
+                let turn = handoff::follow_up_usage(
+                    prepared.invocation.kind,
+                    self.harness_version(prepared).as_deref(),
+                    self.earlier_usage,
+                    attempt.usage,
+                );
+                attempt.usage = add_usage(self.earlier_usage, turn);
             }
             run.persist()?;
         }
@@ -1836,6 +1867,9 @@ impl<'a> Owner<'a> {
             abort.clone(),
             self.live_spend
                 .task_monitor(run, self.index, &task, &stage.model, &task_spend(id)),
+            // `task` was copied before this turn was added.
+            turns_usage(&task.turns),
+            harness_version,
         );
         self.running.insert(
             id.to_owned(),
@@ -1907,7 +1941,21 @@ impl<'a> Owner<'a> {
         let stdout = job.prepared.directory.join("stdout.log");
         // A task a budget stop ended before its final usage event keeps the
         // usage its monitor read.
-        let usage = handoff::usage_file(&stdout, job.prepared.invocation.kind).or(live_usage);
+        // A follow-up turn resumed the task's session, which its earlier
+        // turns' spend adds up to. The live usage already counts only this
+        // turn.
+        let earlier = self
+            .task(run, id)
+            .and_then(|t| turns_usage(&t.turns[..t.turns.len().saturating_sub(1)]));
+        let version =
+            adapters::detected_version(&job.stage.harness, &job.prepared.invocation.program);
+        let usage = handoff::follow_up_usage(
+            job.prepared.invocation.kind,
+            version.as_deref(),
+            earlier,
+            handoff::usage_file(&stdout, job.prepared.invocation.kind),
+        )
+        .or(live_usage);
         let session_reported = read_head(&stdout, 64 * 1024)
             .ok()
             .and_then(|head| handoff::session_id(&head));
@@ -2286,6 +2334,13 @@ impl<'a> Owner<'a> {
             "next": unfinished.then(|| instructions::next_hint(self.kind)),
         })
     }
+}
+
+/// The spend of a task's turns.
+fn turns_usage(turns: &[TaskTurn]) -> Option<handoff::Usage> {
+    turns
+        .iter()
+        .fold(None, |sum, turn| add_usage(sum, turn.usage))
 }
 
 fn add_usage(a: Option<handoff::Usage>, b: Option<handoff::Usage>) -> Option<handoff::Usage> {

@@ -355,7 +355,20 @@ impl PathPicker {
                 return Ok(PickerAction::Stay);
             }
         }
-        match menu_key(key) {
+        let key_code = menu_key(key);
+        // While a folder is read, the list still shows the previous folder:
+        // moving in it or choosing from it would act on what was left. ←
+        // still goes up from the folder being read.
+        if self.reading.is_some()
+            && !self.show_recent
+            && matches!(
+                key_code,
+                Key::Up | Key::Down | Key::PageUp | Key::PageDown | Key::Right | Key::Enter
+            )
+        {
+            return Ok(PickerAction::Stay);
+        }
+        match key_code {
             Key::Esc => return Ok(PickerAction::Close),
             Key::Tab | Key::BackTab => {
                 if !self.files {
@@ -373,7 +386,11 @@ impl PathPicker {
                 self.selected = (self.selected + 10).min(self.matches().len().saturating_sub(1))
             }
             Key::Left => {
-                let previous = self.directory.clone();
+                let previous = self
+                    .reading
+                    .as_ref()
+                    .map_or(&self.directory, |r| &r.directory)
+                    .clone();
                 let parent = previous.parent().unwrap_or(&previous);
                 self.visit_selecting(parent, Some(previous.clone()))?;
             }
@@ -724,6 +741,34 @@ mod tests {
         assert!(
             matches!(key(&mut picker, Key::Enter).unwrap(), PickerAction::Select(path) if path == linked)
         );
+    }
+
+    #[test]
+    fn keys_before_a_folder_arrives_do_not_act_on_the_previous_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let project = root.join("current");
+        fs::create_dir(&project).unwrap();
+        // The browser opens on the project's parent with the project selected.
+        let mut picker = browse(&project, vec![]);
+        assert_eq!(picker.directory, root);
+        // ← ← Enter in one input batch, before the parent's entries arrive:
+        // two steps up, and nothing chosen from the folder just left.
+        let press = |picker: &mut PathPicker, code| picker.key(KeyEvent::new(code, Mods::NONE));
+        assert!(matches!(
+            press(&mut picker, Key::Left),
+            Ok(PickerAction::Stay)
+        ));
+        assert!(matches!(
+            press(&mut picker, Key::Left),
+            Ok(PickerAction::Stay)
+        ));
+        assert!(matches!(
+            press(&mut picker, Key::Enter),
+            Ok(PickerAction::Stay)
+        ));
+        wait(&mut picker);
+        assert_eq!(picker.directory, root.parent().unwrap().parent().unwrap());
     }
 
     #[test]

@@ -445,9 +445,12 @@ Enabled by `delegation.schedules = true`.
   `(schedule id, due time)` under `.model-router/schedules.lock` and records
   it in `schedules.json` before launching, so `serve` and `tick` never both
   fire one occurrence. A launch that fails after the claim records the
-  occurrence as failed with the reason; it is not retried.
+  occurrence as failed with the reason; it is not retried. `every` and `cron`
+  occurrences missed while nothing fired collapse into one, at the latest
+  due time at or before now. `every` takes 5 minutes to 10 years.
 - Webhooks: `serve --http` adds `POST /schedules/<id>/trigger`, behind the
-  server's bearer token like every route. No signature secrets.
+  server's bearer token like every route. No signature secrets. A claimed
+  occurrence whose run fails to start answers `500` with the launch error.
 - Budget: a scheduled run has only its workflow's caps.
 
 ## Lifecycle

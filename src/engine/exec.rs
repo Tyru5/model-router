@@ -521,8 +521,14 @@ Do not edit any project files or run destructive commands. Emit ONLY a valid han
         }
     };
     let repair_stdout = repair_dir.join("stdout.log");
-    if let Some(extra_usage) = handoff::usage_file(&repair_stdout, invocation.kind) {
-        if let Some(attempt) = run.stages[index].attempts.last_mut() {
+    if let Some(attempt) = run.stages[index].attempts.last_mut() {
+        // The nudge resumed the attempt's session, so it may report the
+        // session's total.
+        let reported = handoff::usage_file(&repair_stdout, invocation.kind);
+        let version = adapters::detected_version(&stage.harness, &invocation.program);
+        if let Some(extra_usage) =
+            handoff::follow_up_usage(invocation.kind, version.as_deref(), attempt.usage, reported)
+        {
             attempt.usage = Some(match attempt.usage {
                 Some(existing) => existing + extra_usage,
                 None => extra_usage,

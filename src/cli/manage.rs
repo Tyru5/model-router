@@ -270,6 +270,8 @@ pub fn apply(project: &Path, id: &str, check: bool, yes: bool) -> Result<()> {
             return Ok(());
         }
     }
+    // A killed `git apply` would read as a conflict; applying is short.
+    crate::ignore_interrupts()?;
     let (_, outcome) = engine::apply_worktree(&run, false)?;
     match outcome {
         fanout::Applied::Clean => println!(
@@ -327,6 +329,7 @@ pub fn ship(project: &Path, id: &str, push: bool, draft_pr: bool, yes: bool) -> 
             return Ok(());
         }
     }
+    crate::defer_interrupts()?;
     let ship_stage = run
         .workflow
         .stages
@@ -538,19 +541,25 @@ pub fn schedules(
                 };
                 // `tick` is its own run host: it drives each run to an end.
                 let action = model_router::engine::drive(&mut run, cancel, |_| {});
-                match action {
-                    Ok(action) => println!("{}: run {} {:?}", item.schedule, run.id, action),
-                    Err(error) => {
-                        failed += 1;
-                        eprintln!("{}: run {}: {error:#}", item.schedule, run.id);
+                let errored = match action {
+                    Ok(action) => {
+                        println!("{}: run {} {:?}", item.schedule, run.id, action);
+                        false
                     }
-                }
-                if matches!(
-                    run.status,
-                    model_router::engine::Status::Failed
-                        | model_router::engine::Status::Blocked
-                        | model_router::engine::Status::Cancelled
-                ) {
+                    Err(error) => {
+                        eprintln!("{}: run {}: {error:#}", item.schedule, run.id);
+                        true
+                    }
+                };
+                // One occurrence counts once, however it failed.
+                if errored
+                    || matches!(
+                        run.status,
+                        model_router::engine::Status::Failed
+                            | model_router::engine::Status::Blocked
+                            | model_router::engine::Status::Cancelled
+                    )
+                {
                     failed += 1;
                 }
             }
