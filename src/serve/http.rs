@@ -1,6 +1,7 @@
 //! A small JSON HTTP API over std::net: one thread per connection,
-//! `Connection: close`, bearer-token auth on every route.
+//! `Connection: close`, bearer-token auth on every route except `GET /health`.
 //!
+//! - `GET /health` returns liveness and version JSON without authentication.
 //! - `GET /tools` lists the tools.
 //! - `POST /tools/<name>` with a JSON arguments object runs one.
 //! - `GET /runs/<id>/events[?project=DIR]` streams a run's events (SSE).
@@ -333,8 +334,9 @@ fn read_request(
     if length > MAX_BODY_BYTES {
         return Err(invalid("Body too large"));
     }
-    // Never wait for an unauthenticated client's declared body.
-    if !authorized(&request, token) {
+    // Never wait for an unauthenticated client's declared body, and
+    // `GET /health` takes no body and answers without auth.
+    if is_health(&request) || !authorized(&request, token) {
         return Ok(request);
     }
     if !admit() {
@@ -346,6 +348,10 @@ fn read_request(
     request.body.resize(length, 0);
     reader.read_exact(&mut request.body)?;
     Ok(request)
+}
+
+fn is_health(request: &Request) -> bool {
+    request.method == "GET" && request.path.trim_matches('/') == "health"
 }
 
 /// Compares without leaking the position of the first difference.
@@ -422,6 +428,13 @@ fn connection(
         }
         Err(error) => return respond(&mut stream, 400, &json!({"error": error.to_string()})),
     };
+    if is_health(&request) {
+        return respond(
+            &mut stream,
+            200,
+            &json!({"status": "ok", "version": env!("CARGO_PKG_VERSION")}),
+        );
+    }
     if !authorized(&request, token) {
         return respond(
             &mut stream,
@@ -498,9 +511,14 @@ fn connection(
             Ok(runs) => respond(&mut stream, 200, &json!({"result": {"runs": runs}})),
             Err(error) => respond(&mut stream, 400, &json!({"error": format!("{error:#}")})),
         },
-        (_, ["tools"] | ["tools", _] | ["runs", _, "events"] | ["schedules", _, "trigger"]) => {
-            respond(&mut stream, 405, &json!({"error": "Method not allowed"}))
-        }
+        (
+            _,
+            ["health"]
+            | ["tools"]
+            | ["tools", _]
+            | ["runs", _, "events"]
+            | ["schedules", _, "trigger"],
+        ) => respond(&mut stream, 405, &json!({"error": "Method not allowed"})),
         _ => respond(&mut stream, 404, &json!({"error": "Not found"})),
     }
 }
@@ -684,6 +702,43 @@ mod tests {
         let error = read_request(&stream, "token", Duration::from_secs(2), || true)
             .err()
             .expect("oversized request line must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn health_skips_auth_and_body_wait_but_keeps_header_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // Unauthenticated GET /health with a declared body that never arrives
+        // finishes immediately without invoking `admit`.
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nContent-Length: 100\r\n\r\n")
+            .unwrap();
+        let mut admitted = false;
+        let request = read_request(&stream, "token", Duration::from_secs(2), || {
+            admitted = true;
+            true
+        })
+        .unwrap();
+        assert!(is_health(&request));
+        assert!(!admitted);
+        assert!(request.body.is_empty());
+
+        // Oversized headers on /health are still rejected.
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let writer = std::thread::spawn(move || {
+            let req = format!(
+                "GET /health HTTP/1.1\r\nX-Pad: {}\r\n\r\n",
+                "a".repeat(MAX_HEADER_BYTES + 128)
+            );
+            let _ = client.write_all(req.as_bytes());
+        });
+        let error = read_request(&stream, "token", Duration::from_secs(2), || true)
+            .err()
+            .expect("oversized health headers must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         writer.join().unwrap();
     }

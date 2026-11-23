@@ -1147,7 +1147,7 @@ fn effort_levels_come_from_the_harness_catalog_in_both_editors() {
     let text = screen(&terminal);
     assert!(text.contains("custom  not listed"), "{text}");
     assert!(
-        text.contains("Levels from fixture help for gpt-6-astra"),
+        text.contains("Levels from fixture help for any model"),
         "{text}"
     );
     app.key(key(Key::Right)).unwrap(); // custom → wraps to Harness default
@@ -2687,18 +2687,68 @@ fn raise_budget_is_offered_only_on_a_usd_cap_and_checks_the_amount() {
     settle_driver(&mut app);
     assert!(!crate::cost::budget_blocked(&app.slot().run));
 
-    // A token cap is raised from the CLI; the key is not offered for it.
+    // Token caps can also be raised directly in the TUI.
     let mut app = budget_blocked_app(project.path());
+    let id = app.slot().run.id.clone();
     let run = &mut app.slot_mut().run;
     run.workflow.budget.max_usd = None;
     run.workflow.budget.max_tokens = Some(10);
     run.error = crate::cost::check_budget(run);
+    run.persist().unwrap();
     assert!(crate::cost::budget_blocked(run) && !crate::cost::usd_budget_blocked(run));
     let screen = rows(&mut app, 120, 36).join("\n");
-    assert!(!screen.contains("[B]"), "{screen}");
-    let error = app.perform(ActionId::RaiseBudget).unwrap_err();
-    assert!(format!("{error}").contains("--budget-tokens"), "{error}");
-    // Nor is it for a run that stopped otherwise.
+    let footer = screen.lines().last().unwrap();
+    assert!(footer.contains("[B] raise budget"), "{footer}");
+    assert!(screen.contains("[B] raise budget   [d] diff"), "{screen}");
+    let type_tokens = |app: &mut App, amount: &str| {
+        app.key(shift('B')).unwrap();
+        let title = dialog(app).unwrap();
+        assert!(title.contains("New token budget"), "{title}");
+        for c in amount.chars() {
+            app.key(key(Key::Char(c))).unwrap();
+        }
+        app.key(ctrl('s'))
+    };
+    for bad in ["abc", "5", "100", "-5"] {
+        let error = type_tokens(&mut app, bad).unwrap_err();
+        assert!(format!("{error}").contains("Enter "), "{bad}: {error}");
+        app.key(key(Key::Esc)).unwrap();
+    }
+    type_tokens(&mut app, "50k").unwrap();
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Ask(ask)) if matches!(**ask, Ask::RaiseBudgetTokens { tokens: 50_000, cap: 10, .. })
+    ));
+    app.key(key(Key::Esc)).unwrap();
+    assert_eq!(
+        crate::engine::load(&app.project, &id)
+            .unwrap()
+            .workflow
+            .budget
+            .max_tokens,
+        Some(10)
+    );
+    type_tokens(&mut app, "100000").unwrap();
+    app.key(key(Key::Char('y'))).unwrap();
+    assert!(app.ui.dialog().is_none(), "{}", app.ui.message);
+    assert!(
+        app.ui.message.contains("Token budget raised"),
+        "{}",
+        app.ui.message
+    );
+    assert_eq!(
+        crate::engine::load(&app.project, &id)
+            .unwrap()
+            .workflow
+            .budget
+            .max_tokens,
+        Some(100_000)
+    );
+    settle_driver(&mut app);
+    assert!(!crate::cost::budget_blocked(&app.slot().run));
+
+    // A run that stopped for a non-budget reason still refuses RaiseBudget.
+    let mut app = budget_blocked_app(project.path());
     app.slot_mut().run.error = Some("Harness exited".into());
     let error = app.perform(ActionId::RaiseBudget).unwrap_err();
     assert!(format!("{error}").contains("budget"), "{error}");
@@ -3176,6 +3226,9 @@ fn harness_report(harness: &str, installed: bool) -> crate::doctor::Report {
         tested_versions: vec![],
         version_tested: None,
         version_captured: false,
+        version_pin: None,
+        version_pin_ok: None,
+        auth_hint: None,
         capabilities: None,
         summary: "ok".into(),
         notes: vec![],
@@ -3383,4 +3436,788 @@ fn the_tour_names_the_followed_run_and_how_it_recovers() {
     );
     app.slot_mut().run.error = Some("Harness exited 1".into());
     assert_eq!(app.tour_step(), Step::Watch(Watch::Stopped));
+}
+
+fn git_cmd(dir: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn init_git_repo(dir: &std::path::Path) {
+    git_cmd(dir, &["init", "-q"]);
+    git_cmd(dir, &["config", "user.name", "Test"]);
+    git_cmd(dir, &["config", "user.email", "test@example.invalid"]);
+    git_cmd(dir, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(dir.join(".gitignore"), ".model-router/\n").unwrap();
+    std::fs::write(dir.join("hello.txt"), "initial\n").unwrap();
+    git_cmd(dir, &["add", "."]);
+    git_cmd(dir, &["commit", "-q", "-m", "initial"]);
+}
+
+#[test]
+fn workflow_settings_editor_validates_and_marks_dirty() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    app.ui.page = Page::Workflow;
+    assert!(!app.editor.dirty);
+
+    // Accessible via `W` and via `Space w W`.
+    app.key(key(Key::Char(' '))).unwrap();
+    app.key(key(Key::Char('w'))).unwrap();
+    app.key(shift('W')).unwrap();
+    assert!(matches!(app.ui.dialog(), Some(Modal::Workflow(_))));
+    let screen = rows(&mut app, 80, 24).join("\n");
+    assert!(screen.contains("Workflow settings"), "{screen}");
+    // Unchanged Esc closes without DiscardDraft.
+    app.key(key(Key::Esc)).unwrap();
+    assert!(app.ui.dialog().is_none());
+
+    app.key(shift('W')).unwrap();
+    if let Some(Modal::Workflow(editor)) = app.ui.dialog_mut() {
+        // Reject invalid max_parallel = 0.
+        editor.fields[1] = textarea("0");
+    }
+    app.key(ctrl('s')).unwrap();
+    // Stays open with inline validation error and settings unchanged.
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Workflow(editor)) if !editor.error.is_empty()
+    ));
+    assert!(!app.editor.dirty);
+
+    // Edit all workflow-level fields cleanly.
+    if let Some(Modal::Workflow(editor)) = app.ui.dialog_mut() {
+        editor.fields[0] = textarea("4");
+        editor.fields[1] = textarea("6");
+        editor.fields[2] = textarea("by-role");
+        editor.fields[3] = textarea("on");
+        editor.fields[4] = textarea("$12.50");
+        editor.fields[5] = textarea("250k");
+        editor.fields[6] = textarea("warn");
+        editor.fields[7] = textarea(".github/workflows/*\n**/Cargo.lock");
+    }
+    // Esc on dirty editor prompts DiscardDraft.
+    app.key(key(Key::Esc)).unwrap();
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Ask(ask)) if matches!(**ask, Ask::DiscardDraft)
+    ));
+    app.key(key(Key::Esc)).unwrap();
+    assert!(matches!(app.ui.dialog(), Some(Modal::Workflow(_))));
+
+    // Ctrl+S validates, applies, and marks dirty.
+    app.key(ctrl('s')).unwrap();
+    assert!(app.ui.dialog().is_none());
+    assert!(app.editor.dirty);
+    let wf = &app.editor.settings.workflows[app.editor.workflow];
+    assert_eq!(wf.max_repair_passes, 4);
+    assert_eq!(wf.max_parallel, 6);
+    assert_eq!(wf.sandbox_default, crate::config::Sandbox::ByRole);
+    assert!(wf.handoff_repair);
+    assert_eq!(wf.budget.max_usd, Some(12.5));
+    assert_eq!(wf.budget.max_tokens, Some(250_000));
+    assert_eq!(wf.budget.on_exceed, crate::config::BudgetAction::Warn);
+    assert_eq!(
+        wf.protected_paths,
+        vec![".github/workflows/*".to_owned(), "**/Cargo.lock".to_owned()]
+    );
+}
+
+#[test]
+fn stage_editor_edits_all_new_fields_and_scrolls_on_narrow_terminal() {
+    use crate::config::{Billing, Budget, BudgetAction, Sandbox, SandboxFallback};
+    use crate::delegation::Delegation;
+    let stage = Stage {
+        role: Role::Test,
+        harness: "codex".into(),
+        billing: Some(Billing::Api),
+        budget: Budget {
+            max_usd: Some(3.25),
+            max_tokens: Some(80_000),
+            on_exceed: BudgetAction::Warn,
+        },
+        require_router_checks: true,
+        sandbox: Some(Sandbox::ReadOnly),
+        sandbox_writable: vec!["~/cache".into(), "/tmp/build".into()],
+        sandbox_network: false,
+        sandbox_fallback: SandboxFallback::Warn,
+        delegation: Some(Delegation {
+            harnesses: vec!["claude".into()],
+            models: vec!["sonnet*".into()],
+            runs: true,
+            schedules: true,
+            ..Delegation::default()
+        }),
+        ..Stage::default()
+    };
+    let mut editor = StageEditor::new(stage.clone(), vec!["codex".into(), "claude".into()]);
+    assert!(!editor.changed());
+    let roundtrip = editor.finish().unwrap();
+    assert_eq!(roundtrip.billing, Some(Billing::Api));
+    assert_eq!(roundtrip.budget.max_usd, Some(3.25));
+    assert_eq!(roundtrip.budget.max_tokens, Some(80_000));
+    assert_eq!(roundtrip.budget.on_exceed, BudgetAction::Warn);
+    assert!(roundtrip.require_router_checks);
+    assert_eq!(roundtrip.sandbox_writable, vec!["~/cache", "/tmp/build"]);
+    assert!(!roundtrip.sandbox_network);
+    assert_eq!(roundtrip.sandbox_fallback, SandboxFallback::Warn);
+    let del = roundtrip.delegation.unwrap();
+    assert_eq!(del.harnesses, vec!["claude"]);
+    assert_eq!(del.models, vec!["sonnet*"]);
+    assert!(del.runs && del.schedules);
+
+    // Narrow 65x20 terminal renders cleanly while stepping through every field.
+    let palette = super::theme::Theme::default().palette();
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(65, 20)).unwrap();
+    for _ in 0..editor.fields.len() {
+        terminal
+            .draw(|frame| editor.draw(frame, frame.area(), palette))
+            .unwrap();
+        editor.key(key(Key::Tab));
+    }
+
+    // Invalid delegation TOML fails cleanly.
+    editor.fields[22] = textarea("unknown_delegation_key = true");
+    let err = editor.finish().unwrap_err();
+    assert!(format!("{err:#}").contains("Delegation:"), "{err:#}");
+}
+
+#[test]
+fn handoffs_budget_view_and_transitions_timeline_open_from_runs() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    let mut run = sample_run("inspect-run");
+    run.project = project.path().into();
+    run.workspace = project.path().into();
+    run.directory = crate::storage::run_dir(project.path(), &run.id).unwrap();
+    std::fs::create_dir_all(&run.directory).unwrap();
+    // Put a huge summary on stage 0 so stage 1's handoff inspection reports truncation.
+    run.stages[0].status = Status::Complete;
+    run.stages[0].handoff = Some(crate::handoff::Handoff::unstructured("x".repeat(7000)));
+    run.cursor = 1;
+    run.persist().unwrap();
+    crate::transitions::append(
+        &run.directory,
+        &[crate::transitions::Record {
+            at: chrono::Utc::now(),
+            run_revision: 1,
+            level: crate::transitions::Level::Run,
+            stage_index: None,
+            attempt: None,
+            candidate: None,
+            from: Status::Pending,
+            to: Status::Running,
+            reason: "started stage one".into(),
+            actor: crate::transitions::Actor::Engine,
+        }],
+    )
+    .unwrap();
+    app.session.adopt(run);
+    app.ui.page = Page::Runs;
+
+    // Handoffs budget/loss view via `H`.
+    app.key(shift('H')).unwrap();
+    match app.ui.dialog() {
+        Some(Modal::Text { title, body, .. }) => {
+            assert!(title.contains("Handoffs budget & loss"), "{title}");
+            assert!(body.contains("warning") || body.contains("cut"), "{body}");
+        }
+        _ => panic!("Expected Handoffs Text modal"),
+    }
+    app.key(key(Key::Esc)).unwrap();
+
+    // Transitions timeline view via `l`.
+    app.key(key(Key::Char('l'))).unwrap();
+    match app.ui.dialog() {
+        Some(Modal::Text { title, body, .. }) => {
+            assert!(title.contains("Transitions"), "{title}");
+            assert!(body.contains("started stage one"), "{body}");
+            assert!(body.contains("pending → running"), "{body}");
+        }
+        _ => panic!("Expected Transitions Text modal"),
+    }
+}
+
+#[test]
+fn fork_run_from_stage_checkpoint_launches_worktree_fork_into_session() {
+    use super::modal::InputTarget;
+    use crate::config::{CustomAdapter, Mode};
+    let project = tempfile::tempdir().unwrap();
+    init_git_repo(project.path());
+    // Runs record the canonical project path (macOS temp dirs are symlinked).
+    let mut app = theme_app(&std::fs::canonicalize(project.path()).unwrap());
+    let mut settings = Settings::default();
+    settings.adapters.insert(
+        "fake".into(),
+        CustomAdapter {
+            command: "true".into(),
+            ..CustomAdapter::default()
+        },
+    );
+    let mut wf = settings.workflows[0].clone();
+    wf.stages = vec![
+        Stage {
+            id: "s1".into(),
+            name: "First".into(),
+            role: Role::Research,
+            harness: "fake".into(),
+            mode: Mode::Unattended,
+            ..Stage::default()
+        },
+        Stage {
+            id: "s2".into(),
+            name: "Second".into(),
+            role: Role::Implementation,
+            harness: "fake".into(),
+            model: "orig-model".into(),
+            mode: Mode::Unattended,
+            ..Stage::default()
+        },
+    ];
+    settings.workflows = vec![wf.clone()];
+    app.editor.settings = settings.clone();
+
+    let mut run =
+        crate::engine::Run::create(project.path(), &settings, &wf, "Task".into(), false).unwrap();
+    let tree = crate::snapshot::tree(project.path(), &run.directory).unwrap();
+    let now = chrono::Utc::now();
+    run.stages[0].status = Status::Complete;
+    run.stages[0].handoff = Some(crate::handoff::Handoff::unstructured("stage 1 done".into()));
+    run.stages[0].attempts.push(crate::engine::Attempt {
+        number: 1,
+        started_at: now - chrono::Duration::seconds(10),
+        finished_at: Some(now - chrono::Duration::seconds(5)),
+        mode: Mode::Unattended,
+        model: String::new(),
+        status: Status::Complete,
+        exit_code: Some(0),
+        directory: run.directory.join("01-s1/attempt-001"),
+        handoff_file: run.directory.join("01-s1/attempt-001/handoff.json"),
+        error: None,
+        checks: vec![],
+        checks_tree: None,
+        usage: None,
+        session: None,
+        process_group: None,
+        process_identity: Default::default(),
+        terminal: None,
+        handoff_source: None,
+        worktree: None,
+        tree_before: Some(tree.clone()),
+        tree_after: Some(tree.clone()),
+        turns: vec![],
+        tasks: vec![],
+        launched_runs: vec![],
+    });
+    run.stages[1].status = Status::Complete;
+    run.stages[1].attempts.push(crate::engine::Attempt {
+        number: 1,
+        started_at: now,
+        finished_at: Some(now + chrono::Duration::seconds(5)),
+        mode: Mode::Unattended,
+        model: "orig-model".into(),
+        status: Status::Complete,
+        exit_code: Some(0),
+        directory: run.directory.join("02-s2/attempt-001"),
+        handoff_file: run.directory.join("02-s2/attempt-001/handoff.json"),
+        error: None,
+        checks: vec![],
+        checks_tree: None,
+        usage: None,
+        session: None,
+        process_group: None,
+        process_identity: Default::default(),
+        terminal: None,
+        handoff_source: None,
+        worktree: None,
+        tree_before: Some(tree),
+        tree_after: None,
+        turns: vec![],
+        tasks: vec![],
+        launched_runs: vec![],
+    });
+    run.status = Status::Complete;
+    run.cursor = 2;
+    run.persist().unwrap();
+    let source_id = run.id.clone();
+
+    app.session.adopt(run);
+    app.ui.page = Page::Runs;
+
+    // `K` opens stage checkpoint picker.
+    app.key(shift('K')).unwrap();
+    assert!(matches!(app.ui.dialog(), Some(Modal::Picker { .. })));
+    // Move to second stage (`s2`) and pick it.
+    app.key(key(Key::Down)).unwrap();
+    app.key(key(Key::Enter)).unwrap();
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Input {
+            target: InputTarget::ForkModel,
+            ..
+        })
+    ));
+    for c in "fork-model".chars() {
+        app.key(key(Key::Char(c))).unwrap();
+    }
+    app.key(ctrl('s')).unwrap();
+    assert!(app.starting);
+
+    // Wait for background fork creation to finish and join session runs.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.starting && std::time::Instant::now() < deadline {
+        app.poll().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!app.starting, "{}", app.ui.message);
+    assert_eq!(app.session.runs.len(), 2, "{}", app.ui.message);
+    let forked = app.session.run().unwrap();
+    assert!(forked.worktree);
+    let fork_meta = forked.fork_of.as_ref().expect("fork_of recorded");
+    assert_eq!(fork_meta.run, source_id);
+    assert_eq!(fork_meta.stage, "s2");
+    assert_eq!(forked.workflow.stages[1].model, "fork-model");
+    settle_driver(&mut app);
+}
+
+#[test]
+fn ad_hoc_ship_shows_preview_and_never_commits_without_confirmation() {
+    use crate::config::{CustomAdapter, Mode};
+    let project = tempfile::tempdir().unwrap();
+    init_git_repo(project.path());
+    // Runs record the canonical project path (macOS temp dirs are symlinked).
+    let mut app = theme_app(&std::fs::canonicalize(project.path()).unwrap());
+    let mut settings = Settings::default();
+    settings.adapters.insert(
+        "fake".into(),
+        CustomAdapter {
+            command: "true".into(),
+            ..CustomAdapter::default()
+        },
+    );
+    let mut wf = settings.workflows[0].clone();
+    wf.stages = vec![Stage {
+        id: "implement".into(),
+        name: "Implement".into(),
+        role: Role::Implementation,
+        harness: "fake".into(),
+        mode: Mode::Unattended,
+        ..Stage::default()
+    }];
+    settings.workflows = vec![wf.clone()];
+    let mut run =
+        crate::engine::Run::create(project.path(), &settings, &wf, "Add greeting".into(), false)
+            .unwrap();
+    // Simulate a completed run that modified a tracked file.
+    let before = crate::snapshot::tree(project.path(), &run.directory).unwrap();
+    std::fs::write(project.path().join("hello.txt"), "updated\n").unwrap();
+    let after = crate::snapshot::tree(project.path(), &run.directory).unwrap();
+    run.stages[0].status = Status::Complete;
+    run.stages[0].handoff = Some(crate::handoff::Handoff::unstructured(
+        "Updated greeting".into(),
+    ));
+    run.stages[0].attempts.push(crate::engine::Attempt {
+        number: 1,
+        started_at: chrono::Utc::now(),
+        finished_at: Some(chrono::Utc::now()),
+        mode: Mode::Unattended,
+        model: String::new(),
+        status: Status::Complete,
+        exit_code: Some(0),
+        directory: run.directory.join("01-implement/attempt-001"),
+        handoff_file: run.directory.join("01-implement/attempt-001/handoff.json"),
+        error: None,
+        checks: vec![],
+        checks_tree: None,
+        usage: None,
+        session: None,
+        process_group: None,
+        process_identity: Default::default(),
+        terminal: None,
+        handoff_source: None,
+        worktree: None,
+        tree_before: Some(before),
+        tree_after: Some(after),
+        turns: vec![],
+        tasks: vec![],
+        launched_runs: vec![],
+    });
+    run.status = Status::Complete;
+    run.cursor = run.stages.len();
+    run.persist().unwrap();
+
+    app.session.adopt(run);
+    app.ui.page = Page::Runs;
+
+    let commits_before = git_cmd(project.path(), &["rev-list", "--count", "HEAD"]);
+    let branch_before = git_cmd(project.path(), &["branch", "--show-current"]);
+
+    // `S` plans ship in background and opens ShipConfirm preview.
+    app.key(shift('S')).unwrap();
+    assert!(matches!(app.ui.dialog(), Some(Modal::Loading(_))));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while matches!(app.ui.dialog(), Some(Modal::Loading(_))) && std::time::Instant::now() < deadline
+    {
+        app.poll().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        matches!(app.ui.dialog(), Some(Modal::ShipConfirm(_))),
+        "{}",
+        app.ui.message
+    );
+    let screen = rows(&mut app, 100, 32).join("\n");
+    assert!(screen.contains("Ship preview"), "{screen}");
+    assert!(screen.contains("hello.txt"), "{screen}");
+    assert!(screen.contains("ship as previewed"), "{screen}");
+
+    // Declining with `n` NEVER commits.
+    app.key(key(Key::Char('n'))).unwrap();
+    assert!(app.ui.dialog().is_none());
+    assert_eq!(
+        git_cmd(project.path(), &["rev-list", "--count", "HEAD"]),
+        commits_before
+    );
+    assert_eq!(
+        git_cmd(project.path(), &["branch", "--show-current"]),
+        branch_before
+    );
+
+    // Re-open preview and explicitly confirm with `y` -> commits on a new branch.
+    app.key(shift('S')).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while matches!(app.ui.dialog(), Some(Modal::Loading(_))) && std::time::Instant::now() < deadline
+    {
+        app.poll().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(matches!(app.ui.dialog(), Some(Modal::ShipConfirm(_))));
+    app.key(key(Key::Char('y'))).unwrap();
+    assert!(matches!(app.ui.dialog(), Some(Modal::Loading(_))));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while matches!(app.ui.dialog(), Some(Modal::Loading(_))) && std::time::Instant::now() < deadline
+    {
+        app.poll().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(app.ui.dialog().is_none(), "{}", app.ui.message);
+    assert!(app.ui.message.contains("Shipped"), "{}", app.ui.message);
+    assert_ne!(
+        git_cmd(project.path(), &["branch", "--show-current"]),
+        branch_before
+    );
+    assert_ne!(
+        git_cmd(project.path(), &["rev-list", "--count", "HEAD"]),
+        commits_before
+    );
+}
+
+#[test]
+fn delegated_tasks_inspector_shows_handoff_questions_patch_and_cancel_prompt() {
+    use crate::config::Mode;
+    use crate::delegation::{
+        Isolation,
+        policy::stage_ceiling,
+        records::{ResolvedTarget, SealedPatch, TaskState, TaskStatus},
+    };
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    let mut run = sample_run("del-run");
+    run.project = project.path().into();
+    run.workspace = project.path().into();
+    run.directory = crate::storage::run_dir(project.path(), &run.id).unwrap();
+    let patch_rel = std::path::PathBuf::from("patches/t1-rev1.diff");
+    let patch_abs = run.directory.join(&patch_rel);
+    std::fs::create_dir_all(patch_abs.parent().unwrap()).unwrap();
+    std::fs::write(
+        &patch_abs,
+        "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n",
+    )
+    .unwrap();
+    let ceiling = stage_ceiling(&run.workflow, &run.workflow.stages[0], false);
+    let task1 = TaskState {
+        id: "t1".into(),
+        client_request_id: "req-1".into(),
+        fingerprint: "fp-1".into(),
+        title: "Audit parser".into(),
+        role: Role::Review,
+        target: ResolvedTarget {
+            delegate: Some("reviewer".into()),
+            harness: "codex".into(),
+            model: "gpt-5".into(),
+            provider: String::new(),
+            effort: String::new(),
+        },
+        isolation: Isolation::Worktree,
+        ceiling,
+        status: TaskStatus::Waiting,
+        task: "Check edge cases".into(),
+        turns: vec![],
+        handoff: Some(crate::handoff::Handoff::unstructured(
+            "Found edge case in parser".into(),
+        )),
+        latest_handoff: None,
+        questions: vec!["Should empty input error or return default?".into()],
+        worktree: None,
+        base: None,
+        patches: vec![SealedPatch {
+            revision: 1,
+            turn: 1,
+            path: patch_abs,
+            sha256: "abc".into(),
+            files: vec!["a.rs".into()],
+            added: 1,
+            removed: 1,
+            apply: None,
+        }],
+        error: None,
+        delivered: false,
+        announced: false,
+        cancelled_by_parent: false,
+        queued_messages: vec![],
+        sends: vec![],
+        created_at: chrono::Utc::now(),
+    };
+    run.stages[0].attempts.push(crate::engine::Attempt {
+        number: 1,
+        started_at: chrono::Utc::now(),
+        finished_at: None,
+        mode: Mode::Unattended,
+        model: String::new(),
+        status: Status::Running,
+        exit_code: None,
+        directory: run.directory.join("01-stage/attempt-001"),
+        handoff_file: run.directory.join("01-stage/attempt-001/handoff.json"),
+        error: None,
+        checks: vec![],
+        checks_tree: None,
+        usage: None,
+        session: None,
+        process_group: None,
+        process_identity: Default::default(),
+        terminal: None,
+        handoff_source: None,
+        worktree: None,
+        tree_before: None,
+        tree_after: None,
+        turns: vec![],
+        tasks: vec![task1],
+        launched_runs: vec![],
+    });
+    run.cursor = 0;
+    run.persist().unwrap();
+
+    app.session.adopt(run);
+    app.ui.page = Page::Runs;
+
+    // `g` opens delegated tasks inspector.
+    app.key(key(Key::Char('g'))).unwrap();
+    assert!(matches!(app.ui.dialog(), Some(Modal::DelegatedTasks(_))));
+    let screen = rows(&mut app, 100, 32).join("\n");
+    assert!(screen.contains("t1 · reviewer"), "{screen}");
+    assert!(screen.contains("Should empty input error"), "{screen}");
+    assert!(screen.contains("Found edge case in parser"), "{screen}");
+
+    // `h` opens the task's handoff view.
+    app.key(key(Key::Char('h'))).unwrap();
+    assert!(matches!(app.ui.dialog(), Some(Modal::Handoff(_))));
+    app.key(key(Key::Esc)).unwrap();
+    assert!(matches!(app.ui.dialog(), Some(Modal::DelegatedTasks(_))));
+
+    // `d` opens the task's sealed patch diff.
+    app.key(key(Key::Char('d'))).unwrap();
+    assert!(matches!(app.ui.dialog(), Some(Modal::Diff(_))));
+    app.key(key(Key::Esc)).unwrap();
+    assert!(matches!(app.ui.dialog(), Some(Modal::DelegatedTasks(_))));
+
+    // `C` when live prompts CancelDelegatedTask without cancelling the parent stage.
+    if let Some(Modal::DelegatedTasks(view)) = app.ui.dialog_mut() {
+        view.live = true;
+    }
+    app.key(shift('C')).unwrap();
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Ask(ask)) if matches!(**ask, Ask::CancelDelegatedTask { ref task, .. } if task == "t1")
+    ));
+    assert!(!crate::engine::cancel_delegated_task("del-run", "t1"));
+
+    // Path traversal outside run_dir is refused.
+    let outside = project.path().join("outside.diff");
+    std::fs::write(&outside, "secret").unwrap();
+    let bad_patch = SealedPatch {
+        revision: 1,
+        turn: 1,
+        path: outside,
+        sha256: "abc".into(),
+        files: vec![],
+        added: 0,
+        removed: 0,
+        apply: None,
+    };
+    assert!(
+        super::delegation_view::read_sealed_patch(&app.slot().run.directory, &bad_patch).is_err()
+    );
+}
+
+#[test]
+fn schedules_dialog_respects_trust_and_supports_approve_pause_enable_delete() {
+    use crate::delegation::{
+        policy::Ceiling,
+        schedules::{self, Schedule, Trigger},
+    };
+    let project = tempfile::tempdir().unwrap();
+    // Write a project config with an unattended workflow and a dangerous custom adapter
+    // so trust is required before approving schedules.
+    std::fs::write(
+        project.path().join(".model-router.toml"),
+        r#"version = 2
+[adapters.mytool]
+command = "echo"
+args = ["hi"]
+
+[[workflows]]
+name = "Nightly"
+[[workflows.stages]]
+id = "check"
+name = "Check"
+role = "research"
+harness = "codex"
+mode = "unattended"
+"#,
+    )
+    .unwrap();
+    let now = chrono::Utc::now();
+    schedules::update(project.path(), |store| {
+        store.schedules.push(Schedule {
+            id: "nightly-check".into(),
+            workflow: Some("Nightly".into()),
+            task: "Run nightly audit".into(),
+            trigger: Trigger::Every {
+                seconds: 3600,
+                text: "1h".into(),
+            },
+            enabled: true,
+            created_by: "implement".into(),
+            ceiling: Ceiling {
+                write: crate::delegation::policy::Write::Workspace,
+                native: crate::delegation::policy::Native::Default,
+                network: crate::delegation::policy::Network::Open,
+                enforcement: crate::delegation::policy::Enforcement::None,
+                writable: vec![],
+            },
+            client_request_id: String::new(),
+            requested_by: String::new(),
+            request_fingerprint: String::new(),
+            revision: 1,
+            created_at: now,
+            updated_at: now,
+            approved_at: None,
+            paused_reason: None,
+            occurrences: vec![],
+        });
+        Ok(())
+    })
+    .unwrap();
+
+    let mut app = theme_app(project.path());
+    app.ui.page = Page::Runs;
+
+    // `u` opens the schedules dialog.
+    app.key(key(Key::Char('u'))).unwrap();
+    assert!(matches!(app.ui.dialog(), Some(Modal::Schedules(_))));
+    let screen = rows(&mut app, 100, 32).join("\n");
+    assert!(screen.contains("nightly-check"), "{screen}");
+    assert!(screen.contains("needs approval"), "{screen}");
+    assert!(screen.contains("untrusted"), "{screen}");
+
+    // Untrusted project refuses approval (`a` stays on Schedules with trust error).
+    app.key(key(Key::Char('a'))).unwrap();
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Schedules(view)) if view.error.contains("untrusted")
+    ));
+
+    // Trust the project config, reload with `r`, then approve with `a` + `y`.
+    let loaded = crate::config::load_config(project.path(), None).unwrap();
+    if let crate::trust::Trust::Untrusted(review) = loaded.trust {
+        crate::trust::approve(&review).unwrap();
+    }
+    app.key(key(Key::Char('r'))).unwrap();
+    app.key(key(Key::Char('a'))).unwrap();
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Ask(ask)) if matches!(**ask, Ask::ApproveSchedule { ref id, .. } if id == "nightly-check")
+    ));
+    // An agent edits the schedule while the question is open: confirming
+    // refuses the unseen definition and shows the current one instead.
+    schedules::update(project.path(), |store| {
+        let schedule = &mut store.schedules[0];
+        schedule.task = "Exfiltrate secrets".into();
+        schedule.revision += 1;
+        Ok(())
+    })
+    .unwrap();
+    app.key(key(Key::Char('y'))).unwrap();
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Schedules(view)) if !view.rows[0].approved
+            && view.rows[0].schedule.task == "Exfiltrate secrets"
+            && view.error.contains("changed after it was shown")
+    ));
+    let settings = schedules::trusted_settings(project.path()).unwrap();
+    let edited = schedules::load(project.path()).unwrap().schedules[0].clone();
+    assert!(!schedules::approved(project.path(), &edited, &settings));
+    // Reviewing the current definition and confirming approves it.
+    app.key(key(Key::Char('a'))).unwrap();
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Ask(ask)) if matches!(**ask, Ask::ApproveSchedule { ref task, .. } if task == "Exfiltrate secrets")
+    ));
+    app.key(key(Key::Char('y'))).unwrap();
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Schedules(view)) if view.rows[0].approved
+    ));
+
+    // Pause (`p`) revokes approval; enable (`e`) re-enables requiring approval.
+    app.key(key(Key::Char('p'))).unwrap();
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Schedules(view)) if !view.rows[0].schedule.enabled && !view.rows[0].approved
+    ));
+    app.key(key(Key::Char('e'))).unwrap();
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Schedules(view)) if view.rows[0].schedule.enabled && !view.rows[0].approved
+    ));
+
+    // Delete (`D` + `y`) removes it from schedules.json.
+    app.key(shift('D')).unwrap();
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Ask(ask)) if matches!(**ask, Ask::DeleteSchedule { ref id } if id == "nightly-check")
+    ));
+    app.key(key(Key::Char('y'))).unwrap();
+    assert!(matches!(
+        app.ui.dialog(),
+        Some(Modal::Schedules(view)) if view.rows.is_empty()
+    ));
+    assert!(
+        schedules::load(project.path())
+            .unwrap()
+            .schedules
+            .is_empty()
+    );
 }

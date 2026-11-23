@@ -52,6 +52,141 @@ pub fn usage(raw: &str, kind: OutputKind) -> Option<Usage> {
     json_values(raw).fold(None, |found, event| add_usage(found, &event, kind))
 }
 
+/// Incrementally inspects streamed stdout chunks from an unattended harness and
+/// tracks cumulative usage live (for mid-stream budget enforcement).
+#[derive(Debug, Clone)]
+pub struct UsageTracker {
+    kind: OutputKind,
+    pending: String,
+    discarding: bool,
+    usage: Option<Usage>,
+    assistant_messages: std::collections::BTreeMap<String, Usage>,
+    has_result: bool,
+    msg_seq: usize,
+}
+
+impl UsageTracker {
+    pub fn new(kind: OutputKind) -> Self {
+        Self {
+            kind,
+            pending: String::new(),
+            discarding: false,
+            usage: None,
+            assistant_messages: std::collections::BTreeMap::new(),
+            has_result: false,
+            msg_seq: 0,
+        }
+    }
+
+    /// Feeds the next UTF-8 stdout chunk. Returns `Some(cumulative_usage)` if
+    /// one or more usage events were observed in this chunk.
+    pub fn push(&mut self, chunk: &str) -> Option<Usage> {
+        if matches!(self.kind, OutputKind::Text | OutputKind::Gemini) || chunk.is_empty() {
+            return None;
+        }
+        let mut updated = false;
+        let mut rest = chunk;
+        while let Some(nl) = rest.find('\n') {
+            let segment = &rest[..nl];
+            rest = &rest[nl + 1..];
+            if self.discarding {
+                self.discarding = false;
+                self.pending.clear();
+                continue;
+            }
+            if self.pending.len() + segment.len() > MAX_LINE_BYTES {
+                self.pending.clear();
+                continue;
+            }
+            self.pending.push_str(segment);
+            let line = std::mem::take(&mut self.pending);
+            if self.process_line(&line) {
+                updated = true;
+            }
+        }
+        if !rest.is_empty() && !self.discarding {
+            if self.pending.len() + rest.len() > MAX_LINE_BYTES {
+                self.pending.clear();
+                self.discarding = true;
+            } else {
+                self.pending.push_str(rest);
+            }
+        }
+        updated.then(|| self.current()).flatten()
+    }
+
+    /// Flushes any trailing line without a newline.
+    pub fn finish(&mut self) -> Option<Usage> {
+        if self.discarding || self.pending.is_empty() {
+            self.pending.clear();
+            self.discarding = false;
+            return None;
+        }
+        let line = std::mem::take(&mut self.pending);
+        self.process_line(&line).then(|| self.current()).flatten()
+    }
+
+    /// The best cumulative usage seen so far.
+    pub fn current(&self) -> Option<Usage> {
+        if self.has_result || self.assistant_messages.is_empty() {
+            return self.usage;
+        }
+        let sum = self
+            .assistant_messages
+            .values()
+            .copied()
+            .reduce(|a, b| a + b)?;
+        (sum != Usage::default()).then_some(sum)
+    }
+
+    fn process_line(&mut self, line: &str) -> bool {
+        if !line.contains('{') || !line_may_have_usage(line.as_bytes(), self.kind) {
+            return false;
+        }
+        let mut updated = false;
+        for event in line_values(line) {
+            let kind_name = event.get("type").and_then(Value::as_str).unwrap_or("");
+            if matches!(self.kind, OutputKind::Claude | OutputKind::Amp) && kind_name == "assistant"
+            {
+                if let Some(usage) = event.pointer("/message/usage") {
+                    let count = |key: &str| usage.get(key).and_then(Value::as_u64);
+                    let part = Usage {
+                        input_tokens: count("input_tokens"),
+                        output_tokens: count("output_tokens"),
+                        cache_read_tokens: count("cache_read_input_tokens"),
+                        cache_write_tokens: count("cache_creation_input_tokens"),
+                        cost_usd: None,
+                    };
+                    if part != Usage::default() {
+                        let seq = self.msg_seq;
+                        self.msg_seq += 1;
+                        let id = event
+                            .pointer("/message/id")
+                            .and_then(Value::as_str)
+                            .map_or_else(|| format!("line-{seq}"), str::to_owned);
+                        self.assistant_messages.insert(id, part);
+                        updated = true;
+                    }
+                }
+                continue;
+            }
+            if let Some(part) = event_usage(&event, self.kind) {
+                if matches!(self.kind, OutputKind::Claude | OutputKind::Amp)
+                    && kind_name == "result"
+                {
+                    self.has_result = true;
+                }
+                self.usage = Some(match self.usage {
+                    Some(sum) if summed(self.kind) => sum + part,
+                    _ => part,
+                });
+                updated = true;
+            }
+        }
+        updated
+    }
+}
+
 fn add_usage(found: Option<Usage>, event: &Value, kind: OutputKind) -> Option<Usage> {
     let Some(part) = event_usage(event, kind) else {
         return found;
@@ -972,6 +1107,55 @@ mod usage_tests {
                 at("10:30:00"),
             ),
             Some(tokens(7, 9, None, None))
+        );
+    }
+
+    #[test]
+    fn usage_tracker_accumulates_streamed_events_across_partial_chunks() {
+        let mut codex = UsageTracker::new(OutputKind::Codex);
+        assert_eq!(
+            codex.push("{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,"),
+            None
+        );
+        assert_eq!(
+            codex.push("\"output_tokens\":40}}\n"),
+            Some(tokens(100, 40, None, None))
+        );
+        assert_eq!(
+            codex.push(
+                "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":50,\"output_tokens\":10}}\n"
+            ),
+            Some(tokens(150, 50, None, None))
+        );
+
+        let mut claude = UsageTracker::new(OutputKind::Claude);
+        assert_eq!(
+            claude.push(
+                "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":20,\"output_tokens\":30}}}\n"
+            ),
+            Some(tokens(20, 30, None, None))
+        );
+        assert_eq!(
+            claude.push(
+                "{\"type\":\"assistant\",\"message\":{\"id\":\"m2\",\"usage\":{\"input_tokens\":10,\"output_tokens\":15}}}\n"
+            ),
+            Some(tokens(30, 45, None, None))
+        );
+        assert_eq!(
+            claude.push(
+                "{\"type\":\"result\",\"total_cost_usd\":0.12,\"usage\":{\"input_tokens\":30,\"output_tokens\":50}}"
+            ),
+            None
+        );
+        assert_eq!(
+            claude.finish(),
+            Some(Usage {
+                input_tokens: Some(30),
+                output_tokens: Some(50),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                cost_usd: Some(0.12),
+            })
         );
     }
 }

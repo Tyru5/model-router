@@ -266,6 +266,7 @@ impl Run {
                     fan_out: None,
                     inherited: None,
                     discarded: vec![],
+                    skipped_reason: None,
                 })
                 .collect(),
             orphan_groups: vec![],
@@ -316,6 +317,7 @@ impl Run {
             self.updated_at = prev_updated;
             return result;
         }
+        crate::events::emit_run_metrics(self, prev_revision == 0, &self.journal);
         self.journal.clear();
         Ok(())
     }
@@ -330,8 +332,8 @@ impl Run {
             actor,
             reason,
         } = change;
-        let (level, stage_index, enabled) = match target {
-            Target::Run => (Level::Run, None, true),
+        let (level, stage_index, enabled, conditional) = match target {
+            Target::Run => (Level::Run, None, true, false),
             Target::Stage(i)
             | Target::Attempt(i)
             | Target::Candidate(i, _)
@@ -346,7 +348,12 @@ impl Run {
                     Target::Candidate(..) => Level::Candidate,
                     _ => Level::Attempt,
                 };
-                (level, Some(i), stage.enabled)
+                (
+                    level,
+                    Some(i),
+                    stage.enabled,
+                    !stage.when_changed.is_empty(),
+                )
             }
         };
         let (slot, attempt, candidate) = match target {
@@ -382,7 +389,7 @@ impl Run {
             return Ok(());
         }
         ensure!(
-            legal(level, from, to, enabled),
+            legal(level, from, to, enabled, conditional),
             "Illegal {} transition{}{}: {} → {} ({reason})",
             level.label(),
             stage_index.map_or_else(String::new, |i| format!(" in stage {}", i + 1)),
@@ -630,6 +637,7 @@ impl Run {
             state.handoff = None;
             state.waiver = None;
             state.inherited = None;
+            state.skipped_reason = None;
         }
         // A graph's dependents may come earlier in the list.
         if self.graph() {
@@ -645,8 +653,87 @@ impl Run {
                 state.handoff = None;
                 state.waiver = None;
                 state.inherited = None;
+                state.skipped_reason = None;
             }
         }
+        Ok(())
+    }
+
+    /// Evaluates stage `index`'s `when_changed` globs. Returns `Some(reason)`
+    /// when the stage should be skipped in a Git repo because no files changed
+    /// so far in the run match any glob. Outside Git (or if snapshots cannot be
+    /// inspected), returns `None` so the stage runs normally (fail-safe).
+    pub(crate) fn should_skip_when_changed(&self, index: usize) -> Option<String> {
+        let stage = self.workflow.stages.get(index)?;
+        if stage.when_changed.is_empty() {
+            return None;
+        }
+        // A judge with candidates waiting always runs: their changes are in
+        // their own worktrees, not the workspace, until it chooses one, and
+        // skipping it would apply none.
+        let judging = graph::judged_by(&self.workflow, index)
+            .and_then(|fan| self.stages[fan].fan_out.as_ref())
+            .is_some_and(|round| {
+                !round.candidates.is_empty() && round.selection.as_ref().is_none_or(|s| !s.applied)
+            });
+        if judging {
+            return None;
+        }
+        let from = self.baseline.as_deref()?;
+        if !snapshot::is_repository(&self.workspace) {
+            return None;
+        }
+        let to = match snapshot::current_tree(&self.workspace) {
+            Ok(Some(tree)) => tree,
+            Ok(None) => return None,
+            Err(_) => self.change_range().ok()?.1.to_owned(),
+        };
+        let changed = if from == to {
+            vec![]
+        } else {
+            snapshot::changed_paths(&self.workspace, from, &to).ok()?
+        };
+        let matched = changed.iter().any(|path| {
+            stage
+                .when_changed
+                .iter()
+                .any(|pat| crate::policy::matches_glob(pat, path))
+        });
+        if matched {
+            None
+        } else {
+            Some(format!(
+                "Skipped (when_changed): {} changed file(s) matched none of {}",
+                changed.len(),
+                stage.when_changed.join(", ")
+            ))
+        }
+    }
+
+    /// Enforces `workflow.review_quorum` when > 1: requires at least N distinct
+    /// enabled non-judge review stages to have completed. No-op when unset or 1.
+    pub fn check_review_quorum(&self) -> Result<()> {
+        let required = self.workflow.review_quorum.unwrap_or(1);
+        if required <= 1 {
+            return Ok(());
+        }
+        let mut enabled_reviews = 0usize;
+        let mut passed_reviews = 0usize;
+        for (i, (stage, state)) in self.workflow.stages.iter().zip(&self.stages).enumerate() {
+            if stage.enabled
+                && stage.role == Role::Review
+                && graph::judged_by(&self.workflow, i).is_none()
+            {
+                enabled_reviews += 1;
+                if state.status == Status::Complete {
+                    passed_reviews += 1;
+                }
+            }
+        }
+        ensure!(
+            passed_reviews >= required,
+            "Review quorum not met: {passed_reviews} of {required} distinct review stage(s) passed ({enabled_reviews} enabled). Enable and pass at least {required} distinct review stages"
+        );
         Ok(())
     }
 
@@ -1212,6 +1299,33 @@ impl Run {
     /// Starts a round of fan-out stage `index`: a new attempt for the stage,
     /// and, unless an earlier round left candidates to retry, a base commit
     /// of the workspace and pending candidates.
+    /// Re-snapshots fan-out stage `index`'s candidate base after its
+    /// `before_stage` hooks, so candidates start from the files those hooks
+    /// prepared. Only a round whose candidates have not started yet moves:
+    /// started candidates' patches are relative to the base they saw. The
+    /// stage attempt keeps its pre-hook `tree_before`, as ordinary stages do.
+    pub(super) fn refresh_fan_out_base(&mut self, index: usize) -> Result<()> {
+        let Some(state) = self.stages[index].fan_out.as_ref() else {
+            return Ok(());
+        };
+        if state.candidates.iter().any(|c| !c.attempts.is_empty()) {
+            return Ok(());
+        }
+        let base = snapshot::tree(&self.workspace, &self.directory)
+            .context("Snapshot the workspace after before_stage hooks")?;
+        if base == state.base {
+            return Ok(());
+        }
+        let stage_id = self.workflow.stages[index].id.clone();
+        let reference = snapshot::base_ref(&self.id, &format!("{stage_id}-{:03}", state.round));
+        let base_commit = fanout::base_commit(&self.workspace, &base, &reference)?;
+        if let Some(state) = self.stages[index].fan_out.as_mut() {
+            state.base = base;
+            state.base_commit = base_commit;
+        }
+        self.persist()
+    }
+
     pub(super) fn start_fan_out(&mut self, index: usize) -> Result<()> {
         let stage = self.workflow.stages[index].clone();
         let fan = stage.fan_out.clone().context("Not a fan-out stage")?;
@@ -1415,9 +1529,10 @@ impl Run {
                 program: &invocation.program,
             },
         )?;
+        let harness_version = adapters::detected_version(&candidate.harness, &invocation.program);
         storage::write_json_fast(
             &directory.join("command.json"),
-            &serde_json::json!({ "program": invocation.program, "args": invocation.args, "stdin_from": invocation.stdin.as_ref().map(|_| "prompt.md"), "env": invocation.env.iter().map(|(name, _)| name).collect::<Vec<_>>(), "workspace": cwd, "model": candidate.model, "provider": candidate.provider, "effort": candidate.effort, "mode": candidate.mode, "candidate": id, "sandbox": sandbox }),
+            &serde_json::json!({ "program": invocation.program, "harness_version": harness_version, "args": invocation.args, "stdin_from": invocation.stdin.as_ref().map(|_| "prompt.md"), "env": invocation.env.iter().map(|(name, _)| name).collect::<Vec<_>>(), "workspace": cwd, "model": candidate.model, "provider": candidate.provider, "effort": candidate.effort, "mode": candidate.mode, "candidate": id, "sandbox": sandbox }),
         )?;
         let state = self.candidate_mut(index, c);
         state.harness = config.harness.clone();
@@ -1478,6 +1593,7 @@ impl Run {
                 directory,
                 handoff_file,
                 reattached: false,
+                retry_from: None,
             },
             cwd,
         ))
@@ -1561,6 +1677,20 @@ impl Run {
     pub(super) fn settle_fan_out(&mut self, index: usize, cancelled: bool) -> Result<()> {
         self.cursor = index;
         let stage = self.workflow.stages[index].clone();
+        // A live budget monitor stopped a candidate: stop here while a cap is
+        // still exceeded.
+        let budget_stop = self.stages[index]
+            .fan_out
+            .as_ref()
+            .is_some_and(|f| {
+                f.candidates.iter().any(|c| {
+                    c.error
+                        .as_deref()
+                        .is_some_and(|e| e.starts_with(crate::cost::EXCEEDED))
+                })
+            })
+            .then(|| crate::cost::check_budget(self))
+            .flatten();
         let state = self.stages[index].fan_out.as_ref().context("No fan-out")?;
         let complete = state
             .candidates
@@ -1606,6 +1736,13 @@ impl Run {
                 stage.id
             );
             self.stop(Status::Cancelled, message, Actor::Engine, true)?;
+            finish(self);
+            return Ok(());
+        }
+        if let Some(reason) = budget_stop {
+            // No winner is applied past a cap; `resume --budget-*` raises it
+            // and settles again with the candidates that finished.
+            self.stop(Status::Blocked, reason, Actor::Engine, true)?;
             finish(self);
             return Ok(());
         }
@@ -1739,6 +1876,29 @@ impl Run {
             return Ok(Err(format!(
                 "Candidate {id} modified protected path(s): {detail}. The workspace is unchanged. Choose another candidate, or update workflow protected_paths and retry this stage"
             )));
+        }
+        if crate::policy::has_block_policies(&self.workflow.policies) {
+            let refusing = "refusing to apply; the workspace is unchanged";
+            let Some(tree) = candidate
+                .attempts
+                .last()
+                .and_then(|a| a.tree_after.as_deref())
+            else {
+                return Ok(Err(format!(
+                    "Candidate {id}'s worktree snapshot was not recorded, so workflow policies cannot be verified; {refusing}"
+                )));
+            };
+            // Its patch was made from the base to this tree, whose objects
+            // the workspace's repository shares.
+            if let Err(error) = crate::policy::scan_tree_policies(
+                &self.workflow.policies,
+                &self.workspace,
+                (&state.base, tree),
+                &format!(" in candidate {id}"),
+                refusing,
+            ) {
+                return Ok(Err(format!("{error:#}")));
+            }
         }
         let current = snapshot::tree(&self.workspace, &self.directory)
             .context("Snapshot the workspace before applying the candidate")?;
@@ -1940,6 +2100,29 @@ pub(super) struct CandidatePost {
     pub(super) changes: Option<CandidateChanges>,
     pub(super) stop: Option<(Status, String)>,
     pub(super) survivor: Option<process::Group>,
+    /// The harness exited on its own: not cancelled, timed out, or stalled.
+    pub(super) exited: bool,
+}
+
+/// A candidate its live budget monitor stopped mid-stream: blocked with the
+/// budget reason and its usage kept. Nothing else of its output is evaluated.
+pub(super) fn budget_stopped_candidate(
+    prepared: &Prepared,
+    exit_code: Option<i32>,
+    live_usage: Option<handoff::Usage>,
+    reason: String,
+) -> CandidatePost {
+    let mut post = CandidatePost {
+        exit_code,
+        ..CandidatePost::default()
+    };
+    post.usage = handoff::usage_file(
+        &prepared.directory.join("stdout.log"),
+        prepared.invocation.kind,
+    )
+    .or(live_usage);
+    post.stop = Some((Status::Blocked, reason));
+    post
 }
 
 /// Runs candidate post-processing in the worker thread: exit normalization,
@@ -1953,6 +2136,7 @@ pub(super) fn post_process_candidate(
     base: &str,
     run_id: &str,
     protected_paths: &[String],
+    policies: &[crate::policy::DiffPolicy],
     outcome_result: Result<process::Outcome>,
     journal: &SpawnJournal,
     cancel: &AtomicBool,
@@ -2046,6 +2230,16 @@ pub(super) fn post_process_candidate(
     fanout::write_patch(worktree, base, &tree, &patch)?;
     let (files, added, removed) = fanout::stat(worktree, base, &tree)?;
     let protected = crate::policy::protected_detail(protected_paths, &files);
+    // The text diff, not the `git apply` patch: that one is `--binary` and
+    // quotes non-ASCII paths.
+    let policy_err = crate::policy::scan_tree_policies(
+        policies,
+        worktree,
+        (base, &tree),
+        " in candidate",
+        "its worktree is retained",
+    )
+    .err();
     post.tree_after = Some(tree);
     post.changes = Some(CandidateChanges {
         files,
@@ -2060,6 +2254,8 @@ pub(super) fn post_process_candidate(
                 "Candidate modified protected path(s): {detail}. Its worktree is retained; update workflow protected_paths or retry the stage"
             ),
         ));
+    } else if let Some(error) = policy_err {
+        post.stop = Some((Status::Blocked, format!("{error:#}")));
     }
     Ok(post)
 }

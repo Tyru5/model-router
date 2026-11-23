@@ -49,24 +49,31 @@ Ranked by value for the effort, with the source in parentheses.
    enforced on ordinary stages, fan-out candidates (candidate stops blocked),
    and candidate selection, and refused by `ship` and `apply` (Ralphy,
    Claudexor).
-2. **Block and advise policies.** Regex rules over changed lines; `block`
-   fails the run whatever the review said, `advise` is injected into the
-   review prompt; fail closed when the diff cannot be read (Vibestrate).
-3. **Stall timeout** *(implemented)* **and bounded retry.** Stage
+2. **Block and advise policies** *(implemented)*. Declarative diff rules
+   (`[[workflows.policies]]`) over changed lines and path globs; `block` stops
+   the stage, candidate selection, `apply`, or `ship` whatever the review said
+   (failing closed when the diff cannot be read), and `advise` is injected into
+   the review prompt (Vibestrate).
+3. **Stall timeout and bounded retry** *(implemented)*. Stage
    `stall_timeout_seconds` stops an unattended stage that produces no output
-   for a while; capped exponential retry backoff remains open (Symphony).
+   for a while, and `retry` (`max_attempts`, `base_delay_seconds`,
+   `max_delay_seconds`) retries transient provider errors with capped
+   exponential backoff on the same harness and model (Symphony).
 4. **Secret scan before ship** *(implemented)*. Built-in diff scanner
    (`secret_scan = true`) plus opt-in trust-gated external `secret_scanner`
    failing closed at plan and commit time (Claudexor).
-5. **Lifecycle hooks.** `before_stage`/`after_stage`/`before_ship` commands
-   with a timeout; before-hooks abort, after-hooks log; gated behind
-   `trust` like custom adapters (Symphony, Tutti).
-6. **Harness version pins.** Optional expected versions checked by
-   `doctor --strict`, recorded in each attempt's `command.json`
-   (agents-cli).
-7. **Billing split and budget actions** *(implemented)*. `cost` splits billed
-   API spend from subscription API-equivalent estimates, notes attempts with
-   unknown cost rather than counting them as `$0`, and budgets support
-   `on_exceed = "warn" | "stop"` (Kodo, Vibestrate).
+5. **Lifecycle hooks** *(implemented)*. `before_stage`/`after_stage`/`before_ship`/`on_failure`
+   argument-vector commands with a timeout; before-hooks abort, after-hooks log;
+   gated behind `trust` and run approval digests like custom adapters (Symphony,
+   Tutti).
+6. **Harness version pins** *(implemented)*. Optional `[harness_versions]` pins
+   checked by `doctor` and enforced by `doctor --strict`, with detected
+   `harness_version` recorded in each attempt's `command.json` (agents-cli).
+7. **Billing split, budget actions, and live streaming caps** *(implemented)*.
+   `cost` (`--all-projects`) splits billed API spend from subscription
+   API-equivalent estimates, notes attempts with unknown cost rather than
+   counting them as `$0`, and budgets support `on_exceed = "warn" | "stop"`
+   including mid-stream enforcement on unattended streaming stages (Kodo,
+   Vibestrate).
 8. **A "not enforced" list** *(implemented)* in [safety.md](safety.md#not-enforced)
    naming guarantees that depend on a harness honoring its own flags (ccswarm).

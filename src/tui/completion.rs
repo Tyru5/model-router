@@ -621,11 +621,7 @@ fn next_keys(run: &Run) -> Vec<(&'static str, &'static str)> {
     let fan_out = current.is_some_and(|s| s.fan_out.is_some());
     let ship = current.is_some_and(|s| s.role == crate::config::Role::Ship);
     let keys: &[(&str, &str)] = if crate::cost::budget_blocked(run) {
-        if crate::cost::usd_budget_blocked(run) {
-            &[("B", "raise budget"), ("d", "diff"), ("o", "output")]
-        } else {
-            &[("d", "diff"), ("o", "output")]
-        }
+        &[("B", "raise budget"), ("d", "diff"), ("o", "output")]
     } else if run.repair_blocked() {
         &[
             ("R", "allow repair"),

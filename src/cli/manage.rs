@@ -327,6 +327,30 @@ pub fn ship(project: &Path, id: &str, push: bool, draft_pr: bool, yes: bool) -> 
             return Ok(());
         }
     }
+    let ship_stage = run
+        .workflow
+        .stages
+        .iter()
+        .rev()
+        .find(|s| s.role == model_router::config::Role::Ship);
+    if !run
+        .workflow
+        .hooks_for(ship_stage, model_router::hooks::HookEvent::BeforeShip)
+        .is_empty()
+    {
+        model_router::trust::authorize_run(&run)?;
+        let hook_run = ship::run_before_ship_hooks(
+            &run,
+            ship_stage,
+            &dir,
+            &std::sync::atomic::AtomicBool::new(false),
+            |_| Ok(()),
+            |line| print!("{line}"),
+        )?;
+        if let Some(error) = hook_run.failed {
+            bail!("Ship stopped: {error}");
+        }
+    }
     let outcome = ship::apply(&plan, &dir, |line| print!("{line}"));
     for line in outcome.lines() {
         println!("{line}");
@@ -339,15 +363,32 @@ pub fn ship(project: &Path, id: &str, push: bool, draft_pr: bool, yes: bool) -> 
 
 /// What `model-router schedules` does.
 pub enum SchedulesCommand {
-    List { json: bool },
-    Approve(String),
+    List {
+        json: bool,
+    },
+    Add {
+        id: Option<String>,
+        workflow: Option<String>,
+        task: Option<String>,
+        task_file: Option<std::path::PathBuf>,
+        every: Option<String>,
+        at: Option<String>,
+        cron: Option<String>,
+        webhook: bool,
+        tz: Option<String>,
+        approve: bool,
+    },
+    Approve {
+        id: String,
+        digest: Option<String>,
+    },
     Pause(String),
     Enable(String),
     Delete(String),
     Tick,
 }
 
-/// `model-router schedules`: the schedules a stage's agent created.
+/// `model-router schedules`: list, add, approve, pause, enable, delete, or tick.
 pub fn schedules(
     project: &Path,
     command: SchedulesCommand,
@@ -355,6 +396,60 @@ pub fn schedules(
 ) -> Result<()> {
     use model_router::delegation::schedules;
     match command {
+        SchedulesCommand::Add {
+            id,
+            workflow,
+            task,
+            task_file,
+            every,
+            at,
+            cron,
+            webhook,
+            tz,
+            approve,
+        } => {
+            let task = match (task, task_file) {
+                (Some(task), None) => task,
+                (None, Some(path)) => model_router::task_import::read(&path)?,
+                _ => bail!("Supply --task or --task-file"),
+            };
+            let trigger = schedules::parse_trigger(
+                every.as_deref(),
+                at.as_deref(),
+                cron.as_deref(),
+                webhook,
+                tz.as_deref(),
+            )?;
+            let (schedule, approved) = schedules::add(
+                project,
+                schedules::AddOptions {
+                    id,
+                    workflow,
+                    task,
+                    trigger,
+                    approve,
+                },
+            )?;
+            if approved {
+                println!(
+                    "Added and approved {}: {} runs workflow {} with task: {}",
+                    schedule.id,
+                    schedule.trigger.describe(),
+                    schedule.workflow.as_deref().unwrap_or("(default)"),
+                    model_router::storage::truncate(&schedule.task, 80),
+                );
+            } else {
+                println!(
+                    "Added {} (needs approval): {} runs workflow {} with task: {}\nApprove it with: model-router schedules approve {}",
+                    schedule.id,
+                    schedule.trigger.describe(),
+                    schedule.workflow.as_deref().unwrap_or("(default)"),
+                    model_router::storage::truncate(&schedule.task, 80),
+                    schedule.id,
+                );
+            }
+            Ok(())
+        }
         SchedulesCommand::List { json } => {
             let store = schedules::load(project)?;
             let settings = schedules::trusted_settings(project).ok();
@@ -367,6 +462,7 @@ pub fn schedules(
                         serde_json::json!({
                             "schedule": s,
                             "approved": settings.as_ref().is_some_and(|c| schedules::approved(project, s, c)),
+                            "digest": settings.as_ref().and_then(|c| schedules::digest(project, s, c).ok()),
                             "next_due": schedules::next_due(s, now),
                         })
                     })
@@ -401,8 +497,8 @@ pub fn schedules(
             }
             Ok(())
         }
-        SchedulesCommand::Approve(id) => {
-            let schedule = schedules::approve(project, &id)?;
+        SchedulesCommand::Approve { id, digest } => {
+            let schedule = schedules::approve(project, &id, digest.as_deref())?;
             println!(
                 "Approved {}: {} runs workflow {} with task: {}",
                 schedule.id,

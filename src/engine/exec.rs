@@ -8,6 +8,11 @@ pub(super) struct Prepared {
     /// The harness ran under an earlier mr's approval (reattached), so the
     /// stage's checks need the run to be approved now.
     pub(super) reattached: bool,
+    /// The stage's first attempt in an automatic retry chain. Policy and
+    /// protected-path checks compare against its starting snapshot, so edits
+    /// an earlier failed attempt left behind are checked too. None: this
+    /// attempt's own snapshot.
+    pub(super) retry_from: Option<usize>,
 }
 
 pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
@@ -88,9 +93,10 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
     if let (Some(plan), Some(mcp)) = (sandbox.as_mut(), &mcp) {
         plan.allow_orch(&mcp.sock, &mcp.token_file, &mcp.program);
     }
+    let harness_version = adapters::detected_version(&stage.harness, &invocation.program);
     storage::write_json_fast(
         &directory.join("command.json"),
-        &serde_json::json!({ "program": invocation.program, "args": invocation.args, "stdin_from": invocation.stdin.as_ref().map(|_| "prompt.md"), "env": invocation.env.iter().map(|(name, _)| name).collect::<Vec<_>>(), "workspace": run.workspace, "model": stage.model, "provider": stage.provider, "effort": stage.effort, "mode": stage.mode, "sandbox": sandbox }),
+        &serde_json::json!({ "program": invocation.program, "harness_version": harness_version, "args": invocation.args, "stdin_from": invocation.stdin.as_ref().map(|_| "prompt.md"), "env": invocation.env.iter().map(|(name, _)| name).collect::<Vec<_>>(), "workspace": run.workspace, "model": stage.model, "provider": stage.provider, "effort": stage.effort, "mode": stage.mode, "sandbox": sandbox }),
     )?;
     run.stages[index].attempts.push(Attempt {
         number,
@@ -146,6 +152,7 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
         directory,
         handoff_file,
         reattached: false,
+        retry_from: None,
     })
 }
 
@@ -555,6 +562,7 @@ Do not edit any project files or run destructive commands. Emit ONLY a valid han
         directory: repair_dir,
         handoff_file: prepared.handoff_file.clone(),
         reattached: false,
+        retry_from: None,
     };
     match resolve_handoff(&stage, &repair_prepared, normalized)? {
         Resolved::Handoff(source, handoff) => Ok(RepairOutcome::Repaired(source, handoff)),
@@ -632,17 +640,25 @@ pub(super) fn finish(
     let blocked = handoff.verdict == Verdict::Blocked;
     run.stages[index].handoff = Some(handoff);
     let mut fresh_tree: Option<String> = None;
-    if !run.workflow.protected_paths.is_empty() {
+    let check_protected = !run.workflow.protected_paths.is_empty();
+    let check_policies = crate::policy::has_block_policies(&run.workflow.policies);
+    if check_protected || check_policies {
         let workspace = run.workspace.clone();
-        let Some(before) = run.stages[index]
-            .attempts
-            .last()
-            .and_then(|a| a.tree_before.clone())
-        else {
+        let what = match (check_protected, check_policies) {
+            (true, true) => "workflow protected_paths and policies",
+            (true, false) => "workflow protected_paths",
+            (false, true) => "workflow policies",
+            (false, false) => unreachable!(),
+        };
+        let attempts = &run.stages[index].attempts;
+        let from = prepared
+            .retry_from
+            .filter(|&first| first < attempts.len())
+            .unwrap_or(attempts.len().saturating_sub(1));
+        let Some(before) = attempts.get(from).and_then(|a| a.tree_before.clone()) else {
             run.stop(
                 Status::Blocked,
-                "Could not verify workflow protected_paths: no pre-stage Git snapshot was recorded"
-                    .into(),
+                format!("Could not verify {what}: no pre-stage Git snapshot was recorded"),
                 Actor::Engine,
                 true,
             )?;
@@ -651,8 +667,9 @@ pub(super) fn finish(
         let Some(after) = snapshot::tree(&workspace, &run.directory) else {
             run.stop(
                 Status::Blocked,
-                "Could not snapshot workspace to verify workflow protected_paths; inspect workspace and retry"
-                    .into(),
+                format!(
+                    "Could not snapshot workspace to verify {what}; inspect workspace and retry"
+                ),
                 Actor::Engine,
                 true,
             )?;
@@ -660,32 +677,57 @@ pub(super) fn finish(
         };
         fresh_tree = Some(after.clone());
         if after != before {
-            let changed = match snapshot::changed_paths(&workspace, &before, &after) {
-                Ok(paths) => paths,
-                Err(error) => {
+            if check_protected {
+                let changed = match snapshot::changed_paths(&workspace, &before, &after) {
+                    Ok(paths) => paths,
+                    Err(error) => {
+                        run.stop(
+                            Status::Blocked,
+                            format!(
+                                "Could not diff workspace to verify workflow protected_paths: {error:#}"
+                            ),
+                            Actor::Engine,
+                            true,
+                        )?;
+                        return Ok(fresh_tree);
+                    }
+                };
+                if let Some(detail) =
+                    crate::policy::protected_detail(&run.workflow.protected_paths, &changed)
+                {
                     run.stop(
                         Status::Blocked,
                         format!(
-                            "Could not diff workspace to verify workflow protected_paths: {error:#}"
+                            "Stage modified protected path(s): {detail}. Revert them or update workflow protected_paths before retrying"
                         ),
                         Actor::Engine,
                         true,
                     )?;
                     return Ok(fresh_tree);
                 }
-            };
-            if let Some(detail) =
-                crate::policy::protected_detail(&run.workflow.protected_paths, &changed)
-            {
-                run.stop(
-                    Status::Blocked,
-                    format!(
-                        "Stage modified protected path(s): {detail}. Revert them or update workflow protected_paths before retrying"
-                    ),
-                    Actor::Engine,
-                    true,
-                )?;
-                return Ok(fresh_tree);
+            }
+            if check_policies {
+                let mut scan = crate::policy::PolicyScan::new(&run.workflow.policies);
+                if let Err(error) =
+                    snapshot::patch_lines(&workspace, &before, &after, |line| scan.line(line))
+                {
+                    run.stop(
+                        Status::Blocked,
+                        format!(
+                            "Could not read stage diff to verify workflow policies; blocking stage: {error:#}"
+                        ),
+                        Actor::Engine,
+                        true,
+                    )?;
+                    return Ok(fresh_tree);
+                }
+                if let Err(error) = scan.ensure_clean(
+                    " in stage changes",
+                    "revert matching changes or update workflow policies before retrying",
+                ) {
+                    run.stop(Status::Blocked, format!("{error:#}"), Actor::Engine, true)?;
+                    return Ok(fresh_tree);
+                }
             }
         }
     }
@@ -769,9 +811,250 @@ pub(super) fn run_checks(
     Ok(!cancelled)
 }
 
-/// Prepares the current stage's attempt and announces it; None when that
-/// failed and stopped the stage.
-pub(super) fn start_stage(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<Option<Prepared>> {
+/// Whether a failed unattended attempt's error text or stderr matches a
+/// transient provider/network failure worth retrying with the same harness and
+/// model. Never retries auth, permission, or invalid-request failures.
+pub(crate) fn is_transient_error(message: &str, stderr_tail: &str) -> bool {
+    let combined = format!("{message}\n{stderr_tail}").to_ascii_lowercase();
+    const PERMANENT: &[&str] = &[
+        "invalid api key",
+        "invalid_api_key",
+        "authentication_error",
+        "authentication failed",
+        "unauthorized",
+        "permission denied",
+        "invalid_request_error",
+        "context_length_exceeded",
+        "insufficient_quota",
+        "billing",
+    ];
+    if PERMANENT.iter().any(|needle| combined.contains(needle)) {
+        return false;
+    }
+    const TRANSIENT_PHRASES: &[&str] = &[
+        "rate limit",
+        "rate_limit",
+        "ratelimit",
+        "too many requests",
+        "overloaded_error",
+        "overloaded",
+        "service unavailable",
+        "service_unavailable",
+        "temporarily unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "at capacity",
+        "try again later",
+        "connection reset",
+        "econnreset",
+        "connection refused",
+        "econnrefused",
+        "etimedout",
+        "ehostunreach",
+        "broken pipe",
+        "unexpected eof",
+        "tls handshake",
+        "temporary failure in name resolution",
+        "connection closed before",
+        "stream disconnected",
+        "server_error",
+        "internal server error",
+    ];
+    if TRANSIENT_PHRASES
+        .iter()
+        .any(|needle| combined.contains(needle))
+    {
+        return true;
+    }
+    ["429", "529", "503", "502", "504"]
+        .iter()
+        .any(|code| contains_http_status(&combined, code))
+}
+
+fn contains_http_status(lower: &str, code: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let mut offset = 0;
+    while let Some(pos) = lower[offset..].find(code) {
+        let start = offset + pos;
+        let end = start + code.len();
+        let before_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let after_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            let prefix = lower[..start].trim_end();
+            let false_ctx = [
+                "line",
+                "col",
+                "column",
+                "port",
+                "offset",
+                "byte",
+                "bytes",
+                "pid",
+                "exit code",
+            ]
+            .iter()
+            .any(|word| prefix.ends_with(word));
+            if !false_ctx {
+                return true;
+            }
+        }
+        offset = end;
+    }
+    false
+}
+
+/// Sleeps up to `duration` in short slices; returns `true` if cancelled.
+pub(super) fn sleep_interruptible(
+    duration: Duration,
+    cancel: &AtomicBool,
+    abort: Option<&AtomicBool>,
+) -> bool {
+    if duration.is_zero() {
+        return cancel.load(Ordering::Relaxed)
+            || abort.is_some_and(|flag| flag.load(Ordering::Relaxed));
+    }
+    let deadline = std::time::Instant::now() + duration;
+    loop {
+        if cancel.load(Ordering::Relaxed) || abort.is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+}
+
+/// Runs workflow + stage lifecycle hooks for `event` at stage `index`.
+pub(super) fn run_stage_hooks(
+    run: &mut Run,
+    index: usize,
+    event: crate::hooks::HookEvent,
+    directory: &Path,
+    reattached: bool,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(Event),
+) -> Result<crate::hooks::HookRun> {
+    let stage = run.workflow.stages[index].clone();
+    let configured = run.workflow.hooks_for(Some(&stage), event);
+    if configured.is_empty() {
+        return Ok(crate::hooks::HookRun::default());
+    }
+    if reattached {
+        if let Err(error) = crate::trust::authorize_run(run) {
+            emit(Event::Output(format!(
+                "[hook {}] skipped on reattached stage: {error:#}\n",
+                event.label()
+            )));
+            return Ok(crate::hooks::HookRun::default());
+        }
+    }
+    let ctx = crate::hooks::HookContext {
+        run_id: run.id.clone(),
+        workflow: run.workflow.name.clone(),
+        stage_id: Some(stage.id.clone()),
+        stage_role: Some(stage.role.label().into()),
+        stage_status: matches!(
+            event,
+            crate::hooks::HookEvent::AfterStage | crate::hooks::HookEvent::OnFailure
+        )
+        .then(|| run.stages[index].status.as_str().into()),
+    };
+    let workspace = run.workspace.clone();
+    let result = crate::hooks::run(
+        event,
+        &configured,
+        &ctx,
+        &workspace,
+        directory,
+        cancel,
+        None,
+        |group| {
+            let is_some = group.is_some();
+            if let Some(attempt) = run.stages[index].attempts.last_mut() {
+                attempt.set_group(group);
+            }
+            if is_some {
+                run.persist()?;
+            }
+            Ok(())
+        },
+        |text| emit(Event::Output(text)),
+    )?;
+    if let Some(group) = &result.survivor {
+        if run.retained_groups.iter().all(|g| g.pgid != group.pgid) {
+            run.retained_groups.push(group.clone());
+        }
+    }
+    Ok(result)
+}
+
+/// Runs `after_stage` and (on Failed/Blocked) `on_failure` hooks for stage
+/// `index`, logging results without ever masking the stage's status or error.
+/// When a hook ran, the attempt's `tree_after` is taken again, so files the
+/// hooks changed are part of the stage's recorded changes.
+pub(super) fn run_post_stage_hooks(
+    run: &mut Run,
+    index: usize,
+    directory: &Path,
+    reattached: bool,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(Event),
+) {
+    let status = run.stages[index].status;
+    if status == Status::Cancelled {
+        return;
+    }
+    let mut ran = run_stage_hooks(
+        run,
+        index,
+        crate::hooks::HookEvent::AfterStage,
+        directory,
+        reattached,
+        cancel,
+        emit,
+    )
+    .map_or(true, |hooks| !hooks.results.is_empty());
+    if matches!(status, Status::Failed | Status::Blocked) {
+        ran |= run_stage_hooks(
+            run,
+            index,
+            crate::hooks::HookEvent::OnFailure,
+            directory,
+            reattached,
+            cancel,
+            emit,
+        )
+        .map_or(true, |hooks| !hooks.results.is_empty());
+    }
+    if ran {
+        let tree = snapshot::tree(&run.workspace, &run.directory);
+        if let Some(attempt) = run.stages[index].attempts.last_mut() {
+            if tree.is_some() {
+                attempt.tree_after = tree;
+            }
+        }
+    }
+}
+
+/// Prepares the current stage's attempt, runs `before_stage` hooks, and
+/// announces it; None when preparation or a `before_stage` hook failed.
+pub(super) fn start_stage(
+    run: &mut Run,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(Event),
+) -> Result<Option<Prepared>> {
+    start_stage_inner(run, cancel, true, emit)
+}
+
+pub(super) fn start_stage_inner(
+    run: &mut Run,
+    cancel: &AtomicBool,
+    run_before_hooks: bool,
+    emit: &mut impl FnMut(Event),
+) -> Result<Option<Prepared>> {
     let index = run.cursor;
     let attempts = run.stages[index].attempts.len();
     let prepared = match prepare(run) {
@@ -796,11 +1079,48 @@ pub(super) fn start_stage(run: &mut Run, emit: &mut impl FnMut(Event)) -> Result
         if stage.model.is_empty() { "" } else { " " },
         stage.model
     )));
+    if run_before_hooks {
+        let hook_run = run_stage_hooks(
+            run,
+            index,
+            crate::hooks::HookEvent::BeforeStage,
+            &prepared.directory,
+            false,
+            cancel,
+            emit,
+        )?;
+        if hook_run.cancelled {
+            run.stop(
+                Status::Cancelled,
+                "Stage cancelled during before_stage hook. Filesystem changes are retained; retry explicitly".into(),
+                Actor::User,
+                true,
+            )?;
+            run.persist()?;
+            emit(Event::State(Box::new(run.clone())));
+            return Ok(None);
+        }
+        if let Some(error) = hook_run.failed {
+            run.stop(Status::Failed, error, Actor::Engine, true)?;
+            let _ = run_stage_hooks(
+                run,
+                index,
+                crate::hooks::HookEvent::OnFailure,
+                &prepared.directory,
+                false,
+                cancel,
+                emit,
+            );
+            run.persist()?;
+            emit(Event::State(Box::new(run.clone())));
+            return Ok(None);
+        }
+    }
     Ok(Some(prepared))
 }
 
 /// Finishes the current stage's attempt after its harness ended, records
-/// the workspace snapshot, and saves.
+/// the workspace snapshot, runs post-stage hooks, and saves.
 pub(super) fn conclude(
     run: &mut Run,
     prepared: &Prepared,
@@ -808,17 +1128,49 @@ pub(super) fn conclude(
     cancel: &AtomicBool,
     emit: &mut impl FnMut(Event),
 ) -> Result<()> {
+    conclude_inner(run, prepared, result, None, None, true, cancel, emit)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn conclude_inner(
+    run: &mut Run,
+    prepared: &Prepared,
+    result: Result<process::Outcome>,
+    live_usage: Option<handoff::Usage>,
+    budget_exceeded: Option<String>,
+    run_hooks: bool,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(Event),
+) -> Result<()> {
     let index = run.cursor;
-    let fresh_tree = match finish(run, prepared, result, cancel, emit) {
-        Ok(tree) => tree,
-        Err(error) => {
-            run.stop(
-                Status::Failed,
-                format!("Could not complete stage bookkeeping: {error:#}"),
-                Actor::Engine,
-                true,
-            )?;
-            None
+    let aborted_by_budget = result.as_ref().is_ok_and(|o| o.cancelled)
+        && !cancel.load(Ordering::Relaxed)
+        && budget_exceeded.is_some();
+    let fresh_tree = if let Some(reason) = budget_exceeded.filter(|_| aborted_by_budget) {
+        keep_survivor(run, &result);
+        let stdout = prepared.directory.join("stdout.log");
+        if let Some(attempt) = run.stages[index].attempts.last_mut() {
+            if let Ok(outcome) = &result {
+                attempt.exit_code = outcome.code;
+            }
+            attempt.finished_at.get_or_insert_with(Utc::now);
+            attempt.set_group(None);
+            attempt.usage = handoff::usage_file(&stdout, prepared.invocation.kind).or(live_usage);
+        }
+        run.stop(Status::Blocked, reason, Actor::Engine, true)?;
+        None
+    } else {
+        match finish(run, prepared, result, cancel, emit) {
+            Ok(tree) => tree,
+            Err(error) => {
+                run.stop(
+                    Status::Failed,
+                    format!("Could not complete stage bookkeeping: {error:#}"),
+                    Actor::Engine,
+                    true,
+                )?;
+                None
+            }
         }
     };
     // Finishing may move the cursor, so record the stage that ran (unless
@@ -833,9 +1185,52 @@ pub(super) fn conclude(
             attempt.tree_after = tree;
         }
     }
-    run.persist()?;
+    // Without hooks the caller still decides on a transient retry, and saves
+    // once it has: a run stopped only until its retry is never saved stopped.
+    if run_hooks {
+        run_post_stage_hooks(
+            run,
+            index,
+            &prepared.directory,
+            prepared.reattached,
+            cancel,
+            emit,
+        );
+        run.persist()?;
+    }
     emit(Event::State(Box::new(run.clone())));
     Ok(())
+}
+
+/// Returns whether the just-failed stage `index` can be retried transiently.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn should_transient_retry(
+    run: &Run,
+    index: usize,
+    prepared: &Prepared,
+    outcome_ok_not_aborted: bool,
+    retries_done: u32,
+    retry: crate::config::Retry,
+    budget_exceeded: bool,
+    cancel: &AtomicBool,
+) -> bool {
+    if budget_exceeded
+        || cancel.load(Ordering::Relaxed)
+        || !outcome_ok_not_aborted
+        || retries_done >= retry.max_attempts
+        || run.stages[index].status != Status::Failed
+    {
+        return false;
+    }
+    let message = run.stages[index]
+        .attempts
+        .last()
+        .and_then(|a| a.error.as_deref())
+        .or(run.error.as_deref())
+        .unwrap_or("");
+    let stderr_tail =
+        process::read_tail(&prepared.directory.join("stderr.log"), 4096).unwrap_or_default();
+    is_transient_error(message, &stderr_tail)
 }
 
 /// An interactive stage gets its session and the run's held locks, which go
@@ -847,12 +1242,11 @@ pub(super) fn execute_stage(
     emit: &mut impl FnMut(Event),
 ) -> Result<()> {
     let index = run.cursor;
-    let Some(prepared) = start_stage(run, emit)? else {
-        return Ok(());
-    };
-    let workspace = run.workspace.clone();
-    // Recorded so a later drive can stop the group if mr dies meanwhile.
-    let result = if let Some((session, held)) = interactive {
+    if let Some((session, held)) = interactive {
+        let Some(prepared) = start_stage(run, cancel, emit)? else {
+            return Ok(());
+        };
+        let workspace = run.workspace.clone();
         let locks = lock_paths(run)?;
         let result = process::interactive(
             &prepared.invocation,
@@ -875,11 +1269,31 @@ pub(super) fn execute_stage(
         if left_running(run, &result, session, held, emit)? {
             return Ok(());
         }
-        result
-    } else {
+        return conclude(run, &prepared, result, cancel, emit);
+    }
+
+    let retry = run.workflow.stages[index].effective_retry(&run.workflow);
+    let stage_timeout = Duration::from_secs(run.workflow.stages[index].timeout_seconds);
+    let stage_started = std::time::Instant::now();
+    let mut retries_done = 0u32;
+    let retry_from = run.stages[index].attempts.len();
+
+    loop {
+        let Some(mut prepared) = start_stage_inner(run, cancel, retries_done == 0, emit)? else {
+            return Ok(());
+        };
+        prepared.retry_from = Some(retry_from);
+        let workspace = run.workspace.clone();
         // Events become readable lines; stdout.log keeps them raw.
         let mut formatter = events::Formatter::new(prepared.invocation.kind);
-        let timeout = Duration::from_secs(run.workflow.stages[index].timeout_seconds);
+        let live_budget = crate::cost::LiveBudgetMonitor::for_stage(run, index);
+        let mut usage_tracker = handoff::UsageTracker::new(prepared.invocation.kind);
+        let budget_abort = AtomicBool::new(false);
+        let mut budget_exceeded: Option<String> = None;
+
+        let remaining_timeout = stage_timeout
+            .saturating_sub(stage_started.elapsed())
+            .max(Duration::from_secs(1));
         // Config validation rejects a stall timeout on a harness that
         // prints only at exit; a run whose harness was replaced since never
         // applies one.
@@ -887,13 +1301,14 @@ pub(super) fn execute_stage(
             .stall_timeout_seconds
             .filter(|_| adapters::streams(&run.workflow.stages[index].harness, &run.adapters))
             .map(Duration::from_secs);
-        let result = process::capture_with_stall(
+        let result = process::capture_with_controls(
             &prepared.invocation,
             &workspace,
             &prepared.directory,
-            timeout,
+            remaining_timeout,
             stall_timeout,
             cancel,
+            &[&budget_abort],
             prepared.sandbox.as_ref(),
             |group| {
                 if let Some(attempt) = run.stages[index].attempts.last_mut() {
@@ -907,17 +1322,151 @@ pub(super) fn execute_stage(
                         "[stderr] {}",
                         storage::clean_terminal(text)
                     )));
-                } else if let Some(lines) = formatter.push(text) {
-                    emit(Event::Output(lines));
+                } else {
+                    if let Some(monitor) = &live_budget {
+                        if budget_exceeded.is_none() {
+                            if let Some(live_usage) = usage_tracker.push(text) {
+                                if let Some(reason) = monitor.check(live_usage) {
+                                    budget_exceeded = Some(reason.clone());
+                                    budget_abort.store(true, Ordering::Relaxed);
+                                    emit(Event::Output(format!("\n{reason}\n")));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(lines) = formatter.push(text) {
+                        emit(Event::Output(lines));
+                    }
                 }
             },
         );
         if let Some(rest) = formatter.finish() {
             emit(Event::Output(rest));
         }
-        result
-    };
-    conclude(run, &prepared, result, cancel, emit)
+        let outcome_ok_not_aborted = result
+            .as_ref()
+            .is_ok_and(|o| !o.cancelled && !o.timed_out && !o.stalled);
+        let had_budget_exceed =
+            budget_exceeded.is_some() && result.as_ref().is_ok_and(|o| o.cancelled);
+        let live_usage = usage_tracker.current();
+
+        conclude_inner(
+            run,
+            &prepared,
+            result,
+            live_usage,
+            budget_exceeded,
+            false,
+            cancel,
+            emit,
+        )?;
+
+        if should_transient_retry(
+            run,
+            index,
+            &prepared,
+            outcome_ok_not_aborted,
+            retries_done,
+            retry,
+            had_budget_exceed,
+            cancel,
+        ) {
+            match crate::cost::check_budget_action(run) {
+                crate::cost::BudgetCheck::Ok => {}
+                crate::cost::BudgetCheck::Warn(warning) => {
+                    emit(Event::Output(format!("{warning}\n")));
+                }
+                crate::cost::BudgetCheck::Stop(reason) => {
+                    run.cursor = index;
+                    run.set(
+                        Target::Stage(index),
+                        Status::Pending,
+                        Actor::Engine,
+                        "Budget check before retry",
+                    )?;
+                    run.set(
+                        Target::Run,
+                        Status::Pending,
+                        Actor::Engine,
+                        "Budget check before retry",
+                    )?;
+                    run.stop(Status::Blocked, reason, Actor::Engine, false)?;
+                    run_post_stage_hooks(run, index, &prepared.directory, false, cancel, emit);
+                    run.persist()?;
+                    emit(Event::State(Box::new(run.clone())));
+                    return Ok(());
+                }
+            }
+            let next_retry = retries_done + 1;
+            let delay = retry.delay_for(next_retry);
+            let remaining = stage_timeout.saturating_sub(stage_started.elapsed());
+            if remaining.is_zero() || (!delay.is_zero() && delay >= remaining) {
+                emit(Event::Output(format!(
+                    "Transient retry {next_retry}/{} skipped: stage timeout budget exhausted\n",
+                    retry.max_attempts
+                )));
+                run_post_stage_hooks(run, index, &prepared.directory, false, cancel, emit);
+                run.persist()?;
+                emit(Event::State(Box::new(run.clone())));
+                return Ok(());
+            }
+            let stage = &run.workflow.stages[index];
+            let err_summary = run.error.as_deref().unwrap_or("transient error");
+            emit(Event::Output(format!(
+                "Transient failure ({}); retrying {next_retry}/{} in {}s with {}{}{}\n",
+                storage::truncate(err_summary.lines().next().unwrap_or(""), 160),
+                retry.max_attempts,
+                delay.as_secs(),
+                stage.harness,
+                if stage.model.is_empty() { "" } else { " " },
+                stage.model
+            )));
+            // Saved waiting, not stopped: the run only stops if the retry
+            // never happens, so metrics see one run_end.
+            let reason = format!(
+                "Transient error retry {next_retry}/{} after {}s backoff",
+                retry.max_attempts,
+                delay.as_secs()
+            );
+            run.cursor = index;
+            run.error = None;
+            run.set(
+                Target::Stage(index),
+                Status::Pending,
+                Actor::Engine,
+                &reason,
+            )?;
+            run.set(Target::Run, Status::Pending, Actor::Engine, &reason)?;
+            run.persist()?;
+            emit(Event::State(Box::new(run.clone())));
+            if sleep_interruptible(delay, cancel, None) {
+                run.cursor = index;
+                run.stop(
+                    Status::Cancelled,
+                    "Stage cancelled during transient retry backoff. Filesystem changes are retained; retry explicitly".into(),
+                    Actor::User,
+                    false,
+                )?;
+                run.persist()?;
+                emit(Event::State(Box::new(run.clone())));
+                return Ok(());
+            }
+            retries_done = next_retry;
+            continue;
+        }
+
+        run_post_stage_hooks(
+            run,
+            index,
+            &prepared.directory,
+            prepared.reattached,
+            cancel,
+            emit,
+        );
+        run.persist()?;
+        emit(Event::State(Box::new(run.clone())));
+        return Ok(());
+    }
 }
 
 /// True when the interactive harness was released to its terminal host and
@@ -1003,6 +1552,7 @@ pub(super) fn reprepare(run: &Run) -> Result<Prepared> {
         directory,
         handoff_file: attempt.handoff_file.clone(),
         reattached: true,
+        retry_from: None,
     })
 }
 

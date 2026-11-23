@@ -28,6 +28,7 @@ pub(super) enum ActionId {
     ChooseWorkflow,
     RenameWorkflow,
     DeleteWorkflow,
+    WorkflowSettings,
     PreviousStage,
     NextStage,
     EditStage,
@@ -79,7 +80,13 @@ pub(super) enum ActionId {
     FilterRuns,
     CycleStatus,
     Rerun,
+    ForkRun,
+    ShipRun,
     CompareAttempts,
+    HandoffsView,
+    TransitionsView,
+    DelegatedTasks,
+    Schedules,
     CleanUp,
     // Harnesses
     PreviousHarness,
@@ -320,6 +327,7 @@ const ACTIONS: &[Entry] = {
         act(ChooseWorkflow, Workflow, ch('w'), "switch", "Select/clone workflow or add a preset").menu(WorkflowMenu, 'w'),
         act(RenameWorkflow, Workflow, ch('R'), "rename", "Rename workflow").menu(WorkflowMenu, 'r'),
         act(DeleteWorkflow, Workflow, ch('X'), "delete", "Delete workflow ([y] confirms; [u] undoes)").menu(WorkflowMenu, 'X'),
+        act(WorkflowSettings, Workflow, ch('W'), "settings", "Edit workflow settings (repairs, parallel, sandbox, protected paths, handoff repair, budget)").menu(WorkflowMenu, 'W'),
         act(PreviousStage, Workflow, key(KeyCode::Left), "stage", "Select previous stage").also(&[key(KeyCode::Up), ch('k')]).alias("←→"),
         act(NextStage, Workflow, key(KeyCode::Right), "stage", "Select next stage").also(&[key(KeyCode::Down), ch('j')]).alias("←→"),
         act(EditStage, Workflow, ch('e'), "edit", "Edit selected stage").also(&[key(KeyCode::Enter)]).alias("e").footer().menu(Stage, 'e'),
@@ -351,7 +359,7 @@ const ACTIONS: &[Entry] = {
             .menu(RunMenu, 't'),
         act(CloseRun, MonitorIdle, ch('x'), "close", "Close this run in the session; its files stay and it moves to Saved").menu(RunMenu, 'x'),
         act(AllowRepair, MonitorIdle, ch('R'), "allow repair", "Allow one more review repair pass when the repair limit stopped the run ([y] confirms)").footer().menu(RunMenu, 'R'),
-        act(RaiseBudget, MonitorIdle, ch('B'), "raise budget", "Raise the USD cap a budget stopped the run on, then continue ([y] confirms)").footer().menu(RunMenu, 'B'),
+        act(RaiseBudget, MonitorIdle, ch('B'), "raise budget", "Raise the USD or token cap a budget stopped the run on, then continue ([y] confirms)").footer().menu(RunMenu, 'B'),
         act(Advance, MonitorIdle, ch('a'), "advance", "Accept handoff and advance; also accepts a test stage's not-applicable waiver").footer().menu(RunMenu, 'a'),
         act(Continue, MonitorIdle, ch('c'), "continue", "Continue the run when idle (not in the moment a stage stops)").footer().menu(RunMenu, 'c'),
         act(Retry, MonitorIdle, ch('y'), "retry", "Explicitly retry current stage").footer().menu(RunMenu, 'y'),
@@ -394,7 +402,13 @@ const ACTIONS: &[Entry] = {
             .menu(View, 'F'),
         act(CycleStatus, Runs, ch('s'), "status", "Cycle the saved runs shown: all, active, complete, failed/blocked, cancelled, damaged").footer_in(&[Runs]).menu(View, 's'),
         act(Rerun, Runs, ch('n'), "rerun", "Rerun the selected run as a new run from its saved snapshot (confirm first)").footer_in(&[Runs]).menu(RunMenu, 'n'),
+        act(ForkRun, Runs, ch('K'), "fork", "Fork the selected run from a stage checkpoint in an isolated worktree").menu(RunMenu, 'K'),
+        act(ShipRun, Runs, ch('S'), "ship", "Preview and ship a completed run onto a new branch (confirms first)").menu(RunMenu, 'S'),
         act(CompareAttempts, Runs, ch('='), "compare", "Compare two attempts of a stage of the selected run").menu(View, 'c'),
+        act(HandoffsView, Runs, ch('H'), "handoffs", "Inspect upstream handoff budget, truncation, and loss warnings").menu(View, 'H'),
+        act(TransitionsView, Runs, ch('l'), "timeline", "Show the run's status transitions timeline (transitions.jsonl)").menu(View, 'l'),
+        act(DelegatedTasks, Runs, ch('g'), "tasks", "Inspect delegated tasks, handoffs, sealed patches, and cancel a running task").menu(View, 'g'),
+        act(Schedules, Runs, ch('u'), "schedules", "List and manage scheduled runs (approve, pause, enable, delete)").menu(RunMenu, 'u'),
         act(CleanUp, Runs, ch('D'), "clean", "Preview removing the selected saved run and its artifacts ([y] confirms)").menu_in(RunMenu, 'D', &[Runs]),
         // Harnesses
         act(PreviousHarness, Harnesses, key(KeyCode::Up), "select", "Select previous harness").also(&[ch('k')]).alias("↑↓").footer(),
@@ -435,7 +449,7 @@ const ACTIONS: &[Entry] = {
         act(Notifications, Global, key(KeyCode::F(9)), "notifications", "Notifications…: terminal, desktop, and webhook backends, with a test")
             .more(&["Sent when a run needs input, stops blocked or failed, or completes (saved for all projects)"])
             .menu(View, 'N'),
-        act(Tour, Global, key(KeyCode::F(1)), "tour", "Show or hide the getting-started tour, which walks you to a first completed run").menu(View, 'g'),
+        act(Tour, Global, key(KeyCode::F(1)), "tour", "Show or hide the getting-started tour, which walks you to a first completed run").menu(View, 'G'),
         act(Interrupt, Global, ctrl('c'), "cancel/exit", "Cancel work, or exit (asks to save unsaved edits)"),
     ]
 };

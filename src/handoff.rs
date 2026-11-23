@@ -725,7 +725,9 @@ mod normalize;
 mod usage;
 
 pub use normalize::{Normalized, ProtocolError, normalize, session_id};
-pub use usage::{SessionRoots, Usage, session_usage, session_usage_in, usage, usage_file};
+pub use usage::{
+    SessionRoots, Usage, UsageTracker, session_usage, session_usage_in, usage, usage_file,
+};
 
 #[cfg(test)]
 mod tests {

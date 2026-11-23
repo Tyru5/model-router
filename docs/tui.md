@@ -116,6 +116,7 @@ says how many stages are on, the repair limit, and where the run works.
 | `p` | Repository browser ([below](#repository-browser)) |
 | `w` | Select/clone a workflow or add a workflow preset |
 | `R` / `X` | Rename / delete workflow (`y` confirms) |
+| `W` | Workflow settings editor (repairs, parallel limit, default sandbox, handoff repair, workflow budget, protected paths) |
 | `←` `→` / `↑` `↓` / `k` `j` | Select stage |
 | `e` / `Enter` | Stage editor |
 | `c` | Harness settings for the stage ([below](#harness-settings)) |
@@ -139,9 +140,12 @@ stats favour another assignment.
 ### Stage editor
 
 `e` opens every stage field: Name, Role, Harness, Model, Provider, Reasoning
-effort, Execution, Timeout, Review repair target, Extra arguments, Run after,
-Fan-out candidates, Router checks, Router sandbox, Stage instructions, Ship
-options. See [configuration.md](configuration.md#workflowsstages) for values.
+effort, Execution, Billing (`default`/`api`/`subscription`), Timeout, Stage
+budget (`max_usd`, `max_tokens`, `on_exceed`), Review repair target, Extra
+arguments, Run after, Fan-out candidates, Router checks, Require router checks,
+Router sandbox, Sandbox writable paths, Sandbox network, Sandbox fallback,
+Delegation (TOML), Stage instructions, Ship options. See
+[configuration.md](configuration.md#workflowsstages) for values.
 
 - `↑`/`↓`, `Tab`/`Shift+Tab`, `Ctrl+N`/`Ctrl+P` move between fields; in
   multiline fields `↑`/`↓` move by line and leave from the first/last line.
@@ -222,7 +226,13 @@ The tab counts active runs (`2 Runs ●2`). The header shows
 | `F` | Filter saved runs by ID, workflow, task, status (`Enter` keeps, `Esc` clears) |
 | `s` | Cycle saved runs shown: all, active, complete, failed/blocked, cancelled, damaged |
 | `n` | Rerun the selected run from its saved snapshot (confirm) |
+| `K` | Fork the selected run from a stage checkpoint in an isolated Git worktree (optional model override) |
+| `S` | Preview and ad-hoc ship a completed run onto a new branch (`y` confirms; never commits without confirmation) |
 | `=` | Compare two attempts of a stage |
+| `H` | Inspect upstream handoff budget, truncation, and loss warnings |
+| `l` | Show the run's status transitions timeline (`transitions.jsonl`) |
+| `g` | Inspect delegated tasks (`h` handoff, `d` sealed patch diff, `C` cancel a single running task without cancelling the parent stage) |
+| `u` | Schedules dialog (`.model-router/schedules.json`: `a` approve respecting project trust, `p` pause, `e` enable, `D` delete) |
 | `D` | Preview removing a saved run (`y` confirms); close a session's run with `x` first |
 | `r` | Reload saved runs and sizes |
 
@@ -245,7 +255,7 @@ The saved list loads in the background and refreshes while runs are active.
 | `y` | idle | Retry current stage |
 | `Y` | idle | Retry one failed fan-out candidate (pick from a list) |
 | `R` | idle | Allow one more review repair pass when the repair limit stopped the run (`y` confirms) |
-| `B` | idle | Raise the USD cap a budget stopped the run on, then continue (`y` confirms) |
+| `B` | idle | Raise the USD or token cap a budget stopped the run on, then continue (`y` confirms) |
 | `i` | idle | Retry interactively |
 | `m` | idle | Replace model and retry |
 | `e` | idle | Edit an interactive handoff summary |
@@ -289,11 +299,12 @@ for that stop:
 - Repair limit: `R` asks to allow one more repair pass, saying how many ran
   and the limit, then sends the review's findings back to the implementation
   stage. Same as `resume RUN_ID --allow-repair`.
-- USD budget cap: `B` prompts for a new amount (`Ctrl+S` applies), showing the
-  cap and spend. It must exceed both; then `y` confirms and the run continues.
-  The run's cap and any exceeded stage cap become the amount, as with
-  `resume RUN_ID --budget-usd N`. A retry is not offered, since it would stop
-  on the same cap. A token cap is raised with `--budget-tokens N`.
+- Budget cap (USD or tokens): `B` prompts for a new USD amount or token count
+  (`Ctrl+S` applies), showing the cap and spend. It must exceed both; then `y`
+  confirms and the run continues. The run's cap and any exceeded stage cap
+  become the amount, as with `resume RUN_ID --budget-usd N` or
+  `--budget-tokens N`. A retry is not offered, since it would stop on the same
+  cap.
 
 ### Output search
 

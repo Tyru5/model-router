@@ -1,6 +1,8 @@
-//! Workflow path policies (`protected_paths`) and pre-ship secret scanning.
+//! Workflow path policies (`protected_paths`), declarative diff policies
+//! (`policies`), and pre-ship secret scanning.
 //! No shell evaluates any command; external scanners run as argument vectors.
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::{
     io::Read,
     path::Path,
@@ -108,6 +110,384 @@ pub fn protected_detail(patterns: &[String], paths: &[String]) -> Option<String>
             .collect::<Vec<_>>()
             .join(", ")
     })
+}
+
+/// What a declarative diff policy does when it matches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyAction {
+    /// Block stage completion, candidate selection, apply, and ship on any match
+    /// in added diff lines.
+    #[default]
+    Block,
+    /// Inject the policy message into review stage prompts when matching files
+    /// (and optional line pattern) are touched.
+    Advise,
+}
+impl PolicyAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Advise => "advise",
+        }
+    }
+}
+
+/// Declarative workflow diff policy (`[[workflows.policies]]`).
+///
+/// Pattern syntax (bounded, non-backtracking — never ReDoS):
+/// - Plain text (default): case-sensitive literal substring match against each
+///   added diff line (safe for code containing `*` or `?`).
+/// - `i:<text>`: case-insensitive literal substring match.
+/// - `word:<text>`: case-sensitive match bounded by non-identifier characters
+///   (`!(alphanumeric || '_')`).
+/// - `any:<a|b|c>`: matches if any non-empty `|`-separated literal substring
+///   matches.
+/// - `glob:<pattern>`: whole-line glob match (`*` = any chars, `?` = one char),
+///   evaluated with the linear/bounded two-pointer matcher.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiffPolicy {
+    pub name: String,
+    pub action: PolicyAction,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pattern: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    pub message: String,
+}
+
+impl DiffPolicy {
+    /// Whether this policy applies to repository-relative `path`. An empty
+    /// `paths` list matches every file.
+    pub fn matches_path(&self, path: &str) -> bool {
+        self.paths.is_empty() || self.paths.iter().any(|pat| matches_glob(pat, path))
+    }
+}
+
+/// Matches an added diff line against a declarative policy `pattern`.
+///
+/// Reads the whole line: a match anywhere in it counts. No regex engine, so
+/// no catastrophic backtracking: literal modes are linear in the line, and
+/// `word:` and `glob:` are at most linear in the line times the pattern's
+/// length, which comes from the workflow, not from the diff.
+pub fn matches_line_pattern(pattern: &str, line: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    if let Some(rest) = pattern.strip_prefix("i:") {
+        if rest.is_empty() {
+            return false;
+        }
+        return line.to_lowercase().contains(&rest.to_lowercase());
+    }
+    if let Some(rest) = pattern.strip_prefix("glob:") {
+        if rest.is_empty() {
+            return false;
+        }
+        return match_segment(rest, line);
+    }
+    if let Some(rest) = pattern.strip_prefix("word:") {
+        if rest.is_empty() {
+            return false;
+        }
+        return contains_word(line, rest);
+    }
+    if let Some(rest) = pattern.strip_prefix("any:") {
+        return rest
+            .split('|')
+            .filter(|part| !part.is_empty())
+            .any(|part| line.contains(part));
+    }
+    line.contains(pattern)
+}
+
+fn is_ident_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn contains_word(line: &str, word: &str) -> bool {
+    let mut offset = 0;
+    while let Some(pos) = line[offset..].find(word) {
+        let start = offset + pos;
+        let end = start + word.len();
+        let before_ok = line[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_ident_char(c));
+        let after_ok = line[end..].chars().next().is_none_or(|c| !is_ident_char(c));
+        if before_ok && after_ok {
+            return true;
+        }
+        let step = line[start..].chars().next().map_or(1, char::len_utf8);
+        offset = start + step;
+    }
+    false
+}
+
+/// A path from a diff header as the repository names it. Git C-quotes a path
+/// with a `"`, `\`, or control character (and, unless `core.quotePath` is
+/// false, any non-ASCII byte); this undoes that quoting so `paths` globs see
+/// the real path. An unquoted path is returned as is.
+fn unquote_diff_path(raw: &str) -> String {
+    let Some(inner) = raw
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return raw.to_owned();
+    };
+    let mut out = Vec::with_capacity(inner.len());
+    let mut bytes = inner.bytes().peekable();
+    while let Some(byte) = bytes.next() {
+        if byte != b'\\' {
+            out.push(byte);
+            continue;
+        }
+        let Some(escaped) = bytes.next() else {
+            out.push(b'\\');
+            break;
+        };
+        match escaped {
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            b'0'..=b'7' => {
+                let mut value = u32::from(escaped - b'0');
+                for _ in 0..2 {
+                    let Some(digit) = bytes.next_if(|d| matches!(d, b'0'..=b'7')) else {
+                        break;
+                    };
+                    value = value * 8 + u32::from(digit - b'0');
+                }
+                out.push((value & 0xff) as u8);
+            }
+            other => out.push(other),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// One declarative diff policy match on an added diff line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyHit {
+    pub policy: String,
+    pub file: String,
+    pub line: usize,
+    pub message: String,
+}
+
+impl std::fmt::Display for PolicyHit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{} [{}] {}",
+            self.file, self.line, self.policy, self.message
+        )
+    }
+}
+
+/// Streams a unified Git diff line by line and checks all `block` policies
+/// against added lines in matching paths.
+#[derive(Debug)]
+pub struct PolicyScan<'a> {
+    policies: Vec<&'a DiffPolicy>,
+    state: DiffState,
+    file: String,
+    line_no: usize,
+    hits: Vec<PolicyHit>,
+    more: usize,
+}
+
+impl<'a> PolicyScan<'a> {
+    pub fn new(policies: &'a [DiffPolicy]) -> Self {
+        Self::with_action(policies, PolicyAction::Block)
+    }
+
+    pub fn with_action(policies: &'a [DiffPolicy], action: PolicyAction) -> Self {
+        Self {
+            policies: policies
+                .iter()
+                .filter(|p| p.action == action && !p.pattern.is_empty())
+                .collect(),
+            state: DiffState::Header,
+            file: String::new(),
+            line_no: 0,
+            hits: vec![],
+            more: 0,
+        }
+    }
+
+    pub fn is_empty_rules(&self) -> bool {
+        self.policies.is_empty()
+    }
+
+    /// Feeds the next diff line (without its trailing newline).
+    pub fn line(&mut self, raw: &str) {
+        if self.policies.is_empty() {
+            return;
+        }
+        let raw = raw.strip_suffix('\r').unwrap_or(raw);
+        if raw.starts_with("diff --git ") {
+            self.state = DiffState::Header;
+            self.file.clear();
+            return;
+        }
+        if let Some(hunk) = raw.strip_prefix("@@ ") {
+            self.state = DiffState::Hunk;
+            self.line_no = hunk
+                .split('+')
+                .nth(1)
+                .and_then(|plus| plus.split([',', ' ']).next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(1);
+            return;
+        }
+        match self.state {
+            DiffState::Header => {
+                if let Some(rest) = raw.strip_prefix("+++ ") {
+                    let rest = rest.strip_suffix('\t').unwrap_or(rest);
+                    let path = unquote_diff_path(rest);
+                    self.file = path.strip_prefix("b/").unwrap_or(&path).to_owned();
+                }
+            }
+            DiffState::Hunk => {
+                if let Some(added) = raw.strip_prefix('+') {
+                    for policy in &self.policies {
+                        if policy.matches_path(&self.file)
+                            && matches_line_pattern(&policy.pattern, added)
+                        {
+                            if self.hits.len() < MAX_HITS {
+                                self.hits.push(PolicyHit {
+                                    policy: policy.name.clone(),
+                                    file: self.file.clone(),
+                                    line: self.line_no,
+                                    message: policy.message.clone(),
+                                });
+                            } else {
+                                self.more += 1;
+                            }
+                        }
+                    }
+                    self.line_no = self.line_no.saturating_add(1);
+                } else if raw.starts_with(' ') || raw.is_empty() {
+                    self.line_no = self.line_no.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    pub fn hits(&self) -> &[PolicyHit] {
+        &self.hits
+    }
+
+    pub fn ensure_clean(&self, found_in: &str, refusing: &str) -> Result<()> {
+        if self.hits.is_empty() {
+            return Ok(());
+        }
+        let mut list = self
+            .hits
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        if self.more > 0 {
+            list.push_str(&format!("; and {} more", self.more));
+        }
+        bail!("Diff policy blocked{found_in}; {refusing}: {list}")
+    }
+}
+
+/// Returns whether `policies` contains any blocking diff policies.
+pub fn has_block_policies(policies: &[DiffPolicy]) -> bool {
+    policies
+        .iter()
+        .any(|p| p.action == PolicyAction::Block && !p.pattern.is_empty())
+}
+
+/// Scans a unified diff string against blocking `policies`.
+pub fn scan_diff_policies(policies: &[DiffPolicy], diff: &str) -> Vec<PolicyHit> {
+    let mut scan = PolicyScan::new(policies);
+    for raw in diff.lines() {
+        scan.line(raw);
+    }
+    scan.hits
+}
+
+/// Scans the text diff between Git trees `from` and `to` in repository `dir`
+/// against blocking `policies`, failing closed if the diff cannot be read.
+/// Reads it as `snapshot::patch_lines` does for stage, apply, and ship scans:
+/// files Git calls binary as text, and non-ASCII paths unquoted.
+pub fn scan_tree_policies(
+    policies: &[DiffPolicy],
+    dir: &Path,
+    (from, to): (&str, &str),
+    found_in: &str,
+    refusing: &str,
+) -> Result<()> {
+    if !has_block_policies(policies) {
+        return Ok(());
+    }
+    let mut scan = PolicyScan::new(policies);
+    crate::snapshot::patch_lines(dir, from, to, |line| scan.line(line))
+        .with_context(|| format!("Read the diff to verify workflow policies; {refusing}"))?;
+    scan.ensure_clean(found_in, refusing)
+}
+
+/// An advisory policy matched against the run's changed files (and optional diff
+/// pattern), ready to inject into a review stage prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvisoryMatch {
+    pub name: String,
+    pub message: String,
+    pub files: Vec<String>,
+}
+
+/// Evaluates `advise` policies against `changed_files`, optionally using
+/// `diff_lines` for policies that also specify a `pattern`.
+pub fn advisory_matches(
+    policies: &[DiffPolicy],
+    changed_files: &[String],
+    diff_hits: &[PolicyHit],
+) -> Vec<AdvisoryMatch> {
+    let mut out = vec![];
+    for policy in policies.iter().filter(|p| p.action == PolicyAction::Advise) {
+        if !policy.pattern.is_empty() {
+            let mut files: Vec<String> = diff_hits
+                .iter()
+                .filter(|h| h.policy == policy.name)
+                .map(|h| h.file.clone())
+                .collect();
+            files.sort();
+            files.dedup();
+            if !files.is_empty() {
+                out.push(AdvisoryMatch {
+                    name: policy.name.clone(),
+                    message: policy.message.clone(),
+                    files,
+                });
+            }
+        } else {
+            let mut files: Vec<String> = changed_files
+                .iter()
+                .filter(|path| policy.matches_path(path))
+                .cloned()
+                .collect();
+            files.sort();
+            files.dedup();
+            if !files.is_empty() {
+                out.push(AdvisoryMatch {
+                    name: policy.name.clone(),
+                    message: policy.message.clone(),
+                    files,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// A high-confidence secret signature found on an added diff line.
@@ -689,5 +1069,176 @@ new file mode 100644
             msg.contains("refusing to ship") && msg.len() < 1500,
             "{msg}"
         );
+    }
+
+    #[test]
+    fn line_pattern_modes_and_bounded_glob_matching() {
+        // Default literal substring is safe for code with * and ?.
+        assert!(matches_line_pattern("unwrap()", "let x = foo().unwrap();"));
+        assert!(matches_line_pattern("foo()?", "let x = foo()?;"));
+        assert!(!matches_line_pattern("foo()?", "let x = foo()!;"));
+        // Case-insensitive substring.
+        assert!(matches_line_pattern("i:fixme", "  // FIXME: remove"));
+        assert!(!matches_line_pattern("i:fixme", "  // fixed"));
+        // Identifier-bounded word match.
+        assert!(matches_line_pattern("word:unsafe", "pub unsafe fn f() {}"));
+        assert!(!matches_line_pattern(
+            "word:unsafe",
+            "let is_unsafe = true;"
+        ));
+        // Alternation.
+        assert!(matches_line_pattern(
+            "any:dbg!(|todo!(",
+            "    todo!(\"x\");"
+        ));
+        assert!(!matches_line_pattern(
+            "any:dbg!(|todo!(",
+            "    println!(\"x\");"
+        ));
+        // Whole-line glob match without catastrophic backtracking.
+        assert!(matches_line_pattern(
+            "glob:*eval(*)*",
+            "const r = eval(code);"
+        ));
+        assert!(!matches_line_pattern(
+            "glob:*eval(*)*",
+            "const r = evaluate(code);"
+        ));
+        let started = Instant::now();
+        let evil_pat = format!("glob:{}x", "*a".repeat(25));
+        let evil_line = "a".repeat(200);
+        assert!(!matches_line_pattern(&evil_pat, &evil_line));
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn line_patterns_match_past_16_kib_of_a_long_line() {
+        let filler = "x".repeat(64 * 1024);
+        let line = format!("{filler} BANNED_CALL(é);");
+        for pattern in [
+            "BANNED_CALL(",
+            "i:banned_call(",
+            "word:BANNED_CALL",
+            "any:nope|BANNED_CALL(",
+            "glob:*BANNED_CALL(*",
+        ] {
+            assert!(matches_line_pattern(pattern, &line), "{pattern}");
+        }
+        assert!(!matches_line_pattern("word:BANNED", &line));
+        // A long hostile line stays fast with a hostile glob.
+        let started = Instant::now();
+        let evil_pat = format!("glob:{}x", "*a".repeat(25));
+        assert!(!matches_line_pattern(&evil_pat, &"a".repeat(256 * 1024)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let policies = vec![DiffPolicy {
+            name: "no-banned".into(),
+            action: PolicyAction::Block,
+            pattern: "BANNED_CALL(".into(),
+            paths: vec![],
+            message: "No banned calls".into(),
+        }];
+        let diff = format!("+++ b/min.js\n@@ -0,0 +1 @@\n+{line}\n");
+        assert_eq!(scan_diff_policies(&policies, &diff).len(), 1);
+    }
+
+    #[test]
+    fn diff_policy_scan_decodes_quoted_paths() {
+        assert_eq!(unquote_diff_path("b/src/lib.rs"), "b/src/lib.rs");
+        assert_eq!(
+            unquote_diff_path(r#""b/src/caf\303\251.rs""#),
+            "b/src/café.rs"
+        );
+        assert_eq!(
+            unquote_diff_path(r#""b/a \"q\" \\ \t\n\0018.rs""#),
+            "b/a \"q\" \\ \t\n\u{1}8.rs"
+        );
+        let policies = vec![DiffPolicy {
+            name: "no-banned".into(),
+            action: PolicyAction::Block,
+            pattern: "BANNED".into(),
+            paths: vec!["src/**".into()],
+            message: "No banned calls".into(),
+        }];
+        let diff = "\
+diff --git \"a/src/caf\\303\\251.rs\" \"b/src/caf\\303\\251.rs\"
+--- /dev/null
++++ \"b/src/caf\\303\\251.rs\"
+@@ -0,0 +1 @@
++BANNED();
+";
+        let hits = scan_diff_policies(&policies, diff);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].file, "src/café.rs");
+    }
+
+    #[test]
+    fn diff_policy_scan_checks_added_lines_and_path_globs() {
+        let policies = vec![
+            DiffPolicy {
+                name: "no-unsafe".into(),
+                action: PolicyAction::Block,
+                pattern: "word:unsafe".into(),
+                paths: vec!["src/**/*.rs".into()],
+                message: "Avoid unsafe blocks in src/".into(),
+            },
+            DiffPolicy {
+                name: "review-sql".into(),
+                action: PolicyAction::Advise,
+                pattern: String::new(),
+                paths: vec!["migrations/**".into()],
+                message: "Verify migration is backwards compatible".into(),
+            },
+        ];
+        let diff = "\
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,2 +1,4 @@
+ fn ok() {}
+-unsafe { old(); }
++let is_unsafe = false;
++unsafe { new(); }
+diff --git a/tests/helper.rs b/tests/helper.rs
+--- a/tests/helper.rs
++++ b/tests/helper.rs
+@@ -1,1 +1,2 @@
++unsafe { allowed_in_tests(); }
+";
+        let hits = scan_diff_policies(&policies, diff);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].policy, "no-unsafe");
+        assert_eq!(hits[0].file, "src/lib.rs");
+        assert_eq!(hits[0].line, 3);
+
+        let advisories = advisory_matches(
+            &policies,
+            &["src/lib.rs".into(), "migrations/001_init.sql".into()],
+            &[],
+        );
+        assert_eq!(advisories.len(), 1);
+        assert_eq!(advisories[0].name, "review-sql");
+        assert_eq!(advisories[0].files, vec!["migrations/001_init.sql"]);
+    }
+
+    #[test]
+    fn scan_tree_fails_closed_when_the_diff_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let policies = vec![DiffPolicy {
+            name: "no-dbg".into(),
+            action: PolicyAction::Block,
+            pattern: "dbg!(".into(),
+            paths: vec![],
+            message: "Remove dbg!".into(),
+        }];
+        let err = scan_tree_policies(
+            &policies,
+            dir.path(),
+            ("missing-from", "missing-to"),
+            " in candidate",
+            "refusing to apply",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("refusing to apply"), "{err:#}");
     }
 }

@@ -17,9 +17,56 @@ use crate::serve::mcp::ToolError;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
     time::Instant,
 };
+
+static TASK_CANCELS: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+
+/// Requests cancellation of a single delegated task of a live delegating stage
+/// without cancelling the parent stage. Returns `true` if a live delegating
+/// stage for `run_id` accepted the request.
+pub fn cancel_delegated_task(run_id: &str, task_id: &str) -> bool {
+    let map = TASK_CANCELS.get_or_init(Default::default);
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(queue) = guard.get_mut(run_id) {
+        if !queue.iter().any(|id| id == task_id) {
+            queue.push(task_id.to_owned());
+        }
+        true
+    } else {
+        false
+    }
+}
+
+struct TaskCancelRegistration(String);
+impl TaskCancelRegistration {
+    fn register(run_id: &str) -> Self {
+        let map = TASK_CANCELS.get_or_init(Default::default);
+        let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+        guard.entry(run_id.to_owned()).or_default();
+        Self(run_id.to_owned())
+    }
+}
+impl Drop for TaskCancelRegistration {
+    fn drop(&mut self) {
+        if let Some(map) = TASK_CANCELS.get() {
+            let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+            guard.remove(&self.0);
+        }
+    }
+}
+
+fn take_task_cancels(run_id: &str) -> Vec<String> {
+    let Some(map) = TASK_CANCELS.get() else {
+        return vec![];
+    };
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .get_mut(run_id)
+        .map(std::mem::take)
+        .unwrap_or_default()
+}
 
 /// How a parent learns of finished tasks: woken through `follow_up`,
 /// waiting in tool calls, or (interactive) told by the user.
@@ -56,8 +103,21 @@ enum Msg {
     /// An interactive parent's terminal host socket.
     Terminal(PathBuf),
     Output(Who, String),
-    ParentDone(Result<process::Outcome>, DateTime<Utc>),
-    TaskDone(String, Result<process::Outcome>, DateTime<Utc>),
+    /// The end, with the usage the live monitor read from the stream (kept
+    /// when a budget stop ends the process before its final usage event).
+    ParentDone(
+        Result<process::Outcome>,
+        DateTime<Utc>,
+        Option<handoff::Usage>,
+    ),
+    TaskDone(
+        String,
+        Result<process::Outcome>,
+        DateTime<Utc>,
+        Option<handoff::Usage>,
+    ),
+    /// A process's live budget monitor saw a stop cap exceeded.
+    BudgetStop(String),
     Call(Call),
     Tick,
 }
@@ -121,6 +181,10 @@ struct Owner<'a> {
     /// run after the hand-over.
     released: Option<Result<process::Outcome>>,
     handed_over: bool,
+    /// Live spend shared by the parent's and the tasks' budget monitors.
+    live_spend: crate::cost::LiveSpend,
+    /// Why a live budget monitor stopped the stage.
+    budget_stop: Option<String>,
 }
 
 /// Runs the current stage, which delegates, to its end.
@@ -166,16 +230,19 @@ pub(super) fn drive_stage(
         interactive,
         released: None,
         handed_over: false,
+        live_spend: crate::cost::LiveSpend::new(),
+        budget_stop: None,
     };
     // Turn 1: the broker exists before the launch that names it.
     owner.open_broker(run)?;
     run.mcp = owner.broker.as_ref().map(mcp_launch);
-    let started = start_stage(run, emit);
+    let started = start_stage(run, cancel, emit);
     run.mcp = None;
     let Some(prepared) = started? else {
         owner.close_broker();
         return Ok(());
     };
+    let _cancel_reg = TaskCancelRegistration::register(&run.id);
     let stop_ticker = Arc::new(AtomicBool::new(false));
     thread::scope(|scope| -> Result<()> {
         // Ticks wake an idle owner for the deadline and for cancellation.
@@ -204,10 +271,10 @@ pub(super) fn drive_stage(
         drop(std::mem::replace(&mut owner.tx, mpsc::channel().0));
         while !owner.running.is_empty() || owner.phase_running() {
             match rx.recv() {
-                Ok(Msg::TaskDone(id, outcome, ended)) => {
-                    let _ = owner.task_done(run, &id, outcome, ended);
+                Ok(Msg::TaskDone(id, outcome, ended, live_usage)) => {
+                    let _ = owner.task_done(run, &id, outcome, ended, live_usage);
                 }
-                Ok(Msg::ParentDone(outcome, _)) => {
+                Ok(Msg::ParentDone(outcome, _, _)) => {
                     keep_survivor(run, &outcome);
                     owner.phase = Phase::Done;
                 }
@@ -224,6 +291,14 @@ pub(super) fn drive_stage(
         }
         looped
     })
+}
+
+/// The parent turn's key in the stage's live spend.
+const PARENT_SPEND: &str = "parent";
+
+/// Task `id`'s key in the stage's live spend.
+fn task_spend(id: &str) -> String {
+    format!("task:{id}")
 }
 
 fn not_active() -> ToolError {
@@ -352,6 +427,7 @@ impl<'a> Owner<'a> {
         timeout: Duration,
         stall: Option<Duration>,
         abort: Arc<AtomicBool>,
+        monitor: Option<crate::cost::LiveBudgetMonitor>,
     ) where
         'a: 's,
     {
@@ -360,6 +436,8 @@ impl<'a> Owner<'a> {
         let cancel = self.cancel;
         scope.spawn(move || {
             let mut formatter = events::Formatter::new(invocation.kind);
+            let mut usage_tracker = handoff::UsageTracker::new(invocation.kind);
+            let mut budget_stopped = false;
             let spawned = std::cell::Cell::new(None);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 process::capture_with_stall_and_abort(
@@ -381,6 +459,16 @@ impl<'a> Owner<'a> {
                         let lines = if err {
                             Some(format!("[stderr] {}", storage::clean_terminal(text)))
                         } else {
+                            if let (Some(monitor), false) = (&monitor, budget_stopped) {
+                                let reason = usage_tracker
+                                    .push(text)
+                                    .and_then(|usage| monitor.check(usage));
+                                if let Some(reason) = reason {
+                                    budget_stopped = true;
+                                    abort.store(true, Ordering::SeqCst);
+                                    let _ = tx.send(Msg::BudgetStop(reason));
+                                }
+                            }
                             formatter.push(text)
                         };
                         if let Some(lines) = lines {
@@ -403,9 +491,10 @@ impl<'a> Owner<'a> {
                     journal.recorded(pgid);
                 }
             }
+            let live_usage = usage_tracker.current();
             let _ = tx.send(match who {
-                Who::Parent => Msg::ParentDone(outcome, ended),
-                Who::Task(id) => Msg::TaskDone(id, outcome, ended),
+                Who::Parent => Msg::ParentDone(outcome, ended, live_usage),
+                Who::Task(id) => Msg::TaskDone(id, outcome, ended, live_usage),
             });
         });
     }
@@ -449,7 +538,7 @@ impl<'a> Owner<'a> {
                         let _ = tx.send(Msg::Spawned(Who::Parent, group));
                     },
                 );
-                let _ = tx.send(Msg::ParentDone(outcome, Utc::now()));
+                let _ = tx.send(Msg::ParentDone(outcome, Utc::now(), None));
             });
             self.turn = Some(prepared);
             return;
@@ -464,6 +553,7 @@ impl<'a> Owner<'a> {
             self.remaining(),
             stall,
             self.parent_abort.clone(),
+            self.live_spend.monitor(run, self.index, PARENT_SPEND),
         );
         self.turn = Some(prepared);
     }
@@ -518,8 +608,8 @@ impl<'a> Owner<'a> {
                         emit(Event::State(Box::new(run.clone())));
                     }
                 }
-                Msg::TaskDone(id, outcome, ended) => {
-                    self.task_done(run, &id, outcome, ended)?;
+                Msg::TaskDone(id, outcome, ended, live_usage) => {
+                    self.task_done(run, &id, outcome, ended, live_usage)?;
                     if self.phase == Phase::Releasing {
                         self.finish_release(run, emit)?;
                         continue;
@@ -530,16 +620,53 @@ impl<'a> Owner<'a> {
                         self.maybe_wake(scope, run, emit)?;
                     }
                 }
-                Msg::ParentDone(outcome, ended) => {
-                    self.parent_done(scope, run, outcome, ended, emit)?;
+                Msg::ParentDone(outcome, ended, live_usage) => {
+                    self.parent_done(scope, run, outcome, ended, live_usage, emit)?;
                 }
-                Msg::Tick => self.tick(run, emit)?,
+                Msg::BudgetStop(reason) => self.budget_stopped(run, reason, emit)?,
+                Msg::Tick => self.tick(scope, run, emit)?,
             }
         }
         Ok(())
     }
 
-    fn tick(&mut self, run: &mut Run, emit: &mut impl FnMut(Event)) -> Result<()> {
+    /// A live budget monitor saw a stop cap exceeded: every task stops, and
+    /// the stage stops blocked once no parent turn runs.
+    fn budget_stopped(
+        &mut self,
+        run: &mut Run,
+        reason: String,
+        emit: &mut impl FnMut(Event),
+    ) -> Result<()> {
+        if self.budget_stop.is_some() {
+            return Ok(());
+        }
+        emit(Event::Output(format!("\n{reason}\n")));
+        self.budget_stop = Some(reason.clone());
+        match self.phase {
+            Phase::Running(_) => {
+                self.cancel_live(run);
+                self.parent_abort.store(true, Ordering::SeqCst);
+                let _ = run.persist();
+            }
+            Phase::Awaiting => self.stop_stage(run, Status::Blocked, reason, emit)?,
+            Phase::Releasing | Phase::Done => {}
+        }
+        Ok(())
+    }
+
+    fn tick<'s, 'e>(
+        &mut self,
+        scope: &'s thread::Scope<'s, 'e>,
+        run: &mut Run,
+        emit: &mut impl FnMut(Event),
+    ) -> Result<()>
+    where
+        'a: 's,
+    {
+        for task_id in take_task_cancels(&run.id) {
+            self.cancel_user_task(scope, run, &task_id, emit)?;
+        }
         let cancelled = self.cancel.load(Ordering::Relaxed);
         let late = self.deadline.is_some_and(|d| Instant::now() >= d);
         if !cancelled && !late {
@@ -568,6 +695,48 @@ impl<'a> Owner<'a> {
                 self.stop_stage(run, status, message, emit)?;
             }
             Phase::Releasing | Phase::Done => {}
+        }
+        Ok(())
+    }
+
+    /// Cancels a single delegated task requested by the user (e.g. from the TUI)
+    /// without cancelling the parent stage.
+    fn cancel_user_task<'s, 'e>(
+        &mut self,
+        scope: &'s thread::Scope<'s, 'e>,
+        run: &mut Run,
+        id: &str,
+        emit: &mut impl FnMut(Event),
+    ) -> Result<()>
+    where
+        'a: 's,
+    {
+        let Some(task) = self.task(run, id) else {
+            return Ok(());
+        };
+        if task.status.is_terminal() {
+            return Ok(());
+        }
+        if let Some(job) = self.running.get(id) {
+            job.abort.store(true, Ordering::SeqCst);
+        }
+        self.queue.retain(|q| q != id);
+        if let Some(task) = self.task_mut(run, id) {
+            task.queued_messages.clear();
+            task.error = Some("Cancelled by user".into());
+            if !task.status.is_live() || task.status == TaskStatus::Queued {
+                task.status = TaskStatus::Cancelled;
+                task.delivered = false;
+            }
+        }
+        emit(Event::Output(format!(
+            "Delegation: cancelling task {id} (requested by user)\n"
+        )));
+        let _ = run.persist();
+        self.changed.bump();
+        emit(Event::State(Box::new(run.clone())));
+        if self.phase == Phase::Awaiting {
+            self.maybe_wake(scope, run, emit)?;
         }
         Ok(())
     }
@@ -648,6 +817,7 @@ impl<'a> Owner<'a> {
         run: &mut Run,
         outcome: Result<process::Outcome>,
         ended: DateTime<Utc>,
+        live_usage: Option<handoff::Usage>,
         emit: &mut impl FnMut(Event),
     ) -> Result<()>
     where
@@ -667,6 +837,29 @@ impl<'a> Owner<'a> {
             self.phase = Phase::Releasing;
             run.persist()?;
             return self.finish_release(run, emit);
+        }
+        if let Some(reason) = self.budget_stop.clone() {
+            // Stopped on a cap, whether or not the parent needed a signal.
+            keep_survivor(run, &outcome);
+            // Stopped before a final usage event: keep what the monitor read.
+            let turn_usage = handoff::usage_file(
+                &prepared.directory.join("stdout.log"),
+                prepared.invocation.kind,
+            )
+            .or(live_usage);
+            self.earlier_usage = add_usage(self.earlier_usage, turn_usage);
+            let exit_code = outcome.as_ref().ok().and_then(|o| o.code);
+            if turn_number > 1 {
+                if let Some(turn) = self.attempt_mut(run).turns.last_mut() {
+                    turn.finished_at = Some(ended);
+                    turn.exit_code = exit_code;
+                    turn.usage = turn_usage;
+                }
+            } else {
+                self.attempt_mut(run).exit_code = exit_code;
+            }
+            self.attempt_mut(run).set_group(None);
+            return self.stop_stage(run, Status::Blocked, reason, emit);
         }
         let succeeded = outcome
             .as_ref()
@@ -707,6 +900,7 @@ impl<'a> Owner<'a> {
         // Budget admission (tasks, wakes) reads the attempt's usage; the
         // final turn's conclusion replaces it with that turn's plus these.
         self.attempt_mut(run).usage = self.earlier_usage;
+        self.live_spend.settle(run, PARENT_SPEND);
         if turn_number > 1 {
             if let Some(turn) = self.attempt_mut(run).turns.last_mut() {
                 turn.usage = turn_usage;
@@ -961,6 +1155,7 @@ impl<'a> Owner<'a> {
             directory: turn_dir,
             handoff_file,
             reattached: false,
+            retry_from: None,
         };
         self.spawn_parent(scope, run, prepared);
         Ok(())
@@ -979,6 +1174,9 @@ impl<'a> Owner<'a> {
     {
         if !self.phase_running() {
             return Err(not_active());
+        }
+        if let Some(reason) = &self.budget_stop {
+            return Err(ToolError::new("budget_exceeded", reason.clone()));
         }
         match request {
             Request::Capabilities { search } => Ok(self.capabilities(run, search.as_deref())),
@@ -1400,7 +1598,7 @@ impl<'a> Owner<'a> {
     where
         'a: 's,
     {
-        if self.phase == Phase::Done {
+        if self.phase == Phase::Done || self.budget_stop.is_some() {
             return Ok(());
         }
         // Follow-ups first: their tasks already hold the parent's attention.
@@ -1571,10 +1769,12 @@ impl<'a> Owner<'a> {
                 plan.confine_shared_git(&cwd);
             }
         }
+        let harness_version = adapters::detected_version(&stage.harness, &invocation.program);
         storage::write_json_fast(
             &turn_dir.join("command.json"),
             &json!({
                 "program": invocation.program,
+                "harness_version": harness_version,
                 "args": invocation.args,
                 "env": invocation.env.iter().map(|(n, _)| n).collect::<Vec<_>>(),
                 "workspace": cwd,
@@ -1634,6 +1834,8 @@ impl<'a> Owner<'a> {
             timeout,
             stall,
             abort.clone(),
+            self.live_spend
+                .task_monitor(run, self.index, &task, &stage.model, &task_spend(id)),
         );
         self.running.insert(
             id.to_owned(),
@@ -1645,6 +1847,7 @@ impl<'a> Owner<'a> {
                     directory: turn_dir,
                     handoff_file,
                     reattached: false,
+                    retry_from: None,
                 },
                 stage,
             },
@@ -1692,6 +1895,7 @@ impl<'a> Owner<'a> {
         id: &str,
         outcome: Result<process::Outcome>,
         ended: DateTime<Utc>,
+        live_usage: Option<handoff::Usage>,
     ) -> Result<()> {
         let Some(job) = self.running.remove(id) else {
             return Ok(());
@@ -1701,7 +1905,9 @@ impl<'a> Owner<'a> {
         }
         keep_survivor(run, &outcome);
         let stdout = job.prepared.directory.join("stdout.log");
-        let usage = handoff::usage_file(&stdout, job.prepared.invocation.kind);
+        // A task a budget stop ended before its final usage event keeps the
+        // usage its monitor read.
+        let usage = handoff::usage_file(&stdout, job.prepared.invocation.kind).or(live_usage);
         let session_reported = read_head(&stdout, 64 * 1024)
             .ok()
             .and_then(|head| handoff::session_id(&head));
@@ -1714,6 +1920,8 @@ impl<'a> Owner<'a> {
                 TaskStatus::Cancelled,
                 Some(if cancelled_by_parent {
                     "Cancelled by the parent".into()
+                } else if let Some(reason) = &self.budget_stop {
+                    format!("budget_exceeded: {reason}")
                 } else {
                     "Cancelled".into()
                 }),
@@ -1790,10 +1998,14 @@ impl<'a> Owner<'a> {
         } else {
             task.delivered = false;
         }
-        if task.isolation == Isolation::Worktree && !task.cancelled_by_parent {
+        if task.isolation == Isolation::Worktree
+            && !task.cancelled_by_parent
+            && task.status != TaskStatus::Cancelled
+        {
             self.seal_patch(run, id)?;
         }
         run.persist()?;
+        self.live_spend.settle(run, &task_spend(id));
         self.changed.bump();
         Ok(())
     }
@@ -2149,5 +2361,3 @@ fn task_prompt(
         handoff::contract(task.role, handoff_file, schema_file)
     )
 }
-
-use std::sync::Mutex;

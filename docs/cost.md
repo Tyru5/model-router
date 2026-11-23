@@ -58,10 +58,13 @@ The router does not detect how a harness is signed in: set stage
 
 - Run header and a finished run's brief: amounts with sources.
 - `model-router report RUN_ID` (`--json` for data).
-- `model-router cost [--since 7d] [--json]`: history summed by harness and
-  model (a fan-out candidate counts under its own harness), with a **Billing** split between billed API spend and subscription
-  API-equivalent estimates, plus a note listing attempts with unknown cost
-  (never counted as `$0`). `--since` accepts e.g. `12h`, `7d`, `2w`.
+- `model-router cost [--since 7d] [--all-projects] [--json]`: history summed by
+  harness and model (a fan-out candidate counts under its own harness), with a
+  **Billing** split between billed API spend and subscription API-equivalent
+  estimates, plus a note listing attempts with unknown cost (never counted as
+  `$0`). `--since` accepts e.g. `12h`, `7d`, `2w`. `--all-projects` aggregates
+  across the current project and all entries in `<config dir>/recent-projects.json`
+  (deduplicating by canonical path and skipping missing or unreadable projects).
 - `model-router stats`: reported tokens and cost per assignment.
 
 ## Budgets
@@ -81,16 +84,29 @@ budget = { max_usd = 2.0, on_exceed = "warn" }
   stage's caps also count the runs its agent launched; a launched run
   answers to its launcher's caps as well as its own.
 - After each attempt, a run whose known cost or counted tokens exceed a run or
-  stage cap stops, **blocked**, before its next stage (or logs a warning and
-  continues when `on_exceed = "warn"`). In a stage graph, stages already
-  running side by side finish first.
+  stage cap stops, **blocked**, before its next stage, or instead of completing
+  after its last stage (or logs a warning and continues when
+  `on_exceed = "warn"`). In a stage graph, stages already running side by side
+  finish first.
 - A fan-out stage's spend includes every candidate attempt, also those of a
   round that a repair rewind discarded (kept in `run.json` as the stage's
   `discarded` candidates).
-- A running stage is never killed (live caps on streamed usage are future
-  work).
+- For unattended streaming stages with `on_exceed = "stop"`, the router also
+  tracks incremental usage events mid-stream (`codex`, `claude`, `pi`, `omp`,
+  `opencode`, `amp`, `cursor`, and matching custom stream outputs) and aborts
+  the stage's process group as soon as cumulative run or stage spend/tokens
+  exceed the cap, recording the streamed usage and marking the stage/run
+  **blocked**. A harness that exits on its own right after the usage that
+  crossed the cap keeps its result, and the check after the attempt blocks
+  the run. The same mid-stream check covers fan-out candidates, delegating
+  parents, and delegated tasks. Processes running at the same time share one
+  count: a run cap counts every live stage, candidate, and task, and stops
+  them all; a stage cap counts and stops every live candidate or task of that
+  stage. A candidate stopped this way is **blocked**, and its fan-out stage
+  stops **blocked** without applying a winner while a cap is still exceeded.
+  A delegating stage stops its tasks and parent and ends **blocked**.
 - `max_tokens` counts input, output, and cache writes; cache reads are
   excluded. Unknown costs count only toward `max_tokens`.
 - Continue: `model-router resume RUN_ID --budget-usd N` or `--budget-tokens N`
   sets the run's cap and any exceeded stage cap to `N`. In the TUI, `B` on a
-  run a USD cap stopped asks for `N` and confirms first.
+  run a USD or token cap stopped asks for `N` and confirms first.

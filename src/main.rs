@@ -34,6 +34,10 @@ struct Cli {
     /// Open the TUI immediately, without its startup animation.
     #[arg(long, global = true)]
     no_animation: bool,
+    /// Append structured JSONL metrics (run and stage attempt events) to PATH.
+    /// Also MODEL_ROUTER_METRICS_FILE.
+    #[arg(long, global = true, value_name = "PATH")]
+    metrics_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -45,8 +49,46 @@ enum SchedulesAction {
         #[arg(long)]
         json: bool,
     },
+    /// Create a schedule from the CLI (pass --approve to approve immediately on a trusted project).
+    Add {
+        /// Optional schedule ID (letters, digits, '-' and '_', up to 64 chars).
+        #[arg(long)]
+        id: Option<String>,
+        /// Workflow name; defaults to the first workflow in config.
+        #[arg(short, long)]
+        workflow: Option<String>,
+        #[arg(long, conflicts_with = "task_file")]
+        task: Option<String>,
+        /// Read the task from a local Markdown or UTF-8 text file (up to 32 KiB).
+        #[arg(long)]
+        task_file: Option<PathBuf>,
+        /// Fire every DUR (e.g. 30m, 6h, 1d, 2w; at least 5m).
+        #[arg(long, value_name = "DUR")]
+        every: Option<String>,
+        /// Fire daily at HH:MM (in --tz, default local).
+        #[arg(long, value_name = "HH:MM")]
+        at: Option<String>,
+        /// Fire on a 5-field cron expression ("M H DOM MON DOW").
+        #[arg(long, value_name = "EXPR")]
+        cron: Option<String>,
+        /// Fire on POST /schedules/<id>/trigger to `serve --http`.
+        #[arg(long)]
+        webhook: bool,
+        /// Timezone for --at or --cron: local (default), UTC, or fixed offset like +02:00 / -07:00.
+        #[arg(long, value_name = "TZ", allow_hyphen_values = true)]
+        tz: Option<String>,
+        /// Approve the schedule immediately (requires a trusted project config).
+        #[arg(long)]
+        approve: bool,
+    },
     /// Approve a schedule as it stands now; any later edit asks again.
-    Approve { id: String },
+    Approve {
+        id: String,
+        /// Approve only if the schedule still has this digest (from
+        /// `schedules list --json` or the agent's `schedule_task` result).
+        #[arg(long, value_name = "DIGEST")]
+        digest: Option<String>,
+    },
     /// Pause a schedule (its approval is forgotten).
     Pause { id: String },
     /// Enable a paused schedule; it then needs approval again.
@@ -168,6 +210,9 @@ enum Commands {
         since: Option<String>,
         #[arg(long)]
         json: bool,
+        /// Include every recent project, not only this one.
+        #[arg(long)]
+        all_projects: bool,
     },
     /// Apply a finished worktree run's changes back into the project checkout
     /// without committing or touching Git's index or branches.
@@ -352,18 +397,18 @@ enum Commands {
         #[arg(long, conflicts_with = "yes")]
         revoke: bool,
     },
-    /// Schedules a stage's agent created: list, approve, pause, enable,
-    /// delete, or fire the due ones (`tick`, for cron or systemd timers).
+    /// Manage scheduled runs: list, add, approve, pause, enable, delete, or
+    /// fire due schedules (`tick`, for cron or systemd timers).
     Schedules {
         #[command(subcommand)]
         action: Option<SchedulesAction>,
     },
-    /// Check harness executables, versions, and flags without a model request.
+    /// Check harness executables, versions, pins, provider keys, and flags without a model request.
     Doctor {
         /// Print machine-readable JSON.
         #[arg(long)]
         json: bool,
-        /// Fail when an installed harness lacks a flag the router passes.
+        /// Fail on missing harness flags, version pin drift, or missing configured provider keys.
         #[arg(long)]
         strict: bool,
     },
@@ -443,6 +488,9 @@ fn install_signal_handlers(cancel: &Arc<AtomicBool>) -> Result<()> {
 
 fn main_result() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(path) = &cli.metrics_file {
+        model_router::events::set_metrics_file(Some(path.clone()));
+    }
     match &cli.command {
         Some(Commands::Presets) => {
             print!("{}", presets::listing());
@@ -492,8 +540,31 @@ fn main_result() -> Result<()> {
                             SchedulesAction::List { json } => {
                                 cli::manage::SchedulesCommand::List { json }
                             }
-                            SchedulesAction::Approve { id } => {
-                                cli::manage::SchedulesCommand::Approve(id)
+                            SchedulesAction::Add {
+                                id,
+                                workflow,
+                                task,
+                                task_file,
+                                every,
+                                at,
+                                cron,
+                                webhook,
+                                tz,
+                                approve,
+                            } => cli::manage::SchedulesCommand::Add {
+                                id,
+                                workflow,
+                                task,
+                                task_file,
+                                every,
+                                at,
+                                cron,
+                                webhook,
+                                tz,
+                                approve,
+                            },
+                            SchedulesAction::Approve { id, digest } => {
+                                cli::manage::SchedulesCommand::Approve { id, digest }
                             }
                             SchedulesAction::Pause { id } => {
                                 cli::manage::SchedulesCommand::Pause(id)
@@ -687,9 +758,11 @@ fn main_result() -> Result<()> {
             release_groups,
             &cancel,
         ),
-        Some(Commands::Cost { since, json }) => {
-            cli::inspect::cost_command(&project, since.as_deref(), json)
-        }
+        Some(Commands::Cost {
+            since,
+            json,
+            all_projects,
+        }) => cli::inspect::cost_command(&project, since.as_deref(), json, all_projects),
         Some(Commands::Apply { id, check, yes }) => cli::manage::apply(&project, &id, check, yes),
         Some(Commands::Ship {
             id,

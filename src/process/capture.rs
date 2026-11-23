@@ -37,8 +37,8 @@ pub fn capture_with(
     )
 }
 
-fn is_cancelled(cancel: &AtomicBool, abort: Option<&AtomicBool>) -> bool {
-    cancel.load(Ordering::Relaxed) || abort.is_some_and(|flag| flag.load(Ordering::Relaxed))
+fn is_cancelled(cancel: &AtomicBool, abort_flags: &[&AtomicBool]) -> bool {
+    cancel.load(Ordering::Relaxed) || abort_flags.iter().any(|flag| flag.load(Ordering::Relaxed))
 }
 
 /// `capture_with` with an optional inactivity timeout: stops the process group
@@ -81,6 +81,43 @@ pub fn capture_with_stall_and_abort(
     stall_timeout: Option<Duration>,
     cancel: &AtomicBool,
     abort: Option<&AtomicBool>,
+    sandbox: Option<&Plan>,
+    on_spawn: impl FnOnce(Group) -> Result<()>,
+    on_output: impl FnMut(bool, &str),
+) -> Result<Outcome> {
+    let flags: [&AtomicBool; 1];
+    let abort_flags: &[&AtomicBool] = match abort {
+        Some(flag) => {
+            flags = [flag];
+            &flags
+        }
+        None => &[],
+    };
+    capture_with_controls(
+        inv,
+        cwd,
+        dir,
+        timeout,
+        stall_timeout,
+        cancel,
+        abort_flags,
+        sandbox,
+        on_spawn,
+        on_output,
+    )
+}
+
+/// `capture_with_stall` accepting zero or more secondary abort flags alongside
+/// `cancel` (e.g. a scheduler abort flag and a live mid-stream budget abort flag).
+#[allow(clippy::too_many_arguments)]
+pub fn capture_with_controls(
+    inv: &Invocation,
+    cwd: &Path,
+    dir: &Path,
+    timeout: Duration,
+    stall_timeout: Option<Duration>,
+    cancel: &AtomicBool,
+    abort_flags: &[&AtomicBool],
     sandbox: Option<&Plan>,
     on_spawn: impl FnOnce(Group) -> Result<()>,
     mut on_output: impl FnMut(bool, &str),
@@ -200,7 +237,49 @@ pub fn capture_with_stall_and_abort(
             child.leader_reaped = true;
             break status;
         }
-        cancelled = is_cancelled(cancel, abort);
+        cancelled = is_cancelled(cancel, abort_flags);
+        if cancelled && !cancel.load(Ordering::Relaxed) {
+            // A secondary abort (e.g. live budget cap triggered by a final
+            // result line) may fire micro-seconds before the leader finishes
+            // exiting on its own. Give a brief window for natural exit before
+            // signalling the group.
+            let natural_deadline = Instant::now() + Duration::from_millis(50);
+            let mut exited_naturally = None;
+            while Instant::now() < natural_deadline {
+                if !stdout_eof {
+                    drain(
+                        &mut stdout,
+                        &mut stdout_log,
+                        false,
+                        &mut out_text,
+                        &mut on_output,
+                        &mut stdout_eof,
+                        32,
+                    )?;
+                }
+                if !stderr_eof {
+                    drain(
+                        &mut stderr,
+                        &mut stderr_log,
+                        true,
+                        &mut err_text,
+                        &mut on_output,
+                        &mut stderr_eof,
+                        32,
+                    )?;
+                }
+                if let Some(status) = child.child.try_wait()? {
+                    exited_naturally = Some(status);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            if let Some(status) = exited_naturally {
+                child.leader_reaped = true;
+                cancelled = false;
+                break status;
+            }
+        }
         timed_out = started.elapsed() >= timeout;
         stalled = !timed_out && stall_timeout.is_some_and(|limit| last_activity.elapsed() >= limit);
         if cancelled || timed_out || stalled {

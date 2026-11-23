@@ -9,7 +9,7 @@ files live. For what stages, graphs, and fan-out do, see
 | File | Purpose |
 | --- | --- |
 | `--config FILE` | Explicit config. Always trusted. Wins over everything below. |
-| `<project>/.model-router.toml` | Project config. Replaces the global template set. Some sections need [trust](safety.md#project-trust). |
+| `<project>/.model-router.toml` | Project config. Replaces global workflows, while global `[providers.*]`, `[adapters.*]`, `[delegates.*]`, and `[pricing.*]` layer underneath (project keys win on collision). Global entries stay trusted; project entries need [trust](safety.md#project-trust). Saving a project config omits unmodified global entries. |
 | `<config dir>/config.toml` | Global templates. Always trusted. |
 | (none) | Built-in starter workflow. |
 
@@ -72,7 +72,24 @@ version = 2
 [providers.NAME]     # OpenAI-compatible endpoints
 [pricing."MODEL"]    # token prices
 [delegates.NAME]     # targets a delegating stage's agent may hand tasks to
+[harness_versions]   # optional harness version pins checked by `doctor`
 ```
+
+### `[harness_versions]`
+
+Optional map of harness name to version pin, checked by `model-router doctor`
+(and enforced by `doctor --strict`). Does not require project trust.
+
+```toml
+[harness_versions]
+codex = ">=0.160.0"
+claude = "2.1"
+opencode = "2.2.5"
+```
+
+Accepted pin forms: exact 3-part versions (`"0.167.0"`), 1–2 part segment
+prefixes (`"0.167"`, `"2"`), comparisons (`>=`, `<=`, `>`, `<`, `=`, `==`), and
+comma-separated ranges (`">=0.160.0, <0.200.0"`).
 
 ## `[[workflows]]`
 
@@ -85,6 +102,13 @@ version = 2
 | `budget` | none | `{ max_usd, max_tokens, on_exceed }` for the whole run. |
 | `protected_paths` | `[]` | Repository-relative globs (`*`, `**`, `?`, up to 64). Enforced for ordinary stages, fan-out candidates (candidate stops blocked), and candidate selection; `ship` and `apply` refuse matching files. |
 | `handoff_repair` | `false` | When `true`, an unattended stage that exits 0 without a valid handoff sends one follow-up on the same session asking only for handoff JSON (an extra, possibly billed request). Supported on `codex` (not local providers `ollama`/`lmstudio`), `claude`, `pi`, `opencode`, and custom adapters with `follow_up_args`. |
+| `handoff_budget_bytes` | `14000` | Total byte budget for prior stage handoffs in downstream prompts (`1024`–`200000`). |
+| `handoff_each_bytes` | `5000` | Per-stage byte budget for each prior handoff (`1024`–`200000`, at most `handoff_budget_bytes`). |
+| `context_files` | `[]` | Repo-relative paths or globs (`*`, `**`, `?`, up to 32) whose UTF-8 contents are injected into every stage prompt (max 32 files and 32 KiB total, symlink-safe, never reading `.git` or `.model-router`). Shown in `preview` and `handoffs --prompt`. |
+| `retry` | `{ max_attempts = 0, base_delay_seconds = 5, max_delay_seconds = 60 }` | Default transient retry policy for unattended stages (`max_attempts` `0`–`5`). Below. |
+| `hooks` | `{}` | Workflow lifecycle hooks (`before_stage`, `after_stage`, `before_ship`, `on_failure`). Needs trust in a project config. Below. |
+| `policies` | `[]` | Declarative diff policies (`[[workflows.policies]]` with `action = "block" | "advise"`). Below. |
+| `review_quorum` | unset | Minimum distinct enabled non-judge review stages that must pass (`1`–`64`). When `> 1`, blocks completion and `ship` until that many reviews pass. |
 | `stages` | required | `[[workflows.stages]]` tables, in list order (at most 64). |
 
 ## `[[workflows.stages]]`
@@ -118,6 +142,10 @@ version = 2
 | `after` | `[]` | Stage IDs this stage waits for. Any `after` makes the workflow a graph. |
 | `fan_out` | none | Best-of-N candidates and judge. Below. |
 | `delegation` | none | The stage's agent may delegate tasks, launch runs, and schedule work. Below. Needs trust in a project config. |
+| `context_files` | `[]` | Extra repo-relative paths or globs injected into this stage's prompt after the workflow's `context_files` (same 32-file / 32 KiB total limit and workspace-only safety checks). |
+| `retry` | unset | Overrides workflow `retry` for this stage (`{ max_attempts, base_delay_seconds, max_delay_seconds }`). Rejected on a delegating stage. |
+| `hooks` | `{}` | Stage lifecycle hooks (`before_stage`, `after_stage`, `before_ship`, `on_failure`), run after workflow hooks. Needs trust in a project config. |
+| `when_changed` | `[]` | Repo-relative globs (`*`, `**`, `?`, up to 32). In a Git repository, skips the stage (`skipped`) when no files changed so far in the run match any pattern; outside Git, runs normally. A fan-out judge with candidates waiting for its choice never skips. |
 
 ### `checks`
 
@@ -184,9 +212,85 @@ budget = { max_usd = 2.0, max_tokens = 2_000_000, on_exceed = "stop" }
 ```
 
 `max_usd` and `max_tokens` are optional and must be positive. `on_exceed` is
-`"stop"` (default: block before the next stage) or `"warn"` (log a warning and
-continue). `max_tokens` counts input, output, and cache writes (not cache
-reads). See [cost.md](cost.md#budgets).
+`"stop"` (default: block before the next stage or instead of completing, or
+abort an unattended streaming stage, candidate, or delegated task mid-stream as
+soon as streamed usage exceeds the cap) or `"warn"` (log a
+warning and continue). `max_tokens` counts input, output, and cache writes (not
+cache reads). See [cost.md](cost.md#budgets).
+
+### `retry`
+
+```toml
+retry = { max_attempts = 2, base_delay_seconds = 5, max_delay_seconds = 60 }
+```
+
+Retries unattended stage failures matching transient provider or network errors
+(HTTP 429/502/503/504/529, rate limits, overloaded, connection reset/timeout)
+on the same harness and model with capped exponential backoff (`max_attempts`
+`0`–`5`, `base_delay_seconds` `1`–`600`, `max_delay_seconds` from
+`base_delay_seconds` to `3600`).
+Permanent auth, permission, and invalid-request errors are not retried.
+
+A `fan_out` stage's `retry` applies to each candidate: a candidate that fails
+transiently runs again in a new worktree while the others keep their results,
+within the stage's `timeout_seconds` from its first attempt. Policy and
+`protected_paths` checks of a retried stage cover every change since its first
+attempt, including what failed attempts left. Delegating stages do not retry
+automatically: a stage `retry` with `max_attempts > 0` on a stage with
+`delegation` is a config error, and the workflow default skips them.
+
+### `hooks`
+
+```toml
+[workflows.hooks]
+before_stage = [{ command = ["cargo", "check", "--locked"], timeout_seconds = 120 }]
+after_stage  = [{ command = ["scripts/post-stage.sh"] }]
+before_ship  = [{ command = ["cargo", "test", "--locked"], timeout_seconds = 300 }]
+on_failure   = [{ command = ["scripts/notify-fail.sh"] }]
+```
+
+Each hook entry has `command` (non-empty argv, no shell) and `timeout_seconds`
+(`1`–`3600`, default `120`), run in its own process group with
+`MODEL_ROUTER_HOOK`, `MODEL_ROUTER_RUN_ID`, `MODEL_ROUTER_WORKFLOW`,
+`MODEL_ROUTER_STAGE_ID`, `MODEL_ROUTER_STAGE_ROLE`, and
+`MODEL_ROUTER_STAGE_STATUS`. `before_stage` and `before_ship` abort on non-zero
+exit or timeout; `after_stage` and `on_failure` log results under
+`<attempt>/hooks/<event>/NN/` without masking the stage outcome. Files that
+`after_stage` and `on_failure` hooks change are part of the stage's recorded
+changes (`changes.diff`, worktree apply). A `fan_out` stage runs
+`before_stage` once before its candidates start (a failure cancels them;
+candidates start from the workspace as the hooks left it) and
+`after_stage`/`on_failure` once after the round settles, all in the workspace.
+Requires project trust.
+
+### `policies`
+
+```toml
+[[workflows.policies]]
+name = "no-dbg"
+action = "block"
+pattern = "dbg!("
+paths = ["src/**/*.rs"]
+message = "Remove dbg! macro calls before shipping"
+
+[[workflows.policies]]
+name = "migration-review"
+action = "advise"
+paths = ["migrations/**"]
+message = "Verify rollback safety and lock duration"
+```
+
+Non-backtracking line matcher (`literal`, `i:<case-insensitive>`, `word:<token>`,
+`any:<a|b>`, `glob:<pattern>`). `block` scans added diff lines of matching
+`paths` at stage end, fan-out candidate post-processing and selection, `apply`,
+and `ship`, failing closed if the diff cannot be read. Every scan reads the
+text diff between Git trees: whole lines with no length cutoff, files Git
+treats as binary read as text, and quoted paths (non-ASCII, `"`, `\`, control
+characters) decoded before `paths` matching. Lines over 1 MiB are read in 1 MiB
+pieces overlapping by 2 KiB, so a literal pattern (at most 512 bytes) is never
+split; a `glob:` pattern matches each piece as a whole line. `advise` injects
+`message` into review stage prompts (`POLICY ADVISORIES`) when changed files
+(and optional `pattern`) match.
 
 ### `ship`
 
@@ -234,8 +338,9 @@ evaluates them. See [harnesses.md](harnesses.md#custom-adapters).
 
 ## `[delegates.NAME]`
 
-A named target for stages' `delegation`, in the same file as the workflows
-that name it (config files do not merge). Needs trust in a project config.
+A named target for stages' `delegation` (global `[delegates.*]` layer
+underneath project entries; project keys win on collision). Needs trust in a
+project config.
 
 ```toml
 [delegates.codex-review]
@@ -333,6 +438,8 @@ harness = "codex"
 | `MODEL_ROUTER_NOTIFY=1` | CLI `run`/`resume`/`rerun` notify (as `--notify`). |
 | `MODEL_ROUTER_NOTIFY_URL` | Webhook URL; turns the webhook backend on. |
 | `MODEL_ROUTER_SERVE_TOKEN` | Fixed bearer token for `serve --http`. |
+| `MODEL_ROUTER_METRICS_FILE` | Path for append-only JSONL structured operational events (`run_start`, `run_end`, `attempt_start`, `attempt_end`; same as `--metrics-file`). Contains no task text, prompts, or secrets. |
+| `MODEL_ROUTER_HOOK` | Set by the router on lifecycle hooks (`before_stage`, `after_stage`, `before_ship`, `on_failure`), alongside `MODEL_ROUTER_RUN_ID`, `MODEL_ROUTER_WORKFLOW`, `MODEL_ROUTER_STAGE_ID`, `MODEL_ROUTER_STAGE_ROLE`, and `MODEL_ROUTER_STAGE_STATUS`. |
 | `MODEL_ROUTER_HARNESS_VERSIONS` | Override detected versions, e.g. `opencode=1.4.0`. |
 | `MODEL_ROUTER_FRAME_MARKER=1`, `MODEL_ROUTER_FRAME_FILE` | Test hook: smoke tests wait on frames written to this file. |
 | `MODEL_ROUTER_GROUP` | Set by the router on every harness and check it launches: a random marker that crash recovery uses to recognise the process group. Not read from your environment. |

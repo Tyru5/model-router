@@ -7,7 +7,9 @@ mod interactive;
 mod terminal;
 
 use capture::launch;
-pub use capture::{capture, capture_with, capture_with_stall, capture_with_stall_and_abort};
+pub use capture::{
+    capture, capture_with, capture_with_controls, capture_with_stall, capture_with_stall_and_abort,
+};
 pub use group::{Group, Identity, Verdict};
 pub use interactive::{AttachOutcome, InteractiveSession};
 use interactive::{INPUT_LIMIT, OutputDecoder, Parked, PtyChild, SessionState};

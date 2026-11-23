@@ -386,6 +386,10 @@ harness = "claude"
                 "[workflows.stages.delegation]\nharnesses = [\"codex\"]\nbogus = 1\n",
                 "unknown field",
             ),
+            (
+                "retry = { max_attempts = 1, base_delay_seconds = 1, max_delay_seconds = 5 }\n[workflows.stages.delegation]\nharnesses = [\"codex\"]\n",
+                "does not retry automatically",
+            ),
         ];
         for (section, expected) in cases {
             let error = settings(&format!("{BASE}{section}")).unwrap_err();

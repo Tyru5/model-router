@@ -73,7 +73,7 @@ def main():
                 "review",
                 "summary",
             ]
-            assert stages[1]["instructions"] and stages[1]["model"] == "gpt-6-astra"
+            assert stages[1]["instructions"] and stages[1].get("model", "") == ""
             terminal.send("Jvo")  # move after implementation, toggle mode, disable
             stages = save(terminal, path)[0]["stages"]
             assert stages[2]["role"] == "planning" and not stages[2]["enabled"]

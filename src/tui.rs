@@ -19,6 +19,7 @@ use std::{
 mod actions;
 mod app;
 mod completion;
+mod delegation_view;
 mod diff_view;
 mod editor;
 mod external;
@@ -34,6 +35,7 @@ mod monitor;
 mod output_search;
 mod path_picker;
 mod run_slot;
+mod schedules_view;
 mod session;
 mod startup;
 mod stats_page;
@@ -46,6 +48,7 @@ mod tour;
 pub mod trust_prompt;
 mod ui;
 mod widgets;
+mod workflow_editor;
 mod workflow_page;
 use app::{App, draw};
 

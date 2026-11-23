@@ -112,6 +112,29 @@ confirmed offline. Every harness can run tasks. `doctor` probes the
 injection flags; `tests/fixtures/adapter-golden/delegation.json` records the
 exact launches.
 
+### Codex MCP approval and timeout verification status
+
+- **Verified offline (CLI `--help` and Codex config docs):**
+  - `codex exec` and `codex exec resume` accept repeatable `--config key=value`
+    overrides, including `mcp_servers.model-router.{command,args,env,tool_timeout_sec=120}`,
+    `sandbox_mode`, and `approval_policy` (`on-request` or `never`).
+  - `model-router` passes `tool_timeout_sec=120` on the injected MCP server
+    entry (exceeding the router's 45 s `mode: "wait"` tool wait window) and
+    re-injects the `mcp_servers.model-router.*` overrides on `codex exec resume`
+    wake turns (`FollowUpExtra::ConfigOnly("--config")`).
+- **Requires live verification (not tested offline — no model requests):**
+  - **MCP tool approvals per sandbox mode:** whether `codex exec` executes
+    injected MCP server tools without interactive approval prompts under each
+    combination of `sandbox_mode` (`read-only`, `workspace-write`,
+    `danger-full-access`) and `approval_policy` (default vs `never`), or
+    whether `approval_policy = "never"` is required for unattended delegation
+    under `read-only`/`workspace-write`.
+  - **Code Mode tool call timeouts:** whether Codex Code Mode yields or aborts
+    long-running MCP tool calls earlier than `tool_timeout_sec=120` (for
+    example around 25–30 s). If live testing shows Code Mode yields early,
+    cap `mode: "wait"` to 25 s for Codex parents (or instruct Codex parents to
+    prefer wake mode).
+
 ## Native structured output
 
 The handoff's primary channel, where the harness has one; the prompt's
@@ -206,11 +229,26 @@ Authentication is not checked: that needs a model request. Log in through each h
   adapters that change flags by version (OpenCode).
 - Custom adapters show `not declared`: they have no flag contract, so doctor
   does not run them.
-- Authentication is never checked.
+- **Configured providers** (`[providers.*]`): reports each configured provider's
+  `api_key_env` as `set`, `missing`, or `no key required` without ever reading
+  or printing secret values.
+- **Version pins** (`[harness_versions]`): compares each pinned harness's
+  detected version against its pin (exact `0.167.0`, prefix `0.167`, or range
+  `>=0.160.0`, `>=0.160.0, <0.200.0`) and records `version_pin` /
+  `version_pin_ok` in `--json`. Each attempt's `command.json` also records the
+  cached `harness_version` when available.
+- **Offline auth hints**: for each installed built-in harness, checks only
+  whether well-known API key environment variables are non-empty or standard
+  login/config files exist on disk (never reads file contents or makes network
+  calls). Advisory only: live token validity is never checked offline.
 
-`doctor --json` prints the full reports, including each flag and the help
-command checked. `doctor --strict` exits non-zero when an installed harness
-lacks a flag. Probes run in parallel and finish within about 10 seconds.
+`doctor --json` prints an object with `harnesses`, the full reports (including
+each flag, `version_pin`, `version_pin_ok`, and `auth_hint`), and `providers`,
+one `{name, api_key_env, status}` per configured provider with `status` one of
+`set`, `missing`, or `not_required`. `doctor --strict` exits non-zero when an
+installed harness lacks a flag, any `[harness_versions]` pin mismatches (or
+the pinned harness is missing), or any configured `[providers.*]` required
+`api_key_env` is unset. Probes run in parallel and finish within about 10 seconds.
 The TUI's Harnesses page runs `model_router::doctor::inspect_all` in the
 background when opened or on `r`, shows the same columns, and lists each flag
 on Enter.

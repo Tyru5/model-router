@@ -4,7 +4,7 @@
 # are labelled "table". Override any entry with [pricing."model-id"] in a
 # config file or [models."model-id"] in ~/.config/model-router/pricing.toml.
 # cache_read defaults to 0.1 x input and cache_write to 1.25 x input when omitted.
-as_of = "2026-11-05"
+as_of = "2026-11-22"
 
 # Harness aliases priced as the model they currently select.
 [aliases]
@@ -102,6 +102,21 @@ cache_read = 0.08
 cache_write = 1.0
 
 # OpenAI. Cached input is billed at cache_read; there is no cache write charge.
+[models."gpt-6"]
+input = 2.0
+output = 12.0
+cache_read = 0.2
+cache_write = 0.0
+[models."gpt-6-astra"]
+input = 2.0
+output = 12.0
+cache_read = 0.2
+cache_write = 0.0
+[models."gpt-6.2-sol"]
+input = 2.5
+output = 15.0
+cache_read = 0.25
+cache_write = 0.0
 [models."gpt-5"]
 input = 1.25
 output = 10.0

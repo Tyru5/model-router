@@ -55,10 +55,30 @@ Relative paths resolve against the server's project.
 | `get_report` | `run_id` | `report --json`: time, usage, checks, unresolved items, review summary, and `changes` (files changed during the run) |
 | `confirm_stage` | `run_id` | Accepts a checkpoint (`awaiting_confirmation`) and continues the run |
 | `retry_stage` | `run_id`, `model?`, `force_unattended?` | Retries the current stage of a stopped or waiting run and continues it |
+| `fork_run` | `run_id`, `stage`, `model?`, `force_unattended?`, `no_run?` | Forks a saved run in a new Git worktree from a stage checkpoint, reusing completed upstream handoffs; drives the fork unless `no_run: true` |
+| `apply_run` | `run_id`, `check_only?` (default `true`) | Checks (`check_only: true`) or applies (`check_only: false`) a finished worktree run's uncommitted changes back into the project checkout; enforces `protected_paths` |
+| `get_handoffs` | `run_id`, `stage?`, `include_prompt?` (default `false`) | Handoff budget, truncation, and field-loss report (`handoffs --json`), plus the rendered prompt when `include_prompt: true` |
+| `get_cost` | `since?` (`7d`, `12h`, `30m`, `2w`) | Project cost and token usage summary (`cost --json`) |
+| `get_stats` | `role?`, `min_pass?` (`0`–`1`) | Per-(role, harness, model) routing stats (`stats --json`), with an optional cost-quality shortlist |
+| `list_schedules` | | Project schedules with approval status, `next_due`, and recent occurrences (`schedules list --json`) |
 
 Tool failures (bad arguments, unknown run, interactive workflow, …) are tool
 results with `isError: true` and a text explanation. Unknown tools and
 methods are JSON-RPC errors.
+
+## MCP resources
+
+In `--mcp` mode, `initialize` advertises `capabilities.resources`, exposing
+saved run artifacts as read-only MCP resources:
+
+- `resources/list` lists recent runs' review briefs (`review.md`) and diffs
+  (`changes.diff`) under the server's project as
+  `model-router://runs/<run_id>/review` (`text/markdown`) and
+  `model-router://runs/<run_id>/diff` (`text/x-diff`).
+- `resources/read` reads either URI (optionally with `?project=DIR`,
+  URL-encoded), bounded to 2 MiB and opened without following symlinks beneath
+  the project directory. Both `resources/list` and `resources/read` enforce
+  `--allow-root` and project trust.
 
 A typical client loop: `list_workflows` → `start_run` → `wait_run` (repeat
 while `timed_out`) → `get_report`. When `status` is `awaiting_confirmation`,
@@ -109,15 +129,16 @@ saved as cancelled can be retried later from the server, CLI, or TUI.
 ## HTTP API
 
 `--http ADDR` binds loopback only unless `--allow-remote` is given. Every
-request needs `Authorization: Bearer TOKEN`. The token comes from
-`MODEL_ROUTER_SERVE_TOKEN`, or is generated at startup and printed to stderr.
-Port 0 picks a free port; the bound address is printed to stderr. HTTP allows at
-most 16 pending unauthenticated connections and 32 authenticated connections (of
-which at most 24 may be event streams or `wait_run` calls), with a 64 KiB header
-cap, 1 MiB body cap, and 10-second request read deadline.
+route except `GET /health` needs `Authorization: Bearer TOKEN`. The token comes
+from `MODEL_ROUTER_SERVE_TOKEN`, or is generated at startup and printed to
+stderr. Port 0 picks a free port; the bound address is printed to stderr. HTTP
+allows at most 16 pending unauthenticated connections and 32 authenticated
+connections (of which at most 24 may be event streams or `wait_run` calls),
+with a 64 KiB header cap, 1 MiB body cap, and 10-second request read deadline.
 
 | Route | Body / query | Response |
 | --- | --- | --- |
+| `GET /health` | | Unauthenticated liveness probe: `200 {"status": "ok", "version": "..."}` (no project or run data) |
 | `GET /tools` | | `{"tools": [...]}` with input schemas |
 | `POST /tools/<name>` | JSON arguments object (empty body = `{}`) | `200 {"result": ...}` or `400 {"error": "..."}`; unknown tool `404` |
 | `GET /runs/<id>/events` | `?project=DIR` (URL-encoded, optional) | Server-Sent Events |

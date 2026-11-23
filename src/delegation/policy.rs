@@ -134,11 +134,27 @@ pub const UNSANDBOXED_COMMAND: Ceiling = Ceiling {
     writable: Vec::new(),
 };
 
+/// The ceiling for a user-created CLI schedule: the user owns and approves it
+/// directly, so any trusted workflow's permissions stay within it.
+pub const USER_CEILING: Ceiling = Ceiling {
+    write: Write::Workspace,
+    native: Native::Escalated,
+    network: Network::Open,
+    enforcement: Enforcement::None,
+    writable: Vec::new(),
+};
+
 /// The ceilings everything a workflow would run needs: each enabled stage,
 /// each fan-out candidate, each router check, and a ship stage's secret
 /// scanner. A launched run's plan must stay within its launcher's.
 pub fn workflow_ceilings(workflow: &Workflow, backend: bool) -> Vec<(String, Ceiling)> {
     let mut out = vec![];
+    if !workflow.hooks.is_empty() {
+        out.push((
+            format!("lifecycle hooks of workflow {}", workflow.name),
+            UNSANDBOXED_COMMAND,
+        ));
+    }
     for stage in workflow.stages.iter().filter(|s| s.enabled) {
         out.push((
             format!("stage {}", stage.id),
@@ -154,6 +170,12 @@ pub fn workflow_ceilings(workflow: &Workflow, backend: bool) -> Vec<(String, Cei
         if !stage.checks.is_empty() {
             out.push((
                 format!("router checks of stage {}", stage.id),
+                UNSANDBOXED_COMMAND,
+            ));
+        }
+        if !stage.hooks.is_empty() {
+            out.push((
+                format!("lifecycle hooks of stage {}", stage.id),
                 UNSANDBOXED_COMMAND,
             ));
         }

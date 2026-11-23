@@ -5,7 +5,11 @@
 mod common;
 
 use model_router::{
-    config::{CustomAdapter, CustomSession, Role, Settings, Stage, Workflow},
+    config::{
+        Budget, BudgetAction, CustomAdapter, CustomOutput, CustomSession, Role, Settings, Stage,
+        Workflow,
+    },
+    cost,
     delegation::{Delegate, Delegation, Isolation, records::TaskStatus},
     engine::{self, Action, Run, Status},
     report, sandbox,
@@ -137,6 +141,48 @@ fn task_adapter(writes: Option<&str>) -> CustomAdapter {
     }
 }
 
+/// A Codex-JSONL harness that reports 1,200 tokens, then waits 30 s before
+/// writing its handoff. It accepts the router's MCP config, so it can be a
+/// delegating parent too.
+fn streamer() -> CustomAdapter {
+    let code = r#"import json, sys, time
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1200, "output_tokens": 0}}), flush=True)
+time.sleep(30)
+open(sys.argv[1], "w").write(json.dumps({"schema_version": 2, "summary": "done", "verdict": "complete"}))
+"#;
+    CustomAdapter {
+        command: "python3".into(),
+        args: vec!["-c".into(), code.into(), "{handoff_file}".into()],
+        output: Some(CustomOutput::CodexJsonl),
+        mcp_config_args: Some(vec!["--mcp-config".into(), "{mcp_config}".into()]),
+        ..CustomAdapter::default()
+    }
+}
+
+/// Like [`streamer`], in Claude's stream format: its 1,200 tokens arrive on
+/// an `assistant` event, and only a final `result` event (never written
+/// before the cap stops it) would carry them in the log.
+fn claude_streamer() -> CustomAdapter {
+    let code = r#"import json, sys, time
+print(json.dumps({"type": "assistant", "message": {"id": "m1", "role": "assistant", "usage": {"input_tokens": 1200, "output_tokens": 0}}}), flush=True)
+time.sleep(30)
+open(sys.argv[1], "w").write(json.dumps({"schema_version": 2, "summary": "done", "verdict": "complete"}))
+"#;
+    CustomAdapter {
+        output: Some(CustomOutput::ClaudeStream),
+        args: vec!["-c".into(), code.into(), "{handoff_file}".into()],
+        ..streamer()
+    }
+}
+
+fn token_cap(tokens: u64) -> Budget {
+    Budget {
+        max_tokens: Some(tokens),
+        on_exceed: BudgetAction::Stop,
+        ..Budget::default()
+    }
+}
+
 struct Case {
     dir: tempfile::TempDir,
     script: PathBuf,
@@ -170,6 +216,8 @@ fn case(turns: Value, follow_up: bool, delegate: Delegate, tweak: impl FnOnce(&m
             ("parent".into(), parent(&script, follow_up)),
             ("task".into(), task_adapter(None)),
             ("writer".into(), task_adapter(Some("added.txt"))),
+            ("streamer".into(), streamer()),
+            ("claude_streamer".into(), claude_streamer()),
         ]),
         delegates: BTreeMap::from([("helper".into(), delegate)]),
         ..Settings::default()
@@ -474,6 +522,124 @@ fn a_cancelled_task_needs_no_wake() {
 }
 
 #[test]
+fn a_delegated_task_s_streamed_usage_stops_the_stage_at_its_cap() {
+    if !setup() {
+        return;
+    }
+    let turns = json!({
+        "turns": [[
+            {"call": "delegate_task", "args": {"task": "Look around", "client_request_id": "costly"}}
+        ]],
+        "handoffs": {"1": {"summary": "waiting on tasks", "verdict": "blocked"}}
+    });
+    let costly = Delegate {
+        harness: "streamer".into(),
+        model: "m".into(),
+        ..Delegate::default()
+    };
+    let mut case = case(turns, true, costly, |stage| stage.budget = token_cap(1000));
+    let started = std::time::Instant::now();
+    assert_eq!(
+        drive(&mut case.run),
+        Action::Stopped,
+        "{:?}",
+        case.run.error
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "took {elapsed:?}"
+    );
+    assert_eq!(case.run.status, Status::Blocked);
+    assert!(cost::budget_blocked(&case.run), "{:?}", case.run.error);
+    let task = &case.run.stages[0].attempts[0].tasks[0];
+    assert_eq!(task.status, TaskStatus::Cancelled, "{:?}", task.error);
+    assert!(task.turns[0].usage.is_some());
+}
+
+#[test]
+fn a_delegating_parent_s_streamed_usage_stops_the_stage_at_its_cap() {
+    if !setup() {
+        return;
+    }
+    let mut case = case(json!({"turns": []}), true, helper("m"), |stage| {
+        stage.harness = "streamer".into();
+        stage.model = "m".into();
+        stage.budget = token_cap(1000);
+    });
+    let started = std::time::Instant::now();
+    assert_eq!(
+        drive(&mut case.run),
+        Action::Stopped,
+        "{:?}",
+        case.run.error
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "took {elapsed:?}"
+    );
+    assert!(cost::budget_blocked(&case.run), "{:?}", case.run.error);
+    let attempt = &case.run.stages[0].attempts[0];
+    assert_eq!(attempt.status, Status::Blocked);
+    assert!(attempt.usage.is_some());
+}
+
+#[test]
+fn budget_stopped_claude_workers_keep_their_streamed_usage() {
+    if !setup() {
+        return;
+    }
+    // A task stopped before its `result` event.
+    let turns = json!({
+        "turns": [[
+            {"call": "delegate_task", "args": {"task": "Look around", "client_request_id": "costly"}}
+        ]],
+        "handoffs": {"1": {"summary": "waiting on tasks", "verdict": "blocked"}}
+    });
+    let costly = Delegate {
+        harness: "claude_streamer".into(),
+        model: "m".into(),
+        ..Delegate::default()
+    };
+    let mut task_case = case(turns, true, costly, |stage| stage.budget = token_cap(1000));
+    assert_eq!(
+        drive(&mut task_case.run),
+        Action::Stopped,
+        "{:?}",
+        task_case.run.error
+    );
+    assert!(
+        cost::budget_blocked(&task_case.run),
+        "{:?}",
+        task_case.run.error
+    );
+    let task = &task_case.run.stages[0].attempts[0].tasks[0];
+    let usage = task.turns[0]
+        .usage
+        .expect("the task's streamed usage is kept");
+    assert_eq!(usage.input_tokens, Some(1200));
+
+    // A parent stopped before its `result` event.
+    let mut case = case(json!({"turns": []}), true, helper("m"), |stage| {
+        stage.harness = "claude_streamer".into();
+        stage.model = "m".into();
+        stage.budget = token_cap(1000);
+    });
+    assert_eq!(
+        drive(&mut case.run),
+        Action::Stopped,
+        "{:?}",
+        case.run.error
+    );
+    assert!(cost::budget_blocked(&case.run), "{:?}", case.run.error);
+    let usage = case.run.stages[0].attempts[0]
+        .usage
+        .expect("the parent's streamed usage is kept");
+    assert_eq!(usage.input_tokens, Some(1200));
+}
+
+#[test]
 fn a_worktree_task_s_patch_reaches_the_checkout_only_through_task_apply() {
     if !setup() {
         return;
@@ -676,7 +842,7 @@ fn an_agent_s_schedule_fires_only_after_approval_and_once_per_occurrence() {
             .unwrap()
             .is_empty()
     );
-    schedules::approve(project, "s1").unwrap();
+    schedules::approve(project, "s1", None).unwrap();
     let approved_at = schedules::load(project).unwrap().schedules[0]
         .approved_at
         .unwrap();
@@ -703,7 +869,7 @@ fn an_agent_s_schedule_fires_only_after_approval_and_once_per_occurrence() {
             .unwrap()
             .is_empty()
     );
-    schedules::approve(project, "s2").unwrap();
+    schedules::approve(project, "s2", None).unwrap();
     assert_eq!(
         schedules::fire_due(project, much_later, Some("s2"))
             .unwrap()
@@ -715,6 +881,81 @@ fn an_agent_s_schedule_fires_only_after_approval_and_once_per_occurrence() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn schedule_task_mcp_tool_supports_cron_and_tz() {
+    use model_router::delegation::schedules;
+    if !setup() {
+        return;
+    }
+    let turns = json!({
+        "turns": [[
+            {"call": "schedule_task", "args": {"workflow": "Plain", "task": "Weekday cron", "cron": "0 9 * * 1-5", "tz": "UTC", "client_request_id": "c1"}},
+            {"call": "schedule_task", "args": {"workflow": "Plain", "task": "Weekday cron", "cron": "0 9 * * 1-5", "tz": "+02:00", "client_request_id": "c1"}},
+            {"call": "schedule_task", "args": {"schedule_id": "s1", "tz": "+02:00"}},
+            {"call": "schedule_task", "args": {"workflow": "Plain", "task": "Six-hourly", "every": "6h"}},
+            {"call": "schedule_task", "args": {"schedule_id": "s2", "tz": "UTC"}},
+            {"call": "list_scheduled_tasks"}
+        ]],
+        "handoffs": {"1": {"summary": "final", "verdict": "complete"}}
+    });
+    let mut case = case(turns, true, helper("m"), |stage| {
+        stage.delegation.as_mut().unwrap().schedules = true;
+    });
+    save_project_config(&case, &case.settings.clone());
+    assert_eq!(
+        drive(&mut case.run),
+        Action::Complete,
+        "{:?}",
+        case.run.error
+    );
+    let calls = calls(&case.script);
+    let created = &call(&calls, 1, "schedule_task")[0]["result"];
+    assert_eq!(created["schedule_id"], "s1", "{created}");
+    assert_eq!(created["trigger"], "cron 0 9 * * 1-5 (UTC)", "{created}");
+    assert!(created["next_due"].as_str().is_some(), "{created}");
+    let conflict = &call(&calls, 1, "schedule_task")[1]["result"];
+    assert_eq!(conflict["error"]["code"], "request_conflict", "{conflict}");
+    // A tz alone re-times the stored cron trigger.
+    let retimed = &call(&calls, 1, "schedule_task")[2]["result"];
+    assert_eq!(retimed["trigger"], "cron 0 9 * * 1-5 (+02:00)", "{retimed}");
+    // An every trigger takes no tz: refused, and nothing changes.
+    let refused = &call(&calls, 1, "schedule_task")[4]["result"];
+    assert_eq!(refused["error"]["code"], "invalid_request", "{refused}");
+    let project = case.dir.path();
+    let store = schedules::load(project).unwrap();
+    assert_eq!(store.schedules[0].revision, 2);
+    assert!(matches!(
+        &store.schedules[0].trigger,
+        schedules::Trigger::Cron { tz: Some(tz), .. } if tz == "+02:00"
+    ));
+    assert_eq!(store.schedules[1].revision, 1);
+
+    // Each result's approve command pins the definition it reports: the
+    // first one no longer matches after the tz edit, so it approves nothing.
+    let pinned = |result: &serde_json::Value| {
+        let command = result["approve"].as_str().unwrap().to_owned();
+        command
+            .split_once("--digest ")
+            .map(|(_, digest)| digest.trim().to_owned())
+            .unwrap_or_else(|| panic!("no --digest in {command}"))
+    };
+    let stale = schedules::approve(project, "s1", Some(&pinned(created))).unwrap_err();
+    assert!(
+        format!("{stale:#}").contains("changed after it was shown"),
+        "{stale:#}"
+    );
+    let settings = schedules::trusted_settings(project).unwrap();
+    let current = schedules::load(project).unwrap().schedules[0].clone();
+    assert!(!schedules::approved(project, &current, &settings));
+    let approved = schedules::approve(project, "s1", Some(&pinned(retimed))).unwrap();
+    assert!(schedules::approved(project, &approved, &settings));
+    let next = schedules::next_due(&approved, chrono::Utc::now()).unwrap();
+    let fired = schedules::fire_due(project, next, None).unwrap();
+    assert_eq!(fired.len(), 1);
+    assert!(fired[0].run.is_some());
+    assert!(schedules::fire_due(project, next, None).unwrap().is_empty());
 }
 
 #[test]

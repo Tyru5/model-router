@@ -51,7 +51,7 @@ sleeping.
 
 `.github/workflows/ci.yml` on every PR and push to `main`: formatting, clippy,
 `cargo test` on Linux and macOS, Rust 1.85 MSRV check, smoke tests on Linux
-(macOS smoke runs are non-blocking), and a dependency audit. Failed smoke runs upload screen captures.
+and macOS, and a dependency audit. Failed smoke runs upload screen captures.
 
 Adapter flags were checked against installed CLI help or official docs;
 automated tests use mocks. Live authenticated runs against every harness have

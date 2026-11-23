@@ -2,10 +2,13 @@
 
 use super::{Server, tools};
 use anyhow::Result;
+use percent_encoding::percent_decode_str;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    io::{self, BufRead, Write},
+    fs::File,
+    io::{self, BufRead, Read, Write},
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -20,6 +23,13 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const SERVER_OVERLOADED: i64 = -32000;
+const RESOURCE_NOT_FOUND: i64 = -32002;
+
+const RESOURCE_PREFIX: &str = "model-router://runs/";
+/// Maximum bytes returned by `resources/read`.
+const MAX_RESOURCE_BYTES: usize = crate::snapshot::PATCH_LIMIT;
+/// Maximum recent runs inspected by `resources/list`.
+const MAX_LISTED_RUNS: usize = 20;
 
 /// Maximum bytes read for a single JSON-RPC request line.
 const MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
@@ -34,6 +44,13 @@ const INSTRUCTIONS: &str = "model-router runs a task through a workflow of agent
 Typical use: list_workflows, optionally preview_run, then start_run and wait_run (repeat while timed_out) \
 and get_report. A run waiting at a checkpoint (status awaiting_confirmation) continues with confirm_stage; \
 a failed or blocked one with retry_stage.";
+
+/// Error returned by MCP resource handlers, mapped to JSON-RPC error codes.
+#[derive(Debug, Clone)]
+pub enum ResourceError {
+    InvalidParams(String),
+    NotFound(String),
+}
 
 /// The tools one MCP session serves: `serve`'s run tools, or a delegating
 /// stage's delegation tools (`delegation::tools`).
@@ -50,6 +67,119 @@ pub trait ToolSet: Send + Sync + 'static {
         cancel: Option<&AtomicBool>,
         progress: &mut dyn FnMut(&Value),
     ) -> Result<Value>;
+
+    /// Whether this session exposes MCP resources (`resources/list`, `resources/read`).
+    fn has_resources(&self) -> bool {
+        false
+    }
+    fn list_resources(&self) -> std::result::Result<Vec<Value>, ResourceError> {
+        Ok(vec![])
+    }
+    fn read_resource(&self, _uri: &str) -> std::result::Result<Value, ResourceError> {
+        Err(ResourceError::NotFound(
+            "Resources are not supported".into(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceKind {
+    Review,
+    Diff,
+}
+
+impl ResourceKind {
+    fn filename(self) -> &'static str {
+        match self {
+            Self::Review => "review.md",
+            Self::Diff => "changes.diff",
+        }
+    }
+
+    fn mime_type(self) -> &'static str {
+        match self {
+            Self::Review => "text/markdown",
+            Self::Diff => "text/x-diff",
+        }
+    }
+}
+
+fn parse_resource_uri(
+    uri: &str,
+) -> std::result::Result<(&str, ResourceKind, Option<String>), ResourceError> {
+    let (base, query) = uri.split_once('?').unwrap_or((uri, ""));
+    let Some(rest) = base.strip_prefix(RESOURCE_PREFIX) else {
+        return Err(ResourceError::InvalidParams(format!(
+            "Unsupported resource URI {uri:?}; expected model-router://runs/<run_id>/(review|diff)"
+        )));
+    };
+    let mut parts = rest.split('/');
+    let (Some(run_id), Some(kind_str), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(ResourceError::InvalidParams(format!(
+            "Invalid resource URI {uri:?}; expected model-router://runs/<run_id>/(review|diff)"
+        )));
+    };
+    let kind = match kind_str {
+        "review" => ResourceKind::Review,
+        "diff" => ResourceKind::Diff,
+        _ => {
+            return Err(ResourceError::InvalidParams(format!(
+                "Unknown resource kind {kind_str:?}; expected \"review\" or \"diff\""
+            )));
+        }
+    };
+    let mut project = None;
+    if !query.is_empty() {
+        for pair in query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            if name != "project" {
+                return Err(ResourceError::InvalidParams(format!(
+                    "Unsupported query parameter {name:?} in resource URI"
+                )));
+            }
+            project = Some(
+                percent_decode_str(&value.replace('+', " "))
+                    .decode_utf8_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    Ok((run_id, kind, project))
+}
+
+fn trim_incomplete_utf8_tail(bytes: &mut Vec<u8>) {
+    let tail_start = bytes.len().saturating_sub(4);
+    let mut i = bytes.len();
+    while i > tail_start {
+        i -= 1;
+        if (bytes[i] & 0xC0) != 0x80 {
+            if let Err(err) = std::str::from_utf8(&bytes[i..]) {
+                if err.error_len().is_none() {
+                    bytes.truncate(i);
+                }
+            }
+            break;
+        }
+    }
+}
+
+fn read_bounded(file: File, limit: usize) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    file.take((limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() > limit;
+    if truncated {
+        bytes.truncate(limit);
+        trim_incomplete_utf8_tail(&mut bytes);
+    }
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        text.push_str(&format!("\n[truncated at {limit} bytes]"));
+    }
+    Ok(text)
 }
 
 impl ToolSet for Server {
@@ -73,6 +203,84 @@ impl ToolSet for Server {
         progress: &mut dyn FnMut(&Value),
     ) -> Result<Value> {
         tools::call_with(self, name, arguments, cancel, progress)
+    }
+    fn has_resources(&self) -> bool {
+        true
+    }
+    fn list_resources(&self) -> std::result::Result<Vec<Value>, ResourceError> {
+        let project = self
+            .project(None)
+            .map_err(|e| ResourceError::InvalidParams(format!("{e:#}")))?;
+        let entries = crate::history::list(&project)
+            .map_err(|e| ResourceError::InvalidParams(format!("{e:#}")))?;
+        let mut resources = Vec::new();
+        for summary in entries
+            .iter()
+            .filter_map(|entry| match entry {
+                crate::history::Entry::Summary(summary) => Some(summary),
+                crate::history::Entry::Damaged { .. } => None,
+            })
+            .take(MAX_LISTED_RUNS)
+        {
+            if crate::storage::run_dir(&project, &summary.id).is_err() {
+                continue;
+            }
+            let run_rel = Path::new(".model-router").join("runs").join(&summary.id);
+            let task = crate::history::excerpt(&summary.task);
+            if crate::storage::open_beneath(
+                &project,
+                &run_rel.join(ResourceKind::Review.filename()),
+            )
+            .is_ok()
+            {
+                resources.push(json!({
+                    "uri": format!("{RESOURCE_PREFIX}{}/review", summary.id),
+                    "name": format!("{} review", summary.id),
+                    "description": format!("Review brief for run {} ({}): {}", summary.id, summary.workflow, task),
+                    "mimeType": ResourceKind::Review.mime_type(),
+                }));
+            }
+            if crate::storage::open_beneath(&project, &run_rel.join(ResourceKind::Diff.filename()))
+                .is_ok()
+            {
+                resources.push(json!({
+                    "uri": format!("{RESOURCE_PREFIX}{}/diff", summary.id),
+                    "name": format!("{} diff", summary.id),
+                    "description": format!("Diff for run {} ({}): {}", summary.id, summary.workflow, task),
+                    "mimeType": ResourceKind::Diff.mime_type(),
+                }));
+            }
+        }
+        Ok(resources)
+    }
+    fn read_resource(&self, uri: &str) -> std::result::Result<Value, ResourceError> {
+        let (run_id, kind, requested_project) = parse_resource_uri(uri)?;
+        let project = self
+            .project(requested_project.as_deref())
+            .map_err(|e| ResourceError::InvalidParams(format!("{e:#}")))?;
+        crate::storage::run_dir(&project, run_id)
+            .map_err(|e| ResourceError::InvalidParams(format!("{e:#}")))?;
+        if let Some(owner) = self.runs.project_of(run_id) {
+            if owner != project {
+                return Err(ResourceError::InvalidParams(format!(
+                    "Run {run_id} belongs to project {}",
+                    owner.display()
+                )));
+            }
+        }
+        let relative = Path::new(".model-router")
+            .join("runs")
+            .join(run_id)
+            .join(kind.filename());
+        let file = crate::storage::open_beneath(&project, &relative)
+            .map_err(|e| ResourceError::NotFound(format!("Resource not found: {uri} ({e:#})")))?;
+        let text = read_bounded(file, MAX_RESOURCE_BYTES)
+            .map_err(|e| ResourceError::NotFound(format!("Failed to read {uri}: {e}")))?;
+        Ok(json!({
+            "uri": uri,
+            "mimeType": kind.mime_type(),
+            "text": text,
+        }))
     }
 }
 
@@ -385,21 +593,58 @@ fn handle<T: ToolSet, W: Write + Send + 'static>(
         return None;
     };
     Some(match method {
-        "initialize" => response(
-            id,
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {"tools": {"listChanged": false}},
-                "serverInfo": {
-                    "name": "model-router",
-                    "title": "model-router",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-                "instructions": server.instructions(),
-            }),
-        ),
+        "initialize" => {
+            let mut capabilities = json!({"tools": {"listChanged": false}});
+            if server.has_resources() {
+                capabilities["resources"] = json!({});
+            }
+            response(
+                id,
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": capabilities,
+                    "serverInfo": {
+                        "name": "model-router",
+                        "title": "model-router",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "instructions": server.instructions(),
+                }),
+            )
+        }
         "ping" => response(id, json!({})),
         "tools/list" => response(id, json!({"tools": server.list()})),
+        "resources/list" => {
+            if !server.has_resources() {
+                return Some(error_response(
+                    id,
+                    METHOD_NOT_FOUND,
+                    "Method not found: resources/list",
+                ));
+            }
+            match server.list_resources() {
+                Ok(resources) => response(id, json!({"resources": resources})),
+                Err(ResourceError::InvalidParams(msg)) => error_response(id, INVALID_PARAMS, &msg),
+                Err(ResourceError::NotFound(msg)) => error_response(id, RESOURCE_NOT_FOUND, &msg),
+            }
+        }
+        "resources/read" => {
+            if !server.has_resources() {
+                return Some(error_response(
+                    id,
+                    METHOD_NOT_FOUND,
+                    "Method not found: resources/read",
+                ));
+            }
+            let Some(uri) = params.get("uri").and_then(Value::as_str) else {
+                return Some(error_response(id, INVALID_PARAMS, "Missing resource uri"));
+            };
+            match server.read_resource(uri) {
+                Ok(content) => response(id, json!({"contents": [content]})),
+                Err(ResourceError::InvalidParams(msg)) => error_response(id, INVALID_PARAMS, &msg),
+                Err(ResourceError::NotFound(msg)) => error_response(id, RESOURCE_NOT_FOUND, &msg),
+            }
+        }
         "tools/call" => {
             let Some(name) = params.get("name").and_then(Value::as_str) else {
                 return Some(error_response(id, INVALID_PARAMS, "Missing tool name"));
@@ -575,6 +820,13 @@ mod tests {
         for name in &listed {
             assert!(tools::exists(name), "missing {name} in tools::exists");
         }
+        for &name in tools::tool_names() {
+            assert!(
+                listed.iter().any(|l| l == name),
+                "extra {name} in TOOL_NAMES not present in tools::list"
+            );
+        }
+        assert_eq!(listed.len(), tools::tool_names().len());
         assert!(!tools::exists("nonexistent_tool"));
     }
 
@@ -591,5 +843,60 @@ mod tests {
         assert!(!cancel_a.load(Ordering::Relaxed));
         drop(slot_b);
         assert!(inflight.cancels.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resource_uri_parsing_validates_shape_and_query() {
+        let (run_id, kind, project) =
+            parse_resource_uri("model-router://runs/20260101-120000-abcd1234/review").unwrap();
+        assert_eq!(run_id, "20260101-120000-abcd1234");
+        assert_eq!(kind, ResourceKind::Review);
+        assert_eq!(project, None);
+
+        let (run_id, kind, project) = parse_resource_uri(
+            "model-router://runs/20260101-120000-abcd1234/diff?project=%2Ftmp%2Fmy+repo",
+        )
+        .unwrap();
+        assert_eq!(run_id, "20260101-120000-abcd1234");
+        assert_eq!(kind, ResourceKind::Diff);
+        assert_eq!(project.as_deref(), Some("/tmp/my repo"));
+
+        for bad in [
+            "http://runs/abc/review",
+            "model-router://runs/abc/unknown",
+            "model-router://runs/abc/review/extra",
+            "model-router://runs/abc",
+            "model-router://runs/abc/review?foo=bar",
+        ] {
+            assert!(
+                matches!(
+                    parse_resource_uri(bad),
+                    Err(ResourceError::InvalidParams(_))
+                ),
+                "expected invalid params for {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_resource_read_truncates_cleanly_at_utf8_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("review.md");
+        // 5 ASCII bytes + 3-byte '€' + more bytes.
+        let content = format!("hello€{}", "x".repeat(50));
+        std::fs::write(&path, &content).unwrap();
+
+        let file = File::open(&path).unwrap();
+        // Limit 7 cuts right inside the 3-byte '€' (bytes 5, 6, 7).
+        let text = read_bounded(file, 7).unwrap();
+        assert!(
+            text.starts_with("hello\n[truncated at 7 bytes]"),
+            "{text:?}"
+        );
+        assert!(!text.contains('\u{FFFD}'));
+
+        let file = File::open(&path).unwrap();
+        let full = read_bounded(file, 1024).unwrap();
+        assert_eq!(full, content);
     }
 }

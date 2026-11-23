@@ -4,9 +4,9 @@ use crate::{
     adapters::{self, ContextPaths, Invocation, OutputKind},
     catalog,
     config::{Mode, Settings, Stage},
-    process, storage,
+    process, providers, storage,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -46,6 +46,40 @@ pub struct Capability {
     pub support: Support,
 }
 
+/// Offline auth-readiness signal for an installed harness. Checks only
+/// whether well-known env vars are non-empty or config/auth files exist —
+/// never reads secret contents or makes network requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthStatus {
+    Ready,
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AuthHint {
+    pub status: AuthStatus,
+    /// Names of detected env vars or `~/...` config paths (never secret values).
+    pub signals: Vec<String>,
+    /// Short guidance when no local auth signal was detected.
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKeyStatus {
+    Set,
+    Missing,
+    NotRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderCheck {
+    pub name: String,
+    pub api_key_env: String,
+    pub status: ProviderKeyStatus,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
     pub harness: String,
@@ -60,6 +94,15 @@ pub struct Report {
     pub version_tested: Option<bool>,
     /// Whether a fixture for `version` is captured output, not schema-derived.
     pub version_captured: bool,
+    /// Configured pin from `[harness_versions]`, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_pin: Option<String>,
+    /// Whether the detected version satisfies `version_pin`; None without a pin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_pin_ok: Option<bool>,
+    /// Offline auth-readiness hint for installed built-in harnesses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_hint: Option<AuthHint>,
     /// Derived from the adapter's own invocations. None for custom adapters,
     /// which declare no flag contract.
     pub capabilities: Option<Vec<Capability>>,
@@ -76,6 +119,9 @@ impl Report {
             .iter()
             .flatten()
             .any(|c| c.support == Support::Missing)
+    }
+    pub fn version_pin_mismatch(&self) -> bool {
+        self.version_pin_ok == Some(false)
     }
     pub fn version_label(&self) -> String {
         match &self.version {
@@ -130,12 +176,18 @@ fn inspect_with(harness: &str, settings: &Settings, project: &Path, live: &[Fixt
         tested_versions: vec![],
         version_tested: None,
         version_captured: false,
+        version_pin: settings.harness_versions.get(harness).cloned(),
+        version_pin_ok: None,
+        auth_hint: None,
         capabilities: None,
         summary: "not declared".into(),
         notes: vec![AUTH_NOTE.into()],
     };
     if report.builtin {
         check_with(&mut report, project, live);
+        if report.installed() {
+            report.auth_hint = Some(auth_hint_for(harness));
+        }
     } else if settings.adapters.contains_key(harness) {
         report
             .notes
@@ -143,6 +195,7 @@ fn inspect_with(harness: &str, settings: &Settings, project: &Path, live: &[Fixt
     } else {
         report.notes.push(format!("Unknown harness {harness}"));
     }
+    evaluate_version_pin(&mut report);
     report
 }
 
@@ -706,6 +759,491 @@ pub fn table(reports: &[Report]) -> String {
     output
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinOp {
+    /// Bare pin: exact for 3+ segments (`0.167.0`), segment-prefix for 1–2 (`0.167`, `2`).
+    Bare,
+    Eq,
+    Ge,
+    Gt,
+    Le,
+    Lt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PinClause {
+    op: PinOp,
+    parts: Vec<u64>,
+}
+
+fn parse_version_parts(raw: &str) -> Option<Vec<u64>> {
+    let token = raw.trim().strip_prefix('v').unwrap_or(raw.trim());
+    if token.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for segment in token.split('.') {
+        if segment.is_empty() || !segment.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        parts.push(segment.parse().ok()?);
+    }
+    (!parts.is_empty()).then_some(parts)
+}
+
+fn detected_version_parts(line: &str) -> Option<Vec<u64>> {
+    let token = version_tokens(line).next()?;
+    let mut parts = Vec::new();
+    for segment in token.split('.') {
+        let digits: String = segment.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() {
+            break;
+        }
+        parts.push(digits.parse().ok()?);
+    }
+    (!parts.is_empty()).then_some(parts)
+}
+
+fn parse_pin_clauses(pin: &str) -> Result<Vec<PinClause>> {
+    let trimmed = pin.trim();
+    ensure!(!trimmed.is_empty(), "Version pin cannot be empty");
+    let mut clauses = Vec::new();
+    for part in trimmed.split(',') {
+        let part = part.trim();
+        ensure!(!part.is_empty(), "Empty clause in version pin {pin:?}");
+        let (op, rest) = if let Some(r) = part.strip_prefix(">=") {
+            (PinOp::Ge, r)
+        } else if let Some(r) = part.strip_prefix("<=") {
+            (PinOp::Le, r)
+        } else if let Some(r) = part.strip_prefix("==") {
+            (PinOp::Eq, r)
+        } else if let Some(r) = part.strip_prefix('>') {
+            (PinOp::Gt, r)
+        } else if let Some(r) = part.strip_prefix('<') {
+            (PinOp::Lt, r)
+        } else if let Some(r) = part.strip_prefix('=') {
+            (PinOp::Eq, r)
+        } else {
+            (PinOp::Bare, part)
+        };
+        let parts = parse_version_parts(rest).with_context(|| {
+            format!("Expected numeric version (e.g. 0.167.0 or >=0.160.0), got {pin:?}")
+        })?;
+        clauses.push(PinClause { op, parts });
+    }
+    Ok(clauses)
+}
+
+/// Validates a `[harness_versions]` pin spec (e.g. `"0.167.0"`, `"0.167"`,
+/// `">=0.160.0"`, `">=0.160.0, <0.200.0"`).
+pub fn validate_version_pin(pin: &str) -> Result<()> {
+    parse_pin_clauses(pin)?;
+    Ok(())
+}
+
+fn cmp_version(a: &[u64], b: &[u64]) -> std::cmp::Ordering {
+    let len = a.len().max(b.len());
+    for i in 0..len {
+        let av = a.get(i).copied().unwrap_or(0);
+        let bv = b.get(i).copied().unwrap_or(0);
+        match av.cmp(&bv) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// Whether a `--version` line matches a `[harness_versions]` pin.
+pub fn version_pin_matches(pin: &str, detected_line: &str) -> bool {
+    let Ok(clauses) = parse_pin_clauses(pin) else {
+        return false;
+    };
+    let Some(found) = detected_version_parts(detected_line) else {
+        return false;
+    };
+    clauses.iter().all(|clause| match clause.op {
+        PinOp::Bare => {
+            if clause.parts.len() < 3 {
+                found.len() >= clause.parts.len() && found[..clause.parts.len()] == clause.parts[..]
+            } else {
+                cmp_version(&found, &clause.parts) == std::cmp::Ordering::Equal
+            }
+        }
+        PinOp::Eq => cmp_version(&found, &clause.parts) == std::cmp::Ordering::Equal,
+        PinOp::Ge => cmp_version(&found, &clause.parts) != std::cmp::Ordering::Less,
+        PinOp::Gt => cmp_version(&found, &clause.parts) == std::cmp::Ordering::Greater,
+        PinOp::Le => cmp_version(&found, &clause.parts) != std::cmp::Ordering::Greater,
+        PinOp::Lt => cmp_version(&found, &clause.parts) == std::cmp::Ordering::Less,
+    })
+}
+
+fn evaluate_version_pin(report: &mut Report) {
+    let Some(pin) = report.version_pin.clone() else {
+        return;
+    };
+    if !report.installed() {
+        report.version_pin_ok = Some(false);
+        report.notes.push(format!(
+            "Pinned to {pin}, but {} is not installed.",
+            report.program
+        ));
+        return;
+    }
+    let Some(version) = report.version.as_deref() else {
+        report.version_pin_ok = Some(false);
+        report.notes.push(format!(
+            "Pinned to {pin}, but {} version could not be detected.",
+            report.program
+        ));
+        return;
+    };
+    let ok = version_pin_matches(&pin, version);
+    report.version_pin_ok = Some(ok);
+    if ok {
+        report
+            .notes
+            .push(format!("Matches configured version pin {pin}."));
+    } else {
+        report.notes.push(format!(
+            "Version {} does not match configured pin {pin}.",
+            report.version_label()
+        ));
+    }
+}
+
+/// Checks configured `[providers.*]` API key environment variables (existence
+/// and non-emptiness only; never reads or records secret values).
+pub fn inspect_providers(settings: &Settings) -> Vec<ProviderCheck> {
+    inspect_providers_with(settings, |var| {
+        std::env::var_os(var).is_some_and(|v| !v.is_empty())
+    })
+}
+
+pub fn inspect_providers_with(
+    settings: &Settings,
+    env_set: impl Fn(&str) -> bool,
+) -> Vec<ProviderCheck> {
+    settings
+        .providers
+        .keys()
+        .map(|name| {
+            let resolved = providers::resolve(name, &settings.providers);
+            let api_key_env = resolved
+                .map(|p| p.api_key_env.clone())
+                .unwrap_or_else(|| settings.providers[name].api_key_env.clone());
+            let status = if api_key_env.is_empty() {
+                ProviderKeyStatus::NotRequired
+            } else if env_set(&api_key_env) {
+                ProviderKeyStatus::Set
+            } else {
+                ProviderKeyStatus::Missing
+            };
+            ProviderCheck {
+                name: name.clone(),
+                api_key_env,
+                status,
+            }
+        })
+        .collect()
+}
+
+/// One line for `doctor` summarizing configured `[providers.*]` key presence.
+pub fn providers_line(checks: &[ProviderCheck]) -> Option<String> {
+    if checks.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = checks
+        .iter()
+        .map(|c| match c.status {
+            ProviderKeyStatus::Set => format!("{} ({} set)", c.name, c.api_key_env),
+            ProviderKeyStatus::Missing => format!("{} ({} missing)", c.name, c.api_key_env),
+            ProviderKeyStatus::NotRequired => format!("{} (no key required)", c.name),
+        })
+        .collect();
+    Some(format!("Providers: {}", parts.join("; ")))
+}
+
+/// One line for `doctor` summarizing `[harness_versions]` pins.
+pub fn pins_line(settings: &Settings, reports: &[Report]) -> Option<String> {
+    if settings.harness_versions.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = settings
+        .harness_versions
+        .iter()
+        .map(
+            |(harness, pin)| match reports.iter().find(|r| r.harness == *harness) {
+                Some(r) if r.version_pin_ok == Some(true) => {
+                    format!("{harness} {} matches {pin}", r.version_label())
+                }
+                Some(r) if !r.installed() => format!("{harness} missing (pinned {pin})"),
+                Some(r) => format!("{harness} {} drift (pinned {pin})", r.version_label()),
+                None => format!("{harness} unknown harness (pinned {pin})"),
+            },
+        )
+        .collect();
+    Some(format!("Version pins: {}", parts.join("; ")))
+}
+
+struct AuthSpec {
+    env_vars: &'static [&'static str],
+    /// Paths relative to the user's home directory, checked with `exists()` only.
+    home_files: &'static [&'static str],
+    guidance: &'static str,
+}
+
+fn auth_spec(harness: &str) -> Option<AuthSpec> {
+    Some(match harness {
+        "codex" => AuthSpec {
+            env_vars: &["OPENAI_API_KEY", "CODEX_API_KEY"],
+            home_files: &[".codex/auth.json", ".codex/config.toml"],
+            guidance: "set OPENAI_API_KEY or run `codex login`",
+        },
+        "claude" => AuthSpec {
+            env_vars: &[
+                "ANTHROPIC_API_KEY",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "ANTHROPIC_AUTH_TOKEN",
+            ],
+            home_files: &[
+                ".claude/.credentials.json",
+                ".claude.json",
+                ".config/claude/credentials.json",
+            ],
+            guidance: "set ANTHROPIC_API_KEY or run `claude` to sign in",
+        },
+        "pi" => AuthSpec {
+            env_vars: &[
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "GEMINI_API_KEY",
+                "OPENROUTER_API_KEY",
+            ],
+            home_files: &[
+                ".pi/agent/auth.json",
+                ".pi/agent/models.json",
+                ".config/pi/auth.json",
+            ],
+            guidance: "set a provider API key env var or configure ~/.pi/agent/auth.json",
+        },
+        "omp" => AuthSpec {
+            env_vars: &[
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "GEMINI_API_KEY",
+                "OPENROUTER_API_KEY",
+            ],
+            home_files: &[
+                ".omp/agent/auth.json",
+                ".omp/agent/models.json",
+                ".pi/agent/auth.json",
+            ],
+            guidance: "set a provider API key env var or configure ~/.omp/agent/auth.json",
+        },
+        "cursor" => AuthSpec {
+            env_vars: &["CURSOR_API_KEY"],
+            home_files: &[
+                ".cursor/cli-config.json",
+                ".config/cursor/auth.json",
+                ".cursor/auth.json",
+            ],
+            guidance: "set CURSOR_API_KEY or run `cursor-agent login`",
+        },
+        "gemini" => AuthSpec {
+            env_vars: &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+            home_files: &[".gemini/oauth_creds.json", ".gemini/settings.json"],
+            guidance: "set GEMINI_API_KEY or run `gemini` to sign in",
+        },
+        "opencode" => AuthSpec {
+            env_vars: &[
+                "OPENAI_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "OPENROUTER_API_KEY",
+                "GEMINI_API_KEY",
+            ],
+            home_files: &[
+                ".local/share/opencode/auth.json",
+                ".config/opencode/opencode.json",
+            ],
+            guidance: "set a provider API key env var or run `opencode auth login`",
+        },
+        "aider" => AuthSpec {
+            env_vars: &[
+                "OPENAI_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "OPENROUTER_API_KEY",
+                "GEMINI_API_KEY",
+                "DEEPSEEK_API_KEY",
+            ],
+            home_files: &[".aider.conf.yml", ".aider.model.settings.yml"],
+            guidance: "set OPENAI_API_KEY/ANTHROPIC_API_KEY or configure ~/.aider.conf.yml",
+        },
+        "goose" => AuthSpec {
+            env_vars: &[
+                "OPENAI_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "GOOGLE_API_KEY",
+                "OPENROUTER_API_KEY",
+            ],
+            home_files: &[".config/goose/config.yaml", ".config/goose/secrets.yaml"],
+            guidance: "set a provider API key env var or run `goose configure`",
+        },
+        "amp" => AuthSpec {
+            env_vars: &["AMP_API_KEY"],
+            home_files: &[
+                ".local/share/amp/secrets.json",
+                ".config/amp/settings.json",
+                ".amp/secrets.json",
+            ],
+            guidance: "set AMP_API_KEY or run `amp login`",
+        },
+        "copilot" => AuthSpec {
+            env_vars: &["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"],
+            home_files: &[
+                ".copilot/config.json",
+                ".config/github-copilot/hosts.json",
+                ".config/github-copilot/apps.json",
+            ],
+            guidance: "set GH_TOKEN/GITHUB_TOKEN or run `copilot` to sign in",
+        },
+        _ => return None,
+    })
+}
+
+/// Offline auth-readiness hint for a built-in harness: checks only presence of
+/// well-known env vars or config files (never reads secrets or contacts a host).
+pub fn auth_hint_for(harness: &str) -> AuthHint {
+    let home = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+    auth_hint_with(
+        harness,
+        home.as_deref(),
+        |var| std::env::var_os(var).is_some_and(|v| !v.is_empty()),
+        |var| std::env::var_os(var).map(PathBuf::from),
+    )
+}
+
+pub fn auth_hint_with(
+    harness: &str,
+    home: Option<&Path>,
+    env_set: impl Fn(&str) -> bool,
+    env_path: impl Fn(&str) -> Option<PathBuf>,
+) -> AuthHint {
+    let Some(spec) = auth_spec(harness) else {
+        return AuthHint {
+            status: AuthStatus::Missing,
+            signals: vec![],
+            detail: "no built-in auth hints for this harness".into(),
+        };
+    };
+    let mut signals = Vec::new();
+    for &var in spec.env_vars {
+        if env_set(var) {
+            signals.push(var.to_owned());
+        }
+    }
+    if harness == "codex" {
+        if let Some(codex_home) = env_path("CODEX_HOME") {
+            if codex_home.join("auth.json").exists() {
+                signals.push("$CODEX_HOME/auth.json".into());
+            } else if codex_home.join("config.toml").exists() {
+                signals.push("$CODEX_HOME/config.toml".into());
+            }
+        }
+    }
+    if let Some(home) = home {
+        for &rel in spec.home_files {
+            if home.join(rel).exists() {
+                signals.push(format!("~/{rel}"));
+            }
+        }
+    }
+    if signals.is_empty() {
+        AuthHint {
+            status: AuthStatus::Missing,
+            signals,
+            detail: spec.guidance.into(),
+        }
+    } else {
+        AuthHint {
+            status: AuthStatus::Ready,
+            signals,
+            detail: "local auth signal present (validity not verified offline)".into(),
+        }
+    }
+}
+
+/// One line for `doctor` summarizing offline auth-readiness hints for installed harnesses.
+pub fn auth_hints_line(reports: &[Report]) -> Option<String> {
+    let parts: Vec<String> = reports
+        .iter()
+        .filter_map(|r| {
+            let hint = r.auth_hint.as_ref()?;
+            Some(match hint.status {
+                AuthStatus::Ready => {
+                    format!("{} ready ({})", r.harness, hint.signals.join(", "))
+                }
+                AuthStatus::Missing => format!("{} none detected ({})", r.harness, hint.detail),
+            })
+        })
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("Auth hints (offline): {}", parts.join("; ")))
+    }
+}
+
+/// All `--strict` failure reasons: missing flags, version pin drift, or missing
+/// required `[providers.*]` API keys.
+pub fn strict_failures(
+    settings: &Settings,
+    reports: &[Report],
+    providers: &[ProviderCheck],
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    if reports.iter().any(Report::missing_flags) {
+        failures.push("An installed harness lacks a flag the router passes".into());
+    }
+    for (harness, pin) in &settings.harness_versions {
+        match reports.iter().find(|r| r.harness == *harness) {
+            Some(r) if r.version_pin_ok == Some(true) => {}
+            Some(r) if !r.installed() => failures.push(format!(
+                "Harness {harness} is pinned to {pin} but is not installed"
+            )),
+            Some(r) => failures.push(format!(
+                "Harness {harness} version {} does not match pin {pin}",
+                r.version_label()
+            )),
+            None => failures.push(format!(
+                "Harness {harness} is pinned to {pin} but is unknown/unconfigured"
+            )),
+        }
+    }
+    for check in providers {
+        if check.status == ProviderKeyStatus::Missing {
+            failures.push(format!(
+                "Configured provider {} requires {} which is unset or empty",
+                check.name, check.api_key_env
+            ));
+        }
+    }
+    failures
+}
+
+/// Ensures `strict_failures` is empty, returning an error listing all failures.
+pub fn check_strict(
+    settings: &Settings,
+    reports: &[Report],
+    providers: &[ProviderCheck],
+) -> Result<()> {
+    let failures = strict_failures(settings, reports, providers);
+    if !failures.is_empty() {
+        bail!("{}", failures.join("; "));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -982,6 +1520,9 @@ mod tests {
                 tested_versions: vec![],
                 version_tested: None,
                 version_captured: false,
+                version_pin: None,
+                version_pin_ok: None,
+                auth_hint: None,
                 capabilities: None,
                 summary: "ok".into(),
                 notes: vec![],
@@ -1035,5 +1576,107 @@ mod tests {
         assert_eq!(report.version_label(), "not declared");
         assert!(report.capabilities.is_none() && report.version.is_none());
         assert!(report.notes[0].contains("Authentication is not checked"));
+    }
+
+    #[test]
+    fn version_pins_validate_and_match_exact_prefix_and_ranges() {
+        assert!(validate_version_pin("0.167.0").is_ok());
+        assert!(validate_version_pin("0.167").is_ok());
+        assert!(validate_version_pin(">=0.160.0").is_ok());
+        assert!(validate_version_pin(">=0.160.0, <0.200.0").is_ok());
+        assert!(validate_version_pin("").is_err());
+        assert!(validate_version_pin("latest").is_err());
+        assert!(validate_version_pin("!=0.160.0").is_err());
+        assert!(validate_version_pin("0..1").is_err());
+
+        // Exact 3-segment pin
+        assert!(version_pin_matches("0.167.0", "codex-cli 0.167.0"));
+        assert!(!version_pin_matches("0.167.0", "codex-cli 0.167.1"));
+        // Prefix 1–2 segment pin respects segment boundaries
+        assert!(version_pin_matches("0.167", "codex-cli 0.167.5"));
+        assert!(!version_pin_matches("0.16", "codex-cli 0.167.0"));
+        assert!(version_pin_matches("2", "opencode v2.0.22"));
+        assert!(!version_pin_matches("2", "opencode v1.9.0"));
+        // Semver comparisons & ranges
+        assert!(version_pin_matches(">=0.160.0", "codex-cli 0.167.0"));
+        assert!(version_pin_matches(">=0.160.0", "codex-cli 0.160.0"));
+        assert!(!version_pin_matches(">=0.160.0", "codex-cli 0.159.9"));
+        assert!(version_pin_matches(
+            ">=0.160.0, <0.170.0",
+            "codex-cli 0.167.0"
+        ));
+        assert!(!version_pin_matches(
+            ">=0.160.0, <0.170.0",
+            "codex-cli 0.170.0"
+        ));
+    }
+
+    #[test]
+    fn provider_checks_and_strict_failures_never_leak_secrets() {
+        let mut settings = Settings::default();
+        // Built-in preset opt-in inherits OPENROUTER_API_KEY; ollama needs no key.
+        settings
+            .providers
+            .insert("openrouter".into(), providers::Provider::default());
+        settings
+            .providers
+            .insert("ollama".into(), providers::Provider::default());
+        settings.providers.insert(
+            "gateway".into(),
+            providers::Provider {
+                base_url: "https://gw.example/v1".into(),
+                api_key_env: "GW_SECRET_TOKEN".into(),
+                ..Default::default()
+            },
+        );
+        let checks = inspect_providers_with(&settings, |var| var == "OPENROUTER_API_KEY");
+        assert_eq!(checks.len(), 3);
+        let find = |name: &str| checks.iter().find(|c| c.name == name).unwrap();
+        assert_eq!(find("openrouter").status, ProviderKeyStatus::Set);
+        assert_eq!(find("ollama").status, ProviderKeyStatus::NotRequired);
+        assert_eq!(find("gateway").status, ProviderKeyStatus::Missing);
+        let line = providers_line(&checks).unwrap();
+        assert!(
+            line.contains("openrouter (OPENROUTER_API_KEY set)"),
+            "{line}"
+        );
+        assert!(line.contains("gateway (GW_SECRET_TOKEN missing)"), "{line}");
+        assert!(line.contains("ollama (no key required)"), "{line}");
+
+        let failures = strict_failures(&settings, &[], &checks);
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.contains("gateway") && f.contains("GW_SECRET_TOKEN")),
+            "{failures:?}"
+        );
+    }
+
+    #[test]
+    fn offline_auth_hints_detect_env_or_files_without_reading_contents() {
+        let home = tempfile::tempdir().unwrap();
+        let none = auth_hint_with("codex", Some(home.path()), |_| false, |_| None);
+        assert_eq!(none.status, AuthStatus::Missing);
+        assert!(none.signals.is_empty());
+
+        let via_env = auth_hint_with(
+            "codex",
+            Some(home.path()),
+            |v| v == "OPENAI_API_KEY",
+            |_| None,
+        );
+        assert_eq!(via_env.status, AuthStatus::Ready);
+        assert_eq!(via_env.signals, ["OPENAI_API_KEY"]);
+
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::write(
+            home.path().join(".codex/auth.json"),
+            "SECRET_VALUE_DO_NOT_LEAK",
+        )
+        .unwrap();
+        let via_file = auth_hint_with("codex", Some(home.path()), |_| false, |_| None);
+        assert_eq!(via_file.status, AuthStatus::Ready);
+        assert_eq!(via_file.signals, ["~/.codex/auth.json"]);
+        assert!(!via_file.detail.contains("SECRET_VALUE"));
     }
 }

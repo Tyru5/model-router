@@ -32,14 +32,7 @@ impl StagePreset {
             name: self.name.into(),
             role: self.role,
             harness: if edits { "claude" } else { "codex" }.into(),
-            model: if self.key == "custom" {
-                ""
-            } else if edits {
-                "sonnet"
-            } else {
-                "gpt-6-astra"
-            }
-            .into(),
+            model: if edits { "sonnet" } else { "" }.into(),
             mode: if edits {
                 Mode::Interactive
             } else {
@@ -192,6 +185,13 @@ impl WorkflowPreset {
             budget: Default::default(),
             protected_paths: vec![],
             handoff_repair: false,
+            handoff_budget_bytes: None,
+            handoff_each_bytes: None,
+            context_files: vec![],
+            retry: Default::default(),
+            hooks: Default::default(),
+            policies: vec![],
+            review_quorum: None,
             max_parallel: if self.candidates.is_empty() {
                 2
             } else {
@@ -366,11 +366,7 @@ pub const WORKFLOWS: &[WorkflowPreset] = &[
         name: "Best-of-3 implement",
         purpose: "Research, implement with three harnesses side by side, let a judge pick one, verify, and summarize.",
         stages: &["research", "implement", "judge", "verify", "summary"],
-        candidates: &[
-            ("claude", "sonnet"),
-            ("codex", "gpt-6-astra"),
-            ("opencode", ""),
-        ],
+        candidates: &[("claude", "sonnet"), ("codex", ""), ("opencode", "")],
     },
 ];
 
@@ -475,11 +471,7 @@ mod tests {
             .collect();
         assert_eq!(
             harnesses,
-            [
-                ("claude", "sonnet"),
-                ("codex", "gpt-6-astra"),
-                ("opencode", "")
-            ]
+            [("claude", "sonnet"), ("codex", ""), ("opencode", "")]
         );
         assert!(workflow.stages[2].enabled && workflow.stages[2].role == Role::Review);
         assert_eq!(crate::graph::judge_of(&workflow, 1), Some(2));

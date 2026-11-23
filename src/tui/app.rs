@@ -66,6 +66,8 @@ pub(super) struct App {
     pub(super) cancel_on_adopt: std::collections::HashSet<String>,
     /// The getting-started tour's panel and progress.
     pub(super) tour: super::tour::Tour,
+    /// Stage checkpoint waiting for an optional model override in `InputTarget::ForkModel`.
+    pub(super) pending_fork: Option<(String, String)>,
 }
 
 /// Git facts for the project, refreshed in the background.
@@ -85,6 +87,12 @@ impl Repo {
     }
 }
 
+/// Whether a newly created run came from a rerun or a stage-checkpoint fork.
+pub(super) enum RunOrigin {
+    Rerun(String),
+    Fork { source: String, stage: String },
+}
+
 /// A created run, ready for its driver.
 pub(super) struct Started {
     run: Run,
@@ -92,7 +100,7 @@ pub(super) struct Started {
     holder: Option<String>,
     /// The task as submitted; the editor clears only if it still holds it.
     task: Option<String>,
-    rerun_of: Option<String>,
+    origin: Option<RunOrigin>,
 }
 /// A project read in the background.
 pub(super) struct Opened {
@@ -138,6 +146,7 @@ impl App {
             tasks: Tasks::default(),
             cancel_on_adopt: Default::default(),
             tour: Default::default(),
+            pending_fork: None,
         }
     }
     pub(super) fn choose_theme(&mut self) {
@@ -438,7 +447,7 @@ impl App {
             run,
             holder,
             task,
-            rerun_of,
+            origin,
         } = started;
         // An interactive first stage needs the terminal right away.
         let interactive = run
@@ -452,13 +461,19 @@ impl App {
         self.session.adopt(run);
         self.start_driver()?;
         self.runs.stale = true;
-        if let Some(source) = rerun_of {
-            self.ui.message = format!(
-                "Rerunning {source} as {id}{}…",
-                holder.map_or_else(String::new, |h| format!(
-                    " in a worktree ({h} is using the checkout)"
-                ))
-            );
+        if let Some(origin) = origin {
+            self.ui.message = match origin {
+                RunOrigin::Rerun(source) => format!(
+                    "Rerunning {source} as {id}{}…",
+                    holder.map_or_else(String::new, |h| format!(
+                        " in a worktree ({h} is using the checkout)"
+                    ))
+                ),
+                RunOrigin::Fork { source, stage } => format!(
+                    "Forked {source} at {stage} as {id} in worktree {}…",
+                    short_path(&workspace, 60)
+                ),
+            };
             self.show_run();
             return Ok(());
         }
@@ -491,15 +506,18 @@ impl App {
         create: impl FnOnce(Placement) -> Result<Run> + Send + 'static,
         worktree: bool,
         task: Option<String>,
-        rerun_of: Option<String>,
+        origin: Option<RunOrigin>,
     ) -> Result<()> {
         ensure!(
             !self.starting,
             "A run is still starting; wait for it to begin"
         );
         let (placement, holder) = self.placement(worktree)?;
-        self.ui.message = match &rerun_of {
-            Some(id) => format!("Starting a rerun of {id}…"),
+        self.ui.message = match &origin {
+            Some(RunOrigin::Rerun(id)) => format!("Starting a rerun of {id}…"),
+            Some(RunOrigin::Fork { source, stage }) => {
+                format!("Forking {source} at {stage}…")
+            }
             None => "Starting run…".into(),
         };
         self.starting = true;
@@ -512,7 +530,7 @@ impl App {
                             run,
                             holder,
                             task,
-                            rerun_of,
+                            origin,
                         })
                     })
                     .map_err(|e| format!("{e:#}"))
@@ -962,7 +980,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         if !run.is_some_and(Run::repair_blocked) {
             skip.push(ActionId::AllowRepair);
         }
-        if !run.is_some_and(cost::usd_budget_blocked) {
+        if !run.is_some_and(cost::budget_blocked) {
             skip.push(ActionId::RaiseBudget);
         }
         if run.is_some_and(cost::budget_blocked) {
@@ -1094,6 +1112,18 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Paragraph::new(right).right_aligned(),
         chunks[5].inner(Margin::new(1, 0)),
     );
+    // Keep a live delegated-tasks modal synced with the focused run.
+    let live_run = app
+        .session
+        .focused()
+        .map(|slot| (slot.run.clone(), slot.worker.is_some()));
+    if let Some((run, live)) = &live_run {
+        for dialog in &mut app.ui.dialogs {
+            if let Modal::DelegatedTasks(view) = dialog {
+                view.sync(run, *live);
+            }
+        }
+    }
     // Only the top dialog shows; those below come back as it closes.
     let ask = match app.ui.dialog() {
         Some(Modal::Ask(ask)) => Some(ask.text(app)),

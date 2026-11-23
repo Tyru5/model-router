@@ -61,9 +61,11 @@ pub fn report_command(
 }
 
 pub fn doctor_command(project: &Path, settings: &Settings, json: bool, strict: bool) -> Result<()> {
+    let providers = doctor::inspect_providers(settings);
     let reports = if json {
         let reports = doctor::inspect_all(settings, project);
-        println!("{}", serde_json::to_string_pretty(&reports)?);
+        let value = serde_json::json!({ "harnesses": &reports, "providers": &providers });
+        println!("{}", serde_json::to_string_pretty(&value)?);
         reports
     } else {
         let (reports, sandbox, tools) = std::thread::scope(|scope| {
@@ -79,13 +81,21 @@ pub fn doctor_command(project: &Path, settings: &Settings, json: bool, strict: b
         print!("{}", doctor::table(&reports));
         println!("\n{sandbox}");
         println!("{}", doctor::tools_line(&tools));
+        if let Some(line) = doctor::providers_line(&providers) {
+            println!("{line}");
+        }
+        if let Some(line) = doctor::pins_line(settings, &reports) {
+            println!("{line}");
+        }
+        if let Some(line) = doctor::auth_hints_line(&reports) {
+            println!("{line}");
+        }
         println!("\n{}", doctor::AUTH_NOTE);
         reports
     };
-    ensure!(
-        !strict || !reports.iter().any(doctor::Report::missing_flags),
-        "An installed harness lacks a flag the router passes"
-    );
+    if strict {
+        doctor::check_strict(settings, &reports, &providers)?;
+    }
     Ok(())
 }
 
@@ -365,18 +375,28 @@ pub fn history_command(
     Ok(())
 }
 
-pub fn cost_command(project: &Path, since: Option<&str>, json: bool) -> Result<()> {
+pub fn cost_command(
+    project: &Path,
+    since: Option<&str>,
+    json: bool,
+    all_projects: bool,
+) -> Result<()> {
     let since = since
         .map(cost::parse_since)
         .transpose()?
         .map(|age| chrono::Utc::now() - age);
-    let runs = engine::history(project)?;
-    let mut routed = std::collections::BTreeMap::new();
-    for run in &runs {
-        routed.extend(cost::routed_providers(run));
-    }
-    cost::refresh_provider_prices(project, &routed);
-    let summary = cost::aggregate(&runs, since, &cost::Pricing::load(project));
+    let summary = if all_projects {
+        let projects = model_router::stats::projects(project, true);
+        cost::aggregate_projects(&projects, since, true)
+    } else {
+        let runs = engine::history(project)?;
+        let mut routed = std::collections::BTreeMap::new();
+        for run in &runs {
+            routed.extend(cost::routed_providers(run));
+        }
+        cost::refresh_provider_prices(project, &routed);
+        cost::aggregate(&runs, since, &cost::Pricing::load(project))
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
