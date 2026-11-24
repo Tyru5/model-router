@@ -7,18 +7,7 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ## [Unreleased]
 
-### Changed
-
-- The repository is public under the MIT license. Install with the
-  `model-router-installer.sh` attached to each GitHub release, or
-  `cargo install --git https://github.com/Tyru5/model-router --locked`.
-  The landing page links the source, releases, changelog, and issues.
-
-### Removed
-
-- The R2 download mirror: `scripts/install.sh`, the **R2 downloads**
-  workflow, and `https://model-router.tiru5.me/install.sh`. GitHub release
-  assets no longer need a token, so the release installer replaces them.
+## [0.3.0] - 2026-11-24
 
 ### Added
 
@@ -130,12 +119,22 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Changed
 
+- The repository is public under the MIT license. Install with the
+  `model-router-installer.sh` attached to each GitHub release, or
+  `cargo install --git https://github.com/Tyru5/model-router --locked`.
+  The landing page links the source, releases, changelog, and issues.
 - `model-router doctor --json` prints an object,
   `{"harnesses": [...], "providers": [{name, api_key_env, status}]}`, instead
   of a bare array of harness reports.
 - Built-in starter workflow and stage/workflow presets now leave stage `model`
   blank (`""`) where `gpt-6-astra` was previously hardcoded, so stages inherit
   each harness's native default model out of the box.
+
+### Removed
+
+- The R2 download mirror: `scripts/install.sh`, the **R2 downloads**
+  workflow, and `https://model-router.tiru5.me/install.sh`. GitHub release
+  assets no longer need a token, so the release installer replaces them.
 
 ### Security
 
@@ -547,7 +546,8 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 - CI: format, clippy, tests on Linux and macOS, MSRV check, and terminal smoke
   tests.
 
-[Unreleased]: https://github.com/Tyru5/model-router/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/Tyru5/model-router/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Tyru5/model-router/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/Tyru5/model-router/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Tyru5/model-router/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Tyru5/model-router/releases/tag/v0.1.0
