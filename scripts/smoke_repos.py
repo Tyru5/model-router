@@ -5,10 +5,10 @@ Run: uv run --with-requirements scripts/requirements-smoke.txt python scripts/sm
 """
 
 import json
-from pathlib import Path
 import subprocess
 import tempfile
 import tomllib
+from pathlib import Path
 
 from smoke_common import ARTIFACTS, ROOT, Terminal, records
 

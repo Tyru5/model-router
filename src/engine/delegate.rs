@@ -362,8 +362,8 @@ impl<'a> Owner<'a> {
             close.clone(),
             self.changed.clone(),
             self.kind,
-            self.delegation.runs && run.launched_by.is_none(),
-            self.delegation.schedules && run.launched_by.is_none(),
+            self.delegation.runs && run.launched_by.is_none() && run.creation_source.is_user(),
+            self.delegation.schedules && run.launched_by.is_none() && run.creation_source.is_user(),
         );
         self.broker = Some(Broker::start(Arc::new(tools), close)?);
         Ok(())
@@ -1315,8 +1315,12 @@ impl<'a> Owner<'a> {
             },
             "features": {
                 "isolation": ["shared", "worktree"],
-                "runs": self.delegation.runs && run.launched_by.is_none(),
-                "schedules": self.delegation.schedules && run.launched_by.is_none(),
+                "runs": self.delegation.runs
+                    && run.launched_by.is_none()
+                    && run.creation_source.is_user(),
+                "schedules": self.delegation.schedules
+                    && run.launched_by.is_none()
+                    && run.creation_source.is_user(),
             },
         })
     }

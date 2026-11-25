@@ -4,7 +4,7 @@ Verified locally on Linux with Rust 1.100.0 (and MSRV 1.85).
 
 | Check | Result |
 | --- | --- |
-| `cargo test --locked --no-fail-fast` | 691 tests passed (0 failed, 2 ignored helper tests) |
+| `cargo test --locked --no-fail-fast` | 726 tests passed (0 failed, 2 ignored helper tests) |
 | `cargo clippy --all-targets --locked -- -D warnings` | Passed |
 | `cargo fmt --check` | Passed |
 | `cargo +1.85 check --all-targets --locked` (MSRV) | Passed |

@@ -191,9 +191,36 @@ pub(super) fn page_file(path: &Path) -> Result<Launch> {
     })
 }
 
-/// `git difftool --dir-diff base after` in `dir`, when `diff.tool` is set.
+/// `git difftool --dir-diff base after` in `dir`, when `diff.tool` is set
+/// outside the repository's own config. Repo-local difftool, mergetool, and
+/// filter entries can execute arbitrary commands and are refused.
 pub(super) fn difftool(dir: &Path, base: &str, after: &str) -> Result<Launch> {
-    let output = Command::new("git")
+    let local = crate::snapshot::git_command()
+        .args([
+            "config",
+            "--show-scope",
+            "--get-regexp",
+            r"^(diff\.(tool|guitool|external)|difftool\.|merge\.(tool|guitool)|mergetool\.|filter\.)",
+        ])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("Start Git")?;
+    // Git exits 0 when keys match and 1 when none match; any other exit
+    // (such as Git < 2.26 lacking --show-scope, or a config error) fails closed.
+    ensure!(
+        matches!(local.status.code(), Some(0 | 1)),
+        "Could not verify Git difftool config scope ({})",
+        String::from_utf8_lossy(&local.stderr).trim()
+    );
+    let local_text = String::from_utf8_lossy(&local.stdout);
+    let repo_keys = repo_local_difftool_keys(&local_text);
+    ensure!(
+        repo_keys.is_empty(),
+        "Refusing repo-local Git difftool/filter config ({}); configure diff.tool globally with `git config --global diff.tool <tool>`",
+        repo_keys.join(", ")
+    );
+    let output = crate::snapshot::git_command()
         .args(["config", "--get", "diff.tool"])
         .current_dir(dir)
         .stdin(std::process::Stdio::null())
@@ -202,9 +229,28 @@ pub(super) fn difftool(dir: &Path, base: &str, after: &str) -> Result<Launch> {
     difftool_with(&String::from_utf8_lossy(&output.stdout), dir, base, after)
 }
 
+/// Keys from `git config --show-scope --get-regexp` output whose scope is
+/// repository-controlled (`local` or `worktree`).
+fn repo_local_difftool_keys(output: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for line in output.lines() {
+        let Some((scope, rest)) = line.split_once('\t') else {
+            continue;
+        };
+        if !matches!(scope, "local" | "worktree") {
+            continue;
+        }
+        let key = rest.split_whitespace().next().unwrap_or(rest);
+        if !key.is_empty() && !keys.iter().any(|k| k == key) {
+            keys.push(key.to_owned());
+        }
+    }
+    keys
+}
+
 fn difftool_with(tool: &str, dir: &Path, base: &str, after: &str) -> Result<Launch> {
     if tool.trim().is_empty() {
-        bail!("No difftool configured; set one with `git config diff.tool <tool>`");
+        bail!("No difftool configured; set one with `git config --global diff.tool <tool>`");
     }
     Ok(Launch {
         argv: difftool_argv(base, after),
@@ -214,10 +260,20 @@ fn difftool_with(tool: &str, dir: &Path, base: &str, after: &str) -> Result<Laun
 }
 
 fn difftool_argv(base: &str, after: &str) -> Vec<OsString> {
-    ["git", "difftool", "--dir-diff", base, after]
-        .into_iter()
-        .map(OsString::from)
-        .collect()
+    [
+        "git",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "difftool",
+        "--dir-diff",
+        base,
+        after,
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect()
 }
 
 #[cfg(test)]
@@ -313,14 +369,60 @@ mod tests {
     fn difftool_compares_the_run_trees() {
         assert_eq!(
             strings(&difftool_argv("abc", "def")),
-            ["git", "difftool", "--dir-diff", "abc", "def"]
+            [
+                "git",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "difftool",
+                "--dir-diff",
+                "abc",
+                "def",
+            ]
         );
         let dir = Path::new(".");
         // With no tool set, it explains how to configure one.
         let error = difftool_with("\n", dir, "a", "b").unwrap_err().to_string();
-        assert!(error.contains("git config diff.tool"), "{error}");
+        assert!(error.contains("git config --global diff.tool"), "{error}");
         let launch = difftool_with("meld\n", dir, "a", "b").unwrap();
         assert_eq!(launch.cwd.as_deref(), Some(dir));
+    }
+
+    #[test]
+    fn difftool_refuses_repo_local_config() {
+        assert_eq!(
+            repo_local_difftool_keys(
+                "global\tdiff.tool meld\nlocal\tdifftool.meld.cmd evil\nworktree\tdiff.tool pwn\n"
+            ),
+            vec!["difftool.meld.cmd", "diff.tool"]
+        );
+        for (key, value) in [
+            ("difftool.meld.cmd", "echo pwned"),
+            ("mergetool.vimdiff.path", "/tmp/evil.sh"),
+            ("mergetool.foo.cmd", "echo pwned"),
+            ("filter.evil.smudge", "echo pwned"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let status = Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let status = Command::new("git")
+                .args(["config", "--local", key, value])
+                .current_dir(dir.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let error = difftool(dir.path(), "abc", "def").unwrap_err().to_string();
+            assert!(
+                error.contains("repo-local Git difftool/filter config"),
+                "{key}: {error}"
+            );
+            assert!(error.contains(key), "{key}: {error}");
+        }
     }
 
     #[test]

@@ -14,8 +14,8 @@ use std::{
 };
 
 fn git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<String> {
-    let mut command = crate::snapshot::git_command();
-    command.args(args).current_dir(dir).stdin(Stdio::null());
+    let mut command = crate::snapshot::git_command_in(dir);
+    command.args(args).stdin(Stdio::null());
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
     }
@@ -317,9 +317,8 @@ fn restore(top: &Path, tree: &str, files: &[String], scratch: &Path) -> Result<(
             stdin_bytes.extend_from_slice(file.as_bytes());
             stdin_bytes.push(0);
         }
-        let mut child = crate::snapshot::git_command()
+        let mut child = crate::snapshot::git_command_in(top)
             .args(["checkout-index", "-f", "-z", "--stdin"])
-            .current_dir(top)
             .env("GIT_INDEX_FILE", &index)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())

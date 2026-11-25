@@ -681,11 +681,12 @@ fn schedule_task(
             }
         };
         schedules::check_launchable(&settings, schedule.workflow.as_deref(), &schedule.ceiling)?;
+        // Any edit needs approval again; revoke while schedules.lock is held so
+        // a concurrent `schedules approve` cannot lose its fresh receipt.
+        schedules::revoke(&run.project, &schedule.id);
         Ok(schedule)
     })
     .map_err(|e| error("invalid_request", format!("{e:#}")))?;
-    // Any edit needs approval again.
-    schedules::revoke(&run.project, &schedule.id);
     Ok(schedule_view(&run.project, &schedule))
 }
 

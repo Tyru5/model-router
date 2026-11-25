@@ -306,6 +306,31 @@ pub fn digest(items: &[String]) -> String {
     hash.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Generates a 32-byte random token from the OS CSPRNG, hex-encoded (64 chars).
+pub(crate) fn random_hex_token() -> Result<String> {
+    use ring::rand::SecureRandom;
+    let mut bytes = [0u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("The OS random number generator failed"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Constant-time equality via `ring::hmac::verify` over per-process keyed
+/// HMAC-SHA256 digests, so wrong tokens leak neither byte position nor length.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    static KEY: std::sync::OnceLock<ring::hmac::Key> = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(|| {
+        let mut seed = [0u8; 32];
+        // Best-effort per-process blinding; even with a zero seed, HMAC-SHA256
+        // plus `ring::hmac::verify` remains collision-resistant and constant-time.
+        let _ = ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut seed);
+        ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &seed)
+    });
+    let expected = ring::hmac::sign(key, b);
+    ring::hmac::verify(key, a, expected.as_ref()).is_ok()
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Store {
     #[serde(default)]

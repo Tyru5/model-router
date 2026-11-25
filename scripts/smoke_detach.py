@@ -6,9 +6,9 @@ Build the binary first. All workflows, harnesses, and artifacts are temporary.
 """
 
 import json
-from pathlib import Path
 import sys
 import tempfile
+from pathlib import Path
 
 import smoke_common
 from smoke_common import alive, kill_all, require_binary, trust, wait_until

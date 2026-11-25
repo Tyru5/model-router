@@ -353,19 +353,23 @@ fn host_ip(url: &reqwest::Url) -> Option<IpAddr> {
         .ok()
 }
 
-/// Whether the URL's host is, or resolves to, a private address.
+fn is_localhost(name: &str) -> bool {
+    let host = name.trim_end_matches('.');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .get(host.len().saturating_sub(".localhost".len())..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(".localhost"))
+}
+
+/// Whether the URL's host literally names a private address or localhost.
+/// DNS answers are filtered later by `PublicResolver` and never relax this.
 fn targets_private(url: &reqwest::Url) -> bool {
     let Some(name) = url.host_str() else {
         return false;
     };
     match host_ip(url) {
         Some(ip) => private(ip),
-        None => {
-            name.eq_ignore_ascii_case("localhost")
-                || (name, url.port_or_known_default().unwrap_or(443))
-                    .to_socket_addrs()
-                    .is_ok_and(|mut addrs| addrs.any(|a| private(a.ip())))
-        }
+        None => is_localhost(name),
     }
 }
 
@@ -384,7 +388,7 @@ fn redirect_allowed(
     }
     let literal = match (host_ip(to), to.host_str()) {
         (Some(ip), _) => private(ip),
-        (None, Some(name)) => name.eq_ignore_ascii_case("localhost"),
+        (None, Some(name)) => is_localhost(name),
         (None, None) => true,
     };
     if literal && !allow_private {
@@ -795,7 +799,14 @@ mod tests {
         );
         assert!(targets_private(&url("http://127.0.0.1:9/spec.md")));
         assert!(targets_private(&url("http://localhost/spec.md")));
+        assert!(targets_private(&url("http://sub.localhost/spec.md")));
+        assert!(targets_private(&url("http://localhost./spec.md")));
         assert!(!targets_private(&url("http://93.184.216.34/spec.md")));
+        assert!(!targets_private(&url(
+            "https://169.254.169.254.nip.io/spec.md"
+        )));
+        assert!(redirect_allowed(&public, &url("https://sub.localhost/spec.md"), false).is_err());
+        assert!(redirect_allowed(&public, &url("https://localhost./spec.md"), false).is_err());
     }
 
     #[test]

@@ -784,18 +784,34 @@ fn run_external_scanner_within(
             expanded.push(arg.clone());
         }
     }
-    let mut child = Command::new(program)
-        .args(&expanded)
+    let mut cmd = Command::new(program);
+    // Any Git process the scanner invokes gets the router's hook and fsmonitor
+    // overrides, like `ship` gives `gh`.
+    const OVERRIDES: &str = "'core.hooksPath=/dev/null' 'core.fsmonitor=false'";
+    let mut parameters = std::env::var_os("GIT_CONFIG_PARAMETERS").unwrap_or_default();
+    if !parameters.is_empty() {
+        parameters.push(" ");
+    }
+    parameters.push(OVERRIDES);
+    cmd.args(&expanded)
         .current_dir(dir)
         .env("MODEL_ROUTER_SHIP_FILES", files.join("\n"))
         .env("GIT_INDEX_FILE", index)
+        .env("GIT_CONFIG_PARAMETERS", parameters)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| {
-            format!("Secret scanner {program:?} could not run; refusing to ship without scanning")
-        })?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().with_context(|| {
+        format!("Secret scanner {program:?} could not run; refusing to ship without scanning")
+    })?;
+    let pgid = child.id();
+    #[cfg(unix)]
+    let started = crate::process::group::started(pgid);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let out_reader =
@@ -803,14 +819,27 @@ fn run_external_scanner_within(
     let err_reader =
         stderr.map(|s| std::thread::spawn(move || read_capped_stream(s, SCANNER_OUTPUT_LIMIT)));
 
+    let stop_scanner = |child: &mut std::process::Child| {
+        #[cfg(unix)]
+        crate::process::end_group_if(
+            pgid,
+            Duration::from_millis(200),
+            || {
+                let _ = child.try_wait();
+            },
+            || !crate::process::group_reused(&started, pgid),
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    stop_scanner(&mut child);
                     bail!(
                         "Secret scanner `{}` timed out after {}s; refusing to ship",
                         shell_words::join(command),
@@ -820,14 +849,24 @@ fn run_external_scanner_within(
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                stop_scanner(&mut child);
                 return Err(error).with_context(|| {
                     format!("Secret scanner {program:?} failed while waiting; refusing to ship")
                 });
             }
         }
     };
+    // End any background children the scanner left behind before waiting on
+    // pipes, checking the leader's start time so a reused PGID is never hit.
+    #[cfg(unix)]
+    crate::process::end_group_if(
+        pgid,
+        Duration::from_millis(200),
+        || {
+            let _ = child.try_wait();
+        },
+        || !crate::process::group_reused(&started, pgid),
+    );
     let stdout = out_reader.and_then(|t| t.join().ok()).unwrap_or_default();
     let stderr = err_reader.and_then(|t| t.join().ok()).unwrap_or_default();
     if !status.success() {
@@ -1240,5 +1279,46 @@ diff --git a/tests/helper.rs b/tests/helper.rs
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("refusing to apply"), "{err:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_scanner_sets_git_overrides_and_reaps_process_group_on_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = dir.path().join("index");
+        // Verify GIT_CONFIG_PARAMETERS overrides reach the scanner process.
+        let check_env = vec![
+            "python3".into(),
+            "-c".into(),
+            "import os, sys; p = os.environ.get('GIT_CONFIG_PARAMETERS', ''); assert 'core.hooksPath=/dev/null' in p and 'core.fsmonitor=false' in p, p".into(),
+        ];
+        run_external_scanner_within(dir.path(), &check_env, &[], &index, Duration::from_secs(5))
+            .unwrap();
+
+        // Verify a timed-out scanner's child process is reaped with its group.
+        let pid_file = dir.path().join("child.pid");
+        let spawn_child = vec![
+            "python3".into(),
+            "-c".into(),
+            format!(
+                "import pathlib, subprocess, sys, time; p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); pathlib.Path({:?}).write_text(str(p.pid)); time.sleep(60)",
+                pid_file.display().to_string()
+            ),
+        ];
+        let err = run_external_scanner_within(
+            dir.path(),
+            &spawn_child,
+            &[],
+            &index,
+            Duration::from_millis(1200),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+        let text = std::fs::read_to_string(&pid_file)
+            .expect("scanner did not record child pid before timeout");
+        let pid: libc::pid_t = text.trim().parse().expect("valid child pid");
+        // SAFETY: signal 0 only checks whether the process exists.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "scanner child {pid} survived timeout");
     }
 }

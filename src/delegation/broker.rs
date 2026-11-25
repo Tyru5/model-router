@@ -80,20 +80,12 @@ pub fn orch_socket_dirs() -> Vec<PathBuf> {
 
 /// 32 bytes from the OS RNG, hex-encoded.
 fn new_token() -> Result<String> {
-    use ring::rand::SecureRandom;
-    let mut bytes = [0u8; 32];
-    ring::rand::SystemRandom::new()
-        .fill(&mut bytes)
-        .map_err(|_| anyhow::anyhow!("The OS random number generator failed"))?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    crate::trust::random_hex_token()
 }
 
 /// Constant-time comparison, so a wrong token reveals nothing by timing.
 fn same(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    crate::trust::constant_time_eq(a, b)
 }
 
 /// One turn's socket and token file, and what a launch needs to reach them.
@@ -127,6 +119,7 @@ impl Broker {
     /// Binds a new socket and writes a new token for one turn, then serves
     /// `tools` to the bridge that presents the token.
     pub fn start<T: ToolSet>(tools: Arc<T>, close: Arc<AtomicBool>) -> Result<Self> {
+        let program = bridge_program()?;
         let dir = orch_socket_dir()?;
         let id = new_token()?;
         let stem = format!("orch-{}", &id[..16]);
@@ -135,7 +128,14 @@ impl Broker {
         let token = new_token()?;
         let listener =
             UnixListener::bind(&sock).with_context(|| format!("Bind {}", sock.display()))?;
-        fs::set_permissions(&sock, fs::Permissions::from_mode(0o600))?;
+        let cleanup = |sock: &Path, token_file: &Path| {
+            let _ = fs::remove_file(sock);
+            let _ = fs::remove_file(token_file);
+        };
+        if let Err(error) = fs::set_permissions(&sock, fs::Permissions::from_mode(0o600)) {
+            cleanup(&sock, &token_file);
+            return Err(error).with_context(|| format!("Chmod {}", sock.display()));
+        }
         let written = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -143,22 +143,35 @@ impl Broker {
             .open(&token_file)
             .and_then(|mut file| file.write_all(token.as_bytes()));
         if let Err(error) = written {
-            let _ = fs::remove_file(&sock);
+            cleanup(&sock, &token_file);
             bail!("Write {}: {error}", token_file.display());
         }
-        let (wake_read, wake) = UnixStream::pair()?;
+        let (wake_read, wake) = match UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(error) => {
+                cleanup(&sock, &token_file);
+                return Err(error.into());
+            }
+        };
         let active: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
         let thread = {
             let (close, active) = (close.clone(), active.clone());
-            std::thread::Builder::new()
+            match std::thread::Builder::new()
                 .name("delegation broker".into())
-                .spawn(move || accept_loop(listener, wake_read, token, tools, close, active))?
+                .spawn(move || accept_loop(listener, wake_read, token, tools, close, active))
+            {
+                Ok(thread) => thread,
+                Err(error) => {
+                    cleanup(&sock, &token_file);
+                    return Err(error.into());
+                }
+            }
         };
         Ok(Self {
             endpoint: Endpoint {
                 sock,
                 token_file,
-                program: bridge_program()?,
+                program,
             },
             close,
             wake: Some(wake),

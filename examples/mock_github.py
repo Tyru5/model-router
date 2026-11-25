@@ -4,9 +4,9 @@
 import base64
 import json
 import os
-from pathlib import Path
 import sys
 import time
+from pathlib import Path
 
 args = sys.argv[1:]
 assert args[:5] == ["api", "--hostname", "github.com", "--method", "GET"], args

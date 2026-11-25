@@ -10,11 +10,11 @@ Run: uv run --with-requirements scripts/requirements-smoke.txt python scripts/sm
 
 import json
 import os
-from pathlib import Path
 import shlex
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 from smoke_common import ARTIFACTS, ROOT, Terminal, records, require_binary, trust
 

@@ -7,6 +7,25 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ## [Unreleased]
 
+### Security
+
+- TUI `git` commands now pass `-c core.fsmonitor=false -c core.hooksPath=/dev/null`, and the diff view's `D` (`git difftool`) refuses repository-local `diff.tool`, `diff.guitool`, `diff.external`, `difftool.*`, `merge.tool`, `merge.guitool`, `mergetool.*`, and `filter.*` config entries (failing closed if scope probing fails).
+- Router Git commands (`snapshot`, `storage::repo_info`, `ship`, `fanout`, `delegate_apply`) now disable repository-local and worktree-local `filter.*`, `diff.*`, and `merge.*.driver` executable config keys (via `GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*` and `-c` so subsection names containing `=` cannot bypass it).
+- Task URL imports no longer relax `PublicResolver` or redirect SSRF checks based on pre-request DNS lookups, and redirect checks now also block `*.localhost` and trailing-dot `localhost.`.
+- TUI Harnesses `[t]` now verifies that `scripts/capture_harness_output.py` is a non-symlink file matching the build's script byte-for-byte before enabling or executing live tests, launches Python with `-I` (isolated mode) to prevent stdlib shadowing in `scripts/`, and names the script in the confirmation prompt.
+- External `secret_scanner` commands now run in their own process group (reaped on exit or timeout with start-time verification) with `GIT_CONFIG_PARAMETERS` disabling Git hooks and fsmonitor.
+- HTTP and delegation bearer-token checks now use constant-time `ring::hmac::verify` over per-process keyed digests, and HTTP bearer tokens are generated with `ring::rand::SystemRandom`.
+
+### Fixed
+
+- `serve`'s background schedule ticker no longer panics on hosts with monotonic uptime under 60 seconds.
+- `schedule_task` now revokes prior schedule approvals while holding `schedules.lock`, preventing a race with concurrent `schedules approve`.
+- Scheduled runs no longer advertise `run_*` and `schedule_*` delegation tools that `run_tool` always rejects.
+- HTTP header line reading now decodes UTF-8 after reading a full line instead of per buffer chunk, avoiding spurious errors when multi-byte UTF-8 spans an 8 KiB read boundary.
+- `delegation::broker::Broker::start` resolves the bridge executable before binding and removes partial socket/token files if startup fails.
+- Updated `README.md` and `site/index.html` starter workflow examples to show Codex inheriting its native default model instead of `gpt-6-astra`.
+- `just lint` now checks Python scripts and examples with `ruff check`.
+
 ## [0.3.0] - 2026-11-24
 
 ### Added

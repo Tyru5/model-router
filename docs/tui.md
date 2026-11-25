@@ -327,7 +327,7 @@ the pager shows the rest.
 | `w` | Toggle wrap |
 | `o` | Coloured patch in `$PAGER` (default `less -R`) |
 | `e` / `Enter` | Open the file at the line in view in `$VISUAL`/`$EDITOR` (`+N` for vi/Vim/Neovim/nano/Emacs, `file:N` Helix, `-g file:N` VS Code) |
-| `D` | `git difftool --dir-diff` over the run's changes (needs `diff.tool`) |
+| `D` | `git difftool --dir-diff` over the run's changes (needs global `diff.tool`; refuses repo-local difftool, mergetool, and filter config) |
 | `q` / `Esc` | Close |
 
 `$PAGER` and `$EDITOR` are split like shell words and run without a shell.

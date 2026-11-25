@@ -297,9 +297,10 @@ calls.
   both phases. It runs with `cwd` = workspace, `{files}` and
   `MODEL_ROUTER_SHIP_FILES` = planned paths, and `GIT_INDEX_FILE` = a private
   index containing `HEAD` plus the planned files as they are now, so `--staged`
-  scanners see exactly what will be committed. Your own index is never read or
-  written; planning writes blob objects to Git's object database. Requires
-  project trust and fails closed if missing or non-zero.
+  scanners see exactly what will be committed, in its own process group with
+  `GIT_CONFIG_PARAMETERS` disabling hooks and fsmonitor. Your own index is
+  never read or written; planning writes blob objects to Git's object database.
+  Requires project trust and fails closed if missing or non-zero.
 
 ## Not enforced
 

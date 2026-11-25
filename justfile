@@ -13,6 +13,7 @@ fmt:
 lint:
     cargo fmt --check
     cargo clippy --all-targets --locked -- -D warnings
+    uvx ruff check scripts examples
 
 # Run Rust tests.
 test:

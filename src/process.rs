@@ -107,7 +107,7 @@ pub fn end_group(pgid: u32, grace: Duration, reap: impl FnMut()) {
 }
 
 /// `end_group`, sending each signal only if `still_ours` holds just before.
-pub(super) fn end_group_if(
+pub(crate) fn end_group_if(
     pgid: u32,
     grace: Duration,
     mut reap: impl FnMut(),
@@ -132,7 +132,7 @@ pub(super) fn end_group_if(
     reap();
 }
 
-pub(super) fn group_reused(recorded: &Option<String>, pid: u32) -> bool {
+pub(crate) fn group_reused(recorded: &Option<String>, pid: u32) -> bool {
     let Some(rec) = recorded else {
         return false;
     };

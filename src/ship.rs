@@ -318,7 +318,7 @@ fn exec_with(
     // Git also gets the router's hook and fsmonitor overrides: a stage may
     // have written the hooks directory `core.hooksPath` names.
     let mut command = if program == "git" {
-        crate::snapshot::git_command()
+        crate::snapshot::git_command_in(dir)
     } else {
         Command::new(program)
     };

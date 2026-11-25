@@ -5,10 +5,10 @@ Run: python3 scripts/smoke_shutdown.py [path/to/model-router]
 """
 
 import json
-from pathlib import Path
 import signal
 import sys
 import tempfile
+from pathlib import Path
 
 import smoke_common
 from smoke_common import alive, kill_all, require_binary, trust, wait_until
@@ -28,14 +28,12 @@ def Terminal(project, *, animate=False, controlling=True):
 
 def active_workflow(project, *, interactive=False):
     # Keep an offline child and grandchild alive until the router cancels them.
-    script = "\n".join(
-        [
-            "import json, os, subprocess, sys, time",
-            "from pathlib import Path",
-            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])",
-            "Path('mock-pids.json').write_text(json.dumps([os.getpid(), child.pid]))",
-            "time.sleep(300)",
-        ]
+    script = (
+        "import json, os, subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+        "Path('mock-pids.json').write_text(json.dumps([os.getpid(), child.pid]))\n"
+        "time.sleep(300)"
     )
     (project / ".model-router.toml").write_text(f"""version = 1
 [adapters.mock]
@@ -125,7 +123,8 @@ def main():
             terminal = Terminal(Path(directory).resolve())
             try:
                 terminal.wait_for(
-                    lambda: b"Workflow" in terminal.raw, "Initial screen did not render"
+                    lambda terminal=terminal: b"Workflow" in terminal.raw,
+                    "Initial screen did not render",
                 )
                 terminal.signal_exit(sig)
                 print(

@@ -72,9 +72,101 @@ pub(crate) fn git_command() -> Command {
     command
 }
 
+/// `git_command` in `dir`, additionally disabling any repository-local or
+/// worktree-local `filter.*`, `diff.*`, or `merge.*.driver` executable config
+/// keys so commands like `git status`, `git add -A`, `git worktree add`, and
+/// `git apply --3way` never execute repo-defined commands.
+pub(crate) fn git_command_in(dir: &Path) -> Command {
+    let mut command = git_command();
+    let overrides = repo_filter_overrides(dir);
+    if !overrides.is_empty() {
+        // Pass via `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<i>` / `GIT_CONFIG_VALUE_<i>`
+        // so subsection names containing `=` (e.g. `filter.a=b.clean`) are never
+        // split by `-c name=value`, while also passing `-c` for keys without `=`
+        // for Git versions older than 2.31.
+        let base_count = std::env::var("GIT_CONFIG_COUNT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        for (offset, (key, value)) in overrides.iter().enumerate() {
+            let idx = base_count + offset;
+            command
+                .env(format!("GIT_CONFIG_KEY_{idx}"), key)
+                .env(format!("GIT_CONFIG_VALUE_{idx}"), value);
+            if !key.contains('=') {
+                command.arg("-c").arg(format!("{key}={value}"));
+            }
+        }
+        command.env(
+            "GIT_CONFIG_COUNT",
+            (base_count + overrides.len()).to_string(),
+        );
+    }
+    command.current_dir(dir);
+    command
+}
+
+fn repo_filter_overrides(dir: &Path) -> Vec<(String, &'static str)> {
+    const PATTERN: &str = r"^(filter\..*\.(clean|smudge|process|required)|diff\..*\.(textconv|command)|diff\.external|merge\..*\.driver)$";
+    let scoped = git_command()
+        .args([
+            "config",
+            "--show-scope",
+            "--name-only",
+            "--get-regexp",
+            PATTERN,
+        ])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    let (stdout, has_scope) = match scoped {
+        Ok(output) if output.status.success() => (output.stdout, true),
+        Ok(output) if output.status.code() == Some(1) => return vec![],
+        // Git < 2.26 lacks `--show-scope`; fall back to `--local`.
+        _ => match git_command()
+            .args(["config", "--local", "--name-only", "--get-regexp", PATTERN])
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(output) if output.status.success() => (output.stdout, false),
+            _ => return vec![],
+        },
+    };
+    let mut overrides = Vec::new();
+    for line in String::from_utf8_lossy(&stdout).lines() {
+        let key = if has_scope {
+            let Some((scope, key)) = line.split_once('\t') else {
+                continue;
+            };
+            if !matches!(scope, "local" | "worktree") {
+                continue;
+            }
+            key.trim()
+        } else {
+            line.trim()
+        };
+        if key.is_empty() {
+            continue;
+        }
+        let value = if key.to_ascii_lowercase().ends_with(".required") {
+            "false"
+        } else {
+            ""
+        };
+        let entry = (key.to_owned(), value);
+        if !overrides.contains(&entry) {
+            overrides.push(entry);
+        }
+    }
+    overrides
+}
+
 fn git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
-    let mut command = crate::snapshot::git_command();
-    command.args(args).current_dir(dir).stdin(Stdio::null());
+    let mut command = crate::snapshot::git_command_in(dir);
+    command.args(args).stdin(Stdio::null());
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
     }
@@ -827,5 +919,72 @@ mod tests {
         let mut scan = crate::policy::PolicyScan::new(&policies);
         patch_lines(workspace, &from, &to, |line| scan.line(line)).unwrap();
         assert_eq!(scan.hits().len(), 1, "{:?}", scan.hits());
+    }
+
+    #[test]
+    fn snapshot_and_repo_info_do_not_run_repo_local_filters() {
+        let Some(dir) = repository() else { return };
+        let workspace = dir.path();
+        let marker = workspace.join("pwned-by-filter");
+        let run_git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(workspace)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{args:?}");
+        };
+        run_git(&[
+            "config",
+            "--local",
+            "filter.evil.clean",
+            &format!("sh -c 'touch {:?}; cat'", marker.display().to_string()),
+        ]);
+        run_git(&["config", "--local", "filter.evil.required", "true"]);
+        // Subsection containing `=` must also be neutralized (not split by `-c`).
+        run_git(&[
+            "config",
+            "--local",
+            "filter.a=b.clean",
+            &format!("sh -c 'touch {:?}; cat'", marker.display().to_string()),
+        ]);
+        run_git(&[
+            "config",
+            "--local",
+            "merge.pwn.driver",
+            &format!("sh -c 'touch {:?}'", marker.display().to_string()),
+        ]);
+        fs::write(
+            workspace.join(".gitattributes"),
+            "*.txt filter=evil\n*.eq filter=a=b\n*.mrg merge=pwn\n",
+        )
+        .unwrap();
+        fs::write(workspace.join("filtered.txt"), "hello\n").unwrap();
+        fs::write(workspace.join("subsection.eq"), "hello\n").unwrap();
+
+        let info = crate::storage::repo_info(workspace).expect("repo info");
+        assert!(info.changes >= 3);
+        assert!(
+            !marker.exists(),
+            "repo_info executed repo-local filter command"
+        );
+
+        let run_dir = run_dir(workspace);
+        assert!(tree(workspace, &run_dir).is_some());
+        assert!(
+            !marker.exists(),
+            "snapshot::tree executed repo-local filter command"
+        );
+
+        // Verify merge.pwn.driver is cleared by git_command_in.
+        let effective = git_command_in(workspace)
+            .args(["config", "--get", "merge.pwn.driver"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&effective.stdout).trim().is_empty(),
+            "merge.pwn.driver was not cleared: {:?}",
+            String::from_utf8_lossy(&effective.stdout)
+        );
     }
 }
