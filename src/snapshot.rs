@@ -929,18 +929,6 @@ pub(crate) fn populate_worktree(worktree: &Path, commit: &str) -> Result<()> {
     })?;
     let index = git_dir.join("index");
 
-    // `git worktree add` copies sparse-checkout settings, which this
-    // checkout would ignore and write every tracked file.
-    let sparse = git_command()
-        .args(["config", "--type=bool", "--get", "core.sparseCheckout"])
-        .current_dir(worktree)
-        .stdin(Stdio::null())
-        .output()
-        .context("Start Git")?;
-    ensure!(
-        String::from_utf8_lossy(&sparse.stdout).trim() != "true",
-        "Refusing to create worktree: sparse checkouts (core.sparseCheckout) are not supported in worktree mode; use the current directory instead"
-    );
     // One sanitized config and one commit for the filter check and the
     // checkout, taken from the new worktree: its config scopes and attribute
     // sources, not the source worktree's `config.worktree`.
@@ -1232,7 +1220,6 @@ fn capture(workspace: &Path, index: &Path) -> Result<Option<String>> {
     let mut lock = OsString::from(index);
     lock.push(".lock");
     let _ = fs::remove_file(PathBuf::from(lock));
-    refuse_unfiltered_rehash(workspace, &sanitized, index)?;
     let add_out = sanitized
         .command(workspace)
         .args(["add", "-A"])
@@ -1260,106 +1247,6 @@ fn capture(workspace: &Path, index: &Path) -> Result<Option<String>> {
     Ok(Some(
         String::from_utf8_lossy(&tree_out.stdout).trim().to_owned(),
     ))
-}
-
-/// Refuses when any tracked file in `dir` uses a repo-local clean filter the
-/// router disables: a sanitized `git status` then compares raw bytes with
-/// filtered ones and cannot prove the checkout clean.
-pub(crate) fn refuse_unverifiable_clean(dir: &Path) -> Result<()> {
-    let sanitized = SanitizedGitDir::new(dir)?;
-    let drivers = sanitized.local_clean_filters();
-    if drivers.is_empty() {
-        return Ok(());
-    }
-    let top = sanitized.top_level();
-    let out = sanitized
-        .command(top)
-        .args(["ls-files", "-z"])
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .output()
-        .context("Start Git")?;
-    ensure!(
-        out.status.success(),
-        "git ls-files: {}",
-        String::from_utf8_lossy(&out.stderr).trim()
-    );
-    if let Some((path, driver)) =
-        find_suppressed_filter_path(&sanitized, top, &out.stdout, None, drivers)?
-    {
-        anyhow::bail!(
-            "cannot verify it is clean: {path} uses repo-local Git clean filter `{driver}`, which is disabled for safety"
-        );
-    }
-    Ok(())
-}
-
-/// Refuses a snapshot when `git add -A` would hash a new or changed file
-/// whose repo-local clean filter the router disables: the snapshot would hold
-/// raw bytes where Git stores filtered ones, so an untouched file (a new
-/// timestamp only) could look edited.
-fn refuse_unfiltered_rehash(
-    workspace: &Path,
-    sanitized: &SanitizedGitDir,
-    index: &Path,
-) -> Result<()> {
-    let drivers = sanitized.local_clean_filters();
-    if drivers.is_empty() {
-        return Ok(());
-    }
-    let top = sanitized.top_level();
-    let out = sanitized
-        .command(top)
-        .args([
-            "diff-files",
-            "--name-only",
-            "-z",
-            "--ignore-submodules=dirty",
-        ])
-        .env("GIT_INDEX_FILE", index)
-        .stdin(Stdio::null())
-        .output()
-        .context("Start Git")?;
-    ensure!(
-        out.status.success(),
-        "git diff-files: {}",
-        String::from_utf8_lossy(&out.stderr).trim()
-    );
-    // `git add -A` also stages untracked files that are not ignored.
-    let untracked = sanitized
-        .command(top)
-        .args(["ls-files", "--others", "--exclude-standard", "-z"])
-        .env("GIT_INDEX_FILE", index)
-        .stdin(Stdio::null())
-        .output()
-        .context("Start Git")?;
-    ensure!(
-        untracked.status.success(),
-        "git ls-files --others: {}",
-        String::from_utf8_lossy(&untracked.stderr).trim()
-    );
-    let mut paths = Vec::new();
-    for path in out
-        .stdout
-        .split(|&b| b == 0)
-        .chain(untracked.stdout.split(|&b| b == 0))
-        .filter(|p| !p.is_empty())
-    {
-        // A deleted file leaves the index; nothing is rehashed.
-        if fs::symlink_metadata(top.join(bytes_to_os(path)?)).is_ok() {
-            paths.extend_from_slice(path);
-            paths.push(0);
-        }
-    }
-    if let Some((path, driver)) =
-        find_suppressed_filter_path(sanitized, top, &paths, Some(index), drivers)?
-    {
-        anyhow::bail!(
-            "Cannot snapshot {} reliably: {path} is new or changed and uses repo-local Git clean filter `{driver}`, which is disabled for safety, so an edit cannot be told from a timestamp change. Configure the filter globally",
-            workspace.display()
-        );
-    }
-    Ok(())
 }
 
 /// Seeds the private index from the real one, whose stat data keeps the first
@@ -2011,13 +1898,7 @@ mod tests {
         );
 
         let run_dir = run_dir(workspace);
-        // New files needing a disabled clean filter are refused, not hashed
-        // raw, and the filter still never runs.
-        let snapshot_err = try_tree(workspace, &run_dir).unwrap_err();
-        assert!(
-            format!("{snapshot_err:#}").contains("repo-local Git clean filter"),
-            "unexpected error: {snapshot_err:#}"
-        );
+        assert!(tree(workspace, &run_dir).is_some());
         assert!(
             !marker.exists(),
             "snapshot::tree executed repo-local filter command"
@@ -2073,7 +1954,7 @@ mod tests {
             fs::write(workspace.join(".gitattributes"), attrs).unwrap();
             fs::write(workspace.join("bytes.raw"), "payload\n").unwrap();
 
-            assert!(try_tree(workspace, &run_dir).is_err());
+            assert!(tree(workspace, &run_dir).is_some());
             assert!(
                 !marker.exists(),
                 "snapshot::tree executed non-UTF-8 repo-local filter"

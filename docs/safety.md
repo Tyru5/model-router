@@ -135,10 +135,9 @@ commands; it keeps repo-local Git LFS endpoint URLs and remote selection
 `remote.lfspushdefault`, `branch.*.remote`). Router `git status` calls pass
 `--ignore-submodules=dirty`, so Git never runs inside a submodule with that
 submodule's own config; worktree mode checks each populated submodule with
-its own sanitized Git directory instead. A snapshot is refused when a new or changed file uses a
-disabled repo-local clean filter, since it would hold unfiltered bytes. New
+its own sanitized Git directory instead. New
 worktrees are checked for disabled smudge filters from the new worktree's own
-config, and a fan-out patch apply is refused when a patched file uses one. Worktree mode refuses sparse checkouts. That `GIT_DIR` lives in a `tmp` directory inside the router's
+config, and a fan-out patch apply is refused when a patched file uses one. That `GIT_DIR` lives in a `tmp` directory inside the router's
 socket directory, which stages cannot write. Partial clones
 (`extensions.partialClone` or `remote.*.promisor`) and a repository-local
 `lfs.storage` are refused; use a full clone and set `lfs.storage` globally.
@@ -226,7 +225,9 @@ GitHub URLs go through `gh` and its login; imports read only the named file,
 issue, or PR. Other URLs are fetched without credentials. HTTPS may not
 redirect to HTTP, and neither redirects nor DNS answers may reach loopback,
 link-local (`169.254.0.0/16`, `fe80::/10`), or private (RFC 1918, `fc00::/7`)
-addresses, unless the URL you typed names such a host.
+addresses, unless the URL you typed has such an IP address or `localhost`
+(or a `*.localhost` name) as its host. A public name that resolves to a
+private address is refused.
 
 ## Process cleanup
 

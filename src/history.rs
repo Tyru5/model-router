@@ -998,41 +998,6 @@ pub fn cleanup_plan(project: &Path, criteria: &Criteria) -> Result<Plan> {
     Ok(plan)
 }
 
-/// Removes clean worktree `tree`. Not `git worktree remove`: its own check
-/// for changes reads the live repository config, filters included. The
-/// router moves the tree aside, so nothing saves into it by path any more,
-/// checks it again with its sanitized config, deletes it, and removes only
-/// this worktree's record in the repository. A tree that is locked
-/// (`git worktree lock`) or not clean is kept where it was.
-fn remove_worktree(tree: &Path) -> Result<()> {
-    // Git's record of this worktree, only if Git registered this path.
-    let record = storage::worktree_record(tree)?;
-    let unlocked = || -> Result<()> {
-        ensure!(
-            fs::symlink_metadata(record.join("locked")).is_err(),
-            "locked with `git worktree lock`"
-        );
-        Ok(())
-    };
-    unlocked()?;
-    removable(tree)?;
-    let mut name = tree
-        .file_name()
-        .context("Worktree path has no name")?
-        .to_os_string();
-    name.push(format!(".removing-{}", uuid::Uuid::new_v4().simple()));
-    let aside = tree.with_file_name(name);
-    fs::rename(tree, &aside).with_context(|| format!("Move {} aside", tree.display()))?;
-    if let Err(err) = unlocked().and_then(|()| removable(&aside)) {
-        fs::rename(&aside, tree).with_context(|| format!("Restore {}", tree.display()))?;
-        return Err(err);
-    }
-    fs::remove_dir_all(&aside).with_context(|| format!("Remove {}", aside.display()))?;
-    // Not `git worktree prune`, which also drops records of other
-    // worktrees whose directories are missing for now.
-    fs::remove_dir_all(&record).with_context(|| format!("Remove {}", record.display()))
-}
-
 /// Ok when `git worktree remove` takes `tree` without --force, as far as
 /// the sanitized config can tell: no changes, no untracked files, and no
 /// populated submodules.
@@ -1056,8 +1021,7 @@ fn removable(tree: &Path) -> Result<()> {
         .is_empty(),
         "uncommitted changes"
     );
-    // A status the router cannot trust keeps the tree.
-    crate::snapshot::refuse_unverifiable_clean(tree)
+    Ok(())
 }
 
 /// Removes a plan's runs: a planned worktree first, then handoff and run
@@ -1093,8 +1057,11 @@ fn remove(project: &Path, item: &Item) -> Result<Item> {
     })?;
     let mut done = item.clone();
     if let Some((tree, _)) = &item.worktree {
-        // Only a clean worktree goes. Branches stay.
-        let removed = remove_worktree(tree);
+        // Never --force: Git refuses worktrees with changes. Branches stay.
+        let removed = tree
+            .to_str()
+            .context("Worktree path must be UTF-8")
+            .and_then(|path| storage::git(project, &["worktree", "remove", path]));
         if let Err(error) = removed {
             done.worktree = None;
             done.note = Some(format!("Worktree kept: {error:#}"));
@@ -1393,51 +1360,5 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not upstream of c"), "{err}");
-    }
-
-    #[test]
-    fn remove_worktree_takes_a_clean_tree_and_keeps_a_changed_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
-        let git = |args: &[&str]| storage::git(repo, args).unwrap();
-        git(&["init", "-q"]);
-        fs::write(repo.join("file.txt"), "one\n").unwrap();
-        git(&["add", "."]);
-        git(&[
-            "-c",
-            "user.name=model-router tests",
-            "-c",
-            "user.email=tests@localhost",
-            "-c",
-            "commit.gpgsign=false",
-            "commit",
-            "-qm",
-            "init",
-        ]);
-        let clean = storage::create_worktree(repo, "clean", false).unwrap();
-        let changed = storage::create_worktree(repo, "changed", false).unwrap();
-        fs::write(changed.join("file.txt"), "edited\n").unwrap();
-
-        remove_worktree(&clean).unwrap();
-        assert!(!clean.exists());
-        let listed = git(&["worktree", "list", "--porcelain"]);
-        assert!(!listed.contains("/clean\n"), "{listed}");
-
-        let locked = storage::create_worktree(repo, "locked", false).unwrap();
-        git(&["worktree", "lock", locked.to_str().unwrap()]);
-        let err = remove_worktree(&locked).unwrap_err();
-        assert!(format!("{err:#}").contains("locked"), "{err:#}");
-        assert!(locked.join("file.txt").exists());
-
-        let err = remove_worktree(&changed).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("uncommitted changes"),
-            "{err:#}"
-        );
-        assert_eq!(
-            fs::read_to_string(changed.join("file.txt")).unwrap(),
-            "edited\n"
-        );
-        assert!(listed.contains("/changed\n"), "{listed}");
     }
 }

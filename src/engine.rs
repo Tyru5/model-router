@@ -1463,13 +1463,12 @@ mod tests {
             .expect("prepare should refuse when pre-stage Git snapshot fails");
         let req_msg = format!("{req_err:#}");
         assert!(req_msg.contains("protected_paths"), "{req_msg}");
-        assert!(req_msg.contains("Git clean filter `req`"), "{req_msg}");
+        assert!(req_msg.contains("git add -A"), "{req_msg}");
         assert!(req_run.stages[0].attempts.is_empty());
 
         // Defense in depth: finish also blocks if an existing attempt somehow
         // lacks tree_before.
         run_git(&["config", "--local", "--unset", "filter.req.required"]);
-        run_git(&["config", "--local", "--unset", "filter.req.clean"]);
         let mut run = Run::create(
             repo.path(),
             &settings,
