@@ -2124,6 +2124,48 @@ mod tests {
     }
 
     #[test]
+    fn clean_worktree_check_sees_dirty_submodules_without_their_filters() {
+        let Some(sub_dir) = repository() else { return };
+        let Some(parent_dir) = repository() else {
+            return;
+        };
+        let parent = parent_dir.path();
+        git(
+            parent,
+            None,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &sub_dir.path().display().to_string(),
+                "sub",
+            ],
+        )
+        .unwrap();
+        git(
+            parent,
+            None,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "sub"],
+        )
+        .unwrap();
+        crate::storage::create_worktree(parent, "wt-sub-clean", true).unwrap();
+        // A submodule-local clean filter must not run during the check.
+        let marker = parent.join("filter-ran");
+        let sub = parent.join("sub");
+        let clean = format!("touch '{}'; cat", marker.display());
+        git(&sub, None, &["config", "filter.evil.clean", &clean]).unwrap();
+        fs::write(sub.join(".gitattributes"), "* filter=evil\n").unwrap();
+        let err = crate::storage::create_worktree(parent, "wt-sub-dirty", true).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("is not clean"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!marker.exists(), "submodule-local clean filter ran");
+    }
+
+    #[test]
     fn sanitized_git_preserves_include_if_gitdir_global_filter() {
         let Some(dir) = repository() else { return };
         let workspace = dir.path();

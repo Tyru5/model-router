@@ -455,6 +455,40 @@ pub fn create_worktree(project: &Path, id: &str, require_clean: bool) -> Result<
     Ok(path)
 }
 
+/// `status --ignore-submodules=dirty` skips submodule work trees, so each
+/// populated submodule is checked with its own sanitized Git directory.
+fn ensure_clean_submodules(sanitized: &crate::snapshot::SanitizedGitDir) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let top = sanitized.top_level();
+    let output = sanitized
+        .command(top)
+        .args(["ls-files", "--stage", "-z"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        output.status.success(),
+        "git ls-files --stage: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    // Entries are `<mode> <object> <stage>\t<path>`; 160000 is a gitlink.
+    for entry in output.stdout.split(|&b| b == 0) {
+        let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
+            continue;
+        };
+        if !entry.starts_with(b"160000 ") {
+            continue;
+        }
+        let path = top.join(std::ffi::OsStr::from_bytes(&entry[tab + 1..]));
+        if fs::symlink_metadata(path.join(".git")).is_ok() {
+            ensure_clean_checkout(&path)
+                .with_context(|| format!("Submodule {} is not clean", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn ensure_clean_checkout(project: &Path) -> Result<()> {
     let sanitized = crate::snapshot::SanitizedGitDir::new(project)?;
     let output = sanitized
@@ -472,7 +506,7 @@ fn ensure_clean_checkout(project: &Path) -> Result<()> {
         String::from_utf8_lossy(&output.stderr).trim()
     );
     if output.stdout.is_empty() {
-        return Ok(());
+        return ensure_clean_submodules(&sanitized);
     }
     // If any reported dirty path uses a suppressed repo-local clean filter,
     // Git's sanitized comparison sees raw working-tree bytes against filtered
