@@ -814,10 +814,20 @@ fn run_external_scanner_within(
     let started = crate::process::group::started(pgid);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let out_reader =
-        stdout.map(|s| std::thread::spawn(move || read_capped_stream(s, SCANNER_OUTPUT_LIMIT)));
-    let err_reader =
-        stderr.map(|s| std::thread::spawn(move || read_capped_stream(s, SCANNER_OUTPUT_LIMIT)));
+    let out_rx = stdout.map(|s| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = tx.send(read_capped_stream(s, SCANNER_OUTPUT_LIMIT));
+        });
+        rx
+    });
+    let err_rx = stderr.map(|s| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = tx.send(read_capped_stream(s, SCANNER_OUTPUT_LIMIT));
+        });
+        rx
+    });
 
     let stop_scanner = |child: &mut std::process::Child| {
         #[cfg(unix)]
@@ -867,8 +877,23 @@ fn run_external_scanner_within(
         },
         || !crate::process::group_reused(&started, pgid),
     );
-    let stdout = out_reader.and_then(|t| t.join().ok()).unwrap_or_default();
-    let stderr = err_reader.and_then(|t| t.join().ok()).unwrap_or_default();
+    let recv_bounded = |rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>| -> Result<Vec<u8>> {
+        let Some(rx) = rx else {
+            return Ok(Vec::new());
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(bytes) => Ok(bytes),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => bail!(
+                "Secret scanner `{}` timed out after {}s while collecting output; refusing to ship",
+                shell_words::join(command),
+                timeout.as_secs()
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(Vec::new()),
+        }
+    };
+    let stdout = recv_bounded(out_rx)?;
+    let stderr = recv_bounded(err_rx)?;
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr);
         let stdout = String::from_utf8_lossy(&stdout);
@@ -1317,8 +1342,61 @@ diff --git a/tests/helper.rs b/tests/helper.rs
         let text = std::fs::read_to_string(&pid_file)
             .expect("scanner did not record child pid before timeout");
         let pid: libc::pid_t = text.trim().parse().expect("valid child pid");
-        // SAFETY: signal 0 only checks whether the process exists.
-        let alive = unsafe { libc::kill(pid, 0) } == 0;
-        assert!(!alive, "scanner child {pid} survived timeout");
+        let is_running = |pid: libc::pid_t| -> bool {
+            // SAFETY: signal 0 only checks whether the process exists.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return false;
+            }
+            #[cfg(target_os = "linux")]
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                if let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest.trim_start()) {
+                    if after_comm.starts_with('Z') {
+                        return false;
+                    }
+                }
+            }
+            true
+        };
+        let wait_deadline = Instant::now() + Duration::from_secs(2);
+        while is_running(pid) && Instant::now() < wait_deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!is_running(pid), "scanner child {pid} survived timeout");
+
+        // Verify a detached helper (new session) holding stdout open after the
+        // scanner exits still fails closed at the scanner deadline.
+        let detached_pid_file = dir.path().join("detached.pid");
+        let detached_holder = vec![
+            "python3".into(),
+            "-c".into(),
+            format!(
+                "import pathlib, subprocess, sys; p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True); pathlib.Path({:?}).write_text(str(p.pid))",
+                detached_pid_file.display().to_string()
+            ),
+        ];
+        let started = Instant::now();
+        let err = run_external_scanner_within(
+            dir.path(),
+            &detached_holder,
+            &[],
+            &index,
+            Duration::from_millis(500),
+        )
+        .unwrap_err();
+        // Clean up the detached test helper immediately.
+        if let Ok(text) = std::fs::read_to_string(&detached_pid_file) {
+            if let Ok(dpid) = text.trim().parse::<libc::pid_t>() {
+                // SAFETY: terminating our own test helper.
+                unsafe {
+                    libc::kill(dpid, libc::SIGKILL);
+                }
+            }
+        }
+        assert!(format!("{err:#}").contains("collecting output"), "{err:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "scanner hung past timeout: {:?}",
+            started.elapsed()
+        );
     }
 }

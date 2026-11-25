@@ -75,26 +75,37 @@ pub(crate) fn git_command() -> Command {
 /// `git_command` in `dir`, additionally disabling any repository-local or
 /// worktree-local `filter.*`, `diff.*`, or `merge.*.driver` executable config
 /// keys so commands like `git status`, `git add -A`, `git worktree add`, and
-/// `git apply --3way` never execute repo-defined commands.
-pub(crate) fn git_command_in(dir: &Path) -> Command {
+/// `git apply --3way` never execute repo-defined commands. Fails closed when
+/// config scope cannot be queried or a key cannot be safely overridden.
+pub(crate) fn git_command_in(dir: &Path) -> Result<Command> {
     let mut command = git_command();
-    let overrides = repo_filter_overrides(dir);
+    let overrides = repo_driver_overrides(dir)?;
     if !overrides.is_empty() {
+        let needs_env = overrides.iter().any(|(key, _)| key.contains(&b'='));
+        ensure!(
+            !needs_env || git_supports_config_env(),
+            "Refusing Git command in {}: repository defines a driver key containing `=`, which requires Git 2.31+ to disable safely",
+            dir.display()
+        );
         // Pass via `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<i>` / `GIT_CONFIG_VALUE_<i>`
-        // so subsection names containing `=` (e.g. `filter.a=b.clean`) are never
-        // split by `-c name=value`, while also passing `-c` for keys without `=`
-        // for Git versions older than 2.31.
+        // with raw key bytes so non-UTF-8 subsection names and names containing
+        // `=` are preserved exactly; also pass `-c` for keys without `=` so
+        // Git 2.26-2.30 disables them too.
         let base_count = std::env::var("GIT_CONFIG_COUNT")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(0);
         for (offset, (key, value)) in overrides.iter().enumerate() {
             let idx = base_count + offset;
+            let key_os = bytes_to_os(key)?;
             command
-                .env(format!("GIT_CONFIG_KEY_{idx}"), key)
+                .env(format!("GIT_CONFIG_KEY_{idx}"), &key_os)
                 .env(format!("GIT_CONFIG_VALUE_{idx}"), value);
-            if !key.contains('=') {
-                command.arg("-c").arg(format!("{key}={value}"));
+            if !key.contains(&b'=') {
+                let mut arg = key_os;
+                arg.push("=");
+                arg.push(value);
+                command.arg("-c").arg(arg);
             }
         }
         command.env(
@@ -103,69 +114,150 @@ pub(crate) fn git_command_in(dir: &Path) -> Command {
         );
     }
     command.current_dir(dir);
-    command
+    Ok(command)
 }
 
-fn repo_filter_overrides(dir: &Path) -> Vec<(String, &'static str)> {
-    const PATTERN: &str = r"^(filter\..*\.(clean|smudge|process|required)|diff\..*\.(textconv|command)|diff\.external|merge\..*\.driver)$";
-    let scoped = git_command()
-        .args([
-            "config",
-            "--show-scope",
-            "--name-only",
-            "--get-regexp",
-            PATTERN,
-        ])
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
-    let (stdout, has_scope) = match scoped {
-        Ok(output) if output.status.success() => (output.stdout, true),
-        Ok(output) if output.status.code() == Some(1) => return vec![],
-        // Git < 2.26 lacks `--show-scope`; fall back to `--local`.
-        _ => match git_command()
-            .args(["config", "--local", "--name-only", "--get-regexp", PATTERN])
-            .current_dir(dir)
+/// Raw driver names of repo-local/worktree `filter.<driver>.(clean|process|required)`
+/// keys that `git_command_in` disables in `dir`.
+pub(crate) fn repo_local_clean_filters(dir: &Path) -> Result<Vec<Vec<u8>>> {
+    let mut drivers = Vec::new();
+    for (key, _) in repo_driver_overrides(dir)? {
+        let Some((section, rest)) = split_first(&key, b'.') else {
+            continue;
+        };
+        let Some((subsection, var)) = split_last(rest, b'.') else {
+            continue;
+        };
+        if section.eq_ignore_ascii_case(b"filter")
+            && (var.eq_ignore_ascii_case(b"clean")
+                || var.eq_ignore_ascii_case(b"process")
+                || var.eq_ignore_ascii_case(b"required"))
+            && !subsection.is_empty()
+            && !drivers.iter().any(|d| d == subsection)
+        {
+            drivers.push(subsection.to_vec());
+        }
+    }
+    Ok(drivers)
+}
+
+fn split_first(bytes: &[u8], sep: u8) -> Option<(&[u8], &[u8])> {
+    let pos = bytes.iter().position(|&b| b == sep)?;
+    Some((&bytes[..pos], &bytes[pos + 1..]))
+}
+
+fn split_last(bytes: &[u8], sep: u8) -> Option<(&[u8], &[u8])> {
+    let pos = bytes.iter().rposition(|&b| b == sep)?;
+    Some((&bytes[..pos], &bytes[pos + 1..]))
+}
+
+#[cfg(unix)]
+fn bytes_to_os(bytes: &[u8]) -> Result<OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    ensure!(!bytes.contains(&0), "Git config key contains NUL byte");
+    Ok(std::ffi::OsStr::from_bytes(bytes).to_os_string())
+}
+
+#[cfg(not(unix))]
+fn bytes_to_os(bytes: &[u8]) -> Result<OsString> {
+    let text = std::str::from_utf8(bytes)
+        .context("Git config key is not valid UTF-8 and cannot be safely overridden")?;
+    ensure!(!text.contains('\0'), "Git config key contains NUL byte");
+    Ok(OsString::from(text))
+}
+
+fn git_supports_config_env() -> bool {
+    static SUPPORTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTS.get_or_init(|| {
+        let Ok(output) = git_command()
+            .arg("--version")
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .output()
-        {
-            Ok(output) if output.status.success() => (output.stdout, false),
-            _ => return vec![],
-        },
-    };
-    let mut overrides = Vec::new();
-    for line in String::from_utf8_lossy(&stdout).lines() {
-        let key = if has_scope {
-            let Some((scope, key)) = line.split_once('\t') else {
-                continue;
-            };
-            if !matches!(scope, "local" | "worktree") {
-                continue;
-            }
-            key.trim()
-        } else {
-            line.trim()
+        else {
+            return false;
         };
-        if key.is_empty() {
+        if !output.status.success() {
+            return false;
+        }
+        parse_git_version(&String::from_utf8_lossy(&output.stdout))
+            .is_some_and(|(major, minor)| (major, minor) >= (2, 31))
+    })
+}
+
+fn parse_git_version(text: &str) -> Option<(u32, u32)> {
+    let token = text
+        .split_whitespace()
+        .find(|part| part.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
+    let mut nums = token.split('.');
+    let major = nums.next()?.parse().ok()?;
+    let minor = nums.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+fn driver_override_value(key: &[u8]) -> Option<&'static str> {
+    if key.eq_ignore_ascii_case(b"diff.external") {
+        return Some("");
+    }
+    let (section, rest) = split_first(key, b'.')?;
+    let (subsection, var) = split_last(rest, b'.')?;
+    if subsection.is_empty() {
+        return None;
+    }
+    if section.eq_ignore_ascii_case(b"filter") {
+        if var.eq_ignore_ascii_case(b"clean")
+            || var.eq_ignore_ascii_case(b"smudge")
+            || var.eq_ignore_ascii_case(b"process")
+        {
+            return Some("");
+        }
+        if var.eq_ignore_ascii_case(b"required") {
+            return Some("false");
+        }
+    } else if section.eq_ignore_ascii_case(b"diff") {
+        if var.eq_ignore_ascii_case(b"textconv") || var.eq_ignore_ascii_case(b"command") {
+            return Some("");
+        }
+    } else if section.eq_ignore_ascii_case(b"merge") && var.eq_ignore_ascii_case(b"driver") {
+        return Some("");
+    }
+    None
+}
+
+fn repo_driver_overrides(dir: &Path) -> Result<Vec<(Vec<u8>, &'static str)>> {
+    // `--list -z` avoids locale-dependent regexes (which skip non-UTF-8 keys)
+    // and preserves exact key bytes, including newlines and non-UTF-8 bytes.
+    let output = git_command()
+        .args(["config", "--show-scope", "--name-only", "-z", "--list"])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        output.status.success(),
+        "Could not inspect Git config scopes in {} (requires Git 2.26+): {}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let mut overrides = Vec::new();
+    let mut parts = output.stdout.split(|&b| b == 0);
+    while let (Some(scope), Some(key)) = (parts.next(), parts.next()) {
+        if scope != b"local" && scope != b"worktree" {
             continue;
         }
-        let value = if key.to_ascii_lowercase().ends_with(".required") {
-            "false"
-        } else {
-            ""
+        let Some(value) = driver_override_value(key) else {
+            continue;
         };
-        let entry = (key.to_owned(), value);
+        let entry = (key.to_vec(), value);
         if !overrides.contains(&entry) {
             overrides.push(entry);
         }
     }
-    overrides
+    Ok(overrides)
 }
 
 fn git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
-    let mut command = crate::snapshot::git_command_in(dir);
+    let mut command = crate::snapshot::git_command_in(dir)?;
     command.args(args).stdin(Stdio::null());
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
@@ -978,6 +1070,7 @@ mod tests {
 
         // Verify merge.pwn.driver is cleared by git_command_in.
         let effective = git_command_in(workspace)
+            .unwrap()
             .args(["config", "--get", "merge.pwn.driver"])
             .output()
             .unwrap();
@@ -986,5 +1079,26 @@ mod tests {
             "merge.pwn.driver was not cleared: {:?}",
             String::from_utf8_lossy(&effective.stdout)
         );
+
+        // Non-UTF-8 filter subsection names must also be preserved and neutralized.
+        #[cfg(unix)]
+        {
+            let cfg_path = workspace.join(".git/config");
+            let mut cfg = fs::read(&cfg_path).unwrap();
+            cfg.extend_from_slice(b"\n[filter \"bad\xffname\"]\n\tclean = sh -c 'touch ");
+            cfg.extend_from_slice(marker.to_string_lossy().as_bytes());
+            cfg.extend_from_slice(b"; cat'\n\trequired = true\n");
+            fs::write(&cfg_path, cfg).unwrap();
+            let mut attrs = fs::read(workspace.join(".gitattributes")).unwrap();
+            attrs.extend_from_slice(b"*.raw filter=bad\xffname\n");
+            fs::write(workspace.join(".gitattributes"), attrs).unwrap();
+            fs::write(workspace.join("bytes.raw"), "payload\n").unwrap();
+
+            assert!(tree(workspace, &run_dir).is_some());
+            assert!(
+                !marker.exists(),
+                "snapshot::tree executed non-UTF-8 repo-local filter"
+            );
+        }
     }
 }

@@ -121,12 +121,29 @@ pub(super) struct HarnessChecks {
     /// Tests swap in a stub so no harness runs.
     pub(super) probe: Probe,
 }
+#[derive(Clone, PartialEq, Eq)]
+struct ScriptStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+struct ScriptCache {
+    project: PathBuf,
+    stamp: Option<ScriptStamp>,
+    verified: bool,
+}
+
 /// The Harnesses page: doctor results and the selected row.
 #[derive(Default)]
 pub(super) struct HarnessesPage {
     pub(super) selected: usize,
     pub(super) checks: HarnessChecks,
     pub(super) tests: HarnessTests,
+    script_cache: std::cell::RefCell<Option<ScriptCache>>,
 }
 
 impl Default for HarnessChecks {
@@ -250,19 +267,58 @@ impl HarnessTest {
     }
 }
 
-/// Verifies the script again right before spawn, then runs it and reports its
-/// command, exit status, and output.
+fn script_stamp(project: &Path) -> Option<ScriptStamp> {
+    let meta = std::fs::symlink_metadata(project.join(TEST_SCRIPT)).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    Some(ScriptStamp {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+        #[cfg(unix)]
+        dev: meta.dev(),
+        #[cfg(unix)]
+        ino: meta.ino(),
+    })
+}
+
+/// Verifies the checkout's script, then writes the embedded `TEST_SCRIPT_BYTES`
+/// to a private temporary file outside the checkout so Python executes only
+/// the verified bytes and never reopens a path inside the repository.
 fn run_test(test: &HarnessTest) -> Result<TestOutcome, String> {
     if !verify_test_script(&test.project) {
         return Err(format!(
             "Refusing to run {TEST_SCRIPT}: file missing or does not match this build."
         ));
     }
-    run_test_unchecked(test)
+    let mut temp = tempfile::Builder::new()
+        .prefix("model-router-capture-")
+        .suffix(".py")
+        .tempfile()
+        .map_err(|error| format!("Could not stage capture script: {error}"))?;
+    std::io::Write::write_all(&mut temp, TEST_SCRIPT_BYTES)
+        .map_err(|error| format!("Could not write capture script: {error}"))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|error| format!("Could not flush capture script: {error}"))?;
+    let mut argv = test.argv();
+    // Replace the checkout script path (index 2, after `python3` and `-I`) with
+    // the private temp file so a concurrent edit in the checkout cannot swap it.
+    if let Some(slot) = argv.get_mut(2) {
+        *slot = temp.path().as_os_str().to_owned();
+    }
+    run_test_with_argv(test, &argv)
 }
 
+#[cfg(test)]
 fn run_test_unchecked(test: &HarnessTest) -> Result<TestOutcome, String> {
     let argv = test.argv();
+    run_test_with_argv(test, &argv)
+}
+
+fn run_test_with_argv(test: &HarnessTest, argv: &[OsString]) -> Result<TestOutcome, String> {
     let output = Command::new(&argv[0])
         .args(&argv[1..])
         .current_dir(&test.project)
@@ -444,8 +500,21 @@ impl App {
 impl App {
     /// Whether this project has a verified copy of the built-in test script
     /// (regular file, no symlinks, matching this binary's script byte-for-byte).
+    /// Cached by `(project, metadata)` so UI redraws do not reread the file.
     pub(super) fn can_test_harnesses(&self) -> bool {
-        verify_test_script(&self.project)
+        let stamp = script_stamp(&self.project);
+        if let Some(cache) = self.harnesses.script_cache.borrow().as_ref() {
+            if cache.project == self.project && cache.stamp == stamp {
+                return cache.verified;
+            }
+        }
+        let verified = stamp.is_some() && verify_test_script(&self.project);
+        *self.harnesses.script_cache.borrow_mut() = Some(ScriptCache {
+            project: self.project.clone(),
+            stamp,
+            verified,
+        });
+        verified
     }
     /// Where a test of `harness` started now saves its output.
     pub(super) fn test_output(&self, harness: &str) -> PathBuf {
@@ -473,7 +542,7 @@ impl App {
         if !self.harnesses.tests.batch.is_empty() {
             return Ok(());
         }
-        if !self.can_test_harnesses() {
+        if !verify_test_script(&self.project) {
             self.ui.message = format!(
                 "Refusing to run {TEST_SCRIPT}: file missing or does not match this build."
             );

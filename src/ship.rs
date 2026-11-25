@@ -318,7 +318,7 @@ fn exec_with(
     // Git also gets the router's hook and fsmonitor overrides: a stage may
     // have written the hooks directory `core.hooksPath` names.
     let mut command = if program == "git" {
-        crate::snapshot::git_command_in(dir)
+        crate::snapshot::git_command_in(dir)?
     } else {
         Command::new(program)
     };
@@ -917,7 +917,75 @@ impl Drop for PrivateIndex {
 /// Stages exactly `files`, as they are in the working tree now, on top of
 /// `head` in the private index at `index` (replaced if present), and returns
 /// the tree. The user's own index is not read or written.
+/// Refuses to stage paths whose `.gitattributes` `filter` names a repo-local
+/// or worktree-local clean/process/required filter that `git_command_in`
+/// disables, so `ship` never commits raw unfiltered bytes (such as an uncleaned
+/// Git LFS object).
+fn refuse_suppressed_clean_filters(work: &Path, files: &[FileChange]) -> Result<()> {
+    let drivers = snapshot::repo_local_clean_filters(work)?;
+    if drivers.is_empty() {
+        return Ok(());
+    }
+    let mut stdin_paths = Vec::new();
+    for file in files {
+        if file.status != snapshot::ChangeKind::Deleted {
+            stdin_paths.extend_from_slice(file.path.as_bytes());
+            stdin_paths.push(0);
+        }
+    }
+    if stdin_paths.is_empty() {
+        return Ok(());
+    }
+    let mut child = snapshot::git_command_in(work)?
+        .args(["check-attr", "-z", "filter", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Start Git")?;
+    let output = std::thread::scope(|scope| -> Result<std::process::Output> {
+        let writer = child.stdin.take().map(|mut pipe| {
+            scope.spawn(move || -> std::io::Result<()> {
+                match pipe.write_all(&stdin_paths) {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                    Err(err) => Err(err),
+                }
+            })
+        });
+        let output = child.wait_with_output()?;
+        if let Some(handle) = writer {
+            if let Ok(Err(err)) = handle.join() {
+                if output.status.success() {
+                    return Err(err.into());
+                }
+            }
+        }
+        Ok(output)
+    })?;
+    ensure!(
+        output.status.success(),
+        "git check-attr filter failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let mut parts = output.stdout.split(|&b| b == 0);
+    while let (Some(path), Some(_attr), Some(value)) = (parts.next(), parts.next(), parts.next()) {
+        if matches!(value, b"" | b"unspecified" | b"unset" | b"set") {
+            continue;
+        }
+        if drivers.iter().any(|d| d.as_slice() == value) {
+            anyhow::bail!(
+                "Refusing to ship {}: repo-local Git clean filter `{}` is disabled for safety and shipping would commit unfiltered bytes; configure the filter globally or commit this path manually",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(value)
+            );
+        }
+    }
+    Ok(())
+}
+
 fn stage_planned(work: &Path, head: &str, files: &[FileChange], index: &Path) -> Result<String> {
+    refuse_suppressed_clean_filters(work, files)?;
     let _ = fs::remove_file(index);
     let private = [("GIT_INDEX_FILE", index)];
     exec("git", &["read-tree", head], work, &private)?;
@@ -1727,5 +1795,42 @@ mod tests {
             git(root, &["status", "--porcelain"]).unwrap(),
             "M  notes.txt\n?? other.txt"
         );
+    }
+
+    #[test]
+    fn stage_planned_refuses_paths_with_repo_local_clean_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let run_git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.name", "Test"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        fs::write(root.join("init.txt"), "seed\n").unwrap();
+        run_git(&["add", "init.txt"]);
+        run_git(&["commit", "-q", "-m", "init"]);
+        let head = git(root, &["rev-parse", "HEAD"]).unwrap();
+
+        run_git(&["config", "--local", "filter.lfs.clean", "cat"]);
+        run_git(&["config", "--local", "filter.lfs.required", "true"]);
+        fs::write(root.join(".gitattributes"), "*.bin filter=lfs\n").unwrap();
+        fs::write(root.join("asset.bin"), "raw-binary-bytes\n").unwrap();
+
+        let files = vec![FileChange {
+            path: "asset.bin".into(),
+            status: snapshot::ChangeKind::Added,
+            added: Some(1),
+            removed: Some(0),
+        }];
+        let err = stage_planned(root, &head, &files, &root.join("private.index")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Refusing to ship asset.bin"), "{msg}");
+        assert!(msg.contains("filter `lfs`"), "{msg}");
     }
 }

@@ -387,7 +387,7 @@ pub fn git_readonly(project: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn git_with(project: &Path, args: &[&str], no_optional_locks: bool) -> Result<String> {
-    let mut command = crate::snapshot::git_command_in(project);
+    let mut command = crate::snapshot::git_command_in(project)?;
     command.args(args);
     if no_optional_locks {
         command.env("GIT_OPTIONAL_LOCKS", "0");

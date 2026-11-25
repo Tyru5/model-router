@@ -24,6 +24,7 @@ fn predict(workspace: &Path, index: &Path, patch: &Path, scratch: &Path) -> Opti
     fs::copy(index, &predict).ok()?;
     let run = |args: &[&str]| {
         snapshot::git_command_in(&top)
+            .ok()?
             .args(args)
             .env("GIT_INDEX_FILE", &predict)
             .stdin(std::process::Stdio::null())
