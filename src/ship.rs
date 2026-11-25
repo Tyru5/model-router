@@ -917,11 +917,11 @@ impl Drop for PrivateIndex {
 /// Stages exactly `files`, as they are in the working tree now, on top of
 /// `head` in the private index at `index` (replaced if present), and returns
 /// the tree. The user's own index is not read or written.
-/// Refuses to stage paths whose `.gitattributes` `filter` names a repo-local
-/// or worktree-local clean/process/required filter that `git_command_in`
-/// disables, so `ship` never commits raw unfiltered bytes (such as an uncleaned
-/// Git LFS object).
-fn refuse_suppressed_clean_filters(work: &Path, files: &[FileChange]) -> Result<()> {
+/// Refuses to stage paths whose `.gitattributes` `filter` (in the working tree
+/// or the private staging `index`) names a repo-local or worktree-local
+/// clean/process filter that `git_command_in` disables, so `ship` never commits
+/// raw unfiltered bytes (such as an uncleaned Git LFS object).
+fn refuse_suppressed_clean_filters(work: &Path, files: &[FileChange], index: &Path) -> Result<()> {
     let drivers = snapshot::repo_local_clean_filters(work)?;
     if drivers.is_empty() {
         return Ok(());
@@ -936,59 +936,70 @@ fn refuse_suppressed_clean_filters(work: &Path, files: &[FileChange]) -> Result<
     if stdin_paths.is_empty() {
         return Ok(());
     }
-    let mut child = snapshot::git_command_in(work)?
-        .args(["check-attr", "-z", "filter", "--stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Start Git")?;
-    let output = std::thread::scope(|scope| -> Result<std::process::Output> {
-        let writer = child.stdin.take().map(|mut pipe| {
-            scope.spawn(move || -> std::io::Result<()> {
-                match pipe.write_all(&stdin_paths) {
-                    Ok(()) => Ok(()),
-                    Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-                    Err(err) => Err(err),
-                }
-            })
-        });
-        let output = child.wait_with_output()?;
-        if let Some(handle) = writer {
-            if let Ok(Err(err)) = handle.join() {
-                if output.status.success() {
-                    return Err(err.into());
+    let stdin_slice = stdin_paths.as_slice();
+    for cached in [false, true] {
+        let mut cmd = snapshot::git_command_in(work)?;
+        cmd.arg("check-attr");
+        if cached {
+            cmd.arg("--cached");
+        }
+        let mut child = cmd
+            .args(["-z", "filter", "--stdin"])
+            .env("GIT_INDEX_FILE", index)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Start Git")?;
+        let output = std::thread::scope(|scope| -> Result<std::process::Output> {
+            let writer = child.stdin.take().map(|mut pipe| {
+                scope.spawn(move || -> std::io::Result<()> {
+                    match pipe.write_all(stdin_slice) {
+                        Ok(()) => Ok(()),
+                        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                        Err(err) => Err(err),
+                    }
+                })
+            });
+            let output = child.wait_with_output()?;
+            if let Some(handle) = writer {
+                if let Ok(Err(err)) = handle.join() {
+                    if output.status.success() {
+                        return Err(err.into());
+                    }
                 }
             }
-        }
-        Ok(output)
-    })?;
-    ensure!(
-        output.status.success(),
-        "git check-attr filter failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    let mut parts = output.stdout.split(|&b| b == 0);
-    while let (Some(path), Some(_attr), Some(value)) = (parts.next(), parts.next(), parts.next()) {
-        if matches!(value, b"" | b"unspecified" | b"unset" | b"set") {
-            continue;
-        }
-        if drivers.iter().any(|d| d.as_slice() == value) {
-            anyhow::bail!(
-                "Refusing to ship {}: repo-local Git clean filter `{}` is disabled for safety and shipping would commit unfiltered bytes; configure the filter globally or commit this path manually",
-                String::from_utf8_lossy(path),
-                String::from_utf8_lossy(value)
-            );
+            Ok(output)
+        })?;
+        ensure!(
+            output.status.success(),
+            "git check-attr filter failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let mut parts = output.stdout.split(|&b| b == 0);
+        while let (Some(path), Some(_attr), Some(value)) =
+            (parts.next(), parts.next(), parts.next())
+        {
+            if matches!(value, b"" | b"unspecified" | b"unset" | b"set") {
+                continue;
+            }
+            if drivers.iter().any(|d| d.as_slice() == value) {
+                anyhow::bail!(
+                    "Refusing to ship {}: repo-local Git clean filter `{}` is disabled for safety and shipping would commit unfiltered bytes; configure the filter globally or commit this path manually",
+                    String::from_utf8_lossy(path),
+                    String::from_utf8_lossy(value)
+                );
+            }
         }
     }
     Ok(())
 }
 
 fn stage_planned(work: &Path, head: &str, files: &[FileChange], index: &Path) -> Result<String> {
-    refuse_suppressed_clean_filters(work, files)?;
     let _ = fs::remove_file(index);
     let private = [("GIT_INDEX_FILE", index)];
     exec("git", &["read-tree", head], work, &private)?;
+    refuse_suppressed_clean_filters(work, files, index)?;
     exec_with(
         "git",
         &["update-index", "--add", "--remove", "-z", "--stdin"],

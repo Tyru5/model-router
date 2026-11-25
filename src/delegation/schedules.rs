@@ -130,6 +130,17 @@ fn save(project: &Path, store: &Store) -> Result<()> {
 
 /// Applies `change` to the store under the schedules lock.
 pub fn update<T>(project: &Path, change: impl FnOnce(&mut Store) -> Result<T>) -> Result<T> {
+    update_after(project, change, |_| {})
+}
+
+/// Like `update`, running `after_save` only once `save()` succeeds and while
+/// `schedules.lock` is still held (so a failed save cannot revoke an existing
+/// approval receipt, and no concurrent `approve` can race with revocation).
+pub fn update_after<T>(
+    project: &Path,
+    change: impl FnOnce(&mut Store) -> Result<T>,
+    after_save: impl FnOnce(&T),
+) -> Result<T> {
     let lock = lock_path(project)?;
     if let Some(parent) = lock.parent() {
         fs::create_dir_all(parent)?;
@@ -138,6 +149,7 @@ pub fn update<T>(project: &Path, change: impl FnOnce(&mut Store) -> Result<T>) -
     let mut store = load(project)?;
     let value = change(&mut store)?;
     save(project, &store)?;
+    after_save(&value);
     Ok(value)
 }
 
@@ -726,29 +738,35 @@ pub fn approve(project: &Path, id: &str, expected: Option<&str>) -> Result<Sched
 
 /// Pauses (or enables) schedule `id`; either way it needs approval again.
 pub fn set_enabled(project: &Path, id: &str, enabled: bool) -> Result<Schedule> {
-    update(project, |store| {
-        let schedule = store
-            .schedules
-            .iter_mut()
-            .find(|s| s.id == id)
-            .with_context(|| format!("No schedule {id}"))?;
-        revoke(project, id);
-        schedule.enabled = enabled;
-        schedule.revision += 1;
-        schedule.updated_at = Utc::now();
-        schedule.approved_at = None;
-        Ok(schedule.clone())
-    })
+    update_after(
+        project,
+        |store| {
+            let schedule = store
+                .schedules
+                .iter_mut()
+                .find(|s| s.id == id)
+                .with_context(|| format!("No schedule {id}"))?;
+            schedule.enabled = enabled;
+            schedule.revision += 1;
+            schedule.updated_at = Utc::now();
+            schedule.approved_at = None;
+            Ok(schedule.clone())
+        },
+        |_| revoke(project, id),
+    )
 }
 
 pub fn delete(project: &Path, id: &str) -> Result<()> {
-    update(project, |store| {
-        let before = store.schedules.len();
-        store.schedules.retain(|s| s.id != id);
-        ensure!(store.schedules.len() < before, "No schedule {id}");
-        revoke(project, id);
-        Ok(())
-    })
+    update_after(
+        project,
+        |store| {
+            let before = store.schedules.len();
+            store.schedules.retain(|s| s.id != id);
+            ensure!(store.schedules.len() < before, "No schedule {id}");
+            Ok(())
+        },
+        |_| revoke(project, id),
+    )
 }
 
 /// Refuses a workflow a schedule may not run: unknown, interactive, or

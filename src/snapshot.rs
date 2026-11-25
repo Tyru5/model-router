@@ -205,14 +205,13 @@ fn driver_override_value(key: &[u8]) -> Option<&'static str> {
         return None;
     }
     if section.eq_ignore_ascii_case(b"filter") {
+        // Leave `filter.<driver>.required` intact so Git fails closed on
+        // checkout/worktree/staging when a required repo-local filter cannot run.
         if var.eq_ignore_ascii_case(b"clean")
             || var.eq_ignore_ascii_case(b"smudge")
             || var.eq_ignore_ascii_case(b"process")
         {
             return Some("");
-        }
-        if var.eq_ignore_ascii_case(b"required") {
-            return Some("false");
         }
     } else if section.eq_ignore_ascii_case(b"diff") {
         if var.eq_ignore_ascii_case(b"textconv") || var.eq_ignore_ascii_case(b"command") {
@@ -1032,7 +1031,6 @@ mod tests {
             "filter.evil.clean",
             &format!("sh -c 'touch {:?}; cat'", marker.display().to_string()),
         ]);
-        run_git(&["config", "--local", "filter.evil.required", "true"]);
         // Subsection containing `=` must also be neutralized (not split by `-c`).
         run_git(&[
             "config",
@@ -1087,7 +1085,7 @@ mod tests {
             let mut cfg = fs::read(&cfg_path).unwrap();
             cfg.extend_from_slice(b"\n[filter \"bad\xffname\"]\n\tclean = sh -c 'touch ");
             cfg.extend_from_slice(marker.to_string_lossy().as_bytes());
-            cfg.extend_from_slice(b"; cat'\n\trequired = true\n");
+            cfg.extend_from_slice(b"; cat'\n");
             fs::write(&cfg_path, cfg).unwrap();
             let mut attrs = fs::read(workspace.join(".gitattributes")).unwrap();
             attrs.extend_from_slice(b"*.raw filter=bad\xffname\n");
@@ -1100,5 +1098,38 @@ mod tests {
                 "snapshot::tree executed non-UTF-8 repo-local filter"
             );
         }
+
+        // A required local smudge filter causes worktree checkout to fail closed
+        // instead of silently producing unfiltered pointer files.
+        let wt_dir = repository().unwrap();
+        let wt_ws = wt_dir.path();
+        let wt_marker = wt_ws.join("smudge-pwned");
+        let run_wt_git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(wt_ws)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{args:?}");
+        };
+        fs::write(wt_ws.join(".gitattributes"), "*.lfs filter=lfs\n").unwrap();
+        fs::write(wt_ws.join("asset.lfs"), "pointer-placeholder\n").unwrap();
+        run_wt_git(&["add", ".gitattributes", "asset.lfs"]);
+        run_wt_git(&["commit", "-q", "-m", "add lfs file"]);
+        run_wt_git(&[
+            "config",
+            "--local",
+            "filter.lfs.smudge",
+            &format!("sh -c 'touch {:?}; cat'", wt_marker.display().to_string()),
+        ]);
+        run_wt_git(&["config", "--local", "filter.lfs.required", "true"]);
+        assert!(
+            crate::storage::create_worktree(wt_ws, "wt-required", true).is_err(),
+            "worktree add must fail closed when a required local smudge filter is disabled"
+        );
+        assert!(
+            !wt_marker.exists(),
+            "worktree add executed repo-local smudge filter"
+        );
     }
 }
