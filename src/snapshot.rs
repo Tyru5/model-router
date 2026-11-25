@@ -77,7 +77,7 @@ pub(crate) struct SanitizedGitDir {
     local_clean_filters: Vec<Vec<u8>>,
     local_smudge_filters: Vec<Vec<u8>>,
     local_merge_drivers: Vec<Vec<u8>>,
-    local_merge_default: Option<Vec<u8>>,
+    changed_merge_default: Option<Vec<u8>>,
 }
 
 impl SanitizedGitDir {
@@ -151,7 +151,7 @@ impl SanitizedGitDir {
             local_clean_filters: inspected.local_clean_filters,
             local_smudge_filters: inspected.local_smudge_filters,
             local_merge_drivers: inspected.local_merge_drivers,
-            local_merge_default: inspected.local_merge_default,
+            changed_merge_default: inspected.changed_merge_default,
         })
     }
 
@@ -184,9 +184,11 @@ impl SanitizedGitDir {
         &self.local_merge_drivers
     }
 
-    /// A repo-local `merge.default`, which the sanitized config drops.
-    pub(crate) fn local_merge_default(&self) -> Option<&[u8]> {
-        self.local_merge_default.as_deref()
+    /// The merge driver the repository's config gives files with no `merge`
+    /// attribute, when the sanitized config would use another or a
+    /// repo-local command defines it.
+    pub(crate) fn changed_merge_default(&self) -> Option<&[u8]> {
+        self.changed_merge_default.as_deref()
     }
 
     pub(crate) fn into_parts(self) -> (tempfile::TempDir, PathBuf) {
@@ -242,7 +244,7 @@ struct InspectedRepoConfig {
     local_clean_filters: Vec<Vec<u8>>,
     local_smudge_filters: Vec<Vec<u8>>,
     local_merge_drivers: Vec<Vec<u8>>,
-    local_merge_default: Option<Vec<u8>>,
+    changed_merge_default: Option<Vec<u8>>,
 }
 
 struct ConfigEntry {
@@ -299,6 +301,7 @@ fn parse_and_build_sanitized_config(
     // `merge.default`: neither reaches the sanitized config.
     let mut local_merge_commands: Vec<(Vec<u8>, bool)> = Vec::new();
     let mut local_merge_default: Option<Vec<u8>> = None;
+    let mut trusted_merge_default: Option<Vec<u8>> = None;
     // Repository-local Git LFS endpoint URLs and remote selection (data, not
     // commands), kept so git-lfs can still fetch objects missing from the
     // local cache from the same remote a normal checkout would use.
@@ -345,6 +348,9 @@ fn parse_and_build_sanitized_config(
                     }
                 }
                 continue;
+            }
+            if section.eq_ignore_ascii_case(b"merge") && rest.eq_ignore_ascii_case(b"default") {
+                trusted_merge_default = Some(val.unwrap_or_default().to_vec());
             }
             if is_driver_section(section) {
                 let (subsection, var) = match split_last(rest, b'.') {
@@ -436,7 +442,7 @@ fn parse_and_build_sanitized_config(
                     }
                 }
                 None if rest.eq_ignore_ascii_case(b"default") => {
-                    local_merge_default = val.filter(|v| !v.is_empty()).map(<[u8]>::to_vec);
+                    local_merge_default = Some(val.unwrap_or_default().to_vec());
                 }
                 _ => {}
             }
@@ -485,6 +491,30 @@ fn parse_and_build_sanitized_config(
             local_smudge_filters.push(driver.clone());
         }
     }
+
+    let local_merge_drivers: Vec<Vec<u8>> = local_merge_commands
+        .into_iter()
+        .filter(|(_, empty)| !empty)
+        .map(|(name, _)| name)
+        .collect();
+    // Files with no `merge` attribute use `merge.default`, else `text`. The
+    // sanitized config keeps only the trusted value: compare the driver the
+    // repository's config picks with the one the sanitized config picks.
+    let default_driver = |value: Option<&Vec<u8>>| -> Vec<u8> {
+        value
+            .filter(|name| !name.is_empty())
+            .cloned()
+            .unwrap_or_else(|| b"text".to_vec())
+    };
+    let kept_default = default_driver(trusted_merge_default.as_ref());
+    let live_default = default_driver(
+        local_merge_default
+            .as_ref()
+            .or(trusted_merge_default.as_ref()),
+    );
+    let changed_merge_default = (live_default != kept_default
+        || local_merge_drivers.contains(&live_default))
+    .then_some(live_default);
 
     ensure!(
         !local_lfs_storage,
@@ -600,12 +630,8 @@ fn parse_and_build_sanitized_config(
         sanitized_config,
         local_clean_filters,
         local_smudge_filters,
-        local_merge_drivers: local_merge_commands
-            .into_iter()
-            .filter(|(_, empty)| !empty)
-            .map(|(name, _)| name)
-            .collect(),
-        local_merge_default,
+        local_merge_drivers,
+        changed_merge_default,
     })
 }
 
@@ -820,7 +846,8 @@ fn find_suppressed_filter_path_in(
 /// repository's own config would hand to a repo-local merge driver the
 /// sanitized config leaves out: a `merge` attribute (working tree or
 /// `index`) naming a repo-local `merge.<name>.driver`, or no `merge`
-/// attribute under a repo-local `merge.default`. Returns `(path, driver)`.
+/// attribute when a repo-local `merge.default` changes the default driver.
+/// Returns `(path, driver)`.
 pub(crate) fn find_local_merge_driver_path(
     sanitized: &SanitizedGitDir,
     work: &Path,
@@ -828,7 +855,7 @@ pub(crate) fn find_local_merge_driver_path(
     index: Option<&Path>,
 ) -> Result<Option<(String, String)>> {
     let drivers = sanitized.local_merge_drivers();
-    let default = sanitized.local_merge_default();
+    let default = sanitized.changed_merge_default();
     if (drivers.is_empty() && default.is_none()) || stdin_paths.is_empty() {
         return Ok(None);
     }
@@ -842,8 +869,7 @@ pub(crate) fn find_local_merge_driver_path(
             let driver = if drivers.iter().any(|d| d.as_slice() == value) {
                 Some(value)
             } else if value == b"unspecified" {
-                // `text` is what Git uses with no `merge.default` at all.
-                default.filter(|name| *name != b"text")
+                default
             } else {
                 None
             };
@@ -938,23 +964,41 @@ fn refuse_suppressed_smudge_filters(
     sanitized: &SanitizedGitDir,
     commit_or_tree: &str,
 ) -> Result<()> {
+    refuse_suppressed_smudge_filters_in(sanitized, commit_or_tree, None)
+}
+
+/// `refuse_suppressed_smudge_filters` for only the NUL-delimited paths in
+/// `only` (a sparse checkout's written files), when given.
+fn refuse_suppressed_smudge_filters_in(
+    sanitized: &SanitizedGitDir,
+    commit_or_tree: &str,
+    only: Option<&[u8]>,
+) -> Result<()> {
     let drivers = sanitized.local_smudge_filters();
     if drivers.is_empty() {
         return Ok(());
     }
     let top = sanitized.top_level();
-    let list_out = sanitized
-        .command(top)
-        .args(["ls-tree", "-r", "-z", "--name-only", commit_or_tree])
-        .stdin(Stdio::null())
-        .output()
-        .context("Start Git")?;
-    ensure!(
-        list_out.status.success(),
-        "git ls-tree {commit_or_tree}: {}",
-        String::from_utf8_lossy(&list_out.stderr).trim()
-    );
-    if list_out.stdout.is_empty() {
+    let listed;
+    let paths = match only {
+        Some(paths) => paths,
+        None => {
+            let list_out = sanitized
+                .command(top)
+                .args(["ls-tree", "-r", "-z", "--name-only", commit_or_tree])
+                .stdin(Stdio::null())
+                .output()
+                .context("Start Git")?;
+            ensure!(
+                list_out.status.success(),
+                "git ls-tree {commit_or_tree}: {}",
+                String::from_utf8_lossy(&list_out.stderr).trim()
+            );
+            listed = list_out.stdout;
+            &listed
+        }
+    };
+    if paths.is_empty() {
         return Ok(());
     }
     let scratch = tempfile::Builder::new()
@@ -985,7 +1029,7 @@ fn refuse_suppressed_smudge_filters(
         .stderr(Stdio::piped())
         .spawn()
         .context("Start Git")?;
-    let stdin_bytes = list_out.stdout.as_slice();
+    let stdin_bytes = paths;
     let output = std::thread::scope(|scope| -> Result<std::process::Output> {
         let writer = child.stdin.take().map(|mut pipe| {
             scope.spawn(move || -> std::io::Result<()> {
@@ -1063,7 +1107,7 @@ pub(crate) fn populate_worktree(worktree: &Path, commit: &str) -> Result<()> {
     // checkout, taken from the new worktree: its config scopes and attribute
     // sources, not the source worktree's `config.worktree`.
     let sanitized = SanitizedGitDir::new(worktree)?;
-    refuse_suppressed_smudge_filters(&sanitized, commit)?;
+    let unfiltered = refuse_suppressed_smudge_filters(&sanitized, commit);
     let run = |args: &[&str]| -> Result<()> {
         let out = sanitized
             .command(worktree)
@@ -1108,7 +1152,35 @@ pub(crate) fn populate_worktree(worktree: &Path, commit: &str) -> Result<()> {
             "-u",
             commit,
         ])?;
+        if unfiltered.is_err() {
+            // Some file in the commit needs a disabled filter. Only the
+            // sparse rules Git just applied say whether it was written:
+            // check the files that were. On refusal the caller removes the
+            // worktree.
+            let listed = sanitized
+                .command(worktree)
+                .args(["ls-files", "-t", "-z"])
+                .env("GIT_INDEX_FILE", &index)
+                .stdin(Stdio::null())
+                .output()
+                .context("Start Git")?;
+            ensure!(
+                listed.status.success(),
+                "git ls-files: {}",
+                String::from_utf8_lossy(&listed.stderr).trim()
+            );
+            // Entries are `<tag> <path>`; `S` is skip-worktree.
+            let mut written = Vec::new();
+            for entry in listed.stdout.split(|&b| b == 0) {
+                if entry.len() > 2 && entry[0] != b'S' {
+                    written.extend_from_slice(&entry[2..]);
+                    written.push(0);
+                }
+            }
+            refuse_suppressed_smudge_filters_in(&sanitized, commit, Some(&written))?;
+        }
     } else {
+        unfiltered?;
         run(&["read-tree", commit])?;
         run(&["checkout-index", "-a", "-f"])?;
     }
@@ -2543,6 +2615,69 @@ mod tests {
         crate::fanout::add_worktree(&wt, &candidate, "HEAD").unwrap();
         assert!(candidate.join("kept/file.txt").is_file());
         assert_eq!(candidate.join("left-out").exists(), !copied);
+        if !copied {
+            return;
+        }
+
+        // A disabled smudge filter on a file the sparse rules leave out does
+        // not block the worktree; one on a written file does.
+        git(workspace, None, &["config", "filter.local.smudge", "cat"]).unwrap();
+        let commit_attributes = |rule: &str| {
+            fs::write(workspace.join(".gitattributes"), rule).unwrap();
+            git(workspace, None, &["add", ".gitattributes"]).unwrap();
+            git(
+                workspace,
+                None,
+                &["-c", "commit.gpgsign=false", "commit", "-qm", "Attributes"],
+            )
+            .unwrap();
+        };
+        commit_attributes("left-out/** filter=local\n");
+        let wt = crate::storage::create_worktree(workspace, "sparse-excluded", true).unwrap();
+        assert!(wt.join("kept/file.txt").is_file());
+        assert!(!wt.join("left-out").exists());
+        commit_attributes("kept/** filter=local\n");
+        let err = crate::storage::create_worktree(workspace, "sparse-included", true).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("kept/file.txt uses repo-local Git smudge filter"),
+            "{err:#}"
+        );
+        assert!(
+            !workspace
+                .join(".model-router/worktrees/sparse-included")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn a_repo_local_merge_default_counts_only_when_it_changes_the_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let changed = |raw: &[u8]| {
+            parse_and_build_sanitized_config(dir.path(), &dir.path().join(".git"), raw)
+                .unwrap()
+                .changed_merge_default
+        };
+        // The repo's `text` replaces a different global default.
+        assert_eq!(
+            changed(b"global\0merge.default\nunion\0local\0merge.default\ntext\0"),
+            Some(b"text".to_vec())
+        );
+        assert_eq!(
+            changed(b"local\0merge.default\nunion\0"),
+            Some(b"union".to_vec())
+        );
+        // The same driver either way.
+        assert_eq!(changed(b"local\0merge.default\ntext\0"), None);
+        assert_eq!(
+            changed(b"global\0merge.default\nunion\0local\0merge.default\nunion\0"),
+            None
+        );
+        assert_eq!(changed(b"global\0merge.default\nunion\0"), None);
+        // A global default whose command the repository redefines.
+        assert_eq!(
+            changed(b"global\0merge.default\nmine\0local\0merge.mine.driver\ntrue\0"),
+            Some(b"mine".to_vec())
+        );
     }
 
     #[test]
@@ -2598,6 +2733,26 @@ mod tests {
         crate::fanout::remove_worktrees(workspace, candidate.parent().unwrap()).unwrap();
         let listed = git(workspace, None, &["worktree", "list", "--porcelain"]).unwrap();
         assert!(!String::from_utf8_lossy(&listed).contains("/c1\n"));
+        // Nor does it remove the record of another repository's worktree
+        // found under the run's directory.
+        let Some(foreign_repo) = repository() else {
+            return;
+        };
+        let foreign = workspace.join(".model-router/candidates/run2/foreign");
+        git(
+            foreign_repo.path(),
+            None,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                foreign.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        crate::fanout::remove_worktrees(workspace, foreign.parent().unwrap()).unwrap();
+        assert!(foreign_repo.path().join(".git/worktrees/foreign").is_dir());
         // The other worktree works again once its directory is back.
         fs::rename(&away, &other).unwrap();
         assert!(

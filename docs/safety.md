@@ -140,12 +140,15 @@ worktrees are checked for disabled smudge filters from the new worktree's own
 config, and a fan-out patch apply is refused when a patched file uses one. A
 three-way apply and its preview are refused when a patched file's `merge`
 attribute names a repo-local `merge.<name>.driver`, or the file has no `merge`
-attribute and a repo-local `merge.default` is set; the driver never runs. A
+attribute and a repo-local `merge.default` picks another driver than the
+sanitized config does; the driver never runs. A
 new worktree keeps the sparse-checkout settings and rules `git worktree add`
-copied to it (Git 2.36 or later): files outside them are not written. When
+copied to it (Git 2.36 or later): files outside them are not written, and
+only written files are checked for disabled smudge filters. When
 filling a new worktree fails, or a run's candidate and delegate worktrees are
-removed, the router removes those worktrees and their own records; it never
-runs `git worktree prune`. `history clean --worktrees` runs
+removed, the router removes those worktrees and their own records in the
+project's repository (never another repository's); it never runs
+`git worktree prune`. `history clean --worktrees` runs
 `git worktree remove` with every repo-local clean and process filter turned
 off (`-c filter.<name>.clean= -c filter.<name>.process=`), so a file that
 needs one keeps the worktree. That `GIT_DIR` lives in a `tmp` directory inside the router's

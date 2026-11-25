@@ -443,9 +443,11 @@ pub fn git_readonly(project: &Path, args: &[&str]) -> Result<String> {
 }
 
 /// Git's record of linked worktree `tree` (`<common dir>/worktrees/<id>`),
-/// when `tree` is the path Git registered for it: a copy of a worktree that
-/// was moved still points at the moved one's record.
-pub(crate) fn worktree_record(tree: &Path) -> Result<PathBuf> {
+/// when `project`'s repository holds it and `tree` is the path Git
+/// registered for it: a worktree of another repository is not `project`'s
+/// to remove, and a copy of a worktree that was moved still points at the
+/// moved one's record.
+pub(crate) fn worktree_record(project: &Path, tree: &Path) -> Result<PathBuf> {
     let record = PathBuf::from(git(tree, &["rev-parse", "--absolute-git-dir"])?);
     ensure!(
         record
@@ -454,6 +456,15 @@ pub(crate) fn worktree_record(tree: &Path) -> Result<PathBuf> {
             .is_some_and(|name| name == "worktrees"),
         "not a linked Git worktree"
     );
+    let common = project.join(git(project, &["rev-parse", "--git-common-dir"])?);
+    let owned = match (
+        record.parent().and_then(Path::parent).map(fs::canonicalize),
+        fs::canonicalize(&common),
+    ) {
+        (Some(Ok(owner)), Ok(common)) => owner == common,
+        _ => false,
+    };
+    ensure!(owned, "a worktree of another repository");
     let registered =
         fs::read_to_string(record.join("gitdir")).context("Read the worktree's Git record")?;
     // Absolute, or relative to the record (`extensions.relativeWorktrees`).
@@ -473,12 +484,19 @@ pub(crate) fn worktree_record(tree: &Path) -> Result<PathBuf> {
 /// its own record, by force. Never `git worktree prune`, which also drops
 /// the records of other worktrees whose directories are missing for now.
 pub(crate) fn discard_worktree(project: &Path, tree: &Path) {
-    let record = worktree_record(tree).ok();
+    let record = worktree_record(project, tree).ok();
     if let Some(path) = tree.to_str() {
         let _ = git(project, &["worktree", "remove", "--force", path]);
     }
     let _ = fs::remove_dir_all(tree);
     if let Some(record) = record {
+        remove_worktree_record(tree, &record);
+    }
+}
+
+/// Removes `record` (from `worktree_record`) once worktree `tree` is gone.
+pub(crate) fn remove_worktree_record(tree: &Path, record: &Path) {
+    if fs::symlink_metadata(tree).is_err() {
         let _ = fs::remove_dir_all(record);
     }
 }

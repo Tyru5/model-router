@@ -128,19 +128,22 @@ pub fn remove_worktrees(project: &Path, dir: &Path) -> Result<()> {
     }
     let mut trees = vec![];
     collect(dir, &mut trees);
-    // Each tree's own record, removed below if Git left it: never
-    // `git worktree prune`, which also drops the records of other worktrees
-    // whose directories are missing for now.
+    // Each tree's own record in this project's repository, removed below if
+    // Git left it: never `git worktree prune`, which also drops the records
+    // of other worktrees whose directories are missing for now. A worktree
+    // of another repository keeps its record there.
     let mut records = vec![];
     for tree in trees {
-        records.extend(storage::worktree_record(&tree).ok());
+        if let Ok(record) = storage::worktree_record(project, &tree) {
+            records.push((tree.clone(), record));
+        }
         if let Some(path) = tree.to_str() {
             let _ = git_raw(project, &["worktree", "remove", "--force", path]);
         }
     }
     fs::remove_dir_all(dir).with_context(|| format!("Remove {}", dir.display()))?;
-    for record in records {
-        let _ = fs::remove_dir_all(record);
+    for (tree, record) in records {
+        storage::remove_worktree_record(&tree, &record);
     }
     Ok(())
 }
@@ -246,8 +249,19 @@ pub fn apply(
     let sanitized = snapshot::SanitizedGitDir::new(&top).map_err(refused)?;
     let paths = patch_paths(&sanitized, &top, files, patch).map_err(refused)?;
     refuse_unfiltered_apply(&sanitized, &top, index, &paths, patch, scratch).map_err(refused)?;
-    // Plain apply checks the whole patch before writing any file.
-    if git_in(&sanitized, &top, None, &["apply", "--binary", patch]).is_ok() {
+    // A read-only check picks the plain apply or the three-way one, so a
+    // refusal below always precedes the first write.
+    if git_in(
+        &sanitized,
+        &top,
+        None,
+        &["apply", "--check", "--binary", patch],
+    )
+    .is_ok()
+    {
+        // Not a `Refused`: a failed write may have left part of the patch.
+        git_in(&sanitized, &top, None, &["apply", "--binary", patch])
+            .context("git apply failed after its check passed")?;
         return Ok(Applied::Clean);
     }
     refuse_local_merge_driver(&sanitized, &top, index, &paths).map_err(refused)?;
@@ -310,7 +324,7 @@ fn refuse_local_merge_driver(
         snapshot::find_local_merge_driver_path(sanitized, top, paths, Some(index))?
     {
         anyhow::bail!(
-            "Refusing a three-way apply: {path} uses repo-local Git merge driver `{driver}`, which is disabled for safety, and the built-in merge could give a different result. Configure the driver globally or apply the patch by hand"
+            "Refusing a three-way apply: the repository's Git config gives {path} merge driver `{driver}` through a repo-local `merge.<name>.driver` or `merge.default`, which the router leaves out for safety, so its merge could give a different result. Configure it globally or apply the patch by hand"
         );
     }
     Ok(())
@@ -326,7 +340,7 @@ fn patch_paths(
 ) -> Result<Vec<u8>> {
     if sanitized.local_smudge_filters().is_empty()
         && sanitized.local_merge_drivers().is_empty()
-        && sanitized.local_merge_default().is_none()
+        && sanitized.changed_merge_default().is_none()
     {
         return Ok(Vec::new());
     }
@@ -862,5 +876,56 @@ mod tests {
             "ONE\ntwo\nTHREE\n"
         );
         assert!(!marker.exists(), "the repo-local merge driver ran");
+    }
+
+    #[test]
+    fn a_failed_write_is_not_a_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("sub")).unwrap();
+        git(&repo, None, &["init", "-q"]).unwrap();
+        // A repo-local merge driver, which a three-way apply would refuse.
+        git(&repo, None, &["config", "merge.custom.driver", "false"]).unwrap();
+        fs::write(repo.join(".gitattributes"), "* merge=custom\n").unwrap();
+        let index = dir.path().join("index");
+        let tree = || {
+            git(&repo, Some(&index), &["add", "-A"]).unwrap();
+            git(&repo, Some(&index), &["write-tree"]).unwrap()
+        };
+        fs::write(repo.join("sub/b"), "one\n").unwrap();
+        let from = tree();
+        fs::write(repo.join("sub/b"), "two\n").unwrap();
+        let to = tree();
+        let patch = dir.path().join("changes.diff");
+        write_patch(&repo, &from, &to, &patch).unwrap();
+        fs::write(repo.join("sub/b"), "one\n").unwrap();
+        let current = tree();
+        // The patch checks out, but Git cannot replace the file.
+        let read_only = |mode| {
+            fs::set_permissions(repo.join("sub"), fs::Permissions::from_mode(mode)).unwrap();
+        };
+        read_only(0o555);
+        if fs::write(repo.join("sub/probe"), "").is_ok() {
+            // Running as root: directory permissions do not apply.
+            read_only(0o755);
+            return;
+        }
+        let scratch = dir.path().join("scratch");
+        let result = apply(
+            &repo,
+            &index,
+            &current,
+            &["sub/b".to_owned()],
+            &patch,
+            &scratch,
+        );
+        read_only(0o755);
+        let err = result.unwrap_err();
+        assert!(err.downcast_ref::<Refused>().is_none(), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("after its check passed"),
+            "{err:#}"
+        );
     }
 }
