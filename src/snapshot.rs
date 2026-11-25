@@ -128,7 +128,7 @@ impl SanitizedGitDir {
         let common_dir = resolve(common_dir_raw)?;
         let top_level = resolve(top_raw)?;
 
-        let inspected = inspect_repo_config(dir)?;
+        let inspected = inspect_repo_config(dir, &common_dir)?;
         let shadow = tempfile::Builder::new()
             .prefix("model-router-git-")
             .tempdir()
@@ -140,7 +140,7 @@ impl SanitizedGitDir {
         fs::write(shadow.path().join("HEAD"), head).context("Write shadow HEAD")?;
         link_entry(&common_dir.join("objects"), &shadow.path().join("objects"))
             .context("Link repository objects")?;
-        for name in ["refs", "packed-refs", "reftable", "info", "shallow"] {
+        for name in ["refs", "packed-refs", "reftable", "info", "shallow", "lfs"] {
             let src = common_dir.join(name);
             if fs::symlink_metadata(&src).is_ok() {
                 link_entry(&src, &shadow.path().join(name))
@@ -226,7 +226,7 @@ struct ConfigEntry {
     value: Option<Vec<u8>>,
 }
 
-fn inspect_repo_config(dir: &Path) -> Result<InspectedRepoConfig> {
+fn inspect_repo_config(dir: &Path, common_dir: &Path) -> Result<InspectedRepoConfig> {
     // `--list -z` preserves exact raw key and value bytes without locale regex
     // quirks, including non-UTF-8 subsection names and names containing `=`.
     let output = git_command()
@@ -241,19 +241,26 @@ fn inspect_repo_config(dir: &Path) -> Result<InspectedRepoConfig> {
         dir.display(),
         String::from_utf8_lossy(&output.stderr).trim()
     );
-    parse_and_build_sanitized_config(dir, &output.stdout)
+    parse_and_build_sanitized_config(dir, common_dir, &output.stdout)
 }
 
-fn parse_and_build_sanitized_config(dir: &Path, raw: &[u8]) -> Result<InspectedRepoConfig> {
+fn parse_and_build_sanitized_config(
+    dir: &Path,
+    common_dir: &Path,
+    raw: &[u8],
+) -> Result<InspectedRepoConfig> {
     let mut repo_format_version: u32 = 0;
     let mut core_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut extensions: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut unsupported_extensions: Vec<String> = Vec::new();
+    let mut partial_clone = false;
     // Trusted system/global driver entries resolved against the real checkout
     // (preserving `includeIf.gitdir` rules that would no longer match the
     // temporary shadow `GIT_DIR`).
     let mut trusted_driver_entries: Vec<ConfigEntry> = Vec::new();
-    let mut trusted_filter_drivers: Vec<Vec<u8>> = Vec::new();
+    let mut trusted_lfs_storage: Option<Vec<u8>> = None;
+    let mut local_lfs_storage = false;
+    let mut trusted_filter_required: Vec<Vec<u8>> = Vec::new();
     // Exact raw `filter.<driver>.required` values from local/worktree scope,
     // written verbatim so Git itself parses numeric/boolean forms (e.g. `2`).
     let mut local_filter_required: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
@@ -294,21 +301,24 @@ fn parse_and_build_sanitized_config(dir: &Path, raw: &[u8]) -> Result<InspectedR
         }
 
         if is_trusted_scope {
+            if section.eq_ignore_ascii_case(b"lfs") && rest.eq_ignore_ascii_case(b"storage") {
+                if let Some(v) = val {
+                    if !v.is_empty() {
+                        trusted_lfs_storage = Some(v.to_vec());
+                    }
+                }
+                continue;
+            }
             if is_driver_section(section) {
                 let (subsection, var) = match split_last(rest, b'.') {
                     Some((sub, var)) => (Some(sub.to_vec()), var.to_vec()),
                     None => (None, rest.to_vec()),
                 };
-                if section.eq_ignore_ascii_case(b"filter") {
+                if section.eq_ignore_ascii_case(b"filter") && var.eq_ignore_ascii_case(b"required")
+                {
                     if let Some(sub) = subsection.as_ref() {
-                        if !sub.is_empty()
-                            && (var.eq_ignore_ascii_case(b"clean")
-                                || var.eq_ignore_ascii_case(b"smudge")
-                                || var.eq_ignore_ascii_case(b"process"))
-                            && val.is_some_and(|v| !v.is_empty())
-                            && !trusted_filter_drivers.iter().any(|d| d == sub)
-                        {
-                            trusted_filter_drivers.push(sub.clone());
+                        if !sub.is_empty() && !trusted_filter_required.iter().any(|d| d == sub) {
+                            trusted_filter_required.push(sub.clone());
                         }
                     }
                 }
@@ -330,6 +340,10 @@ fn parse_and_build_sanitized_config(dir: &Path, raw: &[u8]) -> Result<InspectedR
             ) {
                 continue;
             }
+            if lower.as_slice() == b"partialclone" {
+                partial_clone = true;
+                continue;
+            }
             if matches!(lower.as_slice(), b"objectformat" | b"refstorage") {
                 if let Some(value) = val {
                     if !value.contains(&b'\n') && !value.contains(&b'\r') && !value.contains(&0) {
@@ -340,6 +354,16 @@ fn parse_and_build_sanitized_config(dir: &Path, raw: &[u8]) -> Result<InspectedR
                 let name = String::from_utf8_lossy(&lower).into_owned();
                 if !unsupported_extensions.contains(&name) {
                     unsupported_extensions.push(name);
+                }
+            }
+        } else if section.eq_ignore_ascii_case(b"lfs") && rest.eq_ignore_ascii_case(b"storage") {
+            if val.is_some_and(|v| !v.is_empty()) {
+                local_lfs_storage = true;
+            }
+        } else if section.eq_ignore_ascii_case(b"remote") {
+            if let Some((_, var)) = split_last(rest, b'.') {
+                if var.eq_ignore_ascii_case(b"promisor") && !is_git_explicit_false(val) {
+                    partial_clone = true;
                 }
             }
         } else if section.eq_ignore_ascii_case(b"filter") {
@@ -379,6 +403,16 @@ fn parse_and_build_sanitized_config(dir: &Path, raw: &[u8]) -> Result<InspectedR
     }
 
     ensure!(
+        !local_lfs_storage,
+        "Refusing Git operation in {}: repository-local `lfs.storage` is not supported by model-router's sanitized Git config; configure `lfs.storage` globally instead",
+        dir.display()
+    );
+    ensure!(
+        !partial_clone,
+        "Refusing Git operation in {}: partial-clone repositories (extensions.partialClone / remote.*.promisor) are not supported by model-router's sanitized Git config; hydrate the clone first (for example with `git fetch --refetch`) or use a full clone",
+        dir.display()
+    );
+    ensure!(
         repo_format_version == 0 || unsupported_extensions.is_empty(),
         "Refusing Git operation in {}: unsupported repository format extension(s) ({})",
         dir.display(),
@@ -415,11 +449,33 @@ fn parse_and_build_sanitized_config(dir: &Path, raw: &[u8]) -> Result<InspectedR
             sanitized_config.extend_from_slice(b"\"\n");
         }
     }
+    // Keep Git LFS pointed at the real repository's `<common_dir>/lfs` (or the
+    // user's trusted global `lfs.storage`), never the temporary shadow GIT_DIR
+    // whose directory is deleted when this operation finishes.
+    let lfs_storage = match trusted_lfs_storage {
+        Some(path) => path,
+        None => path_to_bytes(&common_dir.join("lfs"))?,
+    };
+    write_config_entry(
+        &mut sanitized_config,
+        &ConfigEntry {
+            section: b"lfs".to_vec(),
+            subsection: None,
+            var: b"storage".to_vec(),
+            value: Some(lfs_storage),
+        },
+    )?;
     for entry in &trusted_driver_entries {
         write_config_entry(&mut sanitized_config, entry)?;
     }
     for (driver, value) in &local_filter_required {
-        if trusted_filter_drivers.iter().any(|d| d == driver) {
+        // Never allow a repository-local `required = false` to downgrade a
+        // trusted system/global `filter.<driver>.required`, while preserving
+        // every other local `required` setting verbatim (including when global
+        // defines only a smudge command or sets `required = false`).
+        if trusted_filter_required.iter().any(|d| d == driver)
+            && is_git_explicit_false(value.as_deref())
+        {
             continue;
         }
         write_config_entry(
@@ -438,6 +494,43 @@ fn parse_and_build_sanitized_config(dir: &Path, raw: &[u8]) -> Result<InspectedR
         local_clean_filters,
         local_smudge_filters,
     })
+}
+
+fn is_git_explicit_false(val: Option<&[u8]>) -> bool {
+    let Some(raw) = val else {
+        return false;
+    };
+    let start = raw
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(raw.len());
+    let end = raw
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(start, |i| i + 1);
+    let lower = raw[start..end].to_ascii_lowercase();
+    matches!(lower.as_slice(), b"" | b"false" | b"no" | b"off" | b"0")
+}
+
+#[cfg(unix)]
+fn path_to_bytes(path: &Path) -> Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    ensure!(
+        !bytes.contains(&0) && !bytes.contains(&b'\r'),
+        "Git path contains invalid control bytes"
+    );
+    Ok(bytes.to_vec())
+}
+
+#[cfg(not(unix))]
+fn path_to_bytes(path: &Path) -> Result<Vec<u8>> {
+    let text = path.to_str().context("Git path is not valid UTF-8")?;
+    ensure!(
+        !text.contains('\0') && !text.contains('\r'),
+        "Git path contains invalid control bytes"
+    );
+    Ok(text.as_bytes().to_vec())
 }
 
 fn is_driver_section(section: &[u8]) -> bool {
@@ -820,23 +913,12 @@ fn git_sanitized(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<
     Ok(output.stdout)
 }
 
-/// Verifies that `dir`'s Git binary supports config-scope inspection
-/// (`--show-scope`, Git 2.26+) so ordinary runs surface a version error before
-/// launch instead of silently losing snapshots and diffs.
+/// Verifies that `dir`'s Git binary and repository layout are supported by
+/// `SanitizedGitDir` (Git 2.26+ `--show-scope`, no partial-clone promisor
+/// remotes, no unsupported format extensions) so runs fail before launch
+/// instead of silently losing snapshots and diffs.
 pub fn ensure_supported_git(dir: &Path) -> Result<()> {
-    let output = git_command()
-        .args(["config", "--show-scope", "--name-only", "-z", "--list"])
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .output()
-        .context("Start Git")?;
-    ensure!(
-        output.status.success(),
-        "Could not inspect Git config scopes in {} (requires Git 2.26+): {}",
-        dir.display(),
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(())
+    SanitizedGitDir::new(dir).map(|_| ())
 }
 
 /// Repository detection independent of config-scope inspection, so older Git
@@ -1971,20 +2053,63 @@ mod tests {
         );
 
         // Verify the sanitized config written from that scope output works when
-        // GIT_DIR points outside the includeIf path.
+        // GIT_DIR points outside the includeIf path, keeps `lfs.storage`
+        // pointed at the real repository's `.git/lfs`, preserves local
+        // `required` even when global defines a smudge command under the same
+        // driver name, and rejects partial-clone repos clearly.
         let prev = std::env::var_os("GIT_CONFIG_GLOBAL");
-        let parsed = parse_and_build_sanitized_config(&repo_canon, &out.stdout).unwrap();
+        let common_dir = repo_canon.join(".git");
+        let parsed =
+            parse_and_build_sanitized_config(&repo_canon, &common_dir, &out.stdout).unwrap();
         let shadow_dir = tempfile::tempdir().unwrap();
         fs::write(shadow_dir.path().join("config"), &parsed.sanitized_config).unwrap();
-        let mut cmd = git_command();
-        cmd.args(["config", "--file"])
-            .arg(shadow_dir.path().join("config"))
-            .args(["--get", "filter.myglobal.clean"]);
-        if let Some(p) = prev {
-            cmd.env("GIT_CONFIG_GLOBAL", p);
+        let read_shadow = |key: &str| {
+            let mut cmd = git_command();
+            cmd.args(["config", "--file"])
+                .arg(shadow_dir.path().join("config"))
+                .args(["--get", key]);
+            if let Some(p) = &prev {
+                cmd.env("GIT_CONFIG_GLOBAL", p);
+            }
+            let val = cmd.output().unwrap();
+            assert!(val.status.success(), "missing {key}");
+            String::from_utf8_lossy(&val.stdout).trim().to_owned()
+        };
+        assert_eq!(read_shadow("filter.myglobal.clean"), "tr a-z A-Z");
+        assert_eq!(
+            PathBuf::from(read_shadow("lfs.storage")),
+            common_dir.join("lfs")
+        );
+
+        // Global smudge + local clean + local required must keep `required`.
+        let mixed_raw = b"global\0filter.mix.smudge\ncat\0local\0filter.mix.clean\ncat\0local\0filter.mix.required\n2\0";
+        let mixed = parse_and_build_sanitized_config(&repo_canon, &common_dir, mixed_raw).unwrap();
+        fs::write(
+            shadow_dir.path().join("mixed.config"),
+            &mixed.sanitized_config,
+        )
+        .unwrap();
+        let mixed_req = git_command()
+            .args(["config", "--file"])
+            .arg(shadow_dir.path().join("mixed.config"))
+            .args(["--bool", "--get", "filter.mix.required"])
+            .output()
+            .unwrap();
+        assert!(mixed_req.status.success());
+        assert_eq!(String::from_utf8_lossy(&mixed_req.stdout).trim(), "true");
+
+        // Partial clones (extensions.partialClone or remote.*.promisor) fail closed.
+        for partial_raw in [
+            &b"local\0core.repositoryformatversion\n1\0local\0extensions.partialclone\norigin\0"[..],
+            &b"local\0remote.origin.promisor\ntrue\0"[..],
+        ] {
+            let err = parse_and_build_sanitized_config(&repo_canon, &common_dir, partial_raw)
+                .err()
+                .expect("partial clone must fail closed");
+            assert!(
+                format!("{err:#}").contains("partial-clone"),
+                "unexpected error: {err:#}"
+            );
         }
-        let val = cmd.output().unwrap();
-        assert!(val.status.success());
-        assert_eq!(String::from_utf8_lossy(&val.stdout).trim(), "tr a-z A-Z");
     }
 }
