@@ -125,7 +125,15 @@ each stage, and Git runs commands its config and hooks name (fsmonitor,
 filters, diff drivers). A stage refuses to start when a Git config file the
 router reads, or the target of an `include.path` or `includeIf.*.path`,
 lies in a path the stage may write. The router's own Git commands also pass
-`-c core.fsmonitor=false -c core.hooksPath=/dev/null`.
+`-c core.fsmonitor=false -c core.hooksPath=/dev/null`. Operations that inspect
+working-tree attributes, stage files, diff, apply patches, populate worktrees,
+or launch `git difftool` run against a fixed, private sanitized `GIT_DIR`
+config (requiring Git 2.26+) that excludes repo-local filters, diff/merge
+drivers, and difftools so concurrent `.git/config` changes cannot inject
+commands; worktree creation and shipping fail closed when affected files rely
+on suppressed repo-local filters, and workflows with `protected_paths` or
+blocking `policies` fail before launch when the pre-stage snapshot cannot be
+captured.
 
 A stage cannot reach a terminal host (see below), whose harness runs outside
 the sandbox, through the usual socket directories: `$XDG_RUNTIME_DIR/model-router`,

@@ -160,9 +160,9 @@ exited ([tui](tui.md#interactive-sessions)).
 `model-router doctor [--json] [--strict]` checks each harness's executable,
 version, and the flags the router passes, using only `--version` and
 `--help`. It reports the sandbox backend, and whether `git` and `gh` are on
-the path with their versions (`git` serves worktrees, snapshots, diffs, and
-ship; `gh` serves GitHub task imports and `ship --draft-pr`). It cannot check
-logins.
+the path with their versions (`git` 2.26+ serves worktrees, snapshots, diffs,
+and ship; `gh` serves GitHub task imports and `ship --draft-pr`). It cannot
+check logins.
 `--strict` fails when an installed harness lacks a flag. The Harnesses page
 (`3`) runs the same checks; the stage details then warn about missing flags.
 A version counts as `tested` when a captured parser fixture covers it, or

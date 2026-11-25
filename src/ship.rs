@@ -318,7 +318,7 @@ fn exec_with(
     // Git also gets the router's hook and fsmonitor overrides: a stage may
     // have written the hooks directory `core.hooksPath` names.
     let mut command = if program == "git" {
-        crate::snapshot::git_command_in(dir)?
+        crate::snapshot::git_command()
     } else {
         Command::new(program)
     };
@@ -914,15 +914,78 @@ impl Drop for PrivateIndex {
     }
 }
 
-/// Stages exactly `files`, as they are in the working tree now, on top of
-/// `head` in the private index at `index` (replaced if present), and returns
-/// the tree. The user's own index is not read or written.
+fn exec_sanitized_git(
+    sanitized: &snapshot::SanitizedGitDir,
+    args: &[&str],
+    dir: &Path,
+    index: &Path,
+    stdin: Option<&[u8]>,
+) -> Result<String> {
+    let mut command = sanitized.command(dir);
+    command
+        .args(args)
+        .env("GIT_INDEX_FILE", index)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().context("Start git")?;
+    let output = std::thread::scope(|scope| -> Result<std::process::Output> {
+        let writer = stdin.zip(child.stdin.take()).map(|(input, mut pipe)| {
+            scope.spawn(move || -> std::io::Result<()> {
+                match pipe.write_all(input) {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                    Err(err) => Err(err),
+                }
+            })
+        });
+        let output = child.wait_with_output()?;
+        if let Some(handle) = writer {
+            if let Ok(Err(err)) = handle.join() {
+                if output.status.success() {
+                    return Err(err.into());
+                }
+            }
+        }
+        Ok(output)
+    })?;
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    ensure!(
+        output.status.success(),
+        "git {} failed ({}): {}",
+        args.first().copied().unwrap_or_default(),
+        output
+            .status
+            .code()
+            .map_or("signal".into(), |c| format!("exit {c}")),
+        if stderr.is_empty() {
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        } else {
+            stderr
+        }
+    );
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_owned())
+}
+
 /// Refuses to stage paths whose `.gitattributes` `filter` (in the working tree
 /// or the private staging `index`) names a repo-local or worktree-local
-/// clean/process filter that `git_command_in` disables, so `ship` never commits
+/// clean/process filter that `SanitizedGitDir` omits, so `ship` never commits
 /// raw unfiltered bytes (such as an uncleaned Git LFS object).
-fn refuse_suppressed_clean_filters(work: &Path, files: &[FileChange], index: &Path) -> Result<()> {
-    let drivers = snapshot::repo_local_clean_filters(work)?;
+fn refuse_suppressed_clean_filters(
+    sanitized: &snapshot::SanitizedGitDir,
+    work: &Path,
+    files: &[FileChange],
+    index: &Path,
+) -> Result<()> {
+    let drivers = sanitized.local_clean_filters();
     if drivers.is_empty() {
         return Ok(());
     }
@@ -938,7 +1001,7 @@ fn refuse_suppressed_clean_filters(work: &Path, files: &[FileChange], index: &Pa
     }
     let stdin_slice = stdin_paths.as_slice();
     for cached in [false, true] {
-        let mut cmd = snapshot::git_command_in(work)?;
+        let mut cmd = sanitized.command(work);
         cmd.arg("check-attr");
         if cached {
             cmd.arg("--cached");
@@ -997,17 +1060,17 @@ fn refuse_suppressed_clean_filters(work: &Path, files: &[FileChange], index: &Pa
 
 fn stage_planned(work: &Path, head: &str, files: &[FileChange], index: &Path) -> Result<String> {
     let _ = fs::remove_file(index);
-    let private = [("GIT_INDEX_FILE", index)];
-    exec("git", &["read-tree", head], work, &private)?;
-    refuse_suppressed_clean_filters(work, files, index)?;
-    exec_with(
-        "git",
+    let sanitized = snapshot::SanitizedGitDir::new(work)?;
+    exec_sanitized_git(&sanitized, &["read-tree", head], work, index, None)?;
+    refuse_suppressed_clean_filters(&sanitized, work, files, index)?;
+    exec_sanitized_git(
+        &sanitized,
         &["update-index", "--add", "--remove", "-z", "--stdin"],
         work,
-        &private,
+        index,
         Some(&path_list(files)),
     )?;
-    exec("git", &["write-tree"], work, &private)
+    exec_sanitized_git(&sanitized, &["write-tree"], work, index, None)
 }
 
 /// What a ship would commit: `tree` on top of `head`, staged in `index`.

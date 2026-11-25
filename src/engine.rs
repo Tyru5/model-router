@@ -1417,7 +1417,9 @@ mod tests {
             )]),
             ..Settings::default()
         };
-        let mut run = Run::create(
+        // Outside Git, prepare refuses before launching a stage when
+        // protected_paths require a pre-stage snapshot.
+        let mut non_git_run = Run::create(
             dir.path(),
             &settings,
             &settings.workflows[0],
@@ -1425,7 +1427,58 @@ mod tests {
             false,
         )
         .unwrap();
+        let err = prepare(&mut non_git_run)
+            .err()
+            .expect("prepare should refuse outside Git when protected_paths is set");
+        assert!(format!("{err:#}").contains("protected_paths"), "{err:#}");
+        assert!(non_git_run.stages[0].attempts.is_empty());
+
+        // Inside a Git repo where snapshot capture fails (e.g. required local
+        // clean filter disabled), prepare refuses before launch and surfaces
+        // the underlying Git error.
+        let repo = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "{args:?}");
+        };
+        run_git(&["init", "-q"]);
+        fs::write(repo.path().join(".gitattributes"), "*.req filter=req\n").unwrap();
+        fs::write(repo.path().join("data.req"), "payload\n").unwrap();
+        run_git(&["config", "--local", "filter.req.clean", "cat"]);
+        run_git(&["config", "--local", "filter.req.required", "true"]);
+        let mut req_run = Run::create(
+            repo.path(),
+            &settings,
+            &settings.workflows[0],
+            "Task".into(),
+            false,
+        )
+        .unwrap();
+        let req_err = prepare(&mut req_run)
+            .err()
+            .expect("prepare should refuse when pre-stage Git snapshot fails");
+        let req_msg = format!("{req_err:#}");
+        assert!(req_msg.contains("protected_paths"), "{req_msg}");
+        assert!(req_msg.contains("git add -A"), "{req_msg}");
+        assert!(req_run.stages[0].attempts.is_empty());
+
+        // Defense in depth: finish also blocks if an existing attempt somehow
+        // lacks tree_before.
+        run_git(&["config", "--local", "--unset", "filter.req.required"]);
+        let mut run = Run::create(
+            repo.path(),
+            &settings,
+            &settings.workflows[0],
+            "Task".into(),
+            false,
+        )
+        .unwrap();
         let prepared = prepare(&mut run).unwrap();
+        run.stages[0].attempts[0].tree_before = None;
         fs::write(prepared.directory.join("stdout.log"), "ok").unwrap();
         fs::write(
             &prepared.handoff_file,

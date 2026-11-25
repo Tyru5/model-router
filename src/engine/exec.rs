@@ -93,6 +93,29 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
     if let (Some(plan), Some(mcp)) = (sandbox.as_mut(), &mcp) {
         plan.allow_orch(&mcp.sock, &mcp.token_file, &mcp.program);
     }
+    let check_protected = !run.workflow.protected_paths.is_empty();
+    let check_policies = crate::policy::has_block_policies(&run.workflow.policies);
+    let tree_before = if check_protected || check_policies {
+        let what = match (check_protected, check_policies) {
+            (true, true) => "workflow protected_paths and policies",
+            (true, false) => "workflow protected_paths",
+            (false, true) => "workflow policies",
+            (false, false) => unreachable!(),
+        };
+        let tree = snapshot::try_tree(&run.workspace, &run.directory).with_context(|| {
+            format!(
+                "Cannot start stage: failed to capture pre-stage Git snapshot required by {what}"
+            )
+        })?;
+        ensure!(
+            tree.is_some(),
+            "Cannot start stage: {what} require a pre-stage Git snapshot, but {} is not a Git repository",
+            run.workspace.display()
+        );
+        tree
+    } else {
+        snapshot::tree(&run.workspace, &run.directory)
+    };
     let harness_version = adapters::detected_version(&stage.harness, &invocation.program);
     storage::write_json_fast(
         &directory.join("command.json"),
@@ -110,7 +133,7 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
         handoff_file: handoff_file.clone(),
         error: None,
         checks: vec![],
-        tree_before: snapshot::tree(&run.workspace, &run.directory),
+        tree_before,
         tree_after: None,
         checks_tree: None,
         usage: None,

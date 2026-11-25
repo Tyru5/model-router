@@ -1311,7 +1311,8 @@ impl Run {
         if state.candidates.iter().any(|c| !c.attempts.is_empty()) {
             return Ok(());
         }
-        let base = snapshot::tree(&self.workspace, &self.directory)
+        let base = snapshot::try_tree(&self.workspace, &self.directory)
+            .context("Snapshot the workspace after before_stage hooks")?
             .context("Snapshot the workspace after before_stage hooks")?;
         if base == state.base {
             return Ok(());
@@ -1336,7 +1337,8 @@ impl Run {
             .join(format!("attempt-{number:03}"));
         fs::create_dir_all(&directory)?;
         if self.stages[index].fan_out.is_none() {
-            let base = snapshot::tree(&self.workspace, &self.directory)
+            let base = snapshot::try_tree(&self.workspace, &self.directory)
+                .context("Fan-out needs a Git snapshot of the workspace")?
                 .context("Fan-out needs a Git snapshot of the workspace")?;
             let reference = snapshot::base_ref(&self.id, &format!("{}-{number:03}", stage.id));
             let base_commit = fanout::base_commit(&self.workspace, &base, &reference)?;

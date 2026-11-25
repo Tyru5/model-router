@@ -19,12 +19,13 @@ fn error(code: &'static str, message: impl Into<String>) -> ToolError {
 /// the snapshot index. None when it cannot tell (no Git 2.32 `--cached`
 /// three-way merge, or a conflict).
 fn predict(workspace: &Path, index: &Path, patch: &Path, scratch: &Path) -> Option<String> {
-    let top = snapshot::top_level(workspace).ok()?;
+    let sanitized = snapshot::SanitizedGitDir::new(workspace).ok()?;
+    let top = sanitized.top_level().to_path_buf();
     let predict = std::path::absolute(scratch.join("predict.index")).ok()?;
     fs::copy(index, &predict).ok()?;
     let run = |args: &[&str]| {
-        snapshot::git_command_in(&top)
-            .ok()?
+        sanitized
+            .command(&top)
             .args(args)
             .env("GIT_INDEX_FILE", &predict)
             .stdin(std::process::Stdio::null())

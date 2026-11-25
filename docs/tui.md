@@ -414,8 +414,10 @@ existing manifest.
 
 One batch runs at a time per project; quitting or switching projects does not
 stop running tests, and their results are dropped. The footer shows `t` and
-`x` only when the project is a model-router checkout; elsewhere the keys
-explain what they need.
+`x` only when the project is a model-router checkout whose
+`scripts/capture_harness_output.py` is a regular file (not a symlink) matching
+the running binary's built-in copy byte for byte; elsewhere (including after
+switching branches to a different script) the keys explain what they need.
 
 ## Stats dialog
 

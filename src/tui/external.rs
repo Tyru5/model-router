@@ -16,8 +16,12 @@ use std::{
 pub(super) struct Launch {
     pub(super) argv: Vec<OsString>,
     pub(super) cwd: Option<PathBuf>,
+    pub(super) env: Vec<(OsString, OsString)>,
+    pub(super) env_remove: Vec<OsString>,
     /// Deleted once the program exits, e.g. the coloured diff a pager reads.
     pub(super) file: Option<tempfile::TempPath>,
+    /// Deleted once the program exits, e.g. a fixed sanitized shadow `GIT_DIR`.
+    pub(super) dir: Option<tempfile::TempDir>,
 }
 
 impl std::fmt::Debug for Launch {
@@ -39,10 +43,17 @@ impl Launch {
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
         }
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
+        for key in &self.env_remove {
+            command.env_remove(key);
+        }
         let status = command
             .status()
             .with_context(|| format!("Could not start {name}"))?;
         drop(self.file);
+        drop(self.dir);
         Ok(if status.success() {
             format!("Returned from {name}.")
         } else {
@@ -156,7 +167,10 @@ pub(super) fn edit(file: &Path, line: Option<usize>, cwd: &Path) -> Result<Launc
     Ok(Launch {
         argv: open_at(base, file, line),
         cwd: Some(cwd.into()),
+        env: vec![],
+        env_remove: vec![],
         file: None,
+        dir: None,
     })
 }
 
@@ -175,7 +189,10 @@ pub(super) fn page_text(text: &str) -> Result<Launch> {
     Ok(Launch {
         argv,
         cwd: None,
+        env: vec![],
+        env_remove: vec![],
         file: Some(path),
+        dir: None,
     })
 }
 
@@ -187,65 +204,106 @@ pub(super) fn page_file(path: &Path) -> Result<Launch> {
     Ok(Launch {
         argv,
         cwd: None,
+        env: vec![],
+        env_remove: vec![],
         file: None,
+        dir: None,
     })
 }
 
 /// `git difftool --dir-diff base after` in `dir`, when `diff.tool` is set
 /// outside the repository's own config. Repo-local difftool, mergetool, and
-/// filter entries can execute arbitrary commands and are refused.
+/// filter entries are refused, and `git difftool` runs against a fixed,
+/// sanitized shadow `GIT_DIR` so concurrent `.git/config` changes cannot
+/// inject drivers after this check.
 pub(super) fn difftool(dir: &Path, base: &str, after: &str) -> Result<Launch> {
     let local = crate::snapshot::git_command()
-        .args([
-            "config",
-            "--show-scope",
-            "--get-regexp",
-            r"^(diff\.(tool|guitool|external)|difftool\.|merge\.(tool|guitool)|mergetool\.|filter\.)",
-        ])
+        .args(["config", "--show-scope", "--name-only", "-z", "--list"])
         .current_dir(dir)
         .stdin(std::process::Stdio::null())
         .output()
         .context("Start Git")?;
-    // Git exits 0 when keys match and 1 when none match; any other exit
-    // (such as Git < 2.26 lacking --show-scope, or a config error) fails closed.
     ensure!(
-        matches!(local.status.code(), Some(0 | 1)),
-        "Could not verify Git difftool config scope ({})",
+        local.status.success(),
+        "Could not verify Git difftool config scope (requires Git 2.26+): {}",
         String::from_utf8_lossy(&local.stderr).trim()
     );
-    let local_text = String::from_utf8_lossy(&local.stdout);
-    let repo_keys = repo_local_difftool_keys(&local_text);
+    let repo_keys = repo_local_difftool_keys(&local.stdout);
     ensure!(
         repo_keys.is_empty(),
         "Refusing repo-local Git difftool/filter config ({}); configure diff.tool globally with `git config --global diff.tool <tool>`",
         repo_keys.join(", ")
     );
-    let output = crate::snapshot::git_command()
+    let sanitized = crate::snapshot::SanitizedGitDir::new(dir)?;
+    let output = sanitized
+        .command(dir)
         .args(["config", "--get", "diff.tool"])
-        .current_dir(dir)
         .stdin(std::process::Stdio::null())
         .output()
         .context("Start Git")?;
-    difftool_with(&String::from_utf8_lossy(&output.stdout), dir, base, after)
+    let mut launch = difftool_with(&String::from_utf8_lossy(&output.stdout), dir, base, after)?;
+    let (shadow_dir, top_level) = sanitized.into_parts();
+    launch.env = vec![
+        (
+            OsString::from("GIT_DIR"),
+            shadow_dir.path().as_os_str().to_os_string(),
+        ),
+        (OsString::from("GIT_WORK_TREE"), top_level.into_os_string()),
+    ];
+    launch.env_remove = vec![OsString::from("GIT_COMMON_DIR")];
+    launch.dir = Some(shadow_dir);
+    Ok(launch)
 }
 
-/// Keys from `git config --show-scope --get-regexp` output whose scope is
-/// repository-controlled (`local` or `worktree`).
-fn repo_local_difftool_keys(output: &str) -> Vec<String> {
+/// Keys from `git config --show-scope --name-only -z --list` whose scope is
+/// repository-controlled (`local` or `worktree`) and that control difftool,
+/// mergetool, diff, or filter execution.
+fn repo_local_difftool_keys(output: &[u8]) -> Vec<String> {
     let mut keys = Vec::new();
-    for line in output.lines() {
-        let Some((scope, rest)) = line.split_once('\t') else {
-            continue;
-        };
-        if !matches!(scope, "local" | "worktree") {
+    let mut parts = output.split(|&b| b == 0);
+    while let (Some(scope), Some(key)) = (parts.next(), parts.next()) {
+        if scope != b"local" && scope != b"worktree" {
             continue;
         }
-        let key = rest.split_whitespace().next().unwrap_or(rest);
-        if !key.is_empty() && !keys.iter().any(|k| k == key) {
-            keys.push(key.to_owned());
+        if !is_difftool_risky_key(key) {
+            continue;
+        }
+        let key_str = String::from_utf8_lossy(key).into_owned();
+        if !key_str.is_empty() && !keys.iter().any(|k| k == &key_str) {
+            keys.push(key_str);
         }
     }
     keys
+}
+
+fn is_difftool_risky_key(key: &[u8]) -> bool {
+    let Some(pos) = key.iter().position(|&b| b == b'.') else {
+        return false;
+    };
+    let (section, rest) = (&key[..pos], &key[pos + 1..]);
+    if section.eq_ignore_ascii_case(b"difftool")
+        || section.eq_ignore_ascii_case(b"mergetool")
+        || section.eq_ignore_ascii_case(b"filter")
+    {
+        return true;
+    }
+    if section.eq_ignore_ascii_case(b"diff") {
+        return rest.eq_ignore_ascii_case(b"tool")
+            || rest.eq_ignore_ascii_case(b"guitool")
+            || rest.eq_ignore_ascii_case(b"external")
+            || rest.rsplit(|&b| b == b'.').next().is_some_and(|var| {
+                var.eq_ignore_ascii_case(b"textconv") || var.eq_ignore_ascii_case(b"command")
+            });
+    }
+    if section.eq_ignore_ascii_case(b"merge") {
+        return rest.eq_ignore_ascii_case(b"tool")
+            || rest.eq_ignore_ascii_case(b"guitool")
+            || rest
+                .rsplit(|&b| b == b'.')
+                .next()
+                .is_some_and(|var| var.eq_ignore_ascii_case(b"driver"));
+    }
+    false
 }
 
 fn difftool_with(tool: &str, dir: &Path, base: &str, after: &str) -> Result<Launch> {
@@ -255,7 +313,10 @@ fn difftool_with(tool: &str, dir: &Path, base: &str, after: &str) -> Result<Laun
     Ok(Launch {
         argv: difftool_argv(base, after),
         cwd: Some(dir.into()),
+        env: vec![],
+        env_remove: vec![],
         file: None,
+        dir: None,
     })
 }
 
@@ -393,7 +454,7 @@ mod tests {
     fn difftool_refuses_repo_local_config() {
         assert_eq!(
             repo_local_difftool_keys(
-                "global\tdiff.tool meld\nlocal\tdifftool.meld.cmd evil\nworktree\tdiff.tool pwn\n"
+                b"global\0diff.tool\0local\0difftool.meld.cmd\0worktree\0diff.tool\0local\0user.name\0"
             ),
             vec!["difftool.meld.cmd", "diff.tool"]
         );
@@ -430,19 +491,28 @@ mod tests {
         let ok = Launch {
             argv: vec!["true".into()],
             cwd: None,
+            env: vec![],
+            env_remove: vec![],
             file: None,
+            dir: None,
         };
         assert_eq!(ok.run().unwrap(), "Returned from true.");
         let failed = Launch {
             argv: vec!["false".into()],
             cwd: None,
+            env: vec![],
+            env_remove: vec![],
             file: None,
+            dir: None,
         };
         assert!(failed.run().unwrap().starts_with("false exited with"));
         let missing = Launch {
             argv: vec!["model-router-no-such-program".into()],
             cwd: None,
+            env: vec![],
+            env_remove: vec![],
             file: None,
+            dir: None,
         };
         assert!(missing.run().is_err());
     }

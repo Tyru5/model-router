@@ -731,6 +731,7 @@ fn has_exact_token(
 const SCANNER_TIMEOUT: Duration = Duration::from_secs(60);
 const SCANNER_OUTPUT_LIMIT: usize = 64 * 1024;
 
+#[cfg(not(unix))]
 fn read_capped_stream(mut stream: impl Read, limit: usize) -> Vec<u8> {
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
@@ -748,6 +749,173 @@ fn read_capped_stream(mut stream: impl Read, limit: usize) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(unix)]
+fn set_nonblocking(fd: libc::c_int) {
+    // SAFETY: `fd` is an open pipe descriptor owned by the caller.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+/// Drains available bytes from a non-blocking pipe into `out` (capped at
+/// `limit`), discarding excess bytes. Returns `true` when the stream hit EOF or
+/// an unrecoverable error and should be closed.
+#[cfg(unix)]
+fn drain_nonblocking(stream: &mut impl Read, out: &mut Vec<u8>, limit: usize) -> bool {
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(n) => {
+                if out.len() < limit {
+                    let take = n.min(limit - out.len());
+                    out.extend_from_slice(&buf[..take]);
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return false,
+            Err(_) => return true,
+        }
+    }
+}
+
+/// Waits for `child` and drains its `stdout`/`stderr` pipes on the calling
+/// thread via `poll(2)` until `deadline`, without spawning reader threads.
+/// Both pipes are dropped (closed) before returning on timeout or error.
+#[cfg(unix)]
+fn collect_scanner_unix(
+    child: &mut std::process::Child,
+    command: &[String],
+    program: &str,
+    pgid: u32,
+    started: &Option<String>,
+    timeout: Duration,
+    deadline: Instant,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    use std::os::unix::io::AsRawFd;
+
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    if let Some(s) = stdout_pipe.as_ref() {
+        set_nonblocking(s.as_raw_fd());
+    }
+    if let Some(s) = stderr_pipe.as_ref() {
+        set_nonblocking(s.as_raw_fd());
+    }
+
+    let stop_scanner = |child: &mut std::process::Child| {
+        crate::process::end_group_if(
+            pgid,
+            Duration::from_millis(200),
+            || {
+                let _ = child.try_wait();
+            },
+            || !crate::process::group_reused(started, pgid),
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut status: Option<std::process::ExitStatus> = None;
+
+    loop {
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(st)) => {
+                    status = Some(st);
+                    // End any background children the scanner left behind
+                    // before waiting on pipes, checking the leader's start
+                    // time so a reused PGID is never hit.
+                    crate::process::end_group_if(
+                        pgid,
+                        Duration::from_millis(200),
+                        || {
+                            let _ = child.try_wait();
+                        },
+                        || !crate::process::group_reused(started, pgid),
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    stop_scanner(child);
+                    drop(stdout_pipe);
+                    drop(stderr_pipe);
+                    return Err(error).with_context(|| {
+                        format!("Secret scanner {program:?} failed while waiting; refusing to ship")
+                    });
+                }
+            }
+        }
+
+        if let Some(s) = stdout_pipe.as_mut() {
+            if drain_nonblocking(s, &mut stdout, SCANNER_OUTPUT_LIMIT) {
+                stdout_pipe = None;
+            }
+        }
+        if let Some(s) = stderr_pipe.as_mut() {
+            if drain_nonblocking(s, &mut stderr, SCANNER_OUTPUT_LIMIT) {
+                stderr_pipe = None;
+            }
+        }
+
+        if let Some(st) = status {
+            if stdout_pipe.is_none() && stderr_pipe.is_none() {
+                return Ok((st, stdout, stderr));
+            }
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            drop(stdout_pipe);
+            drop(stderr_pipe);
+            if status.is_none() {
+                stop_scanner(child);
+                bail!(
+                    "Secret scanner `{}` timed out after {}s; refusing to ship",
+                    shell_words::join(command),
+                    timeout.as_secs()
+                );
+            }
+            bail!(
+                "Secret scanner `{}` timed out after {}s while collecting output; refusing to ship",
+                shell_words::join(command),
+                timeout.as_secs()
+            );
+        }
+
+        let remaining = deadline.saturating_duration_since(now);
+        let wait = if status.is_some() {
+            remaining
+        } else {
+            remaining.min(Duration::from_millis(20))
+        };
+        let mut fds = [
+            libc::pollfd {
+                fd: stdout_pipe.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stderr_pipe.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        if fds[0].fd >= 0 || fds[1].fd >= 0 {
+            let timeout_ms = wait.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+            // SAFETY: `fds` points to 2 valid `pollfd` entries.
+            let _ = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
+        } else {
+            std::thread::sleep(wait);
+        }
+    }
 }
 
 /// Runs a user-configured external secret scanner argv (no shell) in `dir`.
@@ -809,91 +977,72 @@ fn run_external_scanner_within(
     let mut child = cmd.spawn().with_context(|| {
         format!("Secret scanner {program:?} could not run; refusing to ship without scanning")
     })?;
-    let pgid = child.id();
-    #[cfg(unix)]
-    let started = crate::process::group::started(pgid);
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let out_rx = stdout.map(|s| {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let _ = tx.send(read_capped_stream(s, SCANNER_OUTPUT_LIMIT));
-        });
-        rx
-    });
-    let err_rx = stderr.map(|s| {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let _ = tx.send(read_capped_stream(s, SCANNER_OUTPUT_LIMIT));
-        });
-        rx
-    });
-
-    let stop_scanner = |child: &mut std::process::Child| {
-        #[cfg(unix)]
-        crate::process::end_group_if(
-            pgid,
-            Duration::from_millis(200),
-            || {
-                let _ = child.try_wait();
-            },
-            || !crate::process::group_reused(&started, pgid),
-        );
-        let _ = child.kill();
-        let _ = child.wait();
-    };
-
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    stop_scanner(&mut child);
-                    bail!(
-                        "Secret scanner `{}` timed out after {}s; refusing to ship",
-                        shell_words::join(command),
-                        timeout.as_secs()
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(error) => {
-                stop_scanner(&mut child);
-                return Err(error).with_context(|| {
-                    format!("Secret scanner {program:?} failed while waiting; refusing to ship")
-                });
-            }
-        }
-    };
-    // End any background children the scanner left behind before waiting on
-    // pipes, checking the leader's start time so a reused PGID is never hit.
     #[cfg(unix)]
-    crate::process::end_group_if(
-        pgid,
-        Duration::from_millis(200),
-        || {
-            let _ = child.try_wait();
-        },
-        || !crate::process::group_reused(&started, pgid),
-    );
-    let recv_bounded = |rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>| -> Result<Vec<u8>> {
-        let Some(rx) = rx else {
-            return Ok(Vec::new());
-        };
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(remaining) {
-            Ok(bytes) => Ok(bytes),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => bail!(
-                "Secret scanner `{}` timed out after {}s while collecting output; refusing to ship",
-                shell_words::join(command),
-                timeout.as_secs()
-            ),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(Vec::new()),
-        }
+    let (status, stdout, stderr) = {
+        let pgid = child.id();
+        let started = crate::process::group::started(pgid);
+        collect_scanner_unix(
+            &mut child, command, program, pgid, &started, timeout, deadline,
+        )?
     };
-    let stdout = recv_bounded(out_rx)?;
-    let stderr = recv_bounded(err_rx)?;
+    #[cfg(not(unix))]
+    let (status, stdout, stderr) = {
+        let out_rx = child.stdout.take().map(|s| {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let _ = tx.send(read_capped_stream(s, SCANNER_OUTPUT_LIMIT));
+            });
+            rx
+        });
+        let err_rx = child.stderr.take().map(|s| {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let _ = tx.send(read_capped_stream(s, SCANNER_OUTPUT_LIMIT));
+            });
+            rx
+        });
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        bail!(
+                            "Secret scanner `{}` timed out after {}s; refusing to ship",
+                            shell_words::join(command),
+                            timeout.as_secs()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error).with_context(|| {
+                        format!("Secret scanner {program:?} failed while waiting; refusing to ship")
+                    });
+                }
+            }
+        };
+        let recv_bounded = |rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>| -> Result<Vec<u8>> {
+            let Some(rx) = rx else {
+                return Ok(Vec::new());
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(remaining) {
+                Ok(bytes) => Ok(bytes),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => bail!(
+                    "Secret scanner `{}` timed out after {}s while collecting output; refusing to ship",
+                    shell_words::join(command),
+                    timeout.as_secs()
+                ),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(Vec::new()),
+            }
+        };
+        (status, recv_bounded(out_rx)?, recv_bounded(err_rx)?)
+    };
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr);
         let stdout = String::from_utf8_lossy(&stdout);
@@ -1353,6 +1502,17 @@ diff --git a/tests/helper.rs b/tests/helper.rs
                     if after_comm.starts_with('Z') {
                         return false;
                     }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            if let Ok(out) = Command::new("ps")
+                .args(["-o", "state=", "-p", &pid.to_string()])
+                .output()
+            {
+                let state = String::from_utf8_lossy(&out.stdout);
+                let trimmed = state.trim();
+                if !out.status.success() || trimmed.is_empty() || trimmed.starts_with('Z') {
+                    return false;
                 }
             }
             true

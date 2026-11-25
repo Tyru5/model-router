@@ -379,19 +379,24 @@ pub fn open_beneath(base: &Path, relative: &Path) -> Result<File> {
 }
 
 pub fn git(project: &Path, args: &[&str]) -> Result<String> {
-    git_with(project, args, false)
+    let mut command = crate::snapshot::git_command();
+    command.args(args).current_dir(project);
+    let output = command.output().context("Start Git")?;
+    ensure!(
+        output.status.success(),
+        "git {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_owned())
 }
 
 pub fn git_readonly(project: &Path, args: &[&str]) -> Result<String> {
-    git_with(project, args, true)
-}
-
-fn git_with(project: &Path, args: &[&str], no_optional_locks: bool) -> Result<String> {
-    let mut command = crate::snapshot::git_command_in(project)?;
-    command.args(args);
-    if no_optional_locks {
-        command.env("GIT_OPTIONAL_LOCKS", "0");
-    }
+    let sanitized = crate::snapshot::SanitizedGitDir::new(project)?;
+    let mut command = sanitized.command(project);
+    command.args(args).env("GIT_OPTIONAL_LOCKS", "0");
     let output = command.output().context("Start Git")?;
     ensure!(
         output.status.success(),
@@ -411,20 +416,31 @@ pub fn create_worktree(project: &Path, id: &str, require_clean: bool) -> Result<
         !require_clean || git_readonly(project, &["status", "--porcelain"])?.is_empty(),
         "Worktree mode starts from committed HEAD. Commit or stash project changes, or use the current directory instead"
     );
+    crate::snapshot::refuse_suppressed_smudge_filters(project, "HEAD")?;
     let base = metadata_dir(project)?.join("worktrees");
     fs::create_dir_all(&base)?;
     let path = base.join(id);
+    let path_str = path.to_str().context("Worktree path must be UTF-8")?;
+    let branch = format!("model-router/{id}");
     git(
         project,
         &[
             "worktree",
             "add",
+            "--no-checkout",
             "-b",
-            &format!("model-router/{id}"),
-            path.to_str().context("Worktree path must be UTF-8")?,
+            &branch,
+            path_str,
             "HEAD",
         ],
     )?;
+    if let Err(err) = crate::snapshot::populate_worktree(&path) {
+        let _ = git(project, &["worktree", "remove", "--force", path_str]);
+        let _ = fs::remove_dir_all(&path);
+        let _ = git(project, &["worktree", "prune"]);
+        let _ = git(project, &["branch", "-D", &branch]);
+        return Err(err);
+    }
     Ok(path)
 }
 

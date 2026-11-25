@@ -13,8 +13,24 @@ use std::{
     process::Stdio,
 };
 
-fn git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<String> {
-    let mut command = crate::snapshot::git_command_in(dir)?;
+fn git_raw(dir: &Path, args: &[&str]) -> Result<String> {
+    let mut command = crate::snapshot::git_command();
+    command.args(args).current_dir(dir).stdin(Stdio::null());
+    let output = command.output().context("Start Git")?;
+    ensure!(
+        output.status.success(),
+        "git {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_owned())
+}
+
+fn git_sanitized(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<String> {
+    let sanitized = crate::snapshot::SanitizedGitDir::new(dir)?;
+    let mut command = sanitized.command(dir);
     command.args(args).stdin(Stdio::null());
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
@@ -39,7 +55,7 @@ pub fn candidates_dir(project: &Path, run: &str) -> Result<PathBuf> {
 /// The workspace's path inside its repository, e.g. `app/` for a project in
 /// a subdirectory; empty at the top.
 pub fn prefix(workspace: &Path) -> String {
-    git(workspace, None, &["rev-parse", "--show-prefix"]).unwrap_or_default()
+    git_raw(workspace, &["rev-parse", "--show-prefix"]).unwrap_or_default()
 }
 
 /// Commits snapshot `tree` (parent HEAD, if any) under `reference`, so a
@@ -55,11 +71,7 @@ pub fn base_commit(workspace: &Path, tree: &str, reference: &str) -> Result<Stri
         .env("GIT_AUTHOR_EMAIL", "model-router@localhost")
         .env("GIT_COMMITTER_NAME", "model-router")
         .env("GIT_COMMITTER_EMAIL", "model-router@localhost");
-    if let Ok(head) = git(
-        workspace,
-        None,
-        &["rev-parse", "--verify", "--quiet", "HEAD"],
-    ) {
+    if let Ok(head) = git_raw(workspace, &["rev-parse", "--verify", "--quiet", "HEAD"]) {
         command.args(["-p", &head]);
     }
     let output = command.output().context("Start Git")?;
@@ -69,28 +81,35 @@ pub fn base_commit(workspace: &Path, tree: &str, reference: &str) -> Result<Stri
         String::from_utf8_lossy(&output.stderr).trim()
     );
     let commit = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    git(workspace, None, &["update-ref", reference, &commit])?;
+    git_raw(workspace, &["update-ref", reference, &commit])?;
     Ok(commit)
 }
 
-/// A detached worktree at `commit`. Repository hooks do not run.
+/// A detached worktree at `commit`. Repository hooks and local smudge filters
+/// do not run; worktrees requiring a suppressed local smudge filter are refused.
 pub fn add_worktree(workspace: &Path, path: &Path, commit: &str) -> Result<()> {
+    snapshot::refuse_suppressed_smudge_filters(workspace, commit)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    git(
+    let path_str = path.to_str().context("Worktree path must be UTF-8")?;
+    git_raw(
         workspace,
-        None,
         &[
-            "-c",
-            "core.hooksPath=/dev/null",
             "worktree",
             "add",
+            "--no-checkout",
             "--detach",
-            path.to_str().context("Worktree path must be UTF-8")?,
+            path_str,
             commit,
         ],
     )?;
+    if let Err(err) = snapshot::populate_worktree(path) {
+        let _ = git_raw(workspace, &["worktree", "remove", "--force", path_str]);
+        let _ = fs::remove_dir_all(path);
+        let _ = git_raw(workspace, &["worktree", "prune"]);
+        return Err(err);
+    }
     Ok(())
 }
 
@@ -104,11 +123,11 @@ pub fn remove_worktrees(project: &Path, dir: &Path) -> Result<()> {
     collect(dir, &mut trees);
     for tree in trees {
         if let Some(path) = tree.to_str() {
-            let _ = git(project, None, &["worktree", "remove", "--force", path]);
+            let _ = git_raw(project, &["worktree", "remove", "--force", path]);
         }
     }
     fs::remove_dir_all(dir).with_context(|| format!("Remove {}", dir.display()))?;
-    let _ = git(project, None, &["worktree", "prune"]);
+    let _ = git_raw(project, &["worktree", "prune"]);
     Ok(())
 }
 
@@ -128,7 +147,9 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
 pub fn write_patch(dir: &Path, from: &str, to: &str, path: &Path) -> Result<()> {
     // The candidate could write its attempt directory.
     let file = storage::create_fresh(path)?;
-    let output = crate::snapshot::git_command()
+    let sanitized = crate::snapshot::SanitizedGitDir::new(dir)?;
+    let output = sanitized
+        .command(dir)
         .args([
             "--no-pager",
             "diff",
@@ -144,7 +165,6 @@ pub fn write_patch(dir: &Path, from: &str, to: &str, path: &Path) -> Result<()> 
             from,
             to,
         ])
-        .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::from(file))
         .stderr(Stdio::piped())
@@ -185,20 +205,20 @@ pub fn apply(
     patch: &Path,
     scratch: &Path,
 ) -> Result<Applied> {
-    let top = PathBuf::from(git(workspace, None, &["rev-parse", "--show-toplevel"])?);
+    let top = PathBuf::from(git_raw(workspace, &["rev-parse", "--show-toplevel"])?);
     let patch = std::path::absolute(patch)?;
     let patch = patch.to_str().context("Patch path must be UTF-8")?;
     if fs::metadata(patch)?.len() == 0 {
         return Ok(Applied::Clean);
     }
     // Plain apply checks the whole patch before writing any file.
-    if git(&top, None, &["apply", "--binary", patch]).is_ok() {
+    if git_sanitized(&top, None, &["apply", "--binary", patch]).is_ok() {
         return Ok(Applied::Clean);
     }
     fs::create_dir_all(scratch)?;
     let check_index = std::path::absolute(scratch.join("apply-check.index"))?;
     fs::copy(index, &check_index).context("Copy the snapshot index")?;
-    let precheck = git(
+    let precheck = git_sanitized(
         &top,
         Some(&check_index),
         &["apply", "--3way", "--cached", "--binary", patch],
@@ -215,7 +235,7 @@ pub fn apply(
     }
     let merge = std::path::absolute(scratch.join("apply.index"))?;
     fs::copy(index, &merge).context("Copy the snapshot index")?;
-    if git(&top, Some(&merge), &["apply", "--3way", "--binary", patch]).is_ok() {
+    if git_sanitized(&top, Some(&merge), &["apply", "--3way", "--binary", patch]).is_ok() {
         let _ = fs::remove_file(&merge);
         return Ok(Applied::Merged);
     }
@@ -235,18 +255,18 @@ pub fn check(
     patch: &Path,
     scratch: &Path,
 ) -> Result<Applied> {
-    let top = PathBuf::from(git(workspace, None, &["rev-parse", "--show-toplevel"])?);
+    let top = PathBuf::from(git_raw(workspace, &["rev-parse", "--show-toplevel"])?);
     let patch = std::path::absolute(patch)?;
     let patch = patch.to_str().context("Patch path must be UTF-8")?;
     if fs::metadata(patch)?.len() == 0
-        || git(&top, None, &["apply", "--check", "--binary", patch]).is_ok()
+        || git_sanitized(&top, None, &["apply", "--check", "--binary", patch]).is_ok()
     {
         return Ok(Applied::Clean);
     }
     fs::create_dir_all(scratch)?;
     let merge = std::path::absolute(scratch.join("check.index"))?;
     fs::copy(index, &merge).context("Copy the snapshot index")?;
-    let merged = git(
+    let merged = git_sanitized(
         &top,
         Some(&merge),
         &["apply", "--3way", "--cached", "--binary", patch],
@@ -285,15 +305,26 @@ fn restore(top: &Path, tree: &str, files: &[String], scratch: &Path) -> Result<(
         return Ok(());
     }
     fs::create_dir_all(scratch)?;
-    git(top, Some(&index), &["read-tree", tree])?;
+    let sanitized = crate::snapshot::SanitizedGitDir::new(top)?;
+    let read_out = sanitized
+        .command(top)
+        .args(["read-tree", tree])
+        .env("GIT_INDEX_FILE", &index)
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        read_out.status.success(),
+        "git read-tree {tree}: {}",
+        String::from_utf8_lossy(&read_out.stderr).trim()
+    );
     let mut present = std::collections::HashSet::new();
     for chunk in plain_files.chunks(512) {
-        let mut command = crate::snapshot::git_command();
+        let mut command = sanitized.command(top);
         command
             .arg("--literal-pathspecs")
             .args(["ls-files", "-z", "--"])
             .args(chunk)
-            .current_dir(top)
             .env("GIT_INDEX_FILE", &index)
             .stdin(Stdio::null());
         let output = command.output().context("Start Git")?;
@@ -317,7 +348,8 @@ fn restore(top: &Path, tree: &str, files: &[String], scratch: &Path) -> Result<(
             stdin_bytes.extend_from_slice(file.as_bytes());
             stdin_bytes.push(0);
         }
-        let mut child = crate::snapshot::git_command_in(top)?
+        let mut child = sanitized
+            .command(top)
             .args(["checkout-index", "-f", "-z", "--stdin"])
             .env("GIT_INDEX_FILE", &index)
             .stdin(Stdio::piped())
@@ -382,6 +414,24 @@ pub fn stat(dir: &Path, from: &str, to: &str) -> Result<(Vec<String>, u64, u64)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<String> {
+        let mut command = crate::snapshot::git_command();
+        command.args(args).current_dir(dir).stdin(Stdio::null());
+        if let Some(index) = index {
+            command.env("GIT_INDEX_FILE", index);
+        }
+        let output = command.output().context("Start Git")?;
+        ensure!(
+            output.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_owned())
+    }
 
     #[test]
     fn a_patch_never_writes_through_a_link_the_candidate_left() {

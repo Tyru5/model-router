@@ -50,12 +50,6 @@ pub struct FileChange {
     pub removed: Option<u64>,
 }
 
-/// The repository's top-level directory for `dir`.
-pub(crate) fn top_level(dir: &Path) -> Result<PathBuf> {
-    let out = git(dir, None, &["rev-parse", "--show-toplevel"])?;
-    Ok(PathBuf::from(String::from_utf8_lossy(&out).trim()))
-}
-
 /// `git` for the router's own commands in a workspace or checkout. A stage
 /// may have written the repository's config or hooks before the router
 /// runs Git there, outside the stage's sandbox: hooks and an fsmonitor
@@ -72,73 +66,513 @@ pub(crate) fn git_command() -> Command {
     command
 }
 
-/// `git_command` in `dir`, additionally disabling any repository-local or
-/// worktree-local `filter.*`, `diff.*`, or `merge.*.driver` executable config
-/// keys so commands like `git status`, `git add -A`, `git worktree add`, and
-/// `git apply --3way` never execute repo-defined commands. Fails closed when
-/// config scope cannot be queried or a key cannot be safely overridden.
-pub(crate) fn git_command_in(dir: &Path) -> Result<Command> {
-    let mut command = git_command();
-    let overrides = repo_driver_overrides(dir)?;
-    if !overrides.is_empty() {
-        let needs_env = overrides.iter().any(|(key, _)| key.contains(&b'='));
-        ensure!(
-            !needs_env || git_supports_config_env(),
-            "Refusing Git command in {}: repository defines a driver key containing `=`, which requires Git 2.31+ to disable safely",
-            dir.display()
-        );
-        // Pass via `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<i>` / `GIT_CONFIG_VALUE_<i>`
-        // with raw key bytes so non-UTF-8 subsection names and names containing
-        // `=` are preserved exactly; also pass `-c` for keys without `=` so
-        // Git 2.26-2.30 disables them too.
-        let base_count = std::env::var("GIT_CONFIG_COUNT")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
-        for (offset, (key, value)) in overrides.iter().enumerate() {
-            let idx = base_count + offset;
-            let key_os = bytes_to_os(key)?;
-            command
-                .env(format!("GIT_CONFIG_KEY_{idx}"), &key_os)
-                .env(format!("GIT_CONFIG_VALUE_{idx}"), value);
-            if !key.contains(&b'=') {
-                let mut arg = key_os;
-                arg.push("=");
-                arg.push(value);
-                command.arg("-c").arg(arg);
-            }
-        }
-        command.env(
-            "GIT_CONFIG_COUNT",
-            (base_count + overrides.len()).to_string(),
-        );
-    }
-    command.current_dir(dir);
-    Ok(command)
+/// A private, fixed shadow `GIT_DIR` whose `config` keeps only allowlisted
+/// repository-format settings (plus `filter.<driver>.required = true` so
+/// disabled required filters still fail closed). Git processes launched with
+/// this shadow `GIT_DIR` never open `.git/config` or `.git/config.worktree`,
+/// eliminating both repo-local driver execution and TOCTOU config races.
+pub(crate) struct SanitizedGitDir {
+    dir: tempfile::TempDir,
+    top_level: PathBuf,
+    local_clean_filters: Vec<Vec<u8>>,
+    local_smudge_filters: Vec<Vec<u8>>,
 }
 
-/// Raw driver names of repo-local/worktree `filter.<driver>.(clean|process|required)`
-/// keys that `git_command_in` disables in `dir`.
-pub(crate) fn repo_local_clean_filters(dir: &Path) -> Result<Vec<Vec<u8>>> {
-    let mut drivers = Vec::new();
-    for (key, _) in repo_driver_overrides(dir)? {
-        let Some((section, rest)) = split_first(&key, b'.') else {
+impl SanitizedGitDir {
+    /// Inspects `dir`'s Git repository layout and config scopes once (requiring
+    /// Git 2.26+) and materializes a private `0700` shadow `GIT_DIR` with a
+    /// fixed, sanitized `config` file.
+    pub(crate) fn new(dir: &Path) -> Result<Self> {
+        let rev = git_command()
+            .args([
+                "rev-parse",
+                "--git-dir",
+                "--git-common-dir",
+                "--show-toplevel",
+            ])
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .output()
+            .context("Start Git")?;
+        ensure!(
+            rev.status.success(),
+            "git rev-parse: {}",
+            String::from_utf8_lossy(&rev.stderr).trim()
+        );
+        let mut lines = rev
+            .stdout
+            .split(|&b| b == b'\n')
+            .map(|line| line.strip_suffix(b"\r").unwrap_or(line));
+        let git_dir_raw = lines
+            .next()
+            .filter(|l| !l.is_empty())
+            .context("git rev-parse did not return a git-dir")?;
+        let common_dir_raw = lines
+            .next()
+            .filter(|l| !l.is_empty())
+            .context("git rev-parse did not return a git-common-dir")?;
+        let top_raw = lines
+            .next()
+            .filter(|l| !l.is_empty())
+            .context("git rev-parse did not return a work tree")?;
+        let resolve = |raw: &[u8]| -> Result<PathBuf> {
+            let path = PathBuf::from(bytes_to_os(raw)?);
+            let joined = if path.is_absolute() {
+                path
+            } else {
+                dir.join(path)
+            };
+            std::path::absolute(&joined).with_context(|| format!("Resolve {}", joined.display()))
+        };
+        let git_dir = resolve(git_dir_raw)?;
+        let common_dir = resolve(common_dir_raw)?;
+        let top_level = resolve(top_raw)?;
+
+        let inspected = inspect_repo_config(dir)?;
+        let shadow = tempfile::Builder::new()
+            .prefix("model-router-git-")
+            .tempdir()
+            .context("Create sanitized Git directory")?;
+
+        fs::write(shadow.path().join("config"), &inspected.sanitized_config)
+            .context("Write sanitized Git config")?;
+        let head = fs::read(git_dir.join("HEAD")).context("Read repository HEAD")?;
+        fs::write(shadow.path().join("HEAD"), head).context("Write shadow HEAD")?;
+        link_entry(&common_dir.join("objects"), &shadow.path().join("objects"))
+            .context("Link repository objects")?;
+        for name in ["refs", "packed-refs", "reftable", "info", "shallow"] {
+            let src = common_dir.join(name);
+            if fs::symlink_metadata(&src).is_ok() {
+                link_entry(&src, &shadow.path().join(name))
+                    .with_context(|| format!("Link repository {name}"))?;
+            }
+        }
+        let real_index = git_dir.join("index");
+        if fs::symlink_metadata(&real_index).is_ok() {
+            link_entry(&real_index, &shadow.path().join("index"))
+                .context("Link repository index")?;
+        }
+
+        Ok(Self {
+            dir: shadow,
+            top_level,
+            local_clean_filters: inspected.local_clean_filters,
+            local_smudge_filters: inspected.local_smudge_filters,
+        })
+    }
+
+    /// Builds a `git` `Command` pinned to this shadow `GIT_DIR` and work tree.
+    /// The caller must keep `self` alive until the command exits.
+    pub(crate) fn command(&self, cwd: &Path) -> Command {
+        let mut command = git_command();
+        command
+            .current_dir(cwd)
+            .env("GIT_DIR", self.dir.path())
+            .env("GIT_WORK_TREE", &self.top_level)
+            .env_remove("GIT_COMMON_DIR");
+        command
+    }
+
+    pub(crate) fn top_level(&self) -> &Path {
+        &self.top_level
+    }
+
+    pub(crate) fn local_clean_filters(&self) -> &[Vec<u8>] {
+        &self.local_clean_filters
+    }
+
+    pub(crate) fn local_smudge_filters(&self) -> &[Vec<u8>] {
+        &self.local_smudge_filters
+    }
+
+    pub(crate) fn into_parts(self) -> (tempfile::TempDir, PathBuf) {
+        (self.dir, self.top_level)
+    }
+}
+
+#[cfg(unix)]
+fn link_entry(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dst)
+}
+
+#[cfg(not(unix))]
+fn link_entry(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if src.is_dir() {
+        std::os::windows::fs::symlink_dir(src, dst)
+    } else {
+        std::os::windows::fs::symlink_file(src, dst)
+    }
+}
+
+struct InspectedRepoConfig {
+    sanitized_config: Vec<u8>,
+    local_clean_filters: Vec<Vec<u8>>,
+    local_smudge_filters: Vec<Vec<u8>>,
+}
+
+fn inspect_repo_config(dir: &Path) -> Result<InspectedRepoConfig> {
+    // `--list -z` preserves exact raw key and value bytes without locale regex
+    // quirks, including non-UTF-8 subsection names and names containing `=`.
+    let output = git_command()
+        .args(["config", "--show-scope", "-z", "--list"])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        output.status.success(),
+        "Could not inspect Git config scopes in {} (requires Git 2.26+): {}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+
+    let mut repo_format_version: u32 = 0;
+    let mut core_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut extensions: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut unsupported_extensions: Vec<String> = Vec::new();
+    let mut filter_required: Vec<(Vec<u8>, bool)> = Vec::new();
+    let mut local_clean_filters: Vec<Vec<u8>> = Vec::new();
+    let mut local_smudge_filters: Vec<Vec<u8>> = Vec::new();
+
+    let mut parts = output.stdout.split(|&b| b == 0);
+    while let (Some(scope), Some(entry)) = (parts.next(), parts.next()) {
+        if scope != b"local" && scope != b"worktree" {
+            continue;
+        }
+        let (key, val) = match entry.iter().position(|&b| b == b'\n') {
+            Some(pos) => (&entry[..pos], Some(&entry[pos + 1..])),
+            None => (entry, None),
+        };
+        let Some((section, rest)) = split_first(key, b'.') else {
             continue;
         };
-        let Some((subsection, var)) = split_last(rest, b'.') else {
-            continue;
-        };
-        if section.eq_ignore_ascii_case(b"filter")
-            && (var.eq_ignore_ascii_case(b"clean")
-                || var.eq_ignore_ascii_case(b"process")
-                || var.eq_ignore_ascii_case(b"required"))
-            && !subsection.is_empty()
-            && !drivers.iter().any(|d| d == subsection)
-        {
-            drivers.push(subsection.to_vec());
+        if section.eq_ignore_ascii_case(b"core") && !rest.contains(&b'.') {
+            if rest.eq_ignore_ascii_case(b"repositoryformatversion") {
+                if let Some(v) = val.and_then(|b| std::str::from_utf8(b).ok()) {
+                    if let Ok(ver) = v.trim().parse::<u32>() {
+                        repo_format_version = ver;
+                    }
+                }
+                continue;
+            }
+            if is_safe_core_key(rest) {
+                let value = val.unwrap_or(b"true");
+                if !value.contains(&b'\n') && !value.contains(&b'\r') && !value.contains(&0) {
+                    set_last(&mut core_entries, rest.to_ascii_lowercase(), value.to_vec());
+                }
+            }
+        } else if section.eq_ignore_ascii_case(b"extensions") && !rest.contains(&b'.') {
+            let lower = rest.to_ascii_lowercase();
+            if matches!(
+                lower.as_slice(),
+                b"worktreeconfig" | b"relativeworktrees" | b"noop" | b"noop-without-value"
+            ) {
+                continue;
+            }
+            if matches!(lower.as_slice(), b"objectformat" | b"refstorage") {
+                if let Some(value) = val {
+                    if !value.contains(&b'\n') && !value.contains(&b'\r') && !value.contains(&0) {
+                        set_last(&mut extensions, lower, value.to_vec());
+                    }
+                }
+            } else {
+                let name = String::from_utf8_lossy(&lower).into_owned();
+                if !unsupported_extensions.contains(&name) {
+                    unsupported_extensions.push(name);
+                }
+            }
+        } else if section.eq_ignore_ascii_case(b"filter") {
+            let Some((subsection, var)) = split_last(rest, b'.') else {
+                continue;
+            };
+            if subsection.is_empty() {
+                continue;
+            }
+            if var.eq_ignore_ascii_case(b"required") {
+                set_last(
+                    &mut filter_required,
+                    subsection.to_vec(),
+                    git_bool_truthy(val),
+                );
+            } else if var.eq_ignore_ascii_case(b"clean") {
+                if val.is_some_and(|v| !v.is_empty())
+                    && !local_clean_filters.iter().any(|d| d == subsection)
+                {
+                    local_clean_filters.push(subsection.to_vec());
+                }
+            } else if var.eq_ignore_ascii_case(b"smudge") {
+                if val.is_some_and(|v| !v.is_empty())
+                    && !local_smudge_filters.iter().any(|d| d == subsection)
+                {
+                    local_smudge_filters.push(subsection.to_vec());
+                }
+            } else if var.eq_ignore_ascii_case(b"process") && val.is_some_and(|v| !v.is_empty()) {
+                if !local_clean_filters.iter().any(|d| d == subsection) {
+                    local_clean_filters.push(subsection.to_vec());
+                }
+                if !local_smudge_filters.iter().any(|d| d == subsection) {
+                    local_smudge_filters.push(subsection.to_vec());
+                }
+            }
         }
     }
-    Ok(drivers)
+
+    ensure!(
+        repo_format_version == 0 || unsupported_extensions.is_empty(),
+        "Refusing Git operation in {}: unsupported repository format extension(s) ({})",
+        dir.display(),
+        unsupported_extensions.join(", ")
+    );
+
+    let mut sanitized_config = Vec::new();
+    sanitized_config.extend_from_slice(b"[core]\n");
+    if extensions.is_empty() {
+        sanitized_config.extend_from_slice(b"\trepositoryformatversion = 0\n");
+    } else {
+        sanitized_config.extend_from_slice(b"\trepositoryformatversion = 1\n");
+    }
+    sanitized_config.extend_from_slice(b"\tbare = false\n");
+    sanitized_config.extend_from_slice(b"\tfsmonitor = false\n");
+    sanitized_config.extend_from_slice(b"\thooksPath = /dev/null\n");
+    for (var, value) in &core_entries {
+        sanitized_config.push(b'\t');
+        sanitized_config.extend_from_slice(var);
+        sanitized_config.extend_from_slice(b" = \"");
+        push_git_escaped(&mut sanitized_config, value);
+        sanitized_config.extend_from_slice(b"\"\n");
+    }
+    if !extensions.is_empty() {
+        sanitized_config.extend_from_slice(b"[extensions]\n");
+        for (var, value) in &extensions {
+            sanitized_config.push(b'\t');
+            sanitized_config.extend_from_slice(var);
+            sanitized_config.extend_from_slice(b" = \"");
+            push_git_escaped(&mut sanitized_config, value);
+            sanitized_config.extend_from_slice(b"\"\n");
+        }
+    }
+    for (driver, required) in &filter_required {
+        if !required {
+            continue;
+        }
+        ensure!(
+            !driver.contains(&b'\n') && !driver.contains(&b'\r') && !driver.contains(&0),
+            "Git filter name contains invalid control bytes"
+        );
+        sanitized_config.extend_from_slice(b"[filter \"");
+        push_git_escaped(&mut sanitized_config, driver);
+        sanitized_config.extend_from_slice(b"\"]\n\trequired = true\n");
+    }
+
+    Ok(InspectedRepoConfig {
+        sanitized_config,
+        local_clean_filters,
+        local_smudge_filters,
+    })
+}
+
+fn is_safe_core_key(var: &[u8]) -> bool {
+    let lower = var.to_ascii_lowercase();
+    matches!(
+        lower.as_slice(),
+        b"filemode"
+            | b"ignorecase"
+            | b"precomposeunicode"
+            | b"symlinks"
+            | b"autocrlf"
+            | b"eol"
+            | b"safecrlf"
+            | b"longpaths"
+            | b"quotepath"
+            | b"protecthfs"
+            | b"protectntfs"
+            | b"trustctime"
+            | b"checkstat"
+    )
+}
+
+fn git_bool_truthy(val: Option<&[u8]>) -> bool {
+    let Some(raw) = val else {
+        return true;
+    };
+    let trimmed = raw
+        .iter()
+        .copied()
+        .skip_while(|b| b.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    let end = trimmed
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(0, |i| i + 1);
+    let lower = trimmed[..end].to_ascii_lowercase();
+    matches!(lower.as_slice(), b"true" | b"yes" | b"on" | b"1")
+}
+
+fn set_last<T>(list: &mut Vec<(Vec<u8>, T)>, key: Vec<u8>, value: T) {
+    if let Some((_, existing)) = list.iter_mut().find(|(k, _)| *k == key) {
+        *existing = value;
+    } else {
+        list.push((key, value));
+    }
+}
+
+fn push_git_escaped(out: &mut Vec<u8>, bytes: &[u8]) {
+    for &b in bytes {
+        if b == b'\\' || b == b'"' {
+            out.push(b'\\');
+        }
+        out.push(b);
+    }
+}
+
+/// Refuses to check out a worktree at `commit_or_tree` when any file in it has
+/// a `.gitattributes` `filter` naming a repo-local or worktree-local
+/// `smudge`/`process` filter that the router disables, so worktrees never
+/// silently start with unprocessed pointer files (even for optional filters).
+pub(crate) fn refuse_suppressed_smudge_filters(dir: &Path, commit_or_tree: &str) -> Result<()> {
+    let sanitized = SanitizedGitDir::new(dir)?;
+    let drivers = sanitized.local_smudge_filters();
+    if drivers.is_empty() {
+        return Ok(());
+    }
+    let top = sanitized.top_level();
+    let list_out = sanitized
+        .command(top)
+        .args(["ls-tree", "-r", "-z", "--name-only", commit_or_tree])
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        list_out.status.success(),
+        "git ls-tree {commit_or_tree}: {}",
+        String::from_utf8_lossy(&list_out.stderr).trim()
+    );
+    if list_out.stdout.is_empty() {
+        return Ok(());
+    }
+    let scratch = tempfile::Builder::new()
+        .prefix("model-router-wt-attr-")
+        .tempdir()
+        .context("Create scratch directory for worktree attribute check")?;
+    let index = scratch.path().join("index");
+    let read_out = sanitized
+        .command(top)
+        .args(["read-tree", commit_or_tree])
+        .env("GIT_INDEX_FILE", &index)
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        read_out.status.success(),
+        "git read-tree {commit_or_tree}: {}",
+        String::from_utf8_lossy(&read_out.stderr).trim()
+    );
+    let mut child = sanitized
+        .command(top)
+        .args(["check-attr", "--cached", "-z", "filter", "--stdin"])
+        .env("GIT_INDEX_FILE", &index)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Start Git")?;
+    let stdin_bytes = list_out.stdout.as_slice();
+    let output = std::thread::scope(|scope| -> Result<std::process::Output> {
+        let writer = child.stdin.take().map(|mut pipe| {
+            scope.spawn(move || -> std::io::Result<()> {
+                use std::io::Write;
+                match pipe.write_all(stdin_bytes) {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                    Err(err) => Err(err),
+                }
+            })
+        });
+        let output = child.wait_with_output().context("Wait for Git")?;
+        if let Some(handle) = writer {
+            if let Ok(Err(err)) = handle.join() {
+                if output.status.success() {
+                    return Err(err.into());
+                }
+            }
+        }
+        Ok(output)
+    })?;
+    ensure!(
+        output.status.success(),
+        "git check-attr filter failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let mut parts = output.stdout.split(|&b| b == 0);
+    while let (Some(path), Some(_attr), Some(value)) = (parts.next(), parts.next(), parts.next()) {
+        if matches!(value, b"" | b"unspecified" | b"unset" | b"set") {
+            continue;
+        }
+        if drivers.iter().any(|d| d.as_slice() == value) {
+            anyhow::bail!(
+                "Refusing to create worktree: {} uses repo-local Git smudge filter `{}` which is disabled for safety and would leave unprocessed files in the worktree; configure the filter globally instead",
+                String::from_utf8_lossy(path),
+                String::from_utf8_lossy(value)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Populates a newly created `--no-checkout` worktree at `worktree` using a
+/// fixed, sanitized shadow `GIT_DIR`, so repo-local smudge/process filters can
+/// never run during checkout even if `.git/config` changes concurrently.
+pub(crate) fn populate_worktree(worktree: &Path) -> Result<()> {
+    let git_dir_out = git_command()
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(worktree)
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        git_dir_out.status.success(),
+        "git rev-parse --git-dir: {}",
+        String::from_utf8_lossy(&git_dir_out.stderr).trim()
+    );
+    let raw = git_dir_out
+        .stdout
+        .strip_suffix(b"\n")
+        .unwrap_or(&git_dir_out.stdout);
+    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+    let git_dir_rel = PathBuf::from(bytes_to_os(raw)?);
+    let git_dir = std::path::absolute(if git_dir_rel.is_absolute() {
+        git_dir_rel
+    } else {
+        worktree.join(git_dir_rel)
+    })?;
+    let index = git_dir.join("index");
+
+    let sanitized = SanitizedGitDir::new(worktree)?;
+    let run = |args: &[&str]| -> Result<()> {
+        let out = sanitized
+            .command(worktree)
+            .args(args)
+            .env("GIT_INDEX_FILE", &index)
+            .stdin(Stdio::null())
+            .output()
+            .context("Start Git")?;
+        ensure!(
+            out.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        Ok(())
+    };
+    run(&["read-tree", "HEAD"])?;
+    run(&["checkout-index", "-a", "-f"])?;
+    let _ = sanitized
+        .command(worktree)
+        .args(["update-index", "-q", "--refresh"])
+        .env("GIT_INDEX_FILE", &index)
+        .stdin(Stdio::null())
+        .output();
+    Ok(())
 }
 
 fn split_first(bytes: &[u8], sep: u8) -> Option<(&[u8], &[u8])> {
@@ -154,109 +588,42 @@ fn split_last(bytes: &[u8], sep: u8) -> Option<(&[u8], &[u8])> {
 #[cfg(unix)]
 fn bytes_to_os(bytes: &[u8]) -> Result<OsString> {
     use std::os::unix::ffi::OsStrExt;
-    ensure!(!bytes.contains(&0), "Git config key contains NUL byte");
+    ensure!(
+        !bytes.contains(&0),
+        "Git path or config key contains NUL byte"
+    );
     Ok(std::ffi::OsStr::from_bytes(bytes).to_os_string())
 }
 
 #[cfg(not(unix))]
 fn bytes_to_os(bytes: &[u8]) -> Result<OsString> {
-    let text = std::str::from_utf8(bytes)
-        .context("Git config key is not valid UTF-8 and cannot be safely overridden")?;
-    ensure!(!text.contains('\0'), "Git config key contains NUL byte");
+    let text = std::str::from_utf8(bytes).context("Git path or config key is not valid UTF-8")?;
+    ensure!(
+        !text.contains('\0'),
+        "Git path or config key contains NUL byte"
+    );
     Ok(OsString::from(text))
 }
 
-fn git_supports_config_env() -> bool {
-    static SUPPORTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SUPPORTS.get_or_init(|| {
-        let Ok(output) = git_command()
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-        else {
-            return false;
-        };
-        if !output.status.success() {
-            return false;
-        }
-        parse_git_version(&String::from_utf8_lossy(&output.stdout))
-            .is_some_and(|(major, minor)| (major, minor) >= (2, 31))
-    })
-}
-
-fn parse_git_version(text: &str) -> Option<(u32, u32)> {
-    let token = text
-        .split_whitespace()
-        .find(|part| part.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
-    let mut nums = token.split('.');
-    let major = nums.next()?.parse().ok()?;
-    let minor = nums.next()?.parse().ok()?;
-    Some((major, minor))
-}
-
-fn driver_override_value(key: &[u8]) -> Option<&'static str> {
-    if key.eq_ignore_ascii_case(b"diff.external") {
-        return Some("");
-    }
-    let (section, rest) = split_first(key, b'.')?;
-    let (subsection, var) = split_last(rest, b'.')?;
-    if subsection.is_empty() {
-        return None;
-    }
-    if section.eq_ignore_ascii_case(b"filter") {
-        // Leave `filter.<driver>.required` intact so Git fails closed on
-        // checkout/worktree/staging when a required repo-local filter cannot run.
-        if var.eq_ignore_ascii_case(b"clean")
-            || var.eq_ignore_ascii_case(b"smudge")
-            || var.eq_ignore_ascii_case(b"process")
-        {
-            return Some("");
-        }
-    } else if section.eq_ignore_ascii_case(b"diff") {
-        if var.eq_ignore_ascii_case(b"textconv") || var.eq_ignore_ascii_case(b"command") {
-            return Some("");
-        }
-    } else if section.eq_ignore_ascii_case(b"merge") && var.eq_ignore_ascii_case(b"driver") {
-        return Some("");
-    }
-    None
-}
-
-fn repo_driver_overrides(dir: &Path) -> Result<Vec<(Vec<u8>, &'static str)>> {
-    // `--list -z` avoids locale-dependent regexes (which skip non-UTF-8 keys)
-    // and preserves exact key bytes, including newlines and non-UTF-8 bytes.
+fn git_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = git_command()
-        .args(["config", "--show-scope", "--name-only", "-z", "--list"])
+        .args(args)
         .current_dir(dir)
         .stdin(Stdio::null())
         .output()
         .context("Start Git")?;
     ensure!(
         output.status.success(),
-        "Could not inspect Git config scopes in {} (requires Git 2.26+): {}",
-        dir.display(),
+        "git {}: {}",
+        args.join(" "),
         String::from_utf8_lossy(&output.stderr).trim()
     );
-    let mut overrides = Vec::new();
-    let mut parts = output.stdout.split(|&b| b == 0);
-    while let (Some(scope), Some(key)) = (parts.next(), parts.next()) {
-        if scope != b"local" && scope != b"worktree" {
-            continue;
-        }
-        let Some(value) = driver_override_value(key) else {
-            continue;
-        };
-        let entry = (key.to_vec(), value);
-        if !overrides.contains(&entry) {
-            overrides.push(entry);
-        }
-    }
-    Ok(overrides)
+    Ok(output.stdout)
 }
 
-fn git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
-    let mut command = crate::snapshot::git_command_in(dir)?;
+fn git_sanitized(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
+    let sanitized = SanitizedGitDir::new(dir)?;
+    let mut command = sanitized.command(dir);
     command.args(args).stdin(Stdio::null());
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
@@ -271,30 +638,46 @@ fn git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+/// Repository detection independent of config-scope inspection, so older Git
+/// versions (< 2.26) still recognize repositories and surface the version
+/// error when an affected operation runs.
 pub fn is_repository(dir: &Path) -> bool {
-    git(dir, None, &["rev-parse", "--is-inside-work-tree"])
-        .is_ok_and(|out| out.starts_with(b"true"))
+    git_raw(dir, &["rev-parse", "--is-inside-work-tree"]).is_ok_and(|out| out.starts_with(b"true"))
+}
+
+/// The working tree as a Git tree ID. `Ok(None)` outside Git; returns the Git
+/// error when `workspace` is a Git repository and snapshotting fails.
+pub fn try_tree(workspace: &Path, run_dir: &Path) -> Result<Option<String>> {
+    let Some(run) = run_dir.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    try_tree_with(workspace, &run_dir.join("snapshot.index"), run)
+}
+
+/// `try_tree` with its own private index, kept under run `run`'s refs.
+pub fn try_tree_with(workspace: &Path, index: &Path, run: &str) -> Result<Option<String>> {
+    let index = std::path::absolute(index)?;
+    let Some(tree) = capture(workspace, &index)? else {
+        return Ok(None);
+    };
+    // Best effort: an unkept tree still serves until the next gc.
+    let _ = git_raw(
+        workspace,
+        &["update-ref", &format!("{}/{tree}", namespace(run)), &tree],
+    );
+    Ok(Some(tree))
 }
 
 /// The working tree as a Git tree ID. None outside Git or when Git fails; a
-/// snapshot never fails a run.
+/// snapshot never fails a run unless the caller uses `try_tree`.
 pub fn tree(workspace: &Path, run_dir: &Path) -> Option<String> {
-    let run = run_dir.file_name().and_then(|name| name.to_str())?;
-    tree_with(workspace, &run_dir.join("snapshot.index"), run)
+    try_tree(workspace, run_dir).ok().flatten()
 }
 
 /// `tree` with its own private index, e.g. for a fan-out candidate's
 /// worktree; kept under run `run`'s refs.
 pub fn tree_with(workspace: &Path, index: &Path, run: &str) -> Option<String> {
-    let index = std::path::absolute(index).ok()?;
-    let tree = capture(workspace, &index).ok().flatten()?;
-    // Best effort: an unkept tree still serves until the next gc.
-    let _ = git(
-        workspace,
-        None,
-        &["update-ref", &format!("{}/{tree}", namespace(run)), &tree],
-    );
-    Some(tree)
+    try_tree_with(workspace, index, run).ok().flatten()
 }
 
 /// The working tree as a Git tree ID now, through caller-provided `index` and
@@ -313,7 +696,7 @@ pub fn current_tree(workspace: &Path) -> Result<Option<String>> {
 
 /// Whether `tree` names a tree object in `dir`'s repository.
 pub fn exists(dir: &Path, tree: &str) -> bool {
-    git(dir, None, &["cat-file", "-e", &format!("{tree}^{{tree}}")]).is_ok()
+    git_raw(dir, &["cat-file", "-e", &format!("{tree}^{{tree}}")]).is_ok()
 }
 
 /// Makes the files of a fresh checkout `workspace` match snapshot `tree`
@@ -321,18 +704,19 @@ pub fn exists(dir: &Path, tree: &str) -> bool {
 /// refs stay as they are. Fails, saying why, when the result differs from
 /// `tree` (e.g. attribute filters rewrote files).
 pub fn materialize(workspace: &Path, tree: &str) -> Result<()> {
-    let head = git(
+    let head = git_raw(
         workspace,
-        None,
         &["rev-parse", "--verify", "--quiet", "HEAD^{tree}"],
     )
     .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
     .context("The checkout has no HEAD commit")?;
     if head != tree {
+        let sanitized = SanitizedGitDir::new(workspace)?;
         let scratch = tempfile::tempdir().context("Create a scratch directory")?;
         let patch = scratch.path().join("snapshot.patch");
         let file = fs::File::create(&patch)?;
-        let status = crate::snapshot::git_command()
+        let status = sanitized
+            .command(workspace)
             .args([
                 "--no-pager",
                 "diff",
@@ -348,7 +732,6 @@ pub fn materialize(workspace: &Path, tree: &str) -> Result<()> {
                 &head,
                 tree,
             ])
-            .current_dir(workspace)
             .stdin(Stdio::null())
             .stdout(file)
             .stderr(Stdio::null())
@@ -356,11 +739,17 @@ pub fn materialize(workspace: &Path, tree: &str) -> Result<()> {
             .context("Start Git")?;
         ensure!(status.success(), "git diff {head} {tree} failed");
         let patch = patch.to_str().context("Scratch path must be UTF-8")?;
-        git(
-            workspace,
-            None,
-            &["apply", "--binary", "--whitespace=nowarn", patch],
-        )?;
+        let apply = sanitized
+            .command(workspace)
+            .args(["apply", "--binary", "--whitespace=nowarn", patch])
+            .stdin(Stdio::null())
+            .output()
+            .context("Start Git")?;
+        ensure!(
+            apply.status.success(),
+            "git apply --binary --whitespace=nowarn {patch}: {}",
+            String::from_utf8_lossy(&apply.stderr).trim()
+        );
     }
     let now = current_tree(workspace)?.context("The checkout is not a Git repository")?;
     ensure!(
@@ -374,9 +763,8 @@ pub fn materialize(workspace: &Path, tree: &str) -> Result<()> {
 /// run cannot prune it. False when `tree` is not in the repository.
 pub fn keep(dir: &Path, run: &str, tree: &str) -> bool {
     exists(dir, tree)
-        && git(
+        && git_raw(
             dir,
-            None,
             &["update-ref", &format!("{}/{tree}", namespace(run)), tree],
         )
         .is_ok()
@@ -395,11 +783,7 @@ fn namespace(run: &str) -> String {
 /// outside Git.
 pub fn forget(project: &Path, run: &str) {
     let prefix = format!("{}/", namespace(run));
-    let Ok(refs) = git(
-        project,
-        None,
-        &["for-each-ref", "--format=%(refname)", &prefix],
-    ) else {
+    let Ok(refs) = git_raw(project, &["for-each-ref", "--format=%(refname)", &prefix]) else {
         return;
     };
     let commands: String = String::from_utf8_lossy(&refs)
@@ -426,46 +810,77 @@ pub fn forget(project: &Path, run: &str) {
 }
 
 fn capture(workspace: &Path, index: &Path) -> Result<Option<String>> {
-    if !index.exists() {
-        if !is_repository(workspace) {
-            return Ok(None);
-        }
-        seed(workspace, index)?;
+    let existed = index.exists();
+    if !existed && !is_repository(workspace) {
+        return Ok(None);
+    }
+    let sanitized = SanitizedGitDir::new(workspace)?;
+    if !existed {
+        seed(workspace, &sanitized, index)?;
     }
     // Snapshots are taken under the run lock, so a leftover lock is from an
     // interrupted add and would fail every later snapshot.
     let mut lock = OsString::from(index);
     lock.push(".lock");
     let _ = fs::remove_file(PathBuf::from(lock));
-    git(workspace, Some(index), &["add", "-A"])?;
-    let tree = git(workspace, Some(index), &["write-tree"])?;
-    Ok(Some(String::from_utf8_lossy(&tree).trim().to_owned()))
+    let add_out = sanitized
+        .command(workspace)
+        .args(["add", "-A"])
+        .env("GIT_INDEX_FILE", index)
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        add_out.status.success(),
+        "git add -A: {}",
+        String::from_utf8_lossy(&add_out.stderr).trim()
+    );
+    let tree_out = sanitized
+        .command(workspace)
+        .args(["write-tree"])
+        .env("GIT_INDEX_FILE", index)
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        tree_out.status.success(),
+        "git write-tree: {}",
+        String::from_utf8_lossy(&tree_out.stderr).trim()
+    );
+    Ok(Some(
+        String::from_utf8_lossy(&tree_out.stdout).trim().to_owned(),
+    ))
 }
 
 /// Seeds the private index from the real one, whose stat data keeps the first
 /// add fast; else from HEAD; else, for an unborn HEAD, starts empty.
-fn seed(workspace: &Path, index: &Path) -> Result<()> {
-    let real = git(workspace, None, &["rev-parse", "--git-path", "index"])?;
+fn seed(workspace: &Path, sanitized: &SanitizedGitDir, index: &Path) -> Result<()> {
+    let real = git_raw(workspace, &["rev-parse", "--git-path", "index"])?;
     let real = workspace.join(String::from_utf8_lossy(&real).trim_end());
     if fs::copy(&real, index).is_ok() {
         return Ok(());
     }
     let _ = fs::remove_file(index);
-    if git(
-        workspace,
-        None,
-        &["rev-parse", "--verify", "--quiet", "HEAD"],
-    )
-    .is_ok()
-    {
-        git(workspace, Some(index), &["read-tree", "HEAD"])?;
+    if git_raw(workspace, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok() {
+        let out = sanitized
+            .command(workspace)
+            .args(["read-tree", "HEAD"])
+            .env("GIT_INDEX_FILE", index)
+            .stdin(Stdio::null())
+            .output()
+            .context("Start Git")?;
+        ensure!(
+            out.status.success(),
+            "git read-tree HEAD: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(())
 }
 
 /// File paths that differ between two snapshot trees (one `git diff` call).
 pub fn changed_paths(dir: &Path, from: &str, to: &str) -> Result<Vec<String>> {
-    let out = git(
+    let out = git_sanitized(
         dir,
         None,
         &["diff", "--no-renames", "-z", "--name-only", from, to],
@@ -479,16 +894,24 @@ pub fn changed_paths(dir: &Path, from: &str, to: &str) -> Result<Vec<String>> {
 
 /// Files that differ between two snapshot trees.
 pub fn changes(dir: &Path, from: &str, to: &str) -> Result<Vec<FileChange>> {
-    let names = git(
-        dir,
-        None,
-        &["diff", "--no-renames", "-z", "--name-status", from, to],
-    )?;
-    let numstat = git(
-        dir,
-        None,
-        &["diff", "--no-renames", "-z", "--numstat", from, to],
-    )?;
+    let sanitized = SanitizedGitDir::new(dir)?;
+    let run = |args: &[&str]| -> Result<Vec<u8>> {
+        let out = sanitized
+            .command(dir)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .context("Start Git")?;
+        ensure!(
+            out.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        Ok(out.stdout)
+    };
+    let names = run(&["diff", "--no-renames", "-z", "--name-status", from, to])?;
+    let numstat = run(&["diff", "--no-renames", "-z", "--numstat", from, to])?;
     // Each record is "added\tremoved\tpath"; binary files count "-".
     let counts: HashMap<&[u8], (Option<u64>, Option<u64>)> = numstat
         .split(|&b| b == 0)
@@ -526,7 +949,9 @@ fn number(field: &[u8]) -> Option<u64> {
 /// `git diff` between two trees, cut after `max` bytes with a note.
 pub fn patch(dir: &Path, from: &str, to: &str, max: usize) -> Result<String> {
     const STDERR_LIMIT: u64 = 64 * 1024;
-    let mut child = crate::snapshot::git_command()
+    let sanitized = SanitizedGitDir::new(dir)?;
+    let mut child = sanitized
+        .command(dir)
         .args([
             "--no-pager",
             "-c",
@@ -539,7 +964,6 @@ pub fn patch(dir: &Path, from: &str, to: &str, max: usize) -> Result<String> {
             from,
             to,
         ])
-        .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -634,7 +1058,9 @@ pub fn patch_lines(dir: &Path, from: &str, to: &str, mut each: impl FnMut(&str))
     // so a match across a chunk boundary is whole in one chunk.
     const OVERLAP: usize = 2048;
     const STDERR_LIMIT: u64 = 64 * 1024;
-    let mut child = crate::snapshot::git_command()
+    let sanitized = SanitizedGitDir::new(dir)?;
+    let mut child = sanitized
+        .command(dir)
         .args([
             "--no-pager",
             "-c",
@@ -650,7 +1076,6 @@ pub fn patch_lines(dir: &Path, from: &str, to: &str, mut each: impl FnMut(&str))
             from,
             to,
         ])
-        .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -752,6 +1177,22 @@ pub fn patch_lines(dir: &Path, from: &str, to: &str, mut each: impl FnMut(&str))
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
+        let mut command = git_command();
+        command.args(args).current_dir(dir).stdin(Stdio::null());
+        if let Some(index) = index {
+            command.env("GIT_INDEX_FILE", index);
+        }
+        let output = command.output().context("Start Git")?;
+        ensure!(
+            output.status.success(),
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        Ok(output.stdout)
+    }
 
     /// A temporary repository with one commit, or None when the host has no
     /// Git identity: tests never invent commit authorship.
@@ -1066,16 +1507,40 @@ mod tests {
             "snapshot::tree executed repo-local filter command"
         );
 
-        // Verify merge.pwn.driver is cleared by git_command_in.
-        let effective = git_command_in(workspace)
-            .unwrap()
+        // Verify merge.pwn.driver is omitted from SanitizedGitDir, and that a
+        // concurrent `.git/config` mutation after constructing SanitizedGitDir
+        // cannot affect commands executed with it.
+        let sanitized = SanitizedGitDir::new(workspace).unwrap();
+        let late_marker = workspace.join("late-toctou-pwned");
+        run_git(&[
+            "config",
+            "--local",
+            "filter.late.clean",
+            &format!("sh -c 'touch {:?}; cat'", late_marker.display().to_string()),
+        ]);
+        fs::write(workspace.join(".gitattributes"), "*.late filter=late\n").unwrap();
+        fs::write(workspace.join("race.late"), "hello\n").unwrap();
+        let effective = sanitized
+            .command(workspace)
             .args(["config", "--get", "merge.pwn.driver"])
             .output()
             .unwrap();
         assert!(
             String::from_utf8_lossy(&effective.stdout).trim().is_empty(),
-            "merge.pwn.driver was not cleared: {:?}",
+            "merge.pwn.driver was not omitted: {:?}",
             String::from_utf8_lossy(&effective.stdout)
+        );
+        let race_index = workspace.join(".model-router/runs/fixture/race.index");
+        let add_out = sanitized
+            .command(workspace)
+            .args(["add", "-A"])
+            .env("GIT_INDEX_FILE", &race_index)
+            .output()
+            .unwrap();
+        assert!(add_out.status.success());
+        assert!(
+            !late_marker.exists(),
+            "SanitizedGitDir reloaded mutated .git/config"
         );
 
         // Non-UTF-8 filter subsection names must also be preserved and neutralized.
@@ -1099,8 +1564,8 @@ mod tests {
             );
         }
 
-        // A required local smudge filter causes worktree checkout to fail closed
-        // instead of silently producing unfiltered pointer files.
+        // Both optional and required local smudge filters must fail worktree
+        // creation closed instead of silently producing unprocessed files.
         let wt_dir = repository().unwrap();
         let wt_ws = wt_dir.path();
         let wt_marker = wt_ws.join("smudge-pwned");
@@ -1122,6 +1587,28 @@ mod tests {
             "filter.lfs.smudge",
             &format!("sh -c 'touch {:?}; cat'", wt_marker.display().to_string()),
         ]);
+        // Optional (required unset) local smudge filter must still refuse.
+        let opt_err = crate::storage::create_worktree(wt_ws, "wt-optional", true).unwrap_err();
+        assert!(
+            format!("{opt_err:#}").contains("repo-local Git smudge filter"),
+            "{opt_err:#}"
+        );
+        assert!(
+            !wt_marker.exists(),
+            "worktree add executed optional repo-local smudge filter"
+        );
+        // Fan-out worktree creation must also refuse.
+        let fanout_wt = wt_ws.join(".model-router/candidates/test/c1");
+        let fanout_err = crate::fanout::add_worktree(wt_ws, &fanout_wt, "HEAD").unwrap_err();
+        assert!(
+            format!("{fanout_err:#}").contains("repo-local Git smudge filter"),
+            "{fanout_err:#}"
+        );
+        assert!(
+            !wt_marker.exists(),
+            "fanout::add_worktree executed optional repo-local smudge filter"
+        );
+        // Required local smudge filter also refuses.
         run_wt_git(&["config", "--local", "filter.lfs.required", "true"]);
         assert!(
             crate::storage::create_worktree(wt_ws, "wt-required", true).is_err(),
