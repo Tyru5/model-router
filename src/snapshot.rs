@@ -256,8 +256,9 @@ fn parse_and_build_sanitized_config(
     // Only common `local` scope: a source worktree's `config.worktree` does
     // not apply to a newly created worktree.
     let mut local_smudge_filters: Vec<Vec<u8>> = Vec::new();
-    // Repository-local Git LFS endpoint URLs (data, not commands), kept so
-    // git-lfs can still fetch objects missing from the local cache.
+    // Repository-local Git LFS endpoint URLs and remote selection (data, not
+    // commands), kept so git-lfs can still fetch objects missing from the
+    // local cache from the same remote a normal checkout would use.
     let mut lfs_endpoints: Vec<ConfigEntry> = Vec::new();
 
     let mut parts = raw.split(|&b| b == 0);
@@ -355,6 +356,19 @@ fn parse_and_build_sanitized_config(
             }
         } else if section.eq_ignore_ascii_case(b"lfs") && rest.eq_ignore_ascii_case(b"url") {
             push_lfs_endpoint(&mut lfs_endpoints, b"lfs", None, b"url", val);
+        } else if section.eq_ignore_ascii_case(b"remote")
+            && (rest.eq_ignore_ascii_case(b"lfsdefault")
+                || rest.eq_ignore_ascii_case(b"lfspushdefault"))
+        {
+            let var = rest.to_ascii_lowercase();
+            push_lfs_endpoint(&mut lfs_endpoints, b"remote", None, &var, val);
+        } else if section.eq_ignore_ascii_case(b"branch") {
+            // git-lfs fetches from the current branch's remote.
+            if let Some((sub, var)) = split_last(rest, b'.') {
+                if !sub.is_empty() && var.eq_ignore_ascii_case(b"remote") {
+                    push_lfs_endpoint(&mut lfs_endpoints, b"branch", Some(sub), b"remote", val);
+                }
+            }
         } else if section.eq_ignore_ascii_case(b"remote") {
             if let Some((sub, var)) = split_last(rest, b'.') {
                 if var.eq_ignore_ascii_case(b"promisor") && !is_git_explicit_false(val) {
@@ -1151,6 +1165,7 @@ fn capture(workspace: &Path, index: &Path) -> Result<Option<String>> {
     let mut lock = OsString::from(index);
     lock.push(".lock");
     let _ = fs::remove_file(PathBuf::from(lock));
+    refuse_unfiltered_rehash(workspace, &sanitized, index)?;
     let add_out = sanitized
         .command(workspace)
         .args(["add", "-A"])
@@ -1178,6 +1193,56 @@ fn capture(workspace: &Path, index: &Path) -> Result<Option<String>> {
     Ok(Some(
         String::from_utf8_lossy(&tree_out.stdout).trim().to_owned(),
     ))
+}
+
+/// Refuses a snapshot when `git add -A` would rehash an existing file whose
+/// repo-local clean filter the router disables: its index entry may hold the
+/// filtered blob, so storing raw bytes would make an untouched file (a new
+/// timestamp only) look edited.
+fn refuse_unfiltered_rehash(
+    workspace: &Path,
+    sanitized: &SanitizedGitDir,
+    index: &Path,
+) -> Result<()> {
+    let drivers = sanitized.local_clean_filters();
+    if drivers.is_empty() {
+        return Ok(());
+    }
+    let top = sanitized.top_level();
+    let out = sanitized
+        .command(top)
+        .args([
+            "diff-files",
+            "--name-only",
+            "-z",
+            "--ignore-submodules=dirty",
+        ])
+        .env("GIT_INDEX_FILE", index)
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        out.status.success(),
+        "git diff-files: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let mut paths = Vec::new();
+    for path in out.stdout.split(|&b| b == 0).filter(|p| !p.is_empty()) {
+        // A deleted file leaves the index; nothing is rehashed.
+        if fs::symlink_metadata(top.join(bytes_to_os(path)?)).is_ok() {
+            paths.extend_from_slice(path);
+            paths.push(0);
+        }
+    }
+    if let Some((path, driver)) =
+        find_suppressed_filter_path(sanitized, top, &paths, Some(index), drivers)?
+    {
+        anyhow::bail!(
+            "Cannot snapshot {} reliably: {path} changed on disk and uses repo-local Git clean filter `{driver}`, which is disabled for safety, so an edit cannot be told from a timestamp change. Configure the filter globally",
+            workspace.display()
+        );
+    }
+    Ok(())
 }
 
 /// Seeds the private index from the real one, whose stat data keeps the first
@@ -2145,7 +2210,7 @@ mod tests {
 
         // Repo-local LFS endpoint URLs survive; a worktree-scope smudge
         // filter does not block new worktrees, a local one does.
-        let lfs_raw = b"local\0remote.origin.url\nhttps://example.test/r.git\0local\0lfs.url\nhttps://lfs.example.test\0worktree\0filter.wt.smudge\ncat\0local\0filter.lc.smudge\ncat\0";
+        let lfs_raw = b"local\0remote.origin.url\nhttps://example.test/r.git\0local\0lfs.url\nhttps://lfs.example.test\0worktree\0filter.wt.smudge\ncat\0local\0filter.lc.smudge\ncat\0local\0remote.lfsdefault\nupstream\0local\0branch.main.remote\nupstream\0";
         let lfs = parse_and_build_sanitized_config(&repo_canon, &common_dir, lfs_raw).unwrap();
         fs::write(shadow_dir.path().join("lfs.config"), &lfs.sanitized_config).unwrap();
         let get = |key: &str| {
@@ -2159,6 +2224,8 @@ mod tests {
         };
         assert_eq!(get("remote.origin.url"), "https://example.test/r.git");
         assert_eq!(get("lfs.url"), "https://lfs.example.test");
+        assert_eq!(get("remote.lfsdefault"), "upstream");
+        assert_eq!(get("branch.main.remote"), "upstream");
         assert_eq!(get("filter.wt.smudge"), "");
         assert_eq!(lfs.local_smudge_filters, vec![b"lc".to_vec()]);
 

@@ -130,8 +130,13 @@ working-tree attributes, stage files, diff, apply patches, populate worktrees,
 or launch `git difftool` run against a fixed, private sanitized `GIT_DIR`
 config (requiring Git 2.26+) that excludes repo-local filters, diff/merge
 drivers, and difftools so concurrent `.git/config` changes cannot inject
-commands; it keeps repo-local Git LFS endpoint URLs (`lfs.url`,
-`remote.*.url`, `remote.*.lfsurl`). That `GIT_DIR` lives in a `tmp` directory inside the router's
+commands; it keeps repo-local Git LFS endpoint URLs and remote selection
+(`lfs.url`, `remote.*.url`, `remote.*.lfsurl`, `remote.lfsdefault`,
+`remote.lfspushdefault`, `branch.*.remote`). Router `git status` calls pass
+`--ignore-submodules=dirty`, so Git never runs inside a submodule with that
+submodule's own config. A snapshot is refused when a changed file uses a
+disabled repo-local clean filter, since an edit cannot be told from a new
+timestamp. That `GIT_DIR` lives in a `tmp` directory inside the router's
 socket directory, which stages cannot write. Partial clones
 (`extensions.partialClone` or `remote.*.promisor`) and a repository-local
 `lfs.storage` are refused; use a full clone and set `lfs.storage` globally.

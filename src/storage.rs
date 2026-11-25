@@ -263,7 +263,16 @@ pub fn repo_info(project: &Path) -> Option<RepoInfo> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| top.clone());
-    let status = git_readonly(project, &["status", "--porcelain=v2", "--branch"]).ok()?;
+    let status = git_readonly(
+        project,
+        &[
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--ignore-submodules=dirty",
+        ],
+    )
+    .ok()?;
     let mut oid = None;
     let mut branch_head = None;
     let mut changes = 0usize;
@@ -450,7 +459,9 @@ fn ensure_clean_checkout(project: &Path) -> Result<()> {
     let sanitized = crate::snapshot::SanitizedGitDir::new(project)?;
     let output = sanitized
         .command(project)
-        .args(["status", "--porcelain", "-z"])
+        // `dirty`: never run status inside a submodule, whose own config the
+        // shadow GIT_DIR does not cover and a stage may have written.
+        .args(["status", "--porcelain", "-z", "--ignore-submodules=dirty"])
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(std::process::Stdio::null())
         .output()

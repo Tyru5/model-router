@@ -1002,7 +1002,11 @@ pub fn cleanup_plan(project: &Path, criteria: &Criteria) -> Result<Plan> {
 fn removable(tree: &Path) -> Result<()> {
     ensure!(tree.join(".git").is_file(), "not a linked Git worktree");
     ensure!(
-        storage::git_readonly(tree, &["status", "--porcelain"])?.is_empty(),
+        storage::git_readonly(
+            tree,
+            &["status", "--porcelain", "--ignore-submodules=dirty"]
+        )?
+        .is_empty(),
         "uncommitted changes"
     );
     Ok(())
