@@ -444,7 +444,7 @@ pub fn create_worktree(project: &Path, id: &str, require_clean: bool) -> Result<
             &head,
         ],
     )?;
-    if let Err(err) = crate::snapshot::populate_worktree(&path) {
+    if let Err(err) = crate::snapshot::populate_worktree(&path, &head) {
         let _ = git(project, &["worktree", "remove", "--force", path_str]);
         let _ = fs::remove_dir_all(&path);
         let _ = git(project, &["worktree", "prune"]);

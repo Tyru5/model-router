@@ -415,26 +415,20 @@ fn parse_and_build_sanitized_config(
                     subsection.to_vec(),
                     val.map(<[u8]>::to_vec),
                 );
-            } else if var.eq_ignore_ascii_case(b"clean") {
-                if val.is_some_and(|v| !v.is_empty())
-                    && !local_clean_filters.iter().any(|d| d == subsection)
-                {
-                    local_clean_filters.push(subsection.to_vec());
-                }
-            } else if var.eq_ignore_ascii_case(b"smudge") {
-                if val.is_some_and(|v| !v.is_empty())
-                    && !local_smudge_filters.iter().any(|d| d == subsection)
-                {
-                    local_smudge_filters.push(subsection.to_vec());
-                }
-            } else if var.eq_ignore_ascii_case(b"process") && val.is_some_and(|v| !v.is_empty()) {
-                if !local_clean_filters.iter().any(|d| d == subsection) {
-                    local_clean_filters.push(subsection.to_vec());
-                }
-                if !local_smudge_filters.iter().any(|d| d == subsection) {
-                    local_smudge_filters.push(subsection.to_vec());
-                }
             }
+        }
+    }
+    // Disabled drivers come from the last repo-local value of each command,
+    // so one a later empty value turned off blocks nothing.
+    for (driver, var, empty) in &local_filter_commands {
+        if *empty {
+            continue;
+        }
+        if var != b"smudge" && !local_clean_filters.contains(driver) {
+            local_clean_filters.push(driver.clone());
+        }
+        if var != b"clean" && !local_smudge_filters.contains(driver) {
+            local_smudge_filters.push(driver.clone());
         }
     }
 
@@ -787,8 +781,10 @@ pub(crate) fn find_suppressed_filter_path(
 /// a `.gitattributes` `filter` naming a repo-local or worktree-local
 /// `smudge`/`process` filter that the router disables, so worktrees never
 /// silently start with unprocessed pointer files (even for optional filters).
-pub(crate) fn refuse_suppressed_smudge_filters(dir: &Path, commit_or_tree: &str) -> Result<()> {
-    let sanitized = SanitizedGitDir::new(dir)?;
+fn refuse_suppressed_smudge_filters(
+    sanitized: &SanitizedGitDir,
+    commit_or_tree: &str,
+) -> Result<()> {
     let drivers = sanitized.local_smudge_filters();
     if drivers.is_empty() {
         return Ok(());
@@ -885,7 +881,7 @@ pub(crate) fn refuse_suppressed_smudge_filters(dir: &Path, commit_or_tree: &str)
 /// Populates a newly created `--no-checkout` worktree at `worktree` using a
 /// fixed, sanitized shadow `GIT_DIR`, so repo-local smudge/process filters can
 /// never run during checkout even if `.git/config` changes concurrently.
-pub(crate) fn populate_worktree(worktree: &Path) -> Result<()> {
+pub(crate) fn populate_worktree(worktree: &Path, commit: &str) -> Result<()> {
     let git_dir_out = git_command()
         .args(["rev-parse", "--git-dir"])
         .current_dir(worktree)
@@ -910,11 +906,23 @@ pub(crate) fn populate_worktree(worktree: &Path) -> Result<()> {
     })?;
     let index = git_dir.join("index");
 
-    // Checked from the new worktree, so the config scopes and attribute
-    // sources are exactly those the checkout below uses (a source worktree's
-    // `config.worktree` does not apply here).
-    refuse_suppressed_smudge_filters(worktree, "HEAD")?;
+    // `git worktree add` copies sparse-checkout settings, which this
+    // checkout would ignore and write every tracked file.
+    let sparse = git_command()
+        .args(["config", "--type=bool", "--get", "core.sparseCheckout"])
+        .current_dir(worktree)
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        String::from_utf8_lossy(&sparse.stdout).trim() != "true",
+        "Refusing to create worktree: sparse checkouts (core.sparseCheckout) are not supported in worktree mode; use the current directory instead"
+    );
+    // One sanitized config and one commit for the filter check and the
+    // checkout, taken from the new worktree: its config scopes and attribute
+    // sources, not the source worktree's `config.worktree`.
     let sanitized = SanitizedGitDir::new(worktree)?;
+    refuse_suppressed_smudge_filters(&sanitized, commit)?;
     let run = |args: &[&str]| -> Result<()> {
         let out = sanitized
             .command(worktree)
@@ -931,7 +939,7 @@ pub(crate) fn populate_worktree(worktree: &Path) -> Result<()> {
         );
         Ok(())
     };
-    run(&["read-tree", "HEAD"])?;
+    run(&["read-tree", commit])?;
     run(&["checkout-index", "-a", "-f"])?;
     let _ = sanitized
         .command(worktree)
@@ -2377,7 +2385,9 @@ mod tests {
             &["config", "--local", "filter.set.smudge", "cat"],
         )
         .unwrap();
-        let ambig_err = refuse_suppressed_smudge_filters(ambig_ws, "HEAD").unwrap_err();
+        let ambig_err =
+            refuse_suppressed_smudge_filters(&SanitizedGitDir::new(ambig_ws).unwrap(), "HEAD")
+                .unwrap_err();
         assert!(
             format!("{ambig_err:#}").contains("`set`"),
             "expected filter `set` refusal, got: {ambig_err:#}"

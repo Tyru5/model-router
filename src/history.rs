@@ -998,9 +998,15 @@ pub fn cleanup_plan(project: &Path, criteria: &Criteria) -> Result<Plan> {
     Ok(plan)
 }
 
-/// Ok when `git worktree remove` takes `tree` without --force.
+/// Ok when `git worktree remove` would take `tree` without --force: no
+/// changes, no untracked files, and no initialized submodules.
 fn removable(tree: &Path) -> Result<()> {
     ensure!(tree.join(".git").is_file(), "not a linked Git worktree");
+    let git_dir = storage::git_readonly(tree, &["rev-parse", "--absolute-git-dir"])?;
+    ensure!(
+        !Path::new(&git_dir).join("modules").exists(),
+        "contains submodules"
+    );
     ensure!(
         storage::git_readonly(
             tree,
@@ -1045,11 +1051,13 @@ fn remove(project: &Path, item: &Item) -> Result<Item> {
     })?;
     let mut done = item.clone();
     if let Some((tree, _)) = &item.worktree {
-        // Never --force: Git refuses worktrees with changes. Branches stay.
-        let removed = tree
-            .to_str()
-            .context("Worktree path must be UTF-8")
-            .and_then(|path| storage::git(project, &["worktree", "remove", path]));
+        // Git's own check before removal runs with the repository's config,
+        // filters included, so the router checks with its sanitized config
+        // and only then removes with --force. Branches stay.
+        let removed = removable(tree).and_then(|()| {
+            let path = tree.to_str().context("Worktree path must be UTF-8")?;
+            storage::git(project, &["worktree", "remove", "--force", path]).map(|_| ())
+        });
         if let Err(error) = removed {
             done.worktree = None;
             done.note = Some(format!("Worktree kept: {error:#}"));

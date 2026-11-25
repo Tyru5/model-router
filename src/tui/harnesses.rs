@@ -342,14 +342,19 @@ fn run_test_with_argv(test: &HarnessTest, argv: &[OsString]) -> Result<TestOutco
 
 /// The result dialog's body.
 pub(super) fn test_report(test: &HarnessTest, passed: bool, status: &str, output: &str) -> String {
-    let command: Vec<_> = test
+    // The router ran its embedded copy of the script, never the checkout's
+    // file, so the script path is not shown as a command to replay.
+    let mut command: Vec<_> = test
         .argv()
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
+    if let Some(slot) = command.get_mut(2) {
+        *slot = format!("<embedded {TEST_SCRIPT}>");
+    }
     let output = crate::storage::clean_terminal(output.trim());
     let mut text = format!(
-        "{}: {status}\n\n$ {}\n(The router ran this build's embedded copy of {TEST_SCRIPT}; the command above runs the checkout's file, unverified.)\n\n{}\n",
+        "{}: {status}\n\nRan: {}\n\n{}\n",
         if passed { "✓ Passed" } else { "✗ Failed" },
         shell_words::join(&command),
         if output.is_empty() {
@@ -1497,7 +1502,7 @@ mod tests {
         assert_eq!(title, "Test · codex");
         for expected in [
             "✓ Passed: exit status: 0",
-            "capture_harness_output.py codex --confirm-paid-request --router",
+            "<embedded scripts/capture_harness_output.py>' codex --confirm-paid-request --router",
             "--output-dir",
             ".model-router/harness-tests/codex-",
             "Saved fixture.",

@@ -107,7 +107,7 @@ pub fn add_worktree(workspace: &Path, path: &Path, commit: &str) -> Result<()> {
             &resolved,
         ],
     )?;
-    if let Err(err) = snapshot::populate_worktree(path) {
+    if let Err(err) = snapshot::populate_worktree(path, &resolved) {
         let _ = git_raw(workspace, &["worktree", "remove", "--force", path_str]);
         let _ = fs::remove_dir_all(path);
         let _ = git_raw(workspace, &["worktree", "prune"]);
