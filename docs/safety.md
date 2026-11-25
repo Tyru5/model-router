@@ -143,8 +143,9 @@ attribute names a repo-local `merge.<name>.driver`, or the file has no `merge`
 attribute and a repo-local `merge.default` is set; the driver never runs. A
 new worktree keeps the sparse-checkout settings and rules `git worktree add`
 copied to it (Git 2.36 or later): files outside them are not written. When
-filling a new worktree fails, the router removes that worktree and its own
-record, not `git worktree prune`. `history clean --worktrees` runs
+filling a new worktree fails, or a run's candidate and delegate worktrees are
+removed, the router removes those worktrees and their own records; it never
+runs `git worktree prune`. `history clean --worktrees` runs
 `git worktree remove` with every repo-local clean and process filter turned
 off (`-c filter.<name>.clean= -c filter.<name>.process=`), so a file that
 needs one keeps the worktree. That `GIT_DIR` lives in a `tmp` directory inside the router's

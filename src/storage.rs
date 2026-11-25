@@ -445,7 +445,7 @@ pub fn git_readonly(project: &Path, args: &[&str]) -> Result<String> {
 /// Git's record of linked worktree `tree` (`<common dir>/worktrees/<id>`),
 /// when `tree` is the path Git registered for it: a copy of a worktree that
 /// was moved still points at the moved one's record.
-fn worktree_record(tree: &Path) -> Result<PathBuf> {
+pub(crate) fn worktree_record(tree: &Path) -> Result<PathBuf> {
     let record = PathBuf::from(git(tree, &["rev-parse", "--absolute-git-dir"])?);
     ensure!(
         record

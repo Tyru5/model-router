@@ -2587,6 +2587,17 @@ mod tests {
             &["rev-parse", "--verify", "model-router/fails"],
         )
         .unwrap_err();
+        // Removing a run's candidate worktrees leaves it alone too.
+        git(
+            workspace,
+            None,
+            &["config", "--unset", "filter.local.smudge"],
+        )
+        .unwrap();
+        crate::fanout::add_worktree(workspace, &candidate, "HEAD").unwrap();
+        crate::fanout::remove_worktrees(workspace, candidate.parent().unwrap()).unwrap();
+        let listed = git(workspace, None, &["worktree", "list", "--porcelain"]).unwrap();
+        assert!(!String::from_utf8_lossy(&listed).contains("/c1\n"));
         // The other worktree works again once its directory is back.
         fs::rename(&away, &other).unwrap();
         assert!(
