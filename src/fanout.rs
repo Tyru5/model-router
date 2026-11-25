@@ -114,9 +114,7 @@ pub fn add_worktree(workspace: &Path, path: &Path, commit: &str) -> Result<()> {
         ],
     )?;
     if let Err(err) = snapshot::populate_worktree(path, &resolved) {
-        let _ = git_raw(workspace, &["worktree", "remove", "--force", path_str]);
-        let _ = fs::remove_dir_all(path);
-        let _ = git_raw(workspace, &["worktree", "prune"]);
+        storage::discard_worktree(workspace, path);
         return Err(err);
     }
     Ok(())
@@ -130,13 +128,20 @@ pub fn remove_worktrees(project: &Path, dir: &Path) -> Result<()> {
     }
     let mut trees = vec![];
     collect(dir, &mut trees);
+    // Each tree's own record, removed below if Git left it: never
+    // `git worktree prune`, which also drops the records of other worktrees
+    // whose directories are missing for now.
+    let mut records = vec![];
     for tree in trees {
+        records.extend(storage::worktree_record(&tree).ok());
         if let Some(path) = tree.to_str() {
             let _ = git_raw(project, &["worktree", "remove", "--force", path]);
         }
     }
     fs::remove_dir_all(dir).with_context(|| format!("Remove {}", dir.display()))?;
-    let _ = git_raw(project, &["worktree", "prune"]);
+    for record in records {
+        let _ = fs::remove_dir_all(record);
+    }
     Ok(())
 }
 

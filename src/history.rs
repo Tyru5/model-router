@@ -1005,15 +1005,8 @@ pub fn cleanup_plan(project: &Path, criteria: &Criteria) -> Result<Plan> {
 /// this worktree's record in the repository. A tree that is locked
 /// (`git worktree lock`) or not clean is kept where it was.
 fn remove_worktree(tree: &Path) -> Result<()> {
-    // Git's record of this worktree: `<common dir>/worktrees/<id>`.
-    let record = PathBuf::from(storage::git(tree, &["rev-parse", "--absolute-git-dir"])?);
-    ensure!(
-        record
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|name| name == "worktrees"),
-        "not a linked Git worktree"
-    );
+    // Git's record of this worktree, only if Git registered this path.
+    let record = storage::worktree_record(tree)?;
     let unlocked = || -> Result<()> {
         ensure!(
             fs::symlink_metadata(record.join("locked")).is_err(),
