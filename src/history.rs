@@ -1001,9 +1001,27 @@ pub fn cleanup_plan(project: &Path, criteria: &Criteria) -> Result<Plan> {
 /// Removes clean worktree `tree`. Not `git worktree remove`: its own check
 /// for changes reads the live repository config, filters included. The
 /// router moves the tree aside, so nothing saves into it by path any more,
-/// checks it again with its sanitized config, deletes it, and prunes Git's
-/// record. A tree that is not clean is moved back and kept.
-fn remove_worktree(project: &Path, tree: &Path) -> Result<()> {
+/// checks it again with its sanitized config, deletes it, and removes only
+/// this worktree's record in the repository. A tree that is locked
+/// (`git worktree lock`) or not clean is kept where it was.
+fn remove_worktree(tree: &Path) -> Result<()> {
+    // Git's record of this worktree: `<common dir>/worktrees/<id>`.
+    let record = PathBuf::from(storage::git(tree, &["rev-parse", "--absolute-git-dir"])?);
+    ensure!(
+        record
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "worktrees"),
+        "not a linked Git worktree"
+    );
+    let unlocked = || -> Result<()> {
+        ensure!(
+            fs::symlink_metadata(record.join("locked")).is_err(),
+            "locked with `git worktree lock`"
+        );
+        Ok(())
+    };
+    unlocked()?;
     removable(tree)?;
     let mut name = tree
         .file_name()
@@ -1012,12 +1030,14 @@ fn remove_worktree(project: &Path, tree: &Path) -> Result<()> {
     name.push(format!(".removing-{}", uuid::Uuid::new_v4().simple()));
     let aside = tree.with_file_name(name);
     fs::rename(tree, &aside).with_context(|| format!("Move {} aside", tree.display()))?;
-    if let Err(err) = removable(&aside) {
+    if let Err(err) = unlocked().and_then(|()| removable(&aside)) {
         fs::rename(&aside, tree).with_context(|| format!("Restore {}", tree.display()))?;
         return Err(err);
     }
     fs::remove_dir_all(&aside).with_context(|| format!("Remove {}", aside.display()))?;
-    storage::git(project, &["worktree", "prune"]).map(|_| ())
+    // Not `git worktree prune`, which also drops records of other
+    // worktrees whose directories are missing for now.
+    fs::remove_dir_all(&record).with_context(|| format!("Remove {}", record.display()))
 }
 
 /// Ok when `git worktree remove` takes `tree` without --force, as far as
@@ -1032,7 +1052,13 @@ fn removable(tree: &Path) -> Result<()> {
     ensure!(
         storage::git_readonly(
             tree,
-            &["status", "--porcelain", "--ignore-submodules=dirty"]
+            &[
+                "status",
+                "--porcelain",
+                // Whatever status.showUntrackedFiles says.
+                "--untracked-files=normal",
+                "--ignore-submodules=dirty",
+            ]
         )?
         .is_empty(),
         "uncommitted changes"
@@ -1075,7 +1101,7 @@ fn remove(project: &Path, item: &Item) -> Result<Item> {
     let mut done = item.clone();
     if let Some((tree, _)) = &item.worktree {
         // Only a clean worktree goes. Branches stay.
-        let removed = remove_worktree(project, tree);
+        let removed = remove_worktree(tree);
         if let Err(error) = removed {
             done.worktree = None;
             done.note = Some(format!("Worktree kept: {error:#}"));
@@ -1399,12 +1425,18 @@ mod tests {
         let changed = storage::create_worktree(repo, "changed", false).unwrap();
         fs::write(changed.join("file.txt"), "edited\n").unwrap();
 
-        remove_worktree(repo, &clean).unwrap();
+        remove_worktree(&clean).unwrap();
         assert!(!clean.exists());
         let listed = git(&["worktree", "list", "--porcelain"]);
         assert!(!listed.contains("/clean\n"), "{listed}");
 
-        let err = remove_worktree(repo, &changed).unwrap_err();
+        let locked = storage::create_worktree(repo, "locked", false).unwrap();
+        git(&["worktree", "lock", locked.to_str().unwrap()]);
+        let err = remove_worktree(&locked).unwrap_err();
+        assert!(format!("{err:#}").contains("locked"), "{err:#}");
+        assert!(locked.join("file.txt").exists());
+
+        let err = remove_worktree(&changed).unwrap_err();
         assert!(
             format!("{err:#}").contains("uncommitted changes"),
             "{err:#}"
