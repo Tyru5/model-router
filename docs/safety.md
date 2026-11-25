@@ -135,9 +135,11 @@ commands; it keeps repo-local Git LFS endpoint URLs and remote selection
 `remote.lfspushdefault`, `branch.*.remote`). Router `git status` calls pass
 `--ignore-submodules=dirty`, so Git never runs inside a submodule with that
 submodule's own config; worktree mode checks each populated submodule with
-its own sanitized Git directory instead. A snapshot is refused when a changed file uses a
-disabled repo-local clean filter, since an edit cannot be told from a new
-timestamp. That `GIT_DIR` lives in a `tmp` directory inside the router's
+its own sanitized Git directory instead. A snapshot is refused when a new or changed file uses a
+disabled repo-local clean filter, since it would hold unfiltered bytes. New
+worktrees are checked for disabled smudge filters from the new worktree's own
+config, and a fan-out three-way apply is refused when a patched file uses
+one. That `GIT_DIR` lives in a `tmp` directory inside the router's
 socket directory, which stages cannot write. Partial clones
 (`extensions.partialClone` or `remote.*.promisor`) and a repository-local
 `lfs.storage` are refused; use a full clone and set `lfs.storage` globally.

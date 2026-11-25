@@ -427,7 +427,6 @@ pub fn create_worktree(project: &Path, id: &str, require_clean: bool) -> Result<
     // Resolve HEAD to a fixed commit SHA once so the filter check and
     // `worktree add` operate on the exact same commit even if HEAD moves.
     let head = git(project, &["rev-parse", "--verify", "HEAD^{commit}"])?;
-    crate::snapshot::refuse_suppressed_smudge_filters(project, &head)?;
     let base = metadata_dir(project)?.join("worktrees");
     fs::create_dir_all(&base)?;
     let path = base.join(id);

@@ -92,7 +92,6 @@ pub fn add_worktree(workspace: &Path, path: &Path, commit: &str) -> Result<()> {
         workspace,
         &["rev-parse", "--verify", &format!("{commit}^{{commit}}")],
     )?;
-    snapshot::refuse_suppressed_smudge_filters(workspace, &resolved)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -219,6 +218,26 @@ pub fn apply(
     if git_sanitized(&top, None, &["apply", "--binary", patch]).is_ok() {
         return Ok(Applied::Clean);
     }
+    // A three-way apply, and the restore after a failed one, write files
+    // from Git blobs without the smudge filters the router disables.
+    let sanitized = snapshot::SanitizedGitDir::new(&top)?;
+    let mut stdin_paths = Vec::new();
+    for file in files {
+        stdin_paths.extend_from_slice(file.as_bytes());
+        stdin_paths.push(0);
+    }
+    if let Some((path, driver)) = snapshot::find_suppressed_filter_path(
+        &sanitized,
+        &top,
+        &stdin_paths,
+        Some(index),
+        sanitized.local_smudge_filters(),
+    )? {
+        anyhow::bail!(
+            "Refusing a three-way apply: {path} uses repo-local Git smudge filter `{driver}`, which is disabled for safety, and merging or restoring it would write unfiltered contents. Configure the filter globally or apply the patch by hand"
+        );
+    }
+    drop(sanitized);
     fs::create_dir_all(scratch)?;
     let check_index = std::path::absolute(scratch.join("apply-check.index"))?;
     fs::copy(index, &check_index).context("Copy the snapshot index")?;

@@ -253,8 +253,6 @@ fn parse_and_build_sanitized_config(
     // written verbatim so Git itself parses numeric/boolean forms (e.g. `2`).
     let mut local_filter_required: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
     let mut local_clean_filters: Vec<Vec<u8>> = Vec::new();
-    // Only common `local` scope: a source worktree's `config.worktree` does
-    // not apply to a newly created worktree.
     let mut local_smudge_filters: Vec<Vec<u8>> = Vec::new();
     // Repository-local Git LFS endpoint URLs and remote selection (data, not
     // commands), kept so git-lfs can still fetch objects missing from the
@@ -405,8 +403,7 @@ fn parse_and_build_sanitized_config(
                     local_clean_filters.push(subsection.to_vec());
                 }
             } else if var.eq_ignore_ascii_case(b"smudge") {
-                if scope == b"local"
-                    && val.is_some_and(|v| !v.is_empty())
+                if val.is_some_and(|v| !v.is_empty())
                     && !local_smudge_filters.iter().any(|d| d == subsection)
                 {
                     local_smudge_filters.push(subsection.to_vec());
@@ -415,7 +412,7 @@ fn parse_and_build_sanitized_config(
                 if !local_clean_filters.iter().any(|d| d == subsection) {
                     local_clean_filters.push(subsection.to_vec());
                 }
-                if scope == b"local" && !local_smudge_filters.iter().any(|d| d == subsection) {
+                if !local_smudge_filters.iter().any(|d| d == subsection) {
                     local_smudge_filters.push(subsection.to_vec());
                 }
             }
@@ -754,9 +751,8 @@ pub(crate) fn find_suppressed_filter_path(
 }
 
 /// Refuses to check out a worktree at `commit_or_tree` when any file in it has
-/// a `.gitattributes` `filter` naming a repo-local `smudge`/`process` filter
-/// that the router disables (a source worktree's `config.worktree` does not
-/// apply to the new worktree), so worktrees never
+/// a `.gitattributes` `filter` naming a repo-local or worktree-local
+/// `smudge`/`process` filter that the router disables, so worktrees never
 /// silently start with unprocessed pointer files (even for optional filters).
 pub(crate) fn refuse_suppressed_smudge_filters(dir: &Path, commit_or_tree: &str) -> Result<()> {
     let sanitized = SanitizedGitDir::new(dir)?;
@@ -881,6 +877,10 @@ pub(crate) fn populate_worktree(worktree: &Path) -> Result<()> {
     })?;
     let index = git_dir.join("index");
 
+    // Checked from the new worktree, so the config scopes and attribute
+    // sources are exactly those the checkout below uses (a source worktree's
+    // `config.worktree` does not apply here).
+    refuse_suppressed_smudge_filters(worktree, "HEAD")?;
     let sanitized = SanitizedGitDir::new(worktree)?;
     let run = |args: &[&str]| -> Result<()> {
         let out = sanitized
@@ -1195,10 +1195,10 @@ fn capture(workspace: &Path, index: &Path) -> Result<Option<String>> {
     ))
 }
 
-/// Refuses a snapshot when `git add -A` would rehash an existing file whose
-/// repo-local clean filter the router disables: its index entry may hold the
-/// filtered blob, so storing raw bytes would make an untouched file (a new
-/// timestamp only) look edited.
+/// Refuses a snapshot when `git add -A` would hash a new or changed file
+/// whose repo-local clean filter the router disables: the snapshot would hold
+/// raw bytes where Git stores filtered ones, so an untouched file (a new
+/// timestamp only) could look edited.
 fn refuse_unfiltered_rehash(
     workspace: &Path,
     sanitized: &SanitizedGitDir,
@@ -1226,8 +1226,26 @@ fn refuse_unfiltered_rehash(
         "git diff-files: {}",
         String::from_utf8_lossy(&out.stderr).trim()
     );
+    // `git add -A` also stages untracked files that are not ignored.
+    let untracked = sanitized
+        .command(top)
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .env("GIT_INDEX_FILE", index)
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        untracked.status.success(),
+        "git ls-files --others: {}",
+        String::from_utf8_lossy(&untracked.stderr).trim()
+    );
     let mut paths = Vec::new();
-    for path in out.stdout.split(|&b| b == 0).filter(|p| !p.is_empty()) {
+    for path in out
+        .stdout
+        .split(|&b| b == 0)
+        .chain(untracked.stdout.split(|&b| b == 0))
+        .filter(|p| !p.is_empty())
+    {
         // A deleted file leaves the index; nothing is rehashed.
         if fs::symlink_metadata(top.join(bytes_to_os(path)?)).is_ok() {
             paths.extend_from_slice(path);
@@ -1238,7 +1256,7 @@ fn refuse_unfiltered_rehash(
         find_suppressed_filter_path(sanitized, top, &paths, Some(index), drivers)?
     {
         anyhow::bail!(
-            "Cannot snapshot {} reliably: {path} changed on disk and uses repo-local Git clean filter `{driver}`, which is disabled for safety, so an edit cannot be told from a timestamp change. Configure the filter globally",
+            "Cannot snapshot {} reliably: {path} is new or changed and uses repo-local Git clean filter `{driver}`, which is disabled for safety, so an edit cannot be told from a timestamp change. Configure the filter globally",
             workspace.display()
         );
     }
@@ -1894,7 +1912,13 @@ mod tests {
         );
 
         let run_dir = run_dir(workspace);
-        assert!(tree(workspace, &run_dir).is_some());
+        // New files needing a disabled clean filter are refused, not hashed
+        // raw, and the filter still never runs.
+        let snapshot_err = try_tree(workspace, &run_dir).unwrap_err();
+        assert!(
+            format!("{snapshot_err:#}").contains("repo-local Git clean filter"),
+            "unexpected error: {snapshot_err:#}"
+        );
         assert!(
             !marker.exists(),
             "snapshot::tree executed repo-local filter command"
@@ -1950,7 +1974,7 @@ mod tests {
             fs::write(workspace.join(".gitattributes"), attrs).unwrap();
             fs::write(workspace.join("bytes.raw"), "payload\n").unwrap();
 
-            assert!(tree(workspace, &run_dir).is_some());
+            assert!(try_tree(workspace, &run_dir).is_err());
             assert!(
                 !marker.exists(),
                 "snapshot::tree executed non-UTF-8 repo-local filter"
@@ -2250,8 +2274,7 @@ mod tests {
         assert!(mixed_req.status.success());
         assert_eq!(String::from_utf8_lossy(&mixed_req.stdout).trim(), "true");
 
-        // Repo-local LFS endpoint URLs survive; a worktree-scope smudge
-        // filter does not block new worktrees, a local one does.
+        // Repo-local LFS endpoint URLs and remote selection survive.
         let lfs_raw = b"local\0remote.origin.url\nhttps://example.test/r.git\0local\0lfs.url\nhttps://lfs.example.test\0worktree\0filter.wt.smudge\ncat\0local\0filter.lc.smudge\ncat\0local\0remote.lfsdefault\nupstream\0local\0branch.main.remote\nupstream\0";
         let lfs = parse_and_build_sanitized_config(&repo_canon, &common_dir, lfs_raw).unwrap();
         fs::write(shadow_dir.path().join("lfs.config"), &lfs.sanitized_config).unwrap();
@@ -2269,7 +2292,10 @@ mod tests {
         assert_eq!(get("remote.lfsdefault"), "upstream");
         assert_eq!(get("branch.main.remote"), "upstream");
         assert_eq!(get("filter.wt.smudge"), "");
-        assert_eq!(lfs.local_smudge_filters, vec![b"lc".to_vec()]);
+        assert_eq!(
+            lfs.local_smudge_filters,
+            vec![b"wt".to_vec(), b"lc".to_vec()]
+        );
 
         // Partial clones (extensions.partialClone or remote.*.promisor) fail closed.
         for partial_raw in [
