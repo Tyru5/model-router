@@ -254,6 +254,9 @@ fn parse_and_build_sanitized_config(
     let mut local_filter_required: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
     let mut local_clean_filters: Vec<Vec<u8>> = Vec::new();
     let mut local_smudge_filters: Vec<Vec<u8>> = Vec::new();
+    // Whether the last repo-local `filter.<driver>.{clean,smudge,process}` is
+    // empty: an empty value turns a trusted global command off, and is kept.
+    let mut local_filter_commands: Vec<(Vec<u8>, Vec<u8>, bool)> = Vec::new();
     // Repository-local Git LFS endpoint URLs and remote selection (data, not
     // commands), kept so git-lfs can still fetch objects missing from the
     // local cache from the same remote a normal checkout would use.
@@ -390,6 +393,22 @@ fn parse_and_build_sanitized_config(
             if subsection.is_empty() {
                 continue;
             }
+            if [&b"clean"[..], b"smudge", b"process"]
+                .iter()
+                .any(|name| var.eq_ignore_ascii_case(name))
+            {
+                if let Some(value) = val {
+                    let var = var.to_ascii_lowercase();
+                    let empty = value.is_empty();
+                    match local_filter_commands
+                        .iter_mut()
+                        .find(|(d, v, _)| d == subsection && *v == var)
+                    {
+                        Some(entry) => entry.2 = empty,
+                        None => local_filter_commands.push((subsection.to_vec(), var, empty)),
+                    }
+                }
+            }
             if var.eq_ignore_ascii_case(b"required") {
                 set_last(
                     &mut local_filter_required,
@@ -493,6 +512,20 @@ fn parse_and_build_sanitized_config(
     )?;
     for entry in trusted_driver_entries.iter().chain(&lfs_endpoints) {
         write_config_entry(&mut sanitized_config, entry)?;
+    }
+    // After the trusted entries, so the empty value wins as it does in Git.
+    for (driver, var, empty) in &local_filter_commands {
+        if *empty {
+            write_config_entry(
+                &mut sanitized_config,
+                &ConfigEntry {
+                    section: b"filter".to_vec(),
+                    subsection: Some(driver.clone()),
+                    var: var.clone(),
+                    value: Some(Vec::new()),
+                },
+            )?;
+        }
     }
     for (driver, value) in &local_filter_required {
         // Never allow a repository-local `required = false` to downgrade a
@@ -2275,7 +2308,7 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&mixed_req.stdout).trim(), "true");
 
         // Repo-local LFS endpoint URLs and remote selection survive.
-        let lfs_raw = b"local\0remote.origin.url\nhttps://example.test/r.git\0local\0lfs.url\nhttps://lfs.example.test\0worktree\0filter.wt.smudge\ncat\0local\0filter.lc.smudge\ncat\0local\0remote.lfsdefault\nupstream\0local\0branch.main.remote\nupstream\0";
+        let lfs_raw = b"local\0remote.origin.url\nhttps://example.test/r.git\0local\0lfs.url\nhttps://lfs.example.test\0worktree\0filter.wt.smudge\ncat\0local\0filter.lc.smudge\ncat\0local\0remote.lfsdefault\nupstream\0local\0branch.main.remote\nupstream\0global\0filter.off.clean\ncat\0local\0filter.off.clean\n\0";
         let lfs = parse_and_build_sanitized_config(&repo_canon, &common_dir, lfs_raw).unwrap();
         fs::write(shadow_dir.path().join("lfs.config"), &lfs.sanitized_config).unwrap();
         let get = |key: &str| {
@@ -2292,6 +2325,9 @@ mod tests {
         assert_eq!(get("remote.lfsdefault"), "upstream");
         assert_eq!(get("branch.main.remote"), "upstream");
         assert_eq!(get("filter.wt.smudge"), "");
+        // An empty local value still turns the global command off.
+        assert_eq!(get("filter.off.clean"), "");
+        assert!(!lfs.local_clean_filters.contains(&b"off".to_vec()));
         assert_eq!(
             lfs.local_smudge_filters,
             vec![b"wt".to_vec(), b"lc".to_vec()]

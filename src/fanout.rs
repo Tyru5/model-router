@@ -218,26 +218,7 @@ pub fn apply(
     if git_sanitized(&top, None, &["apply", "--binary", patch]).is_ok() {
         return Ok(Applied::Clean);
     }
-    // A three-way apply, and the restore after a failed one, write files
-    // from Git blobs without the smudge filters the router disables.
-    let sanitized = snapshot::SanitizedGitDir::new(&top)?;
-    let mut stdin_paths = Vec::new();
-    for file in files {
-        stdin_paths.extend_from_slice(file.as_bytes());
-        stdin_paths.push(0);
-    }
-    if let Some((path, driver)) = snapshot::find_suppressed_filter_path(
-        &sanitized,
-        &top,
-        &stdin_paths,
-        Some(index),
-        sanitized.local_smudge_filters(),
-    )? {
-        anyhow::bail!(
-            "Refusing a three-way apply: {path} uses repo-local Git smudge filter `{driver}`, which is disabled for safety, and merging or restoring it would write unfiltered contents. Configure the filter globally or apply the patch by hand"
-        );
-    }
-    drop(sanitized);
+    refuse_unfiltered_merge(&top, index, files)?;
     fs::create_dir_all(scratch)?;
     let check_index = std::path::absolute(scratch.join("apply-check.index"))?;
     fs::copy(index, &check_index).context("Copy the snapshot index")?;
@@ -267,6 +248,30 @@ pub fn apply(
     Ok(Applied::Conflict(files.to_vec()))
 }
 
+/// A three-way apply, and the restore after a failed one, write files from
+/// Git blobs without the smudge filters the router disables: refused when a
+/// patched file uses one.
+fn refuse_unfiltered_merge(top: &Path, index: &Path, files: &[String]) -> Result<()> {
+    let sanitized = snapshot::SanitizedGitDir::new(top)?;
+    let mut stdin_paths = Vec::new();
+    for file in files {
+        stdin_paths.extend_from_slice(file.as_bytes());
+        stdin_paths.push(0);
+    }
+    if let Some((path, driver)) = snapshot::find_suppressed_filter_path(
+        &sanitized,
+        top,
+        &stdin_paths,
+        Some(index),
+        sanitized.local_smudge_filters(),
+    )? {
+        anyhow::bail!(
+            "Refusing a three-way apply: {path} uses repo-local Git smudge filter `{driver}`, which is disabled for safety, and merging or restoring it would write unfiltered contents. Configure the filter globally or apply the patch by hand"
+        );
+    }
+    Ok(())
+}
+
 /// What `apply` would do, without touching the workspace: a plain apply
 /// check, then the three-way merge in a copy of the snapshot index only
 /// (`git apply --3way --cached`, Git 2.32 or later; an older Git reports a
@@ -286,6 +291,7 @@ pub fn check(
     {
         return Ok(Applied::Clean);
     }
+    refuse_unfiltered_merge(&top, index, files)?;
     fs::create_dir_all(scratch)?;
     let merge = std::path::absolute(scratch.join("check.index"))?;
     fs::copy(index, &merge).context("Copy the snapshot index")?;

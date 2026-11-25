@@ -349,7 +349,7 @@ pub(super) fn test_report(test: &HarnessTest, passed: bool, status: &str, output
         .collect();
     let output = crate::storage::clean_terminal(output.trim());
     let mut text = format!(
-        "{}: {status}\n\n$ {}\n\n{}\n",
+        "{}: {status}\n\n$ {}\n(The router ran this build's embedded copy of {TEST_SCRIPT}; the command above runs the checkout's file, unverified.)\n\n{}\n",
         if passed { "✓ Passed" } else { "✗ Failed" },
         shell_words::join(&command),
         if output.is_empty() {
