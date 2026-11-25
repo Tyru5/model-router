@@ -1016,7 +1016,8 @@ fn removable(tree: &Path) -> Result<()> {
         .is_empty(),
         "uncommitted changes"
     );
-    Ok(())
+    // Removal is forced, so a status the router cannot trust keeps the tree.
+    crate::snapshot::refuse_unverifiable_clean(tree)
 }
 
 /// Removes a plan's runs: a planned worktree first, then handoff and run

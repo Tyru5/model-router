@@ -710,10 +710,33 @@ pub(crate) fn find_suppressed_filter_path(
     index: Option<&Path>,
     drivers: &[Vec<u8>],
 ) -> Result<Option<(String, String)>> {
+    find_suppressed_filter_path_in(sanitized, work, stdin_paths, index, drivers, &[false, true])
+}
+
+/// `find_suppressed_filter_path` reading attributes only from `index`, not
+/// the working tree: for a proposed result that is not on disk yet.
+pub(crate) fn find_suppressed_filter_path_cached(
+    sanitized: &SanitizedGitDir,
+    work: &Path,
+    stdin_paths: &[u8],
+    index: &Path,
+    drivers: &[Vec<u8>],
+) -> Result<Option<(String, String)>> {
+    find_suppressed_filter_path_in(sanitized, work, stdin_paths, Some(index), drivers, &[true])
+}
+
+fn find_suppressed_filter_path_in(
+    sanitized: &SanitizedGitDir,
+    work: &Path,
+    stdin_paths: &[u8],
+    index: Option<&Path>,
+    drivers: &[Vec<u8>],
+    sources: &[bool],
+) -> Result<Option<(String, String)>> {
     if drivers.is_empty() || stdin_paths.is_empty() {
         return Ok(None);
     }
-    for cached in [false, true] {
+    for &cached in sources {
         let mut cmd = sanitized.command(work);
         cmd.arg("check-attr");
         if cached {
@@ -1234,6 +1257,38 @@ fn capture(workspace: &Path, index: &Path) -> Result<Option<String>> {
     Ok(Some(
         String::from_utf8_lossy(&tree_out.stdout).trim().to_owned(),
     ))
+}
+
+/// Refuses when any tracked file in `dir` uses a repo-local clean filter the
+/// router disables: a sanitized `git status` then compares raw bytes with
+/// filtered ones and cannot prove the checkout clean.
+pub(crate) fn refuse_unverifiable_clean(dir: &Path) -> Result<()> {
+    let sanitized = SanitizedGitDir::new(dir)?;
+    let drivers = sanitized.local_clean_filters();
+    if drivers.is_empty() {
+        return Ok(());
+    }
+    let top = sanitized.top_level();
+    let out = sanitized
+        .command(top)
+        .args(["ls-files", "-z"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        out.status.success(),
+        "git ls-files: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    if let Some((path, driver)) =
+        find_suppressed_filter_path(&sanitized, top, &out.stdout, None, drivers)?
+    {
+        anyhow::bail!(
+            "cannot verify it is clean: {path} uses repo-local Git clean filter `{driver}`, which is disabled for safety"
+        );
+    }
+    Ok(())
 }
 
 /// Refuses a snapshot when `git add -A` would hash a new or changed file

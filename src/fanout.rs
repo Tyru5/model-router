@@ -222,7 +222,7 @@ pub fn apply(
     }
     // One fixed config for the filter check, the applies, and the restore.
     let sanitized = snapshot::SanitizedGitDir::new(&top)?;
-    refuse_unfiltered_apply(&sanitized, &top, index, files)?;
+    refuse_unfiltered_apply(&sanitized, &top, index, files, patch, scratch)?;
     // Plain apply checks the whole patch before writing any file.
     if git_in(&sanitized, &top, None, &["apply", "--binary", patch]).is_ok() {
         return Ok(Applied::Clean);
@@ -272,19 +272,52 @@ fn refuse_unfiltered_apply(
     top: &Path,
     index: &Path,
     files: &[String],
+    patch: &str,
+    scratch: &Path,
 ) -> Result<()> {
+    let drivers = sanitized.local_smudge_filters();
+    if drivers.is_empty() {
+        return Ok(());
+    }
     let mut stdin_paths = Vec::new();
     for file in files {
         stdin_paths.extend_from_slice(file.as_bytes());
         stdin_paths.push(0);
     }
-    if let Some((path, driver)) = snapshot::find_suppressed_filter_path(
-        sanitized,
-        top,
-        &stdin_paths,
-        Some(index),
-        sanitized.local_smudge_filters(),
-    )? {
+    let mut found =
+        snapshot::find_suppressed_filter_path(sanitized, top, &stdin_paths, Some(index), drivers)?;
+    if found.is_none() {
+        // The patch may add the `.gitattributes` rule itself: check again
+        // with the rules of the proposed result, in a copy of the index.
+        fs::create_dir_all(scratch)?;
+        let proposed = std::path::absolute(scratch.join("filter-check.index"))?;
+        let mut applied = false;
+        for mode in [
+            &["apply", "--cached", "--binary"][..],
+            &["apply", "--3way", "--cached", "--binary"],
+        ] {
+            fs::copy(index, &proposed).context("Copy the snapshot index")?;
+            let args: Vec<&str> = mode.iter().copied().chain([patch]).collect();
+            if git_in(sanitized, top, Some(&proposed), &args).is_ok() {
+                applied = true;
+                break;
+            }
+        }
+        let checked = if applied {
+            snapshot::find_suppressed_filter_path_cached(
+                sanitized,
+                top,
+                &stdin_paths,
+                &proposed,
+                drivers,
+            )
+        } else {
+            Ok(None)
+        };
+        let _ = fs::remove_file(&proposed);
+        found = checked?;
+    }
+    if let Some((path, driver)) = found {
         anyhow::bail!(
             "Refusing to apply the patch: {path} uses repo-local Git smudge filter `{driver}`, which is disabled for safety, and applying or restoring it would write unfiltered contents. Configure the filter globally or apply the patch by hand"
         );
@@ -310,7 +343,7 @@ pub fn check(
         return Ok(Applied::Clean);
     }
     let sanitized = snapshot::SanitizedGitDir::new(&top)?;
-    refuse_unfiltered_apply(&sanitized, &top, index, files)?;
+    refuse_unfiltered_apply(&sanitized, &top, index, files, patch, scratch)?;
     if git_in(
         &sanitized,
         &top,
