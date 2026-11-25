@@ -1118,6 +1118,9 @@ pub fn materialize(workspace: &Path, tree: &str) -> Result<()> {
     .context("The checkout has no HEAD commit")?;
     if head != tree {
         let sanitized = SanitizedGitDir::new(workspace)?;
+        // The patch writes Git's stored bytes: refuse when `tree`, by its own
+        // attribute rules, needs a smudge filter the router disables.
+        refuse_suppressed_smudge_filters(&sanitized, tree)?;
         let scratch = tempfile::tempdir().context("Create a scratch directory")?;
         let patch = scratch.path().join("snapshot.patch");
         let file = fs::File::create(&patch)?;
@@ -1289,6 +1292,25 @@ pub(crate) fn refuse_unverifiable_clean(dir: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `-c` arguments that turn off every repo-local clean/process filter, for a
+/// Git command that has to run with the repository's own config. Fails when
+/// a filter name cannot be written as a `-c` key.
+pub(crate) fn clean_filter_overrides(dir: &Path) -> Result<Vec<String>> {
+    let sanitized = SanitizedGitDir::new(dir)?;
+    let mut args = Vec::new();
+    for driver in sanitized.local_clean_filters() {
+        let name = std::str::from_utf8(driver)
+            .ok()
+            .filter(|name| !name.contains(['=', '\n']))
+            .context("a repo-local Git filter name cannot be turned off on the command line")?;
+        for var in ["clean", "process"] {
+            args.push("-c".to_owned());
+            args.push(format!("filter.{name}.{var}="));
+        }
+    }
+    Ok(args)
 }
 
 /// Refuses a snapshot when `git add -A` would hash a new or changed file
@@ -1714,10 +1736,10 @@ mod tests {
                 .success()
                 .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
         };
-        let (Some(name), Some(email)) = (identity("user.name"), identity("user.email")) else {
-            eprintln!("Skipping Git fixture: configure the human git identity first");
-            return None;
-        };
+        // The host's identity when configured; else a fixture-only one, so
+        // these tests never skip silently (CI sets no identity).
+        let name = identity("user.name").unwrap_or_else(|| "model-router tests".into());
+        let email = identity("user.email").unwrap_or_else(|| "tests@localhost".into());
         let dir = tempfile::tempdir().unwrap();
         let run = |args: &[&str]| {
             git(dir.path(), None, args).unwrap();

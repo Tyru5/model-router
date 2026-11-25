@@ -998,8 +998,9 @@ pub fn cleanup_plan(project: &Path, criteria: &Criteria) -> Result<Plan> {
     Ok(plan)
 }
 
-/// Ok when `git worktree remove` would take `tree` without --force: no
-/// changes, no untracked files, and no initialized submodules.
+/// Ok when `git worktree remove` takes `tree` without --force, as far as
+/// the sanitized config can tell: no changes, no untracked files, and no
+/// populated submodules.
 fn removable(tree: &Path) -> Result<()> {
     ensure!(tree.join(".git").is_file(), "not a linked Git worktree");
     ensure!(
@@ -1014,7 +1015,7 @@ fn removable(tree: &Path) -> Result<()> {
         .is_empty(),
         "uncommitted changes"
     );
-    // Removal is forced, so a status the router cannot trust keeps the tree.
+    // A status the router cannot trust keeps the tree.
     crate::snapshot::refuse_unverifiable_clean(tree)
 }
 
@@ -1051,12 +1052,16 @@ fn remove(project: &Path, item: &Item) -> Result<Item> {
     })?;
     let mut done = item.clone();
     if let Some((tree, _)) = &item.worktree {
-        // Git's own check before removal runs with the repository's config,
-        // filters included, so the router checks with its sanitized config
-        // and only then removes with --force. Branches stay.
+        // Never --force: Git refuses worktrees with changes, checking at the
+        // moment of removal. That check runs with the repository's config,
+        // so the router first checks with its sanitized config, then turns
+        // every repo-local clean filter off for Git's own. Branches stay.
         let removed = removable(tree).and_then(|()| {
             let path = tree.to_str().context("Worktree path must be UTF-8")?;
-            storage::git(project, &["worktree", "remove", "--force", path]).map(|_| ())
+            let overrides = crate::snapshot::clean_filter_overrides(tree)?;
+            let mut args: Vec<&str> = overrides.iter().map(String::as_str).collect();
+            args.extend(["worktree", "remove", path]);
+            storage::git(project, &args).map(|_| ())
         });
         if let Err(error) = removed {
             done.worktree = None;
