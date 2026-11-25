@@ -175,6 +175,10 @@ pub struct Plan {
     /// Blocking diff policies verified against the staged tree before commit.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub block_policies: Vec<DiffPolicy>,
+    /// Repo-local Git config the commit or push would run or follow
+    /// (`key=value`; see `repo_command_config`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub git_config: Vec<String>,
 }
 fn default_true() -> bool {
     true
@@ -290,8 +294,73 @@ impl Plan {
             }
             None => text.push_str("Draft PR: no\n"),
         }
+        if !self.git_config.is_empty() {
+            text.push_str(
+                "\nThis repository's own Git config sets commands or URL rewrites the commit or push uses:\n",
+            );
+            for entry in &self.git_config {
+                let _ = writeln!(text, "  {entry}");
+            }
+        }
         text
     }
+}
+
+/// Repo-local (`local` and `worktree` scope) Git config that makes
+/// `git commit-tree -S` or `git push` run a command or go elsewhere:
+/// `gpg.program`, `gpg.<format>.program`, `gpg.ssh.defaultKeyCommand`,
+/// `core.sshCommand`, `core.askPass`, `core.gitProxy`, `credential.helper`,
+/// `credential.<url>.helper`, `url.<base>.insteadOf`,
+/// `url.<base>.pushInsteadOf`, `remote.<name>.receivepack`, and
+/// `remote.<name>.vcs`. Anything that can write the checkout's `.git/config`
+/// can set them, so a ship shows them in its plan and never uses ones the
+/// plan did not show. One `key=value` per entry, in config order.
+fn repo_command_config(work: &Path) -> Result<Vec<String>> {
+    let output = snapshot::git_command()
+        .args(["config", "--show-scope", "-z", "--list"])
+        .current_dir(work)
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        output.status.success(),
+        "git config --list (requires Git 2.26+): {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let mut found = Vec::new();
+    let mut parts = output.stdout.split(|&b| b == 0);
+    while let (Some(scope), Some(entry)) = (parts.next(), parts.next()) {
+        if scope != b"local" && scope != b"worktree" {
+            continue;
+        }
+        let entry = String::from_utf8_lossy(entry);
+        let (key, value) = entry.split_once('\n').unwrap_or((&entry, ""));
+        let Some((section, rest)) = key.split_once('.') else {
+            continue;
+        };
+        let var = rest.rsplit('.').next().unwrap_or(rest).to_ascii_lowercase();
+        let nested = rest.contains('.');
+        let listed = match section.to_ascii_lowercase().as_str() {
+            "gpg" => matches!(var.as_str(), "program" | "defaultkeycommand"),
+            "core" => !nested && matches!(var.as_str(), "sshcommand" | "askpass" | "gitproxy"),
+            "credential" => var == "helper",
+            "url" => nested && matches!(var.as_str(), "insteadof" | "pushinsteadof"),
+            "remote" => nested && matches!(var.as_str(), "receivepack" | "vcs"),
+            _ => false,
+        };
+        if listed {
+            let mut shown = String::new();
+            for c in format!("{key}={value}").chars() {
+                if c.is_control() {
+                    shown.extend(c.escape_default());
+                } else {
+                    shown.push(c);
+                }
+            }
+            found.push(shown);
+        }
+    }
+    Ok(found)
 }
 
 fn short(sha: &str) -> &str {
@@ -760,6 +829,7 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
         secret_scan: options.secret_scan,
         secret_scanner: options.secret_scanner.clone(),
         block_policies,
+        git_config: repo_command_config(dir)?,
     })
 }
 
@@ -1084,6 +1154,11 @@ fn apply_steps(
         short(&plan.head),
         short(&head)
     );
+    // The commit and push below read the repository's own config.
+    ensure!(
+        repo_command_config(work)? == plan.git_config,
+        "This repository's Git config for signing, credentials, SSH, or URL rewrites changed since the ship was planned; plan again and review it"
+    );
     // Stage exactly the planned paths in a private index from HEAD. It
     // stays until the scans below have read it.
     let index = PrivateIndex(std::path::absolute(dir.join("ship.index"))?);
@@ -1392,8 +1467,9 @@ pub fn execute(run: &mut Run, cancel: &AtomicBool, emit: &mut impl FnMut(Event))
     };
     let digest = plan.digest();
     let approved = confirmed.as_deref() == Some(approval(&digest).as_str());
-    // A run an agent or a schedule created never ships unconfirmed.
-    let confirm = options.confirm || !run.creation_source.is_user();
+    // A run an agent or a schedule created never ships unconfirmed, nor
+    // does one whose commit or push would use repo-local Git commands.
+    let confirm = options.confirm || !run.creation_source.is_user() || !plan.git_config.is_empty();
     if confirm && !approved {
         let mut text = plan.preview();
         if confirmed.is_some() {
@@ -1792,6 +1868,8 @@ mod tests {
             secret_scan: false,
             ..Options::default()
         };
+        // Repo-local config a push would run is part of the plan.
+        git(root, &["config", "core.sshCommand", "ssh -i key"]).unwrap();
         let planned = plan(&run, &opts).unwrap();
         assert_eq!(
             planned
@@ -1801,6 +1879,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["sub/added.txt", "sub/deleted.txt", "sub/tracked.txt"]
         );
+        assert_eq!(planned.git_config, ["core.sshcommand=ssh -i key"]);
+        assert!(
+            planned.preview().contains("  core.sshcommand=ssh -i key\n"),
+            "{}",
+            planned.preview()
+        );
 
         // User has unrelated staged edits and an untracked file outside the run.
         fs::write(root.join("notes.txt"), "staged note\n").unwrap();
@@ -1808,6 +1892,30 @@ mod tests {
         fs::write(root.join("other.txt"), "dirty\n").unwrap();
 
         save_plan(&planned, &attempt_dir).unwrap();
+        // A signing program planted after the plan never runs.
+        let marker = root.join("signer-ran");
+        fs::write(root.join(".git/info/exclude"), "signer-ran\nsigner\n").unwrap();
+        let signer = root.join("signer");
+        fs::write(
+            &signer,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&signer, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        git(root, &["config", "gpg.program", signer.to_str().unwrap()]).unwrap();
+        git(root, &["config", "commit.gpgsign", "true"]).unwrap();
+        let outcome = apply(&planned, &attempt_dir, |_| {});
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("changed since the ship was planned")),
+            "{:?}",
+            outcome.error
+        );
+        assert!(outcome.commit.is_none() && !marker.exists());
+        git(root, &["config", "--unset", "gpg.program"]).unwrap();
+        git(root, &["config", "commit.gpgsign", "false"]).unwrap();
         let outcome = apply(&planned, &attempt_dir, |_| {});
         assert_eq!(outcome.error, None);
         assert!(outcome.commit.is_some());

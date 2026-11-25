@@ -155,6 +155,15 @@ needs one keeps the worktree. That `GIT_DIR` lives in a `tmp` directory inside t
 socket directory, which stages cannot write. Partial clones
 (`extensions.partialClone` or `remote.*.promisor`) and a repository-local
 `lfs.storage` are refused; use a full clone and set `lfs.storage` globally.
+
+A ship's commit and push run with the repository's own Git config, so its
+plan lists the repo-local entries that run a command or rewrite where a push
+goes: `gpg.program`, `gpg.<format>.program`, `gpg.ssh.defaultKeyCommand`,
+`core.sshCommand`, `core.askPass`, `core.gitProxy`, `credential.helper`,
+`credential.<url>.helper`, `url.<base>.insteadOf`, `url.<base>.pushInsteadOf`,
+`remote.<name>.receivepack`, and `remote.<name>.vcs`. A plan with any of them
+always waits for confirmation, even with `confirm = false`, and the ship
+stops if they changed after the plan.
 Worktree creation and shipping fail closed when affected files rely
 on suppressed repo-local filters, and workflows with `protected_paths` or
 blocking `policies` fail before launch when the pre-stage snapshot cannot be
