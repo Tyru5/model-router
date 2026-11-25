@@ -442,6 +442,47 @@ pub fn git_readonly(project: &Path, args: &[&str]) -> Result<String> {
         .to_owned())
 }
 
+/// Git's record of linked worktree `tree` (`<common dir>/worktrees/<id>`),
+/// when `tree` is the path Git registered for it: a copy of a worktree that
+/// was moved still points at the moved one's record.
+fn worktree_record(tree: &Path) -> Result<PathBuf> {
+    let record = PathBuf::from(git(tree, &["rev-parse", "--absolute-git-dir"])?);
+    ensure!(
+        record
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "worktrees"),
+        "not a linked Git worktree"
+    );
+    let registered =
+        fs::read_to_string(record.join("gitdir")).context("Read the worktree's Git record")?;
+    // Absolute, or relative to the record (`extensions.relativeWorktrees`).
+    let registered = record.join(registered.trim_end_matches(['\n', '\r']));
+    let same = match (
+        fs::canonicalize(&registered),
+        fs::canonicalize(tree.join(".git")),
+    ) {
+        (Ok(registered), Ok(own)) => registered == own,
+        _ => false,
+    };
+    ensure!(same, "Git registered another path for this worktree");
+    Ok(record)
+}
+
+/// Rolls back worktree `tree`, which the router just added: removes it and
+/// its own record, by force. Never `git worktree prune`, which also drops
+/// the records of other worktrees whose directories are missing for now.
+pub(crate) fn discard_worktree(project: &Path, tree: &Path) {
+    let record = worktree_record(tree).ok();
+    if let Some(path) = tree.to_str() {
+        let _ = git(project, &["worktree", "remove", "--force", path]);
+    }
+    let _ = fs::remove_dir_all(tree);
+    if let Some(record) = record {
+        let _ = fs::remove_dir_all(record);
+    }
+}
+
 /// A worktree on a new branch from HEAD. `require_clean` refuses when the
 /// project has uncommitted changes, which the worktree would not include.
 pub fn create_worktree(project: &Path, id: &str, require_clean: bool) -> Result<PathBuf> {
@@ -469,9 +510,7 @@ pub fn create_worktree(project: &Path, id: &str, require_clean: bool) -> Result<
         ],
     )?;
     if let Err(err) = crate::snapshot::populate_worktree(&path, &head) {
-        let _ = git(project, &["worktree", "remove", "--force", path_str]);
-        let _ = fs::remove_dir_all(&path);
-        let _ = git(project, &["worktree", "prune"]);
+        discard_worktree(project, &path);
         let _ = git(project, &["branch", "-D", &branch]);
         return Err(err);
     }

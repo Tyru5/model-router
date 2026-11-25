@@ -114,9 +114,7 @@ pub fn add_worktree(workspace: &Path, path: &Path, commit: &str) -> Result<()> {
         ],
     )?;
     if let Err(err) = snapshot::populate_worktree(path, &resolved) {
-        let _ = git_raw(workspace, &["worktree", "remove", "--force", path_str]);
-        let _ = fs::remove_dir_all(path);
-        let _ = git_raw(workspace, &["worktree", "prune"]);
+        storage::discard_worktree(workspace, path);
         return Err(err);
     }
     Ok(())
@@ -191,6 +189,22 @@ pub fn write_patch(dir: &Path, from: &str, to: &str, path: &Path) -> Result<()> 
     Ok(())
 }
 
+/// An apply the router refused before it wrote any file.
+#[derive(Debug)]
+pub struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+fn refused(err: anyhow::Error) -> anyhow::Error {
+    Refused(format!("{err:#}")).into()
+}
+
 /// How a chosen candidate's patch reached the workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Applied {
@@ -206,6 +220,7 @@ pub enum Applied {
 /// snapshot is `current` in private index `index`. Tries a plain apply,
 /// then a three-way merge in a copy of that index; on conflict, restores
 /// the patch's files from `current`. `scratch` holds temporary indexes.
+/// An error that is a [`Refused`] left the workspace untouched.
 pub fn apply(
     workspace: &Path,
     index: &Path,
@@ -221,12 +236,14 @@ pub fn apply(
         return Ok(Applied::Clean);
     }
     // One fixed config for the filter check, the applies, and the restore.
-    let sanitized = snapshot::SanitizedGitDir::new(&top)?;
-    refuse_unfiltered_apply(&sanitized, &top, index, files, patch, scratch)?;
+    let sanitized = snapshot::SanitizedGitDir::new(&top).map_err(refused)?;
+    let paths = patch_paths(&sanitized, &top, files, patch).map_err(refused)?;
+    refuse_unfiltered_apply(&sanitized, &top, index, &paths, patch, scratch).map_err(refused)?;
     // Plain apply checks the whole patch before writing any file.
     if git_in(&sanitized, &top, None, &["apply", "--binary", patch]).is_ok() {
         return Ok(Applied::Clean);
     }
+    refuse_local_merge_driver(&sanitized, &top, index, &paths).map_err(refused)?;
     fs::create_dir_all(scratch)?;
     let check_index = std::path::absolute(scratch.join("apply-check.index"))?;
     fs::copy(index, &check_index).context("Copy the snapshot index")?;
@@ -247,10 +264,11 @@ pub fn apply(
         }
         // This Git cannot merge in an index only, so the filter check above
         // never saw the merged result's attribute rules.
-        ensure!(
-            sanitized.local_smudge_filters().is_empty(),
-            "Refusing a three-way apply: this Git lacks `git apply --3way --cached` (Git 2.32 or later), so the merged result cannot be checked for repo-local smudge filters, which are disabled for safety. Apply the patch by hand"
-        );
+        if !sanitized.local_smudge_filters().is_empty() {
+            return Err(refused(anyhow::anyhow!(
+                "Refusing a three-way apply: this Git lacks `git apply --3way --cached` (Git 2.32 or later), so the merged result cannot be checked for repo-local smudge filters, which are disabled for safety. Apply the patch by hand"
+            )));
+        }
     }
     let merge = std::path::absolute(scratch.join("apply.index"))?;
     fs::copy(index, &merge).context("Copy the snapshot index")?;
@@ -270,20 +288,40 @@ pub fn apply(
     Ok(Applied::Conflict(files.to_vec()))
 }
 
-/// An apply, and the restore after a failed three-way one, write files from
-/// Git's stored bytes without the smudge filters the router disables:
-/// refused when a patched file uses one.
-fn refuse_unfiltered_apply(
+/// A three-way apply merges with Git's built-in drivers, since the sanitized
+/// config leaves out repo-local `merge.<name>.driver` commands and
+/// `merge.default`: refused when the repository's config would merge a
+/// patched file with one, whose result or conflict could differ. The local
+/// driver never runs.
+fn refuse_local_merge_driver(
     sanitized: &snapshot::SanitizedGitDir,
     top: &Path,
     index: &Path,
+    paths: &[u8],
+) -> Result<()> {
+    if let Some((path, driver)) =
+        snapshot::find_local_merge_driver_path(sanitized, top, paths, Some(index))?
+    {
+        anyhow::bail!(
+            "Refusing a three-way apply: {path} uses repo-local Git merge driver `{driver}`, which is disabled for safety, and the built-in merge could give a different result. Configure the driver globally or apply the patch by hand"
+        );
+    }
+    Ok(())
+}
+
+/// The patch's paths, NUL-delimited: `files`, and the patch's own as raw
+/// bytes. Empty when no repo-local driver needs an attribute check.
+fn patch_paths(
+    sanitized: &snapshot::SanitizedGitDir,
+    top: &Path,
     files: &[String],
     patch: &str,
-    scratch: &Path,
-) -> Result<()> {
-    let drivers = sanitized.local_smudge_filters();
-    if drivers.is_empty() {
-        return Ok(());
+) -> Result<Vec<u8>> {
+    if sanitized.local_smudge_filters().is_empty()
+        && sanitized.local_merge_drivers().is_empty()
+        && sanitized.local_merge_default().is_none()
+    {
+        return Ok(Vec::new());
     }
     let mut stdin_paths = Vec::new();
     for file in files {
@@ -311,8 +349,26 @@ fn refuse_unfiltered_apply(
             }
         }
     }
+    Ok(stdin_paths)
+}
+
+/// An apply, and the restore after a failed three-way one, write files from
+/// Git's stored bytes without the smudge filters the router disables:
+/// refused when a patched file (`stdin_paths`, from `patch_paths`) uses one.
+fn refuse_unfiltered_apply(
+    sanitized: &snapshot::SanitizedGitDir,
+    top: &Path,
+    index: &Path,
+    stdin_paths: &[u8],
+    patch: &str,
+    scratch: &Path,
+) -> Result<()> {
+    let drivers = sanitized.local_smudge_filters();
+    if drivers.is_empty() {
+        return Ok(());
+    }
     let mut found =
-        snapshot::find_suppressed_filter_path(sanitized, top, &stdin_paths, Some(index), drivers)?;
+        snapshot::find_suppressed_filter_path(sanitized, top, stdin_paths, Some(index), drivers)?;
     if found.is_none() {
         // The patch may add the `.gitattributes` rule itself: check again
         // with the rules of the proposed result, in a copy of the index.
@@ -334,7 +390,7 @@ fn refuse_unfiltered_apply(
             snapshot::find_suppressed_filter_path_cached(
                 sanitized,
                 top,
-                &stdin_paths,
+                stdin_paths,
                 &proposed,
                 drivers,
             )
@@ -370,7 +426,8 @@ pub fn check(
         return Ok(Applied::Clean);
     }
     let sanitized = snapshot::SanitizedGitDir::new(&top)?;
-    refuse_unfiltered_apply(&sanitized, &top, index, files, patch, scratch)?;
+    let paths = patch_paths(&sanitized, &top, files, patch)?;
+    refuse_unfiltered_apply(&sanitized, &top, index, &paths, patch, scratch)?;
     if git_in(
         &sanitized,
         &top,
@@ -381,6 +438,7 @@ pub fn check(
     {
         return Ok(Applied::Clean);
     }
+    refuse_local_merge_driver(&sanitized, &top, index, &paths)?;
     fs::create_dir_all(scratch)?;
     let merge = std::path::absolute(scratch.join("check.index"))?;
     fs::copy(index, &merge).context("Copy the snapshot index")?;
@@ -728,5 +786,74 @@ mod tests {
         assert_eq!(fs::read_to_string(outside.join("victim")).unwrap(), "keep");
         assert!(repo.join(".git/HEAD").is_file());
         assert!(repo.join(".model-router/run.json").is_file());
+    }
+
+    #[test]
+    fn a_three_way_apply_refuses_a_repo_local_merge_driver_without_running_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, None, &["init", "-q"]).unwrap();
+        let marker = dir.path().join("driver-ran");
+        let driver = format!("touch '{}'; exit 1", marker.display());
+        git(&repo, None, &["config", "merge.custom.driver", &driver]).unwrap();
+        fs::write(repo.join(".gitattributes"), "a merge=custom\n").unwrap();
+        let index = dir.path().join("index");
+        let tree = || {
+            git(&repo, Some(&index), &["add", "-A"]).unwrap();
+            git(&repo, Some(&index), &["write-tree"]).unwrap()
+        };
+        fs::write(repo.join("a"), "one\ntwo\nthree\n").unwrap();
+        let from = tree();
+        fs::write(repo.join("a"), "ONE\ntwo\nthree\n").unwrap();
+        let to = tree();
+        let patch = dir.path().join("changes.diff");
+        write_patch(&repo, &from, &to, &patch).unwrap();
+        // The workspace changed another line: only a three-way merge applies.
+        fs::write(repo.join("a"), "one\ntwo\nTHREE\n").unwrap();
+        let current = tree();
+        let scratch = dir.path().join("scratch");
+        let files = ["a".to_owned()];
+
+        let err = apply(&repo, &index, &current, &files, &patch, &scratch).unwrap_err();
+        assert!(err.downcast_ref::<Refused>().is_some(), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("merge driver `custom`"),
+            "{err:#}"
+        );
+        let err = check(&repo, &index, &files, &patch, &scratch).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("merge driver `custom`"),
+            "{err:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("a")).unwrap(),
+            "one\ntwo\nTHREE\n"
+        );
+        assert!(!marker.exists(), "the repo-local merge driver ran");
+
+        // A repo-local merge.default covers files with no merge attribute.
+        fs::write(repo.join(".gitattributes"), "").unwrap();
+        let current = tree();
+        git(&repo, None, &["config", "merge.default", "custom"]).unwrap();
+        let err = apply(&repo, &index, &current, &files, &patch, &scratch).unwrap_err();
+        assert!(err.downcast_ref::<Refused>().is_some(), "{err:#}");
+        assert!(!marker.exists(), "the repo-local merge driver ran");
+
+        // Without them the built-in merge applies.
+        git(&repo, None, &["config", "--unset", "merge.default"]).unwrap();
+        assert_eq!(
+            check(&repo, &index, &files, &patch, &scratch).unwrap(),
+            Applied::Merged
+        );
+        assert_eq!(
+            apply(&repo, &index, &current, &files, &patch, &scratch).unwrap(),
+            Applied::Merged
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("a")).unwrap(),
+            "ONE\ntwo\nTHREE\n"
+        );
+        assert!(!marker.exists(), "the repo-local merge driver ran");
     }
 }

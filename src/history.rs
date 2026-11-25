@@ -1057,11 +1057,18 @@ fn remove(project: &Path, item: &Item) -> Result<Item> {
     })?;
     let mut done = item.clone();
     if let Some((tree, _)) = &item.worktree {
-        // Never --force: Git refuses worktrees with changes. Branches stay.
-        let removed = tree
-            .to_str()
-            .context("Worktree path must be UTF-8")
-            .and_then(|path| storage::git(project, &["worktree", "remove", path]));
+        // Never --force: Git refuses worktrees with changes, checking at the
+        // moment of removal. That check reads the repository's own config,
+        // so every repo-local clean and process filter is turned off for it:
+        // none runs, and a file that needs one keeps the worktree. Branches
+        // stay.
+        let removed = (|| {
+            let path = tree.to_str().context("Worktree path must be UTF-8")?;
+            let overrides = crate::snapshot::clean_filter_overrides(tree)?;
+            let mut args: Vec<&str> = overrides.iter().map(String::as_str).collect();
+            args.extend(["worktree", "remove", path]);
+            storage::git(project, &args)
+        })();
         if let Err(error) = removed {
             done.worktree = None;
             done.note = Some(format!("Worktree kept: {error:#}"));
@@ -1360,5 +1367,83 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not upstream of c"), "{err}");
+    }
+
+    #[test]
+    fn removing_a_worktree_never_runs_a_repo_local_clean_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |dir: &Path, args: &[&str]| storage::git(dir, args);
+        git(repo, &["init", "-q"]).unwrap();
+        let marker = repo.join("filter-ran");
+        let filter = format!("touch '{}'; cat", marker.display());
+        git(repo, &["config", "filter.local.clean", &filter]).unwrap();
+        fs::write(repo.join(".gitignore"), "filter-ran\n.model-router\n").unwrap();
+        fs::write(repo.join(".gitattributes"), "*.txt filter=local\n").unwrap();
+        fs::write(repo.join("file.txt"), "one\n").unwrap();
+        git(repo, &["add", "."]).unwrap();
+        git(
+            repo,
+            &[
+                "-c",
+                "user.name=model-router tests",
+                "-c",
+                "user.email=tests@localhost",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        )
+        .unwrap();
+        // Same bytes, new timestamp: Git has to hash the file again to tell.
+        let restamp = |tree: &Path| {
+            let file = fs::File::options()
+                .write(true)
+                .open(tree.join("file.txt"))
+                .unwrap();
+            file.set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        };
+        let item = |id: &str| {
+            let tree = storage::create_worktree(repo, id, false).unwrap();
+            restamp(&tree);
+            let run_dir = repo.join(".model-router/runs").join(id);
+            fs::create_dir_all(&run_dir).unwrap();
+            Item {
+                id: id.into(),
+                status: "complete",
+                paths: vec![(run_dir, 0)],
+                worktree: Some((tree, 0)),
+                note: None,
+            }
+        };
+        let (clean, changed, control) = (item("clean"), item("changed"), item("control"));
+        fs::remove_file(&marker).ok();
+
+        // Git's own check with the repository's config would run the filter.
+        let control_tree = &control.worktree.as_ref().unwrap().0;
+        git(control_tree, &["status", "--porcelain"]).unwrap();
+        assert!(marker.exists(), "the fixture's filter never runs");
+        fs::remove_file(&marker).unwrap();
+
+        let done = remove(repo, &clean).unwrap();
+        assert!(done.worktree.is_some(), "{:?}", done.note);
+        assert!(!clean.worktree.as_ref().unwrap().0.exists());
+
+        // Git still refuses a worktree with changes.
+        let changed_tree = &changed.worktree.as_ref().unwrap().0;
+        fs::write(changed_tree.join("file.txt"), "edited\n").unwrap();
+        let done = remove(repo, &changed).unwrap();
+        assert!(done.worktree.is_none());
+        assert!(done.note.unwrap().starts_with("Worktree kept"));
+        assert_eq!(
+            fs::read_to_string(changed_tree.join("file.txt")).unwrap(),
+            "edited\n"
+        );
+        assert!(!marker.exists(), "cleanup ran the repo-local clean filter");
     }
 }

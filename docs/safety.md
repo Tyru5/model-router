@@ -137,7 +137,17 @@ commands; it keeps repo-local Git LFS endpoint URLs and remote selection
 submodule's own config; worktree mode checks each populated submodule with
 its own sanitized Git directory instead. New
 worktrees are checked for disabled smudge filters from the new worktree's own
-config, and a fan-out patch apply is refused when a patched file uses one. That `GIT_DIR` lives in a `tmp` directory inside the router's
+config, and a fan-out patch apply is refused when a patched file uses one. A
+three-way apply and its preview are refused when a patched file's `merge`
+attribute names a repo-local `merge.<name>.driver`, or the file has no `merge`
+attribute and a repo-local `merge.default` is set; the driver never runs. A
+new worktree keeps the sparse-checkout settings and rules `git worktree add`
+copied to it (Git 2.36 or later): files outside them are not written. When
+filling a new worktree fails, the router removes that worktree and its own
+record, not `git worktree prune`. `history clean --worktrees` runs
+`git worktree remove` with every repo-local clean and process filter turned
+off (`-c filter.<name>.clean= -c filter.<name>.process=`), so a file that
+needs one keeps the worktree. That `GIT_DIR` lives in a `tmp` directory inside the router's
 socket directory, which stages cannot write. Partial clones
 (`extensions.partialClone` or `remote.*.promisor`) and a repository-local
 `lfs.storage` are refused; use a full clone and set `lfs.storage` globally.

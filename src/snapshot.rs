@@ -76,6 +76,8 @@ pub(crate) struct SanitizedGitDir {
     top_level: PathBuf,
     local_clean_filters: Vec<Vec<u8>>,
     local_smudge_filters: Vec<Vec<u8>>,
+    local_merge_drivers: Vec<Vec<u8>>,
+    local_merge_default: Option<Vec<u8>>,
 }
 
 impl SanitizedGitDir {
@@ -106,6 +108,28 @@ impl SanitizedGitDir {
                     .with_context(|| format!("Link repository {name}"))?;
             }
         }
+        // `info/sparse-checkout` is per worktree; the rest of `info` is
+        // shared. A linked worktree gets its own sparse rules, as Git reads
+        // them, not the main worktree's.
+        if git_dir != common_dir {
+            let info = shadow.path().join("info");
+            let _ = fs::remove_file(&info);
+            fs::create_dir(&info).context("Create shadow info directory")?;
+            if let Ok(entries) = fs::read_dir(common_dir.join("info")) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if name != "sparse-checkout" {
+                        link_entry(&entry.path(), &info.join(&name))
+                            .context("Link repository info")?;
+                    }
+                }
+            }
+            let sparse = git_dir.join("info/sparse-checkout");
+            if fs::symlink_metadata(&sparse).is_ok() {
+                link_entry(&sparse, &info.join("sparse-checkout"))
+                    .context("Link worktree sparse-checkout rules")?;
+            }
+        }
         let real_index = git_dir.join("index");
         if fs::symlink_metadata(&real_index).is_ok() {
             link_entry(&real_index, &shadow.path().join("index"))
@@ -126,6 +150,8 @@ impl SanitizedGitDir {
             top_level,
             local_clean_filters: inspected.local_clean_filters,
             local_smudge_filters: inspected.local_smudge_filters,
+            local_merge_drivers: inspected.local_merge_drivers,
+            local_merge_default: inspected.local_merge_default,
         })
     }
 
@@ -151,6 +177,16 @@ impl SanitizedGitDir {
 
     pub(crate) fn local_smudge_filters(&self) -> &[Vec<u8>] {
         &self.local_smudge_filters
+    }
+
+    /// Repo-local `merge.<name>.driver` commands, which never run.
+    pub(crate) fn local_merge_drivers(&self) -> &[Vec<u8>] {
+        &self.local_merge_drivers
+    }
+
+    /// A repo-local `merge.default`, which the sanitized config drops.
+    pub(crate) fn local_merge_default(&self) -> Option<&[u8]> {
+        self.local_merge_default.as_deref()
     }
 
     pub(crate) fn into_parts(self) -> (tempfile::TempDir, PathBuf) {
@@ -205,6 +241,8 @@ struct InspectedRepoConfig {
     sanitized_config: Vec<u8>,
     local_clean_filters: Vec<Vec<u8>>,
     local_smudge_filters: Vec<Vec<u8>>,
+    local_merge_drivers: Vec<Vec<u8>>,
+    local_merge_default: Option<Vec<u8>>,
 }
 
 struct ConfigEntry {
@@ -257,6 +295,10 @@ fn parse_and_build_sanitized_config(
     // Whether the last repo-local `filter.<driver>.{clean,smudge,process}` is
     // empty: an empty value turns a trusted global command off, and is kept.
     let mut local_filter_commands: Vec<(Vec<u8>, Vec<u8>, bool)> = Vec::new();
+    // Repo-local `merge.<name>.driver` (whether its last value is empty) and
+    // `merge.default`: neither reaches the sanitized config.
+    let mut local_merge_commands: Vec<(Vec<u8>, bool)> = Vec::new();
+    let mut local_merge_default: Option<Vec<u8>> = None;
     // Repository-local Git LFS endpoint URLs and remote selection (data, not
     // commands), kept so git-lfs can still fetch objects missing from the
     // local cache from the same remote a normal checkout would use.
@@ -385,6 +427,18 @@ fn parse_and_build_sanitized_config(
                         val,
                     );
                 }
+            }
+        } else if section.eq_ignore_ascii_case(b"merge") {
+            match split_last(rest, b'.') {
+                Some((name, var)) if !name.is_empty() && var.eq_ignore_ascii_case(b"driver") => {
+                    if let Some(value) = val {
+                        set_last(&mut local_merge_commands, name.to_vec(), value.is_empty());
+                    }
+                }
+                None if rest.eq_ignore_ascii_case(b"default") => {
+                    local_merge_default = val.filter(|v| !v.is_empty()).map(<[u8]>::to_vec);
+                }
+                _ => {}
             }
         } else if section.eq_ignore_ascii_case(b"filter") {
             let Some((subsection, var)) = split_last(rest, b'.') else {
@@ -546,6 +600,12 @@ fn parse_and_build_sanitized_config(
         sanitized_config,
         local_clean_filters,
         local_smudge_filters,
+        local_merge_drivers: local_merge_commands
+            .into_iter()
+            .filter(|(_, empty)| !empty)
+            .map(|(name, _)| name)
+            .collect(),
+        local_merge_default,
     })
 }
 
@@ -737,67 +797,137 @@ fn find_suppressed_filter_path_in(
         return Ok(None);
     }
     for &cached in sources {
-        let mut cmd = sanitized.command(work);
-        cmd.arg("check-attr");
-        if cached {
-            cmd.arg("--cached");
-        }
-        cmd.args(["-z", "filter", "--stdin"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(idx) = index {
-            cmd.env("GIT_INDEX_FILE", idx);
-        }
-        let mut child = cmd.spawn().context("Start Git")?;
-        let output = std::thread::scope(|scope| -> Result<std::process::Output> {
-            let writer = child.stdin.take().map(|mut pipe| {
-                scope.spawn(move || -> std::io::Result<()> {
-                    use std::io::Write;
-                    match pipe.write_all(stdin_paths) {
-                        Ok(()) => Ok(()),
-                        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-                        Err(err) => Err(err),
-                    }
-                })
-            });
-            let output = child.wait_with_output().context("Wait for Git")?;
-            if let Some(handle) = writer {
-                if let Ok(Err(err)) = handle.join() {
-                    if output.status.success() {
-                        return Err(err.into());
-                    }
-                }
-            }
-            Ok(output)
-        })?;
-        ensure!(
-            output.status.success(),
-            "git check-attr filter failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        let mut parts = output.stdout.split(|&b| b == 0);
+        let stdout = check_attr(sanitized, work, stdin_paths, index, cached, "filter")?;
+        let mut parts = stdout.split(|&b| b == 0);
         while let (Some(path), Some(_attr), Some(value)) =
             (parts.next(), parts.next(), parts.next())
         {
-            if value.is_empty() {
-                continue;
-            }
-            // Check disabled driver names BEFORE skipping `check-attr`'s status
-            // labels (`set`, `unset`, `unspecified`), so a disabled filter
-            // carrying one of those ambiguous names fails closed.
-            if drivers.iter().any(|d| d.as_slice() == value) {
+            // Check disabled driver names without skipping `check-attr`'s
+            // status labels (`set`, `unset`, `unspecified`), so a disabled
+            // filter carrying one of those ambiguous names fails closed.
+            if !value.is_empty() && drivers.iter().any(|d| d.as_slice() == value) {
                 return Ok(Some((
                     String::from_utf8_lossy(path).into_owned(),
                     String::from_utf8_lossy(value).into_owned(),
                 )));
             }
-            if matches!(value, b"unspecified" | b"unset" | b"set") {
-                continue;
+        }
+    }
+    Ok(None)
+}
+
+/// The first NUL-delimited path in `stdin_paths` whose three-way merge the
+/// repository's own config would hand to a repo-local merge driver the
+/// sanitized config leaves out: a `merge` attribute (working tree or
+/// `index`) naming a repo-local `merge.<name>.driver`, or no `merge`
+/// attribute under a repo-local `merge.default`. Returns `(path, driver)`.
+pub(crate) fn find_local_merge_driver_path(
+    sanitized: &SanitizedGitDir,
+    work: &Path,
+    stdin_paths: &[u8],
+    index: Option<&Path>,
+) -> Result<Option<(String, String)>> {
+    let drivers = sanitized.local_merge_drivers();
+    let default = sanitized.local_merge_default();
+    if (drivers.is_empty() && default.is_none()) || stdin_paths.is_empty() {
+        return Ok(None);
+    }
+    for cached in [false, true] {
+        let stdout = check_attr(sanitized, work, stdin_paths, index, cached, "merge")?;
+        let mut parts = stdout.split(|&b| b == 0);
+        while let (Some(path), Some(_attr), Some(value)) =
+            (parts.next(), parts.next(), parts.next())
+        {
+            // A driver named like a status label (`unspecified`) fails closed.
+            let driver = if drivers.iter().any(|d| d.as_slice() == value) {
+                Some(value)
+            } else if value == b"unspecified" {
+                // `text` is what Git uses with no `merge.default` at all.
+                default.filter(|name| *name != b"text")
+            } else {
+                None
+            };
+            if let Some(driver) = driver {
+                return Ok(Some((
+                    String::from_utf8_lossy(path).into_owned(),
+                    String::from_utf8_lossy(driver).into_owned(),
+                )));
             }
         }
     }
     Ok(None)
+}
+
+/// `git check-attr -z <attr> --stdin` output for NUL-delimited `stdin_paths`:
+/// `<path> NUL <attr> NUL <value> NUL` records, from the working tree's
+/// attribute files or, with `cached`, the index's.
+fn check_attr(
+    sanitized: &SanitizedGitDir,
+    work: &Path,
+    stdin_paths: &[u8],
+    index: Option<&Path>,
+    cached: bool,
+    attr: &str,
+) -> Result<Vec<u8>> {
+    let mut cmd = sanitized.command(work);
+    cmd.arg("check-attr");
+    if cached {
+        cmd.arg("--cached");
+    }
+    cmd.args(["-z", attr, "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(idx) = index {
+        cmd.env("GIT_INDEX_FILE", idx);
+    }
+    let mut child = cmd.spawn().context("Start Git")?;
+    let output = std::thread::scope(|scope| -> Result<std::process::Output> {
+        let writer = child.stdin.take().map(|mut pipe| {
+            scope.spawn(move || -> std::io::Result<()> {
+                use std::io::Write;
+                match pipe.write_all(stdin_paths) {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                    Err(err) => Err(err),
+                }
+            })
+        });
+        let output = child.wait_with_output().context("Wait for Git")?;
+        if let Some(handle) = writer {
+            if let Ok(Err(err)) = handle.join() {
+                if output.status.success() {
+                    return Err(err.into());
+                }
+            }
+        }
+        Ok(output)
+    })?;
+    ensure!(
+        output.status.success(),
+        "git check-attr {attr} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output.stdout)
+}
+
+/// `-c` arguments that turn off every repo-local clean and process filter,
+/// for a Git command that has to run with the repository's own config. Fails
+/// when a filter name cannot be written as a `-c` key.
+pub(crate) fn clean_filter_overrides(dir: &Path) -> Result<Vec<String>> {
+    let sanitized = SanitizedGitDir::new(dir)?;
+    let mut args = Vec::new();
+    for driver in sanitized.local_clean_filters() {
+        let name = std::str::from_utf8(driver)
+            .ok()
+            .filter(|name| !name.contains(['=', '\n']))
+            .context("a repo-local Git filter name cannot be turned off on the command line")?;
+        for var in ["clean", "process"] {
+            args.push("-c".to_owned());
+            args.push(format!("filter.{name}.{var}="));
+        }
+    }
+    Ok(args)
 }
 
 /// Refuses to check out a worktree at `commit_or_tree` when any file in it has
@@ -950,8 +1080,38 @@ pub(crate) fn populate_worktree(worktree: &Path, commit: &str) -> Result<()> {
         );
         Ok(())
     };
-    run(&["read-tree", commit])?;
-    run(&["checkout-index", "-a", "-f"])?;
+    // `git worktree add` gave the new worktree the source checkout's sparse
+    // settings and rules (Git 2.36 or later). Config is only read here.
+    let setting = |key: &str| -> bool {
+        git_command()
+            .args(["config", "--type=bool", "--get", key])
+            .current_dir(worktree)
+            .stdin(Stdio::null())
+            .output()
+            .is_ok_and(|out| out.stdout.trim_ascii() == b"true")
+    };
+    if setting("core.sparseCheckout") {
+        // A merge into the empty index applies the sparse rules: files
+        // outside them are marked skip-worktree and never written.
+        let cone = if setting("core.sparseCheckoutCone") {
+            "core.sparseCheckoutCone=true"
+        } else {
+            "core.sparseCheckoutCone=false"
+        };
+        run(&[
+            "-c",
+            "core.sparseCheckout=true",
+            "-c",
+            cone,
+            "read-tree",
+            "-m",
+            "-u",
+            commit,
+        ])?;
+    } else {
+        run(&["read-tree", commit])?;
+        run(&["checkout-index", "-a", "-f"])?;
+    }
     let _ = sanitized
         .command(worktree)
         .args(["update-index", "-q", "--refresh"])
@@ -2346,5 +2506,93 @@ mod tests {
                 "snapshot in newline path should succeed"
             );
         }
+    }
+
+    #[test]
+    fn a_new_worktree_keeps_the_source_checkout_s_sparse_rules() {
+        let Some(dir) = repository() else { return };
+        let workspace = dir.path();
+        fs::create_dir(workspace.join("kept")).unwrap();
+        fs::create_dir(workspace.join("left-out")).unwrap();
+        fs::write(workspace.join("kept/file.txt"), "kept\n").unwrap();
+        fs::write(workspace.join("left-out/file.txt"), "left out\n").unwrap();
+        git(workspace, None, &["add", "."]).unwrap();
+        git(
+            workspace,
+            None,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "Directories"],
+        )
+        .unwrap();
+        git(workspace, None, &["sparse-checkout", "set", "kept"]).unwrap();
+        assert!(!workspace.join("left-out").exists());
+
+        let wt = crate::storage::create_worktree(workspace, "sparse-wt", true).unwrap();
+        // Git before 2.36 does not copy sparse settings to a new worktree.
+        let copied = git(&wt, None, &["config", "--get", "core.sparseCheckout"]).is_ok();
+        assert!(wt.join("kept/file.txt").is_file());
+        assert!(wt.join("tracked.txt").is_file());
+        assert_eq!(wt.join("left-out").exists(), !copied);
+        assert!(
+            git(&wt, None, &["status", "--porcelain"])
+                .unwrap()
+                .is_empty()
+        );
+
+        // A candidate worktree made from that one keeps them too.
+        let candidate = workspace.join(".model-router/candidates/run/c1");
+        crate::fanout::add_worktree(&wt, &candidate, "HEAD").unwrap();
+        assert!(candidate.join("kept/file.txt").is_file());
+        assert_eq!(candidate.join("left-out").exists(), !copied);
+    }
+
+    #[test]
+    fn a_failed_worktree_fill_rolls_back_only_its_own_worktree() {
+        let Some(dir) = repository() else { return };
+        let workspace = dir.path();
+        // Another worktree whose directory is missing for now, and whose
+        // record `git worktree prune` would drop.
+        git(
+            workspace,
+            None,
+            &["config", "gc.worktreePruneExpire", "now"],
+        )
+        .unwrap();
+        let other = crate::storage::create_worktree(workspace, "other", true).unwrap();
+        let away = workspace.join(".model-router/other-unmounted");
+        fs::rename(&other, &away).unwrap();
+
+        // Filling the next one fails: a tracked file needs a disabled filter.
+        git(workspace, None, &["config", "filter.local.smudge", "cat"]).unwrap();
+        fs::write(workspace.join(".gitattributes"), "*.txt filter=local\n").unwrap();
+        git(workspace, None, &["add", ".gitattributes"]).unwrap();
+        git(
+            workspace,
+            None,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "Attributes"],
+        )
+        .unwrap();
+        crate::storage::create_worktree(workspace, "fails", false).unwrap_err();
+        let candidate = workspace.join(".model-router/candidates/run/c1");
+        crate::fanout::add_worktree(workspace, &candidate, "HEAD").unwrap_err();
+
+        let listed = git(workspace, None, &["worktree", "list", "--porcelain"]).unwrap();
+        let listed = String::from_utf8_lossy(&listed);
+        assert!(!listed.contains("/fails\n"), "{listed}");
+        assert!(!listed.contains("/c1\n"), "{listed}");
+        assert!(!workspace.join(".model-router/worktrees/fails").exists());
+        assert!(!candidate.exists());
+        git(
+            workspace,
+            None,
+            &["rev-parse", "--verify", "model-router/fails"],
+        )
+        .unwrap_err();
+        // The other worktree works again once its directory is back.
+        fs::rename(&away, &other).unwrap();
+        assert!(
+            git(&other, None, &["status", "--porcelain"])
+                .unwrap()
+                .is_empty()
+        );
     }
 }

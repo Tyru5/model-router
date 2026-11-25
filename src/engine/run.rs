@@ -185,11 +185,7 @@ impl Run {
                     return;
                 }
                 if let Some(path) = &self.worktree {
-                    if let Some(s) = path.to_str() {
-                        let _ = storage::git(&self.project, &["worktree", "remove", "--force", s]);
-                    }
-                    let _ = fs::remove_dir_all(path);
-                    let _ = storage::git(&self.project, &["worktree", "prune"]);
+                    storage::discard_worktree(&self.project, path);
                     let _ = storage::git(
                         &self.project,
                         &["branch", "-D", &format!("model-router/{}", self.id)],

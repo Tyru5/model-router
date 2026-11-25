@@ -161,15 +161,24 @@ pub(super) fn apply_patch(
             unknown: false,
         }),
     )?;
-    let applied = fanout::apply(
+    let applied = match fanout::apply(
         &run.workspace,
         &snapshot_index,
         &current,
         &patch.files,
         &patch.path,
         &scratch,
-    )
-    .map_err(|e| error("orchestration_error", format!("{e:#}")))?;
+    ) {
+        Ok(applied) => applied,
+        Err(e) => {
+            // A refusal wrote nothing: forget the attempt, so recovery
+            // cannot take a later change to the checkout for this apply.
+            if e.downcast_ref::<fanout::Refused>().is_some() {
+                set_journal(run, index, id, revision, None)?;
+            }
+            return Err(error("orchestration_error", format!("{e:#}")));
+        }
+    };
     match applied {
         fanout::Applied::Clean | fanout::Applied::Merged => {
             if let Some(journal) = journal_mut(run, index, id, revision) {

@@ -207,7 +207,7 @@ refs); `--yes` removes. Runs whose `run.lock` is held are skipped.
 | `--older-than DAYS` | Only runs last updated more than `DAYS` ago. |
 | `--status S,..` | Only these statuses (as `history --status`). |
 | `--keep N` | Never remove the `N` newest runs (default 0). |
-| `--worktrees` | Also `git worktree remove` each clean run worktree (never forced; branches stay). |
+| `--worktrees` | Also `git worktree remove` each clean run worktree (never forced; branches stay). Repo-local clean and process filters are turned off for Git's check, so a worktree whose files need one is kept. |
 | `--yes` | Remove instead of previewing. |
 
 ### `cost`
