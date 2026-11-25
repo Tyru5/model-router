@@ -28,8 +28,14 @@ fn git_raw(dir: &Path, args: &[&str]) -> Result<String> {
         .to_owned())
 }
 
-fn git_sanitized(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<String> {
-    let sanitized = crate::snapshot::SanitizedGitDir::new(dir)?;
+/// Runs Git with a caller-held sanitized Git directory, so several steps
+/// share one fixed config.
+fn git_in(
+    sanitized: &snapshot::SanitizedGitDir,
+    dir: &Path,
+    index: Option<&Path>,
+    args: &[&str],
+) -> Result<String> {
     let mut command = sanitized.command(dir);
     command.args(args).stdin(Stdio::null());
     if let Some(index) = index {
@@ -214,15 +220,18 @@ pub fn apply(
     if fs::metadata(patch)?.len() == 0 {
         return Ok(Applied::Clean);
     }
+    // One fixed config for the filter check, the applies, and the restore.
+    let sanitized = snapshot::SanitizedGitDir::new(&top)?;
     // Plain apply checks the whole patch before writing any file.
-    if git_sanitized(&top, None, &["apply", "--binary", patch]).is_ok() {
+    if git_in(&sanitized, &top, None, &["apply", "--binary", patch]).is_ok() {
         return Ok(Applied::Clean);
     }
-    refuse_unfiltered_merge(&top, index, files)?;
+    refuse_unfiltered_merge(&sanitized, &top, index, files)?;
     fs::create_dir_all(scratch)?;
     let check_index = std::path::absolute(scratch.join("apply-check.index"))?;
     fs::copy(index, &check_index).context("Copy the snapshot index")?;
-    let precheck = git_sanitized(
+    let precheck = git_in(
+        &sanitized,
         &top,
         Some(&check_index),
         &["apply", "--3way", "--cached", "--binary", patch],
@@ -239,27 +248,38 @@ pub fn apply(
     }
     let merge = std::path::absolute(scratch.join("apply.index"))?;
     fs::copy(index, &merge).context("Copy the snapshot index")?;
-    if git_sanitized(&top, Some(&merge), &["apply", "--3way", "--binary", patch]).is_ok() {
+    if git_in(
+        &sanitized,
+        &top,
+        Some(&merge),
+        &["apply", "--3way", "--binary", patch],
+    )
+    .is_ok()
+    {
         let _ = fs::remove_file(&merge);
         return Ok(Applied::Merged);
     }
     let _ = fs::remove_file(&merge);
-    restore(&top, current, files, scratch)?;
+    restore(&sanitized, &top, current, files, scratch)?;
     Ok(Applied::Conflict(files.to_vec()))
 }
 
 /// A three-way apply, and the restore after a failed one, write files from
 /// Git blobs without the smudge filters the router disables: refused when a
 /// patched file uses one.
-fn refuse_unfiltered_merge(top: &Path, index: &Path, files: &[String]) -> Result<()> {
-    let sanitized = snapshot::SanitizedGitDir::new(top)?;
+fn refuse_unfiltered_merge(
+    sanitized: &snapshot::SanitizedGitDir,
+    top: &Path,
+    index: &Path,
+    files: &[String],
+) -> Result<()> {
     let mut stdin_paths = Vec::new();
     for file in files {
         stdin_paths.extend_from_slice(file.as_bytes());
         stdin_paths.push(0);
     }
     if let Some((path, driver)) = snapshot::find_suppressed_filter_path(
-        &sanitized,
+        sanitized,
         top,
         &stdin_paths,
         Some(index),
@@ -286,16 +306,26 @@ pub fn check(
     let top = PathBuf::from(git_raw(workspace, &["rev-parse", "--show-toplevel"])?);
     let patch = std::path::absolute(patch)?;
     let patch = patch.to_str().context("Patch path must be UTF-8")?;
-    if fs::metadata(patch)?.len() == 0
-        || git_sanitized(&top, None, &["apply", "--check", "--binary", patch]).is_ok()
+    if fs::metadata(patch)?.len() == 0 {
+        return Ok(Applied::Clean);
+    }
+    let sanitized = snapshot::SanitizedGitDir::new(&top)?;
+    if git_in(
+        &sanitized,
+        &top,
+        None,
+        &["apply", "--check", "--binary", patch],
+    )
+    .is_ok()
     {
         return Ok(Applied::Clean);
     }
-    refuse_unfiltered_merge(&top, index, files)?;
+    refuse_unfiltered_merge(&sanitized, &top, index, files)?;
     fs::create_dir_all(scratch)?;
     let merge = std::path::absolute(scratch.join("check.index"))?;
     fs::copy(index, &merge).context("Copy the snapshot index")?;
-    let merged = git_sanitized(
+    let merged = git_in(
+        &sanitized,
         &top,
         Some(&merge),
         &["apply", "--3way", "--cached", "--binary", patch],
@@ -322,7 +352,13 @@ pub(crate) fn is_plain_repo_path(file: &str) -> bool {
 
 /// Puts `files` back as they are in tree `tree`: present ones checked out,
 /// absent ones removed.
-fn restore(top: &Path, tree: &str, files: &[String], scratch: &Path) -> Result<()> {
+fn restore(
+    sanitized: &snapshot::SanitizedGitDir,
+    top: &Path,
+    tree: &str,
+    files: &[String],
+    scratch: &Path,
+) -> Result<()> {
     let index = std::path::absolute(scratch.join("restore.index"))?;
     let _ = fs::remove_file(&index);
     let plain_files: Vec<&str> = files
@@ -334,7 +370,6 @@ fn restore(top: &Path, tree: &str, files: &[String], scratch: &Path) -> Result<(
         return Ok(());
     }
     fs::create_dir_all(scratch)?;
-    let sanitized = crate::snapshot::SanitizedGitDir::new(top)?;
     let read_out = sanitized
         .command(top)
         .args(["read-tree", tree])
@@ -612,7 +647,14 @@ mod tests {
             ".model-router/run.json".to_owned(),
         ];
         let scratch = dir.path().join("scratch");
-        restore(&repo, &baseline, &files, &scratch).unwrap();
+        restore(
+            &snapshot::SanitizedGitDir::new(&repo).unwrap(),
+            &repo,
+            &baseline,
+            &files,
+            &scratch,
+        )
+        .unwrap();
 
         assert_eq!(
             fs::read_to_string(repo.join("tracked.txt")).unwrap(),
