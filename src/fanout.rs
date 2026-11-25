@@ -284,6 +284,27 @@ fn refuse_unfiltered_apply(
         stdin_paths.extend_from_slice(file.as_bytes());
         stdin_paths.push(0);
     }
+    // The patch's own paths as raw bytes too: `files` is lossy for names
+    // that are not UTF-8. Records are `<added>\t<deleted>\t<path>`.
+    let numstat = sanitized
+        .command(top)
+        .args(["apply", "--numstat", "-z", patch])
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        numstat.status.success(),
+        "git apply --numstat: {}",
+        String::from_utf8_lossy(&numstat.stderr).trim()
+    );
+    for record in numstat.stdout.split(|&b| b == 0) {
+        if let Some(path) = record.splitn(3, |&b| b == b'\t').nth(2) {
+            if !path.is_empty() {
+                stdin_paths.extend_from_slice(path);
+                stdin_paths.push(0);
+            }
+        }
+    }
     let mut found =
         snapshot::find_suppressed_filter_path(sanitized, top, &stdin_paths, Some(index), drivers)?;
     if found.is_none() {

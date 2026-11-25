@@ -1002,10 +1002,8 @@ pub fn cleanup_plan(project: &Path, criteria: &Criteria) -> Result<Plan> {
 /// changes, no untracked files, and no initialized submodules.
 fn removable(tree: &Path) -> Result<()> {
     ensure!(tree.join(".git").is_file(), "not a linked Git worktree");
-    // The real Git directory: `git_readonly` would name its shadow one.
-    let git_dir = storage::git(tree, &["rev-parse", "--absolute-git-dir"])?;
     ensure!(
-        !Path::new(&git_dir).join("modules").exists(),
+        !storage::has_populated_submodules(tree)?,
         "contains submodules"
     );
     ensure!(

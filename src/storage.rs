@@ -454,9 +454,9 @@ pub fn create_worktree(project: &Path, id: &str, require_clean: bool) -> Result<
     Ok(path)
 }
 
-/// `status --ignore-submodules=dirty` skips submodule work trees, so each
-/// populated submodule is checked with its own sanitized Git directory.
-fn ensure_clean_submodules(sanitized: &crate::snapshot::SanitizedGitDir) -> Result<()> {
+/// Paths of the checkout's populated submodules (gitlinks whose directory
+/// has a `.git` entry, whether a file or an old-style directory).
+fn populated_submodules(sanitized: &crate::snapshot::SanitizedGitDir) -> Result<Vec<PathBuf>> {
     use std::os::unix::ffi::OsStrExt;
     let top = sanitized.top_level();
     let output = sanitized
@@ -471,6 +471,7 @@ fn ensure_clean_submodules(sanitized: &crate::snapshot::SanitizedGitDir) -> Resu
         "git ls-files --stage: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
+    let mut found = Vec::new();
     // Entries are `<mode> <object> <stage>\t<path>`; 160000 is a gitlink.
     for entry in output.stdout.split(|&b| b == 0) {
         let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
@@ -481,9 +482,24 @@ fn ensure_clean_submodules(sanitized: &crate::snapshot::SanitizedGitDir) -> Resu
         }
         let path = top.join(std::ffi::OsStr::from_bytes(&entry[tab + 1..]));
         if fs::symlink_metadata(path.join(".git")).is_ok() {
-            ensure_clean_checkout(&path)
-                .with_context(|| format!("Submodule {} is not clean", path.display()))?;
+            found.push(path);
         }
+    }
+    Ok(found)
+}
+
+/// Whether the checkout at `dir` has a populated submodule.
+pub(crate) fn has_populated_submodules(dir: &Path) -> Result<bool> {
+    let sanitized = crate::snapshot::SanitizedGitDir::new(dir)?;
+    Ok(!populated_submodules(&sanitized)?.is_empty())
+}
+
+/// `status --ignore-submodules=dirty` skips submodule work trees, so each
+/// populated submodule is checked with its own sanitized Git directory.
+fn ensure_clean_submodules(sanitized: &crate::snapshot::SanitizedGitDir) -> Result<()> {
+    for path in populated_submodules(sanitized)? {
+        ensure_clean_checkout(&path)
+            .with_context(|| format!("Submodule {} is not clean", path.display()))?;
     }
     Ok(())
 }
@@ -505,6 +521,10 @@ fn ensure_clean_checkout(project: &Path) -> Result<()> {
         String::from_utf8_lossy(&output.stderr).trim()
     );
     if output.stdout.is_empty() {
+        // An empty status proves nothing for files whose clean filter the
+        // router disables.
+        crate::snapshot::refuse_unverifiable_clean(project)
+            .context("Worktree mode needs a clean checkout")?;
         return ensure_clean_submodules(&sanitized);
     }
     // If any reported dirty path uses a suppressed repo-local clean filter,
