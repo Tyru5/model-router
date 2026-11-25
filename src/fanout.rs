@@ -245,6 +245,12 @@ pub fn apply(
         if !unsupported {
             return Ok(Applied::Conflict(files.to_vec()));
         }
+        // This Git cannot merge in an index only, so the filter check above
+        // never saw the merged result's attribute rules.
+        ensure!(
+            sanitized.local_smudge_filters().is_empty(),
+            "Refusing a three-way apply: this Git lacks `git apply --3way --cached` (Git 2.32 or later), so the merged result cannot be checked for repo-local smudge filters, which are disabled for safety. Apply the patch by hand"
+        );
     }
     let merge = std::path::absolute(scratch.join("apply.index"))?;
     fs::copy(index, &merge).context("Copy the snapshot index")?;
