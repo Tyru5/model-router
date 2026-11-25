@@ -222,11 +222,11 @@ pub fn apply(
     }
     // One fixed config for the filter check, the applies, and the restore.
     let sanitized = snapshot::SanitizedGitDir::new(&top)?;
+    refuse_unfiltered_apply(&sanitized, &top, index, files)?;
     // Plain apply checks the whole patch before writing any file.
     if git_in(&sanitized, &top, None, &["apply", "--binary", patch]).is_ok() {
         return Ok(Applied::Clean);
     }
-    refuse_unfiltered_merge(&sanitized, &top, index, files)?;
     fs::create_dir_all(scratch)?;
     let check_index = std::path::absolute(scratch.join("apply-check.index"))?;
     fs::copy(index, &check_index).context("Copy the snapshot index")?;
@@ -264,10 +264,10 @@ pub fn apply(
     Ok(Applied::Conflict(files.to_vec()))
 }
 
-/// A three-way apply, and the restore after a failed one, write files from
-/// Git blobs without the smudge filters the router disables: refused when a
-/// patched file uses one.
-fn refuse_unfiltered_merge(
+/// An apply, and the restore after a failed three-way one, write files from
+/// Git's stored bytes without the smudge filters the router disables:
+/// refused when a patched file uses one.
+fn refuse_unfiltered_apply(
     sanitized: &snapshot::SanitizedGitDir,
     top: &Path,
     index: &Path,
@@ -286,7 +286,7 @@ fn refuse_unfiltered_merge(
         sanitized.local_smudge_filters(),
     )? {
         anyhow::bail!(
-            "Refusing a three-way apply: {path} uses repo-local Git smudge filter `{driver}`, which is disabled for safety, and merging or restoring it would write unfiltered contents. Configure the filter globally or apply the patch by hand"
+            "Refusing to apply the patch: {path} uses repo-local Git smudge filter `{driver}`, which is disabled for safety, and applying or restoring it would write unfiltered contents. Configure the filter globally or apply the patch by hand"
         );
     }
     Ok(())
@@ -310,6 +310,7 @@ pub fn check(
         return Ok(Applied::Clean);
     }
     let sanitized = snapshot::SanitizedGitDir::new(&top)?;
+    refuse_unfiltered_apply(&sanitized, &top, index, files)?;
     if git_in(
         &sanitized,
         &top,
@@ -320,7 +321,6 @@ pub fn check(
     {
         return Ok(Applied::Clean);
     }
-    refuse_unfiltered_merge(&sanitized, &top, index, files)?;
     fs::create_dir_all(scratch)?;
     let merge = std::path::absolute(scratch.join("check.index"))?;
     fs::copy(index, &merge).context("Copy the snapshot index")?;

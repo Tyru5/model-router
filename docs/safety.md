@@ -138,8 +138,7 @@ submodule's own config; worktree mode checks each populated submodule with
 its own sanitized Git directory instead. A snapshot is refused when a new or changed file uses a
 disabled repo-local clean filter, since it would hold unfiltered bytes. New
 worktrees are checked for disabled smudge filters from the new worktree's own
-config, and a fan-out three-way apply is refused when a patched file uses
-one. Worktree mode refuses sparse checkouts. That `GIT_DIR` lives in a `tmp` directory inside the router's
+config, and a fan-out patch apply is refused when a patched file uses one. Worktree mode refuses sparse checkouts. That `GIT_DIR` lives in a `tmp` directory inside the router's
 socket directory, which stages cannot write. Partial clones
 (`extensions.partialClone` or `remote.*.promisor`) and a repository-local
 `lfs.storage` are refused; use a full clone and set `lfs.storage` globally.
