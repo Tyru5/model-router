@@ -1294,25 +1294,6 @@ pub(crate) fn refuse_unverifiable_clean(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `-c` arguments that turn off every repo-local clean/process filter, for a
-/// Git command that has to run with the repository's own config. Fails when
-/// a filter name cannot be written as a `-c` key.
-pub(crate) fn clean_filter_overrides(dir: &Path) -> Result<Vec<String>> {
-    let sanitized = SanitizedGitDir::new(dir)?;
-    let mut args = Vec::new();
-    for driver in sanitized.local_clean_filters() {
-        let name = std::str::from_utf8(driver)
-            .ok()
-            .filter(|name| !name.contains(['=', '\n']))
-            .context("a repo-local Git filter name cannot be turned off on the command line")?;
-        for var in ["clean", "process"] {
-            args.push("-c".to_owned());
-            args.push(format!("filter.{name}.{var}="));
-        }
-    }
-    Ok(args)
-}
-
 /// Refuses a snapshot when `git add -A` would hash a new or changed file
 /// whose repo-local clean filter the router disables: the snapshot would hold
 /// raw bytes where Git stores filtered ones, so an untouched file (a new

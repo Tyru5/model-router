@@ -207,7 +207,7 @@ refs); `--yes` removes. Runs whose `run.lock` is held are skipped.
 | `--older-than DAYS` | Only runs last updated more than `DAYS` ago. |
 | `--status S,..` | Only these statuses (as `history --status`). |
 | `--keep N` | Never remove the `N` newest runs (default 0). |
-| `--worktrees` | Also remove each clean run worktree: the router checks it for changes, untracked files, and submodules with its sanitized Git config, then runs `git worktree remove` (never forced; branches stay) with every repo-local clean filter turned off. |
+| `--worktrees` | Also remove each clean run worktree: the router checks it for changes, untracked files, and submodules with its sanitized Git config, moves it aside, checks it again, deletes it, and runs `git worktree prune` (branches stay). A worktree that is not clean is kept. |
 | `--yes` | Remove instead of previewing. |
 
 ### `cost`

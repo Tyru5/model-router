@@ -3113,6 +3113,7 @@ fn unchanged_repo_msg_does_not_clobber_pending_redraw_and_stale_msgs_stay_quiet(
             head: "main".into(),
             detached: false,
             changes: 1,
+            status_error: None,
         }))),
     );
     assert!(app.ui.redraw);

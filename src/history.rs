@@ -998,6 +998,28 @@ pub fn cleanup_plan(project: &Path, criteria: &Criteria) -> Result<Plan> {
     Ok(plan)
 }
 
+/// Removes clean worktree `tree`. Not `git worktree remove`: its own check
+/// for changes reads the live repository config, filters included. The
+/// router moves the tree aside, so nothing saves into it by path any more,
+/// checks it again with its sanitized config, deletes it, and prunes Git's
+/// record. A tree that is not clean is moved back and kept.
+fn remove_worktree(project: &Path, tree: &Path) -> Result<()> {
+    removable(tree)?;
+    let mut name = tree
+        .file_name()
+        .context("Worktree path has no name")?
+        .to_os_string();
+    name.push(format!(".removing-{}", uuid::Uuid::new_v4().simple()));
+    let aside = tree.with_file_name(name);
+    fs::rename(tree, &aside).with_context(|| format!("Move {} aside", tree.display()))?;
+    if let Err(err) = removable(&aside) {
+        fs::rename(&aside, tree).with_context(|| format!("Restore {}", tree.display()))?;
+        return Err(err);
+    }
+    fs::remove_dir_all(&aside).with_context(|| format!("Remove {}", aside.display()))?;
+    storage::git(project, &["worktree", "prune"]).map(|_| ())
+}
+
 /// Ok when `git worktree remove` takes `tree` without --force, as far as
 /// the sanitized config can tell: no changes, no untracked files, and no
 /// populated submodules.
@@ -1052,17 +1074,8 @@ fn remove(project: &Path, item: &Item) -> Result<Item> {
     })?;
     let mut done = item.clone();
     if let Some((tree, _)) = &item.worktree {
-        // Never --force: Git refuses worktrees with changes, checking at the
-        // moment of removal. That check runs with the repository's config,
-        // so the router first checks with its sanitized config, then turns
-        // every repo-local clean filter off for Git's own. Branches stay.
-        let removed = removable(tree).and_then(|()| {
-            let path = tree.to_str().context("Worktree path must be UTF-8")?;
-            let overrides = crate::snapshot::clean_filter_overrides(tree)?;
-            let mut args: Vec<&str> = overrides.iter().map(String::as_str).collect();
-            args.extend(["worktree", "remove", path]);
-            storage::git(project, &args).map(|_| ())
-        });
+        // Only a clean worktree goes. Branches stay.
+        let removed = remove_worktree(project, tree);
         if let Err(error) = removed {
             done.worktree = None;
             done.note = Some(format!("Worktree kept: {error:#}"));
@@ -1361,5 +1374,45 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not upstream of c"), "{err}");
+    }
+
+    #[test]
+    fn remove_worktree_takes_a_clean_tree_and_keeps_a_changed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| storage::git(repo, args).unwrap();
+        git(&["init", "-q"]);
+        fs::write(repo.join("file.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=model-router tests",
+            "-c",
+            "user.email=tests@localhost",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "init",
+        ]);
+        let clean = storage::create_worktree(repo, "clean", false).unwrap();
+        let changed = storage::create_worktree(repo, "changed", false).unwrap();
+        fs::write(changed.join("file.txt"), "edited\n").unwrap();
+
+        remove_worktree(repo, &clean).unwrap();
+        assert!(!clean.exists());
+        let listed = git(&["worktree", "list", "--porcelain"]);
+        assert!(!listed.contains("/clean\n"), "{listed}");
+
+        let err = remove_worktree(repo, &changed).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("uncommitted changes"),
+            "{err:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(changed.join("file.txt")).unwrap(),
+            "edited\n"
+        );
+        assert!(listed.contains("/changed\n"), "{listed}");
     }
 }

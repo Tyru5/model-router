@@ -255,15 +255,20 @@ pub struct RepoInfo {
     pub detached: bool,
     /// Modified, staged, or untracked entries in `git status`.
     pub changes: usize,
+    /// Why `git status` could not run with the sanitized Git config (a
+    /// partial clone, for example); `changes` is then 0.
+    pub status_error: Option<String>,
 }
 
 pub fn repo_info(project: &Path) -> Option<RepoInfo> {
-    let top = git_readonly(project, &["rev-parse", "--show-toplevel"]).ok()?;
+    // Detection reads no working-tree file, so it needs no sanitized config
+    // and still names a checkout that config refuses.
+    let top = git(project, &["rev-parse", "--show-toplevel"]).ok()?;
     let name = Path::new(&top)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| top.clone());
-    let status = git_readonly(
+    let status = match git_readonly(
         project,
         &[
             "status",
@@ -271,8 +276,26 @@ pub fn repo_info(project: &Path) -> Option<RepoInfo> {
             "--branch",
             "--ignore-submodules=dirty",
         ],
-    )
-    .ok()?;
+    ) {
+        Ok(status) => status,
+        Err(err) => {
+            let (head, detached) = match git(project, &["symbolic-ref", "--short", "-q", "HEAD"]) {
+                Ok(branch) => (branch, false),
+                Err(_) => (
+                    git(project, &["rev-parse", "--short", "HEAD"])
+                        .unwrap_or_else(|_| "no commits".into()),
+                    true,
+                ),
+            };
+            return Some(RepoInfo {
+                name,
+                head,
+                detached,
+                changes: 0,
+                status_error: Some(format!("{err:#}")),
+            });
+        }
+    };
     let mut oid = None;
     let mut branch_head = None;
     let mut changes = 0usize;
@@ -300,6 +323,7 @@ pub fn repo_info(project: &Path) -> Option<RepoInfo> {
         head,
         detached,
         changes,
+        status_error: None,
     })
 }
 
