@@ -83,50 +83,9 @@ impl SanitizedGitDir {
     /// Git 2.26+) and materializes a private `0700` shadow `GIT_DIR` with a
     /// fixed, sanitized `config` file.
     pub(crate) fn new(dir: &Path) -> Result<Self> {
-        let rev = git_command()
-            .args([
-                "rev-parse",
-                "--git-dir",
-                "--git-common-dir",
-                "--show-toplevel",
-            ])
-            .current_dir(dir)
-            .stdin(Stdio::null())
-            .output()
-            .context("Start Git")?;
-        ensure!(
-            rev.status.success(),
-            "git rev-parse: {}",
-            String::from_utf8_lossy(&rev.stderr).trim()
-        );
-        let mut lines = rev
-            .stdout
-            .split(|&b| b == b'\n')
-            .map(|line| line.strip_suffix(b"\r").unwrap_or(line));
-        let git_dir_raw = lines
-            .next()
-            .filter(|l| !l.is_empty())
-            .context("git rev-parse did not return a git-dir")?;
-        let common_dir_raw = lines
-            .next()
-            .filter(|l| !l.is_empty())
-            .context("git rev-parse did not return a git-common-dir")?;
-        let top_raw = lines
-            .next()
-            .filter(|l| !l.is_empty())
-            .context("git rev-parse did not return a work tree")?;
-        let resolve = |raw: &[u8]| -> Result<PathBuf> {
-            let path = PathBuf::from(bytes_to_os(raw)?);
-            let joined = if path.is_absolute() {
-                path
-            } else {
-                dir.join(path)
-            };
-            std::path::absolute(&joined).with_context(|| format!("Resolve {}", joined.display()))
-        };
-        let git_dir = resolve(git_dir_raw)?;
-        let common_dir = resolve(common_dir_raw)?;
-        let top_level = resolve(top_raw)?;
+        let git_dir = rev_parse_path(dir, "--git-dir")?;
+        let common_dir = rev_parse_path(dir, "--git-common-dir")?;
+        let top_level = rev_parse_path(dir, "--show-toplevel")?;
 
         let inspected = inspect_repo_config(dir, &common_dir)?;
         let shadow = tempfile::Builder::new()
@@ -197,6 +156,35 @@ impl SanitizedGitDir {
     pub(crate) fn into_parts(self) -> (tempfile::TempDir, PathBuf) {
         (self.dir, self.top_level)
     }
+}
+
+/// Queries one `git rev-parse` path flag at a time and strips only its single
+/// trailing line terminator, preserving embedded line breaks in directory paths.
+fn rev_parse_path(dir: &Path, flag: &str) -> Result<PathBuf> {
+    let rev = git_command()
+        .args(["rev-parse", flag])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        rev.status.success(),
+        "git rev-parse {flag}: {}",
+        String::from_utf8_lossy(&rev.stderr).trim()
+    );
+    let raw = rev.stdout.strip_suffix(b"\n").unwrap_or(&rev.stdout);
+    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+    ensure!(
+        !raw.is_empty(),
+        "git rev-parse {flag} returned empty output"
+    );
+    let path = PathBuf::from(bytes_to_os(raw)?);
+    let joined = if path.is_absolute() {
+        path
+    } else {
+        dir.join(path)
+    };
+    std::path::absolute(&joined).with_context(|| format!("Resolve {}", joined.display()))
 }
 
 #[cfg(unix)]
@@ -449,11 +437,20 @@ fn parse_and_build_sanitized_config(
             sanitized_config.extend_from_slice(b"\"\n");
         }
     }
-    // Keep Git LFS pointed at the real repository's `<common_dir>/lfs` (or the
-    // user's trusted global `lfs.storage`), never the temporary shadow GIT_DIR
-    // whose directory is deleted when this operation finishes.
+    // Keep Git LFS pointed at the real repository's `<common_dir>/lfs` (or an
+    // absolute trusted global `lfs.storage`), never the temporary shadow
+    // GIT_DIR whose directory is deleted when this operation finishes.
     let lfs_storage = match trusted_lfs_storage {
-        Some(path) => path,
+        Some(path) => {
+            let path_os = bytes_to_os(&path)?;
+            ensure!(
+                Path::new(&path_os).is_absolute(),
+                "Refusing Git operation in {}: relative `lfs.storage` ({}) is not supported by model-router's sanitized Git config; configure an absolute `lfs.storage` path or unset it to use `.git/lfs`",
+                dir.display(),
+                String::from_utf8_lossy(&path)
+            );
+            path
+        }
         None => path_to_bytes(&common_dir.join("lfs"))?,
     };
     write_config_entry(
@@ -686,14 +683,20 @@ pub(crate) fn find_suppressed_filter_path(
         while let (Some(path), Some(_attr), Some(value)) =
             (parts.next(), parts.next(), parts.next())
         {
-            if matches!(value, b"" | b"unspecified" | b"unset" | b"set") {
+            if value.is_empty() {
                 continue;
             }
+            // Check disabled driver names BEFORE skipping `check-attr`'s status
+            // labels (`set`, `unset`, `unspecified`), so a disabled filter
+            // carrying one of those ambiguous names fails closed.
             if drivers.iter().any(|d| d.as_slice() == value) {
                 return Ok(Some((
                     String::from_utf8_lossy(path).into_owned(),
                     String::from_utf8_lossy(value).into_owned(),
                 )));
+            }
+            if matches!(value, b"unspecified" | b"unset" | b"set") {
+                continue;
             }
         }
     }
@@ -742,6 +745,8 @@ pub(crate) fn refuse_suppressed_smudge_filters(dir: &Path, commit_or_tree: &str)
         "git read-tree {commit_or_tree}: {}",
         String::from_utf8_lossy(&read_out.stderr).trim()
     );
+    // Check `--cached` against `commit_or_tree`'s index directly (ignoring
+    // unrelated working-tree `.gitattributes`).
     let mut child = sanitized
         .command(top)
         .args(["check-attr", "--cached", "-z", "filter", "--stdin"])
@@ -780,7 +785,7 @@ pub(crate) fn refuse_suppressed_smudge_filters(dir: &Path, commit_or_tree: &str)
     );
     let mut parts = output.stdout.split(|&b| b == 0);
     while let (Some(path), Some(_attr), Some(value)) = (parts.next(), parts.next(), parts.next()) {
-        if matches!(value, b"" | b"unspecified" | b"unset" | b"set") {
+        if value.is_empty() {
             continue;
         }
         if drivers.iter().any(|d| d.as_slice() == value) {
@@ -789,6 +794,9 @@ pub(crate) fn refuse_suppressed_smudge_filters(dir: &Path, commit_or_tree: &str)
                 String::from_utf8_lossy(path),
                 String::from_utf8_lossy(value)
             );
+        }
+        if matches!(value, b"unspecified" | b"unset" | b"set") {
+            continue;
         }
     }
     Ok(())
@@ -2109,6 +2117,57 @@ mod tests {
             assert!(
                 format!("{err:#}").contains("partial-clone"),
                 "unexpected error: {err:#}"
+            );
+        }
+
+        // Relative trusted `lfs.storage` fails closed instead of writing into
+        // the temporary shadow GIT_DIR.
+        let rel_lfs_raw = b"global\0lfs.storage\nrelative-lfs-cache\0";
+        let rel_lfs_err = parse_and_build_sanitized_config(&repo_canon, &common_dir, rel_lfs_raw)
+            .err()
+            .expect("relative lfs.storage must fail closed");
+        assert!(
+            format!("{rel_lfs_err:#}").contains("relative `lfs.storage`"),
+            "unexpected error: {rel_lfs_err:#}"
+        );
+
+        // Disabled filters named `set` / `unset` / `unspecified` must not be
+        // skipped as check-attr status labels.
+        let ambig_dir = repository().unwrap();
+        let ambig_ws = ambig_dir.path();
+        fs::write(ambig_ws.join(".gitattributes"), "*.ambig filter=set\n").unwrap();
+        fs::write(ambig_ws.join("item.ambig"), "raw\n").unwrap();
+        git(ambig_ws, None, &["add", ".gitattributes", "item.ambig"]).unwrap();
+        git(
+            ambig_ws,
+            None,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "ambig"],
+        )
+        .unwrap();
+        git(
+            ambig_ws,
+            None,
+            &["config", "--local", "filter.set.smudge", "cat"],
+        )
+        .unwrap();
+        let ambig_err = refuse_suppressed_smudge_filters(ambig_ws, "HEAD").unwrap_err();
+        assert!(
+            format!("{ambig_err:#}").contains("`set`"),
+            "expected filter `set` refusal, got: {ambig_err:#}"
+        );
+
+        // Checkout paths containing line breaks must still resolve git dirs cleanly.
+        #[cfg(unix)]
+        {
+            let parent = tempfile::tempdir().unwrap();
+            let nl_repo = parent.path().join("line1\nline2");
+            fs::create_dir(&nl_repo).unwrap();
+            git(&nl_repo, None, &["init", "-q"]).unwrap();
+            fs::write(nl_repo.join("hello.txt"), "hi\n").unwrap();
+            let nl_run = run_dir(&nl_repo);
+            assert!(
+                try_tree(&nl_repo, &nl_run).unwrap().is_some(),
+                "snapshot in newline path should succeed"
             );
         }
     }

@@ -88,7 +88,11 @@ pub fn base_commit(workspace: &Path, tree: &str, reference: &str) -> Result<Stri
 /// A detached worktree at `commit`. Repository hooks and local smudge filters
 /// do not run; worktrees requiring a suppressed local smudge filter are refused.
 pub fn add_worktree(workspace: &Path, path: &Path, commit: &str) -> Result<()> {
-    snapshot::refuse_suppressed_smudge_filters(workspace, commit)?;
+    let resolved = git_raw(
+        workspace,
+        &["rev-parse", "--verify", &format!("{commit}^{{commit}}")],
+    )?;
+    snapshot::refuse_suppressed_smudge_filters(workspace, &resolved)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -101,7 +105,7 @@ pub fn add_worktree(workspace: &Path, path: &Path, commit: &str) -> Result<()> {
             "--no-checkout",
             "--detach",
             path_str,
-            commit,
+            &resolved,
         ],
     )?;
     if let Err(err) = snapshot::populate_worktree(path) {

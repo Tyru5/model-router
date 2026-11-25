@@ -415,7 +415,10 @@ pub fn create_worktree(project: &Path, id: &str, require_clean: bool) -> Result<
     if require_clean {
         ensure_clean_checkout(project)?;
     }
-    crate::snapshot::refuse_suppressed_smudge_filters(project, "HEAD")?;
+    // Resolve HEAD to a fixed commit SHA once so the filter check and
+    // `worktree add` operate on the exact same commit even if HEAD moves.
+    let head = git(project, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    crate::snapshot::refuse_suppressed_smudge_filters(project, &head)?;
     let base = metadata_dir(project)?.join("worktrees");
     fs::create_dir_all(&base)?;
     let path = base.join(id);
@@ -430,7 +433,7 @@ pub fn create_worktree(project: &Path, id: &str, require_clean: bool) -> Result<
             "-b",
             &branch,
             path_str,
-            "HEAD",
+            &head,
         ],
     )?;
     if let Err(err) = crate::snapshot::populate_worktree(&path) {
