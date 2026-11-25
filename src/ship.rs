@@ -996,64 +996,12 @@ fn refuse_suppressed_clean_filters(
             stdin_paths.push(0);
         }
     }
-    if stdin_paths.is_empty() {
-        return Ok(());
-    }
-    let stdin_slice = stdin_paths.as_slice();
-    for cached in [false, true] {
-        let mut cmd = sanitized.command(work);
-        cmd.arg("check-attr");
-        if cached {
-            cmd.arg("--cached");
-        }
-        let mut child = cmd
-            .args(["-z", "filter", "--stdin"])
-            .env("GIT_INDEX_FILE", index)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("Start Git")?;
-        let output = std::thread::scope(|scope| -> Result<std::process::Output> {
-            let writer = child.stdin.take().map(|mut pipe| {
-                scope.spawn(move || -> std::io::Result<()> {
-                    match pipe.write_all(stdin_slice) {
-                        Ok(()) => Ok(()),
-                        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-                        Err(err) => Err(err),
-                    }
-                })
-            });
-            let output = child.wait_with_output()?;
-            if let Some(handle) = writer {
-                if let Ok(Err(err)) = handle.join() {
-                    if output.status.success() {
-                        return Err(err.into());
-                    }
-                }
-            }
-            Ok(output)
-        })?;
-        ensure!(
-            output.status.success(),
-            "git check-attr filter failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+    if let Some((path, driver)) =
+        snapshot::find_suppressed_filter_path(sanitized, work, &stdin_paths, Some(index), drivers)?
+    {
+        anyhow::bail!(
+            "Refusing to ship {path}: repo-local Git clean filter `{driver}` is disabled for safety and shipping would commit unfiltered bytes; configure the filter globally or commit this path manually"
         );
-        let mut parts = output.stdout.split(|&b| b == 0);
-        while let (Some(path), Some(_attr), Some(value)) =
-            (parts.next(), parts.next(), parts.next())
-        {
-            if matches!(value, b"" | b"unspecified" | b"unset" | b"set") {
-                continue;
-            }
-            if drivers.iter().any(|d| d.as_slice() == value) {
-                anyhow::bail!(
-                    "Refusing to ship {}: repo-local Git clean filter `{}` is disabled for safety and shipping would commit unfiltered bytes; configure the filter globally or commit this path manually",
-                    String::from_utf8_lossy(path),
-                    String::from_utf8_lossy(value)
-                );
-            }
-        }
     }
     Ok(())
 }

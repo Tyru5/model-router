@@ -219,6 +219,13 @@ struct InspectedRepoConfig {
     local_smudge_filters: Vec<Vec<u8>>,
 }
 
+struct ConfigEntry {
+    section: Vec<u8>,
+    subsection: Option<Vec<u8>>,
+    var: Vec<u8>,
+    value: Option<Vec<u8>>,
+}
+
 fn inspect_repo_config(dir: &Path) -> Result<InspectedRepoConfig> {
     // `--list -z` preserves exact raw key and value bytes without locale regex
     // quirks, including non-UTF-8 subsection names and names containing `=`.
@@ -234,18 +241,30 @@ fn inspect_repo_config(dir: &Path) -> Result<InspectedRepoConfig> {
         dir.display(),
         String::from_utf8_lossy(&output.stderr).trim()
     );
+    parse_and_build_sanitized_config(dir, &output.stdout)
+}
 
+fn parse_and_build_sanitized_config(dir: &Path, raw: &[u8]) -> Result<InspectedRepoConfig> {
     let mut repo_format_version: u32 = 0;
     let mut core_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut extensions: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut unsupported_extensions: Vec<String> = Vec::new();
-    let mut filter_required: Vec<(Vec<u8>, bool)> = Vec::new();
+    // Trusted system/global driver entries resolved against the real checkout
+    // (preserving `includeIf.gitdir` rules that would no longer match the
+    // temporary shadow `GIT_DIR`).
+    let mut trusted_driver_entries: Vec<ConfigEntry> = Vec::new();
+    let mut trusted_filter_drivers: Vec<Vec<u8>> = Vec::new();
+    // Exact raw `filter.<driver>.required` values from local/worktree scope,
+    // written verbatim so Git itself parses numeric/boolean forms (e.g. `2`).
+    let mut local_filter_required: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
     let mut local_clean_filters: Vec<Vec<u8>> = Vec::new();
     let mut local_smudge_filters: Vec<Vec<u8>> = Vec::new();
 
-    let mut parts = output.stdout.split(|&b| b == 0);
+    let mut parts = raw.split(|&b| b == 0);
     while let (Some(scope), Some(entry)) = (parts.next(), parts.next()) {
-        if scope != b"local" && scope != b"worktree" {
+        let is_trusted_scope = scope == b"system" || scope == b"global";
+        let is_repo_scope = scope == b"local" || scope == b"worktree";
+        if !is_trusted_scope && !is_repo_scope {
             continue;
         }
         let (key, val) = match entry.iter().position(|&b| b == b'\n') {
@@ -255,8 +274,9 @@ fn inspect_repo_config(dir: &Path) -> Result<InspectedRepoConfig> {
         let Some((section, rest)) = split_first(key, b'.') else {
             continue;
         };
+
         if section.eq_ignore_ascii_case(b"core") && !rest.contains(&b'.') {
-            if rest.eq_ignore_ascii_case(b"repositoryformatversion") {
+            if is_repo_scope && rest.eq_ignore_ascii_case(b"repositoryformatversion") {
                 if let Some(v) = val.and_then(|b| std::str::from_utf8(b).ok()) {
                     if let Ok(ver) = v.trim().parse::<u32>() {
                         repo_format_version = ver;
@@ -270,7 +290,39 @@ fn inspect_repo_config(dir: &Path) -> Result<InspectedRepoConfig> {
                     set_last(&mut core_entries, rest.to_ascii_lowercase(), value.to_vec());
                 }
             }
-        } else if section.eq_ignore_ascii_case(b"extensions") && !rest.contains(&b'.') {
+            continue;
+        }
+
+        if is_trusted_scope {
+            if is_driver_section(section) {
+                let (subsection, var) = match split_last(rest, b'.') {
+                    Some((sub, var)) => (Some(sub.to_vec()), var.to_vec()),
+                    None => (None, rest.to_vec()),
+                };
+                if section.eq_ignore_ascii_case(b"filter") {
+                    if let Some(sub) = subsection.as_ref() {
+                        if !sub.is_empty()
+                            && (var.eq_ignore_ascii_case(b"clean")
+                                || var.eq_ignore_ascii_case(b"smudge")
+                                || var.eq_ignore_ascii_case(b"process"))
+                            && val.is_some_and(|v| !v.is_empty())
+                            && !trusted_filter_drivers.iter().any(|d| d == sub)
+                        {
+                            trusted_filter_drivers.push(sub.clone());
+                        }
+                    }
+                }
+                trusted_driver_entries.push(ConfigEntry {
+                    section: section.to_ascii_lowercase(),
+                    subsection,
+                    var,
+                    value: val.map(<[u8]>::to_vec),
+                });
+            }
+            continue;
+        }
+
+        if section.eq_ignore_ascii_case(b"extensions") && !rest.contains(&b'.') {
             let lower = rest.to_ascii_lowercase();
             if matches!(
                 lower.as_slice(),
@@ -299,9 +351,9 @@ fn inspect_repo_config(dir: &Path) -> Result<InspectedRepoConfig> {
             }
             if var.eq_ignore_ascii_case(b"required") {
                 set_last(
-                    &mut filter_required,
+                    &mut local_filter_required,
                     subsection.to_vec(),
-                    git_bool_truthy(val),
+                    val.map(<[u8]>::to_vec),
                 );
             } else if var.eq_ignore_ascii_case(b"clean") {
                 if val.is_some_and(|v| !v.is_empty())
@@ -350,7 +402,7 @@ fn inspect_repo_config(dir: &Path) -> Result<InspectedRepoConfig> {
         sanitized_config.push(b'\t');
         sanitized_config.extend_from_slice(var);
         sanitized_config.extend_from_slice(b" = \"");
-        push_git_escaped(&mut sanitized_config, value);
+        push_git_value_escaped(&mut sanitized_config, value);
         sanitized_config.extend_from_slice(b"\"\n");
     }
     if !extensions.is_empty() {
@@ -359,21 +411,26 @@ fn inspect_repo_config(dir: &Path) -> Result<InspectedRepoConfig> {
             sanitized_config.push(b'\t');
             sanitized_config.extend_from_slice(var);
             sanitized_config.extend_from_slice(b" = \"");
-            push_git_escaped(&mut sanitized_config, value);
+            push_git_value_escaped(&mut sanitized_config, value);
             sanitized_config.extend_from_slice(b"\"\n");
         }
     }
-    for (driver, required) in &filter_required {
-        if !required {
+    for entry in &trusted_driver_entries {
+        write_config_entry(&mut sanitized_config, entry)?;
+    }
+    for (driver, value) in &local_filter_required {
+        if trusted_filter_drivers.iter().any(|d| d == driver) {
             continue;
         }
-        ensure!(
-            !driver.contains(&b'\n') && !driver.contains(&b'\r') && !driver.contains(&0),
-            "Git filter name contains invalid control bytes"
-        );
-        sanitized_config.extend_from_slice(b"[filter \"");
-        push_git_escaped(&mut sanitized_config, driver);
-        sanitized_config.extend_from_slice(b"\"]\n\trequired = true\n");
+        write_config_entry(
+            &mut sanitized_config,
+            &ConfigEntry {
+                section: b"filter".to_vec(),
+                subsection: Some(driver.clone()),
+                var: b"required".to_vec(),
+                value: value.clone(),
+            },
+        )?;
     }
 
     Ok(InspectedRepoConfig {
@@ -381,6 +438,50 @@ fn inspect_repo_config(dir: &Path) -> Result<InspectedRepoConfig> {
         local_clean_filters,
         local_smudge_filters,
     })
+}
+
+fn is_driver_section(section: &[u8]) -> bool {
+    section.eq_ignore_ascii_case(b"filter")
+        || section.eq_ignore_ascii_case(b"diff")
+        || section.eq_ignore_ascii_case(b"difftool")
+        || section.eq_ignore_ascii_case(b"merge")
+        || section.eq_ignore_ascii_case(b"mergetool")
+}
+
+fn write_config_entry(out: &mut Vec<u8>, entry: &ConfigEntry) -> Result<()> {
+    ensure!(
+        !entry.var.is_empty()
+            && entry
+                .var
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b == b'-'),
+        "Git config key contains invalid bytes"
+    );
+    out.push(b'[');
+    out.extend_from_slice(&entry.section);
+    if let Some(sub) = &entry.subsection {
+        ensure!(
+            !sub.contains(&b'\n') && !sub.contains(&b'\r') && !sub.contains(&0),
+            "Git config subsection contains invalid control bytes"
+        );
+        out.extend_from_slice(b" \"");
+        push_git_subsection_escaped(out, sub);
+        out.push(b'"');
+    }
+    out.extend_from_slice(b"]\n\t");
+    out.extend_from_slice(&entry.var);
+    if let Some(val) = &entry.value {
+        ensure!(
+            !val.contains(&0) && !val.contains(&b'\r'),
+            "Git config value contains invalid control bytes"
+        );
+        out.extend_from_slice(b" = \"");
+        push_git_value_escaped(out, val);
+        out.extend_from_slice(b"\"\n");
+    } else {
+        out.push(b'\n');
+    }
+    Ok(())
 }
 
 fn is_safe_core_key(var: &[u8]) -> bool {
@@ -405,23 +506,6 @@ fn is_safe_core_key(var: &[u8]) -> bool {
     )
 }
 
-fn git_bool_truthy(val: Option<&[u8]>) -> bool {
-    let Some(raw) = val else {
-        return true;
-    };
-    let trimmed = raw
-        .iter()
-        .copied()
-        .skip_while(|b| b.is_ascii_whitespace())
-        .collect::<Vec<_>>();
-    let end = trimmed
-        .iter()
-        .rposition(|b| !b.is_ascii_whitespace())
-        .map_or(0, |i| i + 1);
-    let lower = trimmed[..end].to_ascii_lowercase();
-    matches!(lower.as_slice(), b"true" | b"yes" | b"on" | b"1")
-}
-
 fn set_last<T>(list: &mut Vec<(Vec<u8>, T)>, key: Vec<u8>, value: T) {
     if let Some((_, existing)) = list.iter_mut().find(|(k, _)| *k == key) {
         *existing = value;
@@ -430,13 +514,97 @@ fn set_last<T>(list: &mut Vec<(Vec<u8>, T)>, key: Vec<u8>, value: T) {
     }
 }
 
-fn push_git_escaped(out: &mut Vec<u8>, bytes: &[u8]) {
+fn push_git_subsection_escaped(out: &mut Vec<u8>, bytes: &[u8]) {
     for &b in bytes {
         if b == b'\\' || b == b'"' {
             out.push(b'\\');
         }
         out.push(b);
     }
+}
+
+fn push_git_value_escaped(out: &mut Vec<u8>, bytes: &[u8]) {
+    for &b in bytes {
+        match b {
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            _ => out.push(b),
+        }
+    }
+}
+
+/// Checks whether any NUL-delimited path in `stdin_paths` resolves a `filter`
+/// attribute (working-tree or `--cached`) naming one of `drivers`. Returns the
+/// first matching `(path, driver)` pair.
+pub(crate) fn find_suppressed_filter_path(
+    sanitized: &SanitizedGitDir,
+    work: &Path,
+    stdin_paths: &[u8],
+    index: Option<&Path>,
+    drivers: &[Vec<u8>],
+) -> Result<Option<(String, String)>> {
+    if drivers.is_empty() || stdin_paths.is_empty() {
+        return Ok(None);
+    }
+    for cached in [false, true] {
+        let mut cmd = sanitized.command(work);
+        cmd.arg("check-attr");
+        if cached {
+            cmd.arg("--cached");
+        }
+        cmd.args(["-z", "filter", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(idx) = index {
+            cmd.env("GIT_INDEX_FILE", idx);
+        }
+        let mut child = cmd.spawn().context("Start Git")?;
+        let output = std::thread::scope(|scope| -> Result<std::process::Output> {
+            let writer = child.stdin.take().map(|mut pipe| {
+                scope.spawn(move || -> std::io::Result<()> {
+                    use std::io::Write;
+                    match pipe.write_all(stdin_paths) {
+                        Ok(()) => Ok(()),
+                        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                        Err(err) => Err(err),
+                    }
+                })
+            });
+            let output = child.wait_with_output().context("Wait for Git")?;
+            if let Some(handle) = writer {
+                if let Ok(Err(err)) = handle.join() {
+                    if output.status.success() {
+                        return Err(err.into());
+                    }
+                }
+            }
+            Ok(output)
+        })?;
+        ensure!(
+            output.status.success(),
+            "git check-attr filter failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let mut parts = output.stdout.split(|&b| b == 0);
+        while let (Some(path), Some(_attr), Some(value)) =
+            (parts.next(), parts.next(), parts.next())
+        {
+            if matches!(value, b"" | b"unspecified" | b"unset" | b"set") {
+                continue;
+            }
+            if drivers.iter().any(|d| d.as_slice() == value) {
+                return Ok(Some((
+                    String::from_utf8_lossy(path).into_owned(),
+                    String::from_utf8_lossy(value).into_owned(),
+                )));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Refuses to check out a worktree at `commit_or_tree` when any file in it has
@@ -1697,5 +1865,126 @@ mod tests {
         let wt = crate::storage::create_worktree(workspace, "split-wt", true)
             .expect("create_worktree on split index");
         assert!(wt.join("tracked.txt").is_file());
+    }
+
+    #[test]
+    fn sanitized_git_preserves_numeric_required_and_reports_clean_filter_status() {
+        let Some(dir) = repository() else { return };
+        let workspace = dir.path();
+        let run_dir = run_dir(workspace);
+
+        // Numeric truthy `filter.*.required = 2` must stay required in the
+        // sanitized config so Git fails closed.
+        fs::write(workspace.join(".gitattributes"), "*.num filter=numreq\n").unwrap();
+        fs::write(workspace.join("data.num"), "payload\n").unwrap();
+        git(
+            workspace,
+            None,
+            &["config", "--local", "filter.numreq.clean", "cat"],
+        )
+        .unwrap();
+        git(
+            workspace,
+            None,
+            &["config", "--local", "filter.numreq.required", "2"],
+        )
+        .unwrap();
+        assert!(
+            try_tree(workspace, &run_dir).is_err(),
+            "filter.*.required = 2 must fail closed"
+        );
+
+        // Clean checkout with a local clean filter that rewrites file content:
+        // when stat info is stale, create_worktree must report the disabled
+        // local filter instead of asking the user to commit or stash.
+        let clean_dir = repository().unwrap();
+        let clean_ws = clean_dir.path();
+        fs::write(clean_ws.join(".gitattributes"), "*.upper filter=upper\n").unwrap();
+        fs::write(clean_ws.join("note.upper"), "hello\n").unwrap();
+        git(
+            clean_ws,
+            None,
+            &["config", "--local", "filter.upper.clean", "tr a-z A-Z"],
+        )
+        .unwrap();
+        git(clean_ws, None, &["add", ".gitattributes", "note.upper"]).unwrap();
+        git(
+            clean_ws,
+            None,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "filtered"],
+        )
+        .unwrap();
+        // Rewrite the same working-tree bytes to invalidate index stat cache
+        // while keeping native `git status` clean.
+        fs::write(clean_ws.join("note.upper"), "hello\n").unwrap();
+        git(clean_ws, None, &["update-index", "--really-refresh"]).ok();
+        // Force a stale index entry so Git re-reads note.upper from disk.
+        let _ = Command::new("touch")
+            .args(["-t", "202001010000", "note.upper"])
+            .current_dir(clean_ws)
+            .status();
+        let err = crate::storage::create_worktree(clean_ws, "wt-clean-filter", true).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("repo-local Git clean filter") && msg.contains("upper"),
+            "expected disabled clean filter error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn sanitized_git_preserves_include_if_gitdir_global_filter() {
+        let Some(dir) = repository() else { return };
+        let workspace = dir.path();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let included = cfg_dir.path().join("work.gitconfig");
+        fs::write(
+            &included,
+            "[filter \"myglobal\"]\n\tclean = tr a-z A-Z\n\trequired = true\n",
+        )
+        .unwrap();
+        let global = cfg_dir.path().join("global.gitconfig");
+        let repo_canon = fs::canonicalize(workspace).unwrap();
+        fs::write(
+            &global,
+            format!(
+                "[includeIf \"gitdir:{}/\"]\n\tpath = {}\n",
+                repo_canon.display(),
+                included.display()
+            ),
+        )
+        .unwrap();
+
+        // Run `git config --show-scope -z --list` with GIT_CONFIG_GLOBAL set
+        // to our includeIf config and verify inspect_repo_config carries the
+        // matched global filter into the shadow config.
+        let out = git_command()
+            .args(["config", "--show-scope", "-z", "--list"])
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .current_dir(&repo_canon)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("filter.myglobal.clean"),
+            "test fixture includeIf did not match: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+
+        // Verify the sanitized config written from that scope output works when
+        // GIT_DIR points outside the includeIf path.
+        let prev = std::env::var_os("GIT_CONFIG_GLOBAL");
+        let parsed = parse_and_build_sanitized_config(&repo_canon, &out.stdout).unwrap();
+        let shadow_dir = tempfile::tempdir().unwrap();
+        fs::write(shadow_dir.path().join("config"), &parsed.sanitized_config).unwrap();
+        let mut cmd = git_command();
+        cmd.args(["config", "--file"])
+            .arg(shadow_dir.path().join("config"))
+            .args(["--get", "filter.myglobal.clean"]);
+        if let Some(p) = prev {
+            cmd.env("GIT_CONFIG_GLOBAL", p);
+        }
+        let val = cmd.output().unwrap();
+        assert!(val.status.success());
+        assert_eq!(String::from_utf8_lossy(&val.stdout).trim(), "tr a-z A-Z");
     }
 }

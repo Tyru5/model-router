@@ -412,10 +412,9 @@ pub fn git_readonly(project: &Path, args: &[&str]) -> Result<String> {
 /// A worktree on a new branch from HEAD. `require_clean` refuses when the
 /// project has uncommitted changes, which the worktree would not include.
 pub fn create_worktree(project: &Path, id: &str, require_clean: bool) -> Result<PathBuf> {
-    ensure!(
-        !require_clean || git_readonly(project, &["status", "--porcelain"])?.is_empty(),
-        "Worktree mode starts from committed HEAD. Commit or stash project changes, or use the current directory instead"
-    );
+    if require_clean {
+        ensure_clean_checkout(project)?;
+    }
     crate::snapshot::refuse_suppressed_smudge_filters(project, "HEAD")?;
     let base = metadata_dir(project)?.join("worktrees");
     fs::create_dir_all(&base)?;
@@ -442,6 +441,59 @@ pub fn create_worktree(project: &Path, id: &str, require_clean: bool) -> Result<
         return Err(err);
     }
     Ok(path)
+}
+
+fn ensure_clean_checkout(project: &Path) -> Result<()> {
+    let sanitized = crate::snapshot::SanitizedGitDir::new(project)?;
+    let output = sanitized
+        .command(project)
+        .args(["status", "--porcelain", "-z"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        output.status.success(),
+        "git status --porcelain -z: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    if output.stdout.is_empty() {
+        return Ok(());
+    }
+    // If any reported dirty path uses a suppressed repo-local clean filter,
+    // Git's sanitized comparison sees raw working-tree bytes against filtered
+    // index blobs and cannot prove whether the file actually changed.
+    let drivers = sanitized.local_clean_filters();
+    if !drivers.is_empty() {
+        let mut stdin_paths = Vec::new();
+        let mut entries = output.stdout.split(|&b| b == 0);
+        while let Some(entry) = entries.next() {
+            if entry.len() <= 3 {
+                continue;
+            }
+            let x = entry[0];
+            let y = entry[1];
+            stdin_paths.extend_from_slice(&entry[3..]);
+            stdin_paths.push(0);
+            if matches!(x, b'R' | b'C') || matches!(y, b'R' | b'C') {
+                let _ = entries.next();
+            }
+        }
+        if let Some((path, driver)) = crate::snapshot::find_suppressed_filter_path(
+            &sanitized,
+            sanitized.top_level(),
+            &stdin_paths,
+            None,
+            drivers,
+        )? {
+            anyhow::bail!(
+                "Cannot verify whether {path} is clean: repo-local Git clean filter `{driver}` is disabled for safety. Configure the filter globally or use the current directory instead"
+            );
+        }
+    }
+    anyhow::bail!(
+        "Worktree mode starts from committed HEAD. Commit or stash project changes, or use the current directory instead"
+    );
 }
 
 pub fn clean_terminal(text: &str) -> String {
