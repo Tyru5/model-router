@@ -253,7 +253,12 @@ fn parse_and_build_sanitized_config(
     // written verbatim so Git itself parses numeric/boolean forms (e.g. `2`).
     let mut local_filter_required: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
     let mut local_clean_filters: Vec<Vec<u8>> = Vec::new();
+    // Only common `local` scope: a source worktree's `config.worktree` does
+    // not apply to a newly created worktree.
     let mut local_smudge_filters: Vec<Vec<u8>> = Vec::new();
+    // Repository-local Git LFS endpoint URLs (data, not commands), kept so
+    // git-lfs can still fetch objects missing from the local cache.
+    let mut lfs_endpoints: Vec<ConfigEntry> = Vec::new();
 
     let mut parts = raw.split(|&b| b == 0);
     while let (Some(scope), Some(entry)) = (parts.next(), parts.next()) {
@@ -348,10 +353,22 @@ fn parse_and_build_sanitized_config(
             if val.is_some_and(|v| !v.is_empty()) {
                 local_lfs_storage = true;
             }
+        } else if section.eq_ignore_ascii_case(b"lfs") && rest.eq_ignore_ascii_case(b"url") {
+            push_lfs_endpoint(&mut lfs_endpoints, b"lfs", None, b"url", val);
         } else if section.eq_ignore_ascii_case(b"remote") {
-            if let Some((_, var)) = split_last(rest, b'.') {
+            if let Some((sub, var)) = split_last(rest, b'.') {
                 if var.eq_ignore_ascii_case(b"promisor") && !is_git_explicit_false(val) {
                     partial_clone = true;
+                } else if !sub.is_empty()
+                    && (var.eq_ignore_ascii_case(b"url") || var.eq_ignore_ascii_case(b"lfsurl"))
+                {
+                    push_lfs_endpoint(
+                        &mut lfs_endpoints,
+                        b"remote",
+                        Some(sub),
+                        &var.to_ascii_lowercase(),
+                        val,
+                    );
                 }
             }
         } else if section.eq_ignore_ascii_case(b"filter") {
@@ -374,7 +391,8 @@ fn parse_and_build_sanitized_config(
                     local_clean_filters.push(subsection.to_vec());
                 }
             } else if var.eq_ignore_ascii_case(b"smudge") {
-                if val.is_some_and(|v| !v.is_empty())
+                if scope == b"local"
+                    && val.is_some_and(|v| !v.is_empty())
                     && !local_smudge_filters.iter().any(|d| d == subsection)
                 {
                     local_smudge_filters.push(subsection.to_vec());
@@ -383,7 +401,7 @@ fn parse_and_build_sanitized_config(
                 if !local_clean_filters.iter().any(|d| d == subsection) {
                     local_clean_filters.push(subsection.to_vec());
                 }
-                if !local_smudge_filters.iter().any(|d| d == subsection) {
+                if scope == b"local" && !local_smudge_filters.iter().any(|d| d == subsection) {
                     local_smudge_filters.push(subsection.to_vec());
                 }
             }
@@ -462,7 +480,7 @@ fn parse_and_build_sanitized_config(
             value: Some(lfs_storage),
         },
     )?;
-    for entry in &trusted_driver_entries {
+    for entry in trusted_driver_entries.iter().chain(&lfs_endpoints) {
         write_config_entry(&mut sanitized_config, entry)?;
     }
     for (driver, value) in &local_filter_required {
@@ -536,6 +554,24 @@ fn is_driver_section(section: &[u8]) -> bool {
         || section.eq_ignore_ascii_case(b"difftool")
         || section.eq_ignore_ascii_case(b"merge")
         || section.eq_ignore_ascii_case(b"mergetool")
+}
+
+fn push_lfs_endpoint(
+    out: &mut Vec<ConfigEntry>,
+    section: &[u8],
+    subsection: Option<&[u8]>,
+    var: &[u8],
+    val: Option<&[u8]>,
+) {
+    let Some(value) = val.filter(|v| !v.is_empty() && !v.contains(&b'\n')) else {
+        return;
+    };
+    out.push(ConfigEntry {
+        section: section.to_vec(),
+        subsection: subsection.map(<[u8]>::to_vec),
+        var: var.to_vec(),
+        value: Some(value.to_vec()),
+    });
 }
 
 fn write_config_entry(out: &mut Vec<u8>, entry: &ConfigEntry) -> Result<()> {
@@ -704,8 +740,9 @@ pub(crate) fn find_suppressed_filter_path(
 }
 
 /// Refuses to check out a worktree at `commit_or_tree` when any file in it has
-/// a `.gitattributes` `filter` naming a repo-local or worktree-local
-/// `smudge`/`process` filter that the router disables, so worktrees never
+/// a `.gitattributes` `filter` naming a repo-local `smudge`/`process` filter
+/// that the router disables (a source worktree's `config.worktree` does not
+/// apply to the new worktree), so worktrees never
 /// silently start with unprocessed pointer files (even for optional filters).
 pub(crate) fn refuse_suppressed_smudge_filters(dir: &Path, commit_or_tree: &str) -> Result<()> {
     let sanitized = SanitizedGitDir::new(dir)?;
@@ -2105,6 +2142,25 @@ mod tests {
             .unwrap();
         assert!(mixed_req.status.success());
         assert_eq!(String::from_utf8_lossy(&mixed_req.stdout).trim(), "true");
+
+        // Repo-local LFS endpoint URLs survive; a worktree-scope smudge
+        // filter does not block new worktrees, a local one does.
+        let lfs_raw = b"local\0remote.origin.url\nhttps://example.test/r.git\0local\0lfs.url\nhttps://lfs.example.test\0worktree\0filter.wt.smudge\ncat\0local\0filter.lc.smudge\ncat\0";
+        let lfs = parse_and_build_sanitized_config(&repo_canon, &common_dir, lfs_raw).unwrap();
+        fs::write(shadow_dir.path().join("lfs.config"), &lfs.sanitized_config).unwrap();
+        let get = |key: &str| {
+            let out = git_command()
+                .args(["config", "--file"])
+                .arg(shadow_dir.path().join("lfs.config"))
+                .args(["--get", key])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        assert_eq!(get("remote.origin.url"), "https://example.test/r.git");
+        assert_eq!(get("lfs.url"), "https://lfs.example.test");
+        assert_eq!(get("filter.wt.smudge"), "");
+        assert_eq!(lfs.local_smudge_filters, vec![b"lc".to_vec()]);
 
         // Partial clones (extensions.partialClone or remote.*.promisor) fail closed.
         for partial_raw in [
