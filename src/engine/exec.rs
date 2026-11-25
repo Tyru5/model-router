@@ -95,6 +95,9 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
     }
     let check_protected = !run.workflow.protected_paths.is_empty();
     let check_policies = crate::policy::has_block_policies(&run.workflow.policies);
+    if !check_protected && !check_policies && snapshot::is_repository(&run.workspace) {
+        snapshot::ensure_supported_git(&run.workspace)?;
+    }
     let tree_before = if check_protected || check_policies {
         let what = match (check_protected, check_policies) {
             (true, true) => "workflow protected_paths and policies",

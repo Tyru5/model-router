@@ -121,10 +121,14 @@ impl Run {
                     .map(|c| c.stage(s))
             })
             .collect();
+        let is_repo = snapshot::is_repository(project);
         ensure!(
-            candidates.is_empty() || snapshot::is_repository(project),
+            candidates.is_empty() || is_repo,
             "Fan-out stages need a Git repository: candidates run in Git worktrees"
         );
+        if is_repo {
+            snapshot::ensure_supported_git(project)?;
+        }
         for stage in workflow
             .stages
             .iter()

@@ -152,6 +152,15 @@ impl SanitizedGitDir {
             link_entry(&real_index, &shadow.path().join("index"))
                 .context("Link repository index")?;
         }
+        if let Ok(entries) = fs::read_dir(&git_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with("sharedindex.") {
+                    link_entry(&entry.path(), &shadow.path().join(&name))
+                        .context("Link repository shared index")?;
+                }
+            }
+        }
 
         Ok(Self {
             dir: shadow,
@@ -334,6 +343,9 @@ fn inspect_repo_config(dir: &Path) -> Result<InspectedRepoConfig> {
     sanitized_config.extend_from_slice(b"\tbare = false\n");
     sanitized_config.extend_from_slice(b"\tfsmonitor = false\n");
     sanitized_config.extend_from_slice(b"\thooksPath = /dev/null\n");
+    // Keep private indexes self-contained so they never depend on a
+    // `sharedindex.*` created inside this temporary shadow GIT_DIR.
+    sanitized_config.extend_from_slice(b"\tsplitIndex = false\n");
     for (var, value) in &core_entries {
         sanitized_config.push(b'\t');
         sanitized_config.extend_from_slice(var);
@@ -388,6 +400,8 @@ fn is_safe_core_key(var: &[u8]) -> bool {
             | b"protectntfs"
             | b"trustctime"
             | b"checkstat"
+            | b"excludesfile"
+            | b"attributesfile"
     )
 }
 
@@ -636,6 +650,25 @@ fn git_sanitized(dir: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(output.stdout)
+}
+
+/// Verifies that `dir`'s Git binary supports config-scope inspection
+/// (`--show-scope`, Git 2.26+) so ordinary runs surface a version error before
+/// launch instead of silently losing snapshots and diffs.
+pub fn ensure_supported_git(dir: &Path) -> Result<()> {
+    let output = git_command()
+        .args(["config", "--show-scope", "--name-only", "-z", "--list"])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        output.status.success(),
+        "Could not inspect Git config scopes in {} (requires Git 2.26+): {}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
 }
 
 /// Repository detection independent of config-scope inspection, so older Git
@@ -1618,5 +1651,51 @@ mod tests {
             !wt_marker.exists(),
             "worktree add executed repo-local smudge filter"
         );
+    }
+
+    #[test]
+    fn sanitized_git_preserves_local_excludes_file_and_split_indexes() {
+        let Some(dir) = repository() else { return };
+        let workspace = dir.path();
+        let run_dir = run_dir(workspace);
+        let excludes = workspace.join(".local-ignore");
+        fs::write(&excludes, "*.secret-local\n.local-ignore\n").unwrap();
+        git(
+            workspace,
+            None,
+            &["config", "--local", "core.excludesFile", ".local-ignore"],
+        )
+        .unwrap();
+        fs::write(workspace.join("ignored.secret-local"), "do not stage\n").unwrap();
+
+        let before = tree(workspace, &run_dir).unwrap();
+        fs::write(workspace.join("visible.txt"), "hello\n").unwrap();
+        let after = tree(workspace, &run_dir).unwrap();
+        let changed = changed_paths(workspace, &before, &after).unwrap();
+        assert_eq!(changed, vec!["visible.txt"]);
+
+        // Enable split-index mode in the repository and verify status, worktree
+        // creation, and consecutive snapshots all succeed.
+        git(
+            workspace,
+            None,
+            &["config", "--local", "core.splitIndex", "true"],
+        )
+        .unwrap();
+        git(workspace, None, &["update-index", "--split-index"]).unwrap();
+        fs::remove_file(workspace.join("visible.txt")).unwrap();
+        let info = crate::storage::repo_info(workspace).expect("repo_info on split index");
+        assert_eq!(info.changes, 0, "unexpected dirty state: {info:?}");
+        let snap1 = tree(workspace, &run_dir).expect("first snapshot on split index");
+        fs::write(workspace.join("after-split.txt"), "ok\n").unwrap();
+        let snap2 = tree(workspace, &run_dir).expect("second snapshot on split index");
+        assert_eq!(
+            changed_paths(workspace, &snap1, &snap2).unwrap(),
+            vec!["after-split.txt"]
+        );
+        fs::remove_file(workspace.join("after-split.txt")).unwrap();
+        let wt = crate::storage::create_worktree(workspace, "split-wt", true)
+            .expect("create_worktree on split index");
+        assert!(wt.join("tracked.txt").is_file());
     }
 }

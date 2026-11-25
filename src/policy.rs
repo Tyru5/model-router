@@ -762,16 +762,26 @@ fn set_nonblocking(fd: libc::c_int) {
     }
 }
 
-/// Drains available bytes from a non-blocking pipe into `out` (capped at
-/// `limit`), discarding excess bytes. Returns `true` when the stream hit EOF or
-/// an unrecoverable error and should be closed.
+/// Drains up to one bounded slice of available bytes from a non-blocking pipe
+/// into `out` (capped at `limit`), discarding excess bytes while checking
+/// `deadline` so a continuously flooding scanner cannot starve the timeout.
+/// Returns `true` when the stream hit EOF or an unrecoverable error and should
+/// be closed.
 #[cfg(unix)]
-fn drain_nonblocking(stream: &mut impl Read, out: &mut Vec<u8>, limit: usize) -> bool {
+fn drain_nonblocking(
+    stream: &mut impl Read,
+    out: &mut Vec<u8>,
+    limit: usize,
+    deadline: Instant,
+) -> bool {
+    const MAX_PER_TICK: usize = 64 * 1024;
     let mut buf = [0u8; 8192];
-    loop {
+    let mut read_this_tick = 0usize;
+    while read_this_tick < MAX_PER_TICK && Instant::now() < deadline {
         match stream.read(&mut buf) {
             Ok(0) => return true,
             Ok(n) => {
+                read_this_tick += n;
                 if out.len() < limit {
                     let take = n.min(limit - out.len());
                     out.extend_from_slice(&buf[..take]);
@@ -782,6 +792,7 @@ fn drain_nonblocking(stream: &mut impl Read, out: &mut Vec<u8>, limit: usize) ->
             Err(_) => return true,
         }
     }
+    false
 }
 
 /// Waits for `child` and drains its `stdout`/`stderr` pipes on the calling
@@ -855,12 +866,12 @@ fn collect_scanner_unix(
         }
 
         if let Some(s) = stdout_pipe.as_mut() {
-            if drain_nonblocking(s, &mut stdout, SCANNER_OUTPUT_LIMIT) {
+            if drain_nonblocking(s, &mut stdout, SCANNER_OUTPUT_LIMIT, deadline) {
                 stdout_pipe = None;
             }
         }
         if let Some(s) = stderr_pipe.as_mut() {
-            if drain_nonblocking(s, &mut stderr, SCANNER_OUTPUT_LIMIT) {
+            if drain_nonblocking(s, &mut stderr, SCANNER_OUTPUT_LIMIT, deadline) {
                 stderr_pipe = None;
             }
         }
@@ -1557,6 +1568,31 @@ diff --git a/tests/helper.rs b/tests/helper.rs
             started.elapsed() < Duration::from_secs(3),
             "scanner hung past timeout: {:?}",
             started.elapsed()
+        );
+
+        // Verify a scanner continuously flooding stdout still hits the deadline.
+        let flooder = vec![
+            "python3".into(),
+            "-c".into(),
+            "import sys; chunk = b'x' * 16384\nwhile True:\n    sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()".into(),
+        ];
+        let flood_started = Instant::now();
+        let flood_err = run_external_scanner_within(
+            dir.path(),
+            &flooder,
+            &[],
+            &index,
+            Duration::from_millis(400),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{flood_err:#}").contains("timed out"),
+            "{flood_err:#}"
+        );
+        assert!(
+            flood_started.elapsed() < Duration::from_secs(3),
+            "flooding scanner missed timeout: {:?}",
+            flood_started.elapsed()
         );
     }
 }
