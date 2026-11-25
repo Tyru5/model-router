@@ -293,10 +293,12 @@ fn run_test(test: &HarnessTest) -> Result<TestOutcome, String> {
             "Refusing to run {TEST_SCRIPT}: file missing or does not match this build."
         ));
     }
+    let private = crate::process::host::private_temp_dir()
+        .map_err(|error| format!("Could not stage capture script: {error:#}"))?;
     let mut temp = tempfile::Builder::new()
         .prefix("model-router-capture-")
         .suffix(".py")
-        .tempfile()
+        .tempfile_in(private)
         .map_err(|error| format!("Could not stage capture script: {error}"))?;
     std::io::Write::write_all(&mut temp, TEST_SCRIPT_BYTES)
         .map_err(|error| format!("Could not write capture script: {error}"))?;

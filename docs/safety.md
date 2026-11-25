@@ -130,7 +130,11 @@ working-tree attributes, stage files, diff, apply patches, populate worktrees,
 or launch `git difftool` run against a fixed, private sanitized `GIT_DIR`
 config (requiring Git 2.26+) that excludes repo-local filters, diff/merge
 drivers, and difftools so concurrent `.git/config` changes cannot inject
-commands; worktree creation and shipping fail closed when affected files rely
+commands. That `GIT_DIR` lives in a `tmp` directory inside the router's
+socket directory, which stages cannot write. Partial clones
+(`extensions.partialClone` or `remote.*.promisor`) and a repository-local
+`lfs.storage` are refused; use a full clone and set `lfs.storage` globally.
+Worktree creation and shipping fail closed when affected files rely
 on suppressed repo-local filters, and workflows with `protected_paths` or
 blocking `policies` fail before launch when the pre-stage snapshot cannot be
 captured.

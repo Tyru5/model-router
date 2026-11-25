@@ -90,7 +90,7 @@ impl SanitizedGitDir {
         let inspected = inspect_repo_config(dir, &common_dir)?;
         let shadow = tempfile::Builder::new()
             .prefix("model-router-git-")
-            .tempdir()
+            .tempdir_in(crate::process::host::private_temp_dir()?)
             .context("Create sanitized Git directory")?;
 
         fs::write(shadow.path().join("config"), &inspected.sanitized_config)
@@ -397,7 +397,7 @@ fn parse_and_build_sanitized_config(
     );
     ensure!(
         !partial_clone,
-        "Refusing Git operation in {}: partial-clone repositories (extensions.partialClone / remote.*.promisor) are not supported by model-router's sanitized Git config; hydrate the clone first (for example with `git fetch --refetch`) or use a full clone",
+        "Refusing Git operation in {}: partial-clone repositories (extensions.partialClone / remote.*.promisor) are not supported by model-router's sanitized Git config; use a full clone (`git clone` without `--filter`)",
         dir.display()
     );
     ensure!(

@@ -991,7 +991,10 @@ fn refuse_suppressed_clean_filters(
     }
     let mut stdin_paths = Vec::new();
     for file in files {
-        if file.status != snapshot::ChangeKind::Deleted {
+        // A deleted path restored since the run is staged as a file too.
+        if file.status != snapshot::ChangeKind::Deleted
+            || fs::symlink_metadata(work.join(&file.path)).is_ok()
+        {
             stdin_paths.extend_from_slice(file.path.as_bytes());
             stdin_paths.push(0);
         }
