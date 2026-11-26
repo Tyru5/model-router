@@ -175,7 +175,7 @@ or subsection. Read the values with `git config --show-scope --list`.
 100,000 rounds, salted with the workspace path). The ship stops if that
 digest differs before staging, before the commit, or before the push, so
 any repo-local config change after the plan means planning again. The
-commit, index update, push, and draft PR all run before the checkout moves
+commit, push, draft PR, and index update all run before the checkout moves
 to the new branch, so config an `includeIf.onbranch` rule turns on for that
 branch is never what they read. A push remote that only a legacy
 `.git/remotes/<name>` or `.git/branches/<name>` file defines is refused,
@@ -191,10 +191,13 @@ after the stage, and stops the stage blocked when one was added, changed, or
 removed, whatever made Git ignore it (`.gitignore`, `.git/info/exclude`,
 `core.excludesFile`). It reads each file's path, mode, and contents, a
 symbolic link's target and the file it leads to, and the files inside an
-ignored nested repository; it skips `.model-router`. Git lists the files
+ignored nested repository; it skips the router's own `.model-router`. A
+glob such as `dir/**` therefore also covers ignored build output under
+`dir`. Git lists the files
 against the run's own snapshot index, so staging one in the checkout's index
 does not hide it. The check reads every matching ignored file in full twice
-per stage, and a directory Git cannot read under a protected glob stops the
+per stage, and anything Git warns about while listing them (a directory it
+cannot read; a glob that starts with `**` reaches every directory) stops the
 stage. `run.json` keeps only a PBKDF2 digest of them. A `before_stage` hook
 runs after the first reading, so a hook that rewrites a protected ignored
 file blocks its stage, as it does for a tracked one. Not covered, as for

@@ -1384,10 +1384,20 @@ fn hash_untracked_entry(context: &mut ring::digest::Context, path: &Path) -> Res
         // A write to the path lands in the file the link leads to.
         return match fs::metadata(path) {
             Ok(target) if target.is_file() => hash_file(context, path, true),
-            _ => {
+            Ok(_) => {
                 context.update(b"x");
                 Ok(())
             }
+            // A link that leads nowhere. Anything else (a directory on the
+            // way that cannot be searched) could hide a file behind it.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) =>
+            {
+                context.update(b"x");
+                Ok(())
+            }
+            Err(error) => Err(error).with_context(|| format!("Follow {}", path.display())),
         };
     }
     if metadata.is_file() {
@@ -1397,18 +1407,17 @@ fn hash_untracked_entry(context: &mut ring::digest::Context, path: &Path) -> Res
     Ok(())
 }
 
-/// The leading segments of protected-path glob `pattern` that have no
-/// wildcard, joined with `/`: every path `policy::matches_glob` accepts for
-/// the pattern is that path or lies under it. None when the pattern starts
-/// with a wildcard, so it gives no such limit.
+/// The first path segment of protected-path glob `pattern` when it has no
+/// wildcard: every path `policy::matches_glob` accepts for the pattern is
+/// that path or lies under it. None when the segment has a wildcard or is
+/// `.` or `..`, so it gives no such limit. Only the first segment is used:
+/// Git refuses a pathspec that reaches inside an ignored nested repository.
 fn literal_prefix(pattern: &str) -> Option<String> {
-    let segments: Vec<&str> = pattern
+    let first = pattern
         .trim()
         .split('/')
-        .filter(|segment| !segment.is_empty())
-        .take_while(|segment| !segment.contains(['*', '?']))
-        .collect();
-    (!segments.is_empty()).then(|| segments.join("/"))
+        .find(|segment| !segment.is_empty())?;
+    (!first.contains(['*', '?']) && first != "." && first != "..").then(|| first.to_owned())
 }
 
 /// A digest of the untracked files Git ignores whose repository-relative
@@ -1423,8 +1432,9 @@ fn literal_prefix(pattern: &str) -> Option<String> {
 /// `tree` fills, so a file is in the snapshot or in this list whatever a
 /// stage did to the checkout's own index. An ignored nested repository,
 /// which Git lists as one directory, is walked here. The router's own
-/// `.model-router` directories are left out. Anything Git warns about (a
-/// directory it could not read) is an error. `Ok(None)` outside Git.
+/// `.model-router` directory (in `workspace` and at the top of the work
+/// tree) is left out. Anything Git warns about (a directory it could not
+/// read) is an error. `Ok(None)` outside Git.
 pub fn ignored_protected_digest(
     workspace: &Path,
     run_dir: &Path,
@@ -1447,9 +1457,15 @@ pub fn ignored_protected_digest(
             .iter()
             .any(|pattern| crate::policy::matches_glob(pattern, &path))
     };
+    // `workspace` relative to the top of the work tree: empty, or `sub/`.
+    let show_prefix = git_raw(workspace, &["rev-parse", "--show-prefix"])?;
+    let show_prefix = show_prefix.strip_suffix(b"\n").unwrap_or(&show_prefix);
+    let mut own_dir = show_prefix.to_vec();
+    own_dir.extend_from_slice(b".model-router/");
     let is_router_dir = |raw: &[u8]| {
-        raw.split(|&b| b == b'/')
-            .any(|part| part == b".model-router")
+        [own_dir.as_slice(), b".model-router/"]
+            .iter()
+            .any(|dir| raw.starts_with(dir))
     };
     // Limit Git's walk to where a pattern can match, unless one can match
     // anywhere. A path that is not valid UTF-8 is matched as lossy text, so
@@ -1506,10 +1522,6 @@ pub fn ignored_protected_digest(
     }
     let status = child.wait().context("Wait for git ls-files")?;
     listing.context("Read git ls-files output")?;
-    ensure!(
-        status.success(),
-        "git ls-files --others --ignored failed ({status})"
-    );
     let mut warnings = Vec::new();
     {
         use std::io::Seek;
@@ -1519,10 +1531,16 @@ pub fn ignored_protected_digest(
             .read_to_end(&mut warnings)
             .context("Read Git's warnings")?;
     }
+    let warnings = String::from_utf8_lossy(&warnings);
     ensure!(
-        warnings.is_empty(),
+        status.success(),
+        "git ls-files --others --ignored failed ({status}): {}",
+        warnings.trim()
+    );
+    ensure!(
+        warnings.trim().is_empty(),
         "git ls-files could not list every ignored file: {}",
-        String::from_utf8_lossy(&warnings).trim()
+        warnings.trim()
     );
     // Git lists an ignored nested repository as one directory and nothing
     // inside it.
@@ -1532,7 +1550,7 @@ pub fn ignored_protected_digest(
         for entry in entries {
             let entry = entry.with_context(|| format!("List {}", path.display()))?;
             let name = entry.file_name();
-            if name == ".git" || name == ".model-router" {
+            if name == ".git" {
                 continue;
             }
             let mut raw = directory.clone();
@@ -2632,6 +2650,14 @@ mod tests {
         fs::write(workspace.join("secrets/key"), "k2\n").unwrap();
         let edited = digest();
         assert_ne!(hidden, edited);
+        // Only the router's own directory is left out, not one of that name
+        // under a protected path.
+        fs::create_dir(workspace.join("secrets/.model-router")).unwrap();
+        fs::write(workspace.join("secrets/.model-router/key"), "k\n").unwrap();
+        let named = digest();
+        assert_ne!(edited, named);
+        fs::remove_dir_all(workspace.join("secrets/.model-router")).unwrap();
+        assert_eq!(edited, digest());
         // Its mode is part of it.
         fs::set_permissions(
             workspace.join("secrets/key"),
@@ -2682,7 +2708,13 @@ mod tests {
         let Some(dir) = repository() else { return };
         let workspace = dir.path();
         let run_dir = run_dir(workspace);
-        let patterns = vec!["vault/**/*.env".to_owned()];
+        // The second pattern names a path deep inside the nested repository,
+        // and the third one leaves the repository; neither stops Git.
+        let patterns = vec![
+            "vault/**/*.env".to_owned(),
+            "vault/deep/prod.env".to_owned(),
+            "../outside/.env".to_owned(),
+        ];
         let digest = || {
             tree(workspace, &run_dir).unwrap();
             ignored_protected_digest(workspace, &run_dir, &patterns)
@@ -2720,7 +2752,10 @@ mod tests {
     #[test]
     fn literal_prefix_limits_only_patterns_without_a_leading_wildcard() {
         assert_eq!(literal_prefix(".env").as_deref(), Some(".env"));
-        assert_eq!(literal_prefix(" /a//b/*.json ").as_deref(), Some("a/b"));
+        assert_eq!(literal_prefix(" /a//b/*.json ").as_deref(), Some("a"));
+        assert_eq!(literal_prefix("../shared/.env"), None);
+        assert_eq!(literal_prefix("./.env"), None);
+        assert_eq!(literal_prefix(" / "), None);
         assert_eq!(literal_prefix("secrets/**").as_deref(), Some("secrets"));
         assert_eq!(literal_prefix("**/.env"), None);
         assert_eq!(literal_prefix("*.pem"), None);

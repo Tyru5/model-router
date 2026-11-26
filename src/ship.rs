@@ -335,11 +335,10 @@ fn git_config_digest(work: &Path, entries: &[u8]) -> String {
 /// is a helper too.
 fn runs_remote_helper(url: &str) -> bool {
     let is_name = |name: &str| {
-        !name.is_empty()
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        name.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
     };
+    // Git takes an empty transport too and runs `git-remote-`.
     if url
         .split_once("::")
         .is_some_and(|(transport, _)| is_name(transport))
@@ -347,7 +346,8 @@ fn runs_remote_helper(url: &str) -> bool {
         return true;
     }
     url.split_once("://").is_some_and(|(scheme, _)| {
-        is_name(scheme)
+        !scheme.is_empty()
+            && is_name(scheme)
             && !matches!(
                 scheme,
                 "http" | "https" | "ftp" | "ftps" | "ssh" | "git" | "file" | "git+ssh" | "ssh+git"
@@ -1321,38 +1321,49 @@ fn apply_steps(
     git(work, &["branch", "--no-track", &plan.branch, &commit])?;
     outcome.commit = Some(commit.clone());
     outcome.author = git(work, &["log", "-1", "--format=%an <%ae>", &commit]).ok();
-    // Sync ONLY the committed paths in the real index to match `commit`'s tree,
-    // avoiding re-hashing live working tree files and leaving unrelated staged
-    // changes untouched.
-    exec_with(
-        "git",
-        &[
-            "reset",
-            "-q",
-            &commit,
-            "--pathspec-from-file=-",
-            "--pathspec-file-nul",
-        ],
-        &top,
-        &[],
-        Some(&list),
-    )?;
     let published = publish(plan, dir, &commit, outcome, log);
     // Point the checkout at the branch whether or not publishing worked;
     // the working tree is untouched, like `git switch -c` with the commit on
     // top.
-    git(
-        work,
-        &[
-            "symbolic-ref",
-            "-m",
-            "model-router ship",
-            "HEAD",
-            &format!("refs/heads/{}", plan.branch),
-        ],
-    )?;
-    log(format!("Switched to new branch {}\n", plan.branch));
-    published
+    let switched = (|| -> Result<()> {
+        // Sync ONLY the committed paths in the real index to match
+        // `commit`'s tree, leaving unrelated staged changes untouched.
+        exec_with(
+            "git",
+            &[
+                "reset",
+                "-q",
+                &commit,
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+            ],
+            &top,
+            &[],
+            Some(&list),
+        )?;
+        git(
+            work,
+            &[
+                "symbolic-ref",
+                "-m",
+                "model-router ship",
+                "HEAD",
+                &format!("refs/heads/{}", plan.branch),
+            ],
+        )?;
+        Ok(())
+    })();
+    match (published, switched) {
+        (published, Ok(())) => {
+            log(format!("Switched to new branch {}\n", plan.branch));
+            published
+        }
+        (Ok(()), Err(switch)) => Err(switch),
+        (Err(publish), Err(switch)) => Err(anyhow::anyhow!(
+            "{publish:#}\nThe checkout also could not move to branch {}: {switch:#}",
+            plan.branch
+        )),
+    }
 }
 
 /// Pushes `plan`'s branch and opens its draft PR, as planned. Runs before
@@ -2190,6 +2201,7 @@ mod tests {
         for helper in [
             "ext::sh -c x",
             "hg::https://h/r",
+            "::addr",
             "vendor://h/r",
             "HTTPS://h/r",
             "a+b://h/r",
