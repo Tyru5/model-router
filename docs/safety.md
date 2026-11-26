@@ -165,17 +165,18 @@ goes: `gpg.program`, `gpg.<format>.program`, `gpg.ssh.defaultKeyCommand`,
 `remote.<name>.vcs`, `http.proxy`, and `http.<url>.proxy`. A plan with any of
 them always waits for confirmation, even with `confirm = false`, and the ship
 stops if they, or a repo-local `remote.<name>.url`, changed after the plan.
-The plan and `plan.json` leave credentials out: a URL's user name and
-password show as `<hidden>`, a credential helper shows only its first word,
-and a SHA-256 of the exact entries detects the change.
+A helper, proxy, or URL can hold a credential, so the plan and `plan.json`
+name the keys only (`credential.helper`, `remote.*.pushurl`), never a value
+or subsection; a SHA-256 of the exact entries detects the change. Read the
+values with `git config --show-scope --list`.
 Worktree creation and shipping fail closed when affected files rely
 on suppressed repo-local filters, and workflows with `protected_paths` or
 blocking `policies` fail before launch when the pre-stage snapshot cannot be
 captured. Snapshots skip ignored files, so for those workflows a stage also
 stops blocked when repo-local ignore rules it does not snapshot changed while
-it ran: a repo-local or worktree `core.excludesFile` value, the file it
-names, or `.git/info/exclude`. Either file must be a regular file of at most
-16 MiB.
+it ran: the `core.excludesFile` path Git resolves (through the sanitized
+config, so it is the file a snapshot reads), that file, or
+`.git/info/exclude`. Either file must be a regular file of at most 16 MiB.
 
 A stage cannot reach a terminal host (see below), whose harness runs outside
 the sandbox, through the usual socket directories: `$XDG_RUNTIME_DIR/model-router`,

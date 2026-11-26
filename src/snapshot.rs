@@ -1321,54 +1321,63 @@ fn hash_ignore_file(context: &mut ring::digest::Context, path: &Path) -> Result<
 }
 
 /// A digest of the ignore rules a stage can change without touching a
-/// snapshotted file: repo-local and worktree `core.excludesFile` values, the
-/// file the last of them names (the one Git reads), and `info/exclude`.
-/// Snapshots skip ignored files, so a stage that changes these can hide an
-/// untracked file from the tree diff that `protected_paths` and policies
-/// read. `Ok(None)` outside Git.
+/// snapshotted file: the `core.excludesFile` path Git resolves, that file,
+/// and `info/exclude`. Snapshots skip ignored files, so a stage that changes
+/// these can hide an untracked file from the tree diff that
+/// `protected_paths` and policies read. Git itself answers which excludes
+/// file applies, through the same sanitized config a snapshot uses, so the
+/// two cannot disagree. `Ok(None)` outside Git.
 pub fn ignore_rules_digest(workspace: &Path) -> Result<Option<String>> {
     if !is_repository(workspace) {
         return Ok(None);
     }
-    let top_level = rev_parse_path(workspace, "--show-toplevel")?;
     let common_dir = rev_parse_path(workspace, "--git-common-dir")?;
-    let raw = git_raw(workspace, &["config", "--null", "--show-scope", "--list"])?;
-    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
-    let mut effective: Option<Vec<u8>> = None;
-    let mut parts = raw.split(|&b| b == 0);
-    while let (Some(scope), Some(entry)) = (parts.next(), parts.next()) {
-        if scope != b"local" && scope != b"worktree" {
-            continue;
+    let sanitized = SanitizedGitDir::new(workspace)?;
+    let output = sanitized
+        .command(workspace)
+        .args([
+            "config",
+            "--null",
+            "--type=path",
+            "--get",
+            "core.excludesFile",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    let excludes_file = match output.status.code() {
+        Some(0) => {
+            let raw = output.stdout.strip_suffix(b"\0").unwrap_or(&output.stdout);
+            ensure!(!raw.is_empty(), "core.excludesFile is empty");
+            // Git reads a relative path from the top of the work tree.
+            Some(sanitized.top_level().join(bytes_to_os(raw)?))
         }
-        let (key, value) = match entry.iter().position(|&b| b == b'\n') {
-            Some(pos) => (&entry[..pos], Some(&entry[pos + 1..])),
-            None => (entry, None),
-        };
-        if !key.eq_ignore_ascii_case(b"core.excludesfile") {
-            continue;
-        }
-        let value = value.unwrap_or_default();
-        context.update(b"value");
-        context.update(&(value.len() as u64).to_le_bytes());
-        context.update(value);
-        effective = Some(value.to_vec());
-    }
-    let excludes_file = match effective.as_deref().filter(|value| !value.is_empty()) {
-        Some(value) => match value.strip_prefix(b"~/") {
-            Some(rest) => std::env::var_os("HOME")
-                .map(|home| -> Result<PathBuf> { Ok(PathBuf::from(home).join(bytes_to_os(rest)?)) })
-                .transpose()?,
-            None => Some(top_level.join(bytes_to_os(value)?)),
+        // Unset: Git reads `$XDG_CONFIG_HOME/git/ignore`, or
+        // `$HOME/.config/git/ignore` without `XDG_CONFIG_HOME`.
+        Some(1) => match std::env::var_os("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
+            Some(dir) => Some(PathBuf::from(dir).join("git/ignore")),
+            None => std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .map(|home| PathBuf::from(home).join(".config/git/ignore")),
         },
-        None => None,
+        _ => anyhow::bail!(
+            "git config --get core.excludesFile: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
     };
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
     for (label, path) in [
-        (&b"file"[..], excludes_file),
+        (&b"core.excludesFile"[..], excludes_file),
         (&b"info/exclude"[..], Some(common_dir.join("info/exclude"))),
     ] {
         context.update(label);
         let present = match &path {
-            Some(path) => hash_ignore_file(&mut context, path)?,
+            Some(path) => {
+                let name = path.as_os_str().as_encoded_bytes();
+                context.update(&(name.len() as u64).to_le_bytes());
+                context.update(name);
+                hash_ignore_file(&mut context, path)?
+            }
             None => false,
         };
         context.update(&[u8::from(present)]);
@@ -2465,7 +2474,19 @@ mod tests {
             &["config", "--local", "--add", "core.excludesFile", ".hide"],
         )
         .unwrap();
-        ignore_rules_digest(workspace).unwrap().unwrap();
+        let last_wins = ignore_rules_digest(workspace).unwrap().unwrap();
+
+        // A value with a line break never reaches the sanitized config, so
+        // the snapshot keeps reading `.hide`, and so does this.
+        git(
+            workspace,
+            None,
+            &["config", "--local", "--add", "core.excludesFile", "a\nb"],
+        )
+        .unwrap();
+        assert_eq!(last_wins, ignore_rules_digest(workspace).unwrap().unwrap());
+        fs::write(&hide, "more\n").unwrap();
+        assert_ne!(last_wins, ignore_rules_digest(workspace).unwrap().unwrap());
     }
 
     #[test]
