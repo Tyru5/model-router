@@ -1360,24 +1360,39 @@ fn apply_steps(
 /// config: no repo-local filter runs, and a required one that is left out
 /// does not stop it.
 fn sync_index(work: &Path, top: &Path, commit: &str, files: &[FileChange]) -> Result<()> {
-    let shipped: std::collections::HashSet<&str> =
-        files.iter().map(|file| file.path.as_str()).collect();
-    let tree = exec("git", &["ls-tree", "-r", "-z", commit], top, &[])?;
+    let shipped: std::collections::HashSet<&[u8]> =
+        files.iter().map(|file| file.path.as_bytes()).collect();
+    // Raw bytes: a file name that is not valid UTF-8 must not be taken for
+    // a shipped path that merely decodes to the same text.
+    let tree = snapshot::git_command()
+        .args(["ls-tree", "-r", "-z", commit])
+        .current_dir(top)
+        .stdin(Stdio::null())
+        .output()
+        .context("Start git")?;
+    ensure!(
+        tree.status.success(),
+        "git ls-tree failed: {}",
+        String::from_utf8_lossy(&tree.stderr).trim()
+    );
     let mut entries = Vec::new();
     // Drop each path first, at every stage; a path the commit deleted stays
     // dropped.
     let null_id = "0".repeat(commit.len());
     for path in &shipped {
-        entries.extend_from_slice(format!("0 {null_id}\t{path}").as_bytes());
+        entries.extend_from_slice(format!("0 {null_id}\t").as_bytes());
+        entries.extend_from_slice(path);
         entries.push(0);
     }
     // `<mode> <type> <object>\t<path>`, which `--index-info` reads as is.
-    for entry in tree.split('\0') {
-        if let Some((_, path)) = entry.split_once('\t') {
-            if shipped.contains(path) {
-                entries.extend_from_slice(entry.as_bytes());
-                entries.push(0);
-            }
+    for entry in tree.stdout.split(|&b| b == 0) {
+        let path = entry
+            .iter()
+            .position(|&b| b == b'\t')
+            .map(|tab| &entry[tab + 1..]);
+        if path.is_some_and(|path| shipped.contains(path)) {
+            entries.extend_from_slice(entry);
+            entries.push(0);
         }
     }
     let sanitized = snapshot::SanitizedGitDir::new(work)?;
@@ -2335,10 +2350,30 @@ mod tests {
         // An unrelated staged change stays staged.
         fs::write(root.join("staged.txt"), "s\n").unwrap();
         git(root, &["add", "staged.txt"]).unwrap();
+        // An unrelated file whose name is not valid UTF-8, and a shipped
+        // path that is what that name decodes to. They are different files.
+        let raw_name =
+            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"caf\xe9.txt");
+        fs::write(root.join(raw_name), "raw\n").unwrap();
+        git(root, &["add", "."]).unwrap();
+        let mut files = files;
+        files.push(change("caf\u{fffd}.txt", snapshot::ChangeKind::Modified));
+        // Every entry is "racily clean" when the index is older than the
+        // files, so Git compares them all when it writes the index.
+        fs::File::options()
+            .write(true)
+            .open(root.join(".git/index"))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000))
+            .unwrap();
         let _ = fs::remove_file(&marker);
 
         sync_index(root, root, &commit, &files).unwrap();
         assert!(!marker.exists(), "a repo-local clean filter ran");
+        // Only the real file is in the index: no entry was made up for the
+        // decoded name.
+        let names = git(root, &["ls-files", "-z"]).unwrap();
+        assert_eq!(names.matches("caf").count(), 1, "{names:?}");
         let entries = git(
             root,
             &["ls-files", "-s", "--", "keep.txt", "gone.txt", "new.txt"],

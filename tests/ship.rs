@@ -565,6 +565,14 @@ fn the_index_update_runs_no_repo_local_filter() {
     let mut run = fx.create();
     // Same contents, new stat data: Git has to read the file to refresh it.
     fs::write(dir.join("unrelated.bin"), "payload\n").unwrap();
+    // With the index older than the files, Git compares every entry when
+    // it next writes the index, whatever the timing of this test.
+    fs::File::options()
+        .write(true)
+        .open(dir.join(".git/index"))
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000))
+        .unwrap();
     let _ = fs::remove_file(&marker);
     assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
     assert!(git(dir, &["symbolic-ref", "--short", "HEAD"]).starts_with("mr/"));
