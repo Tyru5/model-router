@@ -1302,7 +1302,6 @@ fn apply_steps(
         (" in staged changes", "refusing to commit"),
     )?;
     drop(index);
-    let list = path_list(&plan.files);
     let message = std::path::absolute(dir.join("commit-message.txt"))?;
     let message = message.to_str().context("Attempt path must be UTF-8")?;
     // The scans above took time; signing runs what the config names now.
@@ -1326,26 +1325,7 @@ fn apply_steps(
     // the working tree is untouched, like `git switch -c` with the commit on
     // top.
     let switched = (|| -> Result<()> {
-        // Sync ONLY the committed paths in the real index to match
-        // `commit`'s tree, leaving unrelated staged changes untouched. Git
-        // refreshes the index as it does, which runs clean filters, so this
-        // goes through the sanitized config: no repo-local filter runs,
-        // whatever the repository's config says by now.
-        let sanitized = snapshot::SanitizedGitDir::new(work)?;
-        let real_index = snapshot::rev_parse_path(work, "--git-dir")?.join("index");
-        exec_sanitized_git(
-            &sanitized,
-            &[
-                "reset",
-                "-q",
-                &commit,
-                "--pathspec-from-file=-",
-                "--pathspec-file-nul",
-            ],
-            &top,
-            &real_index,
-            Some(&list),
-        )?;
+        sync_index(work, &top, &commit, &plan.files)?;
         git(
             work,
             &[
@@ -1369,6 +1349,48 @@ fn apply_steps(
             plan.branch
         )),
     }
+}
+
+/// Makes the checkout's index match `commit` for exactly the shipped
+/// `files`, leaving every other entry, staged or not, as it is. The entries
+/// are written straight from the commit's tree, so Git does not refresh the
+/// index, which `git reset <commit> -- <paths>` would. Git still compares
+/// any file whose timestamp matches the index's when it writes the index,
+/// and that runs clean filters, so the write goes through the sanitized
+/// config: no repo-local filter runs, and a required one that is left out
+/// does not stop it.
+fn sync_index(work: &Path, top: &Path, commit: &str, files: &[FileChange]) -> Result<()> {
+    let shipped: std::collections::HashSet<&str> =
+        files.iter().map(|file| file.path.as_str()).collect();
+    let tree = exec("git", &["ls-tree", "-r", "-z", commit], top, &[])?;
+    let mut entries = Vec::new();
+    // Drop each path first, at every stage; a path the commit deleted stays
+    // dropped.
+    let null_id = "0".repeat(commit.len());
+    for path in &shipped {
+        entries.extend_from_slice(format!("0 {null_id}\t{path}").as_bytes());
+        entries.push(0);
+    }
+    // `<mode> <type> <object>\t<path>`, which `--index-info` reads as is.
+    for entry in tree.split('\0') {
+        if let Some((_, path)) = entry.split_once('\t') {
+            if shipped.contains(path) {
+                entries.extend_from_slice(entry.as_bytes());
+                entries.push(0);
+            }
+        }
+    }
+    let sanitized = snapshot::SanitizedGitDir::new(work)?;
+    sanitized.allow_missing_local_filters()?;
+    let real_index = snapshot::rev_parse_path(work, "--git-dir")?.join("index");
+    exec_sanitized_git(
+        &sanitized,
+        &["update-index", "-z", "--index-info"],
+        top,
+        &real_index,
+        Some(&entries),
+    )?;
+    Ok(())
 }
 
 /// Pushes `plan`'s branch and opens its draft PR, as planned. Runs before
@@ -2249,6 +2271,102 @@ mod tests {
         )
         .unwrap();
         ensure_configured_remote(root, "origin").unwrap();
+    }
+
+    #[test]
+    fn sync_index_sets_shipped_paths_without_running_or_needing_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main"]).unwrap();
+        for (key, value) in [
+            ("user.name", "Test"),
+            ("user.email", "test@example.com"),
+            ("commit.gpgsign", "false"),
+        ] {
+            git(root, &["config", key, value]).unwrap();
+        }
+        fs::write(root.join(".gitattributes"), "*.bin filter=mark\n").unwrap();
+        for (name, text) in [
+            ("keep.txt", "a\n"),
+            ("gone.txt", "b\n"),
+            ("other.bin", "u\n"),
+        ] {
+            fs::write(root.join(name), text).unwrap();
+        }
+        git(root, &["add", "."]).unwrap();
+        git(root, &["commit", "-qm", "init"]).unwrap();
+        let head = git(root, &["rev-parse", "HEAD"]).unwrap();
+
+        // The commit a ship would make: one file edited, one deleted, one
+        // added.
+        fs::write(root.join("keep.txt"), "a2\n").unwrap();
+        fs::remove_file(root.join("gone.txt")).unwrap();
+        fs::write(root.join("new.txt"), "n\n").unwrap();
+        let change = |path: &str, status| FileChange {
+            path: path.into(),
+            status,
+            added: None,
+            removed: None,
+        };
+        let files = vec![
+            change("keep.txt", snapshot::ChangeKind::Modified),
+            change("gone.txt", snapshot::ChangeKind::Deleted),
+            change("new.txt", snapshot::ChangeKind::Added),
+        ];
+        let index = root.join(".git/ship.index");
+        let tree = stage_planned(root, &head, &files, &index).unwrap();
+        let commit = git(root, &["commit-tree", &tree, "-p", &head, "-m", "ship"]).unwrap();
+
+        // A repo-local required filter on an unrelated file whose stat data
+        // no longer matches the index: Git reads it when the index is
+        // written.
+        let marker = root.join("filter-ran");
+        git(
+            root,
+            &[
+                "config",
+                "filter.mark.clean",
+                &format!("touch '{}'; cat", marker.display()),
+            ],
+        )
+        .unwrap();
+        git(root, &["config", "filter.mark.required", "true"]).unwrap();
+        fs::write(root.join("other.bin"), "u\n").unwrap();
+        // An unrelated staged change stays staged.
+        fs::write(root.join("staged.txt"), "s\n").unwrap();
+        git(root, &["add", "staged.txt"]).unwrap();
+        let _ = fs::remove_file(&marker);
+
+        sync_index(root, root, &commit, &files).unwrap();
+        assert!(!marker.exists(), "a repo-local clean filter ran");
+        let entries = git(
+            root,
+            &["ls-files", "-s", "--", "keep.txt", "gone.txt", "new.txt"],
+        )
+        .unwrap();
+        let expected = git(
+            root,
+            &[
+                "ls-tree", "-r", &commit, "--", "keep.txt", "gone.txt", "new.txt",
+            ],
+        )
+        .unwrap();
+        let ids = |text: &str| -> Vec<String> {
+            text.lines()
+                .map(|line| {
+                    let (meta, path) = line.split_once('\t').unwrap();
+                    let id = meta.split(' ').find(|part| part.len() >= 40).unwrap();
+                    format!("{id} {path}")
+                })
+                .collect()
+        };
+        assert_eq!(ids(&entries), ids(&expected));
+        assert_eq!(ids(&entries).len(), 2, "{entries}");
+        assert!(
+            git(root, &["ls-files", "--", "staged.txt", "other.bin"])
+                .unwrap()
+                .contains("staged.txt")
+        );
     }
 
     #[test]

@@ -171,6 +171,36 @@ impl SanitizedGitDir {
         &self.top_level
     }
 
+    /// Turns `filter.<driver>.required` off for every repo-local filter
+    /// this config leaves out. For a command that only writes index entries
+    /// and adds no file's contents: Git still compares a file whose
+    /// timestamp matches the index's, and with the filter gone a required
+    /// one would stop it.
+    pub(crate) fn allow_missing_local_filters(&self) -> Result<()> {
+        use std::io::Write;
+        let mut entries = Vec::new();
+        for driver in self
+            .local_clean_filters
+            .iter()
+            .chain(&self.local_smudge_filters)
+        {
+            write_config_entry(
+                &mut entries,
+                &ConfigEntry {
+                    section: b"filter".to_vec(),
+                    subsection: Some(driver.clone()),
+                    var: b"required".to_vec(),
+                    value: Some(b"false".to_vec()),
+                },
+            )?;
+        }
+        fs::OpenOptions::new()
+            .append(true)
+            .open(self.dir.path().join("config"))
+            .and_then(|mut config| config.write_all(&entries))
+            .context("Update sanitized Git config")
+    }
+
     pub(crate) fn local_clean_filters(&self) -> &[Vec<u8>] {
         &self.local_clean_filters
     }
@@ -1536,7 +1566,23 @@ pub fn ignored_protected_digest(
             continue;
         }
         if let Some(directory) = raw.strip_suffix(b"/") {
-            nested.push(directory.to_vec());
+            // Git also lists a nested repository whose name only starts like
+            // a pathspec (`app/` for `app-config`). Nothing under it can
+            // match, so it is not walked.
+            let under = |outer: &[u8], inner: &[u8]| {
+                inner == outer
+                    || inner
+                        .strip_prefix(outer)
+                        .is_some_and(|rest| rest.starts_with(b"/"))
+            };
+            let reachable = prefixes.as_ref().is_none_or(|prefixes| {
+                prefixes.iter().any(|prefix| {
+                    under(prefix.as_bytes(), directory) || under(directory, prefix.as_bytes())
+                })
+            });
+            if reachable {
+                nested.push(directory.to_vec());
+            }
         } else if is_protected(&raw) {
             matched.push(raw);
         }
@@ -2722,6 +2768,10 @@ mod tests {
         assert_ne!(with_link, linked);
         fs::write(workspace.join("secrets/link"), "two\n").unwrap();
         assert_ne!(linked, digest());
+        // A link whose target name is too long to follow leads nowhere.
+        fs::remove_file(workspace.join("secrets/link")).unwrap();
+        std::os::unix::fs::symlink("a".repeat(300), workspace.join("secrets/link")).unwrap();
+        digest();
     }
 
     #[test]
@@ -2741,10 +2791,26 @@ mod tests {
         };
         fs::write(
             workspace.join(".git/info/exclude"),
-            "vault/\n.model-router/\n",
+            "vault/\nvau/\n.model-router/\n",
         )
         .unwrap();
-        let base = digest().unwrap().unwrap();
+        // An ignored nested repository whose name only starts like the
+        // pathspec is listed too. It is not walked, so a directory in it
+        // that cannot be read stops nothing.
+        fs::create_dir_all(workspace.join("vau/closed")).unwrap();
+        git(&workspace.join("vau"), None, &["init", "-q"]).unwrap();
+        fs::set_permissions(
+            workspace.join("vau/closed"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .unwrap();
+        let base = digest();
+        fs::set_permissions(
+            workspace.join("vau/closed"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let base = base.unwrap().unwrap();
 
         // Git lists an ignored nested repository as one directory.
         fs::create_dir_all(workspace.join("vault/deep")).unwrap();
