@@ -184,6 +184,12 @@ pub struct Plan {
     /// plans saved before it was recorded, which no longer apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_config_digest: Option<String>,
+    /// Salted PBKDF2 digest of where Git would push for `push`
+    /// (`push_destination_digest`), to tell whether that changed after the
+    /// plan. None without a push, and in plans saved before it was recorded,
+    /// which no longer push.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_digest: Option<String>,
 }
 fn default_true() -> bool {
     true
@@ -444,6 +450,31 @@ fn repo_command_config(work: &Path) -> Result<RepoCommandConfig> {
         shown,
         digest: git_config_digest(work, &entries),
     })
+}
+
+/// A digest of where `git push <remote>` goes: the push URLs Git resolves
+/// for `remote` from every config scope, with `pushUrl`, `insteadOf`, and
+/// `pushInsteadOf` applied. `git_config_digest` covers the repository's own
+/// config only, and a global or system `includeIf.onbranch` rule can change
+/// the destination once the checkout is on the ship's branch. A URL can hold
+/// a credential, so only `snapshot::stretched_digest` of it is kept.
+fn push_destination_digest(work: &Path, remote: &str) -> Result<String> {
+    let output = snapshot::git_command()
+        .args(["remote", "get-url", "--push", "--all", remote])
+        .current_dir(work)
+        .stdin(Stdio::null())
+        .output()
+        .context("Start git")?;
+    ensure!(
+        output.status.success(),
+        "git remote get-url --push {remote} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(snapshot::stretched_digest(
+        b"model-router ship push destination v1",
+        work,
+        &output.stdout,
+    ))
 }
 
 /// Whether the repository's own Git config is what `plan` recorded. A plan
@@ -930,6 +961,10 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
         ensure_configured_remote(dir, remote)?;
     }
     let git_config = repo_command_config(dir)?;
+    let push_digest = match &push {
+        Some(remote) => Some(push_destination_digest(dir, remote)?),
+        None => None,
+    };
     Ok(Plan {
         run: run.id.clone(),
         workspace: dir.to_path_buf(),
@@ -949,6 +984,7 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
         block_policies,
         git_config: git_config.shown,
         git_config_digest: Some(git_config.digest),
+        push_digest,
     })
 }
 
@@ -1418,6 +1454,14 @@ fn publish(
             plan.branch
         );
         ensure_configured_remote(work, remote)?;
+        // Config from any scope can name another destination now that the
+        // checkout is on the new branch.
+        ensure!(
+            plan.push_digest.as_deref() == Some(push_destination_digest(work, remote)?.as_str()),
+            "Git would now push {remote} somewhere other than when the ship was planned (config changed, or an includeIf.onbranch rule applies on the new branch), so nothing was pushed. Commit {} is on branch {}; check `git remote get-url --push {remote}` and push it yourself",
+            short(commit),
+            plan.branch
+        );
         let refspec = format!("refs/heads/{0}:refs/heads/{0}", plan.branch);
         git(work, &["push", "--set-upstream", remote, &refspec])?;
         outcome.pushed = Some(format!("{remote}/{}", plan.branch));
@@ -2255,6 +2299,77 @@ mod tests {
         ] {
             assert!(!runs_remote_helper(plain), "{plain}");
         }
+    }
+
+    #[test]
+    fn push_destination_digest_follows_what_git_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main"]).unwrap();
+        assert!(push_destination_digest(root, "origin").is_err());
+        git(
+            root,
+            &[
+                "config",
+                "remote.origin.url",
+                "https://example.invalid/x.git",
+            ],
+        )
+        .unwrap();
+        let plain = push_destination_digest(root, "origin").unwrap();
+        assert_eq!(plain, push_destination_digest(root, "origin").unwrap());
+        assert!(!plain.contains("example"), "{plain}");
+
+        // A rewrite and a push URL each change where the push goes.
+        git(
+            root,
+            &[
+                "config",
+                "url.https://mirror.invalid/.pushInsteadOf",
+                "https://example.invalid/",
+            ],
+        )
+        .unwrap();
+        let rewritten = push_destination_digest(root, "origin").unwrap();
+        assert_ne!(plain, rewritten);
+        git(
+            root,
+            &[
+                "config",
+                "remote.origin.pushUrl",
+                "https://other.invalid/y.git",
+            ],
+        )
+        .unwrap();
+        let push_url = push_destination_digest(root, "origin").unwrap();
+        assert_ne!(rewritten, push_url);
+
+        // So does config that applies only on another branch, as a rule in
+        // any scope would.
+        git(root, &["config", "--unset", "remote.origin.pushUrl"]).unwrap();
+        git(
+            root,
+            &[
+                "config",
+                "--unset",
+                "url.https://mirror.invalid/.pushInsteadOf",
+            ],
+        )
+        .unwrap();
+        assert_eq!(plain, push_destination_digest(root, "origin").unwrap());
+        fs::write(
+            root.join(".git/on-ship.inc"),
+            "[remote \"origin\"]\n\tpushurl = https://branch.invalid/z.git\n",
+        )
+        .unwrap();
+        git(
+            root,
+            &["config", "includeIf.onbranch:ship/**.path", "on-ship.inc"],
+        )
+        .unwrap();
+        assert_eq!(plain, push_destination_digest(root, "origin").unwrap());
+        git(root, &["symbolic-ref", "HEAD", "refs/heads/ship/x"]).unwrap();
+        assert_ne!(plain, push_destination_digest(root, "origin").unwrap());
     }
 
     #[test]

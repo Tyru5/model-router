@@ -179,7 +179,10 @@ commit the ship updates the checkout's index (with repo-local filters turned
 off, so a locked index stops it with nothing pushed) and moves the checkout
 to the new branch, and only then pushes. Config an `includeIf.onbranch` rule
 turns on for that branch is not what the plan recorded, so the push is
-refused and the commit stays on the branch for you to push.
+refused and the commit stays on the branch for you to push. The plan also
+keeps a digest of the push URLs Git resolves for the remote from every
+config scope, and the push is refused when they differ on the new branch,
+which covers a global or system `includeIf.onbranch` rule.
 A push remote that only a legacy
 `.git/remotes/<name>` or `.git/branches/<name>` file defines is refused,
 since `git config` does not list it.
