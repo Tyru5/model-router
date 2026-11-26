@@ -175,8 +175,10 @@ or subsection. Read the values with `git config --show-scope --list`.
 100,000 rounds, salted with the workspace path). The ship stops if that
 digest differs before staging, before the commit, or before the push, so
 any repo-local config change after the plan means planning again. The
-commit, push, and draft PR all run before the checkout moves to the new
-branch, and the index update runs with repo-local filters turned off, so config an `includeIf.onbranch` rule turns on for that
+commit, index update, push, and draft PR all run before the checkout moves
+to the new branch (the index update first, so a locked index stops the ship
+with nothing pushed), and the index update runs with repo-local filters
+turned off, so config an `includeIf.onbranch` rule turns on for that
 branch is never what they read. A push remote that only a legacy
 `.git/remotes/<name>` or `.git/branches/<name>` file defines is refused,
 since `git config` does not list it.
@@ -190,16 +192,19 @@ also compares the ignored, untracked files that match its globs before and
 after the stage, and stops the stage blocked when one was added, changed, or
 removed, whatever made Git ignore it (`.gitignore`, `.git/info/exclude`,
 `core.excludesFile`). It reads each file's path, mode, and contents, a
-symbolic link's target and the file it leads to, and the files inside an
+symbolic link's target and, when the link stays inside the work tree, the
+file it leads to, and the matching files inside an
 ignored nested repository; it skips the router's own `.model-router`. A
 glob such as `dir/**` therefore also covers ignored build output under
 `dir`. Git lists the files
 against the run's own snapshot index, so staging one in the checkout's index
-does not hide it. The check reads every matching ignored file in full twice
-per stage, and anything Git warns about while listing them (a directory it
-cannot read) stops the stage. Git walks each glob's literal leading
-directories only, so that applies under those, and everywhere for a glob
-that starts with a wildcard. `run.json` keeps only a PBKDF2 digest of them. A `before_stage` hook
+does not hide it. The check reads every matching ignored file twice per
+stage, at most 64 MiB of one file and 256 MiB in all; past that the stage
+stops, so keep large files out of `protected_paths`. Anything Git warns
+about while listing them (a directory it cannot read) also stops the stage.
+Git walks each glob's literal leading directories only, so that applies
+under those, and everywhere for a glob that starts with a wildcard.
+`run.json` keeps only a PBKDF2 digest of them. A `before_stage` hook
 runs after the first reading, so a hook that rewrites a protected ignored
 file blocks its stage, as it does for a tracked one. Not covered, as for
 tracked files: paths inside submodules, and names that differ only by case

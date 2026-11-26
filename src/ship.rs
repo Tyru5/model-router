@@ -1320,26 +1320,25 @@ fn apply_steps(
     git(work, &["branch", "--no-track", &plan.branch, &commit])?;
     outcome.commit = Some(commit.clone());
     outcome.author = git(work, &["log", "-1", "--format=%an <%ae>", &commit]).ok();
+    // Before anything is published: if the index cannot be written (another
+    // Git process holds its lock), the ship stops with nothing pushed.
+    sync_index(work, &top, &commit, &plan.files)?;
     let published = publish(plan, dir, &commit, outcome, log);
     // Point the checkout at the branch whether or not publishing worked;
     // the working tree is untouched, like `git switch -c` with the commit on
     // top.
-    let switched = (|| -> Result<()> {
-        sync_index(work, &top, &commit, &plan.files)?;
-        git(
-            work,
-            &[
-                "symbolic-ref",
-                "-m",
-                "model-router ship",
-                "HEAD",
-                &format!("refs/heads/{}", plan.branch),
-            ],
-        )?;
-        Ok(())
-    })();
+    let switched = git(
+        work,
+        &[
+            "symbolic-ref",
+            "-m",
+            "model-router ship",
+            "HEAD",
+            &format!("refs/heads/{}", plan.branch),
+        ],
+    );
     match (published, switched) {
-        (published, Ok(())) => {
+        (published, Ok(_)) => {
             log(format!("Switched to new branch {}\n", plan.branch));
             published
         }
@@ -1397,7 +1396,9 @@ fn sync_index(work: &Path, top: &Path, commit: &str, files: &[FileChange]) -> Re
     }
     let sanitized = snapshot::SanitizedGitDir::new(work)?;
     sanitized.allow_missing_local_filters()?;
-    let real_index = snapshot::rev_parse_path(work, "--git-dir")?.join("index");
+    // The index this checkout's Git commands use, which is not the Git
+    // directory's when the caller set `GIT_INDEX_FILE`.
+    let real_index = snapshot::index_path(work)?;
     exec_sanitized_git(
         &sanitized,
         &["update-index", "-z", "--index-info"],

@@ -255,6 +255,31 @@ pub(crate) fn rev_parse_path(dir: &Path, flag: &str) -> Result<PathBuf> {
     std::path::absolute(&joined).with_context(|| format!("Resolve {}", joined.display()))
 }
 
+/// The index file Git uses for `dir`'s checkout: `GIT_INDEX_FILE` when the
+/// caller set it, else the Git directory's `index`.
+pub(crate) fn index_path(dir: &Path) -> Result<PathBuf> {
+    let output = git_command()
+        .args(["rev-parse", "--git-path", "index"])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        output.status.success(),
+        "git rev-parse --git-path index: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let raw = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
+    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+    ensure!(
+        !raw.is_empty(),
+        "git rev-parse --git-path index returned nothing"
+    );
+    // Git prints it relative to `dir`.
+    let joined = dir.join(PathBuf::from(bytes_to_os(raw)?));
+    std::path::absolute(&joined).with_context(|| format!("Resolve {}", joined.display()))
+}
+
 #[cfg(unix)]
 fn link_entry(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(src, dst)
@@ -1323,32 +1348,33 @@ pub(crate) fn stretched_digest(label: &[u8], salt: &Path, material: &[u8]) -> St
     out.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Adds a regular file's permission bits and contents to `context`, through
-/// a symbolic link only when `follow`. Never blocks on a FIFO. A file the
-/// router may not read adds its size, times, and inode instead, so it can
-/// still tell a change; nothing there, or anything not a regular file, adds
-/// only that fact.
-fn hash_file(context: &mut ring::digest::Context, path: &Path, follow: bool) -> Result<()> {
+/// Most bytes `ignored_protected_digest` reads from one file, and from all
+/// the files of one call. Past either it stops with an error.
+const PROTECTED_FILE_LIMIT: u64 = 64 * 1024 * 1024;
+const PROTECTED_TOTAL_LIMIT: u64 = 256 * 1024 * 1024;
+
+/// Adds a regular file's permission bits and contents to `context`, never
+/// through a symbolic link and never blocking on a FIFO. `budget` is how
+/// many more bytes this call may read in all; a file larger than
+/// `PROTECTED_FILE_LIMIT` or than the budget is an error. A file the router
+/// may not read adds its size, times, and inode instead, so it can still
+/// tell a change; nothing there, or anything not a regular file, adds only
+/// that fact.
+fn hash_file(context: &mut ring::digest::Context, path: &Path, budget: &mut u64) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let mut flags = libc::O_NONBLOCK | libc::O_NOCTTY;
-    if !follow {
-        flags |= libc::O_NOFOLLOW;
-    }
     let mut options = fs::OpenOptions::new();
-    options.read(true).custom_flags(flags);
-    let mut file = match options.open(path) {
+    options
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_NOFOLLOW);
+    let file = match options.open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             context.update(b"-");
             return Ok(());
         }
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            let metadata = if follow {
-                fs::metadata(path)
-            } else {
-                fs::symlink_metadata(path)
-            }
-            .with_context(|| format!("Inspect {}", path.display()))?;
+            let metadata = fs::symlink_metadata(path)
+                .with_context(|| format!("Inspect {}", path.display()))?;
             context.update(b"u");
             for field in [
                 metadata.mode() as i64,
@@ -1375,10 +1401,14 @@ fn hash_file(context: &mut ring::digest::Context, path: &Path, follow: bool) -> 
     }
     context.update(b"f");
     context.update(&(metadata.mode() & 0o7777).to_le_bytes());
+    let allowed = PROTECTED_FILE_LIMIT.min(*budget);
+    // One byte past the allowance tells a file that fits from one that
+    // does not, however large it is or grows.
+    let mut reader = file.take(allowed + 1);
     let mut buffer = [0u8; 8192];
     let mut total: u64 = 0;
     loop {
-        let read = match file.read(&mut buffer) {
+        let read = match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => read,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -1387,16 +1417,32 @@ fn hash_file(context: &mut ring::digest::Context, path: &Path, follow: bool) -> 
             }
         };
         total += read as u64;
+        ensure!(
+            total <= allowed,
+            "{} is too large to check: protected_paths reads at most {} MiB of one Git-ignored file and {} MiB in all. Narrow protected_paths or remove the file",
+            path.display(),
+            PROTECTED_FILE_LIMIT / (1024 * 1024),
+            PROTECTED_TOTAL_LIMIT / (1024 * 1024)
+        );
         context.update(&buffer[..read]);
     }
+    *budget -= total;
     context.update(&total.to_le_bytes());
     Ok(())
 }
 
 /// Adds what is at `path` to `context`: nothing, a regular file
-/// (`hash_file`), a symbolic link's target and the regular file it leads
-/// to, or only the kind of anything else.
-fn hash_untracked_entry(context: &mut ring::digest::Context, path: &Path) -> Result<()> {
+/// (`hash_file`), a symbolic link's target, or only the kind of anything
+/// else. A link that leads to a regular file inside work tree `top` (given
+/// with its own links resolved) also adds that file, since a write to the
+/// path lands there. A link that leads out of the work tree is not
+/// followed: what is there is not the checkout's, and may be large or slow.
+fn hash_untracked_entry(
+    context: &mut ring::digest::Context,
+    top: &Path,
+    path: &Path,
+    budget: &mut u64,
+) -> Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1411,11 +1457,18 @@ fn hash_untracked_entry(context: &mut ring::digest::Context, path: &Path) -> Res
         context.update(b"l");
         context.update(&(target.len() as u64).to_le_bytes());
         context.update(target);
-        // A write to the path lands in the file the link leads to.
-        return match fs::metadata(path) {
-            Ok(target) if target.is_file() => hash_file(context, path, true),
+        return match fs::canonicalize(path) {
+            Ok(resolved) if resolved.starts_with(top) => {
+                let leads_to_file = fs::symlink_metadata(&resolved).is_ok_and(|m| m.is_file());
+                if leads_to_file {
+                    hash_file(context, &resolved, budget)
+                } else {
+                    context.update(b"x");
+                    Ok(())
+                }
+            }
             Ok(_) => {
-                context.update(b"x");
+                context.update(b"e");
                 Ok(())
             }
             // A link that leads nowhere. Anything else (a directory on the
@@ -1434,27 +1487,42 @@ fn hash_untracked_entry(context: &mut ring::digest::Context, path: &Path) -> Res
         };
     }
     if metadata.is_file() {
-        return hash_file(context, path, false);
+        return hash_file(context, path, budget);
     }
     context.update(if metadata.is_dir() { b"d" } else { b"o" });
     Ok(())
 }
 
 /// The leading path segments of protected-path glob `pattern` that have no
-/// wildcard, as far as Git accepts them as a pathspec under work tree `top`:
-/// every path `policy::matches_glob` accepts for the pattern is that path or
-/// lies under it. None when the first segment has a wildcard or is `.` or
-/// `..`, so the pattern gives no such limit.
-///
-/// The prefix stops at the first segment that is not a plain directory, and
+/// wildcard, joined with `/`: every path `policy::matches_glob` accepts for
+/// the pattern is that path or lies under it. None when the first segment
+/// has a wildcard or is `.` or `..`, so the pattern gives no such limit.
+fn pattern_prefix(pattern: &str) -> Option<String> {
+    let segments: Vec<&str> = pattern
+        .trim()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .take_while(|segment| !segment.contains(['*', '?']) && *segment != "." && *segment != "..")
+        .collect();
+    (!segments.is_empty()).then(|| segments.join("/"))
+}
+
+/// Whether `inner` is `outer` or lies under it, as `/`-separated paths.
+fn is_under(outer: &[u8], inner: &[u8]) -> bool {
+    inner == outer
+        || inner
+            .strip_prefix(outer)
+            .is_some_and(|rest| rest.starts_with(b"/"))
+}
+
+/// `pattern_prefix` as far as Git accepts it as a pathspec under work tree
+/// `top`. It stops at the first segment that is not a plain directory, and
 /// at a directory holding `.git`: Git refuses a pathspec that reaches inside
 /// an ignored nested repository, and lists that repository as one entry.
 fn literal_prefix(top: &Path, pattern: &str) -> Option<String> {
+    let full = pattern_prefix(pattern)?;
     let mut prefix = String::new();
-    for segment in pattern.trim().split('/').filter(|s| !s.is_empty()) {
-        if segment.contains(['*', '?']) || segment == "." || segment == ".." {
-            break;
-        }
+    for segment in full.split('/') {
         if !prefix.is_empty() {
             prefix.push('/');
         }
@@ -1466,7 +1534,7 @@ fn literal_prefix(top: &Path, pattern: &str) -> Option<String> {
             break;
         }
     }
-    (!prefix.is_empty()).then_some(prefix)
+    Some(prefix)
 }
 
 /// A digest of the untracked files Git ignores whose repository-relative
@@ -1480,7 +1548,10 @@ fn literal_prefix(top: &Path, pattern: &str) -> Option<String> {
 /// Git lists them against run `run_dir`'s private snapshot index, the one
 /// `tree` fills, so a file is in the snapshot or in this list whatever a
 /// stage did to the checkout's own index. An ignored nested repository,
-/// which Git lists as one directory, is walked here. The router's own
+/// which Git lists as one directory, is walked here, only where a pattern
+/// can match. Reading is bounded (`PROTECTED_FILE_LIMIT`,
+/// `PROTECTED_TOTAL_LIMIT`), and a symbolic link is followed only inside the
+/// work tree. The router's own
 /// `.model-router` directory (in `workspace` and at the top of the work
 /// tree) is left out. Anything Git warns about (a directory it could not
 /// read) is an error. `Ok(None)` outside Git.
@@ -1526,6 +1597,21 @@ pub fn ignored_protected_digest(
             literal_prefix(&top_level, pattern).filter(|prefix| !prefix.contains('\u{fffd}'))
         })
         .collect();
+    // The same limit for the walk below, which is not Git's: every literal
+    // segment counts there, also inside a nested repository.
+    let walk_prefixes: Option<Vec<String>> = patterns
+        .iter()
+        .filter(|pattern| !pattern.trim().trim_start_matches('/').is_empty())
+        .map(|pattern| pattern_prefix(pattern).filter(|prefix| !prefix.contains('\u{fffd}')))
+        .collect();
+    // Whether a match can be at `directory` or under it.
+    let reachable = |directory: &[u8]| {
+        walk_prefixes.as_ref().is_none_or(|prefixes| {
+            prefixes.iter().any(|prefix| {
+                is_under(prefix.as_bytes(), directory) || is_under(directory, prefix.as_bytes())
+            })
+        })
+    };
     let mut stderr = tempfile::tempfile().context("Create a file for Git's warnings")?;
     let mut command = sanitized.command(&top_level);
     command
@@ -1569,18 +1655,7 @@ pub fn ignored_protected_digest(
             // Git also lists a nested repository whose name only starts like
             // a pathspec (`app/` for `app-config`). Nothing under it can
             // match, so it is not walked.
-            let under = |outer: &[u8], inner: &[u8]| {
-                inner == outer
-                    || inner
-                        .strip_prefix(outer)
-                        .is_some_and(|rest| rest.starts_with(b"/"))
-            };
-            let reachable = prefixes.as_ref().is_none_or(|prefixes| {
-                prefixes.iter().any(|prefix| {
-                    under(prefix.as_bytes(), directory) || under(directory, prefix.as_bytes())
-                })
-            });
-            if reachable {
+            if reachable(directory) {
                 nested.push(directory.to_vec());
             }
         } else if is_protected(&raw) {
@@ -1627,7 +1702,11 @@ pub fn ignored_protected_digest(
                 .file_type()
                 .with_context(|| format!("Inspect {}", entry.path().display()))?;
             if kind.is_dir() {
-                nested.push(raw);
+                // Only where a match can be: a directory no pattern reaches
+                // is never opened, readable or not.
+                if reachable(&raw) {
+                    nested.push(raw);
+                }
             } else if is_protected(&raw) {
                 matched.push(raw);
             }
@@ -1636,10 +1715,20 @@ pub fn ignored_protected_digest(
     matched.sort();
     matched.dedup();
     let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    // To tell a symbolic link that stays in the work tree from one that
+    // leaves it.
+    let resolved_top =
+        fs::canonicalize(&top_level).with_context(|| format!("Resolve {}", top_level.display()))?;
+    let mut budget = PROTECTED_TOTAL_LIMIT;
     for raw in &matched {
         context.update(&(raw.len() as u64).to_le_bytes());
         context.update(raw);
-        hash_untracked_entry(&mut context, &top_level.join(bytes_to_os(raw)?))?;
+        hash_untracked_entry(
+            &mut context,
+            &resolved_top,
+            &top_level.join(bytes_to_os(raw)?),
+            &mut budget,
+        )?;
     }
     Ok(Some(stretched_digest(
         b"model-router ignored protected files v1",
@@ -2772,6 +2861,30 @@ mod tests {
         fs::remove_file(workspace.join("secrets/link")).unwrap();
         std::os::unix::fs::symlink("a".repeat(300), workspace.join("secrets/link")).unwrap();
         digest();
+
+        // A link that leaves the work tree is not followed: only where it
+        // points is part of the digest, not what is there.
+        let outside = tempfile::tempdir().unwrap();
+        let far = outside.path().join("far.txt");
+        fs::write(&far, "one\n").unwrap();
+        fs::remove_file(workspace.join("secrets/link")).unwrap();
+        std::os::unix::fs::symlink(&far, workspace.join("secrets/link")).unwrap();
+        let leaving = digest();
+        fs::write(&far, "two\n").unwrap();
+        assert_eq!(leaving, digest());
+        fs::remove_file(workspace.join("secrets/link")).unwrap();
+
+        // A file past the size limit is an error, not a long read.
+        let big = fs::File::create(workspace.join("secrets/big")).unwrap();
+        big.set_len(PROTECTED_FILE_LIMIT + 1).unwrap();
+        tree(workspace, &run_dir).unwrap();
+        let error = ignored_protected_digest(workspace, &run_dir, &patterns).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("too large to check"),
+            "{error:#}"
+        );
+        big.set_len(PROTECTED_FILE_LIMIT).unwrap();
+        digest();
     }
 
     #[test]
@@ -2823,6 +2936,24 @@ mod tests {
         fs::write(workspace.join("vault/deep/prod.env"), "A=2\n").unwrap();
         assert_ne!(added, digest().unwrap().unwrap());
 
+        // With only an exact path as the pattern, a directory beside it in
+        // the nested repository is never opened, readable or not.
+        fs::create_dir_all(workspace.join("vault/other")).unwrap();
+        fs::set_permissions(
+            workspace.join("vault/other"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .unwrap();
+        let exact = vec!["vault/deep/prod.env".to_owned()];
+        let exact_only = ignored_protected_digest(workspace, &run_dir, &exact);
+        fs::set_permissions(
+            workspace.join("vault/other"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        exact_only.unwrap().unwrap();
+        fs::remove_dir(workspace.join("vault/other")).unwrap();
+
         // A pattern that leaves the repository matches nothing and does not
         // stop Git either.
         let outside = vec!["../outside/.env".to_owned(), "vault/**".to_owned()];
@@ -2840,6 +2971,24 @@ mod tests {
         if unreadable {
             assert!(result.is_err());
         }
+    }
+
+    #[test]
+    fn index_path_is_the_index_git_uses() {
+        let Some(dir) = repository() else { return };
+        let workspace = dir.path();
+        let common = rev_parse_path(workspace, "--git-dir").unwrap();
+        assert_eq!(index_path(workspace).unwrap(), common.join("index"));
+        // From a subdirectory Git prints it relative to there.
+        fs::create_dir(workspace.join("inner")).unwrap();
+        assert_eq!(
+            fs::canonicalize(index_path(&workspace.join("inner")).unwrap()).unwrap(),
+            fs::canonicalize(common.join("index")).unwrap()
+        );
+        assert_eq!(pattern_prefix("a/b/*.json").as_deref(), Some("a/b"));
+        assert_eq!(pattern_prefix("**/x"), None);
+        assert!(is_under(b"app", b"app/x") && is_under(b"app", b"app"));
+        assert!(!is_under(b"app", b"app-config") && !is_under(b"app/x", b"app"));
     }
 
     #[test]

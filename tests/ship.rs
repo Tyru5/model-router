@@ -536,6 +536,33 @@ fn config_that_only_applies_on_the_ship_branch_does_not_reach_the_push() {
     );
 }
 
+/// The checkout's index is updated before anything is published, so a ship
+/// that cannot write it (another Git process holds the lock) pushes nothing.
+#[test]
+fn a_locked_index_stops_the_ship_before_it_pushes() {
+    let options = ship::Options {
+        push: true,
+        confirm: false,
+        ..ship::Options::default()
+    };
+    let Some(fx) = fixture(two_writers(), Some(options)) else {
+        return;
+    };
+    let dir = fx.dir();
+    fs::write(dir.join(".git/index.lock"), "").unwrap();
+    let mut run = fx.create();
+    assert_eq!(drive(&mut run), Action::Stopped);
+    assert_eq!(run.status, Status::Blocked);
+    fs::remove_file(dir.join(".git/index.lock")).unwrap();
+    let pushed = git(
+        &fx.remote(),
+        &["for-each-ref", "--format=%(refname)", "refs/heads/mr/"],
+    );
+    assert_eq!(pushed, "", "{:?}", run.error);
+    let outcome = &report::build(&run).shipped[0];
+    assert!(outcome.pushed.is_none() && outcome.error.is_some());
+}
+
 /// The ship updates the checkout's index for the files it committed. Git
 /// refreshes the whole index as it does, so a repo-local clean filter on an
 /// unrelated file must not run then.
