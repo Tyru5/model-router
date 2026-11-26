@@ -321,35 +321,37 @@ struct RepoCommandConfig {
     digest: String,
 }
 
-/// Rounds of PBKDF2-HMAC-SHA256 behind `git_config_digest`.
-const GIT_CONFIG_DIGEST_ROUNDS: std::num::NonZeroU32 = std::num::NonZeroU32::new(100_000).unwrap();
-
 /// A digest of repo-local Git config `entries` that is safe to save: the
 /// entries can hold a credential (a proxy or push URL, a helper command), so
-/// it is a slow PBKDF2-HMAC-SHA256 salted with the workspace path, not a
-/// plain hash a guess could be checked against quickly.
+/// it is `snapshot::stretched_digest`, salted with the workspace path.
 fn git_config_digest(work: &Path, entries: &[u8]) -> String {
-    let mut salt = b"model-router ship git config v1\0".to_vec();
-    salt.extend_from_slice(work.as_os_str().as_encoded_bytes());
-    let mut out = [0u8; 32];
-    ring::pbkdf2::derive(
-        ring::pbkdf2::PBKDF2_HMAC_SHA256,
-        GIT_CONFIG_DIGEST_ROUNDS,
-        &salt,
-        entries,
-        &mut out,
-    );
-    out.iter().map(|b| format!("{b:02x}")).collect()
+    snapshot::stretched_digest(b"model-router ship git config v1", work, entries)
 }
 
-/// Whether a remote URL names a remote helper (`<transport>::<address>`,
-/// such as `ext::<command>`), which `git push` runs as a program.
-fn is_helper_transport(url: &str) -> bool {
-    url.split_once("::").is_some_and(|(transport, _)| {
-        !transport.is_empty()
-            && transport
+/// Whether `git push` to remote URL `url` runs a remote helper program
+/// other than Git's own: `<transport>::<address>` (such as `ext::<command>`)
+/// runs `git-remote-<transport>`, and so does `<scheme>://` for any scheme
+/// Git does not handle itself. Git compares schemes exactly, so `HTTPS://`
+/// is a helper too.
+fn runs_remote_helper(url: &str) -> bool {
+    let is_name = |name: &str| {
+        !name.is_empty()
+            && name
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    };
+    if url
+        .split_once("::")
+        .is_some_and(|(transport, _)| is_name(transport))
+    {
+        return true;
+    }
+    url.split_once("://").is_some_and(|(scheme, _)| {
+        is_name(scheme)
+            && !matches!(
+                scheme,
+                "http" | "https" | "ftp" | "ftps" | "ssh" | "git" | "file" | "git+ssh" | "ssh+git"
+            )
     })
 }
 
@@ -360,14 +362,14 @@ fn is_helper_transport(url: &str) -> bool {
 /// `core.gitProxy`, `credential.helper`, `credential.<url>.helper`,
 /// `url.<base>.insteadOf`, `url.<base>.pushInsteadOf`,
 /// `remote.<name>.pushUrl`, `remote.<name>.proxy`,
-/// `remote.<name>.receivepack`, `remote.<name>.vcs`, a `remote.<name>.url`
-/// that names a remote helper, every `http.*` and `protocol.*` key,
-/// `push.recurseSubmodules`, `push.followTags`, `submodule.recurse`, and an
-/// `includeIf.onbranch:<pattern>.path`, whose file Git reads only once the
-/// ship has switched to its branch. Anything that can write the checkout's
-/// `.git/config` can set them, so a ship names them in its plan. The router
-/// stores no credentials, and a helper, proxy, or URL can hold one, so the
-/// plan keeps only key names. The digest covers every repo-local entry.
+/// `remote.<name>.receivepack`, `remote.<name>.uploadpack`,
+/// `remote.<name>.vcs`, a `remote.<name>.url` that runs a remote helper
+/// (`runs_remote_helper`), every `http.*` and `protocol.*` key,
+/// `push.recurseSubmodules`, `push.followTags`, `push.negotiate`, and
+/// `submodule.recurse`. Anything that can write the checkout's `.git/config`
+/// can set them, so a ship names them in its plan. The router stores no
+/// credentials, and a helper, proxy, or URL can hold one, so the plan keeps
+/// only key names. The digest covers every repo-local entry.
 fn repo_command_config(work: &Path) -> Result<RepoCommandConfig> {
     let output = snapshot::git_command()
         .args(["config", "--show-scope", "-z", "--list"])
@@ -409,20 +411,20 @@ fn repo_command_config(work: &Path) -> Result<RepoCommandConfig> {
             "url" => nested && matches!(var.as_str(), "insteadof" | "pushinsteadof"),
             "remote" => {
                 nested
-                    && (matches!(var.as_str(), "pushurl" | "proxy" | "receivepack" | "vcs")
-                        || (var == "url" && is_helper_transport(value)))
+                    && (matches!(
+                        var.as_str(),
+                        "pushurl" | "proxy" | "receivepack" | "uploadpack" | "vcs"
+                    ) || (var == "url" && runs_remote_helper(value)))
             }
             "http" | "protocol" => true,
-            "push" => !nested && matches!(var.as_str(), "recursesubmodules" | "followtags"),
-            "submodule" => !nested && var == "recurse",
-            "includeif" => {
-                var == "path"
-                    && subsection.is_some_and(|condition| {
-                        condition
-                            .get(.."onbranch:".len())
-                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("onbranch:"))
-                    })
+            "push" => {
+                !nested
+                    && matches!(
+                        var.as_str(),
+                        "recursesubmodules" | "followtags" | "negotiate"
+                    )
             }
+            "submodule" => !nested && var == "recurse",
             _ => false,
         };
         if listed {
@@ -444,29 +446,31 @@ fn repo_command_config(work: &Path) -> Result<RepoCommandConfig> {
     })
 }
 
-/// Stops unless the repository's own Git config is what `plan` recorded.
-fn ensure_git_config_planned(plan: &Plan, work: &Path, before: &str) -> Result<()> {
+/// Whether the repository's own Git config is what `plan` recorded. A plan
+/// saved without a digest never matches.
+fn git_config_is_planned(plan: &Plan, work: &Path) -> Result<bool> {
     let current = repo_command_config(work)?;
-    ensure!(
-        plan.git_config_digest.as_deref() == Some(current.digest.as_str()),
-        "This repository's own Git config changed since the ship was planned (checked before {before}); plan again and review it"
-    );
-    Ok(())
+    Ok(plan.git_config_digest.as_deref() == Some(current.digest.as_str()))
 }
 
-/// Refuses a push remote defined by a legacy `remotes/<name>` or
-/// `branches/<name>` file in the Git directory: `git config` does not list
-/// those, so a plan cannot tell where the push goes or whether it changed.
+/// Refuses a push remote that only a legacy `remotes/<name>` or
+/// `branches/<name>` file in the Git directory defines: `git config` does
+/// not list those, so a plan cannot tell where the push goes or whether it
+/// changed. Git ignores such a file when the config defines the remote.
 fn ensure_configured_remote(work: &Path, remote: &str) -> Result<()> {
-    let common = PathBuf::from(git(work, &["rev-parse", "--git-common-dir"])?);
-    let common = if common.is_absolute() {
-        common
-    } else {
-        work.join(common)
-    };
+    if git(work, &["config", "--get", &format!("remote.{remote}.url")]).is_ok() {
+        return Ok(());
+    }
+    let common = snapshot::rev_parse_path(work, "--git-common-dir")?;
     for legacy in ["remotes", "branches"] {
+        let file = common.join(legacy).join(remote);
+        // Only a file that is not there is safe to ignore.
+        let absent = matches!(
+            fs::symlink_metadata(&file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        );
         ensure!(
-            fs::symlink_metadata(common.join(legacy).join(remote)).is_err(),
+            absent,
             "Remote {remote} is defined by a legacy .git/{legacy}/{remote} file; define it with `git remote add` to ship to it"
         );
     }
@@ -1270,7 +1274,11 @@ fn apply_steps(
         short(&head)
     );
     // The commit and push below read the repository's own config.
-    ensure_git_config_planned(plan, work, "staging")?;
+    const CONFIG_CHANGED: &str = "This repository's own Git config changed since the ship was planned; plan again and review it";
+    ensure!(git_config_is_planned(plan, work)?, "{CONFIG_CHANGED}");
+    if let Some(remote) = &plan.push {
+        ensure_configured_remote(work, remote)?;
+    }
     // Stage exactly the planned paths in a private index from HEAD. It
     // stays until the scans below have read it.
     let index = PrivateIndex(std::path::absolute(dir.join("ship.index"))?);
@@ -1298,7 +1306,7 @@ fn apply_steps(
     let message = std::path::absolute(dir.join("commit-message.txt"))?;
     let message = message.to_str().context("Attempt path must be UTF-8")?;
     // The scans above took time; signing runs what the config names now.
-    ensure_git_config_planned(plan, work, "the commit")?;
+    ensure!(git_config_is_planned(plan, work)?, "{CONFIG_CHANGED}");
     // `commit-tree` ignores commit.gpgSign; honor it as `git commit` would.
     let sign = git(work, &["config", "--bool", "commit.gpgsign"]).is_ok_and(|v| v == "true");
     let mut args = vec!["commit-tree", &tree, "-p", &head, "-F", message];
@@ -1307,21 +1315,12 @@ fn apply_steps(
     }
     let commit = git(work, &args)?;
     log(format!("Committed {}\n", short(&commit)));
-    // Create the branch at the commit, then point the checkout at it; the
-    // working tree is untouched, like `git switch -c` with the commit on top.
+    // Create the branch at the commit. The checkout moves to it last: until
+    // then every command below reads the config the plan recorded, not one
+    // an `includeIf.onbranch` rule turns on for the new branch.
     git(work, &["branch", "--no-track", &plan.branch, &commit])?;
     outcome.commit = Some(commit.clone());
     outcome.author = git(work, &["log", "-1", "--format=%an <%ae>", &commit]).ok();
-    git(
-        work,
-        &[
-            "symbolic-ref",
-            "-m",
-            "model-router ship",
-            "HEAD",
-            &format!("refs/heads/{}", plan.branch),
-        ],
-    )?;
     // Sync ONLY the committed paths in the real index to match `commit`'s tree,
     // avoiding re-hashing live working tree files and leaving unrelated staged
     // changes untouched.
@@ -1338,11 +1337,41 @@ fn apply_steps(
         &[],
         Some(&list),
     )?;
+    let published = publish(plan, dir, &commit, outcome, log);
+    // Point the checkout at the branch whether or not publishing worked;
+    // the working tree is untouched, like `git switch -c` with the commit on
+    // top.
+    git(
+        work,
+        &[
+            "symbolic-ref",
+            "-m",
+            "model-router ship",
+            "HEAD",
+            &format!("refs/heads/{}", plan.branch),
+        ],
+    )?;
     log(format!("Switched to new branch {}\n", plan.branch));
+    published
+}
+
+/// Pushes `plan`'s branch and opens its draft PR, as planned. Runs before
+/// the checkout moves to the branch.
+fn publish(
+    plan: &Plan,
+    dir: &Path,
+    commit: &str,
+    outcome: &mut Outcome,
+    log: &mut impl FnMut(String),
+) -> Result<()> {
+    let work = plan.workspace.as_path();
     if let Some(remote) = &plan.push {
-        // HEAD is on the new branch now, so an `includeIf.onbranch` file
-        // that matches it is part of the config the push reads.
-        ensure_git_config_planned(plan, work, "the push, on the new branch")?;
+        ensure!(
+            git_config_is_planned(plan, work)?,
+            "This repository's own Git config changed after the commit, so nothing was pushed. Commit {} is on branch {}; review the config and push it yourself",
+            short(commit),
+            plan.branch
+        );
         ensure_configured_remote(work, remote)?;
         let refspec = format!("refs/heads/{0}:refs/heads/{0}", plan.branch);
         git(work, &["push", "--set-upstream", remote, &refspec])?;
@@ -2109,32 +2138,38 @@ mod tests {
             ("push.recurseSubmodules", "on-demand"),
             ("push.followTags", "true"),
             ("submodule.recurse", "true"),
-            ("includeIf.onbranch:mr/**.path", "evil.inc"),
+            ("push.negotiate", "true"),
+            ("remote.origin.uploadpack", "touch x"),
+            ("remote.plain.url", "https://plain.invalid/r"),
             ("includeIf.gitdir:/elsewhere/.path", "other.inc"),
         ] {
             git(root, &["config", key, value]).unwrap();
         }
         let found = repo_command_config(root).unwrap();
         assert_ne!(found.digest, signing.digest);
+        // Git files a key under its section, so compare as a set.
+        let mut names = found.shown.clone();
+        names.sort();
         assert_eq!(
-            found.shown,
+            names,
             [
-                "remote.*.pushurl",
-                "remote.*.proxy",
+                "credential.*.helper",
+                "credential.helper",
+                "gpg.program",
+                "http.*.proxy",
+                "http.extraheader",
                 "http.proxy",
                 "http.sslverify",
-                "http.extraheader",
-                "http.*.proxy",
-                "credential.helper",
-                "credential.*.helper",
-                "url.*.insteadof",
-                "gpg.program",
                 "protocol.*.allow",
-                "remote.*.url",
-                "push.recursesubmodules",
                 "push.followtags",
+                "push.negotiate",
+                "push.recursesubmodules",
+                "remote.*.proxy",
+                "remote.*.pushurl",
+                "remote.*.uploadpack",
+                "remote.*.url",
                 "submodule.recurse",
-                "includeif.*.path",
+                "url.*.insteadof",
             ]
         );
 
@@ -2152,50 +2187,35 @@ mod tests {
         assert_eq!(changed.shown, found.shown);
         assert_ne!(changed.digest, found.digest);
 
-        assert!(is_helper_transport("ext::sh -c x") && is_helper_transport("hg::https://h/r"));
+        for helper in [
+            "ext::sh -c x",
+            "hg::https://h/r",
+            "vendor://h/r",
+            "HTTPS://h/r",
+            "a+b://h/r",
+        ] {
+            assert!(runs_remote_helper(helper), "{helper}");
+        }
         for plain in [
             "https://h/r",
-            "git@h:r.git",
+            "http://[::1]/r",
             "ssh://[::1]/r",
+            "git+ssh://h/r",
+            "file:///a/b",
+            "git@h:r.git",
             "[::1]:r",
             "/a/b",
+            "../r.git",
         ] {
-            assert!(!is_helper_transport(plain), "{plain}");
+            assert!(!runs_remote_helper(plain), "{plain}");
         }
     }
 
     #[test]
-    fn apply_rechecks_config_that_the_ship_branch_turns_on() {
+    fn a_push_remote_only_a_legacy_file_defines_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         git(root, &["init", "-q", "-b", "main"]).unwrap();
-        git(root, &["config", "user.name", "Test"]).unwrap();
-        git(root, &["config", "user.email", "test@example.com"]).unwrap();
-        fs::write(root.join("a.txt"), "one\n").unwrap();
-        git(root, &["add", "a.txt"]).unwrap();
-        git(root, &["commit", "-q", "-m", "init"]).unwrap();
-        // An include that applies only on the ship's branch is not in the
-        // config on `main`, and is once HEAD moves there.
-        fs::write(
-            root.join(".git/on-ship.inc"),
-            "[core]\n\tsshCommand = false\n",
-        )
-        .unwrap();
-        let on_main = repo_command_config(root).unwrap();
-        git(
-            root,
-            &["config", "includeIf.onbranch:ship/**.path", "on-ship.inc"],
-        )
-        .unwrap();
-        let planned = repo_command_config(root).unwrap();
-        assert_eq!(planned.shown, ["includeif.*.path"]);
-        assert_ne!(planned.digest, on_main.digest);
-        git(root, &["symbolic-ref", "HEAD", "refs/heads/ship/x"]).unwrap();
-        let on_branch = repo_command_config(root).unwrap();
-        assert_eq!(on_branch.shown, ["includeif.*.path", "core.sshcommand"]);
-        assert_ne!(on_branch.digest, planned.digest);
-
-        // A legacy remote file is refused: `git config` cannot see it.
         ensure_configured_remote(root, "origin").unwrap();
         fs::create_dir_all(root.join(".git/remotes")).unwrap();
         fs::write(
@@ -2205,6 +2225,13 @@ mod tests {
         .unwrap();
         let error = ensure_configured_remote(root, "origin").unwrap_err();
         assert!(format!("{error:#}").contains("legacy"), "{error:#}");
+        // Git ignores the file once the config defines the remote.
+        git(
+            root,
+            &["config", "remote.origin.url", "https://h.invalid/r"],
+        )
+        .unwrap();
+        ensure_configured_remote(root, "origin").unwrap();
     }
 
     #[test]

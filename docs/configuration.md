@@ -304,7 +304,7 @@ split; a `glob:` pattern matches each piece as a whole line. `advise` injects
 | `remote` | `"origin"` | Push remote. |
 | `draft_pr` | `false` | `gh pr create --draft`. Requires `push`. |
 | `base` | `""` | PR base. Empty = checkout's upstream branch, else `gh`'s default branch. |
-| `confirm` | `true` | `false` skips the preview, unless the repository's own Git config sets commands or URL rewrites the commit or push would use (see [safety](safety.md)). Needs trust in a project config. |
+| `confirm` | `true` | `false` skips the preview, unless the repository's own Git config sets commands, proxies, URL rewrites, or the other entries the commit or push would follow (listed in [safety](safety.md)). Needs trust in a project config. |
 | `include_untracked` | `true` | Commit files the run created. |
 | `include_preexisting` | `false` | Commit files you also changed before the run; otherwise they block the ship. |
 | `secret_scan` | `true` | Built-in scan of the full diff of the planned files only (no size cutoff; files Git treats as binary are read as text) for high-confidence secrets at plan time and right before commit; lists at most 20 hits then `and N more` (never prints secret values). Setting `false` needs trust in a project config. |

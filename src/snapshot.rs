@@ -198,7 +198,7 @@ impl SanitizedGitDir {
 
 /// Queries one `git rev-parse` path flag at a time and strips only its single
 /// trailing line terminator, preserving embedded line breaks in directory paths.
-fn rev_parse_path(dir: &Path, flag: &str) -> Result<PathBuf> {
+pub(crate) fn rev_parse_path(dir: &Path, flag: &str) -> Result<PathBuf> {
     let rev = git_command()
         .args(["rev-parse", flag])
         .current_dir(dir)
@@ -1271,48 +1271,80 @@ pub fn is_repository(dir: &Path) -> bool {
     git_raw(dir, &["rev-parse", "--is-inside-work-tree"]).is_ok_and(|out| out.starts_with(b"true"))
 }
 
-/// Adds what is at `path` to `context` without following a symbolic link or
-/// blocking on a FIFO: nothing, a regular file's contents, a link's target,
-/// or only the kind of anything else.
-fn hash_untracked_entry(context: &mut ring::digest::Context, path: &Path) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+/// Rounds of PBKDF2-HMAC-SHA256 behind `stretched_digest`.
+const STRETCH_ROUNDS: std::num::NonZeroU32 = std::num::NonZeroU32::new(100_000).unwrap();
+
+/// A digest of `material` that is safe to save in a run's records when the
+/// material may hold a secret (a protected file, a Git config value): a slow
+/// PBKDF2-HMAC-SHA256 salted with `label` and the path `salt`, not a plain
+/// hash a guess could be checked against quickly. Hex.
+pub(crate) fn stretched_digest(label: &[u8], salt: &Path, material: &[u8]) -> String {
+    let mut full_salt = label.to_vec();
+    full_salt.push(0);
+    full_salt.extend_from_slice(salt.as_os_str().as_encoded_bytes());
+    let mut out = [0u8; 32];
+    ring::pbkdf2::derive(
+        ring::pbkdf2::PBKDF2_HMAC_SHA256,
+        STRETCH_ROUNDS,
+        &full_salt,
+        material,
+        &mut out,
+    );
+    out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Adds a regular file's permission bits and contents to `context`, through
+/// a symbolic link only when `follow`. Never blocks on a FIFO. A file the
+/// router may not read adds its size, times, and inode instead, so it can
+/// still tell a change; nothing there, or anything not a regular file, adds
+/// only that fact.
+fn hash_file(context: &mut ring::digest::Context, path: &Path, follow: bool) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut flags = libc::O_NONBLOCK | libc::O_NOCTTY;
+    if !follow {
+        flags |= libc::O_NOFOLLOW;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(flags);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             context.update(b"-");
             return Ok(());
         }
-        Err(error) => return Err(error).with_context(|| format!("Inspect {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            let metadata = if follow {
+                fs::metadata(path)
+            } else {
+                fs::symlink_metadata(path)
+            }
+            .with_context(|| format!("Inspect {}", path.display()))?;
+            context.update(b"u");
+            for field in [
+                metadata.mode() as i64,
+                metadata.size() as i64,
+                metadata.ino() as i64,
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            ] {
+                context.update(&field.to_le_bytes());
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error).with_context(|| format!("Open {}", path.display())),
     };
-    if metadata.file_type().is_symlink() {
-        let target = fs::read_link(path).with_context(|| format!("Read {}", path.display()))?;
-        let target = target.as_os_str().as_encoded_bytes();
-        context.update(b"l");
-        context.update(&(target.len() as u64).to_le_bytes());
-        context.update(target);
-        return Ok(());
-    }
-    if !metadata.is_file() {
-        context.update(if metadata.is_dir() { b"d" } else { b"o" });
-        return Ok(());
-    }
-    let mut options = fs::OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_NOCTTY);
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("Open {}", path.display()))?;
-    // The entry may have been swapped since the check above.
-    if !file
+    // The entry may have been swapped since the caller looked at it.
+    let metadata = file
         .metadata()
-        .with_context(|| format!("Inspect {}", path.display()))?
-        .is_file()
-    {
+        .with_context(|| format!("Inspect {}", path.display()))?;
+    if !metadata.is_file() {
         context.update(b"o");
         return Ok(());
     }
     context.update(b"f");
+    context.update(&(metadata.mode() & 0o7777).to_le_bytes());
     let mut buffer = [0u8; 8192];
     let mut total: u64 = 0;
     loop {
@@ -1331,38 +1363,129 @@ fn hash_untracked_entry(context: &mut ring::digest::Context, path: &Path) -> Res
     Ok(())
 }
 
+/// Adds what is at `path` to `context`: nothing, a regular file
+/// (`hash_file`), a symbolic link's target and the regular file it leads
+/// to, or only the kind of anything else.
+fn hash_untracked_entry(context: &mut ring::digest::Context, path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            context.update(b"-");
+            return Ok(());
+        }
+        Err(error) => return Err(error).with_context(|| format!("Inspect {}", path.display())),
+    };
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(path).with_context(|| format!("Read {}", path.display()))?;
+        let target = target.as_os_str().as_encoded_bytes();
+        context.update(b"l");
+        context.update(&(target.len() as u64).to_le_bytes());
+        context.update(target);
+        // A write to the path lands in the file the link leads to.
+        return match fs::metadata(path) {
+            Ok(target) if target.is_file() => hash_file(context, path, true),
+            _ => {
+                context.update(b"x");
+                Ok(())
+            }
+        };
+    }
+    if metadata.is_file() {
+        return hash_file(context, path, false);
+    }
+    context.update(if metadata.is_dir() { b"d" } else { b"o" });
+    Ok(())
+}
+
+/// The leading segments of protected-path glob `pattern` that have no
+/// wildcard, joined with `/`: every path `policy::matches_glob` accepts for
+/// the pattern is that path or lies under it. None when the pattern starts
+/// with a wildcard, so it gives no such limit.
+fn literal_prefix(pattern: &str) -> Option<String> {
+    let segments: Vec<&str> = pattern
+        .trim()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .take_while(|segment| !segment.contains(['*', '?']))
+        .collect();
+    (!segments.is_empty()).then(|| segments.join("/"))
+}
+
 /// A digest of the untracked files Git ignores whose repository-relative
 /// path matches one of `patterns` (`policy::matches_glob`): each path and
 /// what is there. Snapshots skip ignored files, so the tree diff that
 /// `protected_paths` reads cannot see a protected file a stage wrote and had
 /// Git ignore (through a `.gitignore`, `info/exclude`, or `core.excludesFile`).
 /// Comparing this digest before and after the stage covers those files
-/// whatever made Git ignore them. The router's own `.model-router`
-/// directories are left out. `Ok(None)` outside Git.
-pub fn ignored_protected_digest(workspace: &Path, patterns: &[String]) -> Result<Option<String>> {
+/// whatever made Git ignore them.
+///
+/// Git lists them against run `run_dir`'s private snapshot index, the one
+/// `tree` fills, so a file is in the snapshot or in this list whatever a
+/// stage did to the checkout's own index. An ignored nested repository,
+/// which Git lists as one directory, is walked here. The router's own
+/// `.model-router` directories are left out. Anything Git warns about (a
+/// directory it could not read) is an error. `Ok(None)` outside Git.
+pub fn ignored_protected_digest(
+    workspace: &Path,
+    run_dir: &Path,
+    patterns: &[String],
+) -> Result<Option<String>> {
     if !is_repository(workspace) {
         return Ok(None);
     }
+    let index = std::path::absolute(run_dir.join("snapshot.index"))?;
+    ensure!(
+        index.is_file(),
+        "The run has no snapshot index at {}",
+        index.display()
+    );
     let sanitized = SanitizedGitDir::new(workspace)?;
     let top_level = sanitized.top_level().to_path_buf();
-    // From the top of the work tree, so paths are repository-relative like
-    // `changed_paths`.
-    let mut child = sanitized
-        .command(&top_level)
+    let is_protected = |raw: &[u8]| {
+        let path = String::from_utf8_lossy(raw);
+        patterns
+            .iter()
+            .any(|pattern| crate::policy::matches_glob(pattern, &path))
+    };
+    let is_router_dir = |raw: &[u8]| {
+        raw.split(|&b| b == b'/')
+            .any(|part| part == b".model-router")
+    };
+    // Limit Git's walk to where a pattern can match, unless one can match
+    // anywhere. A path that is not valid UTF-8 is matched as lossy text, so
+    // a pattern holding the replacement character gives no limit either.
+    let prefixes: Option<Vec<String>> = patterns
+        .iter()
+        .filter(|pattern| !pattern.trim().trim_start_matches('/').is_empty())
+        .map(|pattern| literal_prefix(pattern).filter(|prefix| !prefix.contains('\u{fffd}')))
+        .collect();
+    let mut stderr = tempfile::tempfile().context("Create a file for Git's warnings")?;
+    let mut command = sanitized.command(&top_level);
+    command
+        // From the top of the work tree, so paths are repository-relative
+        // like `changed_paths`.
         .args([
             "ls-files",
             "-z",
             "--others",
             "--ignored",
             "--exclude-standard",
+            "--",
         ])
+        .env("GIT_INDEX_FILE", &index)
+        .env("GIT_LITERAL_PATHSPECS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("Start Git")?;
+        .stderr(Stdio::from(
+            stderr.try_clone().context("Share Git's warning file")?,
+        ));
+    if let Some(prefixes) = &prefixes {
+        command.args(prefixes);
+    }
+    let mut child = command.spawn().context("Start Git")?;
     let stdout = child.stdout.take().context("Read git ls-files output")?;
     let mut matched: Vec<Vec<u8>> = Vec::new();
+    let mut nested: Vec<Vec<u8>> = Vec::new();
     let mut listing = Ok(());
     for entry in std::io::BufReader::new(stdout).split(0) {
         let raw = match entry {
@@ -1372,18 +1495,12 @@ pub fn ignored_protected_digest(workspace: &Path, patterns: &[String]) -> Result
                 break;
             }
         };
-        if raw.is_empty()
-            || raw
-                .split(|&b| b == b'/')
-                .any(|part| part == b".model-router")
-        {
+        if raw.is_empty() || is_router_dir(&raw) {
             continue;
         }
-        let path = String::from_utf8_lossy(&raw);
-        if patterns
-            .iter()
-            .any(|pattern| crate::policy::matches_glob(pattern, &path))
-        {
+        if let Some(directory) = raw.strip_suffix(b"/") {
+            nested.push(directory.to_vec());
+        } else if is_protected(&raw) {
             matched.push(raw);
         }
     }
@@ -1393,17 +1510,57 @@ pub fn ignored_protected_digest(workspace: &Path, patterns: &[String]) -> Result
         status.success(),
         "git ls-files --others --ignored failed ({status})"
     );
+    let mut warnings = Vec::new();
+    {
+        use std::io::Seek;
+        stderr.rewind().context("Read Git's warnings")?;
+        (&mut stderr)
+            .take(4096)
+            .read_to_end(&mut warnings)
+            .context("Read Git's warnings")?;
+    }
+    ensure!(
+        warnings.is_empty(),
+        "git ls-files could not list every ignored file: {}",
+        String::from_utf8_lossy(&warnings).trim()
+    );
+    // Git lists an ignored nested repository as one directory and nothing
+    // inside it.
+    while let Some(directory) = nested.pop() {
+        let path = top_level.join(bytes_to_os(&directory)?);
+        let entries = fs::read_dir(&path).with_context(|| format!("List {}", path.display()))?;
+        for entry in entries {
+            let entry = entry.with_context(|| format!("List {}", path.display()))?;
+            let name = entry.file_name();
+            if name == ".git" || name == ".model-router" {
+                continue;
+            }
+            let mut raw = directory.clone();
+            raw.push(b'/');
+            raw.extend_from_slice(name.as_encoded_bytes());
+            let kind = entry
+                .file_type()
+                .with_context(|| format!("Inspect {}", entry.path().display()))?;
+            if kind.is_dir() {
+                nested.push(raw);
+            } else if is_protected(&raw) {
+                matched.push(raw);
+            }
+        }
+    }
     matched.sort();
+    matched.dedup();
     let mut context = ring::digest::Context::new(&ring::digest::SHA256);
     for raw in &matched {
         context.update(&(raw.len() as u64).to_le_bytes());
         context.update(raw);
         hash_untracked_entry(&mut context, &top_level.join(bytes_to_os(raw)?))?;
     }
-    let digest = context.finish();
-    Ok(Some(
-        digest.as_ref().iter().map(|b| format!("{b:02x}")).collect(),
-    ))
+    Ok(Some(stretched_digest(
+        b"model-router ignored protected files v1",
+        &top_level,
+        context.finish().as_ref(),
+    )))
 }
 
 /// The working tree as a Git tree ID. `Ok(None)` outside Git; returns the Git
@@ -2434,12 +2591,19 @@ mod tests {
     fn ignored_protected_digest_follows_ignored_files_that_match() {
         let Some(dir) = repository() else { return };
         let workspace = dir.path();
+        let run_dir = run_dir(workspace);
         let patterns = vec![".env".to_owned(), "secrets/**".to_owned()];
+        // Like a stage: the snapshot fills the private index, then the
+        // ignored files are read against it.
         let digest = || {
-            ignored_protected_digest(workspace, &patterns)
+            tree(workspace, &run_dir).unwrap();
+            ignored_protected_digest(workspace, &run_dir, &patterns)
                 .unwrap()
                 .unwrap()
         };
+        assert!(
+            ignored_protected_digest(workspace, &dir.path().join("no-run"), &patterns).is_err()
+        );
         let base = digest();
         assert_eq!(base, digest());
 
@@ -2468,38 +2632,99 @@ mod tests {
         fs::write(workspace.join("secrets/key"), "k2\n").unwrap();
         let edited = digest();
         assert_ne!(hidden, edited);
-
-        // The same file ignored through `info/exclude` or a planted
-        // `core.excludesFile`.
-        fs::write(workspace.join(".git/info/exclude"), "*.log\n.env\n").unwrap();
-        let excluded = digest();
-        assert_ne!(edited, excluded);
-        fs::write(workspace.join(".git/info/exclude"), "*.log\n").unwrap();
-        assert_eq!(edited, digest());
-        fs::write(workspace.join(".hide"), ".env\n.hide\n").unwrap();
-        git(
-            workspace,
-            None,
-            &["config", "--local", "core.excludesFile", ".hide"],
+        // Its mode is part of it.
+        fs::set_permissions(
+            workspace.join("secrets/key"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
         )
         .unwrap();
-        assert_eq!(excluded, digest());
+        let chmodded = digest();
+        assert_ne!(edited, chmodded);
+
+        // Forcing an ignored file into the checkout's own index does not
+        // take it out: the snapshot's index decides.
+        git(workspace, None, &["add", "-f", "secrets/key"]).unwrap();
+        assert_eq!(chmodded, digest());
+        git(workspace, None, &["rm", "-q", "--cached", "secrets/key"]).unwrap();
+
+        // A file the snapshot holds, ignored through `info/exclude` or a
+        // planted `core.excludesFile` afterwards, stays in the snapshot,
+        // where the tree diff sees it change.
+        fs::write(workspace.join(".git/info/exclude"), "*.log\n.env\n").unwrap();
+        assert_eq!(chmodded, digest());
+        let before = tree(workspace, &run_dir).unwrap();
+        fs::write(workspace.join(".env"), "A=2\n").unwrap();
+        let after = tree(workspace, &run_dir).unwrap();
+        assert_eq!(changed_paths(workspace, &before, &after).unwrap(), [".env"]);
 
         // Git lists no FIFO, so one at a protected path is never opened. A
-        // symbolic link is read as a link, not followed.
+        // symbolic link is read as a link, and through to a regular file.
         let status = Command::new("mkfifo")
             .arg(workspace.join("secrets/pipe"))
             .status()
             .unwrap();
         assert!(status.success());
-        let with_pipe = digest();
-        assert_eq!(excluded, with_pipe);
+        assert_eq!(chmodded, digest());
         std::os::unix::fs::symlink("/nonexistent/a", workspace.join("secrets/link")).unwrap();
         let with_link = digest();
-        assert_ne!(with_pipe, with_link);
+        assert_ne!(chmodded, with_link);
         fs::remove_file(workspace.join("secrets/link")).unwrap();
-        std::os::unix::fs::symlink("/nonexistent/b", workspace.join("secrets/link")).unwrap();
-        assert_ne!(with_link, digest());
+        fs::write(workspace.join("elsewhere.log"), "one\n").unwrap();
+        std::os::unix::fs::symlink("../elsewhere.log", workspace.join("secrets/link")).unwrap();
+        let linked = digest();
+        assert_ne!(with_link, linked);
+        fs::write(workspace.join("secrets/link"), "two\n").unwrap();
+        assert_ne!(linked, digest());
+    }
+
+    #[test]
+    fn ignored_protected_digest_reads_nested_repositories_and_fails_closed() {
+        let Some(dir) = repository() else { return };
+        let workspace = dir.path();
+        let run_dir = run_dir(workspace);
+        let patterns = vec!["vault/**/*.env".to_owned()];
+        let digest = || {
+            tree(workspace, &run_dir).unwrap();
+            ignored_protected_digest(workspace, &run_dir, &patterns)
+        };
+        fs::write(
+            workspace.join(".git/info/exclude"),
+            "vault/\n.model-router/\n",
+        )
+        .unwrap();
+        let base = digest().unwrap().unwrap();
+
+        // Git lists an ignored nested repository as one directory.
+        fs::create_dir_all(workspace.join("vault/deep")).unwrap();
+        git(&workspace.join("vault"), None, &["init", "-q"]).unwrap();
+        fs::write(workspace.join("vault/deep/notes.txt"), "n\n").unwrap();
+        assert_eq!(base, digest().unwrap().unwrap());
+        fs::write(workspace.join("vault/deep/prod.env"), "A=1\n").unwrap();
+        let added = digest().unwrap().unwrap();
+        assert_ne!(base, added);
+        fs::write(workspace.join("vault/deep/prod.env"), "A=2\n").unwrap();
+        assert_ne!(added, digest().unwrap().unwrap());
+
+        // A directory Git cannot read hides what is in it, so that is an
+        // error, not an unchanged digest. (Root reads it anyway.)
+        let closed = workspace.join("vault/deep");
+        fs::set_permissions(&closed, std::os::unix::fs::PermissionsExt::from_mode(0o300)).unwrap();
+        let unreadable = fs::read_dir(&closed).is_err();
+        let result = digest();
+        fs::set_permissions(&closed, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        if unreadable {
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn literal_prefix_limits_only_patterns_without_a_leading_wildcard() {
+        assert_eq!(literal_prefix(".env").as_deref(), Some(".env"));
+        assert_eq!(literal_prefix(" /a//b/*.json ").as_deref(), Some("a/b"));
+        assert_eq!(literal_prefix("secrets/**").as_deref(), Some("secrets"));
+        assert_eq!(literal_prefix("**/.env"), None);
+        assert_eq!(literal_prefix("*.pem"), None);
+        assert_eq!(literal_prefix("a?/b"), None);
     }
 
     #[test]

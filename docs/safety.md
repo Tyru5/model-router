@@ -162,31 +162,45 @@ goes, or change which server it trusts: `gpg.program`, `gpg.<format>.program`,
 `gpg.ssh.defaultKeyCommand`, `core.sshCommand`, `core.askPass`,
 `core.gitProxy`, `credential.helper`, `credential.<url>.helper`,
 `url.<base>.insteadOf`, `url.<base>.pushInsteadOf`, `remote.<name>.pushUrl`,
-`remote.<name>.proxy`, `remote.<name>.receivepack`, `remote.<name>.vcs`, a
-`remote.<name>.url` that names a remote helper (`ext::...`), every `http.*`
-and `protocol.*` key, `push.recurseSubmodules`, `push.followTags`,
-`submodule.recurse`, and an `includeIf.onbranch:<pattern>.path`. A plan with
+`remote.<name>.proxy`, `remote.<name>.receivepack`,
+`remote.<name>.uploadpack`, `remote.<name>.vcs`, a `remote.<name>.url` that
+runs a remote helper (`ext::...`, or a `scheme://` Git does not handle
+itself), every `http.*` and `protocol.*` key, `push.recurseSubmodules`,
+`push.followTags`, `push.negotiate`, and `submodule.recurse`. A plan with
 any of them always waits for confirmation, even with `confirm = false`.
 A helper, proxy, or URL can hold a credential, so the plan and `plan.json`
 name the keys only (`credential.helper`, `remote.*.pushurl`), never a value
 or subsection. Read the values with `git config --show-scope --list`.
 `plan.json` also keeps a digest of every repo-local entry (PBKDF2-HMAC-SHA256,
 100,000 rounds, salted with the workspace path). The ship stops if that
-digest differs before staging, before the commit, or before the push. The
-last check runs on the new branch, so a file an `includeIf.onbranch` rule
-adds there stops the push; the commit stays on the branch. A push remote
-defined by a legacy `.git/remotes/<name>` or `.git/branches/<name>` file is
-refused, since `git config` does not list it.
+digest differs before staging, before the commit, or before the push, so
+any repo-local config change after the plan means planning again. The
+commit, index update, push, and draft PR all run before the checkout moves
+to the new branch, so config an `includeIf.onbranch` rule turns on for that
+branch is never what they read. A push remote that only a legacy
+`.git/remotes/<name>` or `.git/branches/<name>` file defines is refused,
+since `git config` does not list it.
 Worktree creation and shipping fail closed when affected files rely
 on suppressed repo-local filters, and workflows with `protected_paths` or
 blocking `policies` fail before launch when the pre-stage snapshot cannot be
-captured. Snapshots skip files Git ignores, so `protected_paths` also
-compares the ignored, untracked files that match its globs before and after
-a stage (paths, contents, and symbolic-link targets, outside `.model-router`)
-and stops the stage blocked when one was added, changed, or removed, whatever
-made Git ignore it (`.gitignore`, `.git/info/exclude`, `core.excludesFile`).
-Blocking `policies` read the diff, which has no ignored files; `ship` and
-`apply` never include them.
+captured.
+
+Snapshots skip files Git ignores, so for an ordinary stage `protected_paths`
+also compares the ignored, untracked files that match its globs before and
+after the stage, and stops the stage blocked when one was added, changed, or
+removed, whatever made Git ignore it (`.gitignore`, `.git/info/exclude`,
+`core.excludesFile`). It reads each file's path, mode, and contents, a
+symbolic link's target and the file it leads to, and the files inside an
+ignored nested repository; it skips `.model-router`. Git lists the files
+against the run's own snapshot index, so staging one in the checkout's index
+does not hide it. The check reads every matching ignored file in full twice
+per stage, and a directory Git cannot read under a protected glob stops the
+stage. `run.json` keeps only a PBKDF2 digest of them. A `before_stage` hook
+runs after the first reading, so a hook that rewrites a protected ignored
+file blocks its stage, as it does for a tracked one. Not covered, as for
+tracked files: paths inside submodules, and names that differ only by case
+on a case-insensitive filesystem. Blocking `policies` read the diff, which
+has no ignored files; `ship` and `apply` never include them.
 
 A stage cannot reach a terminal host (see below), whose harness runs outside
 the sandbox, through the usual socket directories: `$XDG_RUNTIME_DIR/model-router`,

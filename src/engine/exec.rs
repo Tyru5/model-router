@@ -121,7 +121,11 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
     };
     // Snapshots skip files Git ignores, so protected ones are compared apart.
     let ignored_protected_before = if check_protected {
-        snapshot::ignored_protected_digest(&run.workspace, &run.workflow.protected_paths)
+        snapshot::ignored_protected_digest(
+            &run.workspace,
+            &run.directory,
+            &run.workflow.protected_paths,
+        )
             .context(
                 "Cannot start stage: failed to read the Git-ignored files workflow protected_paths cover",
             )?
@@ -726,7 +730,11 @@ pub(super) fn finish(
                 .and_then(|a| a.ignored_protected_before.clone());
             let problem = match (
                 ignored_before,
-                snapshot::ignored_protected_digest(&workspace, &run.workflow.protected_paths),
+                snapshot::ignored_protected_digest(
+                    &workspace,
+                    &run.directory,
+                    &run.workflow.protected_paths,
+                ),
             ) {
                 (None, _) => Some(
                     "Could not verify workflow protected_paths: this attempt recorded no baseline of Git-ignored protected files; retry the stage".to_owned(),

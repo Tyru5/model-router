@@ -494,6 +494,48 @@ fn push_failure_blocks_with_gits_stderr_and_keeps_the_commit() {
     assert_eq!(git(dir, &["rev-parse", "HEAD"]), commit);
 }
 
+/// The push runs before the checkout moves to the ship's branch, so config
+/// an `includeIf.onbranch` rule turns on there cannot redirect it.
+#[test]
+fn config_that_only_applies_on_the_ship_branch_does_not_reach_the_push() {
+    let options = ship::Options {
+        push: true,
+        confirm: false,
+        ..ship::Options::default()
+    };
+    let Some(fx) = fixture(two_writers(), Some(options)) else {
+        return;
+    };
+    let dir = fx.dir();
+    let elsewhere = fx.home.path().join("elsewhere.git");
+    fs::write(
+        dir.join(".git/on-ship.inc"),
+        format!("[remote \"origin\"]\n\tpushurl = {}\n", elsewhere.display()),
+    )
+    .unwrap();
+    git(
+        dir,
+        &["config", "includeIf.onbranch:mr/**.path", "on-ship.inc"],
+    );
+    let mut run = fx.create();
+    assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+    let branch = git(dir, &["symbolic-ref", "--short", "HEAD"]);
+    assert!(branch.starts_with("mr/"), "{branch}");
+    // The rule applies now that the checkout is on the branch.
+    assert_eq!(
+        git(dir, &["config", "--get", "remote.origin.pushurl"]),
+        elsewhere.display().to_string()
+    );
+    let commit = git(dir, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        git(
+            &fx.remote(),
+            &["rev-parse", &format!("refs/heads/{branch}")]
+        ),
+        commit
+    );
+}
+
 #[test]
 fn options_validate_and_ship_stages_need_no_harness() {
     let mut settings = Settings::default();
