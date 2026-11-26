@@ -175,8 +175,8 @@ or subsection. Read the values with `git config --show-scope --list`.
 100,000 rounds, salted with the workspace path). The ship stops if that
 digest differs before staging, before the commit, or before the push, so
 any repo-local config change after the plan means planning again. The
-commit, push, draft PR, and index update all run before the checkout moves
-to the new branch, so config an `includeIf.onbranch` rule turns on for that
+commit, push, and draft PR all run before the checkout moves to the new
+branch, and the index update runs with repo-local filters turned off, so config an `includeIf.onbranch` rule turns on for that
 branch is never what they read. A push remote that only a legacy
 `.git/remotes/<name>` or `.git/branches/<name>` file defines is refused,
 since `git config` does not list it.
@@ -197,13 +197,18 @@ glob such as `dir/**` therefore also covers ignored build output under
 against the run's own snapshot index, so staging one in the checkout's index
 does not hide it. The check reads every matching ignored file in full twice
 per stage, and anything Git warns about while listing them (a directory it
-cannot read; a glob that starts with `**` reaches every directory) stops the
-stage. `run.json` keeps only a PBKDF2 digest of them. A `before_stage` hook
+cannot read) stops the stage. Git walks each glob's literal leading
+directories only, so that applies under those, and everywhere for a glob
+that starts with a wildcard. `run.json` keeps only a PBKDF2 digest of them. A `before_stage` hook
 runs after the first reading, so a hook that rewrites a protected ignored
 file blocks its stage, as it does for a tracked one. Not covered, as for
 tracked files: paths inside submodules, and names that differ only by case
-on a case-insensitive filesystem. Blocking `policies` read the diff, which
-has no ignored files; `ship` and `apply` never include them.
+on a case-insensitive filesystem.
+
+Blocking `policies` govern what a run can ship or apply. Both take their
+files from the snapshot trees, so a file Git ignores, however it came to be
+ignored, is never shipped or applied, and is not scanned at the stage. `ship`
+stages only its planned paths and scans them again before the commit.
 
 A stage cannot reach a terminal host (see below), whose harness runs outside
 the sandbox, through the usual socket directories: `$XDG_RUNTIME_DIR/model-router`,

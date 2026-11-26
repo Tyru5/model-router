@@ -782,6 +782,10 @@ pub(super) fn finish(
                     return Ok(fresh_tree);
                 }
             }
+            // Policies govern what a run can ship or apply, and both take
+            // their files from these snapshot trees. A file Git ignores is in
+            // neither tree, so it can be neither shipped nor applied, and
+            // `ship` scans what it stages again. It needs no scan here.
             if check_policies {
                 let mut scan = crate::policy::PolicyScan::new(&run.workflow.policies);
                 if let Err(error) =

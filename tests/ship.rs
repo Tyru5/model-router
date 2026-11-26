@@ -536,6 +536,41 @@ fn config_that_only_applies_on_the_ship_branch_does_not_reach_the_push() {
     );
 }
 
+/// The ship updates the checkout's index for the files it committed. Git
+/// refreshes the whole index as it does, so a repo-local clean filter on an
+/// unrelated file must not run then.
+#[test]
+fn the_index_update_runs_no_repo_local_filter() {
+    let options = ship::Options {
+        confirm: false,
+        ..ship::Options::default()
+    };
+    let Some(fx) = fixture(two_writers(), Some(options)) else {
+        return;
+    };
+    let dir = fx.dir();
+    let marker = fx.home.path().join("filter-ran");
+    fs::write(dir.join(".gitattributes"), "*.bin filter=mark\n").unwrap();
+    fs::write(dir.join("unrelated.bin"), "payload\n").unwrap();
+    git(dir, &["add", ".gitattributes", "unrelated.bin"]);
+    git(dir, &["commit", "-qm", "Add a filtered file"]);
+    git(
+        dir,
+        &[
+            "config",
+            "filter.mark.clean",
+            &format!("touch '{}'; cat", marker.display()),
+        ],
+    );
+    let mut run = fx.create();
+    // Same contents, new stat data: Git has to read the file to refresh it.
+    fs::write(dir.join("unrelated.bin"), "payload\n").unwrap();
+    let _ = fs::remove_file(&marker);
+    assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+    assert!(git(dir, &["symbolic-ref", "--short", "HEAD"]).starts_with("mr/"));
+    assert!(!marker.exists(), "a repo-local clean filter ran");
+}
+
 #[test]
 fn options_validate_and_ship_stages_need_no_harness() {
     let mut settings = Settings::default();

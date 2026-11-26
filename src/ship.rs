@@ -1327,9 +1327,14 @@ fn apply_steps(
     // top.
     let switched = (|| -> Result<()> {
         // Sync ONLY the committed paths in the real index to match
-        // `commit`'s tree, leaving unrelated staged changes untouched.
-        exec_with(
-            "git",
+        // `commit`'s tree, leaving unrelated staged changes untouched. Git
+        // refreshes the index as it does, which runs clean filters, so this
+        // goes through the sanitized config: no repo-local filter runs,
+        // whatever the repository's config says by now.
+        let sanitized = snapshot::SanitizedGitDir::new(work)?;
+        let real_index = snapshot::rev_parse_path(work, "--git-dir")?.join("index");
+        exec_sanitized_git(
+            &sanitized,
             &[
                 "reset",
                 "-q",
@@ -1338,7 +1343,7 @@ fn apply_steps(
                 "--pathspec-file-nul",
             ],
             &top,
-            &[],
+            &real_index,
             Some(&list),
         )?;
         git(

@@ -1392,7 +1392,10 @@ fn hash_untracked_entry(context: &mut ring::digest::Context, path: &Path) -> Res
             // way that cannot be searched) could hide a file behind it.
             Err(error)
                 if error.kind() == std::io::ErrorKind::NotFound
-                    || matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) =>
+                    || matches!(
+                        error.raw_os_error(),
+                        Some(libc::ENOTDIR | libc::ELOOP | libc::ENAMETOOLONG)
+                    ) =>
             {
                 context.update(b"x");
                 Ok(())
@@ -1407,17 +1410,33 @@ fn hash_untracked_entry(context: &mut ring::digest::Context, path: &Path) -> Res
     Ok(())
 }
 
-/// The first path segment of protected-path glob `pattern` when it has no
-/// wildcard: every path `policy::matches_glob` accepts for the pattern is
-/// that path or lies under it. None when the segment has a wildcard or is
-/// `.` or `..`, so it gives no such limit. Only the first segment is used:
-/// Git refuses a pathspec that reaches inside an ignored nested repository.
-fn literal_prefix(pattern: &str) -> Option<String> {
-    let first = pattern
-        .trim()
-        .split('/')
-        .find(|segment| !segment.is_empty())?;
-    (!first.contains(['*', '?']) && first != "." && first != "..").then(|| first.to_owned())
+/// The leading path segments of protected-path glob `pattern` that have no
+/// wildcard, as far as Git accepts them as a pathspec under work tree `top`:
+/// every path `policy::matches_glob` accepts for the pattern is that path or
+/// lies under it. None when the first segment has a wildcard or is `.` or
+/// `..`, so the pattern gives no such limit.
+///
+/// The prefix stops at the first segment that is not a plain directory, and
+/// at a directory holding `.git`: Git refuses a pathspec that reaches inside
+/// an ignored nested repository, and lists that repository as one entry.
+fn literal_prefix(top: &Path, pattern: &str) -> Option<String> {
+    let mut prefix = String::new();
+    for segment in pattern.trim().split('/').filter(|s| !s.is_empty()) {
+        if segment.contains(['*', '?']) || segment == "." || segment == ".." {
+            break;
+        }
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(segment);
+        let path = top.join(&prefix);
+        let plain_directory = fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir())
+            && fs::symlink_metadata(path.join(".git")).is_err();
+        if !plain_directory {
+            break;
+        }
+    }
+    (!prefix.is_empty()).then_some(prefix)
 }
 
 /// A digest of the untracked files Git ignores whose repository-relative
@@ -1473,7 +1492,9 @@ pub fn ignored_protected_digest(
     let prefixes: Option<Vec<String>> = patterns
         .iter()
         .filter(|pattern| !pattern.trim().trim_start_matches('/').is_empty())
-        .map(|pattern| literal_prefix(pattern).filter(|prefix| !prefix.contains('\u{fffd}')))
+        .map(|pattern| {
+            literal_prefix(&top_level, pattern).filter(|prefix| !prefix.contains('\u{fffd}'))
+        })
         .collect();
     let mut stderr = tempfile::tempfile().context("Create a file for Git's warnings")?;
     let mut command = sanitized.command(&top_level);
@@ -2708,12 +2729,11 @@ mod tests {
         let Some(dir) = repository() else { return };
         let workspace = dir.path();
         let run_dir = run_dir(workspace);
-        // The second pattern names a path deep inside the nested repository,
-        // and the third one leaves the repository; neither stops Git.
+        // The second pattern names a path deep inside the nested repository.
+        // Git refuses that as a pathspec, so the walk is limited to `vault`.
         let patterns = vec![
             "vault/**/*.env".to_owned(),
             "vault/deep/prod.env".to_owned(),
-            "../outside/.env".to_owned(),
         ];
         let digest = || {
             tree(workspace, &run_dir).unwrap();
@@ -2737,6 +2757,13 @@ mod tests {
         fs::write(workspace.join("vault/deep/prod.env"), "A=2\n").unwrap();
         assert_ne!(added, digest().unwrap().unwrap());
 
+        // A pattern that leaves the repository matches nothing and does not
+        // stop Git either.
+        let outside = vec!["../outside/.env".to_owned(), "vault/**".to_owned()];
+        ignored_protected_digest(workspace, &run_dir, &outside)
+            .unwrap()
+            .unwrap();
+
         // A directory Git cannot read hides what is in it, so that is an
         // error, not an unchanged digest. (Root reads it anyway.)
         let closed = workspace.join("vault/deep");
@@ -2750,16 +2777,43 @@ mod tests {
     }
 
     #[test]
-    fn literal_prefix_limits_only_patterns_without_a_leading_wildcard() {
-        assert_eq!(literal_prefix(".env").as_deref(), Some(".env"));
-        assert_eq!(literal_prefix(" /a//b/*.json ").as_deref(), Some("a"));
-        assert_eq!(literal_prefix("../shared/.env"), None);
-        assert_eq!(literal_prefix("./.env"), None);
-        assert_eq!(literal_prefix(" / "), None);
-        assert_eq!(literal_prefix("secrets/**").as_deref(), Some("secrets"));
-        assert_eq!(literal_prefix("**/.env"), None);
-        assert_eq!(literal_prefix("*.pem"), None);
-        assert_eq!(literal_prefix("a?/b"), None);
+    fn literal_prefix_stops_at_wildcards_files_and_nested_repositories() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path();
+        fs::create_dir_all(top.join("config/secrets")).unwrap();
+        fs::write(top.join("config/secrets/a.log"), "x\n").unwrap();
+        fs::create_dir_all(top.join("vault/.git")).unwrap();
+        fs::create_dir_all(top.join("vault/deep")).unwrap();
+        std::os::unix::fs::symlink("config", top.join("link")).unwrap();
+        let prefix = |pattern: &str| literal_prefix(top, pattern);
+
+        assert_eq!(prefix(".env").as_deref(), Some(".env"));
+        // As deep as plain directories go, so Git does not walk siblings.
+        assert_eq!(
+            prefix("config/secrets/a.log").as_deref(),
+            Some("config/secrets/a.log")
+        );
+        assert_eq!(
+            prefix(" /config//secrets/*.json ").as_deref(),
+            Some("config/secrets")
+        );
+        assert_eq!(
+            prefix("config/missing/deeper/x").as_deref(),
+            Some("config/missing")
+        );
+        // Never inside a nested repository or through a symbolic link.
+        assert_eq!(prefix("vault/deep/prod.env").as_deref(), Some("vault"));
+        assert_eq!(prefix("link/secrets/a.log").as_deref(), Some("link"));
+        for unlimited in [
+            "**/.env",
+            "*.pem",
+            "a?/b",
+            "../shared/.env",
+            "./.env",
+            " / ",
+        ] {
+            assert_eq!(prefix(unlimited), None, "{unlimited}");
+        }
     }
 
     #[test]
