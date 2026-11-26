@@ -179,9 +179,9 @@ pub struct Plan {
     /// follow, never values or subsections (see `repo_command_config`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub git_config: Vec<String>,
-    /// SHA-256 of the exact entries behind `git_config` and of every
-    /// repo-local remote URL, to tell whether they changed after the plan.
-    /// None in plans saved before it was recorded.
+    /// Salted PBKDF2 digest of every repo-local Git config entry, to tell
+    /// whether any changed after the plan (`git_config_digest`). None in
+    /// plans saved before it was recorded, which no longer apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_config_digest: Option<String>,
 }
@@ -317,23 +317,57 @@ struct RepoCommandConfig {
     /// `section.*.var` for a key with a subsection. Never a value or a
     /// subsection, either of which can hold a credential.
     shown: Vec<String>,
-    /// SHA-256 (hex) of the exact listed entries and remote URLs.
+    /// `git_config_digest` of every repo-local entry.
     digest: String,
 }
 
+/// Rounds of PBKDF2-HMAC-SHA256 behind `git_config_digest`.
+const GIT_CONFIG_DIGEST_ROUNDS: std::num::NonZeroU32 = std::num::NonZeroU32::new(100_000).unwrap();
+
+/// A digest of repo-local Git config `entries` that is safe to save: the
+/// entries can hold a credential (a proxy or push URL, a helper command), so
+/// it is a slow PBKDF2-HMAC-SHA256 salted with the workspace path, not a
+/// plain hash a guess could be checked against quickly.
+fn git_config_digest(work: &Path, entries: &[u8]) -> String {
+    let mut salt = b"model-router ship git config v1\0".to_vec();
+    salt.extend_from_slice(work.as_os_str().as_encoded_bytes());
+    let mut out = [0u8; 32];
+    ring::pbkdf2::derive(
+        ring::pbkdf2::PBKDF2_HMAC_SHA256,
+        GIT_CONFIG_DIGEST_ROUNDS,
+        &salt,
+        entries,
+        &mut out,
+    );
+    out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Whether a remote URL names a remote helper (`<transport>::<address>`,
+/// such as `ext::<command>`), which `git push` runs as a program.
+fn is_helper_transport(url: &str) -> bool {
+    url.split_once("::").is_some_and(|(transport, _)| {
+        !transport.is_empty()
+            && transport
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    })
+}
+
 /// Repo-local (`local` and `worktree` scope) Git config that makes
-/// `git commit-tree -S` or `git push` run a command or go elsewhere:
-/// `gpg.program`, `gpg.<format>.program`, `gpg.ssh.defaultKeyCommand`,
-/// `core.sshCommand`, `core.askPass`, `core.gitProxy`, `credential.helper`,
-/// `credential.<url>.helper`, `url.<base>.insteadOf`,
-/// `url.<base>.pushInsteadOf`, `remote.<name>.pushUrl`,
-/// `remote.<name>.proxy`, `remote.<name>.receivepack`, `remote.<name>.vcs`,
-/// `http.proxy`, and `http.<url>.proxy`. Anything that can write the
-/// checkout's `.git/config` can set them, so a ship names them in its plan
-/// and never uses ones that changed after it. The router stores no
-/// credentials, and a helper, proxy, or URL can hold one, so the plan keeps
-/// only key names and a digest of the entries. The digest also covers
-/// `remote.<name>.url`, which every clone has and the plan does not list.
+/// `git commit-tree -S` or `git push` run a command, go elsewhere, or trust
+/// another server: `gpg.program`, `gpg.<format>.program`,
+/// `gpg.ssh.defaultKeyCommand`, `core.sshCommand`, `core.askPass`,
+/// `core.gitProxy`, `credential.helper`, `credential.<url>.helper`,
+/// `url.<base>.insteadOf`, `url.<base>.pushInsteadOf`,
+/// `remote.<name>.pushUrl`, `remote.<name>.proxy`,
+/// `remote.<name>.receivepack`, `remote.<name>.vcs`, a `remote.<name>.url`
+/// that names a remote helper, every `http.*` and `protocol.*` key,
+/// `push.recurseSubmodules`, `push.followTags`, `submodule.recurse`, and an
+/// `includeIf.onbranch:<pattern>.path`, whose file Git reads only once the
+/// ship has switched to its branch. Anything that can write the checkout's
+/// `.git/config` can set them, so a ship names them in its plan. The router
+/// stores no credentials, and a helper, proxy, or URL can hold one, so the
+/// plan keeps only key names. The digest covers every repo-local entry.
 fn repo_command_config(work: &Path) -> Result<RepoCommandConfig> {
     let output = snapshot::git_command()
         .args(["config", "--show-scope", "-z", "--list"])
@@ -347,19 +381,26 @@ fn repo_command_config(work: &Path) -> Result<RepoCommandConfig> {
         String::from_utf8_lossy(&output.stderr).trim()
     );
     let mut shown: Vec<String> = Vec::new();
-    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut entries: Vec<u8> = Vec::new();
     let mut parts = output.stdout.split(|&b| b == 0);
     while let (Some(scope), Some(raw)) = (parts.next(), parts.next()) {
         if scope != b"local" && scope != b"worktree" {
             continue;
         }
+        for part in [scope, raw] {
+            entries.extend_from_slice(&(part.len() as u64).to_le_bytes());
+            entries.extend_from_slice(part);
+        }
         let entry = String::from_utf8_lossy(raw);
-        let key = entry.split_once('\n').map_or(&*entry, |(key, _)| key);
+        let (key, value) = entry.split_once('\n').unwrap_or((&entry, ""));
         let Some((section, rest)) = key.split_once('.') else {
             continue;
         };
-        let var = rest.rsplit('.').next().unwrap_or(rest).to_ascii_lowercase();
-        let nested = rest.contains('.');
+        let (subsection, var) = match rest.rsplit_once('.') {
+            Some((subsection, var)) => (Some(subsection), var.to_ascii_lowercase()),
+            None => (None, rest.to_ascii_lowercase()),
+        };
+        let nested = subsection.is_some();
         let section = section.to_ascii_lowercase();
         let listed = match section.as_str() {
             "gpg" => matches!(var.as_str(), "program" | "defaultkeycommand"),
@@ -367,19 +408,26 @@ fn repo_command_config(work: &Path) -> Result<RepoCommandConfig> {
             "credential" => var == "helper",
             "url" => nested && matches!(var.as_str(), "insteadof" | "pushinsteadof"),
             "remote" => {
-                nested && matches!(var.as_str(), "pushurl" | "proxy" | "receivepack" | "vcs")
+                nested
+                    && (matches!(var.as_str(), "pushurl" | "proxy" | "receivepack" | "vcs")
+                        || (var == "url" && is_helper_transport(value)))
             }
-            "http" => var == "proxy",
+            "http" | "protocol" => true,
+            "push" => !nested && matches!(var.as_str(), "recursesubmodules" | "followtags"),
+            "submodule" => !nested && var == "recurse",
+            "includeif" => {
+                var == "path"
+                    && subsection.is_some_and(|condition| {
+                        condition
+                            .get(.."onbranch:".len())
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("onbranch:"))
+                    })
+            }
             _ => false,
         };
-        if listed || (section == "remote" && nested && var == "url") {
-            context.update(&(scope.len() as u64).to_le_bytes());
-            context.update(scope);
-            context.update(&(raw.len() as u64).to_le_bytes());
-            context.update(raw);
-        }
         if listed {
-            // `section` and `var` matched fixed names above.
+            // `section` and `var` are config names, never a value or a
+            // subsection.
             let name = if nested {
                 format!("{section}.*.{var}")
             } else {
@@ -390,11 +438,39 @@ fn repo_command_config(work: &Path) -> Result<RepoCommandConfig> {
             }
         }
     }
-    let digest = context.finish();
     Ok(RepoCommandConfig {
         shown,
-        digest: digest.as_ref().iter().map(|b| format!("{b:02x}")).collect(),
+        digest: git_config_digest(work, &entries),
     })
+}
+
+/// Stops unless the repository's own Git config is what `plan` recorded.
+fn ensure_git_config_planned(plan: &Plan, work: &Path, before: &str) -> Result<()> {
+    let current = repo_command_config(work)?;
+    ensure!(
+        plan.git_config_digest.as_deref() == Some(current.digest.as_str()),
+        "This repository's own Git config changed since the ship was planned (checked before {before}); plan again and review it"
+    );
+    Ok(())
+}
+
+/// Refuses a push remote defined by a legacy `remotes/<name>` or
+/// `branches/<name>` file in the Git directory: `git config` does not list
+/// those, so a plan cannot tell where the push goes or whether it changed.
+fn ensure_configured_remote(work: &Path, remote: &str) -> Result<()> {
+    let common = PathBuf::from(git(work, &["rev-parse", "--git-common-dir"])?);
+    let common = if common.is_absolute() {
+        common
+    } else {
+        work.join(common)
+    };
+    for legacy in ["remotes", "branches"] {
+        ensure!(
+            fs::symlink_metadata(common.join(legacy).join(remote)).is_err(),
+            "Remote {remote} is defined by a legacy .git/{legacy}/{remote} file; define it with `git remote add` to ship to it"
+        );
+    }
+    Ok(())
 }
 
 fn short(sha: &str) -> &str {
@@ -846,6 +922,9 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
     } else {
         None
     };
+    if let Some(remote) = &push {
+        ensure_configured_remote(dir, remote)?;
+    }
     let git_config = repo_command_config(dir)?;
     Ok(Plan {
         run: run.id.clone(),
@@ -1191,14 +1270,7 @@ fn apply_steps(
         short(&head)
     );
     // The commit and push below read the repository's own config.
-    let git_config = repo_command_config(work)?;
-    ensure!(
-        match &plan.git_config_digest {
-            Some(digest) => *digest == git_config.digest,
-            None => git_config.shown == plan.git_config,
-        },
-        "This repository's Git config for signing, credentials, SSH, or URL rewrites changed since the ship was planned; plan again and review it"
-    );
+    ensure_git_config_planned(plan, work, "staging")?;
     // Stage exactly the planned paths in a private index from HEAD. It
     // stays until the scans below have read it.
     let index = PrivateIndex(std::path::absolute(dir.join("ship.index"))?);
@@ -1225,6 +1297,8 @@ fn apply_steps(
     let list = path_list(&plan.files);
     let message = std::path::absolute(dir.join("commit-message.txt"))?;
     let message = message.to_str().context("Attempt path must be UTF-8")?;
+    // The scans above took time; signing runs what the config names now.
+    ensure_git_config_planned(plan, work, "the commit")?;
     // `commit-tree` ignores commit.gpgSign; honor it as `git commit` would.
     let sign = git(work, &["config", "--bool", "commit.gpgsign"]).is_ok_and(|v| v == "true");
     let mut args = vec!["commit-tree", &tree, "-p", &head, "-F", message];
@@ -1266,6 +1340,10 @@ fn apply_steps(
     )?;
     log(format!("Switched to new branch {}\n", plan.branch));
     if let Some(remote) = &plan.push {
+        // HEAD is on the new branch now, so an `includeIf.onbranch` file
+        // that matches it is part of the config the push reads.
+        ensure_git_config_planned(plan, work, "the push, on the new branch")?;
+        ensure_configured_remote(work, remote)?;
         let refspec = format!("refs/heads/{0}:refs/heads/{0}", plan.branch);
         git(work, &["push", "--set-upstream", remote, &refspec])?;
         outcome.pushed = Some(format!("{remote}/{}", plan.branch));
@@ -1433,7 +1511,7 @@ pub fn execute(run: &mut Run, cancel: &AtomicBool, emit: &mut impl FnMut(Event))
         tree_before: tree.clone(),
         tree_after: tree,
         checks_tree: None,
-        ignore_rules_before: None,
+        ignored_protected_before: None,
         usage: None,
         session: None,
         process_group: None,
@@ -2000,12 +2078,16 @@ mod tests {
         let empty = repo_command_config(root).unwrap();
         assert!(empty.shown.is_empty());
 
-        // A plain remote is in the digest and not in the list.
+        // A plain remote and a signing choice are in the digest, not the list.
         let url = "https://example.invalid/x.git";
         git(root, &["config", "remote.origin.url", url]).unwrap();
         let remote = repo_command_config(root).unwrap();
         assert!(remote.shown.is_empty());
         assert_ne!(remote.digest, empty.digest);
+        git(root, &["config", "commit.gpgsign", "true"]).unwrap();
+        let signing = repo_command_config(root).unwrap();
+        assert!(signing.shown.is_empty());
+        assert_ne!(signing.digest, remote.digest);
 
         for (key, value) in [
             ("remote.origin.pushUrl", "https://bob:s3cret@push.invalid/x"),
@@ -2020,22 +2102,39 @@ mod tests {
                 "https://e/",
             ),
             ("gpg.program", "/opt/sign --token=abc123"),
+            ("http.sslVerify", "false"),
+            ("http.extraHeader", "Authorization: Bearer abc123"),
+            ("protocol.ext.allow", "always"),
+            ("remote.helper.url", "ext::sh -c 'touch x'"),
+            ("push.recurseSubmodules", "on-demand"),
+            ("push.followTags", "true"),
+            ("submodule.recurse", "true"),
+            ("includeIf.onbranch:mr/**.path", "evil.inc"),
+            ("includeIf.gitdir:/elsewhere/.path", "other.inc"),
         ] {
             git(root, &["config", key, value]).unwrap();
         }
         let found = repo_command_config(root).unwrap();
-        assert_ne!(found.digest, remote.digest);
+        assert_ne!(found.digest, signing.digest);
         assert_eq!(
             found.shown,
             [
                 "remote.*.pushurl",
                 "remote.*.proxy",
                 "http.proxy",
+                "http.sslverify",
+                "http.extraheader",
                 "http.*.proxy",
                 "credential.helper",
                 "credential.*.helper",
                 "url.*.insteadof",
                 "gpg.program",
+                "protocol.*.allow",
+                "remote.*.url",
+                "push.recursesubmodules",
+                "push.followtags",
+                "submodule.recurse",
+                "includeif.*.path",
             ]
         );
 
@@ -2052,6 +2151,60 @@ mod tests {
         let changed = repo_command_config(root).unwrap();
         assert_eq!(changed.shown, found.shown);
         assert_ne!(changed.digest, found.digest);
+
+        assert!(is_helper_transport("ext::sh -c x") && is_helper_transport("hg::https://h/r"));
+        for plain in [
+            "https://h/r",
+            "git@h:r.git",
+            "ssh://[::1]/r",
+            "[::1]:r",
+            "/a/b",
+        ] {
+            assert!(!is_helper_transport(plain), "{plain}");
+        }
+    }
+
+    #[test]
+    fn apply_rechecks_config_that_the_ship_branch_turns_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main"]).unwrap();
+        git(root, &["config", "user.name", "Test"]).unwrap();
+        git(root, &["config", "user.email", "test@example.com"]).unwrap();
+        fs::write(root.join("a.txt"), "one\n").unwrap();
+        git(root, &["add", "a.txt"]).unwrap();
+        git(root, &["commit", "-q", "-m", "init"]).unwrap();
+        // An include that applies only on the ship's branch is not in the
+        // config on `main`, and is once HEAD moves there.
+        fs::write(
+            root.join(".git/on-ship.inc"),
+            "[core]\n\tsshCommand = false\n",
+        )
+        .unwrap();
+        let on_main = repo_command_config(root).unwrap();
+        git(
+            root,
+            &["config", "includeIf.onbranch:ship/**.path", "on-ship.inc"],
+        )
+        .unwrap();
+        let planned = repo_command_config(root).unwrap();
+        assert_eq!(planned.shown, ["includeif.*.path"]);
+        assert_ne!(planned.digest, on_main.digest);
+        git(root, &["symbolic-ref", "HEAD", "refs/heads/ship/x"]).unwrap();
+        let on_branch = repo_command_config(root).unwrap();
+        assert_eq!(on_branch.shown, ["includeif.*.path", "core.sshcommand"]);
+        assert_ne!(on_branch.digest, planned.digest);
+
+        // A legacy remote file is refused: `git config` cannot see it.
+        ensure_configured_remote(root, "origin").unwrap();
+        fs::create_dir_all(root.join(".git/remotes")).unwrap();
+        fs::write(
+            root.join(".git/remotes/origin"),
+            "URL: https://h.invalid/r\n",
+        )
+        .unwrap();
+        let error = ensure_configured_remote(root, "origin").unwrap_err();
+        assert!(format!("{error:#}").contains("legacy"), "{error:#}");
     }
 
     #[test]

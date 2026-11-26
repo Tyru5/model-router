@@ -1271,116 +1271,134 @@ pub fn is_repository(dir: &Path) -> bool {
     git_raw(dir, &["rev-parse", "--is-inside-work-tree"]).is_ok_and(|out| out.starts_with(b"true"))
 }
 
-/// Most bytes of one ignore file `ignore_rules_digest` reads.
-const IGNORE_FILE_LIMIT: u64 = 16 * 1024 * 1024;
-
-/// Hashes a regular file's contents into `context` without holding them in
-/// memory. `Ok(false)` when nothing is at `path`. Anything that is not a
-/// regular file, or is longer than `IGNORE_FILE_LIMIT`, is an error; the
-/// open never blocks on a FIFO.
-fn hash_ignore_file(context: &mut ring::digest::Context, path: &Path) -> Result<bool> {
+/// Adds what is at `path` to `context` without following a symbolic link or
+/// blocking on a FIFO: nothing, a regular file's contents, a link's target,
+/// or only the kind of anything else.
+fn hash_untracked_entry(context: &mut ring::digest::Context, path: &Path) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
-    let mut options = fs::OpenOptions::new();
-    options.read(true).custom_flags(libc::O_NONBLOCK);
-    let file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error).with_context(|| format!("Open Git ignore file {}", path.display()));
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            context.update(b"-");
+            return Ok(());
         }
+        Err(error) => return Err(error).with_context(|| format!("Inspect {}", path.display())),
     };
-    let metadata = file
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(path).with_context(|| format!("Read {}", path.display()))?;
+        let target = target.as_os_str().as_encoded_bytes();
+        context.update(b"l");
+        context.update(&(target.len() as u64).to_le_bytes());
+        context.update(target);
+        return Ok(());
+    }
+    if !metadata.is_file() {
+        context.update(if metadata.is_dir() { b"d" } else { b"o" });
+        return Ok(());
+    }
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_NOCTTY);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("Open {}", path.display()))?;
+    // The entry may have been swapped since the check above.
+    if !file
         .metadata()
-        .with_context(|| format!("Inspect Git ignore file {}", path.display()))?;
-    ensure!(
-        metadata.is_file(),
-        "Git ignore file {} is not a regular file",
-        path.display()
-    );
-    let mut reader = file.take(IGNORE_FILE_LIMIT + 1);
+        .with_context(|| format!("Inspect {}", path.display()))?
+        .is_file()
+    {
+        context.update(b"o");
+        return Ok(());
+    }
+    context.update(b"f");
     let mut buffer = [0u8; 8192];
     let mut total: u64 = 0;
     loop {
-        let read = reader
-            .read(&mut buffer)
-            .with_context(|| format!("Read Git ignore file {}", path.display()))?;
-        if read == 0 {
-            break;
-        }
+        let read = match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("Read {}", path.display()));
+            }
+        };
         total += read as u64;
-        ensure!(
-            total <= IGNORE_FILE_LIMIT,
-            "Git ignore file {} is larger than {} MiB",
-            path.display(),
-            IGNORE_FILE_LIMIT / (1024 * 1024)
-        );
         context.update(&buffer[..read]);
     }
     context.update(&total.to_le_bytes());
-    Ok(true)
+    Ok(())
 }
 
-/// A digest of the ignore rules a stage can change without touching a
-/// snapshotted file: the `core.excludesFile` path Git resolves, that file,
-/// and `info/exclude`. Snapshots skip ignored files, so a stage that changes
-/// these can hide an untracked file from the tree diff that
-/// `protected_paths` and policies read. Git itself answers which excludes
-/// file applies, through the same sanitized config a snapshot uses, so the
-/// two cannot disagree. `Ok(None)` outside Git.
-pub fn ignore_rules_digest(workspace: &Path) -> Result<Option<String>> {
+/// A digest of the untracked files Git ignores whose repository-relative
+/// path matches one of `patterns` (`policy::matches_glob`): each path and
+/// what is there. Snapshots skip ignored files, so the tree diff that
+/// `protected_paths` reads cannot see a protected file a stage wrote and had
+/// Git ignore (through a `.gitignore`, `info/exclude`, or `core.excludesFile`).
+/// Comparing this digest before and after the stage covers those files
+/// whatever made Git ignore them. The router's own `.model-router`
+/// directories are left out. `Ok(None)` outside Git.
+pub fn ignored_protected_digest(workspace: &Path, patterns: &[String]) -> Result<Option<String>> {
     if !is_repository(workspace) {
         return Ok(None);
     }
-    let common_dir = rev_parse_path(workspace, "--git-common-dir")?;
     let sanitized = SanitizedGitDir::new(workspace)?;
-    let output = sanitized
-        .command(workspace)
+    let top_level = sanitized.top_level().to_path_buf();
+    // From the top of the work tree, so paths are repository-relative like
+    // `changed_paths`.
+    let mut child = sanitized
+        .command(&top_level)
         .args([
-            "config",
-            "--null",
-            "--type=path",
-            "--get",
-            "core.excludesFile",
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
         ])
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .context("Start Git")?;
-    let excludes_file = match output.status.code() {
-        Some(0) => {
-            let raw = output.stdout.strip_suffix(b"\0").unwrap_or(&output.stdout);
-            ensure!(!raw.is_empty(), "core.excludesFile is empty");
-            // Git reads a relative path from the top of the work tree.
-            Some(sanitized.top_level().join(bytes_to_os(raw)?))
-        }
-        // Unset: Git reads `$XDG_CONFIG_HOME/git/ignore`, or
-        // `$HOME/.config/git/ignore` without `XDG_CONFIG_HOME`.
-        Some(1) => match std::env::var_os("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
-            Some(dir) => Some(PathBuf::from(dir).join("git/ignore")),
-            None => std::env::var_os("HOME")
-                .filter(|home| !home.is_empty())
-                .map(|home| PathBuf::from(home).join(".config/git/ignore")),
-        },
-        _ => anyhow::bail!(
-            "git config --get core.excludesFile: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-    };
-    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
-    for (label, path) in [
-        (&b"core.excludesFile"[..], excludes_file),
-        (&b"info/exclude"[..], Some(common_dir.join("info/exclude"))),
-    ] {
-        context.update(label);
-        let present = match &path {
-            Some(path) => {
-                let name = path.as_os_str().as_encoded_bytes();
-                context.update(&(name.len() as u64).to_le_bytes());
-                context.update(name);
-                hash_ignore_file(&mut context, path)?
+    let stdout = child.stdout.take().context("Read git ls-files output")?;
+    let mut matched: Vec<Vec<u8>> = Vec::new();
+    let mut listing = Ok(());
+    for entry in std::io::BufReader::new(stdout).split(0) {
+        let raw = match entry {
+            Ok(raw) => raw,
+            Err(error) => {
+                listing = Err(error);
+                break;
             }
-            None => false,
         };
-        context.update(&[u8::from(present)]);
+        if raw.is_empty()
+            || raw
+                .split(|&b| b == b'/')
+                .any(|part| part == b".model-router")
+        {
+            continue;
+        }
+        let path = String::from_utf8_lossy(&raw);
+        if patterns
+            .iter()
+            .any(|pattern| crate::policy::matches_glob(pattern, &path))
+        {
+            matched.push(raw);
+        }
+    }
+    let status = child.wait().context("Wait for git ls-files")?;
+    listing.context("Read git ls-files output")?;
+    ensure!(
+        status.success(),
+        "git ls-files --others --ignored failed ({status})"
+    );
+    matched.sort();
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    for raw in &matched {
+        context.update(&(raw.len() as u64).to_le_bytes());
+        context.update(raw);
+        hash_untracked_entry(&mut context, &top_level.join(bytes_to_os(raw)?))?;
     }
     let digest = context.finish();
     Ok(Some(
@@ -2413,80 +2431,75 @@ mod tests {
     }
 
     #[test]
-    fn ignore_rules_digest_changes_with_local_excludes() {
+    fn ignored_protected_digest_follows_ignored_files_that_match() {
         let Some(dir) = repository() else { return };
         let workspace = dir.path();
-        let base = ignore_rules_digest(workspace).unwrap().unwrap();
-        assert_eq!(base, ignore_rules_digest(workspace).unwrap().unwrap());
+        let patterns = vec![".env".to_owned(), "secrets/**".to_owned()];
+        let digest = || {
+            ignored_protected_digest(workspace, &patterns)
+                .unwrap()
+                .unwrap()
+        };
+        let base = digest();
+        assert_eq!(base, digest());
 
-        // A tracked `.gitignore` is in the snapshot; it is not part of this.
-        fs::write(workspace.join(".gitignore"), "*.tmp\n").unwrap();
-        assert_eq!(base, ignore_rules_digest(workspace).unwrap().unwrap());
+        // Ignored files that match no pattern, and the router's own
+        // directory, are not part of it.
+        fs::write(
+            workspace.join(".git/info/exclude"),
+            "*.log\n.model-router/\n",
+        )
+        .unwrap();
+        fs::write(workspace.join("build.log"), "noise\n").unwrap();
+        fs::create_dir_all(workspace.join(".model-router/secrets")).unwrap();
+        fs::write(workspace.join(".model-router/secrets/run"), "x\n").unwrap();
+        assert_eq!(base, digest());
 
-        let hide = workspace.join(".hide");
-        fs::write(&hide, ".env\n").unwrap();
+        // An untracked file Git does not ignore is in the snapshot instead.
+        fs::write(workspace.join(".env"), "A=1\n").unwrap();
+        assert_eq!(base, digest());
+
+        // A `.gitignore` that hides itself and a protected file.
+        fs::create_dir(workspace.join("secrets")).unwrap();
+        fs::write(workspace.join("secrets/.gitignore"), "*\n").unwrap();
+        fs::write(workspace.join("secrets/key"), "k1\n").unwrap();
+        let hidden = digest();
+        assert_ne!(base, hidden);
+        fs::write(workspace.join("secrets/key"), "k2\n").unwrap();
+        let edited = digest();
+        assert_ne!(hidden, edited);
+
+        // The same file ignored through `info/exclude` or a planted
+        // `core.excludesFile`.
+        fs::write(workspace.join(".git/info/exclude"), "*.log\n.env\n").unwrap();
+        let excluded = digest();
+        assert_ne!(edited, excluded);
+        fs::write(workspace.join(".git/info/exclude"), "*.log\n").unwrap();
+        assert_eq!(edited, digest());
+        fs::write(workspace.join(".hide"), ".env\n.hide\n").unwrap();
         git(
             workspace,
             None,
             &["config", "--local", "core.excludesFile", ".hide"],
         )
         .unwrap();
-        let planted = ignore_rules_digest(workspace).unwrap().unwrap();
-        assert_ne!(base, planted);
+        assert_eq!(excluded, digest());
 
-        fs::write(&hide, ".env\nsecrets/\n").unwrap();
-        let edited = ignore_rules_digest(workspace).unwrap().unwrap();
-        assert_ne!(planted, edited);
-
-        git(
-            workspace,
-            None,
-            &["config", "--local", "--unset", "core.excludesFile"],
-        )
-        .unwrap();
-        assert_eq!(base, ignore_rules_digest(workspace).unwrap().unwrap());
-
-        let common = rev_parse_path(workspace, "--git-common-dir").unwrap();
-        fs::create_dir_all(common.join("info")).unwrap();
-        fs::write(common.join("info/exclude"), ".env\n").unwrap();
-        assert_ne!(base, ignore_rules_digest(workspace).unwrap().unwrap());
-
-        // Only the last value names a file Git reads. An overridden FIFO is
-        // never opened, and an effective one is refused without blocking.
-        fs::remove_file(common.join("info/exclude")).unwrap();
-        let fifo = workspace.join(".fifo");
-        let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        // Git lists no FIFO, so one at a protected path is never opened. A
+        // symbolic link is read as a link, not followed.
+        let status = Command::new("mkfifo")
+            .arg(workspace.join("secrets/pipe"))
+            .status()
+            .unwrap();
         assert!(status.success());
-        git(
-            workspace,
-            None,
-            &["config", "--local", "core.excludesFile", ".fifo"],
-        )
-        .unwrap();
-        let error = ignore_rules_digest(workspace).unwrap_err();
-        assert!(
-            format!("{error:#}").contains("not a regular file"),
-            "{error:#}"
-        );
-        git(
-            workspace,
-            None,
-            &["config", "--local", "--add", "core.excludesFile", ".hide"],
-        )
-        .unwrap();
-        let last_wins = ignore_rules_digest(workspace).unwrap().unwrap();
-
-        // A value with a line break never reaches the sanitized config, so
-        // the snapshot keeps reading `.hide`, and so does this.
-        git(
-            workspace,
-            None,
-            &["config", "--local", "--add", "core.excludesFile", "a\nb"],
-        )
-        .unwrap();
-        assert_eq!(last_wins, ignore_rules_digest(workspace).unwrap().unwrap());
-        fs::write(&hide, "more\n").unwrap();
-        assert_ne!(last_wins, ignore_rules_digest(workspace).unwrap().unwrap());
+        let with_pipe = digest();
+        assert_eq!(excluded, with_pipe);
+        std::os::unix::fs::symlink("/nonexistent/a", workspace.join("secrets/link")).unwrap();
+        let with_link = digest();
+        assert_ne!(with_pipe, with_link);
+        fs::remove_file(workspace.join("secrets/link")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/b", workspace.join("secrets/link")).unwrap();
+        assert_ne!(with_link, digest());
     }
 
     #[test]

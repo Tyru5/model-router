@@ -100,7 +100,7 @@ comma-separated ranges (`">=0.160.0, <0.200.0"`).
 | `max_parallel` | `2` | Harness processes a graph workflow or fan-out runs at once. |
 | `sandbox_default` | `"off"` | Router sandbox for stages without `sandbox`: `off`, `read-only`, `workspace-write`, `by-role`. |
 | `budget` | none | `{ max_usd, max_tokens, on_exceed }` for the whole run. |
-| `protected_paths` | `[]` | Repository-relative globs (`*`, `**`, `?`, up to 64). Enforced for ordinary stages, fan-out candidates (candidate stops blocked), and candidate selection; `ship` and `apply` refuse matching files. |
+| `protected_paths` | `[]` | Repository-relative globs (`*`, `**`, `?`, up to 64). Enforced for ordinary stages, fan-out candidates (candidate stops blocked), and candidate selection; `ship` and `apply` refuse matching files. An ordinary stage is also checked for matching files Git ignores (see `docs/safety.md`). |
 | `handoff_repair` | `false` | When `true`, an unattended stage that exits 0 without a valid handoff sends one follow-up on the same session asking only for handoff JSON (an extra, possibly billed request). Supported on `codex` (not local providers `ollama`/`lmstudio`), `claude`, `pi`, `opencode`, and custom adapters with `follow_up_args`. |
 | `handoff_budget_bytes` | `14000` | Total byte budget for prior stage handoffs in downstream prompts (`1024`–`200000`). |
 | `handoff_each_bytes` | `5000` | Per-stage byte budget for each prior handoff (`1024`–`200000`, at most `handoff_budget_bytes`). |

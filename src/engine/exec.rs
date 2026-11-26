@@ -98,7 +98,7 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
     if !check_protected && !check_policies && snapshot::is_repository(&run.workspace) {
         snapshot::ensure_supported_git(&run.workspace)?;
     }
-    let (tree_before, ignore_rules_before) = if check_protected || check_policies {
+    let tree_before = if check_protected || check_policies {
         let what = match (check_protected, check_policies) {
             (true, true) => "workflow protected_paths and policies",
             (true, false) => "workflow protected_paths",
@@ -115,12 +115,18 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
             "Cannot start stage: {what} require a pre-stage Git snapshot, but {} is not a Git repository",
             run.workspace.display()
         );
-        let ignore_rules = snapshot::ignore_rules_digest(&run.workspace).with_context(|| {
-            format!("Cannot start stage: failed to read Git ignore rules required by {what}")
-        })?;
-        (tree, ignore_rules)
+        tree
     } else {
-        (snapshot::tree(&run.workspace, &run.directory), None)
+        snapshot::tree(&run.workspace, &run.directory)
+    };
+    // Snapshots skip files Git ignores, so protected ones are compared apart.
+    let ignored_protected_before = if check_protected {
+        snapshot::ignored_protected_digest(&run.workspace, &run.workflow.protected_paths)
+            .context(
+                "Cannot start stage: failed to read the Git-ignored files workflow protected_paths cover",
+            )?
+    } else {
+        None
     };
     let harness_version = adapters::detected_version(&stage.harness, &invocation.program);
     storage::write_json_fast(
@@ -142,7 +148,7 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
         tree_before,
         tree_after: None,
         checks_tree: None,
-        ignore_rules_before,
+        ignored_protected_before,
         usage: None,
         session,
         process_group: None,
@@ -700,28 +706,6 @@ pub(super) fn finish(
             )?;
             return Ok(None);
         };
-        // Snapshots skip ignored files, so ignore rules the stage changed
-        // outside the tree would hide an untracked file from the diff below.
-        if let Some(rules_before) = attempts
-            .get(from)
-            .and_then(|a| a.ignore_rules_before.clone())
-        {
-            let unchanged = match snapshot::ignore_rules_digest(&workspace) {
-                Ok(rules_after) => rules_after.as_deref() == Some(rules_before.as_str()),
-                Err(_) => false,
-            };
-            if !unchanged {
-                run.stop(
-                    Status::Blocked,
-                    format!(
-                        "Repo-local Git ignore rules (core.excludesFile or .git/info/exclude) changed during the stage, so ignored files are missing from the diff that {what} check. Restore them and retry"
-                    ),
-                    Actor::Engine,
-                    true,
-                )?;
-                return Ok(None);
-            }
-        }
         let Some(after) = snapshot::tree(&workspace, &run.directory) else {
             run.stop(
                 Status::Blocked,
@@ -734,6 +718,32 @@ pub(super) fn finish(
             return Ok(None);
         };
         fresh_tree = Some(after.clone());
+        if check_protected {
+            // Snapshots skip files Git ignores, so a protected file the
+            // stage wrote and had Git ignore is not in the diff below.
+            let ignored_before = attempts
+                .get(from)
+                .and_then(|a| a.ignored_protected_before.clone());
+            let problem = match (
+                ignored_before,
+                snapshot::ignored_protected_digest(&workspace, &run.workflow.protected_paths),
+            ) {
+                (None, _) => Some(
+                    "Could not verify workflow protected_paths: this attempt recorded no baseline of Git-ignored protected files; retry the stage".to_owned(),
+                ),
+                (Some(_), Err(error)) => Some(format!(
+                    "Could not read the Git-ignored files workflow protected_paths cover: {error:#}"
+                )),
+                (Some(before), Ok(after)) if after.as_deref() != Some(before.as_str()) => Some(
+                    "A Git-ignored file matching workflow protected_paths was added, changed, or removed during the stage. Revert it or update workflow protected_paths before retrying".to_owned(),
+                ),
+                (Some(_), Ok(_)) => None,
+            };
+            if let Some(problem) = problem {
+                run.stop(Status::Blocked, problem, Actor::Engine, true)?;
+                return Ok(fresh_tree);
+            }
+        }
         if after != before {
             if check_protected {
                 let changed = match snapshot::changed_paths(&workspace, &before, &after) {

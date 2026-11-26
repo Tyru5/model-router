@@ -129,22 +129,37 @@ fn protected_paths_block_stage_that_edits_matching_file() {
     assert!(err.contains(".github/workflows/ci.yml"), "{err}");
 }
 
-/// Snapshots skip ignored files, so a stage that rewrites `.git/info/exclude`
-/// could hide an untracked protected file from the diff. It stops blocked.
+/// Snapshots skip files Git ignores, so a protected file the stage writes
+/// while Git ignores it is not in the tree diff. The stage still stops
+/// blocked, and an ignored protected file it leaves alone does not block it.
 #[test]
-fn protected_paths_block_stage_that_changes_repo_local_ignore_rules() {
+fn protected_paths_cover_files_git_ignores() {
     let dir = common::tempdir();
     init_git(dir.path());
-    let mut impl_stage = stage("implement", Role::Implementation);
-    impl_stage.extra_args = vec!["--write-file".into(), ".git/info/exclude".into()];
-    let mut wf = Workflow::new("Protected", vec![impl_stage]);
-    wf.protected_paths = vec![".env".into()];
-    let settings = common::settings(&wf);
-    let mut run = Run::create(dir.path(), &settings, &wf, "hide a file".into(), false).unwrap();
-    assert_eq!(drive(&mut run), Action::Stopped);
+    fs::write(dir.path().join(".gitignore"), ".env\n.model-router/\n").unwrap();
+    git(dir.path(), &["add", ".gitignore"]);
+    git(dir.path(), &["commit", "-m", "ignore .env"]);
+    fs::write(dir.path().join(".env"), "TOKEN=kept\n").unwrap();
+
+    let run_stage = |target: &str| {
+        let mut impl_stage = stage("implement", Role::Implementation);
+        impl_stage.extra_args = vec!["--write-file".into(), target.into()];
+        let mut wf = Workflow::new("Protected", vec![impl_stage]);
+        wf.protected_paths = vec![".env".into()];
+        let settings = common::settings(&wf);
+        let mut run = Run::create(dir.path(), &settings, &wf, "task".into(), false).unwrap();
+        let action = drive(&mut run);
+        (action, run)
+    };
+
+    let (action, run) = run_stage("notes.txt");
+    assert_eq!(action, Action::Complete, "{:?}", run.error);
+
+    let (action, run) = run_stage(".env");
+    assert_eq!(action, Action::Stopped);
     assert_eq!(run.status, Status::Blocked);
     let err = run.error.as_deref().unwrap_or("");
-    assert!(err.contains("ignore rules"), "{err}");
+    assert!(err.contains("Git-ignored file matching"), "{err}");
 }
 
 /// A fan-out candidate that edits a protected path stops blocked, and its
