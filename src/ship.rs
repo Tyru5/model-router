@@ -1314,20 +1314,18 @@ fn apply_steps(
     }
     let commit = git(work, &args)?;
     log(format!("Committed {}\n", short(&commit)));
-    // Create the branch at the commit. The checkout moves to it last: until
-    // then every command below reads the config the plan recorded, not one
-    // an `includeIf.onbranch` rule turns on for the new branch.
+    // Create the branch at the commit, then finish everything local before
+    // waiting on the network: update the index and point the checkout at
+    // the branch (the working tree is untouched, like `git switch -c` with
+    // the commit on top). The shipped files are then never left staged on
+    // the old branch while a push runs.
     git(work, &["branch", "--no-track", &plan.branch, &commit])?;
     outcome.commit = Some(commit.clone());
     outcome.author = git(work, &["log", "-1", "--format=%an <%ae>", &commit]).ok();
-    // Before anything is published: if the index cannot be written (another
-    // Git process holds its lock), the ship stops with nothing pushed.
+    // The index update reads the config the plan recorded: HEAD has not
+    // moved yet, and it runs through the sanitized config in any case.
     sync_index(work, &top, &commit, &plan.files)?;
-    let published = publish(plan, dir, &commit, outcome, log);
-    // Point the checkout at the branch whether or not publishing worked;
-    // the working tree is untouched, like `git switch -c` with the commit on
-    // top.
-    let switched = git(
+    git(
         work,
         &[
             "symbolic-ref",
@@ -1336,18 +1334,9 @@ fn apply_steps(
             "HEAD",
             &format!("refs/heads/{}", plan.branch),
         ],
-    );
-    match (published, switched) {
-        (published, Ok(_)) => {
-            log(format!("Switched to new branch {}\n", plan.branch));
-            published
-        }
-        (Ok(()), Err(switch)) => Err(switch),
-        (Err(publish), Err(switch)) => Err(anyhow::anyhow!(
-            "{publish:#}\nThe checkout also could not move to branch {}: {switch:#}",
-            plan.branch
-        )),
-    }
+    )?;
+    log(format!("Switched to new branch {}\n", plan.branch));
+    publish(plan, dir, &commit, outcome, log)
 }
 
 /// Makes the checkout's index match `commit` for exactly the shipped
@@ -1409,8 +1398,10 @@ fn sync_index(work: &Path, top: &Path, commit: &str, files: &[FileChange]) -> Re
     Ok(())
 }
 
-/// Pushes `plan`'s branch and opens its draft PR, as planned. Runs before
-/// the checkout moves to the branch.
+/// Pushes `plan`'s branch and opens its draft PR, as planned. The checkout
+/// is on the new branch by now, so config an `includeIf.onbranch` rule turns
+/// on for it is in effect: the push runs only if the repository's own config
+/// is still exactly what the plan recorded.
 fn publish(
     plan: &Plan,
     dir: &Path,
@@ -1422,7 +1413,7 @@ fn publish(
     if let Some(remote) = &plan.push {
         ensure!(
             git_config_is_planned(plan, work)?,
-            "This repository's own Git config changed after the commit, so nothing was pushed. Commit {} is on branch {}; review the config and push it yourself",
+            "This repository's own Git config is not what the plan recorded (it changed after the commit, or an includeIf.onbranch rule applies on the new branch), so nothing was pushed. Commit {} is on branch {}; review the config and push it yourself",
             short(commit),
             plan.branch
         );

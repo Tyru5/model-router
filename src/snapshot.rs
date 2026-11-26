@@ -269,8 +269,8 @@ pub(crate) fn index_path(dir: &Path) -> Result<PathBuf> {
         "git rev-parse --git-path index: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
+    // Only the newline Git adds: the name itself may end in any byte.
     let raw = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
-    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
     ensure!(
         !raw.is_empty(),
         "git rev-parse --git-path index returned nothing"

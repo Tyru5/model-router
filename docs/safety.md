@@ -174,12 +174,13 @@ or subsection. Read the values with `git config --show-scope --list`.
 `plan.json` also keeps a digest of every repo-local entry (PBKDF2-HMAC-SHA256,
 100,000 rounds, salted with the workspace path). The ship stops if that
 digest differs before staging, before the commit, or before the push, so
-any repo-local config change after the plan means planning again. The
-commit, index update, push, and draft PR all run before the checkout moves
-to the new branch (the index update first, so a locked index stops the ship
-with nothing pushed), and the index update runs with repo-local filters
-turned off, so config an `includeIf.onbranch` rule turns on for that
-branch is never what they read. A push remote that only a legacy
+any repo-local config change after the plan means planning again. After the
+commit the ship updates the checkout's index (with repo-local filters turned
+off, so a locked index stops it with nothing pushed) and moves the checkout
+to the new branch, and only then pushes. Config an `includeIf.onbranch` rule
+turns on for that branch is not what the plan recorded, so the push is
+refused and the commit stays on the branch for you to push.
+A push remote that only a legacy
 `.git/remotes/<name>` or `.git/branches/<name>` file defines is refused,
 since `git config` does not list it.
 Worktree creation and shipping fail closed when affected files rely

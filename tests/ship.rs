@@ -29,7 +29,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
-/// The host's human identity; tests never invent commit authorship.
+/// The host's human identity. A machine without one gets a fixed test
+/// identity, set only in the temporary repository, so no test is skipped.
 fn identity() -> Option<(String, String)> {
     let get = |key| {
         let output = Command::new("git")
@@ -40,14 +41,12 @@ fn identity() -> Option<(String, String)> {
             .status
             .success()
             .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .filter(|value| !value.is_empty())
     };
-    match (get("user.name"), get("user.email")) {
-        (Some(name), Some(email)) => Some((name, email)),
-        _ => {
-            eprintln!("Skipping ship test: configure the human git identity first");
-            None
-        }
-    }
+    Some(match (get("user.name"), get("user.email")) {
+        (Some(name), Some(email)) => (name, email),
+        _ => ("Test User".to_owned(), "test@example.com".to_owned()),
+    })
 }
 
 struct Fixture {
@@ -494,10 +493,11 @@ fn push_failure_blocks_with_gits_stderr_and_keeps_the_commit() {
     assert_eq!(git(dir, &["rev-parse", "HEAD"]), commit);
 }
 
-/// The push runs before the checkout moves to the ship's branch, so config
-/// an `includeIf.onbranch` rule turns on there cannot redirect it.
+/// The checkout is on the ship's branch when the push runs, so config an
+/// `includeIf.onbranch` rule turns on there is in effect. It is not what the
+/// plan recorded, so nothing is pushed and the commit stays on the branch.
 #[test]
-fn config_that_only_applies_on_the_ship_branch_does_not_reach_the_push() {
+fn config_that_only_applies_on_the_ship_branch_stops_the_push() {
     let options = ship::Options {
         push: true,
         confirm: false,
@@ -508,6 +508,10 @@ fn config_that_only_applies_on_the_ship_branch_does_not_reach_the_push() {
     };
     let dir = fx.dir();
     let elsewhere = fx.home.path().join("elsewhere.git");
+    git(
+        fx.home.path(),
+        &["init", "-q", "--bare", elsewhere.to_str().unwrap()],
+    );
     fs::write(
         dir.join(".git/on-ship.inc"),
         format!("[remote \"origin\"]\n\tpushurl = {}\n", elsewhere.display()),
@@ -518,22 +522,25 @@ fn config_that_only_applies_on_the_ship_branch_does_not_reach_the_push() {
         &["config", "includeIf.onbranch:mr/**.path", "on-ship.inc"],
     );
     let mut run = fx.create();
-    assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+    assert_eq!(drive(&mut run), Action::Stopped);
+    assert_eq!(run.status, Status::Blocked);
+    let error = run.error.clone().unwrap();
+    assert!(error.contains("nothing was pushed"), "{error}");
+    // The commit is on the new branch, which the checkout is on.
     let branch = git(dir, &["symbolic-ref", "--short", "HEAD"]);
     assert!(branch.starts_with("mr/"), "{branch}");
-    // The rule applies now that the checkout is on the branch.
-    assert_eq!(
-        git(dir, &["config", "--get", "remote.origin.pushurl"]),
-        elsewhere.display().to_string()
-    );
     let commit = git(dir, &["rev-parse", "HEAD"]);
-    assert_eq!(
-        git(
-            &fx.remote(),
-            &["rev-parse", &format!("refs/heads/{branch}")]
-        ),
-        commit
-    );
+    assert!(error.contains(&commit[..12]), "{error}");
+    // Neither the real remote nor the one the rule names got the branch.
+    for remote in [fx.remote(), elsewhere] {
+        assert_eq!(
+            git(
+                &remote,
+                &["for-each-ref", "--format=%(refname)", "refs/heads/mr/"]
+            ),
+            ""
+        );
+    }
 }
 
 /// The checkout's index is updated before anything is published, so a ship
