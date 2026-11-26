@@ -130,7 +130,7 @@ run's ship stage options, else the defaults ([shipping](workflows.md#shipping)).
 
 | Option | Meaning |
 | --- | --- |
-| `--push` | Push the branch with `--set-upstream`. |
+| `--push` | Push the commit to the remote branch and set it as upstream. |
 | `--draft-pr` | Open a draft PR with `gh`; implies `--push`. |
 | `--yes` | Ship without asking after the preview (required without a terminal). |
 

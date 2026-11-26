@@ -184,12 +184,12 @@ pub struct Plan {
     /// plans saved before it was recorded, which no longer apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_config_digest: Option<String>,
-    /// Salted PBKDF2 digest of where Git would push for `push`
-    /// (`push_destination_digest`), to tell whether that changed after the
-    /// plan. None without a push, and in plans saved before it was recorded,
-    /// which no longer push.
+    /// Salted PBKDF2 digest of the Git config of every scope
+    /// (`effective_config_digest`), to tell whether what a push reads changed
+    /// after the plan. None without a push, and in plans saved before it was
+    /// recorded, which no longer push.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub push_digest: Option<String>,
+    pub push_config_digest: Option<String>,
 }
 fn default_true() -> bool {
     true
@@ -286,7 +286,7 @@ impl Plan {
             Some(remote) => {
                 let _ = writeln!(
                     text,
-                    "Push: git push --set-upstream {remote} {}",
+                    "Push: the commit to {remote} as {} (no tags, no submodule commits), set as the branch's upstream",
                     self.branch
                 );
             }
@@ -371,11 +371,12 @@ fn runs_remote_helper(url: &str) -> bool {
 /// `remote.<name>.receivepack`, `remote.<name>.uploadpack`,
 /// `remote.<name>.vcs`, a `remote.<name>.url` that runs a remote helper
 /// (`runs_remote_helper`), every `http.*` and `protocol.*` key,
-/// `push.recurseSubmodules`, `push.followTags`, `push.negotiate`, and
-/// `submodule.recurse`. Anything that can write the checkout's `.git/config`
-/// can set them, so a ship names them in its plan. The router stores no
-/// credentials, and a helper, proxy, or URL can hold one, so the plan keeps
-/// only key names. The digest covers every repo-local entry.
+/// `push.recurseSubmodules`, `push.followTags`, `push.negotiate`,
+/// `push.pushOption`, and `submodule.recurse`. Anything that can write the
+/// checkout's `.git/config` can set them, so a ship names them in its plan.
+/// The router stores no credentials, and a helper, proxy, or URL can hold
+/// one, so the plan keeps only key names. The digest covers every repo-local
+/// entry.
 fn repo_command_config(work: &Path) -> Result<RepoCommandConfig> {
     let output = snapshot::git_command()
         .args(["config", "--show-scope", "-z", "--list"])
@@ -427,7 +428,7 @@ fn repo_command_config(work: &Path) -> Result<RepoCommandConfig> {
                 !nested
                     && matches!(
                         var.as_str(),
-                        "recursesubmodules" | "followtags" | "negotiate"
+                        "recursesubmodules" | "followtags" | "negotiate" | "pushoption"
                     )
             }
             "submodule" => !nested && var == "recurse",
@@ -452,29 +453,66 @@ fn repo_command_config(work: &Path) -> Result<RepoCommandConfig> {
     })
 }
 
-/// A digest of where `git push <remote>` goes: the push URLs Git resolves
-/// for `remote` from every config scope, with `pushUrl`, `insteadOf`, and
-/// `pushInsteadOf` applied. `git_config_digest` covers the repository's own
-/// config only, and a global or system `includeIf.onbranch` rule can change
-/// the destination once the checkout is on the ship's branch. A URL can hold
-/// a credential, so only `snapshot::stretched_digest` of it is kept.
-fn push_destination_digest(work: &Path, remote: &str) -> Result<String> {
+/// A digest of the Git config a push reads: every entry of every scope
+/// (system, global, repository, worktree), in the order Git lists them.
+/// `git_config_digest` covers the repository's own entries only, and an
+/// `includeIf.onbranch` rule in the user's or the system's config can turn
+/// entries on once the checkout is on the ship's branch: another push URL,
+/// `push.followTags`, a proxy. Comparing this digest between the plan and
+/// the push covers any of them without a list of settings to keep up to
+/// date. Entries given on the command line or through
+/// `GIT_CONFIG_PARAMETERS` are left out; they are the caller's and the
+/// router's own. A value can hold a credential, so only
+/// `snapshot::stretched_digest` of the entries is kept.
+fn effective_config_digest(work: &Path) -> Result<String> {
     let output = snapshot::git_command()
-        .args(["remote", "get-url", "--push", "--all", remote])
+        .args(["config", "--show-scope", "-z", "--list"])
         .current_dir(work)
         .stdin(Stdio::null())
         .output()
-        .context("Start git")?;
+        .context("Start Git")?;
     ensure!(
         output.status.success(),
-        "git remote get-url --push {remote} failed: {}",
+        "git config --list (requires Git 2.26+): {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
+    let mut entries: Vec<u8> = Vec::new();
+    let mut parts = output.stdout.split(|&b| b == 0);
+    while let (Some(scope), Some(raw)) = (parts.next(), parts.next()) {
+        if scope == b"command" {
+            continue;
+        }
+        for part in [scope, raw] {
+            entries.extend_from_slice(&(part.len() as u64).to_le_bytes());
+            entries.extend_from_slice(part);
+        }
+    }
     Ok(snapshot::stretched_digest(
-        b"model-router ship push destination v1",
+        b"model-router ship effective git config v1",
         work,
-        &output.stdout,
+        &entries,
     ))
+}
+
+/// What to pass as `git push --recurse-submodules`. The push sends the
+/// planned commit and nothing else, so it never pushes submodule commits on
+/// its own (`on-demand`, `only`). Where the user's config asks for any of
+/// that, or for `check`, Git still checks that the submodule commits the
+/// planned commit names are on a remote, and refuses the push if not.
+fn push_submodule_mode(work: &Path) -> &'static str {
+    let configured = git(work, &["config", "--get", "push.recurseSubmodules"])
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase());
+    let wants_submodules = match configured.as_deref() {
+        Some(value) => matches!(value, "check" | "on-demand" | "only"),
+        // Unset: `submodule.recurse` decides.
+        None => git(
+            work,
+            &["config", "--type=bool", "--get", "submodule.recurse"],
+        )
+        .is_ok_and(|value| value.trim() == "true"),
+    };
+    if wants_submodules { "check" } else { "no" }
 }
 
 /// Whether the repository's own Git config is what `plan` recorded. A plan
@@ -961,8 +999,8 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
         ensure_configured_remote(dir, remote)?;
     }
     let git_config = repo_command_config(dir)?;
-    let push_digest = match &push {
-        Some(remote) => Some(push_destination_digest(dir, remote)?),
+    let push_config_digest = match &push {
+        Some(_) => Some(effective_config_digest(dir)?),
         None => None,
     };
     Ok(Plan {
@@ -984,7 +1022,7 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
         block_policies,
         git_config: git_config.shown,
         git_config_digest: Some(git_config.digest),
-        push_digest,
+        push_config_digest,
     })
 }
 
@@ -1454,18 +1492,44 @@ fn publish(
             plan.branch
         );
         ensure_configured_remote(work, remote)?;
-        // Config from any scope can name another destination now that the
-        // checkout is on the new branch.
+        // The same for the config of every other scope: a rule in the
+        // user's or the system's config can apply to the new branch only.
         ensure!(
-            plan.push_digest.as_deref() == Some(push_destination_digest(work, remote)?.as_str()),
-            "Git would now push {remote} somewhere other than when the ship was planned (config changed, or an includeIf.onbranch rule applies on the new branch), so nothing was pushed. Commit {} is on branch {}; check `git remote get-url --push {remote}` and push it yourself",
+            plan.push_config_digest.as_deref() == Some(effective_config_digest(work)?.as_str()),
+            "Git's config is not what it was when the ship was planned (a setting changed, or an includeIf.onbranch rule in your or the system's config applies to one branch and not the other), so nothing was pushed. Commit {} is on branch {}; review `git config --show-scope --list` and push it yourself",
             short(commit),
             plan.branch
         );
-        let refspec = format!("refs/heads/{0}:refs/heads/{0}", plan.branch);
-        git(work, &["push", "--set-upstream", remote, &refspec])?;
+        // Push the commit that was scanned, by its ID: the checkout is on
+        // the branch by now, and a commit made on it since would otherwise
+        // go out unscanned. Nothing else goes with it: no tags
+        // (`push.followTags`) and no submodule commits.
+        let refspec = format!("{commit}:refs/heads/{}", plan.branch);
+        let submodules = format!("--recurse-submodules={}", push_submodule_mode(work));
+        git(
+            work,
+            &["push", "--no-follow-tags", &submodules, remote, &refspec],
+        )?;
         outcome.pushed = Some(format!("{remote}/{}", plan.branch));
         log(format!("Pushed {remote}/{}\n", plan.branch));
+        // `--set-upstream` sets nothing for a push by commit ID, so record
+        // the upstream as it would have. The branch is pushed either way.
+        let upstream = [
+            (format!("branch.{}.remote", plan.branch), remote.clone()),
+            (
+                format!("branch.{}.merge", plan.branch),
+                format!("refs/heads/{}", plan.branch),
+            ),
+        ];
+        for (key, value) in &upstream {
+            if let Err(error) = git(work, &["config", key, value]) {
+                log(format!(
+                    "Could not set {remote}/{} as the branch's upstream: {error:#}\n",
+                    plan.branch
+                ));
+                break;
+            }
+        }
     }
     if let Some(pr) = &plan.pr {
         let body = std::path::absolute(dir.join("pr-body.md"))?;
@@ -2226,6 +2290,7 @@ mod tests {
             ("remote.helper.url", "ext::sh -c 'touch x'"),
             ("push.recurseSubmodules", "on-demand"),
             ("push.followTags", "true"),
+            ("push.pushOption", "merge_request.create"),
             ("submodule.recurse", "true"),
             ("push.negotiate", "true"),
             ("remote.origin.uploadpack", "touch x"),
@@ -2252,6 +2317,7 @@ mod tests {
                 "protocol.*.allow",
                 "push.followtags",
                 "push.negotiate",
+                "push.pushoption",
                 "push.recursesubmodules",
                 "remote.*.proxy",
                 "remote.*.pushurl",
@@ -2302,11 +2368,10 @@ mod tests {
     }
 
     #[test]
-    fn push_destination_digest_follows_what_git_resolves() {
+    fn effective_config_digest_follows_every_entry_git_reads() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         git(root, &["init", "-q", "-b", "main"]).unwrap();
-        assert!(push_destination_digest(root, "origin").is_err());
         git(
             root,
             &[
@@ -2316,47 +2381,19 @@ mod tests {
             ],
         )
         .unwrap();
-        let plain = push_destination_digest(root, "origin").unwrap();
-        assert_eq!(plain, push_destination_digest(root, "origin").unwrap());
+        let plain = effective_config_digest(root).unwrap();
+        assert_eq!(plain, effective_config_digest(root).unwrap());
         assert!(!plain.contains("example"), "{plain}");
 
-        // A rewrite and a push URL each change where the push goes.
-        git(
-            root,
-            &[
-                "config",
-                "url.https://mirror.invalid/.pushInsteadOf",
-                "https://example.invalid/",
-            ],
-        )
-        .unwrap();
-        let rewritten = push_destination_digest(root, "origin").unwrap();
-        assert_ne!(plain, rewritten);
-        git(
-            root,
-            &[
-                "config",
-                "remote.origin.pushUrl",
-                "https://other.invalid/y.git",
-            ],
-        )
-        .unwrap();
-        let push_url = push_destination_digest(root, "origin").unwrap();
-        assert_ne!(rewritten, push_url);
+        // Any entry counts, not a list of them.
+        git(root, &["config", "push.followTags", "true"]).unwrap();
+        let tags = effective_config_digest(root).unwrap();
+        assert_ne!(plain, tags);
+        git(root, &["config", "--unset", "push.followTags"]).unwrap();
+        assert_eq!(plain, effective_config_digest(root).unwrap());
 
-        // So does config that applies only on another branch, as a rule in
-        // any scope would.
-        git(root, &["config", "--unset", "remote.origin.pushUrl"]).unwrap();
-        git(
-            root,
-            &[
-                "config",
-                "--unset",
-                "url.https://mirror.invalid/.pushInsteadOf",
-            ],
-        )
-        .unwrap();
-        assert_eq!(plain, push_destination_digest(root, "origin").unwrap());
+        // Config that applies only on another branch, as a rule in any
+        // scope would, changes it once HEAD is there.
         fs::write(
             root.join(".git/on-ship.inc"),
             "[remote \"origin\"]\n\tpushurl = https://branch.invalid/z.git\n",
@@ -2367,9 +2404,32 @@ mod tests {
             &["config", "includeIf.onbranch:ship/**.path", "on-ship.inc"],
         )
         .unwrap();
-        assert_eq!(plain, push_destination_digest(root, "origin").unwrap());
+        let ruled = effective_config_digest(root).unwrap();
+        assert_ne!(plain, ruled);
         git(root, &["symbolic-ref", "HEAD", "refs/heads/ship/x"]).unwrap();
-        assert_ne!(plain, push_destination_digest(root, "origin").unwrap());
+        assert_ne!(ruled, effective_config_digest(root).unwrap());
+    }
+
+    #[test]
+    fn push_submodule_mode_never_pushes_submodule_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main"]).unwrap();
+        // Whatever the user's own config says, the repository's wins here.
+        for (value, mode) in [
+            ("no", "no"),
+            ("check", "check"),
+            ("on-demand", "check"),
+            ("only", "check"),
+            ("On-Demand", "check"),
+        ] {
+            git(root, &["config", "push.recurseSubmodules", value]).unwrap();
+            assert_eq!(push_submodule_mode(root), mode, "{value}");
+        }
+        // `push.recurseSubmodules = no` beats `submodule.recurse`.
+        git(root, &["config", "push.recurseSubmodules", "no"]).unwrap();
+        git(root, &["config", "submodule.recurse", "true"]).unwrap();
+        assert_eq!(push_submodule_mode(root), "no");
     }
 
     #[test]

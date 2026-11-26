@@ -80,6 +80,11 @@ impl Fixture {
         .unwrap()
     }
     fn cli(&self, args: &[&str]) -> Output {
+        self.cli_env(args, &[])
+    }
+    /// `cli` with extra environment variables, such as a Git config file
+    /// standing in for the user's own.
+    fn cli_env(&self, args: &[&str], envs: &[(&str, &Path)]) -> Output {
         let bin = self.home.path().join("bin");
         let path = std::iter::once(bin)
             .chain(std::env::split_paths(
@@ -96,6 +101,7 @@ impl Fixture {
             .env("FAKE_GH_LOG", self.gh_log())
             .env("MODEL_ROUTER_CONFIG_DIR", self.home.path().join("home"))
             .env("MODEL_ROUTER_NO_ANIMATION", "1")
+            .envs(envs.iter().copied())
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap()
@@ -541,6 +547,111 @@ fn config_that_only_applies_on_the_ship_branch_stops_the_push() {
             ""
         );
     }
+}
+
+/// The same for a rule in the user's own Git config, which the digest of
+/// the repository's config does not cover: `push.followTags` turned on for
+/// the ship's branch only would send tags the plan never listed.
+#[test]
+fn a_rule_in_the_users_config_for_the_ship_branch_stops_the_push() {
+    let Some(fx) = fixture(two_writers(), None) else {
+        return;
+    };
+    let dir = fx.dir();
+    let mut run = fx.create();
+    assert_eq!(drive(&mut run), Action::Complete);
+    let global = fx.home.path().join("gitconfig");
+    let include = fx.home.path().join("on-ship.inc");
+    fs::write(&include, "[push]\n\tfollowTags = true\n").unwrap();
+    fs::write(
+        &global,
+        format!(
+            "[includeIf \"onbranch:mr/**\"]\n\tpath = {}\n",
+            include.display()
+        ),
+    )
+    .unwrap();
+    git(dir, &["tag", "-a", "v-local", "-m", "local tag"]);
+
+    let output = fx.cli_env(
+        &["ship", &run.id, "--push", "--yes"],
+        &[("GIT_CONFIG_GLOBAL", &global)],
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("nothing was pushed"), "{text}");
+    assert!(git(dir, &["symbolic-ref", "--short", "HEAD"]).starts_with("mr/"));
+    let pushed = git(
+        &fx.remote(),
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/mr/",
+            "refs/tags/",
+        ],
+    );
+    assert_eq!(pushed, "", "{text}");
+}
+
+/// The push sends the planned commit and nothing else, whatever the user's
+/// config would add, and the branch tracks what was pushed.
+#[test]
+fn the_push_sends_only_the_planned_commit_and_sets_the_upstream() {
+    let Some(fx) = fixture(two_writers(), None) else {
+        return;
+    };
+    let dir = fx.dir();
+    let mut run = fx.create();
+    assert_eq!(drive(&mut run), Action::Complete);
+    // In effect on every branch, so the plan and the push agree on it.
+    let global = fx.home.path().join("gitconfig");
+    fs::write(&global, "[push]\n\tfollowTags = true\n").unwrap();
+    // An annotated tag the remote lacks, on a commit the push reaches.
+    git(dir, &["tag", "-a", "v-local", "-m", "local tag"]);
+
+    let output = fx.cli_env(
+        &["ship", &run.id, "--push", "--yes"],
+        &[("GIT_CONFIG_GLOBAL", &global)],
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{text}");
+    let branch = git(dir, &["symbolic-ref", "--short", "HEAD"]);
+    assert!(branch.starts_with("mr/"), "{branch}");
+    let commit = git(dir, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        git(
+            &fx.remote(),
+            &["rev-parse", &format!("refs/heads/{branch}")]
+        ),
+        commit
+    );
+    assert_eq!(
+        git(
+            &fx.remote(),
+            &["for-each-ref", "--format=%(refname)", "refs/tags/"]
+        ),
+        "",
+        "a tag went with the push"
+    );
+    assert_eq!(
+        git(
+            dir,
+            &[
+                "rev-parse",
+                "--abbrev-ref",
+                &format!("{branch}@{{upstream}}")
+            ]
+        ),
+        format!("origin/{branch}")
+    );
 }
 
 /// The checkout's index is updated before anything is published, so a ship

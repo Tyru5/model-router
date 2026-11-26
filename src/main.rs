@@ -230,7 +230,7 @@ enum Commands {
     /// Uses the run's ship stage options, else the defaults.
     Ship {
         id: String,
-        /// Push the branch with --set-upstream.
+        /// Push the commit to the remote branch and set it as upstream.
         #[arg(long)]
         push: bool,
         /// Open a draft pull request with gh; implies --push.

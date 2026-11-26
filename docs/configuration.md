@@ -300,7 +300,7 @@ split; a `glob:` pattern matches each piece as a whole line. `advise` injects
 | --- | --- | --- |
 | `branch` | `"mr/{run_id}-{slug}"` | New branch. `{run_id}`, `{slug}` (task's first line) expand. |
 | `commit_message` | `""` | Empty = summary's first line + summary. Template placeholders: `{subject}`, `{summary}`, `{task}`, `{run_id}`, `{slug}`, `{branch}`. |
-| `push` | `false` | `git push --set-upstream REMOTE BRANCH`. Never forced. |
+| `push` | `false` | Pushes the commit to `REMOTE` as the new branch (`git push --no-follow-tags REMOTE COMMIT:refs/heads/BRANCH`) and sets it as the branch's upstream. Never forced. |
 | `remote` | `"origin"` | Push remote. |
 | `draft_pr` | `false` | `gh pr create --draft`. Requires `push`. |
 | `base` | `""` | PR base. Empty = checkout's upstream branch, else `gh`'s default branch. |

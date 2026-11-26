@@ -166,7 +166,8 @@ goes, or change which server it trusts: `gpg.program`, `gpg.<format>.program`,
 `remote.<name>.uploadpack`, `remote.<name>.vcs`, a `remote.<name>.url` that
 runs a remote helper (`ext::...`, or a `scheme://` Git does not handle
 itself), every `http.*` and `protocol.*` key, `push.recurseSubmodules`,
-`push.followTags`, `push.negotiate`, and `submodule.recurse`. A plan with
+`push.followTags`, `push.negotiate`, `push.pushOption`, and
+`submodule.recurse`. A plan with
 any of them always waits for confirmation, even with `confirm = false`.
 A helper, proxy, or URL can hold a credential, so the plan and `plan.json`
 name the keys only (`credential.helper`, `remote.*.pushurl`), never a value
@@ -180,9 +181,13 @@ off, so a locked index stops it with nothing pushed) and moves the checkout
 to the new branch, and only then pushes. Config an `includeIf.onbranch` rule
 turns on for that branch is not what the plan recorded, so the push is
 refused and the commit stays on the branch for you to push. The plan also
-keeps a digest of the push URLs Git resolves for the remote from every
-config scope, and the push is refused when they differ on the new branch,
-which covers a global or system `includeIf.onbranch` rule.
+keeps a digest of the Git config of every scope, and the push is refused
+when it differs on the new branch, which covers a rule in your own or the
+system's config that applies to one branch and not the other. The push
+sends the scanned commit by its ID to the planned branch, with
+`--no-follow-tags` and without pushing submodule commits (it only checks
+them when your config asks for any submodule handling), and then records
+the branch's upstream.
 A push remote that only a legacy
 `.git/remotes/<name>` or `.git/branches/<name>` file defines is refused,
 since `git config` does not list it.
