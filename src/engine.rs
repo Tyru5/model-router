@@ -1286,6 +1286,7 @@ mod tests {
             tree_before: None,
             tree_after: None,
             checks_tree: None,
+            ignore_rules_before: None,
             usage: None,
             session: None,
             process_group: None,

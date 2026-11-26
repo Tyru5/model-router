@@ -167,7 +167,10 @@ stops if they changed after the plan.
 Worktree creation and shipping fail closed when affected files rely
 on suppressed repo-local filters, and workflows with `protected_paths` or
 blocking `policies` fail before launch when the pre-stage snapshot cannot be
-captured.
+captured. Snapshots skip ignored files, so for those workflows a stage also
+stops blocked when repo-local ignore rules it does not snapshot changed while
+it ran: a repo-local or worktree `core.excludesFile` value, the file it
+names, or `.git/info/exclude`.
 
 A stage cannot reach a terminal host (see below), whose harness runs outside
 the sandbox, through the usual socket directories: `$XDG_RUNTIME_DIR/model-router`,

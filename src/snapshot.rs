@@ -1271,6 +1271,65 @@ pub fn is_repository(dir: &Path) -> bool {
     git_raw(dir, &["rev-parse", "--is-inside-work-tree"]).is_ok_and(|out| out.starts_with(b"true"))
 }
 
+/// A digest of the ignore rules a stage can change without touching a
+/// snapshotted file: repo-local and worktree `core.excludesFile` values, the
+/// files they name, and `info/exclude`. Snapshots skip ignored files, so a
+/// stage that changes these can hide an untracked file from the tree diff
+/// that `protected_paths` and policies read. `Ok(None)` outside Git.
+pub fn ignore_rules_digest(workspace: &Path) -> Result<Option<String>> {
+    if !is_repository(workspace) {
+        return Ok(None);
+    }
+    let top_level = rev_parse_path(workspace, "--show-toplevel")?;
+    let common_dir = rev_parse_path(workspace, "--git-common-dir")?;
+    let raw = git_raw(workspace, &["config", "--null", "--show-scope", "--list"])?;
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut add = |label: &[u8], bytes: Option<&[u8]>| {
+        context.update(label);
+        match bytes {
+            Some(bytes) => {
+                context.update(&[1]);
+                context.update(&(bytes.len() as u64).to_le_bytes());
+                context.update(bytes);
+            }
+            None => context.update(&[0]),
+        }
+    };
+    let mut parts = raw.split(|&b| b == 0);
+    while let (Some(scope), Some(entry)) = (parts.next(), parts.next()) {
+        if scope != b"local" && scope != b"worktree" {
+            continue;
+        }
+        let (key, value) = match entry.iter().position(|&b| b == b'\n') {
+            Some(pos) => (&entry[..pos], Some(&entry[pos + 1..])),
+            None => (entry, None),
+        };
+        if !key.eq_ignore_ascii_case(b"core.excludesfile") {
+            continue;
+        }
+        add(b"value", value);
+        let Some(value) = value.filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let path = match value.strip_prefix(b"~/") {
+            Some(rest) => match std::env::var_os("HOME") {
+                Some(home) => PathBuf::from(home).join(bytes_to_os(rest)?),
+                None => continue,
+            },
+            None => top_level.join(bytes_to_os(value)?),
+        };
+        add(b"file", fs::read(&path).ok().as_deref());
+    }
+    add(
+        b"info/exclude",
+        fs::read(common_dir.join("info/exclude")).ok().as_deref(),
+    );
+    let digest = context.finish();
+    Ok(Some(
+        digest.as_ref().iter().map(|b| format!("{b:02x}")).collect(),
+    ))
+}
+
 /// The working tree as a Git tree ID. `Ok(None)` outside Git; returns the Git
 /// error when `workspace` is a Git repository and snapshotting fails.
 pub fn try_tree(workspace: &Path, run_dir: &Path) -> Result<Option<String>> {
@@ -2293,6 +2352,46 @@ mod tests {
         let wt = crate::storage::create_worktree(workspace, "split-wt", true)
             .expect("create_worktree on split index");
         assert!(wt.join("tracked.txt").is_file());
+    }
+
+    #[test]
+    fn ignore_rules_digest_changes_with_local_excludes() {
+        let Some(dir) = repository() else { return };
+        let workspace = dir.path();
+        let base = ignore_rules_digest(workspace).unwrap().unwrap();
+        assert_eq!(base, ignore_rules_digest(workspace).unwrap().unwrap());
+
+        // A tracked `.gitignore` is in the snapshot; it is not part of this.
+        fs::write(workspace.join(".gitignore"), "*.tmp\n").unwrap();
+        assert_eq!(base, ignore_rules_digest(workspace).unwrap().unwrap());
+
+        let hide = workspace.join(".hide");
+        fs::write(&hide, ".env\n").unwrap();
+        git(
+            workspace,
+            None,
+            &["config", "--local", "core.excludesFile", ".hide"],
+        )
+        .unwrap();
+        let planted = ignore_rules_digest(workspace).unwrap().unwrap();
+        assert_ne!(base, planted);
+
+        fs::write(&hide, ".env\nsecrets/\n").unwrap();
+        let edited = ignore_rules_digest(workspace).unwrap().unwrap();
+        assert_ne!(planted, edited);
+
+        git(
+            workspace,
+            None,
+            &["config", "--local", "--unset", "core.excludesFile"],
+        )
+        .unwrap();
+        assert_eq!(base, ignore_rules_digest(workspace).unwrap().unwrap());
+
+        let common = rev_parse_path(workspace, "--git-common-dir").unwrap();
+        fs::create_dir_all(common.join("info")).unwrap();
+        fs::write(common.join("info/exclude"), ".env\n").unwrap();
+        assert_ne!(base, ignore_rules_digest(workspace).unwrap().unwrap());
     }
 
     #[test]

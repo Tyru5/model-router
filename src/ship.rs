@@ -1393,6 +1393,7 @@ pub fn execute(run: &mut Run, cancel: &AtomicBool, emit: &mut impl FnMut(Event))
         tree_before: tree.clone(),
         tree_after: tree,
         checks_tree: None,
+        ignore_rules_before: None,
         usage: None,
         session: None,
         process_group: None,
