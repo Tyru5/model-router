@@ -176,9 +176,14 @@ pub struct Plan {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub block_policies: Vec<DiffPolicy>,
     /// Repo-local Git config the commit or push would run or follow
-    /// (`key=value`; see `repo_command_config`).
+    /// (`key=value` with credentials left out; see `repo_command_config`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub git_config: Vec<String>,
+    /// SHA-256 of the exact entries behind `git_config` and of every
+    /// repo-local remote URL, to tell whether they changed after the plan.
+    /// None in plans saved before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_config_digest: Option<String>,
 }
 fn default_true() -> bool {
     true
@@ -306,16 +311,27 @@ impl Plan {
     }
 }
 
+/// What `repo_command_config` found.
+struct RepoCommandConfig {
+    /// One `key=value` per listed entry, in config order, with credentials
+    /// left out (`shown_config_entry`).
+    shown: Vec<String>,
+    /// SHA-256 (hex) of the exact listed entries and remote URLs.
+    digest: String,
+}
+
 /// Repo-local (`local` and `worktree` scope) Git config that makes
 /// `git commit-tree -S` or `git push` run a command or go elsewhere:
 /// `gpg.program`, `gpg.<format>.program`, `gpg.ssh.defaultKeyCommand`,
 /// `core.sshCommand`, `core.askPass`, `core.gitProxy`, `credential.helper`,
 /// `credential.<url>.helper`, `url.<base>.insteadOf`,
-/// `url.<base>.pushInsteadOf`, `remote.<name>.receivepack`, and
-/// `remote.<name>.vcs`. Anything that can write the checkout's `.git/config`
-/// can set them, so a ship shows them in its plan and never uses ones the
-/// plan did not show. One `key=value` per entry, in config order.
-fn repo_command_config(work: &Path) -> Result<Vec<String>> {
+/// `url.<base>.pushInsteadOf`, `remote.<name>.pushUrl`,
+/// `remote.<name>.proxy`, `remote.<name>.receivepack`, `remote.<name>.vcs`,
+/// `http.proxy`, and `http.<url>.proxy`. Anything that can write the
+/// checkout's `.git/config` can set them, so a ship shows them in its plan
+/// and never uses ones the plan did not show. The digest also covers
+/// `remote.<name>.url`, which every clone has and the plan does not list.
+fn repo_command_config(work: &Path) -> Result<RepoCommandConfig> {
     let output = snapshot::git_command()
         .args(["config", "--show-scope", "-z", "--list"])
         .current_dir(work)
@@ -327,40 +343,94 @@ fn repo_command_config(work: &Path) -> Result<Vec<String>> {
         "git config --list (requires Git 2.26+): {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
-    let mut found = Vec::new();
+    let mut shown = Vec::new();
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
     let mut parts = output.stdout.split(|&b| b == 0);
-    while let (Some(scope), Some(entry)) = (parts.next(), parts.next()) {
+    while let (Some(scope), Some(raw)) = (parts.next(), parts.next()) {
         if scope != b"local" && scope != b"worktree" {
             continue;
         }
-        let entry = String::from_utf8_lossy(entry);
+        let entry = String::from_utf8_lossy(raw);
         let (key, value) = entry.split_once('\n').unwrap_or((&entry, ""));
         let Some((section, rest)) = key.split_once('.') else {
             continue;
         };
         let var = rest.rsplit('.').next().unwrap_or(rest).to_ascii_lowercase();
         let nested = rest.contains('.');
-        let listed = match section.to_ascii_lowercase().as_str() {
+        let section = section.to_ascii_lowercase();
+        let listed = match section.as_str() {
             "gpg" => matches!(var.as_str(), "program" | "defaultkeycommand"),
             "core" => !nested && matches!(var.as_str(), "sshcommand" | "askpass" | "gitproxy"),
             "credential" => var == "helper",
             "url" => nested && matches!(var.as_str(), "insteadof" | "pushinsteadof"),
-            "remote" => nested && matches!(var.as_str(), "receivepack" | "vcs"),
+            "remote" => {
+                nested && matches!(var.as_str(), "pushurl" | "proxy" | "receivepack" | "vcs")
+            }
+            "http" => var == "proxy",
             _ => false,
         };
+        if listed || (section == "remote" && nested && var == "url") {
+            context.update(&(raw.len() as u64).to_le_bytes());
+            context.update(raw);
+        }
         if listed {
-            let mut shown = String::new();
-            for c in format!("{key}={value}").chars() {
-                if c.is_control() {
-                    shown.extend(c.escape_default());
-                } else {
-                    shown.push(c);
-                }
-            }
-            found.push(shown);
+            shown.push(shown_config_entry(&section, key, value));
         }
     }
-    Ok(found)
+    let digest = context.finish();
+    Ok(RepoCommandConfig {
+        shown,
+        digest: digest.as_ref().iter().map(|b| format!("{b:02x}")).collect(),
+    })
+}
+
+/// A listed config entry as the plan stores and shows it. The router keeps
+/// no credentials, so the user name and password of any URL are left out,
+/// and a credential helper shows only its first word (the helper's name or
+/// program), not arguments or an inline script that can hold a token.
+fn shown_config_entry(section: &str, key: &str, value: &str) -> String {
+    let value = if section == "credential" {
+        let mut words = value.split_whitespace();
+        let first = words.next().unwrap_or_default();
+        if words.next().is_some() {
+            format!("{first} <arguments hidden>")
+        } else {
+            first.to_owned()
+        }
+    } else {
+        value.to_owned()
+    };
+    let mut shown = String::new();
+    for c in without_url_credentials(&format!("{key}={value}")).chars() {
+        if c.is_control() {
+            shown.extend(c.escape_default());
+        } else {
+            shown.push(c);
+        }
+    }
+    shown
+}
+
+/// `text` with the `user:password@` part of every `scheme://` URL replaced.
+fn without_url_credentials(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let (head, tail) = rest.split_at(at + 3);
+        out.push_str(head);
+        let authority_end = tail
+            .find(|c: char| c == '/' || c.is_whitespace())
+            .unwrap_or(tail.len());
+        match tail[..authority_end].rfind('@') {
+            Some(user_end) => {
+                out.push_str("<hidden>@");
+                rest = &tail[user_end + 1..];
+            }
+            None => rest = tail,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn short(sha: &str) -> &str {
@@ -812,6 +882,7 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
     } else {
         None
     };
+    let git_config = repo_command_config(dir)?;
     Ok(Plan {
         run: run.id.clone(),
         workspace: dir.to_path_buf(),
@@ -829,7 +900,8 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
         secret_scan: options.secret_scan,
         secret_scanner: options.secret_scanner.clone(),
         block_policies,
-        git_config: repo_command_config(dir)?,
+        git_config: git_config.shown,
+        git_config_digest: Some(git_config.digest),
     })
 }
 
@@ -1155,8 +1227,12 @@ fn apply_steps(
         short(&head)
     );
     // The commit and push below read the repository's own config.
+    let git_config = repo_command_config(work)?;
     ensure!(
-        repo_command_config(work)? == plan.git_config,
+        match &plan.git_config_digest {
+            Some(digest) => *digest == git_config.digest,
+            None => git_config.shown == plan.git_config,
+        },
         "This repository's Git config for signing, credentials, SSH, or URL rewrites changed since the ship was planned; plan again and review it"
     );
     // Stage exactly the planned paths in a private index from HEAD. It
@@ -1917,6 +1993,26 @@ mod tests {
         assert!(outcome.commit.is_none() && !marker.exists());
         git(root, &["config", "--unset", "gpg.program"]).unwrap();
         git(root, &["config", "commit.gpgsign", "false"]).unwrap();
+        // Nor does a remote URL swapped after the plan receive a push.
+        git(
+            root,
+            &[
+                "config",
+                "remote.origin.url",
+                "https://elsewhere.invalid/x.git",
+            ],
+        )
+        .unwrap();
+        let outcome = apply(&planned, &attempt_dir, |_| {});
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("changed since the ship was planned")),
+            "{:?}",
+            outcome.error
+        );
+        git(root, &["config", "--remove-section", "remote.origin"]).unwrap();
         let outcome = apply(&planned, &attempt_dir, |_| {});
         assert_eq!(outcome.error, None);
         assert!(outcome.commit.is_some());
@@ -1929,6 +2025,88 @@ mod tests {
             git(root, &["status", "--porcelain"]).unwrap(),
             "M  notes.txt\n?? other.txt"
         );
+    }
+
+    #[test]
+    fn repo_command_config_lists_push_overrides_without_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main"]).unwrap();
+        let empty = repo_command_config(root).unwrap();
+        assert!(empty.shown.is_empty());
+
+        // A plain remote is in the digest and not in the list.
+        git(
+            root,
+            &[
+                "config",
+                "remote.origin.url",
+                "https://example.invalid/x.git",
+            ],
+        )
+        .unwrap();
+        let remote = repo_command_config(root).unwrap();
+        assert!(remote.shown.is_empty());
+        assert_ne!(remote.digest, empty.digest);
+
+        for (key, value) in [
+            (
+                "remote.origin.pushUrl",
+                "https://bob:s3cret@push.invalid/x.git",
+            ),
+            (
+                "http.proxy",
+                "http://proxyuser:proxypass@proxy.invalid:8080",
+            ),
+            (
+                "http.https://example.invalid/.proxy",
+                "socks5://proxy.invalid",
+            ),
+            ("remote.origin.proxy", "http://proxy2.invalid"),
+            ("credential.helper", "!f() { echo password=hunter2; }; f"),
+            (
+                "credential.https://alice:tok3n@example.invalid.helper",
+                "store",
+            ),
+            (
+                "url.https://carol:pw@mirror.invalid/.insteadOf",
+                "https://example.invalid/",
+            ),
+        ] {
+            git(root, &["config", key, value]).unwrap();
+        }
+        let found = repo_command_config(root).unwrap();
+        assert_ne!(found.digest, remote.digest);
+        assert_eq!(
+            found.shown,
+            [
+                "remote.origin.pushurl=https://<hidden>@push.invalid/x.git",
+                "remote.origin.proxy=http://proxy2.invalid",
+                "http.proxy=http://<hidden>@proxy.invalid:8080",
+                "http.https://example.invalid/.proxy=socks5://proxy.invalid",
+                "credential.helper=!f() <arguments hidden>",
+                "credential.https://<hidden>@example.invalid.helper=store",
+                "url.https://<hidden>@mirror.invalid/.insteadof=https://example.invalid/",
+            ]
+        );
+        let joined = found.shown.join("\n");
+        for secret in ["s3cret", "proxypass", "hunter2", "tok3n", "carol", "pw@"] {
+            assert!(!joined.contains(secret), "{joined}");
+        }
+
+        // The digest still tells one credential from another.
+        git(
+            root,
+            &[
+                "config",
+                "remote.origin.pushUrl",
+                "https://bob:other@push.invalid/x.git",
+            ],
+        )
+        .unwrap();
+        let changed = repo_command_config(root).unwrap();
+        assert_eq!(changed.shown, found.shown);
+        assert_ne!(changed.digest, found.digest);
     }
 
     #[test]
