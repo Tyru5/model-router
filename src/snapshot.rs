@@ -3436,10 +3436,23 @@ mod tests {
         git(workspace, None, &["config", "filter.local.smudge", "cat"]).unwrap();
         fs::write(workspace.join(".gitattributes"), "*.txt filter=local\n").unwrap();
         git(workspace, None, &["add", ".gitattributes"]).unwrap();
+        // Without Git's own maintenance: on newer Git a commit can start
+        // it, and with `gc.worktreePruneExpire = now` that prunes the other
+        // worktree's record, which is this test's doing, not the router's.
         git(
             workspace,
             None,
-            &["-c", "commit.gpgsign=false", "commit", "-qm", "Attributes"],
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "maintenance.auto=false",
+                "-c",
+                "gc.auto=0",
+                "commit",
+                "-qm",
+                "Attributes",
+            ],
         )
         .unwrap();
         crate::storage::create_worktree(workspace, "fails", false).unwrap_err();

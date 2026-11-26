@@ -2519,12 +2519,15 @@ mod tests {
         git(root, &["add", "staged.txt"]).unwrap();
         // An unrelated file whose name is not valid UTF-8, and a shipped
         // path that is what that name decodes to. They are different files.
+        // (APFS refuses such a name, so macOS skips this part.)
         let raw_name =
             <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"caf\xe9.txt");
-        fs::write(root.join(raw_name), "raw\n").unwrap();
+        let has_raw_name = fs::write(root.join(raw_name), "raw\n").is_ok();
         git(root, &["add", "."]).unwrap();
         let mut files = files;
-        files.push(change("caf\u{fffd}.txt", snapshot::ChangeKind::Modified));
+        if has_raw_name {
+            files.push(change("caf\u{fffd}.txt", snapshot::ChangeKind::Modified));
+        }
         // Every entry is "racily clean" when the index is older than the
         // files, so Git compares them all when it writes the index.
         fs::File::options()
@@ -2539,8 +2542,10 @@ mod tests {
         assert!(!marker.exists(), "a repo-local clean filter ran");
         // Only the real file is in the index: no entry was made up for the
         // decoded name.
-        let names = git(root, &["ls-files", "-z"]).unwrap();
-        assert_eq!(names.matches("caf").count(), 1, "{names:?}");
+        if has_raw_name {
+            let names = git(root, &["ls-files", "-z"]).unwrap();
+            assert_eq!(names.matches("caf").count(), 1, "{names:?}");
+        }
         let entries = git(
             root,
             &["ls-files", "-s", "--", "keep.txt", "gone.txt", "new.txt"],
