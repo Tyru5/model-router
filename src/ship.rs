@@ -460,10 +460,12 @@ fn repo_command_config(work: &Path) -> Result<RepoCommandConfig> {
 /// entries on once the checkout is on the ship's branch: another push URL,
 /// `push.followTags`, a proxy. Comparing this digest between the plan and
 /// the push covers any of them without a list of settings to keep up to
-/// date. Entries given on the command line or through
-/// `GIT_CONFIG_PARAMETERS` are left out; they are the caller's and the
-/// router's own. A value can hold a credential, so only
-/// `snapshot::stretched_digest` of the entries is kept.
+/// date. Entries the caller's environment gives (`GIT_CONFIG_PARAMETERS`,
+/// `GIT_CONFIG_COUNT`) count too: the push reads them, and a `resume
+/// --advance` can run with other ones than the plan. Only the router's own
+/// overrides (`snapshot::git_command`), the same in every process, are left
+/// out. A value can hold a credential, so only `snapshot::stretched_digest`
+/// of the entries is kept.
 fn effective_config_digest(work: &Path) -> Result<String> {
     let output = snapshot::git_command()
         .args(["config", "--show-scope", "-z", "--list"])
@@ -478,8 +480,9 @@ fn effective_config_digest(work: &Path) -> Result<String> {
     );
     let mut entries: Vec<u8> = Vec::new();
     let mut parts = output.stdout.split(|&b| b == 0);
+    let router_overrides: [&[u8]; 2] = [b"core.fsmonitor\nfalse", b"core.hookspath\n/dev/null"];
     while let (Some(scope), Some(raw)) = (parts.next(), parts.next()) {
-        if scope == b"command" {
+        if scope == b"command" && router_overrides.contains(&raw) {
             continue;
         }
         for part in [scope, raw] {

@@ -183,7 +183,10 @@ turns on for that branch is not what the plan recorded, so the push is
 refused and the commit stays on the branch for you to push. The plan also
 keeps a digest of the Git config of every scope, and the push is refused
 when it differs on the new branch, which covers a rule in your own or the
-system's config that applies to one branch and not the other. The push
+system's config that applies to one branch and not the other. That digest
+includes config your environment passes Git (`GIT_CONFIG_PARAMETERS`,
+`GIT_CONFIG_COUNT`), so a `resume --advance` run with settings the plan did
+not see asks you to confirm a new plan. The push
 sends the scanned commit by its ID to the planned branch, with
 `--no-follow-tags` and without pushing submodule commits (it only checks
 them when your config asks for any submodule handling), and then records

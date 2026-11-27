@@ -571,7 +571,10 @@ fn a_rule_in_the_users_config_for_the_ship_branch_stops_the_push() {
         ),
     )
     .unwrap();
-    git(dir, &["tag", "-a", "v-local", "-m", "local tag"]);
+    git(
+        dir,
+        &["tag", "-a", "--no-sign", "v-local", "-m", "local tag"],
+    );
 
     let output = fx.cli_env(
         &["ship", &run.id, "--push", "--yes"],
@@ -597,6 +600,62 @@ fn a_rule_in_the_users_config_for_the_ship_branch_stops_the_push() {
     assert_eq!(pushed, "", "{text}");
 }
 
+/// Config the caller passes in the environment counts too: a `resume
+/// --advance` run with a push URL the plan never saw pushes nothing and
+/// asks to confirm the new plan.
+#[test]
+fn config_the_caller_adds_on_resume_stops_the_push() {
+    let options = ship::Options {
+        push: true,
+        ..ship::Options::default()
+    };
+    let Some(fx) = fixture(two_writers(), Some(options)) else {
+        return;
+    };
+    let output = fx.cli(&["run", "--task", "Add the new greeting file"]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(!output.status.success(), "{stdout}");
+    let id = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("Run: "))
+        .unwrap()
+        .to_owned();
+    let elsewhere = fx.home.path().join("elsewhere.git");
+    git(
+        fx.home.path(),
+        &["init", "-q", "--bare", elsewhere.to_str().unwrap()],
+    );
+
+    let output = fx.cli_env(
+        &["resume", &id, "--advance"],
+        &[
+            ("GIT_CONFIG_COUNT", Path::new("1")),
+            ("GIT_CONFIG_KEY_0", Path::new("remote.origin.pushurl")),
+            ("GIT_CONFIG_VALUE_0", &elsewhere),
+        ],
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("The plan changed since you confirmed it"),
+        "{text}"
+    );
+    for remote in [fx.remote(), elsewhere] {
+        assert_eq!(
+            git(
+                &remote,
+                &["for-each-ref", "--format=%(refname)", "refs/heads/mr/"]
+            ),
+            "",
+            "{text}"
+        );
+    }
+}
+
 /// The push sends the planned commit and nothing else, whatever the user's
 /// config would add, and the branch tracks what was pushed.
 #[test]
@@ -611,7 +670,10 @@ fn the_push_sends_only_the_planned_commit_and_sets_the_upstream() {
     let global = fx.home.path().join("gitconfig");
     fs::write(&global, "[push]\n\tfollowTags = true\n").unwrap();
     // An annotated tag the remote lacks, on a commit the push reaches.
-    git(dir, &["tag", "-a", "v-local", "-m", "local tag"]);
+    git(
+        dir,
+        &["tag", "-a", "--no-sign", "v-local", "-m", "local tag"],
+    );
 
     let output = fx.cli_env(
         &["ship", &run.id, "--push", "--yes"],
