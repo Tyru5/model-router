@@ -626,13 +626,12 @@ fn config_the_caller_adds_on_resume_stops_the_push() {
         &["init", "-q", "--bare", elsewhere.to_str().unwrap()],
     );
 
+    // Every Git the router supports reads `GIT_CONFIG_PARAMETERS`;
+    // `GIT_CONFIG_COUNT` needs 2.31.
+    let parameters = format!("'remote.origin.pushurl={}'", elsewhere.display());
     let output = fx.cli_env(
         &["resume", &id, "--advance"],
-        &[
-            ("GIT_CONFIG_COUNT", Path::new("1")),
-            ("GIT_CONFIG_KEY_0", Path::new("remote.origin.pushurl")),
-            ("GIT_CONFIG_VALUE_0", &elsewhere),
-        ],
+        &[("GIT_CONFIG_PARAMETERS", Path::new(&parameters))],
     );
     let text = format!(
         "{}{}",
