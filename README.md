@@ -86,7 +86,12 @@ Codex stages leave `model` blank to inherit your harness default. `w` adds prese
 - Cost estimates and budgets → [cost](docs/cost.md)
 - Notifications: terminal, desktop, webhook → [tui](docs/tui.md#notifications)
 - Run history, reports, compare, stats, bench → [automation](docs/automation.md)
-- MCP and HTTP server for other agents → [serve](docs/serve.md)
+- MCP and HTTP server for other agents: MCP over stdio or Streamable HTTP
+  (`POST /mcp`) with tools, prompts, run resources, and argument completion,
+  plus a JSON API with SSE run events → [serve](docs/serve.md)
+- `serve --client-config` prints the registration for Claude Code, Codex,
+  Cursor, Gemini CLI, OpenCode, VS Code, Amp, Copilot CLI, Pi, oh-my-pi, and
+  goose → [serve](docs/serve.md#register-it-with-an-agent), [compatibility](docs/serve.md#client-compatibility)
 - Delegation: a stage's agent hands tasks to other harnesses and models,
   launches runs, and schedules work you approve → [delegation](docs/delegation.md)
 - Fourteen themes and optional Vim motions → [themes](docs/themes.md), [tui](docs/tui.md#vim-motions)
