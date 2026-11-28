@@ -13,9 +13,9 @@ use std::{
 
 /// Points `MODEL_ROUTER_CONFIG_DIR` at a temporary directory for this test
 /// binary, so in-process runs never read or write the user's approvals or
-/// trust store. Leaves a directory the binary already set alone. Called by
-/// `settings` and `create`; call it first in a test that builds a `Run`
-/// another way.
+/// trust store, even when the developer exports `MODEL_ROUTER_CONFIG_DIR`.
+/// Called by `settings` and `create`; call it first in a test that builds a
+/// `Run` another way.
 pub fn isolate_config_dir() -> PathBuf {
     static DIR: Mutex<Option<tempfile::TempDir>> = Mutex::new(None);
     extern "C" fn cleanup() {
@@ -26,9 +26,6 @@ pub fn isolate_config_dir() -> PathBuf {
     let mut guard = DIR.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(dir) = guard.as_ref() {
         return dir.path().to_path_buf();
-    }
-    if let Some(dir) = std::env::var_os("MODEL_ROUTER_CONFIG_DIR").filter(|d| !d.is_empty()) {
-        return PathBuf::from(dir);
     }
     let temp = tempfile::tempdir().expect("test config dir");
     // SAFETY: set once, under the mutex. Test threads read the environment
