@@ -21,7 +21,7 @@ from smoke_common import ARTIFACTS, ROOT, Terminal, records, require_binary, tru
 HARNESSES = [
     "codex",
     "claude",
-    "gemini",
+    "agy",
     "pi",
     "omp",
     "opencode",
