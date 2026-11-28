@@ -16,13 +16,59 @@ use std::{
     thread::JoinHandle,
 };
 
-pub const PROTOCOL_VERSION: &str = "2025-06-18";
+/// 2025-11-25 adds only optional features over 2025-06-18 (icons, tasks,
+/// elicitation, sampling tools, OAuth discovery); what it requires of a
+/// server (403 for a foreign Origin, argument errors as tool results) holds.
+pub const PROTOCOL_VERSION: &str = "2025-11-25";
+/// Protocol revisions `initialize` accepts, newest first. A client asking
+/// for one of them gets it back; any other request gets `PROTOCOL_VERSION`.
+pub const SUPPORTED_VERSIONS: &[&str] =
+    &[PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// The revision to answer an `initialize` request with.
+pub fn negotiate(params: &Value) -> &'static str {
+    let requested = params.get("protocolVersion").and_then(Value::as_str);
+    SUPPORTED_VERSIONS
+        .iter()
+        .find(|v| Some(**v) == requested)
+        .copied()
+        .unwrap_or(PROTOCOL_VERSION)
+}
+
+/// Most values `completion/complete` returns, as the spec caps them.
+pub const MAX_COMPLETIONS: usize = 100;
+
+/// What a tool does, for the MCP tool annotations clients use to decide
+/// which calls need approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effect {
+    /// Reads state only.
+    Read,
+    /// Changes state additively: starts or continues work.
+    Write,
+    /// Stops, deletes, or overwrites something.
+    Destructive,
+}
+
+/// Adds `title` and `annotations` to a tool definition. `open_world`: the
+/// call can launch harnesses, which reach model providers.
+pub fn annotate(tool: &mut Value, title: &str, effect: Effect, idempotent: bool, open_world: bool) {
+    tool["title"] = json!(title);
+    tool["annotations"] = json!({
+        "title": title,
+        "readOnlyHint": effect == Effect::Read,
+        "destructiveHint": effect == Effect::Destructive,
+        "idempotentHint": effect == Effect::Read || idempotent,
+        "openWorldHint": open_world,
+    });
+}
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
-const SERVER_OVERLOADED: i64 = -32000;
+const INTERNAL_ERROR: i64 = -32603;
+pub(super) const SERVER_OVERLOADED: i64 = -32000;
 const RESOURCE_NOT_FOUND: i64 = -32002;
 
 const RESOURCE_PREFIX: &str = "model-router://runs/";
@@ -33,7 +79,8 @@ const MAX_LISTED_RUNS: usize = 20;
 
 /// Maximum bytes read for a single JSON-RPC request line.
 const MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
-/// Maximum concurrent in-flight MCP `tools/call` worker threads.
+/// Maximum concurrent in-flight MCP worker threads (`tools/call` and the
+/// requests that read run records).
 const MAX_CONCURRENT_CALLS: usize = 32;
 /// Of those, how many may be calls that block (`tools::blocks`: `wait_run`).
 /// The rest stay free for calls that answer at once, so waiting clients can
@@ -80,19 +127,61 @@ pub trait ToolSet: Send + Sync + 'static {
             "Resources are not supported".into(),
         ))
     }
+    /// `resources/templates/list` entries.
+    fn resource_templates(&self) -> Vec<Value> {
+        vec![]
+    }
+
+    /// Whether this session exposes MCP prompts (`prompts/list`, `prompts/get`).
+    fn has_prompts(&self) -> bool {
+        false
+    }
+    fn list_prompts(&self) -> Vec<Value> {
+        vec![]
+    }
+    /// A `prompts/get` result: `{description, messages}`.
+    fn get_prompt(
+        &self,
+        name: &str,
+        _arguments: &Value,
+    ) -> std::result::Result<Value, ResourceError> {
+        Err(ResourceError::InvalidParams(format!(
+            "Unknown prompt: {name}"
+        )))
+    }
+
+    /// Candidate values for one prompt or resource-template argument
+    /// (`completion/complete`). `reference` is the request's `ref`.
+    fn complete(&self, _reference: &Value, _argument: &str, _value: &str) -> Vec<String> {
+        vec![]
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResourceKind {
     Review,
     Diff,
+    /// `get_report`'s JSON, computed on read.
+    Report,
 }
 
 impl ResourceKind {
-    fn filename(self) -> &'static str {
+    const ALL: [Self; 3] = [Self::Review, Self::Diff, Self::Report];
+
+    fn segment(self) -> &'static str {
         match self {
-            Self::Review => "review.md",
-            Self::Diff => "changes.diff",
+            Self::Review => "review",
+            Self::Diff => "diff",
+            Self::Report => "report",
+        }
+    }
+
+    /// The run artifact it reads; None for a computed resource.
+    fn filename(self) -> Option<&'static str> {
+        match self {
+            Self::Review => Some("review.md"),
+            Self::Diff => Some("changes.diff"),
+            Self::Report => None,
         }
     }
 
@@ -100,6 +189,15 @@ impl ResourceKind {
         match self {
             Self::Review => "text/markdown",
             Self::Diff => "text/x-diff",
+            Self::Report => "application/json",
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Review => "Review brief",
+            Self::Diff => "Diff of files changed",
+            Self::Report => "Report (status, time, usage, checks, unresolved items, changes)",
         }
     }
 }
@@ -110,23 +208,22 @@ fn parse_resource_uri(
     let (base, query) = uri.split_once('?').unwrap_or((uri, ""));
     let Some(rest) = base.strip_prefix(RESOURCE_PREFIX) else {
         return Err(ResourceError::InvalidParams(format!(
-            "Unsupported resource URI {uri:?}; expected model-router://runs/<run_id>/(review|diff)"
+            "Unsupported resource URI {uri:?}; expected model-router://runs/<run_id>/(review|diff|report)"
         )));
     };
     let mut parts = rest.split('/');
     let (Some(run_id), Some(kind_str), None) = (parts.next(), parts.next(), parts.next()) else {
         return Err(ResourceError::InvalidParams(format!(
-            "Invalid resource URI {uri:?}; expected model-router://runs/<run_id>/(review|diff)"
+            "Invalid resource URI {uri:?}; expected model-router://runs/<run_id>/(review|diff|report)"
         )));
     };
-    let kind = match kind_str {
-        "review" => ResourceKind::Review,
-        "diff" => ResourceKind::Diff,
-        _ => {
-            return Err(ResourceError::InvalidParams(format!(
-                "Unknown resource kind {kind_str:?}; expected \"review\" or \"diff\""
-            )));
-        }
+    let Some(kind) = ResourceKind::ALL
+        .into_iter()
+        .find(|kind| kind.segment() == kind_str)
+    else {
+        return Err(ResourceError::InvalidParams(format!(
+            "Unknown resource kind {kind_str:?}; expected review, diff, or report"
+        )));
     };
     let mut project = None;
     if !query.is_empty() {
@@ -227,28 +324,18 @@ impl ToolSet for Server {
             }
             let run_rel = Path::new(".model-router").join("runs").join(&summary.id);
             let task = crate::history::excerpt(&summary.task);
-            if crate::storage::open_beneath(
-                &project,
-                &run_rel.join(ResourceKind::Review.filename()),
-            )
-            .is_ok()
-            {
-                resources.push(json!({
-                    "uri": format!("{RESOURCE_PREFIX}{}/review", summary.id),
-                    "name": format!("{} review", summary.id),
-                    "description": format!("Review brief for run {} ({}): {}", summary.id, summary.workflow, task),
-                    "mimeType": ResourceKind::Review.mime_type(),
-                }));
-            }
-            if crate::storage::open_beneath(&project, &run_rel.join(ResourceKind::Diff.filename()))
-                .is_ok()
-            {
-                resources.push(json!({
-                    "uri": format!("{RESOURCE_PREFIX}{}/diff", summary.id),
-                    "name": format!("{} diff", summary.id),
-                    "description": format!("Diff for run {} ({}): {}", summary.id, summary.workflow, task),
-                    "mimeType": ResourceKind::Diff.mime_type(),
-                }));
+            for kind in ResourceKind::ALL {
+                let present = kind.filename().is_none_or(|name| {
+                    crate::storage::open_beneath(&project, &run_rel.join(name)).is_ok()
+                });
+                if present {
+                    resources.push(json!({
+                        "uri": format!("{RESOURCE_PREFIX}{}/{}", summary.id, kind.segment()),
+                        "name": format!("{} {}", summary.id, kind.segment()),
+                        "description": format!("{} for run {} ({}): {}", kind.describe(), summary.id, summary.workflow, task),
+                        "mimeType": kind.mime_type(),
+                    }));
+                }
             }
         }
         Ok(resources)
@@ -268,19 +355,64 @@ impl ToolSet for Server {
                 )));
             }
         }
-        let relative = Path::new(".model-router")
-            .join("runs")
-            .join(run_id)
-            .join(kind.filename());
-        let file = crate::storage::open_beneath(&project, &relative)
-            .map_err(|e| ResourceError::NotFound(format!("Resource not found: {uri} ({e:#})")))?;
-        let text = read_bounded(file, MAX_RESOURCE_BYTES)
-            .map_err(|e| ResourceError::NotFound(format!("Failed to read {uri}: {e}")))?;
+        let text = match kind.filename() {
+            Some(name) => {
+                let relative = Path::new(".model-router")
+                    .join("runs")
+                    .join(run_id)
+                    .join(name);
+                let file = crate::storage::open_beneath(&project, &relative).map_err(|e| {
+                    ResourceError::NotFound(format!("Resource not found: {uri} ({e:#})"))
+                })?;
+                read_bounded(file, MAX_RESOURCE_BYTES)
+                    .map_err(|e| ResourceError::NotFound(format!("Failed to read {uri}: {e}")))?
+            }
+            None => {
+                // The project as the client named it: a resolved path need
+                // not be UTF-8, and `json!` panics on one that is not.
+                let arguments = json!({"run_id": run_id, "project": requested_project});
+                let report = tools::call_with(self, "get_report", &arguments, None, &mut |_| {})
+                    .map_err(|e| {
+                        ResourceError::NotFound(format!("Resource not found: {uri} ({e:#})"))
+                    })?;
+                serde_json::to_string_pretty(&report).unwrap_or_default()
+            }
+        };
         Ok(json!({
             "uri": uri,
             "mimeType": kind.mime_type(),
             "text": text,
         }))
+    }
+    fn resource_templates(&self) -> Vec<Value> {
+        ResourceKind::ALL
+            .into_iter()
+            .map(|kind| {
+                json!({
+                    "uriTemplate": format!("{RESOURCE_PREFIX}{{run_id}}/{}", kind.segment()),
+                    "name": format!("run-{}", kind.segment()),
+                    "title": format!("Run {}", kind.segment()),
+                    "description": format!("{} of a saved run. Append ?project=DIR (URL-encoded) for another allowed project.", kind.describe()),
+                    "mimeType": kind.mime_type(),
+                })
+            })
+            .collect()
+    }
+    fn has_prompts(&self) -> bool {
+        true
+    }
+    fn list_prompts(&self) -> Vec<Value> {
+        super::prompts::list()
+    }
+    fn get_prompt(
+        &self,
+        name: &str,
+        arguments: &Value,
+    ) -> std::result::Result<Value, ResourceError> {
+        super::prompts::get(self, name, arguments)
+    }
+    fn complete(&self, reference: &Value, argument: &str, value: &str) -> Vec<String> {
+        super::prompts::complete(self, reference, argument, value)
     }
 }
 
@@ -560,6 +692,52 @@ fn progress_notification(token: &Value, step: u64, snapshot: &Value) -> Value {
     })
 }
 
+/// A JSON-RPC message split into its parts.
+enum Incoming {
+    /// A request to answer.
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
+    /// A notification or a response; nothing to answer.
+    Notification { method: String, params: Value },
+}
+
+/// Classifies a message, or returns the error response for a malformed one
+/// (`Err(None)`: malformed, but nothing to answer).
+fn incoming(message: Value) -> std::result::Result<Incoming, Option<Value>> {
+    let Value::Object(mut object) = message else {
+        return Err(Some(error_response(
+            Value::Null,
+            INVALID_REQUEST,
+            "Expected a JSON-RPC object; batches are not supported",
+        )));
+    };
+    let id = object.remove("id");
+    let params = object.remove("params").unwrap_or(Value::Null);
+    let Some(method) = object
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        // A response to a request we never send is ignored; anything else
+        // without a method is an invalid request.
+        if object.contains_key("result") || object.contains_key("error") {
+            return Err(None);
+        }
+        return Err(Some(error_response(
+            id.unwrap_or(Value::Null),
+            INVALID_REQUEST,
+            "Missing method",
+        )));
+    };
+    Ok(match id {
+        Some(id) => Incoming::Request { id, method, params },
+        None => Incoming::Notification { method, params },
+    })
+}
+
 /// The response to send now, if any. Tool calls answer later from a thread.
 fn handle<T: ToolSet, W: Write + Send + 'static>(
     server: &Arc<T>,
@@ -568,40 +746,221 @@ fn handle<T: ToolSet, W: Write + Send + 'static>(
     message: Value,
     calls: &mut Vec<JoinHandle<()>>,
 ) -> Option<Value> {
-    let Some(object) = message.as_object() else {
+    let (id, method, params) = match incoming(message) {
+        Err(response) => return response,
+        Ok(Incoming::Notification { method, params }) => {
+            if method == "notifications/cancelled" {
+                if let Some(request_id) = params.get("requestId") {
+                    inflight.cancel(request_id);
+                }
+            }
+            return None;
+        }
+        Ok(Incoming::Request { id, method, params }) => (id, method, params),
+    };
+    // Static answers come at once; anything that reads run records, runs
+    // `git`, or calls a tool goes to a worker so this reader keeps reading
+    // (`notifications/cancelled`, `ping`) while it works.
+    if !matches!(
+        method.as_str(),
+        "tools/call" | "resources/list" | "resources/read" | "prompts/get" | "completion/complete"
+    ) {
+        return Some(answer(server.as_ref(), id, &method, &params));
+    }
+    let tool = if method == "tools/call" {
+        match tool_name(server.as_ref(), &params) {
+            Ok(name) => Some(name.to_owned()),
+            Err(message) => return Some(error_response(id, INVALID_PARAMS, &message)),
+        }
+    } else {
+        None
+    };
+    let blocking = tool.as_deref().is_some_and(|name| server.blocks(name));
+    let Some((slot, cancel)) = inflight.acquire(&id, blocking) else {
         return Some(error_response(
-            Value::Null,
-            INVALID_REQUEST,
-            "Expected a JSON-RPC object; batches are not supported",
+            id,
+            SERVER_OVERLOADED,
+            &match &tool {
+                Some(name) if blocking => format!(
+                    "Too many concurrent {name} calls (limit {MAX_BLOCKING_CALLS}); retry after one returns"
+                ),
+                _ => "Too many concurrent requests".to_owned(),
+            },
         ));
     };
-    let id = object.get("id").cloned();
-    let Some(method) = object.get("method").and_then(Value::as_str) else {
-        // A response to a request we never send, or garbage.
-        return id
-            .filter(|_| !object.contains_key("result") && !object.contains_key("error"))
-            .map(|id| error_response(id, INVALID_REQUEST, "Missing method"));
-    };
-    let params = object.get("params").cloned().unwrap_or(Value::Null);
-    // Notifications get no response.
-    let Some(id) = id else {
-        if method == "notifications/cancelled" {
-            if let Some(request_id) = params.get("requestId") {
-                inflight.cancel(request_id);
+    let progress_token = params
+        .get("_meta")
+        .and_then(|m| m.get("progressToken"))
+        .filter(|v| v.is_string() || v.is_number())
+        .cloned();
+    let (server, output) = (server.clone(), output.clone());
+    let is_tool = tool.is_some();
+    let spawned = std::thread::Builder::new()
+        .name(format!("mcp {}", tool.as_deref().unwrap_or(&method)))
+        .spawn({
+            let id = id.clone();
+            move || {
+                let _slot = slot;
+                let reply = guarded(&id, tool.is_some(), || match &tool {
+                    Some(name) => {
+                        let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
+                        let mut step = 0u64;
+                        let mut progress = |snapshot: &Value| {
+                            if let Some(token) = &progress_token {
+                                if !cancel.load(Ordering::Relaxed) {
+                                    step += 1;
+                                    send(&output, &progress_notification(token, step, snapshot));
+                                }
+                            }
+                        };
+                        let result = server.call(name, &arguments, Some(&cancel), &mut progress);
+                        response(id.clone(), tool_result(result))
+                    }
+                    None => answer(server.as_ref(), id.clone(), &method, &params),
+                });
+                // MCP clients expect no response for a cancelled request.
+                if !cancel.load(Ordering::Relaxed) {
+                    send(&output, &reply);
+                }
             }
+        });
+    match spawned {
+        Ok(call) => {
+            calls.push(call);
+            None
         }
-        return None;
+        Err(error) if is_tool => Some(response(id, tool_result(Err(error.into())))),
+        Err(error) => Some(error_response(
+            id,
+            INTERNAL_ERROR,
+            &format!("Could not start a worker: {error}"),
+        )),
+    }
+}
+
+/// Runs `work`, turning a panic into an answer: a tool error for a tool
+/// call, an internal error otherwise. Without it a panic would leave the
+/// request unanswered.
+fn guarded(id: &Value, tool: bool, work: impl FnOnce() -> Value) -> Value {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|_| {
+        let message = "Internal error while answering this request; see the server's stderr";
+        if tool {
+            response(id.clone(), tool_result(Err(anyhow::anyhow!(message))))
+        } else {
+            error_response(id.clone(), INTERNAL_ERROR, message)
+        }
+    })
+}
+
+/// The tool a `tools/call` names, if this session has it.
+fn tool_name<'a, T: ToolSet>(
+    server: &T,
+    params: &'a Value,
+) -> std::result::Result<&'a str, String> {
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or("Missing tool name")?;
+    if !server.exists(name) {
+        return Err(format!("Unknown tool: {name}"));
+    }
+    Ok(name)
+}
+
+/// What one Streamable HTTP POST is answered with.
+#[derive(Debug)]
+pub enum Reply {
+    /// A JSON-RPC response (HTTP 200).
+    Response(Value),
+    /// The error for a malformed message (HTTP 400).
+    Invalid(Value),
+    /// A notification or a response, accepted with no body (HTTP 202).
+    Accepted,
+}
+
+/// Answers one message on the calling thread, tool calls included: the
+/// Streamable HTTP transport, where each POST carries one message and waits
+/// for its response. `cancel` stops a blocking call. Progress notifications
+/// are not sent: the response is plain JSON, not an event stream. The caller
+/// handles `notifications/cancelled` (see `cancelled_request`).
+pub fn handle_one<T: ToolSet>(server: &T, message: Value, cancel: &AtomicBool) -> Reply {
+    let (id, method, params) = match incoming(message) {
+        Err(Some(error)) => return Reply::Invalid(error),
+        Err(None) | Ok(Incoming::Notification { .. }) => return Reply::Accepted,
+        Ok(Incoming::Request { id, method, params }) => (id, method, params),
     };
-    Some(match method {
+    let tool = method == "tools/call";
+    Reply::Response(guarded(&id, tool, || {
+        if !tool {
+            return answer(server, id.clone(), &method, &params);
+        }
+        let name = match tool_name(server, &params) {
+            Ok(name) => name,
+            Err(message) => return error_response(id.clone(), INVALID_PARAMS, &message),
+        };
+        let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
+        let result = server.call(name, &arguments, Some(cancel), &mut |_| {});
+        response(id.clone(), tool_result(result))
+    }))
+}
+
+/// The tool a message calls, when it is a `tools/call` request.
+pub fn called_tool(message: &Value) -> Option<&str> {
+    (message.get("method").and_then(Value::as_str) == Some("tools/call"))
+        .then(|| message.get("params")?.get("name")?.as_str())
+        .flatten()
+}
+
+/// The ID of a request, as the key `notifications/cancelled` names it by.
+pub fn request_key(message: &Value) -> Option<String> {
+    message
+        .get("method")
+        .and(message.get("id"))
+        .map(Value::to_string)
+}
+
+/// The request a `notifications/cancelled` message cancels, as a key
+/// comparable with `request_key`.
+pub fn cancelled_request(message: &Value) -> Option<String> {
+    (message.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
+        && message.get("id").is_none())
+    .then(|| {
+        message
+            .get("params")?
+            .get("requestId")
+            .map(Value::to_string)
+    })
+    .flatten()
+}
+
+fn resource_error(id: Value, error: ResourceError) -> Value {
+    match error {
+        ResourceError::InvalidParams(msg) => error_response(id, INVALID_PARAMS, &msg),
+        ResourceError::NotFound(msg) => error_response(id, RESOURCE_NOT_FOUND, &msg),
+    }
+}
+
+/// Every request except `tools/call`, which may block and so runs where
+/// the transport decides.
+fn answer<T: ToolSet>(server: &T, id: Value, method: &str, params: &Value) -> Value {
+    let not_found =
+        |id| error_response(id, METHOD_NOT_FOUND, &format!("Method not found: {method}"));
+    match method {
         "initialize" => {
             let mut capabilities = json!({"tools": {"listChanged": false}});
             if server.has_resources() {
-                capabilities["resources"] = json!({});
+                capabilities["resources"] = json!({"subscribe": false, "listChanged": false});
+            }
+            if server.has_prompts() {
+                capabilities["prompts"] = json!({"listChanged": false});
+            }
+            if server.has_resources() || server.has_prompts() {
+                capabilities["completions"] = json!({});
             }
             response(
                 id,
                 json!({
-                    "protocolVersion": PROTOCOL_VERSION,
+                    "protocolVersion": negotiate(params),
                     "capabilities": capabilities,
                     "serverInfo": {
                         "name": "model-router",
@@ -614,102 +973,53 @@ fn handle<T: ToolSet, W: Write + Send + 'static>(
         }
         "ping" => response(id, json!({})),
         "tools/list" => response(id, json!({"tools": server.list()})),
-        "resources/list" => {
-            if !server.has_resources() {
-                return Some(error_response(
-                    id,
-                    METHOD_NOT_FOUND,
-                    "Method not found: resources/list",
-                ));
-            }
-            match server.list_resources() {
-                Ok(resources) => response(id, json!({"resources": resources})),
-                Err(ResourceError::InvalidParams(msg)) => error_response(id, INVALID_PARAMS, &msg),
-                Err(ResourceError::NotFound(msg)) => error_response(id, RESOURCE_NOT_FOUND, &msg),
-            }
-        }
-        "resources/read" => {
-            if !server.has_resources() {
-                return Some(error_response(
-                    id,
-                    METHOD_NOT_FOUND,
-                    "Method not found: resources/read",
-                ));
-            }
+        "resources/list" if server.has_resources() => match server.list_resources() {
+            Ok(resources) => response(id, json!({"resources": resources})),
+            Err(error) => resource_error(id, error),
+        },
+        "resources/templates/list" if server.has_resources() => response(
+            id,
+            json!({"resourceTemplates": server.resource_templates()}),
+        ),
+        "resources/read" if server.has_resources() => {
             let Some(uri) = params.get("uri").and_then(Value::as_str) else {
-                return Some(error_response(id, INVALID_PARAMS, "Missing resource uri"));
+                return error_response(id, INVALID_PARAMS, "Missing resource uri");
             };
             match server.read_resource(uri) {
                 Ok(content) => response(id, json!({"contents": [content]})),
-                Err(ResourceError::InvalidParams(msg)) => error_response(id, INVALID_PARAMS, &msg),
-                Err(ResourceError::NotFound(msg)) => error_response(id, RESOURCE_NOT_FOUND, &msg),
+                Err(error) => resource_error(id, error),
             }
         }
-        "tools/call" => {
+        "prompts/list" if server.has_prompts() => {
+            response(id, json!({"prompts": server.list_prompts()}))
+        }
+        "prompts/get" if server.has_prompts() => {
             let Some(name) = params.get("name").and_then(Value::as_str) else {
-                return Some(error_response(id, INVALID_PARAMS, "Missing tool name"));
+                return error_response(id, INVALID_PARAMS, "Missing prompt name");
             };
-            if !server.exists(name) {
-                return Some(error_response(
-                    id,
-                    INVALID_PARAMS,
-                    &format!("Unknown tool: {name}"),
-                ));
-            }
-            let blocking = server.blocks(name);
-            let Some((slot, cancel)) = inflight.acquire(&id, blocking) else {
-                return Some(error_response(
-                    id,
-                    SERVER_OVERLOADED,
-                    &if blocking {
-                        format!(
-                            "Too many concurrent {name} calls (limit {MAX_BLOCKING_CALLS}); retry after one returns"
-                        )
-                    } else {
-                        "Too many concurrent tool calls".to_owned()
-                    },
-                ));
-            };
-            let name = name.to_owned();
-            let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
-            let progress_token = params
-                .get("_meta")
-                .and_then(|m| m.get("progressToken"))
-                .filter(|v| v.is_string() || v.is_number())
-                .cloned();
-            let (server, output) = (server.clone(), output.clone());
-            let spawned = std::thread::Builder::new()
-                .name(format!("tool {name}"))
-                .spawn({
-                    let id = id.clone();
-                    move || {
-                        let _slot = slot;
-                        let mut step = 0u64;
-                        let mut progress = |snapshot: &Value| {
-                            if let Some(token) = &progress_token {
-                                if !cancel.load(Ordering::Relaxed) {
-                                    step += 1;
-                                    send(&output, &progress_notification(token, step, snapshot));
-                                }
-                            }
-                        };
-                        let result = server.call(&name, &arguments, Some(&cancel), &mut progress);
-                        // MCP clients expect no response for a cancelled request.
-                        if !cancel.load(Ordering::Relaxed) {
-                            send(&output, &response(id, tool_result(result)));
-                        }
-                    }
-                });
-            match spawned {
-                Ok(call) => {
-                    calls.push(call);
-                    return None;
-                }
-                Err(error) => response(id, tool_result(Err(error.into()))),
+            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+            match server.get_prompt(name, &arguments) {
+                Ok(prompt) => response(id, prompt),
+                Err(error) => resource_error(id, error),
             }
         }
-        _ => error_response(id, METHOD_NOT_FOUND, &format!("Method not found: {method}")),
-    })
+        "completion/complete" if server.has_resources() || server.has_prompts() => {
+            let reference = params.get("ref").cloned().unwrap_or(Value::Null);
+            let argument = params.get("argument").cloned().unwrap_or(Value::Null);
+            let Some(name) = argument.get("name").and_then(Value::as_str) else {
+                return error_response(id, INVALID_PARAMS, "Missing argument name");
+            };
+            let value = argument.get("value").and_then(Value::as_str).unwrap_or("");
+            let values = server.complete(&reference, name, value);
+            let total = values.len();
+            let values: Vec<String> = values.into_iter().take(MAX_COMPLETIONS).collect();
+            response(
+                id,
+                json!({"completion": {"values": values, "total": total, "hasMore": total > MAX_COMPLETIONS}}),
+            )
+        }
+        _ => not_found(id),
+    }
 }
 
 /// A `tools/call` result; tool failures are results with `isError`, not

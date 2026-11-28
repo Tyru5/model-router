@@ -327,12 +327,14 @@ JSON HTTP API with SSE events. Runs are unattended only.
 | `--http ADDR` | HTTP API on `ADDR`, e.g. `127.0.0.1:8737` (port 0 picks one). |
 | `--allow-remote` | Let `--http` bind non-loopback. Anyone with the token can run harnesses. |
 | `--allow-root PATH` | Directory whose projects clients may name (repeatable). Default: the server's project only. |
+| `--client-config CLIENT` | Print the snippet that registers this `serve --mcp` command (absolute program path, `-C`, `--config`, `--allow-root`, and `--metrics-file` or `MODEL_ROUTER_METRICS_FILE` as an absolute `--metrics-file`) with `claude`, `codex`, `cursor`, `gemini`, `opencode`, `vscode`, `amp`, `copilot`, `pi`, `omp`, `goose`, or `json` (`mcpServers`), then exit. Edits no file; refuses paths that are not UTF-8. Conflicts with `--mcp` and `--http`. |
 
 ```sh
 claude mcp add model-router -- model-router serve --mcp -C /path/to/project
+model-router -C /path/to/project serve --client-config codex >> ~/.codex/config.toml
 ```
 
-Tools, Codex setup, HTTP routes: [serve.md](serve.md).
+Tools, prompts, resources, Codex setup, HTTP routes: [serve.md](serve.md).
 
 ## Schedules
 

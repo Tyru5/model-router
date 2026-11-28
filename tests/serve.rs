@@ -110,11 +110,33 @@ fn project() -> tempfile::TempDir {
                     ),
                 ],
             ),
+            // Two stages share a name; the second's harness fails.
+            workflow(
+                "Twins",
+                vec![
+                    Stage {
+                        name: "Review".into(),
+                        ..stage("first", Role::Research, "mock", Mode::Unattended)
+                    },
+                    Stage {
+                        name: "Review".into(),
+                        ..stage("second", Role::Research, "failing", Mode::Unattended)
+                    },
+                ],
+            ),
         ],
         adapters: BTreeMap::from([
             ("mock".into(), mock_adapter(&[])),
             ("slowmock".into(), mock_adapter(&["--delay", "60"])),
             ("steadymock".into(), mock_adapter(&["--delay", "1"])),
+            (
+                "failing".into(),
+                CustomAdapter {
+                    command: "python3".into(),
+                    args: vec!["-c".into(), "raise SystemExit(3)".into()],
+                    ..CustomAdapter::default()
+                },
+            ),
         ]),
         ..Settings::default()
     };
@@ -379,6 +401,17 @@ fn mcp_failed_resume_leaves_other_projects_runs_readable() {
         json!({"run_id": id, "project": owner.path().to_str().unwrap()}),
     );
     assert_eq!(status["status"], "complete", "{status}");
+    // The report resource reads the run from the project the URI names.
+    let uri = format!(
+        "model-router://runs/{id}/report?project={}",
+        owner.path().to_str().unwrap().replace(' ', "%20")
+    );
+    let report = mcp.request("resources/read", json!({"uri": uri}));
+    let text = report["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{report}"));
+    let report: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(report["status"], "complete", "{report}");
 }
 
 #[test]
@@ -416,6 +449,15 @@ fn mcp_reports_errors_and_cancels() {
     assert_eq!(missing["error"]["code"], -32601, "{missing}");
     mcp.send(json!("not an object"));
     assert_eq!(mcp.read()["error"]["code"], -32600);
+    // A response is ignored; an object with no method is invalid.
+    mcp.send(json!({"jsonrpc": "2.0", "id": 77, "result": {}}));
+    mcp.send(json!({"jsonrpc": "2.0"}));
+    let invalid = mcp.read();
+    assert_eq!(
+        (&invalid["id"], &invalid["error"]["code"]),
+        (&Value::Null, &json!(-32600)),
+        "{invalid}"
+    );
     // A line that is not UTF-8 is a parse error; the requests below still
     // get answers.
     let stdin = mcp.stdin.as_mut().unwrap();
@@ -1510,4 +1552,452 @@ fn http_health_endpoint_is_unauthenticated_and_resilient() {
         let _ = stream.write_all(b"{}");
     }
     drop(busy);
+}
+
+/// Prompts, completion, resource templates, the report resource, tool
+/// annotations, and protocol negotiation over stdio.
+#[test]
+fn mcp_prompts_completion_and_annotations() {
+    let dir = project();
+    let mut mcp = Mcp::spawn(dir.path(), &[]);
+
+    // An older revision the server supports is echoed back; an unknown one
+    // gets the server's own.
+    let old = mcp.request(
+        "initialize",
+        json!({"protocolVersion": "2024-11-05", "capabilities": {}}),
+    );
+    assert_eq!(old["result"]["protocolVersion"], "2024-11-05");
+    let unknown = mcp.request(
+        "initialize",
+        json!({"protocolVersion": "1999-01-01", "capabilities": {}}),
+    );
+    assert_eq!(unknown["result"]["protocolVersion"], "2025-11-25");
+    let capabilities = &unknown["result"]["capabilities"];
+    assert!(capabilities["prompts"].is_object(), "{capabilities}");
+    assert!(capabilities["completions"].is_object(), "{capabilities}");
+    mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+
+    let tools = mcp.request("tools/list", json!({}))["result"]["tools"].clone();
+    let annotations = |name: &str| {
+        tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} listed"))["annotations"]
+            .clone()
+    };
+    assert_eq!(annotations("get_report")["readOnlyHint"], true);
+    assert_eq!(annotations("start_run")["readOnlyHint"], false);
+    assert_eq!(annotations("start_run")["openWorldHint"], true);
+    assert_eq!(annotations("start_run")["destructiveHint"], false);
+    assert_eq!(annotations("cancel_run")["destructiveHint"], true);
+    assert_eq!(annotations("apply_run")["destructiveHint"], true);
+    assert!(
+        tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["title"].is_string()),
+        "{tools}"
+    );
+
+    let templates =
+        mcp.request("resources/templates/list", json!({}))["result"]["resourceTemplates"].clone();
+    let uris: Vec<&str> = templates
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["uriTemplate"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        uris,
+        [
+            "model-router://runs/{run_id}/review",
+            "model-router://runs/{run_id}/diff",
+            "model-router://runs/{run_id}/report"
+        ]
+    );
+
+    let prompts = mcp.request("prompts/list", json!({}))["result"]["prompts"].clone();
+    let names: Vec<&str> = prompts
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["run_task", "review_run", "unblock_run"]);
+
+    // Missing required arguments and unknown workflows are invalid params.
+    let missing = mcp.request("prompts/get", json!({"name": "run_task", "arguments": {}}));
+    assert_eq!(missing["error"]["code"], -32602, "{missing}");
+    let bad = mcp.request(
+        "prompts/get",
+        json!({"name": "run_task", "arguments": {"task": "x", "workflow": "Nope"}}),
+    );
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
+    let prompt = mcp.request(
+        "prompts/get",
+        json!({"name": "run_task", "arguments": {"task": "Fix the flaky test", "workflow": "Quick"}}),
+    );
+    let text = prompt["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("Fix the flaky test"), "{text}");
+    assert!(text.contains("workflow \"Quick\""), "{text}");
+
+    // Workflow names complete by prefix, in config order.
+    let completion = mcp.request(
+        "completion/complete",
+        json!({"ref": {"type": "ref/prompt", "name": "run_task"}, "argument": {"name": "workflow", "value": "P"}}),
+    );
+    assert_eq!(
+        completion["result"]["completion"]["values"],
+        json!(["Pair", "Paced"])
+    );
+    // An argument the prompt does not take completes to nothing.
+    let other = mcp.request(
+        "completion/complete",
+        json!({"ref": {"type": "ref/prompt", "name": "review_run"}, "argument": {"name": "workflow", "value": ""}}),
+    );
+    assert_eq!(other["result"]["completion"]["values"], json!([]));
+
+    let started = mcp.call(
+        "start_run",
+        json!({"task": "Report me", "workflow": "Quick"}),
+    );
+    let id = started["run_id"].as_str().unwrap().to_owned();
+    let done = mcp.call("wait_run", json!({"run_id": id, "timeout_seconds": 60}));
+    assert_eq!(done["status"], "complete", "{done}");
+
+    let run_ids = mcp.request(
+        "completion/complete",
+        json!({"ref": {"type": "ref/resource", "uri": "model-router://runs/{run_id}/report"}, "argument": {"name": "run_id", "value": &id[..10]}}),
+    );
+    assert_eq!(run_ids["result"]["completion"]["values"], json!([id]));
+
+    let report_uri = format!("model-router://runs/{id}/report");
+    let listed = mcp.request("resources/list", json!({}))["result"]["resources"].clone();
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["uri"] == report_uri.as_str()),
+        "{listed}"
+    );
+    let report =
+        mcp.request("resources/read", json!({"uri": report_uri}))["result"]["contents"][0].clone();
+    assert_eq!(report["mimeType"], "application/json");
+    let report: Value = serde_json::from_str(report["text"].as_str().unwrap()).unwrap();
+    assert_eq!(report["status"], "complete", "{report}");
+
+    let review = mcp.request(
+        "prompts/get",
+        json!({"name": "review_run", "arguments": {"run_id": id}}),
+    );
+    let messages = review["result"]["messages"].as_array().unwrap();
+    let embedded = &messages[1]["content"]["resource"];
+    assert_eq!(embedded["uri"], report_uri.as_str());
+    let embedded: Value = serde_json::from_str(embedded["text"].as_str().unwrap()).unwrap();
+    assert_eq!(embedded["status"], "complete");
+
+    // The report resource refuses a project outside the allowed roots.
+    let outside = tempfile::tempdir().unwrap();
+    let outside_uri = format!(
+        "{report_uri}?project={}",
+        outside.path().to_str().unwrap().replace(' ', "%20")
+    );
+    let refused = mcp.request("resources/read", json!({"uri": outside_uri}));
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+
+    // unblock_run reads the current stage by ID: both Twins stages are
+    // named "Review", and the run stops at the second.
+    let started = mcp.call("start_run", json!({"task": "Twins", "workflow": "Twins"}));
+    let twins = started["run_id"].as_str().unwrap().to_owned();
+    let stopped = mcp.call("wait_run", json!({"run_id": twins, "timeout_seconds": 60}));
+    assert_ne!(stopped["status"], "complete", "{stopped}");
+    assert_eq!(stopped["cursor"], 1, "{stopped}");
+    let unblock = mcp.request(
+        "prompts/get",
+        json!({"name": "unblock_run", "arguments": {"run_id": twins}}),
+    );
+    let texts: Vec<&str> = unblock["result"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["content"]["text"].as_str().unwrap())
+        .collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.starts_with("get_handoff for stage second:")),
+        "{unblock}"
+    );
+}
+
+/// A project path that is not UTF-8 makes some tools fail, but never takes
+/// the stdio server down: prompts still answer, a failing tool answers with
+/// an error, and the server keeps answering.
+#[cfg(target_os = "linux")]
+#[test]
+fn mcp_survives_a_non_utf8_project_path() {
+    use std::os::unix::ffi::OsStrExt;
+    let base = project();
+    let dir = base
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"bad-\xff-name"));
+    std::fs::create_dir(&dir).unwrap();
+    let mut mcp = Mcp::spawn(&dir, &[]);
+    let init = mcp.request(
+        "initialize",
+        json!({"protocolVersion": "2025-11-25", "capabilities": {}}),
+    );
+    assert_eq!(init["result"]["serverInfo"]["name"], "model-router");
+
+    let prompt = mcp.request(
+        "prompts/get",
+        json!({"name": "run_task", "arguments": {"task": "x"}}),
+    );
+    assert!(prompt["result"]["messages"].is_array(), "{prompt}");
+    // list_workflows cannot put this path in JSON; it fails as a tool error.
+    let listed = mcp.call_raw("list_workflows", json!({}));
+    assert_eq!(listed["isError"], true, "{listed}");
+    let pong = mcp.request("ping", json!({}));
+    assert_eq!(pong["result"], json!({}));
+}
+
+/// `serve --client-config` registers the command it was given, metrics
+/// file included, with absolute paths.
+#[test]
+fn client_config_carries_the_metrics_file() {
+    let dir = project();
+    let output = Command::new(env!("CARGO_BIN_EXE_model-router"))
+        .current_dir(dir.path())
+        .env("MODEL_ROUTER_CONFIG_DIR", dir.path().join("config-home"))
+        .args([
+            "--metrics-file",
+            "logs/m.jsonl",
+            "serve",
+            "--client-config",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let snippet: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let args: Vec<&str> = snippet["mcpServers"]["model-router"]["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    let at = args
+        .iter()
+        .position(|a| *a == "--metrics-file")
+        .expect("--metrics-file");
+    let canonical = dir.path().canonicalize().unwrap();
+    assert!(
+        [dir.path(), canonical.as_path()]
+            .iter()
+            .any(|base| Path::new(args[at + 1]) == base.join("logs/m.jsonl")),
+        "{args:?}"
+    );
+}
+
+/// `POST /mcp`: the Streamable HTTP transport on the HTTP server.
+#[test]
+fn http_mcp_endpoint_speaks_json_rpc() {
+    let dir = project();
+    let config_home = dir.path().join("config-home");
+    let server = HttpServer::spawn(dir.path(), &config_home, "mcp-token");
+    let post = |token: Option<&str>, extra: &[&str], body: &str| {
+        let mut stream = TcpStream::connect(&server.addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(90)))
+            .unwrap();
+        let mut headers = String::new();
+        if let Some(t) = token {
+            headers.push_str(&format!("Authorization: Bearer {t}\r\n"));
+        }
+        for header in extra {
+            headers.push_str(&format!("{header}\r\n"));
+        }
+        write!(
+            stream,
+            "POST /mcp HTTP/1.1\r\nHost: {}\r\n{headers}Accept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            server.addr,
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let code: u16 = response[9..12].parse().unwrap();
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_owned())
+            .unwrap_or_default();
+        (code, body)
+    };
+    let token = Some(server.token.as_str());
+
+    let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}}}).to_string();
+    let (code, _) = post(None, &[], &init);
+    assert_eq!(code, 401);
+    let (code, _) = post(token, &["Origin: https://evil.example"], &init);
+    assert_eq!(code, 403);
+    let (code, body) = post(token, &["Origin: http://localhost:3000"], &init);
+    assert_eq!(code, 200, "{body}");
+    let init: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(init["id"], 1);
+    assert_eq!(init["result"]["serverInfo"]["name"], "model-router");
+
+    let (code, body) = post(
+        token,
+        &[],
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    );
+    assert_eq!((code, body.as_str()), (202, ""));
+
+    let call = json!({"jsonrpc": "2.0", "id": "c", "method": "tools/call", "params": {"name": "list_workflows", "arguments": {}}}).to_string();
+    let (code, body) = post(token, &[], &call);
+    assert_eq!(code, 200, "{body}");
+    let call: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(call["result"]["isError"], false, "{call}");
+    assert_eq!(
+        call["result"]["structuredContent"]["workflows"][0]["name"],
+        "Quick"
+    );
+
+    let (code, body) = post(token, &[], "{not json");
+    assert_eq!(code, 400);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["error"]["code"],
+        -32700
+    );
+
+    let (code, _) = http(&server.addr, "GET", "/mcp", token, "");
+    assert_eq!(code, 405);
+
+    // An unsupported MCP-Protocol-Version is refused; a supported one is not.
+    let call = json!({"jsonrpc": "2.0", "id": "v", "method": "tools/call", "params": {"name": "list_workflows", "arguments": {}}}).to_string();
+    let (code, body) = post(token, &["MCP-Protocol-Version: 1999-01-01"], &call);
+    assert_eq!(code, 400, "{body}");
+    let (code, body) = post(token, &["MCP-Protocol-Version: 2025-06-18"], &call);
+    assert_eq!(code, 200, "{body}");
+    // A server/discover probe for a newer revision gets method-not-found,
+    // so the client falls back to initialize.
+    let (code, body) = post(
+        token,
+        &["MCP-Protocol-Version: 2026-07-28"],
+        r#"{"jsonrpc":"2.0","id":"d","method":"server/discover"}"#,
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["error"]["code"],
+        -32601
+    );
+
+    // Malformed messages get 400, not a 200 carrying an error.
+    for bad in [
+        r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#,
+        r#"{"jsonrpc":"2.0","id":5}"#,
+        r#"{}"#,
+        r#"{"foo":1}"#,
+    ] {
+        let (code, body) = post(token, &[], bad);
+        assert_eq!(code, 400, "{bad}: {body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["error"]["code"],
+            -32600
+        );
+    }
+    // A response to a request the server never sent is accepted and ignored.
+    let (code, body) = post(token, &[], r#"{"jsonrpc":"2.0","id":9,"result":{}}"#);
+    assert_eq!((code, body.as_str()), (202, ""));
+
+    // notifications/cancelled ends a blocking wait_run long before its timeout.
+    let start = json!({"jsonrpc": "2.0", "id": "s", "method": "tools/call", "params": {"name": "start_run", "arguments": {"workflow": "Slow", "task": "wait for me"}}}).to_string();
+    let (code, body) = post(token, &[], &start);
+    assert_eq!(code, 200, "{body}");
+    let run_id =
+        serde_json::from_str::<Value>(&body).unwrap()["result"]["structuredContent"]["run_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    // Control: on an open connection with no cancel, the wait runs its course.
+    let wait = json!({"jsonrpc": "2.0", "id": "w0", "method": "tools/call", "params": {"name": "wait_run", "arguments": {"run_id": run_id, "timeout_seconds": 2}}}).to_string();
+    let began = Instant::now();
+    let (code, body) = post(token, &[], &wait);
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains(r#""timed_out":true"#), "{body}");
+    assert!(
+        began.elapsed() >= Duration::from_secs(2),
+        "{:?}",
+        began.elapsed()
+    );
+
+    let wait = json!({"jsonrpc": "2.0", "id": "w1", "method": "tools/call", "params": {"name": "wait_run", "arguments": {"run_id": run_id, "timeout_seconds": 3600}}}).to_string();
+    let began = Instant::now();
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| post(token, &[], &wait));
+        // The wait may not be registered yet; cancel until it answers.
+        while !waiter.is_finished() {
+            let (code, _) = post(
+                token,
+                &[],
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"w1"}}"#,
+            );
+            assert_eq!(code, 202);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let (code, body) = waiter.join().unwrap();
+        assert_eq!(code, 200, "{body}");
+        let waited: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            waited["result"]["structuredContent"]["timed_out"], true,
+            "{waited}"
+        );
+    });
+    assert!(
+        began.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        began.elapsed()
+    );
+
+    // A client that half-closes after its request ends the wait too, even
+    // when stray bytes follow the body.
+    let wait = json!({"jsonrpc": "2.0", "id": "w2", "method": "tools/call", "params": {"name": "wait_run", "arguments": {"run_id": run_id, "timeout_seconds": 3600}}}).to_string();
+    let began = Instant::now();
+    let mut stream = TcpStream::connect(&server.addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(90)))
+        .unwrap();
+    write!(
+        stream,
+        "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{wait}",
+        server.addr,
+        server.token,
+        wait.len()
+    )
+    .unwrap();
+    // The CRLF usually arrives after the server has read the body; the unit
+    // test `peer_closed_sees_a_close_behind_stray_bytes` covers it exactly.
+    std::thread::sleep(Duration::from_millis(300));
+    stream.write_all(b"\r\n").unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains(r#""timed_out":true"#), "{response}");
+    assert!(
+        began.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        began.elapsed()
+    );
+
+    let cancel = json!({"jsonrpc": "2.0", "id": "x", "method": "tools/call", "params": {"name": "cancel_run", "arguments": {"run_id": run_id}}}).to_string();
+    let (code, _) = post(token, &[], &cancel);
+    assert_eq!(code, 200);
 }

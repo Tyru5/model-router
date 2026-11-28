@@ -5,13 +5,14 @@
 //! - `GET /tools` lists the tools.
 //! - `POST /tools/<name>` with a JSON arguments object runs one.
 //! - `GET /runs/<id>/events[?project=DIR]` streams a run's events (SSE).
+//! - `POST /mcp` speaks MCP's Streamable HTTP transport (JSON responses).
 
-use super::{Server, runs::Message, tools};
+use super::{Server, mcp, runs::Message, tools};
 use percent_encoding::percent_decode_str;
 use serde_json::{Value, json};
 use std::{
     cell::Cell,
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io::{self, BufRead, BufReader, Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
     sync::{
@@ -144,6 +145,7 @@ pub fn serve(listener: TcpListener, server: Arc<Server>, token: String, stop: Ar
     let active = Arc::new(AtomicUsize::new(0));
     let long = Arc::new(AtomicUsize::new(0));
     let pending = Arc::new(Mutex::new(Pending::default()));
+    let calls: Arc<McpCalls> = Arc::default();
     while !stop.load(Ordering::Relaxed) {
         let wait = {
             let queue = pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -183,9 +185,12 @@ pub fn serve(listener: TcpListener, server: Arc<Server>, token: String, stop: Ar
                     long: long.clone(),
                     left: Cell::new(None),
                 };
-                let (server, token, stop) = (server.clone(), token.clone(), stop.clone());
+                let (server, token, stop, calls) =
+                    (server.clone(), token.clone(), stop.clone(), calls.clone());
                 let spawned = std::thread::Builder::new().spawn(move || {
-                    if let Err(error) = connection(stream, &server, &token, &admission, &stop) {
+                    if let Err(error) =
+                        connection(stream, &server, &token, &admission, &calls, &stop)
+                    {
                         if error.kind() != io::ErrorKind::BrokenPipe {
                             super::log(format!("HTTP connection: {error}"));
                         }
@@ -215,6 +220,8 @@ struct Request {
     path: String,
     query: String,
     authorization: Option<String>,
+    origin: Option<String>,
+    protocol_version: Option<String>,
     body: Vec<u8>,
 }
 
@@ -299,6 +306,8 @@ fn read_request(
         path: path.to_owned(),
         query: query.to_owned(),
         authorization: None,
+        origin: None,
+        protocol_version: None,
         body: vec![],
     };
     let mut length = 0usize;
@@ -324,6 +333,8 @@ fn read_request(
                     .map_err(|_| invalid("Invalid Content-Length"))?;
             }
             "authorization" => request.authorization = Some(value.to_owned()),
+            "origin" => request.origin = Some(value.to_owned()),
+            "mcp-protocol-version" => request.protocol_version = Some(value.to_owned()),
             "transfer-encoding" => return Err(invalid("Chunked bodies are not supported")),
             _ => {}
         }
@@ -367,8 +378,10 @@ fn authorized(request: &Request, token: &str) -> bool {
 fn respond(stream: &mut TcpStream, code: u16, body: &Value) -> io::Result<()> {
     let reason = match code {
         200 => "OK",
+        202 => "Accepted",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
@@ -395,6 +408,7 @@ fn connection(
     server: &Server,
     token: &str,
     admission: &Admission,
+    calls: &McpCalls,
     stop: &Arc<AtomicBool>,
 ) -> io::Result<()> {
     stream.set_nonblocking(false)?;
@@ -490,6 +504,7 @@ fn connection(
                 Err(error) => respond(&mut stream, 400, &json!({"error": format!("{error:#}")})),
             }
         }
+        ("POST", ["mcp"]) => mcp_post(&mut stream, server, &request, admission, calls, stop),
         ("GET", ["runs", id, "events"]) => {
             let Some(_long) = admission.long_lived() else {
                 return respond(
@@ -523,10 +538,226 @@ fn connection(
             ["health"]
             | ["tools"]
             | ["tools", _]
+            | ["mcp"]
             | ["runs", _, "events"]
             | ["schedules", _, "trigger"],
         ) => respond(&mut stream, 405, &json!({"error": "Method not allowed"})),
         _ => respond(&mut stream, 404, &json!({"error": "Not found"})),
+    }
+}
+
+/// Whether an `Origin` header names this machine: `http` or `https`, host
+/// `localhost`, `127.0.0.1`, or `[::1]`, and an optional numeric port,
+/// nothing else. A browser page served elsewhere (DNS rebinding) sends its
+/// own origin, so it is refused even when it somehow holds the token.
+fn loopback_origin(origin: &str) -> bool {
+    let Some(authority) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    // `rest` keeps the colon before a port.
+    let (host, rest) = match authority.strip_prefix("[::1]") {
+        Some(rest) => ("[::1]", rest),
+        None => authority.split_at(authority.find(':').unwrap_or(authority.len())),
+    };
+    let port_ok = rest.is_empty()
+        || rest.strip_prefix(':').is_some_and(|digits| {
+            (1..=5).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
+        });
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]") && port_ok
+}
+
+/// `tools/call` requests in flight on `POST /mcp`, by JSON-RPC ID, so a
+/// `notifications/cancelled` POST can stop one. Without sessions, IDs are
+/// shared by every client holding the token; a cancel only ends a wait.
+pub(super) type McpCalls = Mutex<HashMap<String, Vec<Arc<AtomicBool>>>>;
+
+/// Sets `cancel` when the server stops or the client closes the connection
+/// (a plain JSON response cannot reach a client that left), until `done`.
+fn watch_call(
+    stream: &TcpStream,
+    cancel: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let stream = stream.try_clone().ok()?;
+    std::thread::Builder::new()
+        .name("mcp watch".into())
+        .spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                if stop.load(Ordering::Relaxed) || peer_closed(&stream) {
+                    cancel.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+        })
+        .ok()
+}
+
+/// Waits up to 200 ms for the peer; true once it has closed, half-closed,
+/// or reset the connection. The request body is already read and the
+/// connection ends after this response, so bytes it sends later (a stray
+/// CRLF, a pipelined request) are discarded and do not count.
+fn peer_closed(stream: &TcpStream) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let mut pfd = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd references an open descriptor owned by `stream`.
+        let ready = unsafe { libc::poll(&mut pfd, 1, 200) };
+        if ready < 0 {
+            std::thread::sleep(Duration::from_millis(200));
+            return false;
+        }
+        if ready == 0 {
+            return false;
+        }
+        // Readable: EOF or an error means the peer is gone; data does not.
+        match (&*stream).read(&mut [0u8; 512]) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(error) => !matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+            ),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = stream;
+        std::thread::sleep(Duration::from_millis(200));
+        false
+    }
+}
+
+fn mcp_error(id: Value, message: &str) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32600, "message": message}})
+}
+
+/// MCP Streamable HTTP: one JSON-RPC message per POST, answered with one
+/// JSON response, `202` with no body for a notification or response, and
+/// `400` for a malformed message or an unsupported `MCP-Protocol-Version`.
+/// The server keeps no session and offers no server-to-client stream, so
+/// `GET /mcp` is 405.
+fn mcp_post(
+    stream: &mut TcpStream,
+    server: &Server,
+    request: &Request,
+    admission: &Admission,
+    calls: &McpCalls,
+    stop: &Arc<AtomicBool>,
+) -> io::Result<()> {
+    if request
+        .origin
+        .as_deref()
+        .is_some_and(|o| !loopback_origin(o))
+    {
+        return respond(stream, 403, &json!({"error": "Origin not allowed"}));
+    }
+    let message: Value = match serde_json::from_slice(&request.body) {
+        Ok(message) => message,
+        Err(error) => {
+            return respond(
+                stream,
+                400,
+                &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": format!("Parse error: {error}")}}),
+            );
+        }
+    };
+    // Version probes may name a revision this server does not speak; they
+    // get their own answer (a negotiated version, or method-not-found).
+    let probe = matches!(
+        message.get("method").and_then(Value::as_str),
+        Some("initialize" | "server/discover")
+    );
+    if let Some(version) = request.protocol_version.as_deref() {
+        if !probe && !mcp::SUPPORTED_VERSIONS.contains(&version) {
+            let id = message.get("id").cloned().unwrap_or(Value::Null);
+            return respond(
+                stream,
+                400,
+                &mcp_error(
+                    id,
+                    &format!(
+                        "Unsupported MCP-Protocol-Version {version:?}; supported: {}",
+                        mcp::SUPPORTED_VERSIONS.join(", ")
+                    ),
+                ),
+            );
+        }
+    }
+    let lock = || calls.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(key) = mcp::cancelled_request(&message) {
+        for flag in lock().get(&key).into_iter().flatten() {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+    let blocking = mcp::called_tool(&message).is_some_and(tools::blocks);
+    let _long = if blocking {
+        let Some(slot) = admission.long_lived() else {
+            // A JSON-RPC error with the request's ID, as stdio answers.
+            let id = message.get("id").cloned().unwrap_or(Value::Null);
+            return respond(
+                stream,
+                503,
+                &json!({"jsonrpc": "2.0", "id": id, "error": {
+                    "code": mcp::SERVER_OVERLOADED,
+                    "message": "Too many concurrent long-lived connections; retry after one returns",
+                }}),
+            );
+        };
+        Some(slot)
+    } else {
+        None
+    };
+    // A blocking call ends early when cancelled, the client leaves, or the
+    // server stops; the others answer at once.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let key = mcp::request_key(&message).filter(|_| blocking);
+    let done = Arc::new(AtomicBool::new(false));
+    let watcher = if let Some(key) = &key {
+        lock().entry(key.clone()).or_default().push(cancel.clone());
+        watch_call(stream, cancel.clone(), stop.clone(), done.clone())
+    } else {
+        None
+    };
+    let reply = if blocking {
+        mcp::handle_one(server, message, &cancel)
+    } else {
+        mcp::handle_one(server, message, stop)
+    };
+    done.store(true, Ordering::Relaxed);
+    if let Some(key) = &key {
+        let mut map = lock();
+        if let Some(flags) = map.get_mut(key) {
+            flags.retain(|flag| !Arc::ptr_eq(flag, &cancel));
+            if flags.is_empty() {
+                map.remove(key);
+            }
+        }
+    }
+    if let Some(watcher) = watcher {
+        // Wakes the watcher's poll at once instead of after its timeout;
+        // the response still goes out on the write half.
+        let _ = stream.shutdown(Shutdown::Read);
+        let _ = watcher.join();
+    }
+    match reply {
+        mcp::Reply::Response(response) => respond(stream, 200, &response),
+        mcp::Reply::Invalid(error) => respond(stream, 400, &error),
+        mcp::Reply::Accepted => {
+            write!(
+                stream,
+                "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+            )?;
+            stream.flush()
+        }
     }
 }
 
@@ -621,6 +852,33 @@ fn events(
 mod tests {
     use super::*;
 
+    /// Bytes after the request do not hide a close: with them pending,
+    /// a half-close or a full close is still seen.
+    #[cfg(unix)]
+    #[test]
+    fn peer_closed_sees_a_close_behind_stray_bytes() {
+        for half in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            client.write_all(b"\r\n").unwrap();
+            assert!(!peer_closed(&stream), "data alone is not a close");
+            client.write_all(b"\r\n").unwrap();
+            if half {
+                client.shutdown(Shutdown::Write).unwrap();
+            } else {
+                drop(client);
+            }
+            let started = Instant::now();
+            while !peer_closed(&stream) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "close not seen (half: {half})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn trickled_requests_have_an_absolute_deadline() {
         for prefix in [
@@ -649,6 +907,38 @@ mod tests {
             assert!(started.elapsed() < Duration::from_millis(600));
             drop(stream);
             writer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn only_loopback_origins_are_allowed() {
+        for allowed in [
+            "http://localhost",
+            "http://localhost:3000",
+            "https://127.0.0.1:8737",
+            "http://[::1]",
+            "http://[::1]:5173",
+        ] {
+            assert!(loopback_origin(allowed), "{allowed} should be allowed");
+        }
+        for refused in [
+            "",
+            "null",
+            "localhost",
+            "file://localhost",
+            "http://localhost.evil.com",
+            "http://127.0.0.1.evil.com",
+            "http://localhost:3000.evil.com",
+            "http://localhost:x@evil.com",
+            "http://evil.com@localhost",
+            "http://[::1]evil",
+            "http://[::1]:",
+            "http://localhost:123456",
+            "http://localhost/",
+            "http://LOCALHOST",
+            "https://evil.example",
+        ] {
+            assert!(!loopback_origin(refused), "{refused:?} should be refused");
         }
     }
 

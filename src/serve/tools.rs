@@ -1,6 +1,10 @@
 //! Tool definitions and implementations shared by MCP and HTTP.
 
-use super::{Server, runs::Info};
+use super::{
+    Server,
+    mcp::{Effect, annotate},
+    runs::Info,
+};
 use crate::{
     config::{Mode, validate_task},
     engine::{self, Run, Status},
@@ -62,7 +66,7 @@ pub fn list() -> Vec<Value> {
         "type": "boolean",
         "description": "Run interactive stages unattended for this run. The server never opens a terminal."
     });
-    vec![
+    let mut tools = vec![
         tool(
             "list_workflows",
             "List the project's workflows and their stages (harness, model, mode, enabled). The first workflow is the default.",
@@ -234,7 +238,39 @@ pub fn list() -> Vec<Value> {
             "List the project's schedules with their approval status, next due time, and recent occurrences (same data as `model-router schedules list --json`).",
             schema(json!({}), &[]),
         ),
-    ]
+    ];
+    for tool in &mut tools {
+        let name = tool["name"].as_str().unwrap_or_default().to_owned();
+        let (title, effect, idempotent, open_world) = annotation(&name);
+        annotate(tool, title, effect, idempotent, open_world);
+    }
+    tools
+}
+
+/// `(title, effect, idempotent, open_world)` for each tool's MCP annotations.
+/// Open world: the call can launch harnesses, which reach model providers.
+fn annotation(name: &str) -> (&'static str, Effect, bool, bool) {
+    match name {
+        "list_workflows" => ("List workflows", Effect::Read, true, false),
+        "preview_run" => ("Preview run commands", Effect::Read, true, false),
+        "start_run" => ("Start run", Effect::Write, false, true),
+        "run_status" => ("Run status", Effect::Read, true, false),
+        "wait_run" => ("Wait for run", Effect::Read, true, false),
+        "cancel_run" => ("Cancel run", Effect::Destructive, true, false),
+        "list_runs" => ("List runs", Effect::Read, true, false),
+        "get_handoff" => ("Get stage handoff", Effect::Read, true, false),
+        "get_report" => ("Get run report", Effect::Read, true, false),
+        "confirm_stage" => ("Confirm checkpoint", Effect::Write, false, true),
+        "retry_stage" => ("Retry stage", Effect::Write, false, true),
+        "fork_run" => ("Fork run", Effect::Write, false, true),
+        // check_only: false writes into the project checkout.
+        "apply_run" => ("Apply run changes", Effect::Destructive, false, false),
+        "get_handoffs" => ("Handoff budget report", Effect::Read, true, false),
+        "get_cost" => ("Cost summary", Effect::Read, true, false),
+        "get_stats" => ("Routing stats", Effect::Read, true, false),
+        "list_schedules" => ("List schedules", Effect::Read, true, false),
+        _ => ("model-router tool", Effect::Destructive, false, true),
+    }
 }
 
 const TOOL_NAMES: &[&str] = &[

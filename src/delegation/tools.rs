@@ -2,7 +2,7 @@
 //! call becomes a request to the stage's owner loop, the only thread that
 //! reads or changes the run; this side only waits.
 use super::instructions::ParentKind;
-use crate::serve::mcp::{ToolError, ToolSet};
+use crate::serve::mcp::{Effect, ToolError, ToolSet, annotate};
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::{
@@ -350,7 +350,7 @@ impl ToolSet for DelegationTools {
 }
 
 fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
-    json!({
+    let mut tool = json!({
         "name": name,
         "description": description,
         "inputSchema": {
@@ -359,7 +359,36 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
             "required": required,
             "additionalProperties": false,
         },
-    })
+    });
+    let (title, effect, idempotent, open_world) = annotation(name);
+    annotate(&mut tool, title, effect, idempotent, open_world);
+    tool
+}
+
+/// `(title, effect, idempotent, open_world)` for each tool's MCP annotations.
+/// Calls with a `client_request_id` are idempotent per key, not per call, so
+/// only reads and cancels are marked idempotent.
+fn annotation(name: &str) -> (&'static str, Effect, bool, bool) {
+    match name {
+        "orchestrator_capabilities" => ("Delegation capabilities", Effect::Read, true, false),
+        "delegate_task" => ("Delegate task", Effect::Write, false, true),
+        "task_status" => ("Task status", Effect::Read, true, false),
+        "task_wait" => ("Wait for tasks", Effect::Read, true, false),
+        "task_cancel" => ("Cancel task", Effect::Destructive, true, false),
+        "task_send" => ("Message task", Effect::Write, false, true),
+        "task_apply" => ("Apply task patch", Effect::Destructive, false, false),
+        "run_launch" => ("Launch runs", Effect::Write, false, true),
+        "run_list" => ("List runs", Effect::Read, true, false),
+        "run_read" => ("Read run", Effect::Read, true, false),
+        "run_wait" => ("Wait for run", Effect::Read, true, false),
+        "run_retry" => ("Retry run", Effect::Write, false, true),
+        "run_cancel" => ("Cancel run", Effect::Destructive, true, false),
+        // Its firings launch harnesses.
+        "schedule_task" => ("Schedule task", Effect::Write, false, true),
+        "list_scheduled_tasks" => ("List schedules", Effect::Read, true, false),
+        "delete_scheduled_task" => ("Delete schedule", Effect::Destructive, true, false),
+        _ => ("model-router tool", Effect::Destructive, false, true),
+    }
 }
 
 fn client_request_id() -> Value {

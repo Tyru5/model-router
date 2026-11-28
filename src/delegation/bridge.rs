@@ -87,7 +87,7 @@ pub fn answer_inactive(input: impl BufRead, mut output: impl Write) {
         let method = message.get("method").and_then(Value::as_str).unwrap_or("");
         let result = match method {
             "initialize" => json!({
-                "protocolVersion": crate::serve::mcp::PROTOCOL_VERSION,
+                "protocolVersion": crate::serve::mcp::negotiate(message.get("params").unwrap_or(&Value::Null)),
                 "capabilities": {"tools": {"listChanged": false}},
                 "serverInfo": {"name": "model-router", "version": env!("CARGO_PKG_VERSION")},
             }),
@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn a_closed_session_answers_every_call_with_parent_not_active() {
         let input = concat!(
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
             "\n",
             r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
             "\n",
@@ -143,6 +143,8 @@ mod tests {
             .collect();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0]["result"]["serverInfo"]["name"], "model-router");
+        // A supported older revision the client asks for is echoed back.
+        assert_eq!(lines[0]["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(lines[1]["result"]["isError"], true);
         assert_eq!(
             lines[1]["result"]["structuredContent"]["error"]["code"],

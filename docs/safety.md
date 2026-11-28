@@ -386,8 +386,13 @@ while reading each line) and bodies at 1 MiB, sharing a 10-second absolute read
 deadline; authorization is checked before waiting for a request body.
 
 MCP over stdio (`serve --mcp`) caps request lines at 2 MiB and concurrent
-`tools/call` workers at 32, of which at most 24 may be blocking `wait_run`
-calls.
+workers at 32 (`tools/call`, `resources/list`, `resources/read`,
+`prompts/get`, and `completion/complete` each take one), of which at most 24
+may be blocking `wait_run` calls. MCP over HTTP (`POST /mcp`) shares the HTTP
+limits above, needs the same bearer token as every route, and refuses with
+`403` any request whose `Origin` header is not `http(s)://` + `localhost`,
+`127.0.0.1`, or `[::1]` with an optional port, so a page on another origin
+cannot drive it through DNS rebinding.
 
 ## Protected paths and secret scanning
 

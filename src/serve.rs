@@ -5,8 +5,10 @@
 //! Runs execute unattended on background threads. Stdout carries JSON-RPC
 //! only; diagnostics go to stderr.
 
+mod client_config;
 mod http;
 pub mod mcp;
+mod prompts;
 mod runs;
 mod tools;
 
@@ -39,6 +41,10 @@ pub struct Args {
     /// Default: the server's project only.
     #[arg(long = "allow-root", value_name = "PATH")]
     pub allow_roots: Vec<PathBuf>,
+    /// Print the snippet that registers this `serve --mcp` command with an
+    /// MCP client, then exit. Edits no file.
+    #[arg(long, value_name = "CLIENT", value_enum, conflicts_with_all = ["mcp", "http"])]
+    pub client_config: Option<client_config::Client>,
 }
 
 /// Environment variable that fixes the HTTP bearer token.
@@ -201,6 +207,35 @@ pub fn run(
     config: Option<PathBuf>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
+    if let Some(client) = args.client_config {
+        let project = catalog::check_project(&project)?;
+        let config = config
+            .map(|path| {
+                std::fs::canonicalize(&path)
+                    .with_context(|| format!("Config not found: {}", path.display()))
+            })
+            .transpose()?;
+        let roots = args
+            .allow_roots
+            .iter()
+            .map(|root| {
+                std::fs::canonicalize(root)
+                    .with_context(|| format!("Allowed root not found: {}", root.display()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // The file may not exist yet, so it is made absolute, not canonical.
+        let metrics = crate::events::metrics_file()
+            .map(|path| std::path::absolute(&path))
+            .transpose()
+            .context("Resolve the metrics file path")?;
+        let snippet = client_config::render(
+            client,
+            &client_config::program()?,
+            &client_config::serve_args(&project, config.as_deref(), &roots, metrics.as_deref())?,
+        )?;
+        print!("{snippet}");
+        return Ok(());
+    }
     ensure!(
         args.mcp || args.http.is_some(),
         "Choose --mcp, --http ADDR, or both"

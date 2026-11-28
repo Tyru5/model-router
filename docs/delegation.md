@@ -185,8 +185,9 @@ it runs it is the only thing in flight. It runs in its own owner loop,
   nothing.
 - MCP framing, `initialize`, `tools/list`, `notifications/cancelled`, and
   progress reuse `src/serve/mcp.rs`, parameterized over a tool-set trait so
-  `serve` and the broker share one implementation. Protocol `2025-06-18`.
-  Server name `model-router`.
+  `serve` and the broker share one implementation. Protocol `2025-11-25`,
+  or `2025-06-18`, `2025-03-26`, or `2024-11-05` when the client asks for
+  one. Server name `model-router`.
 - When the socket refuses (turn over, broker closed, parent released) the
   bridge answers every call with `parent_not_active` itself.
 

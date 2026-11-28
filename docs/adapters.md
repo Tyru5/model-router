@@ -122,6 +122,12 @@ exact launches.
     entry (exceeding the router's 45 s `mode: "wait"` tool wait window) and
     re-injects the `mcp_servers.model-router.*` overrides on `codex exec resume`
     wake turns (`FollowUpExtra::ConfigOnly("--config")`).
+  - Delegation tools carry MCP tool annotations. Every hint is equal to or
+    less alarming than the MCP default for a tool without annotations
+    (`readOnlyHint: false`, `destructiveHint: true`, `openWorldHint: true`),
+    so a harness that gates approval on annotations prompts for no tool it
+    did not prompt for before. Claude Code's `--allowedTools=mcp__model-router__*`
+    pre-approves every delegation tool regardless of hints.
 - **Requires live verification (not tested offline — no model requests):**
   - **MCP tool approvals per sandbox mode:** whether `codex exec` executes
     injected MCP server tools without interactive approval prompts under each

@@ -7,6 +7,20 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ## [Unreleased]
 
+### Added
+
+- `serve` MCP prompts: `run_task`, `review_run`, and `unblock_run`, checked against the project's workflows and filled in with the run's report, review brief, status, and handoff.
+- `serve` MCP argument completion (`completion/complete`) for workflow names and recent run IDs.
+- `serve` MCP resource templates and a `model-router://runs/<run_id>/report` resource (`get_report` as JSON).
+- MCP tool titles and annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) on `serve` and delegation tools.
+- `POST /mcp` on `serve --http`: MCP's Streamable HTTP transport with JSON responses, behind the bearer token. It refuses non-loopback `Origin` headers, unsupported `MCP-Protocol-Version` headers, and malformed messages, and ends a blocking `wait_run` on `notifications/cancelled` or when its client closes or half-closes the connection.
+- `serve --client-config CLIENT` prints the registration snippet for Claude Code, Codex, Cursor, Gemini CLI, OpenCode, VS Code, Amp, GitHub Copilot CLI, Pi, oh-my-pi, goose, or generic `mcpServers` JSON. It carries `-C`, `--config`, `--allow-root`, and the metrics file, writes the path `model-router` was started by when that is the running file, and refuses paths that are not UTF-8.
+
+### Changed
+
+- `serve --mcp` answers a request whose worker fails unexpectedly (for example a tool that cannot put a non-UTF-8 project path in JSON) with an error instead of leaving it unanswered, and reads run records for `resources/*`, `prompts/get`, and `completion/complete` on worker threads so the stdio reader keeps reading.
+- MCP servers (`serve` and the delegation bridge) speak protocol `2025-11-25`, which current Claude Code, Gemini CLI, OpenCode, Cursor, Amp, Pi, oh-my-pi, and goose request, and echo `2025-06-18` (Codex), `2025-03-26`, or `2024-11-05` when a client asks for one. `serve` and an active bridge refuse batches at every revision, and answer a message with no `method`, `result`, or `error` with `-32600`.
+
 ## [0.3.1] - 2026-11-28
 
 ### Security
