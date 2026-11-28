@@ -50,6 +50,7 @@ pub(super) enum ActionId {
     SaveGlobal,
     // Monitor
     CancelStage,
+    FinishStage,
     TakeOver,
     CloseRun,
     AllowRepair,
@@ -354,6 +355,7 @@ const ACTIONS: &[Entry] = {
         act(SaveGlobal, Workflow, ch('S'), "save global", "Save global templates").menu(WorkflowMenu, 'S'),
         // Monitor: while running, while idle, or both
         act(CancelStage, MonitorRunning, ch('C'), "cancel stage", "Cancel active stage ([y] confirms)").footer().menu(RunMenu, 'c'),
+        act(FinishStage, MonitorRunning, ch('e'), "finish", "Finish an interactive stage using the handoff file its harness already wrote").footer().menu(RunMenu, 'e'),
         act(TakeOver, Monitor, ch('t'), "terminal", "Attach to the live interactive terminal, or reopen the stage's saved session (an unattended stage stops first; [y] confirms)")
             .footer_in(&[MonitorRunning])
             .menu(RunMenu, 't'),
@@ -458,6 +460,7 @@ const ACTIONS: &[Entry] = {
 const GUIDE_NOTES: &str = "INTERACTIVE HARNESS
 \tNative terminal keys and paste are forwarded.
 \tExit the harness to inspect its handoff; /exit quits, not detaches.
+\tOnce a handoff file is written, [e] on Runs finishes the stage without reattaching.
 Ctrl+B\tDetach to Runs; the session keeps running. [t] reattaches.
 \t[q] can leave it running after mr exits; the next mr reattaches.
 Ctrl+]\tStop a stuck stage

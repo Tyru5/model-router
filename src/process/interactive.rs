@@ -69,6 +69,9 @@ pub(super) struct SessionState {
     pub(super) started: bool,
     pub(super) finished: bool,
     pub(super) cancelled: bool,
+    /// Stop the running harness and conclude the stage using its written
+    /// handoff file instead of cancelling.
+    pub(super) finish_with_handoff: bool,
     /// Leave the harness running in its host when this mr lets go.
     pub(super) released: bool,
     /// The released connection, kept open until the caller saved the run
@@ -103,6 +106,7 @@ impl SessionState {
             started: false,
             finished: false,
             cancelled: false,
+            finish_with_handoff: false,
             released: false,
             parked: None,
         }
@@ -251,6 +255,22 @@ impl InteractiveSession {
     /// Whether `release` let go of a running harness.
     pub fn released(&self) -> bool {
         self.state().released
+    }
+
+    /// Stops a running interactive harness so the router can conclude the
+    /// stage from the handoff file it already wrote rather than cancelling.
+    pub fn finish_with_handoff(&self) {
+        let mut state = self.state();
+        if !state.finished && !state.cancelled && !state.released {
+            state.finish_with_handoff = true;
+            drop(state);
+            self.wake_supervisor();
+        }
+    }
+
+    /// Whether the user asked to stop the harness and conclude from its handoff.
+    pub fn finishing(&self) -> bool {
+        self.state().finish_with_handoff
     }
 
     /// Whether a harness runs in this session now.

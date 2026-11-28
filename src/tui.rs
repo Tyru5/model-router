@@ -296,7 +296,15 @@ pub fn run(
             };
             app.ui.message = match result {
                 Ok(AttachOutcome::Detached) => {
-                    "Interactive session detached and still running. [t] reattaches; [C] stops it. /exit quits the harness.".into()
+                    if app
+                        .session
+                        .focused()
+                        .is_some_and(|slot| slot.ready_handoff.is_some())
+                    {
+                        "Interactive stage wrote its handoff. [e] finishes the stage; [t] reattaches to review or /exit.".into()
+                    } else {
+                        "Interactive session detached and still running. [t] reattaches; [C] stops it. /exit quits the harness.".into()
+                    }
                 }
                 Ok(AttachOutcome::Finished) => "Harness returned. Finishing stage…".into(),
                 Err(error) => {

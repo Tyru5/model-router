@@ -66,10 +66,17 @@ try:
     emit("\x1b[?1049h\x1b[2J\x1b[H\x1b[1;35mDETACH SCREEN SENTINEL\x1b[0m"
          "\x1b[2;1HFAKE NATIVE READY\x1b[?2004h\x1b[5;1H> ")
     finished = False
+    handoff_written = False
     while not finished:
         ticks += 1
         snapshot()
         emit(f"\x1b[3;1HPROGRESS {ticks}\x1b[K\x1b[5;1H> ")
+        if Path("write-handoff").exists() and not handoff_written:
+            handoff = dict(summary="Offline detach evidence", verdict="complete",
+                           decisions=["Same native process resumed"], files_changed=[],
+                           tests=[], unresolved=[])
+            Path(sys.argv[1]).write_text(json.dumps(handoff))
+            handoff_written = True
         if Path("finish-harness").exists():
             break
         if not select.select([0], [], [], 0.1)[0]:
@@ -390,9 +397,60 @@ def leave_running(*, cli=False):
                 cleanup(later, project)
 
 
+def finish_from_handoff(*, cli=False):
+    """Harness writes its handoff and stays open; [e] finishes the stage cleanly."""
+    label = "CLI" if cli else "TUI"
+    with tempfile.TemporaryDirectory(prefix="router-finish-handoff-") as directory:
+        project = Path(directory).resolve()
+        workflow(project)
+        terminal = Terminal(project, cli=cli)
+        try:
+            start(terminal, project, cli=cli)
+            detach(terminal, project, cli=cli)
+            if not cli:
+                terminal.wait_for_text(
+                    "live in mock",
+                    message="Detached interactive card was not shown before handoff",
+                )
+            (project / "write-handoff").touch()
+            terminal.wait_for(
+                lambda: (
+                    "Handoff file written" in terminal.text()
+                    and "[e] Finish stage" in terminal.text()
+                    if cli
+                    else "wrote its handoff" in terminal.text()
+                    and "finish stage" in terminal.text()
+                ),
+                "Router did not surface the written interactive handoff",
+            )
+            terminal.send(b"e", settle=None)
+            checkpoint(terminal, project)
+            run = record(project)
+            assert (
+                run["stages"][0]["handoff"]["summary"] == "Offline detach evidence"
+            ), run["stages"][0]["handoff"]
+            terminal.wait_for(
+                lambda: (
+                    "Save and stop" in terminal.text()
+                    if cli
+                    else "MODEL ROUTER" in terminal.text()
+                ),
+                "Router did not return to checkpoint after [e] finish",
+            )
+            terminal.send(b"q\r" if cli else b"q")
+            terminal.exit()
+            print(
+                f"PASS: {label} interactive handoff detected and finished with [e]",
+                flush=True,
+            )
+        finally:
+            cleanup(terminal, project)
+
+
 def main():
     require_binary()
     for cli in (False, True):
+        finish_from_handoff(cli=cli)
         leave_running(cli=cli)
         round_trip(cli=cli)
         for action in ("complete", "c", "q"):

@@ -118,6 +118,8 @@ enum Msg {
     ),
     /// A process's live budget monitor saw a stop cap exceeded.
     BudgetStop(String),
+    /// The running interactive parent wrote a valid structured handoff file.
+    InteractiveHandoff(Box<Handoff>),
     Call(Call),
     Tick,
 }
@@ -528,14 +530,17 @@ impl<'a> Owner<'a> {
             // An interactive first turn runs in its terminal host.
             let (tx, journal, cancel) = (self.tx.clone(), self.journal, self.cancel);
             let locks = lock_paths(run).unwrap_or_default();
-            let (invocation, cwd, directory, sandbox) = (
+            let (invocation, cwd, directory, sandbox, handoff_file) = (
                 prepared.invocation.clone(),
                 run.workspace.clone(),
                 prepared.directory.clone(),
                 prepared.sandbox.clone(),
+                prepared.handoff_file.clone(),
             );
+            let role = self.stage.role;
             scope.spawn(move || {
-                let outcome = process::interactive(
+                let mut watcher = super::exec::HandoffWatcher::new(handoff_file, role);
+                let outcome = process::interactive_with_poll(
                     &invocation,
                     &cwd,
                     &directory,
@@ -547,6 +552,11 @@ impl<'a> Owner<'a> {
                         let _ = journal.add(&group);
                         let _ = tx.send(Msg::Terminal(socket.to_path_buf()));
                         let _ = tx.send(Msg::Spawned(Who::Parent, group));
+                    },
+                    || {
+                        if let Some(handoff) = watcher.poll() {
+                            let _ = tx.send(Msg::InteractiveHandoff(Box::new(handoff)));
+                        }
                     },
                 );
                 let _ = tx.send(Msg::ParentDone(outcome, Utc::now(), None));
@@ -637,6 +647,7 @@ impl<'a> Owner<'a> {
                     self.parent_done(scope, run, outcome, ended, live_usage, emit)?;
                 }
                 Msg::BudgetStop(reason) => self.budget_stopped(run, reason, emit)?,
+                Msg::InteractiveHandoff(handoff) => emit(Event::InteractiveHandoff(handoff)),
                 Msg::Tick => self.tick(scope, run, emit)?,
             }
         }

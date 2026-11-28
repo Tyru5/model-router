@@ -443,5 +443,6 @@ pub fn capture_with_controls(
         timed_out,
         stalled,
         released: false,
+        finished_with_handoff: false,
     })
 }

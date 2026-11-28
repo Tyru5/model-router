@@ -74,10 +74,11 @@ fan-out judges start enabled. `model-router init --preset KEY` writes one.
 ## Running
 
 Order without `after`: list order. Successful unattended stages advance
-automatically. Interactive stages stop at a checkpoint when the harness exits:
-inspect the handoff, then advance (`a`), reopen (`i`), retry (`y`), or replace
-the model (`m`). CLI: `resume RUN_ID --advance`, `--interactive`, `--retry`,
-`--model ID`.
+automatically. Interactive stages keep the harness open until you exit it
+(`/exit`) or press `e` (TUI Runs page or detached CLI) once it has written a
+valid handoff file; either stops at a checkpoint to inspect the handoff, then
+advance (`a`), reopen (`i`), retry (`y`), or replace the model (`m`). CLI:
+`resume RUN_ID --advance`, `--interactive`, `--retry`, `--model ID`.
 
 Failures, cancellation, malformed review verdicts, timeouts, and stall timeouts
 (`stall_timeout_seconds` on unattended streaming stages; ignored while

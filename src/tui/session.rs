@@ -159,14 +159,16 @@ impl Session {
 }
 
 impl RunSlot {
-    /// Waiting on the user: an interactive stage ready for its terminal, or
-    /// a handoff or waiver to accept.
+    /// Waiting on the user: an interactive stage ready for its terminal, a
+    /// live interactive stage that has already written its handoff, or a
+    /// handoff or waiver to accept.
     pub(super) fn needs_input(&self) -> bool {
-        self.worker.is_none()
-            && matches!(
-                self.run.status,
-                Status::Interactive | Status::AwaitingConfirmation
-            )
+        (self.ready_handoff.is_some() && !self.terminal().is_some_and(|t| t.finishing()))
+            || (self.worker.is_none()
+                && matches!(
+                    self.run.status,
+                    Status::Interactive | Status::AwaitingConfirmation
+                ))
     }
 }
 
@@ -272,6 +274,12 @@ impl App {
         let run = &slot.run;
         let name = format!("{} ({})", run.workflow.name, run.id);
         match run.status {
+            _ if slot.terminal().is_some() && slot.ready_handoff.is_some() => {
+                format!(
+                    "{name}: {} wrote its handoff. [e] finishes the stage; [t] attaches.",
+                    run.current_name()
+                )
+            }
             _ if slot.terminal().is_some() => {
                 format!("{name}: its interactive session is live. [t] attaches.")
             }
@@ -503,7 +511,16 @@ pub(super) fn draw_session_runs(
             } else {
                 run.updated_at
             };
-            let note = if slot.needs_input() {
+            let note = if slot.ready_handoff.is_some()
+                && !slot.terminal().is_some_and(|t| t.finishing())
+            {
+                Span::styled(
+                    "◆ handoff ready",
+                    Style::default()
+                        .fg(palette.warn)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else if slot.needs_input() {
                 Span::styled(
                     "◆ needs input",
                     Style::default()

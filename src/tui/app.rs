@@ -279,10 +279,12 @@ impl App {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((100, 30));
         let session = process::InteractiveSession::new(cols, rows);
         let terminal = session.clone();
+        slot.ready_handoff = None;
         slot.cancel.store(false, Ordering::Relaxed);
         let cancel = slot.cancel.clone();
+        let handoff_event = crate::notify::NotifyEvent::interactive_handoff(&run);
         // The user ends an interactive stage themselves, so only failures
-        // notify; a harness left running in the background has not ended.
+        // notify at exit; a written handoff notifies as soon as it appears.
         let failures = |result: &std::result::Result<Action, String>| {
             !matches!(result, Ok(Action::Confirm | Action::Interactive))
         };
@@ -290,7 +292,13 @@ impl App {
             Some(session.clone()),
             failures,
             move |emit| {
-                let result = engine::authorize_replay(&mut run, explicit.as_deref(), &mut *emit)
+                let mut emit = |event: engine::Event| {
+                    if matches!(&event, engine::Event::InteractiveHandoff(_)) {
+                        crate::notify::notify(handoff_event.clone());
+                    }
+                    emit(event);
+                };
+                let result = engine::authorize_replay(&mut run, explicit.as_deref(), &mut emit)
                     .and_then(|()| engine::run_interactive(&mut run, &cancel, &terminal, emit))
                     .map(|()| {
                         if terminal.released() {
@@ -367,8 +375,23 @@ impl App {
             let Some(slot) = self.session.runs.get_mut(index) else {
                 continue;
             };
-            let (changed, stopped) = slot.poll();
+            let (changed, handoff_arrived, stopped) = slot.poll();
             self.ui.redraw |= changed;
+            if handoff_arrived {
+                let run = &self.session.runs[index].run;
+                let name = format!("{} ({})", run.workflow.name, run.id);
+                let stage = run.current_name();
+                let text = if index == focus && self.monitoring() {
+                    format!(
+                        "{name}: {stage} wrote its handoff — [e] finishes the stage, or [t] attaches to review or /exit."
+                    )
+                } else {
+                    format!(
+                        "{name}: {stage} wrote its handoff — [N] jumps to it; [e] finishes or [t] attaches."
+                    )
+                };
+                self.push_notice(text, false);
+            }
             let Some(result) = stopped else { continue };
             self.run_stopped();
             if index == focus {
@@ -971,6 +994,14 @@ pub(super) fn draw(frame: &mut Frame<'_>, app: &mut App) {
         // does not continue (an interrupted one must be retried, a waiting
         // one accepted); a complete one has nothing to retry.
         let mut skip = vec![];
+        if app.page_scope() == Scope::MonitorRunning
+            && !app
+                .session
+                .focused()
+                .is_some_and(|slot| slot.terminal().is_some() && slot.ready_handoff.is_some())
+        {
+            skip.push(ActionId::FinishStage);
+        }
         let run = app
             .session
             .run()

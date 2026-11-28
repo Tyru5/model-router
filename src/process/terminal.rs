@@ -19,6 +19,32 @@ pub fn interactive(
     locks: &[PathBuf],
     on_start: impl FnOnce(Group, &Path),
 ) -> Result<Outcome> {
+    interactive_with_poll(
+        inv,
+        cwd,
+        dir,
+        cancel,
+        session,
+        sandbox,
+        locks,
+        on_start,
+        || {},
+    )
+}
+
+/// Like [`interactive`], calling `on_tick` periodically while the harness runs.
+#[allow(clippy::too_many_arguments)]
+pub fn interactive_with_poll(
+    inv: &Invocation,
+    cwd: &Path,
+    dir: &Path,
+    cancel: &AtomicBool,
+    session: &InteractiveSession,
+    sandbox: Option<&Plan>,
+    locks: &[PathBuf],
+    on_start: impl FnOnce(Group, &Path),
+    on_tick: impl FnMut(),
+) -> Result<Outcome> {
     let (cols, rows) = match begin(session, cancel)? {
         Ok(size) => size,
         Err(outcome) => return Ok(outcome),
@@ -80,7 +106,7 @@ pub fn interactive(
         }
     };
     terminal.set_marker(Some(marker));
-    terminal.supervise(dir, cancel, session)
+    terminal.supervise(dir, cancel, session, on_tick)
 }
 
 /// A harness's process group that cleanup after a failure left running,
@@ -129,6 +155,17 @@ pub fn reconnect(
     cancel: &AtomicBool,
     session: &InteractiveSession,
 ) -> Result<Outcome> {
+    reconnect_with_poll(terminal, dir, cancel, session, || {})
+}
+
+/// Like [`reconnect`], calling `on_tick` periodically while the harness runs.
+pub fn reconnect_with_poll(
+    terminal: Terminal,
+    dir: &Path,
+    cancel: &AtomicBool,
+    session: &InteractiveSession,
+    on_tick: impl FnMut(),
+) -> Result<Outcome> {
     {
         let mut state = session.state();
         ensure!(
@@ -138,7 +175,7 @@ pub fn reconnect(
         state.started = true;
     }
     let _finish = SessionFinish(session);
-    terminal.supervise(dir, cancel, session)
+    terminal.supervise(dir, cancel, session, on_tick)
 }
 
 /// How the harness of an attempt ended while no mr was connected, if its
@@ -150,6 +187,7 @@ pub fn recorded_exit(dir: &Path) -> Option<Outcome> {
         timed_out: false,
         stalled: false,
         released: false,
+        finished_with_handoff: false,
     })
 }
 
@@ -173,6 +211,7 @@ pub(super) fn begin(
             timed_out: false,
             stalled: false,
             released: false,
+            finished_with_handoff: false,
         }));
     }
     Ok(Ok(state.size))
@@ -321,6 +360,7 @@ impl Terminal {
         dir: &Path,
         cancel: &AtomicBool,
         session: &InteractiveSession,
+        mut on_tick: impl FnMut(),
     ) -> Result<Outcome> {
         let group = self.group();
         let mut frames = std::mem::take(&mut self.frames);
@@ -329,7 +369,9 @@ impl Terminal {
         let mut written = 0;
         let mut size = None;
         let mut cancelled = false;
+        let mut finish_with_handoff = false;
         let mut stopped: Option<Instant> = None;
+        let mut last_tick: Option<Instant> = None;
         loop {
             session.wakes.0.clear();
             let has_more_input = {
@@ -347,11 +389,20 @@ impl Terminal {
                         timed_out: false,
                         stalled: false,
                         released: true,
+                        finished_with_handoff: false,
                     });
                 }
                 cancelled |= cancel.load(Ordering::Relaxed) || state.cancelled || state.finished;
-                if cancelled && stopped.is_none() {
-                    cancel.store(true, Ordering::Relaxed);
+                if !cancelled && state.finish_with_handoff {
+                    finish_with_handoff = true;
+                }
+                if cancelled {
+                    finish_with_handoff = false;
+                }
+                if (cancelled || finish_with_handoff) && stopped.is_none() {
+                    if cancelled {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
                     host::frame(host::tag::STOP, &[], &mut out);
                     stopped = Some(Instant::now());
                 }
@@ -369,6 +420,12 @@ impl Terminal {
                 }
                 !state.input.is_empty()
             };
+            if stopped.is_none()
+                && last_tick.is_none_or(|at| at.elapsed() >= Duration::from_millis(250))
+            {
+                last_tick = Some(Instant::now());
+                on_tick();
+            }
             let flushed = host::flush(&mut self.stream, &mut out, &mut written);
             let filled = frames.fill(&self.stream);
             let open = flushed && filled;
@@ -387,10 +444,15 @@ impl Terminal {
                             let exit: host::Exit = serde_json::from_slice(&payload)?;
                             return Ok(Some(Outcome {
                                 code: exit.code,
-                                cancelled: cancelled || exit.cancelled,
+                                cancelled: if finish_with_handoff {
+                                    cancelled
+                                } else {
+                                    cancelled || exit.cancelled
+                                },
                                 timed_out: false,
                                 stalled: false,
                                 released: false,
+                                finished_with_handoff: finish_with_handoff,
                             }));
                         }
                         _ => {}
@@ -420,7 +482,12 @@ impl Terminal {
             if !open {
                 session.finish();
                 if let Some(mut outcome) = recorded_exit(dir) {
-                    outcome.cancelled |= cancelled;
+                    if finish_with_handoff && !cancelled {
+                        outcome.cancelled = false;
+                        outcome.finished_with_handoff = true;
+                    } else {
+                        outcome.cancelled |= cancelled;
+                    }
                     return Ok(outcome);
                 }
                 // The host died: its closed PTY hangs the harness up; make sure.
@@ -438,10 +505,11 @@ impl Terminal {
                 }
                 return Ok(Outcome {
                     code: None,
-                    cancelled: true,
+                    cancelled: !finish_with_handoff || cancelled,
                     timed_out: false,
                     stalled: false,
                     released: false,
+                    finished_with_handoff: finish_with_handoff && !cancelled,
                 });
             }
             let mut polls = [

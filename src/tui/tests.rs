@@ -1757,7 +1757,7 @@ fn interactive_worker_failure_before_launch_finishes_its_terminal() {
     ));
     let start = std::time::Instant::now();
     loop {
-        if let Some(result) = slot.poll().1 {
+        if let Some(result) = slot.poll().2 {
             assert_eq!(result, Err("Replay approval refused".into()));
             break;
         }
@@ -1789,7 +1789,7 @@ fn a_panicking_worker_fails_the_run_and_finishes_its_terminal() {
     ));
     let start = std::time::Instant::now();
     let result = loop {
-        if let Some(result) = slot.poll().1 {
+        if let Some(result) = slot.poll().2 {
             break result;
         }
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
@@ -1856,7 +1856,7 @@ fn a_worker_that_panics_after_saving_unreported_state_leaves_the_saved_revision(
     ));
     let start = std::time::Instant::now();
     let result = loop {
-        if let Some(result) = slot.poll().1 {
+        if let Some(result) = slot.poll().2 {
             break result;
         }
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
@@ -4225,4 +4225,92 @@ mode = "unattended"
             .schedules
             .is_empty()
     );
+}
+
+#[test]
+fn live_interactive_stage_surfaces_handoff_and_supports_one_key_finish() {
+    let project = tempfile::tempdir().unwrap();
+    let mut app = theme_app(project.path());
+    let mut run = sample_run("live-interactive");
+    run.status = Status::Running;
+    run.cursor = 0;
+    run.repair_passes = 0;
+    run.workflow.stages[0].mode = config::Mode::Interactive;
+    run.stages[0].status = Status::Running;
+    run.stages[0].handoff = None;
+    app.session.adopt(run);
+    app.ui.page = Page::Runs;
+    app.runs.on_saved = false;
+
+    let session = crate::process::InteractiveSession::new(80, 24);
+    app.slot_mut().worker = Some(Worker::stub_interactive(session.clone()));
+
+    // Before handoff: live card shows attach + /exit guidance; not needing input; [e] hidden.
+    assert!(!app.slot().needs_input());
+    let before = rows(&mut app, 110, 30).join("\n");
+    assert!(before.contains("detached [t]"), "{before}");
+    assert!(before.contains("live in"), "{before}");
+    assert!(before.contains("/exit"), "{before}");
+    assert!(!before.contains("wrote its handoff"), "{before}");
+
+    // Pressing `e` before any handoff is written refuses cleanly and does not finish the session.
+    let err = app.key(key(Key::Char('e'))).unwrap_err();
+    assert!(!session.finishing());
+    assert!(
+        format!("{err:#}").contains("No valid handoff file written yet"),
+        "{err:#}"
+    );
+
+    // Harness writes a valid handoff file while still open at its interactive prompt.
+    let handoff = crate::handoff::Handoff {
+        summary: "Implemented the requested feature and ran checks.".into(),
+        verdict: crate::handoff::Verdict::Complete,
+        files_changed: vec!["src/lib.rs".into()],
+        ..crate::handoff::Handoff::unstructured(String::new())
+    };
+    app.slot()
+        .worker
+        .as_ref()
+        .unwrap()
+        .send(RunEvent::InteractiveHandoff(Box::new(handoff)));
+    app.poll().unwrap();
+
+    assert!(app.slot().ready_handoff.is_some());
+    assert!(app.slot().needs_input());
+    assert_eq!(app.session.needing_input(), 1);
+    assert!(
+        app.ui.message.contains("wrote its handoff"),
+        "{}",
+        app.ui.message
+    );
+
+    let ready = rows(&mut app, 110, 30).join("\n");
+    assert!(ready.contains("1 need input [N]"), "{ready}");
+    assert!(ready.contains("handoff ready [e] / [t]"), "{ready}");
+    assert!(ready.contains("wrote its handoff"), "{ready}");
+    assert!(ready.contains("finish stage"), "{ready}");
+    assert!(
+        ready.contains("Implemented the requested feature"),
+        "{ready}"
+    );
+    assert!(ready.contains("1 file changed"), "{ready}");
+
+    // [h] opens the live handoff before exiting.
+    app.key(key(Key::Char('h'))).unwrap();
+    assert!(matches!(app.ui.dialog(), Some(Modal::Handoff(_))));
+    app.key(key(Key::Esc)).unwrap();
+
+    // [L] Session runs marks it as handoff ready.
+    app.key(shift('L')).unwrap();
+    let list = rows(&mut app, 110, 30).join("\n");
+    assert!(list.contains("handoff ready"), "{list}");
+    app.key(key(Key::Esc)).unwrap();
+
+    // [e] finishes the stage cleanly from its handoff without cancelling.
+    app.key(key(Key::Char('e'))).unwrap();
+    assert!(session.finishing());
+    assert!(!app.slot().cancel.load(Ordering::Relaxed));
+    assert!(!app.slot().needs_input());
+    let finishing = rows(&mut app, 110, 30).join("\n");
+    assert!(finishing.contains("Finishing"), "{finishing}");
 }
