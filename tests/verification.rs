@@ -2,9 +2,9 @@ mod common;
 
 use common::{count, drive, fixture, stage};
 use model_router::{
-    config::{Check, Role, Stage},
-    engine::{self, Action, Event, Status},
-    handoff::TestStatus,
+    config::{Check, CustomAdapter, Execution, Mode, Role, Stage},
+    engine::{self, Action, Cmd, Event, Status},
+    handoff::{HandoffSource, TestStatus, Verdict},
 };
 use std::{
     fs,
@@ -605,4 +605,432 @@ fn receipts_outside_git_say_freshness_is_unavailable() {
     let partial = model_router::report::receipts(&run).remove(0);
     assert_eq!(partial.basis, Basis::RouterChecksFailed);
     assert_eq!((partial.required_passed, partial.required_total), (1, 2));
+}
+
+/// A test stage whose checks the router runs in place of a harness.
+fn checks_only(checks: Vec<Check>) -> Stage {
+    Stage {
+        execution: Execution::ChecksOnly,
+        checks,
+        ..stage("verify", Role::Test)
+    }
+}
+
+#[test]
+fn checks_only_stage_runs_its_checks_and_never_launches_a_harness() {
+    let mut verify = checks_only(vec![
+        python("print('router check ran')", true),
+        python("import sys; sys.exit(4)", false),
+    ]);
+    // Its harness is not installed: nothing looks for it or starts it.
+    verify.harness = "absent".into();
+    let workflow = common::workflow(vec![
+        stage("implementation", Role::Implementation),
+        verify,
+        stage("handoff", Role::Custom),
+    ]);
+    let mut settings = common::settings(&workflow);
+    settings.adapters.insert(
+        "absent".into(),
+        CustomAdapter {
+            command: "/nonexistent/model-router-test-harness".into(),
+            ..CustomAdapter::default()
+        },
+    );
+    let dir = common::tempdir();
+    let mut run = common::create(dir.path(), &settings, &workflow);
+    let mut output = String::new();
+    let action = engine::drive(&mut run, &AtomicBool::new(false), |event| {
+        if let Event::Output(text) = event {
+            output.push_str(&text);
+        }
+    })
+    .unwrap();
+    assert_eq!(action, Action::Complete, "{:?}", run.error);
+    assert_eq!(
+        ["implementation", "verify", "handoff"].map(|role| count(dir.path(), role)),
+        [1, 0, 1]
+    );
+    assert!(
+        output.contains("verify · attempt 1 · router checks, no harness")
+            && output.contains("router check ran"),
+        "{output}"
+    );
+
+    let state = &run.stages[1];
+    assert_eq!((state.status, state.attempts.len()), (Status::Complete, 1));
+    let attempt = &state.attempts[0];
+    assert_eq!(
+        attempt
+            .checks
+            .iter()
+            .map(|c| (c.required, c.status, c.exit_code))
+            .collect::<Vec<_>>(),
+        [
+            (true, TestStatus::Passed, Some(0)),
+            (false, TestStatus::Failed, Some(4))
+        ]
+    );
+    assert_eq!(attempt.handoff_source, Some(HandoffSource::Router));
+    assert!(attempt.model.is_empty() && attempt.usage.is_none() && attempt.session.is_none());
+    // No prompt was built and nothing was sent anywhere.
+    assert!(!attempt.directory.join("prompt.md").exists());
+    assert!(!attempt.directory.join("stdout.log").exists());
+    let command: serde_json::Value =
+        serde_json::from_slice(&fs::read(attempt.directory.join("command.json")).unwrap()).unwrap();
+    assert_eq!(command["execution"], "checks-only");
+    assert!(command.get("program").is_none());
+
+    // The handoff is the router's: results stay on the attempt, and `tests`
+    // (what a model reports) stays empty.
+    let handoff = state.handoff.as_ref().unwrap();
+    assert_eq!(handoff.verdict, Verdict::Complete);
+    assert!(handoff.tests.is_empty() && handoff.structured);
+    assert!(
+        handoff
+            .summary
+            .starts_with("Router checks: 1/1 required passed, 0/1 optional passed. No harness ran"),
+        "{}",
+        handoff.summary
+    );
+    // Failures are in the summary once, with their logs; the report reads
+    // the results themselves, so the handoff repeats none as findings.
+    assert!(handoff.findings.is_empty());
+    assert!(
+        handoff.summary.contains("(optional): exit 4. Logs: ")
+            && handoff.summary.contains("(required): passed"),
+        "{}",
+        handoff.summary
+    );
+    assert!(attempt.directory.join("handoff.json").is_file());
+    let prompt = fs::read_to_string(dir.path().join(".model-router/mock/handoff.prompt")).unwrap();
+    assert!(
+        prompt.contains("PRIOR STAGE: verify") && prompt.contains("1/1 required passed"),
+        "{prompt}"
+    );
+
+    let report = model_router::report::build(&run);
+    assert_eq!(report.stages[1].execution, Execution::ChecksOnly);
+    assert_eq!(report.stages[1].handoff_source, Some(HandoffSource::Router));
+    let text = model_router::report::render(&report, None);
+    assert!(
+        text.contains("router checks, no harness · handoff: router"),
+        "{text}"
+    );
+    // Its attempt ran no model: it adds no usage, and is not counted as an
+    // attempt whose cost is unknown.
+    assert_eq!(report.stages[1].attempts, 1);
+    assert_eq!(report.stages[1].usage.attempts, 0);
+    assert_eq!(report.usage.attempts, 2);
+    let pricing = model_router::cost::Pricing::load(dir.path());
+    let totals = model_router::cost::stage_totals(&run, &pricing);
+    assert_eq!(
+        totals.iter().map(|t| t.attempts).collect::<Vec<_>>(),
+        [1, 0, 1]
+    );
+    let receipt = receipt(&run, "verify");
+    assert_eq!(receipt.basis, model_router::report::Basis::RouterChecks);
+    assert_eq!(receipt.model_reported_passed, 0);
+}
+
+#[test]
+fn checks_only_failing_required_check_blocks_until_a_retry_passes() {
+    let (dir, _, mut run) = fixture(vec![
+        checks_only(vec![python(
+            "import os, sys; sys.exit(0 if os.path.exists('fixed') else 3)",
+            true,
+        )]),
+        stage("handoff", Role::Custom),
+    ]);
+    assert_eq!(drive(&mut run), Action::Stopped);
+    assert_eq!((run.status, run.cursor), (Status::Blocked, 0));
+    let error = run.error.clone().unwrap();
+    assert!(
+        error.contains("Required check failed: python3 -c") && error.contains("(exit 3)"),
+        "{error}"
+    );
+    let handoff = run.stages[0].handoff.as_ref().unwrap();
+    assert_eq!(handoff.verdict, Verdict::NeedsChanges);
+    assert!(handoff.summary.contains("0/1 required passed"));
+    assert_eq!(count(dir.path(), "handoff"), 0);
+
+    // No harness exists to reopen or to give another model.
+    for cmd in [
+        Cmd::Retry {
+            interactive: true,
+            model: None,
+        },
+        Cmd::Retry {
+            interactive: false,
+            model: Some("other".into()),
+        },
+        Cmd::TakeOver,
+    ] {
+        let error = engine::command(dir.path(), &run.id, Some(run.revision), cmd).unwrap_err();
+        assert!(error.to_string().contains("Checks-only"), "{error:#}");
+    }
+
+    fs::write(dir.path().join("fixed"), "").unwrap();
+    run = engine::command(
+        dir.path(),
+        &run.id,
+        Some(run.revision),
+        Cmd::Retry {
+            interactive: false,
+            model: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+    assert_eq!(run.stages[0].attempts.len(), 2);
+    assert_eq!(
+        run.stages[0].handoff.as_ref().unwrap().verdict,
+        Verdict::Complete
+    );
+    assert_eq!(
+        (count(dir.path(), "verify"), count(dir.path(), "handoff")),
+        (0, 1)
+    );
+}
+
+#[test]
+fn cancelling_a_checks_only_stage_cancels_the_run() {
+    let (dir, _, mut run) = fixture(vec![
+        checks_only(vec![
+            python(
+                "import pathlib, time; pathlib.Path('check-started').touch(); time.sleep(30)",
+                true,
+            ),
+            python("pass", true),
+        ]),
+        stage("handoff", Role::Custom),
+    ]);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let signal = cancel.clone();
+    let marker = dir.path().join("check-started");
+    let watcher = thread::spawn(move || {
+        let start = Instant::now();
+        while !marker.exists() && start.elapsed() < Duration::from_secs(10) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        signal.store(true, Ordering::Relaxed);
+    });
+    let started = Instant::now();
+    assert_eq!(
+        engine::drive(&mut run, &cancel, |_| {}).unwrap(),
+        Action::Stopped
+    );
+    watcher.join().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(15));
+    assert_eq!(run.status, Status::Cancelled);
+    let attempt = &run.stages[0].attempts[0];
+    assert_eq!(attempt.status, Status::Cancelled);
+    assert_eq!(attempt.checks.len(), 1, "The second check must not start");
+    assert!(attempt.process_group.is_none());
+    // A cancelled attempt wrote no handoff, and nothing downstream ran.
+    assert!(run.stages[0].handoff.is_none());
+    assert!(
+        run.error
+            .as_deref()
+            .unwrap()
+            .contains("cancelled during checks")
+    );
+    assert_eq!(count(dir.path(), "handoff"), 0);
+}
+
+#[test]
+fn checks_only_is_for_unattended_test_stages_with_a_required_check() {
+    let rejected = |edit: fn(&mut Stage)| {
+        let mut stage = checks_only(vec![python("pass", true)]);
+        edit(&mut stage);
+        let workflow = common::workflow(vec![stage]);
+        format!("{:#}", common::settings(&workflow).validate().unwrap_err())
+    };
+    assert!(rejected(|s| s.role = Role::Implementation).contains("Only test stages"));
+    assert!(rejected(|s| s.mode = Mode::Interactive).contains("cannot be interactive"));
+    assert!(rejected(|s| s.checks[0].required = false).contains("at least one required check"));
+    assert!(rejected(|s| s.checks.clear()).contains("at least one required check"));
+    // A disabled draft may still lack its checks.
+    let mut draft = checks_only(vec![]);
+    draft.enabled = false;
+    let workflow = common::workflow(vec![stage("implementation", Role::Implementation), draft]);
+    common::settings(&workflow).validate().unwrap();
+
+    // The field is omitted for ordinary stages, so older configs round-trip.
+    let plain = toml::to_string(&stage("verify", Role::Test)).unwrap();
+    assert!(!plain.contains("execution"), "{plain}");
+    let saved = toml::to_string(&checks_only(vec![python("pass", true)])).unwrap();
+    assert!(saved.contains("execution = \"checks-only\""), "{saved}");
+    let parsed: Stage = toml::from_str(&saved).unwrap();
+    assert!(parsed.checks_only());
+}
+
+#[test]
+fn preview_shows_a_checks_only_stage_without_a_harness_command() {
+    let (dir, settings, _) = fixture(vec![
+        stage("implementation", Role::Implementation),
+        checks_only(vec![python("pass", true)]),
+    ]);
+    let text = engine::preview(&settings, &settings.workflows[0], dir.path(), "Task").unwrap();
+    assert!(
+        text.contains("2. verify | test | router checks, no harness\n   check: python3 -c pass (required, 600s)"),
+        "{text}"
+    );
+    assert_eq!(text.matches("mock_harness.py").count(), 1, "{text}");
+}
+
+const CHECKS_ONLY_PROJECT: &str = r#"version = 2
+
+[[workflows]]
+name = "Checks only"
+
+[[workflows.stages]]
+id = "verify"
+name = "Verify"
+role = "test"
+execution = "checks-only"
+checks = [{ command = ["python3", "-c", "open('checked', 'w').close()"] }]
+
+[[workflows.stages]]
+id = "summary"
+name = "Summary"
+role = "summary"
+enabled = false
+"#;
+
+#[test]
+fn untrusted_checks_only_stage_refuses_to_run_instead_of_launching_its_harness() {
+    use model_router::{config, engine::Run, trust};
+    common::isolate_config_dir();
+    let dir = common::tempdir();
+    fs::write(dir.path().join(".model-router.toml"), CHECKS_ONLY_PROJECT).unwrap();
+    let create = |settings: &config::Settings| {
+        Run::create(
+            dir.path(),
+            settings,
+            &settings.workflows[0],
+            "Verify".into(),
+            false,
+        )
+    };
+
+    // Untrusted: the checks are ignored, the config still loads, and the
+    // stage has nothing to run. Its default harness is never the fallback.
+    let (untrusted, _) = config::load(dir.path(), None).unwrap();
+    let stage = &untrusted.workflows[0].stages[0];
+    assert!(stage.checks_only() && stage.checks.is_empty());
+    let text = engine::preview(&untrusted, &untrusted.workflows[0], dir.path(), "Task").unwrap();
+    assert!(text.contains("no required check"), "{text}");
+    let error = format!("{:#}", create(&untrusted).unwrap_err());
+    assert!(
+        error.contains("has no required check to run") && error.contains("model-router trust"),
+        "{error}"
+    );
+    assert!(!dir.path().join("checked").exists());
+
+    let loaded = config::load_config(dir.path(), None).unwrap();
+    trust::approve(loaded.review().unwrap()).unwrap();
+    let (trusted, _) = config::load(dir.path(), None).unwrap();
+    let mut run = create(&trusted).unwrap();
+    assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+    assert!(dir.path().join("checked").exists());
+
+    // A saved run edited to launch the harness instead no longer matches
+    // what was approved.
+    let path = run.directory.join("run.json");
+    let saved = fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("\"execution\": \"checks-only\""), "{saved}");
+    fs::write(
+        &path,
+        saved.replace(
+            "\"execution\": \"checks-only\"",
+            "\"execution\": \"harness\"",
+        ),
+    )
+    .unwrap();
+    let edited = engine::load(dir.path(), &run.id).unwrap();
+    assert!(trust::authorize_run(&edited).is_err());
+}
+
+#[test]
+fn checks_only_receipt_binds_to_the_tested_snapshot() {
+    use model_router::report::{Basis, Freshness};
+    let dir = common::tempdir();
+    if common::repository(dir.path()).is_none() {
+        return;
+    }
+    let workflow = common::workflow(vec![checks_only(vec![python("pass", true)])]);
+    let settings = common::settings(&workflow);
+    let mut run = common::create(dir.path(), &settings, &workflow);
+    assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+    let attempt = &run.stages[0].attempts[0];
+    let tested = attempt.checks_tree.clone().unwrap();
+    assert_eq!(attempt.tree_before.as_deref(), Some(tested.as_str()));
+    assert_eq!(attempt.tree_after.as_deref(), Some(tested.as_str()));
+    let verified = receipt(&run, "verify");
+    assert_eq!(verified.basis, Basis::RouterChecks);
+    assert_eq!((verified.required_passed, verified.required_total), (1, 1));
+    assert_eq!(verified.snapshot.as_deref(), Some(tested.as_str()));
+    assert_eq!(verified.freshness, Some(Freshness::Current));
+    fs::write(dir.path().join("tracked.txt"), "edited later\n").unwrap();
+    match receipt(&run, "verify").freshness {
+        Some(Freshness::Stale { changed }) => assert_eq!(changed, ["tracked.txt"]),
+        other => panic!("expected stale, got {other:?}"),
+    }
+}
+
+#[test]
+fn checks_only_changes_answer_to_protected_paths() {
+    let dir = common::tempdir();
+    if common::repository(dir.path()).is_none() {
+        return;
+    }
+    let mut workflow = common::workflow(vec![
+        checks_only(vec![python("open('locked.txt', 'w').write('x')", true)]),
+        stage("handoff", Role::Custom),
+    ]);
+    workflow.protected_paths = vec!["locked.txt".into()];
+    let settings = common::settings(&workflow);
+    let mut run = common::create(dir.path(), &settings, &workflow);
+    assert_eq!(drive(&mut run), Action::Stopped);
+    assert_eq!(run.status, Status::Blocked);
+    let error = run.error.as_deref().unwrap();
+    assert!(
+        error.contains("protected path") && error.contains("locked.txt"),
+        "{error}"
+    );
+    // The check passed and its results are kept; the stage still stops.
+    assert_eq!(
+        run.stages[0].attempts[0].checks[0].status,
+        TestStatus::Passed
+    );
+    assert_eq!(count(dir.path(), "handoff"), 0);
+}
+
+#[test]
+fn checks_only_stage_runs_alone_in_a_dependency_graph() {
+    let mut verify = checks_only(vec![python("open('verified', 'w').close()", true)]);
+    verify.after = vec!["implementation".into()];
+    let mut review = stage("review", Role::Review);
+    review.after = vec!["verify".into()];
+    let mut research = stage("research", Role::Research);
+    research.after = vec!["verify".into()];
+    let (dir, _, mut run) = fixture(vec![
+        stage("implementation", Role::Implementation),
+        verify,
+        review,
+        research,
+    ]);
+    assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+    assert!(run.stages.iter().all(|s| s.status == Status::Complete));
+    assert!(dir.path().join("verified").exists());
+    assert_eq!(
+        ["implementation", "verify", "review", "research"].map(|role| count(dir.path(), role)),
+        [1, 0, 1, 1]
+    );
+    // Both dependents started only after the checks finished.
+    let checked = run.stages[1].attempts[0].finished_at.unwrap();
+    for dependent in [2, 3] {
+        assert!(run.stages[dependent].attempts[0].started_at >= checked);
+    }
 }

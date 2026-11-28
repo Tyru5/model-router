@@ -123,7 +123,7 @@ says how many stages are on, the repair limit, and where the run works.
 | `h` | Pick harness |
 | `m` | Discover models |
 | `o` | Enable/disable stage |
-| `v` | Toggle unattended/interactive |
+| `v` | Toggle unattended/interactive (not on a checks-only stage) |
 | `a` | Add stage preset (edit, `Ctrl+S` inserts after the selection) |
 | `d` / `x` | Duplicate / remove stage |
 | `u` | Undo last stage removal or workflow deletion (until you switch projects) |
@@ -145,7 +145,9 @@ budget (`max_usd`, `max_tokens`, `on_exceed`), Review repair target, Extra
 arguments, Run after, Fan-out candidates, Router checks, Require router checks,
 Router sandbox, Sandbox writable paths, Sandbox network, Sandbox fallback,
 Delegation (TOML), Stage instructions, Ship options. See
-[configuration.md](configuration.md#workflowsstages) for values.
+[configuration.md](configuration.md#workflowsstages) for values. Execution is
+`unattended`, `interactive`, or `checks-only` (`mode` and `execution`);
+`checks-only` runs a test stage's router checks with no harness.
 
 - `↑`/`↓`, `Tab`/`Shift+Tab`, `Ctrl+N`/`Ctrl+P` move between fields; in
   multiline fields `↑`/`↓` move by line and leave from the first/last line.

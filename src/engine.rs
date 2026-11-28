@@ -55,9 +55,9 @@ pub use types::{
 
 use exec::{
     Exit, INTERRUPTED, Prepared, Resolved, candidate_index, conclude, conclude_inner,
-    evaluate_outcome, execute_stage, is_transient_error, keep_survivor, read_head, reattach_stage,
-    resolve_handoff, run_post_stage_hooks, run_stage_hooks, should_transient_retry,
-    sleep_interruptible, start_stage, start_stage_inner,
+    evaluate_outcome, execute_checks_only, execute_stage, is_transient_error, keep_survivor,
+    read_head, reattach_stage, resolve_handoff, run_post_stage_hooks, run_stage_hooks,
+    should_transient_retry, sleep_interruptible, start_stage, start_stage_inner,
 };
 #[cfg(test)]
 use exec::{finish, prepare};
@@ -194,6 +194,10 @@ pub fn drive(run: &mut Run, cancel: &AtomicBool, mut emit: impl FnMut(Event)) ->
         }
         if run.workflow.stages[run.cursor].role == Role::Ship {
             crate::ship::execute(run, cancel, &mut emit)?;
+            continue;
+        }
+        if run.workflow.stages[run.cursor].checks_only() {
+            execute_checks_only(run, cancel, &mut emit)?;
             continue;
         }
         if run.workflow.stages[run.cursor].mode == Mode::Interactive {
@@ -363,6 +367,21 @@ pub fn preview(
             }
             continue;
         }
+        if stage.checks_only() {
+            text.push_str(&format!(
+                "{}. {} | {} | router checks, no harness\n",
+                index + 1,
+                stage.name,
+                stage.role.label()
+            ));
+            if !stage.checks.iter().any(|check| check.required) {
+                text.push_str(
+                    "   no required check: the stage cannot run (a project's checks are ignored until `model-router trust`)\n",
+                );
+            }
+            preview_checks(&mut text, stage);
+            continue;
+        }
         // A delegating stage's launch carries the bridge; its socket and
         // token file are made per turn.
         let mcp = stage.delegation.as_ref().map(|_| adapters::McpLaunch {
@@ -468,40 +487,46 @@ pub fn preview(
                 }
             ));
         }
-        for check in &stage.checks {
-            text.push_str(&format!(
-                "   check: {} ({}, {}s)\n",
-                shell_words::join(&check.command),
-                if check.required {
-                    "required"
-                } else {
-                    "optional"
-                },
-                check.timeout_seconds
-            ));
-        }
-        if !stage.when_changed.is_empty() {
-            text.push_str(&format!(
-                "   when_changed: {}\n",
-                stage.when_changed.join(", ")
-            ));
-        }
         if let Some(retry) = &stage.retry {
             text.push_str(&format!(
                 "   retry: up to {} transient attempt(s) (base {}s, max {}s)\n",
                 retry.max_attempts, retry.base_delay_seconds, retry.max_delay_seconds
             ));
         }
-        for (event, hook) in stage.hooks.all_entries() {
-            text.push_str(&format!(
-                "   hook ({}): {} ({}s)\n",
-                event.label(),
-                shell_words::join(&hook.command),
-                hook.timeout_seconds
-            ));
-        }
+        preview_checks(&mut text, stage);
     }
     Ok(text)
+}
+
+/// The preview lines for what the router itself runs at a stage: its checks,
+/// its `when_changed` condition, and its hooks.
+fn preview_checks(text: &mut String, stage: &Stage) {
+    for check in &stage.checks {
+        text.push_str(&format!(
+            "   check: {} ({}, {}s)\n",
+            shell_words::join(&check.command),
+            if check.required {
+                "required"
+            } else {
+                "optional"
+            },
+            check.timeout_seconds
+        ));
+    }
+    if !stage.when_changed.is_empty() {
+        text.push_str(&format!(
+            "   when_changed: {}\n",
+            stage.when_changed.join(", ")
+        ));
+    }
+    for (event, hook) in stage.hooks.all_entries() {
+        text.push_str(&format!(
+            "   hook ({}): {} ({}s)\n",
+            event.label(),
+            shell_words::join(&hook.command),
+            hook.timeout_seconds
+        ));
+    }
 }
 
 pub fn ensure_runnable(run: &Run) -> Result<()> {

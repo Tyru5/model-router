@@ -109,6 +109,19 @@ impl Run {
             workflow.stages.iter().any(|s| s.enabled),
             "Enable at least one stage"
         );
+        // A checks-only stage whose checks were ignored (untrusted project)
+        // has nothing to run; it never falls back to launching its harness.
+        for stage in workflow
+            .stages
+            .iter()
+            .filter(|s| s.enabled && s.checks_only())
+        {
+            ensure!(
+                stage.checks.iter().any(|check| check.required),
+                "Checks-only stage {} has no required check to run. A project config's checks are ignored until it is trusted: run `model-router trust`",
+                stage.name
+            );
+        }
         // Catch every missing selected harness before any stage mutates the project.
         let candidates: Vec<Stage> = workflow
             .stages
@@ -132,8 +145,8 @@ impl Run {
         for stage in workflow
             .stages
             .iter()
-            // Ship stages run in the router, without a harness.
-            .filter(|s| s.enabled && s.fan_out.is_none() && s.role != Role::Ship)
+            // Ship and checks-only stages run in the router, without a harness.
+            .filter(|s| s.enabled && s.fan_out.is_none() && s.launches_harness())
             .chain(&candidates)
         {
             let program = adapters::program(&stage.harness, &settings.adapters);
@@ -464,6 +477,10 @@ impl Run {
             !(interactive && self.workflow.stages[index].fan_out.is_some()),
             "Fan-out candidates run unattended; retry without interactive, or retry one candidate"
         );
+        ensure!(
+            !((interactive || model.is_some()) && self.workflow.stages[index].checks_only()),
+            "Checks-only stages run no harness; retry without interactive or a model"
+        );
         if self.status == Status::Running {
             self.interrupt_candidates(INTERRUPTED)?;
             if self.graph() {
@@ -548,6 +565,10 @@ impl Run {
         ensure!(
             stage.fan_out.is_none(),
             "Fan-out stages have no session to take over; open a candidate's worktree, or retry one candidate"
+        );
+        ensure!(
+            !stage.checks_only(),
+            "Checks-only stages run no harness and have no session to take over; retry the stage instead"
         );
         ensure!(
             adapters::resumable(&stage.harness, &self.adapters),

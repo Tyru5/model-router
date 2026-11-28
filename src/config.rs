@@ -81,6 +81,29 @@ pub enum SandboxFallback {
     Warn,
 }
 
+/// What runs a stage's attempt.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Execution {
+    /// The stage's harness runs, then the router runs the stage's checks.
+    #[default]
+    Harness,
+    /// The router runs the stage's checks and writes the handoff from their
+    /// results; no harness launches. Unattended test stages only.
+    ChecksOnly,
+}
+impl Execution {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Harness => "harness",
+            Self::ChecksOnly => "checks-only",
+        }
+    }
+    pub fn is_harness(&self) -> bool {
+        *self == Self::Harness
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -135,6 +158,11 @@ pub struct Stage {
     pub provider: String,
     pub effort: String,
     pub mode: Mode,
+    /// `checks-only`: the router runs the stage's checks in place of a
+    /// harness. Its harness, model, provider, effort, instructions, extra
+    /// arguments, sandbox, retry, and stall timeout are then unused.
+    #[serde(skip_serializing_if = "Execution::is_harness")]
+    pub execution: Execution,
     pub instructions: String,
     pub extra_args: Vec<String>,
     /// Explicit harness-native settings for this stage; empty inherits native configuration.
@@ -224,6 +252,15 @@ impl Stage {
     pub fn effective_retry(&self, workflow: &Workflow) -> Retry {
         self.retry.unwrap_or(workflow.retry)
     }
+    /// Whether the router runs this stage's checks in place of a harness.
+    pub fn checks_only(&self) -> bool {
+        self.execution == Execution::ChecksOnly
+    }
+    /// Whether an attempt of this stage launches a harness: not a ship
+    /// stage, which the router runs, nor a checks-only one.
+    pub fn launches_harness(&self) -> bool {
+        self.role != Role::Ship && !self.checks_only()
+    }
 }
 
 /// `judge` value that picks the winner without a model.
@@ -308,6 +345,7 @@ impl Default for Stage {
             provider: String::new(),
             effort: String::new(),
             mode: Mode::Unattended,
+            execution: Execution::Harness,
             instructions: String::new(),
             extra_args: vec![],
             harness_settings: BTreeMap::new(),
@@ -1537,6 +1575,37 @@ impl Settings {
                     "Only test stages can set require_router_checks ({})",
                     stage.name
                 );
+                if stage.checks_only() {
+                    ensure!(
+                        stage.role == Role::Test,
+                        "Only test stages can set execution = \"checks-only\" ({})",
+                        stage.name
+                    );
+                    ensure!(
+                        stage.mode == Mode::Unattended,
+                        "Checks-only stage {} runs no harness, so it cannot be interactive",
+                        stage.name
+                    );
+                    ensure!(
+                        stage.fan_out.is_none() && stage.delegation.is_none(),
+                        "Checks-only stage {} runs no harness, so it cannot fan out or delegate",
+                        stage.name
+                    );
+                    // An untrusted project's checks are ignored this session:
+                    // the config still loads, and run creation refuses the
+                    // stage instead of launching a harness in its place.
+                    let ignored = self
+                        .ignored
+                        .as_ref()
+                        .is_some_and(|i| i.has_checks(&workflow.name, &stage.id));
+                    ensure!(
+                        !stage.enabled
+                            || ignored
+                            || stage.checks.iter().any(|check| check.required),
+                        "Checks-only stage {} needs at least one required check",
+                        stage.name
+                    );
+                }
                 if stage.enabled && !stage.repair_target.is_empty() {
                     ensure!(
                         stage.role == Role::Review,

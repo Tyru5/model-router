@@ -93,45 +93,7 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
     if let (Some(plan), Some(mcp)) = (sandbox.as_mut(), &mcp) {
         plan.allow_orch(&mcp.sock, &mcp.token_file, &mcp.program);
     }
-    let check_protected = !run.workflow.protected_paths.is_empty();
-    let check_policies = crate::policy::has_block_policies(&run.workflow.policies);
-    if !check_protected && !check_policies && snapshot::is_repository(&run.workspace) {
-        snapshot::ensure_supported_git(&run.workspace)?;
-    }
-    let tree_before = if check_protected || check_policies {
-        let what = match (check_protected, check_policies) {
-            (true, true) => "workflow protected_paths and policies",
-            (true, false) => "workflow protected_paths",
-            (false, true) => "workflow policies",
-            (false, false) => unreachable!(),
-        };
-        let tree = snapshot::try_tree(&run.workspace, &run.directory).with_context(|| {
-            format!(
-                "Cannot start stage: failed to capture pre-stage Git snapshot required by {what}"
-            )
-        })?;
-        ensure!(
-            tree.is_some(),
-            "Cannot start stage: {what} require a pre-stage Git snapshot, but {} is not a Git repository",
-            run.workspace.display()
-        );
-        tree
-    } else {
-        snapshot::tree(&run.workspace, &run.directory)
-    };
-    // Snapshots skip files Git ignores, so protected ones are compared apart.
-    let ignored_protected_before = if check_protected {
-        snapshot::ignored_protected_digest(
-            &run.workspace,
-            &run.directory,
-            &run.workflow.protected_paths,
-        )
-            .context(
-                "Cannot start stage: failed to read the Git-ignored files workflow protected_paths cover",
-            )?
-    } else {
-        None
-    };
+    let (tree_before, ignored_protected_before) = baseline(run)?;
     let harness_version = adapters::detected_version(&stage.harness, &invocation.program);
     storage::write_json_fast(
         &directory.join("command.json"),
@@ -194,6 +156,52 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
         reattached: false,
         retry_from: None,
     })
+}
+
+/// The workspace before an attempt starts: its Git snapshot, which workflow
+/// `protected_paths` and policies require, and the digest of the Git-ignored
+/// files `protected_paths` cover.
+fn baseline(run: &Run) -> Result<(Option<String>, Option<String>)> {
+    let check_protected = !run.workflow.protected_paths.is_empty();
+    let check_policies = crate::policy::has_block_policies(&run.workflow.policies);
+    if !check_protected && !check_policies && snapshot::is_repository(&run.workspace) {
+        snapshot::ensure_supported_git(&run.workspace)?;
+    }
+    let tree_before = if check_protected || check_policies {
+        let what = match (check_protected, check_policies) {
+            (true, true) => "workflow protected_paths and policies",
+            (true, false) => "workflow protected_paths",
+            (false, true) => "workflow policies",
+            (false, false) => unreachable!(),
+        };
+        let tree = snapshot::try_tree(&run.workspace, &run.directory).with_context(|| {
+            format!(
+                "Cannot start stage: failed to capture pre-stage Git snapshot required by {what}"
+            )
+        })?;
+        ensure!(
+            tree.is_some(),
+            "Cannot start stage: {what} require a pre-stage Git snapshot, but {} is not a Git repository",
+            run.workspace.display()
+        );
+        tree
+    } else {
+        snapshot::tree(&run.workspace, &run.directory)
+    };
+    // Snapshots skip files Git ignores, so protected ones are compared apart.
+    let ignored_protected_before = if check_protected {
+        snapshot::ignored_protected_digest(
+            &run.workspace,
+            &run.directory,
+            &run.workflow.protected_paths,
+        )
+            .context(
+                "Cannot start stage: failed to read the Git-ignored files workflow protected_paths cover",
+            )?
+    } else {
+        None
+    };
+    Ok((tree_before, ignored_protected_before))
 }
 
 /// The first `max` bytes of a log, where harnesses report their session.
@@ -685,14 +693,49 @@ pub(super) fn finish(
     // A reported block stops the stage regardless of check results.
     let blocked = handoff.verdict == Verdict::Blocked;
     run.stages[index].handoff = Some(handoff);
-    let mut fresh_tree: Option<String> = None;
     let check_protected = !run.workflow.protected_paths.is_empty();
-    let check_policies = crate::policy::has_block_policies(&run.workflow.policies);
     let attempts = &run.stages[index].attempts;
     let from = prepared
         .retry_from
         .filter(|&first| first < attempts.len())
         .unwrap_or(attempts.len().saturating_sub(1));
+    let (allowed, mut fresh_tree) = check_workspace_rules(run, from)?;
+    if !allowed {
+        return Ok(fresh_tree);
+    }
+    if !blocked && !run.workflow.stages[index].checks.is_empty() {
+        if !run_checks(
+            run,
+            &prepared.directory,
+            prepared.reattached,
+            fresh_tree.take(),
+            cancel,
+            emit,
+        )? {
+            return Ok(None);
+        }
+        // Checks can write ignored files without changing the tested tree.
+        if check_protected && !check_ignored_protected(run, from)? {
+            return Ok(None);
+        }
+    }
+    if run.workflow.stages[index].mode == Mode::Interactive {
+        run.checkpoint()?;
+    } else {
+        run.advance(Actor::Engine)?;
+    }
+    Ok(fresh_tree)
+}
+
+/// Holds what the current stage changed since attempt `from` started to the
+/// workflow's `protected_paths` and block policies. False when a violation,
+/// or a snapshot it could not take or read, stopped the stage. Also returns
+/// the workspace snapshot it took, if any.
+fn check_workspace_rules(run: &mut Run, from: usize) -> Result<(bool, Option<String>)> {
+    let index = run.cursor;
+    let mut fresh_tree: Option<String> = None;
+    let check_protected = !run.workflow.protected_paths.is_empty();
+    let check_policies = crate::policy::has_block_policies(&run.workflow.policies);
     if check_protected || check_policies {
         let workspace = run.workspace.clone();
         let what = match (check_protected, check_policies) {
@@ -701,14 +744,18 @@ pub(super) fn finish(
             (false, true) => "workflow policies",
             (false, false) => unreachable!(),
         };
-        let Some(before) = attempts.get(from).and_then(|a| a.tree_before.clone()) else {
+        let Some(before) = run.stages[index]
+            .attempts
+            .get(from)
+            .and_then(|a| a.tree_before.clone())
+        else {
             run.stop(
                 Status::Blocked,
                 format!("Could not verify {what}: no pre-stage Git snapshot was recorded"),
                 Actor::Engine,
                 true,
             )?;
-            return Ok(None);
+            return Ok((false, None));
         };
         let after = match snapshot::try_tree(&workspace, &run.directory)
             .and_then(|tree| tree.context("Workspace has no Git snapshot"))
@@ -721,12 +768,12 @@ pub(super) fn finish(
                     Actor::Engine,
                     true,
                 )?;
-                return Ok(None);
+                return Ok((false, None));
             }
         };
         fresh_tree = Some(after.clone());
         if check_protected && !check_ignored_protected(run, from)? {
-            return Ok(fresh_tree);
+            return Ok((false, fresh_tree));
         }
         if after != before {
             if check_protected {
@@ -741,7 +788,7 @@ pub(super) fn finish(
                             Actor::Engine,
                             true,
                         )?;
-                        return Ok(fresh_tree);
+                        return Ok((false, fresh_tree));
                     }
                 };
                 if let Some(detail) =
@@ -755,7 +802,7 @@ pub(super) fn finish(
                         Actor::Engine,
                         true,
                     )?;
-                    return Ok(fresh_tree);
+                    return Ok((false, fresh_tree));
                 }
             }
             // Policies govern what a run can ship or apply, and both take
@@ -775,33 +822,19 @@ pub(super) fn finish(
                         Actor::Engine,
                         true,
                     )?;
-                    return Ok(fresh_tree);
+                    return Ok((false, fresh_tree));
                 }
                 if let Err(error) = scan.ensure_clean(
                     " in stage changes",
                     "revert matching changes or update workflow policies before retrying",
                 ) {
                     run.stop(Status::Blocked, format!("{error:#}"), Actor::Engine, true)?;
-                    return Ok(fresh_tree);
+                    return Ok((false, fresh_tree));
                 }
             }
         }
     }
-    if !blocked && !run.workflow.stages[index].checks.is_empty() {
-        if !run_checks(run, prepared, fresh_tree.take(), cancel, emit)? {
-            return Ok(None);
-        }
-        // Checks can write ignored files without changing the tested tree.
-        if check_protected && !check_ignored_protected(run, from)? {
-            return Ok(None);
-        }
-    }
-    if run.workflow.stages[index].mode == Mode::Interactive {
-        run.checkpoint()?;
-    } else {
-        run.advance(Actor::Engine)?;
-    }
-    Ok(fresh_tree)
+    Ok((true, fresh_tree))
 }
 
 /// Checks protected files that won't appear in a Git snapshot diff.
@@ -831,7 +864,8 @@ fn check_ignored_protected(run: &mut Run, from: usize) -> Result<bool> {
 /// Runs the current stage's router checks. False when cancellation stopped the run.
 pub(super) fn run_checks(
     run: &mut Run,
-    prepared: &Prepared,
+    directory: &Path,
+    reattached: bool,
     existing_tree: Option<String>,
     cancel: &AtomicBool,
     emit: &mut impl FnMut(Event),
@@ -841,7 +875,7 @@ pub(super) fn run_checks(
     if configured.is_empty() {
         return Ok(true);
     }
-    if prepared.reattached {
+    if reattached {
         if let Err(error) = crate::trust::authorize_run(run) {
             run.stop(
                 Status::Failed,
@@ -861,7 +895,7 @@ pub(super) fn run_checks(
     let (results, cancelled) = checks::run(
         &configured,
         &workspace,
-        &prepared.directory,
+        directory,
         cancel,
         |group| {
             let is_some = group.is_some();
@@ -1160,44 +1194,268 @@ pub(super) fn start_stage_inner(
         if stage.model.is_empty() { "" } else { " " },
         stage.model
     )));
-    if run_before_hooks {
-        let hook_run = run_stage_hooks(
+    if run_before_hooks && !before_stage_hooks(run, index, &prepared.directory, cancel, emit)? {
+        return Ok(None);
+    }
+    Ok(Some(prepared))
+}
+
+/// Runs the `before_stage` hooks of stage `index`, whose attempt logs to
+/// `directory`. False when a hook failed or was cancelled, which stopped the
+/// stage.
+fn before_stage_hooks(
+    run: &mut Run,
+    index: usize,
+    directory: &Path,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(Event),
+) -> Result<bool> {
+    let hook_run = run_stage_hooks(
+        run,
+        index,
+        crate::hooks::HookEvent::BeforeStage,
+        directory,
+        false,
+        cancel,
+        emit,
+    )?;
+    if hook_run.cancelled {
+        run.stop(
+            Status::Cancelled,
+            "Stage cancelled during before_stage hook. Filesystem changes are retained; retry explicitly".into(),
+            Actor::User,
+            true,
+        )?;
+        run.persist()?;
+        emit(Event::State(Box::new(run.clone())));
+        return Ok(false);
+    }
+    if let Some(error) = hook_run.failed {
+        run.stop(Status::Failed, error, Actor::Engine, true)?;
+        let _ = run_stage_hooks(
             run,
             index,
-            crate::hooks::HookEvent::BeforeStage,
-            &prepared.directory,
+            crate::hooks::HookEvent::OnFailure,
+            directory,
             false,
             cancel,
             emit,
-        )?;
-        if hook_run.cancelled {
+        );
+        run.persist()?;
+        emit(Event::State(Box::new(run.clone())));
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Starts an attempt of the current checks-only stage, which runs no
+/// harness: records it with the workspace baseline and marks it running.
+/// Returns the attempt's directory.
+fn prepare_checks_only(run: &mut Run) -> Result<PathBuf> {
+    let index = run.cursor;
+    let stage = &run.workflow.stages[index];
+    // Run creation refuses this too. A saved run fails closed here: without
+    // a required check the stage has nothing that could pass.
+    ensure!(
+        stage.checks.iter().any(|check| check.required),
+        "Checks-only stage {} has no required check to run",
+        stage.name
+    );
+    let number = run.stages[index].attempts.len() + 1;
+    let directory = run
+        .directory
+        .join(format!("{:02}-{}", index + 1, stage.id))
+        .join(format!("attempt-{number:03}"));
+    fs::create_dir_all(&directory)?;
+    let (tree_before, ignored_protected_before) = baseline(run)?;
+    storage::write_json_fast(
+        &directory.join("command.json"),
+        &serde_json::json!({ "execution": stage.execution, "checks": stage.checks, "workspace": run.workspace }),
+    )?;
+    run.stages[index].attempts.push(Attempt {
+        number,
+        started_at: Utc::now(),
+        finished_at: None,
+        model: String::new(),
+        mode: Mode::Unattended,
+        status: Status::Pending,
+        exit_code: None,
+        directory: directory.clone(),
+        handoff_file: directory.join("handoff.json"),
+        error: None,
+        checks: vec![],
+        tree_before,
+        tree_after: None,
+        checks_tree: None,
+        ignored_protected_before,
+        usage: None,
+        session: None,
+        process_group: None,
+        process_identity: Default::default(),
+        terminal: None,
+        handoff_source: None,
+        worktree: None,
+        tasks: vec![],
+        turns: vec![],
+        launched_runs: vec![],
+    });
+    // An earlier attempt's handoff never stands for this one's checks.
+    run.stages[index].handoff = None;
+    let reason = format!("Attempt {number} started: router checks, no harness");
+    run.resume = None;
+    run.error = None;
+    for target in [Target::Attempt(index), Target::Stage(index), Target::Run] {
+        run.set(target, Status::Running, Actor::Engine, &reason)?;
+    }
+    run.persist()?;
+    Ok(directory)
+}
+
+/// The handoff the router writes for a checks-only stage: each command's
+/// outcome in the summary, for the stages that read it. `tests` and
+/// `findings` stay empty: they hold what a model reports, and these results
+/// are the router's, kept on the attempt, where reports read them.
+fn checks_handoff(results: &[CheckResult]) -> Handoff {
+    // (passed, total) of the required or the optional checks.
+    let tally = |required: bool| {
+        let of_kind = results.iter().filter(|c| c.required == required);
+        (
+            of_kind
+                .clone()
+                .filter(|c| c.status == TestStatus::Passed)
+                .count(),
+            of_kind.count(),
+        )
+    };
+    let (required_passed, required_total) = tally(true);
+    let mut summary = format!("Router checks: {required_passed}/{required_total} required passed");
+    let (optional_passed, optional_total) = tally(false);
+    if optional_total > 0 {
+        summary.push_str(&format!(
+            ", {optional_passed}/{optional_total} optional passed"
+        ));
+    }
+    summary.push_str(". No harness ran; the router ran each command in the workspace.");
+    for check in results {
+        summary.push_str(&format!(
+            "\n- {} ({}): {}",
+            shell_words::join(&check.command),
+            if check.required {
+                "required"
+            } else {
+                "optional"
+            },
+            check.outcome()
+        ));
+        if check.status != TestStatus::Passed {
+            summary.push_str(&format!(". Logs: {}", check.directory.display()));
+        }
+    }
+    Handoff {
+        schema_version: Some(handoff::SCHEMA_VERSION),
+        verdict: if required_passed == required_total {
+            Verdict::Complete
+        } else {
+            Verdict::NeedsChanges
+        },
+        structured: true,
+        ..Handoff::unstructured(summary)
+    }
+}
+
+/// Runs the checks of the current checks-only stage, writes its handoff, and
+/// passes it through the gate every test stage has.
+fn finish_checks_only(
+    run: &mut Run,
+    directory: &Path,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(Event),
+) -> Result<()> {
+    let index = run.cursor;
+    if !run_checks(run, directory, false, None, cancel, emit)? {
+        return Ok(());
+    }
+    let attempt = run.stages[index]
+        .attempts
+        .last_mut()
+        .context("No attempt")?;
+    attempt.finished_at = Some(Utc::now());
+    attempt.handoff_source = Some(HandoffSource::Router);
+    let handoff = checks_handoff(&attempt.checks);
+    storage::write_json(&directory.join("handoff.json"), &handoff)?;
+    run.stages[index].handoff = Some(handoff);
+    // The checks are all that ran: what they changed answers to the
+    // workflow's protected paths and policies, as a harness's changes do.
+    let from = run.stages[index].attempts.len().saturating_sub(1);
+    let (allowed, tree) = check_workspace_rules(run, from)?;
+    if let Some(attempt) = run.stages[index].attempts.last_mut() {
+        attempt.tree_after = tree;
+    }
+    if !allowed {
+        return Ok(());
+    }
+    run.advance(Actor::Engine)
+}
+
+/// Runs the current checks-only stage: the router runs the stage's checks in
+/// place of a harness and writes the handoff from their results. Nothing is
+/// sent to a model.
+pub(super) fn execute_checks_only(
+    run: &mut Run,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(Event),
+) -> Result<()> {
+    let index = run.cursor;
+    let attempts = run.stages[index].attempts.len();
+    let directory = match prepare_checks_only(run) {
+        Ok(directory) => directory,
+        Err(error) => {
+            // As in `start_stage_inner`: an error before the attempt was
+            // recorded belongs to the stage.
+            let recorded = run.stages[index].attempts.len() > attempts;
             run.stop(
-                Status::Cancelled,
-                "Stage cancelled during before_stage hook. Filesystem changes are retained; retry explicitly".into(),
-                Actor::User,
-                true,
+                Status::Failed,
+                format!("{error:#}"),
+                Actor::Engine,
+                recorded,
             )?;
             run.persist()?;
             emit(Event::State(Box::new(run.clone())));
-            return Ok(None);
+            return Ok(());
         }
-        if let Some(error) = hook_run.failed {
-            run.stop(Status::Failed, error, Actor::Engine, true)?;
-            let _ = run_stage_hooks(
-                run,
-                index,
-                crate::hooks::HookEvent::OnFailure,
-                &prepared.directory,
-                false,
-                cancel,
-                emit,
-            );
-            run.persist()?;
-            emit(Event::State(Box::new(run.clone())));
-            return Ok(None);
+    };
+    emit(Event::State(Box::new(run.clone())));
+    emit(Event::Output(format!(
+        "── {} · attempt {} · router checks, no harness ──\n",
+        run.workflow.stages[index].name,
+        run.stages[index].attempts.len(),
+    )));
+    if !before_stage_hooks(run, index, &directory, cancel, emit)? {
+        return Ok(());
+    }
+    if let Err(error) = finish_checks_only(run, &directory, cancel, emit) {
+        run.stop(
+            Status::Failed,
+            format!("Could not complete stage bookkeeping: {error:#}"),
+            Actor::Engine,
+            true,
+        )?;
+    }
+    // Finishing may move the cursor, so record the stage that ran.
+    if run.stages[index]
+        .attempts
+        .last()
+        .is_some_and(|a| a.tree_after.is_none())
+    {
+        let tree = snapshot::tree(&run.workspace, &run.directory);
+        if let Some(attempt) = run.stages[index].attempts.last_mut() {
+            attempt.tree_after = tree;
         }
     }
-    Ok(Some(prepared))
+    run_post_stage_hooks(run, index, &directory, false, cancel, emit);
+    run.persist()?;
+    emit(Event::State(Box::new(run.clone())));
+    Ok(())
 }
 
 /// Finishes the current stage's attempt after its harness ended, records

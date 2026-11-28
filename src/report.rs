@@ -56,6 +56,10 @@ pub struct StageReport {
     pub harness: String,
     /// The latest attempt's model; empty for the harness default.
     pub model: String,
+    /// `checks-only`: the router ran the stage's checks and no harness, so
+    /// `harness` and `model` name nothing that ran.
+    #[serde(skip_serializing_if = "crate::config::Execution::is_harness")]
+    pub execution: crate::config::Execution,
     pub status: Status,
     pub attempts: usize,
     pub retries: usize,
@@ -492,7 +496,17 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
         let est = |a: &Attempt| {
             cost::estimate_with_billing(a.usage.as_ref(), &a.model, provider, billing, pricing)
         };
-        estimates.push(state.attempts.iter().map(est).collect());
+        // A checks-only stage's attempts ran no model: they add no usage and
+        // are not attempts of unknown cost.
+        let checks_only = run.workflow.stages[index].checks_only();
+        estimates.push(
+            state
+                .attempts
+                .iter()
+                .filter(|_| !checks_only)
+                .map(est)
+                .collect(),
+        );
         // The current round's candidates first: `FanOutReport` slices them.
         candidate_estimates.push(state.candidate_attempts().map(|(_, a)| est(a)).collect());
     }
@@ -669,6 +683,7 @@ pub fn build_with(run: &Run, pricing: &Pricing) -> RunReport {
             role: stage.role,
             harness: stage.harness.clone(),
             model: last.map_or_else(|| stage.model.clone(), |a| a.model.clone()),
+            execution: stage.execution,
             status: state.status,
             attempts: state.attempts.len(),
             retries: state.attempts.len().saturating_sub(1),
@@ -1186,7 +1201,15 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
         if stage.inherited {
             text.push_str(" · handoff reused from the fork's source run");
         }
-        if stage.attempts > 0 {
+        if stage.attempts > 0 && !stage.execution.is_harness() {
+            // No harness ran, so there is no model, usage, or cost to show.
+            let _ = write!(
+                text,
+                " · {} · {} · router checks, no harness",
+                count(stage.attempts, "attempt", "attempts"),
+                duration(stage.active_seconds),
+            );
+        } else if stage.attempts > 0 {
             let _ = write!(
                 text,
                 " · {} · {} · {} {} · {} · cost {}",
@@ -1201,6 +1224,8 @@ pub fn render(report: &RunReport, changes: Option<&Changes>) -> String {
                 usage_text(&stage.usage),
                 cost_text(&stage.usage.cost, &stage.budget)
             );
+        }
+        if stage.attempts > 0 {
             if let Some(source) = stage.handoff_source {
                 let _ = write!(text, " · handoff: {}", source.label());
             }

@@ -397,6 +397,13 @@ impl SchedulerState {
                 start_round(run, index, ctx.cancel, emit)?;
                 Ok(PreparedLaunch::Inline)
             }
+            // A checks-only stage runs its checks here, alone: a test stage
+            // is never parallel-safe, so nothing else is in flight.
+            Launch::Stage(index) if run.workflow.stages[index].checks_only() => {
+                run.cursor = index;
+                super::exec::execute_checks_only(run, ctx.cancel, emit)?;
+                Ok(PreparedLaunch::Inline)
+            }
             // A delegating stage runs alone in its own owner loop.
             Launch::Stage(index) if run.workflow.stages[index].delegation.is_some() => {
                 run.cursor = index;
