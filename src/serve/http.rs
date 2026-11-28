@@ -112,13 +112,9 @@ impl Drop for ConnectionSlot {
     }
 }
 
-/// A random bearer token (from the OS RNG via UUID v4).
-pub fn new_token() -> String {
-    format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    )
+/// A random bearer token: 32 bytes from the OS RNG, hex-encoded.
+pub fn new_token() -> anyhow::Result<String> {
+    crate::trust::random_hex_token()
 }
 
 fn wait_for_listener(listener: &TcpListener) {
@@ -252,29 +248,30 @@ fn read_http_line(
     max_bytes: usize,
 ) -> io::Result<usize> {
     out.clear();
-    let mut total = 0usize;
+    let mut raw = Vec::new();
     loop {
         let buf = reader.fill_buf()?;
         if buf.is_empty() {
-            return Ok(total);
+            break;
         }
         let take = buf
             .iter()
             .position(|&b| b == b'\n')
             .map_or(buf.len(), |pos| pos + 1);
-        if total + take > max_bytes {
+        if raw.len() + take > max_bytes {
             return Err(invalid("Headers too large or truncated"));
         }
-        let text =
-            std::str::from_utf8(&buf[..take]).map_err(|_| invalid("Headers must be UTF-8"))?;
-        out.push_str(text);
-        total += take;
-        let done = text.ends_with('\n');
+        let done = buf[take - 1] == b'\n';
+        raw.extend_from_slice(&buf[..take]);
         reader.consume(take);
         if done {
-            return Ok(total);
+            break;
         }
     }
+    let text = String::from_utf8(raw).map_err(|_| invalid("Headers must be UTF-8"))?;
+    let total = text.len();
+    *out = text;
+    Ok(total)
 }
 
 /// Calls `admit` once the headers authenticate, before reading the body;
@@ -354,9 +351,9 @@ fn is_health(request: &Request) -> bool {
     request.method == "GET" && request.path.trim_matches('/') == "health"
 }
 
-/// Compares without leaking the position of the first difference.
+/// Constant-time comparison, so a wrong token reveals nothing by timing.
 fn same(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    crate::trust::constant_time_eq(a, b)
 }
 
 fn authorized(request: &Request, token: &str) -> bool {
@@ -665,7 +662,7 @@ mod tests {
             Some("/tmp/my dir")
         );
         assert_eq!(query_param("a=1", "project"), None);
-        assert_eq!(new_token().len(), 64);
+        assert_eq!(new_token().unwrap().len(), 64);
     }
 
     #[test]

@@ -458,11 +458,13 @@ impl Ask {
                 },
                 match harnesses.as_slice() {
                     [harness] => format!(
-                        "Send one real request through {harness} with its own login and default model? The provider may bill it. Output goes to {}/.",
+                        "Run {} to send one real request through {harness} with its own login and default model? The provider may bill it. Output goes to {}/.",
+                        super::harnesses::TEST_SCRIPT,
                         crate::doctor::LIVE_TESTS
                     ),
                     many => format!(
-                        "Send one real request through each of {} ({} requests, in parallel) with their own logins and default models? Providers may bill them. Output goes to {}/.",
+                        "Run {} to send one real request through each of {} ({} requests, in parallel) with their own logins and default models? Providers may bill them. Output goes to {}/.",
+                        super::harnesses::TEST_SCRIPT,
                         many.join(", "),
                         many.len(),
                         crate::doctor::LIVE_TESTS

@@ -31,6 +31,10 @@ pub(super) type Probe = fn(&Settings, &Path) -> Vec<Report>;
 /// The script, in a checkout of this repository, that sends one real request
 /// through a harness and records its sanitized output.
 pub(super) const TEST_SCRIPT: &str = "scripts/capture_harness_output.py";
+/// Exact contents of `TEST_SCRIPT` built into this binary. `can_test_harnesses`
+/// verifies the checkout's copy matches byte-for-byte (without following
+/// symlinks), so an untrusted repo cannot plant an arbitrary Python script.
+const TEST_SCRIPT_BYTES: &[u8] = include_bytes!("../../scripts/capture_harness_output.py");
 
 /// One live harness test: the script's arguments.
 #[derive(Clone, Debug)]
@@ -117,12 +121,29 @@ pub(super) struct HarnessChecks {
     /// Tests swap in a stub so no harness runs.
     pub(super) probe: Probe,
 }
+#[derive(Clone, PartialEq, Eq)]
+struct ScriptStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+struct ScriptCache {
+    project: PathBuf,
+    stamp: Option<ScriptStamp>,
+    verified: bool,
+}
+
 /// The Harnesses page: doctor results and the selected row.
 #[derive(Default)]
 pub(super) struct HarnessesPage {
     pub(super) selected: usize,
     pub(super) checks: HarnessChecks,
     pub(super) tests: HarnessTests,
+    script_cache: std::cell::RefCell<Option<ScriptCache>>,
 }
 
 impl Default for HarnessChecks {
@@ -210,6 +231,20 @@ impl HarnessesPage {
     }
 }
 
+/// Whether `project/scripts/capture_harness_output.py` is a non-symlink regular
+/// file matching this binary's built-in script byte-for-byte.
+fn verify_test_script(project: &Path) -> bool {
+    use std::io::Read;
+    let Ok(file) = crate::storage::open_beneath(project, Path::new(TEST_SCRIPT)) else {
+        return false;
+    };
+    let mut bytes = Vec::with_capacity(TEST_SCRIPT_BYTES.len());
+    file.take((TEST_SCRIPT_BYTES.len() as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .is_ok()
+        && bytes == TEST_SCRIPT_BYTES
+}
+
 impl HarnessTest {
     pub(super) fn script(&self) -> PathBuf {
         self.project.join(TEST_SCRIPT)
@@ -218,6 +253,9 @@ impl HarnessTest {
         let python = if cfg!(windows) { "python" } else { "python3" };
         vec![
             python.into(),
+            // Isolated mode: do not add `<project>/scripts` to `sys.path[0]`
+            // and ignore `PYTHONPATH`, preventing stdlib module shadowing.
+            "-I".into(),
             self.script().into(),
             self.harness.as_str().into(),
             "--confirm-paid-request".into(),
@@ -229,9 +267,60 @@ impl HarnessTest {
     }
 }
 
-/// Runs the script and reports its command, exit status, and output.
+fn script_stamp(project: &Path) -> Option<ScriptStamp> {
+    let meta = std::fs::symlink_metadata(project.join(TEST_SCRIPT)).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    Some(ScriptStamp {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+        #[cfg(unix)]
+        dev: meta.dev(),
+        #[cfg(unix)]
+        ino: meta.ino(),
+    })
+}
+
+/// Verifies the checkout's script, then writes the embedded `TEST_SCRIPT_BYTES`
+/// to a private temporary file outside the checkout so Python executes only
+/// the verified bytes and never reopens a path inside the repository.
 fn run_test(test: &HarnessTest) -> Result<TestOutcome, String> {
+    if !verify_test_script(&test.project) {
+        return Err(format!(
+            "Refusing to run {TEST_SCRIPT}: file missing or does not match this build."
+        ));
+    }
+    let private = crate::process::host::private_temp_dir()
+        .map_err(|error| format!("Could not stage capture script: {error:#}"))?;
+    let mut temp = tempfile::Builder::new()
+        .prefix("model-router-capture-")
+        .suffix(".py")
+        .tempfile_in(private)
+        .map_err(|error| format!("Could not stage capture script: {error}"))?;
+    std::io::Write::write_all(&mut temp, TEST_SCRIPT_BYTES)
+        .map_err(|error| format!("Could not write capture script: {error}"))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|error| format!("Could not flush capture script: {error}"))?;
+    let mut argv = test.argv();
+    // Replace the checkout script path (index 2, after `python3` and `-I`) with
+    // the private temp file so a concurrent edit in the checkout cannot swap it.
+    if let Some(slot) = argv.get_mut(2) {
+        *slot = temp.path().as_os_str().to_owned();
+    }
+    run_test_with_argv(test, &argv)
+}
+
+#[cfg(test)]
+fn run_test_unchecked(test: &HarnessTest) -> Result<TestOutcome, String> {
     let argv = test.argv();
+    run_test_with_argv(test, &argv)
+}
+
+fn run_test_with_argv(test: &HarnessTest, argv: &[OsString]) -> Result<TestOutcome, String> {
     let output = Command::new(&argv[0])
         .args(&argv[1..])
         .current_dir(&test.project)
@@ -253,14 +342,19 @@ fn run_test(test: &HarnessTest) -> Result<TestOutcome, String> {
 
 /// The result dialog's body.
 pub(super) fn test_report(test: &HarnessTest, passed: bool, status: &str, output: &str) -> String {
-    let command: Vec<_> = test
+    // The router ran its embedded copy of the script, never the checkout's
+    // file, so the script path is not shown as a command to replay.
+    let mut command: Vec<_> = test
         .argv()
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
+    if let Some(slot) = command.get_mut(2) {
+        *slot = format!("<embedded {TEST_SCRIPT}>");
+    }
     let output = crate::storage::clean_terminal(output.trim());
     let mut text = format!(
-        "{}: {status}\n\n$ {}\n\n{}\n",
+        "{}: {status}\n\nRan: {}\n\n{}\n",
         if passed { "✓ Passed" } else { "✗ Failed" },
         shell_words::join(&command),
         if output.is_empty() {
@@ -411,9 +505,23 @@ impl App {
 }
 
 impl App {
-    /// Whether this project has the test script, i.e. is a model-router checkout.
+    /// Whether this project has a verified copy of the built-in test script
+    /// (regular file, no symlinks, matching this binary's script byte-for-byte).
+    /// Cached by `(project, metadata)` so UI redraws do not reread the file.
     pub(super) fn can_test_harnesses(&self) -> bool {
-        self.project.join(TEST_SCRIPT).is_file()
+        let stamp = script_stamp(&self.project);
+        if let Some(cache) = self.harnesses.script_cache.borrow().as_ref() {
+            if cache.project == self.project && cache.stamp == stamp {
+                return cache.verified;
+            }
+        }
+        let verified = stamp.is_some() && verify_test_script(&self.project);
+        *self.harnesses.script_cache.borrow_mut() = Some(ScriptCache {
+            project: self.project.clone(),
+            stamp,
+            verified,
+        });
+        verified
     }
     /// Where a test of `harness` started now saves its output.
     pub(super) fn test_output(&self, harness: &str) -> PathBuf {
@@ -439,6 +547,12 @@ impl App {
     /// the background.
     pub(super) fn start_harness_tests(&mut self, harnesses: Vec<String>) -> Result<()> {
         if !self.harnesses.tests.batch.is_empty() {
+            return Ok(());
+        }
+        if !verify_test_script(&self.project) {
+            self.ui.message = format!(
+                "Refusing to run {TEST_SCRIPT}: file missing or does not match this build."
+            );
             return Ok(());
         }
         // A check may have landed while the confirmation was open.
@@ -1090,7 +1204,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let script = project.path().join(TEST_SCRIPT);
         std::fs::create_dir_all(script.parent().unwrap()).unwrap();
-        std::fs::write(&script, "").unwrap();
+        std::fs::write(&script, TEST_SCRIPT_BYTES).unwrap();
         let mut app = App::new(
             project.path().into(),
             Settings::default(),
@@ -1205,6 +1319,21 @@ mod tests {
         assert_eq!(
             app.harnesses.tests.marked.iter().collect::<Vec<_>>(),
             ["opencode"]
+        );
+    }
+
+    #[test]
+    fn untrusted_modified_capture_script_cannot_run() {
+        let (project, mut app) = checkout();
+        assert!(app.can_test_harnesses());
+        std::fs::write(project.path().join(TEST_SCRIPT), "print('pwned')\n").unwrap();
+        assert!(!app.can_test_harnesses());
+        app.start_harness_tests(vec!["codex".into()]).unwrap();
+        assert!(app.harnesses.tests.batch.is_empty());
+        assert!(
+            app.ui.message.contains("does not match this build"),
+            "{}",
+            app.ui.message
         );
     }
 
@@ -1336,7 +1465,7 @@ mod tests {
 
         let script = project.path().join(TEST_SCRIPT);
         std::fs::create_dir_all(script.parent().unwrap()).unwrap();
-        std::fs::write(&script, "").unwrap();
+        std::fs::write(&script, TEST_SCRIPT_BYTES).unwrap();
         let (text, _) = render(&mut app, 100, "test");
         assert!(text.contains("[t] test"), "{text}");
         // [n] sends nothing.
@@ -1373,7 +1502,7 @@ mod tests {
         assert_eq!(title, "Test · codex");
         for expected in [
             "✓ Passed: exit status: 0",
-            "capture_harness_output.py codex --confirm-paid-request --router",
+            "<embedded scripts/capture_harness_output.py>' codex --confirm-paid-request --router",
             "--output-dir",
             ".model-router/harness-tests/codex-",
             "Saved fixture.",
@@ -1401,12 +1530,43 @@ mod tests {
             router: PathBuf::from("/bin/true"),
             output: project.path().join("out"),
         };
-        let outcome = run_test(&test).unwrap();
+        // `run_test` itself refuses scripts that do not match the build.
+        assert!(run_test(&test).is_err());
+        let outcome = run_test_unchecked(&test).unwrap();
         assert!(!outcome.passed);
         let body = outcome.report;
         assert!(body.starts_with("✗ Failed: exit status: 1"), "{body}");
         assert!(body.contains("to stderr\nto stdout"), "{body}");
         assert!(!body.contains("cargo test"), "{body}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn python_isolated_mode_blocks_stdlib_shadowing_in_scripts_dir() {
+        let project = tempfile::tempdir().unwrap();
+        let script = project.path().join(TEST_SCRIPT);
+        let scripts_dir = script.parent().unwrap();
+        std::fs::create_dir_all(scripts_dir).unwrap();
+        std::fs::write(&script, "import json\nprint(json.dumps({'ok': True}))\n").unwrap();
+        // A malicious stdlib shadow beside the script must not be imported under -I.
+        std::fs::write(
+            scripts_dir.join("json.py"),
+            "raise RuntimeError('shadowed stdlib imported')\n",
+        )
+        .unwrap();
+        let test = HarnessTest {
+            harness: "codex".into(),
+            project: project.path().into(),
+            router: PathBuf::from("/bin/true"),
+            output: project.path().join("out"),
+        };
+        let outcome = run_test_unchecked(&test).unwrap();
+        assert!(outcome.passed, "{}", outcome.report);
+        assert!(
+            outcome.report.contains("{\"ok\": true}"),
+            "{}",
+            outcome.report
+        );
     }
 
     #[test]
@@ -1435,8 +1595,9 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(
-            argv[1..4],
+            argv[1..5],
             [
+                "-I",
                 "/repo/scripts/capture_harness_output.py",
                 "claude",
                 "--confirm-paid-request"

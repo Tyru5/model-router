@@ -764,6 +764,56 @@ fn a_worktree_task_s_patch_reaches_the_checkout_only_through_task_apply() {
 }
 
 #[test]
+fn a_refused_apply_leaves_no_journal_behind() {
+    if !setup() {
+        return;
+    }
+    let turns = json!({
+        "turns": [
+            [{"call": "delegate_task", "args": {"task": "Add a file", "isolation": "worktree"}}],
+            [
+                {"call": "task_status", "args": {"task_id": "t1"}},
+                {"call": "task_apply", "args": {"task_id": "t1", "revision": 1}}
+            ]
+        ],
+        "handoffs": {"2": {"summary": "final", "verdict": "complete"}}
+    });
+    let writer = Delegate {
+        harness: "writer".into(),
+        ..Delegate::default()
+    };
+    let mut case = case(turns, true, writer, |_| {});
+    // The file the task adds needs a repo-local smudge filter, which the
+    // router never runs: the apply is refused before it writes anything.
+    git(case.dir.path(), &["config", "filter.local.smudge", "cat"]);
+    fs::write(
+        case.dir.path().join(".gitattributes"),
+        "added.txt filter=local\n",
+    )
+    .unwrap();
+    assert_eq!(
+        drive(&mut case.run),
+        Action::Complete,
+        "{:?}",
+        case.run.error
+    );
+    let calls = calls(&case.script);
+    let apply = &call(&calls, 2, "task_apply")[0]["result"];
+    assert_eq!(apply["error"]["code"], "orchestration_error", "{apply}");
+    assert!(
+        apply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("smudge filter `local`"),
+        "{apply}"
+    );
+    assert!(!case.dir.path().join("added.txt").exists());
+    // No started apply for recovery to mistake a later edit for.
+    let task = &case.run.stages[0].attempts[0].tasks[0];
+    assert!(task.patches[0].apply.is_none(), "{:?}", task.patches[0]);
+}
+
+#[test]
 fn an_unlisted_target_or_an_unknown_task_is_refused() {
     if !setup() {
         return;

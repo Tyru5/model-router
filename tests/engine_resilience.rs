@@ -21,35 +21,11 @@ use model_router::{
 use std::{
     collections::BTreeMap,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     process::Command,
-    sync::{
-        Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
-
-fn init_test_config_dir() -> PathBuf {
-    static DIR: Mutex<Option<tempfile::TempDir>> = Mutex::new(None);
-    extern "C" fn cleanup() {
-        if let Ok(mut guard) = DIR.lock() {
-            guard.take();
-        }
-    }
-    let mut guard = DIR.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_none() {
-        let temp = tempfile::tempdir().expect("test config dir");
-        // SAFETY: initialized once under the mutex before tests run, and
-        // `cleanup` is a plain extern "C" function.
-        unsafe {
-            std::env::set_var("MODEL_ROUTER_CONFIG_DIR", temp.path());
-            libc::atexit(cleanup);
-        }
-        *guard = Some(temp);
-    }
-    guard.as_ref().unwrap().path().to_path_buf()
-}
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -91,7 +67,7 @@ fn init_git(dir: &Path) {
 
 #[test]
 fn transient_retry_succeeds_after_provider_errors_preserving_model_and_transitions() {
-    init_test_config_dir();
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let script = dir.path().join("transient.py");
     fs::write(
@@ -192,7 +168,7 @@ handoff_path.write_text(json.dumps({
 
 #[test]
 fn non_transient_errors_do_not_retry_and_cancel_interrupts_backoff() {
-    init_test_config_dir();
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let script = dir.path().join("auth_fail.py");
     fs::write(
@@ -290,7 +266,7 @@ else:
 
 #[test]
 fn lifecycle_hooks_are_gated_by_trust_run_in_order_and_enforce_abort_rules() {
-    init_test_config_dir();
+    common::isolate_config_dir();
     let dir = common::tempdir();
     init_git(dir.path());
     let marker = dir.path().join("hooks.log");
@@ -404,7 +380,7 @@ after_stage = [
 
 #[test]
 fn before_stage_and_before_ship_abort_on_failure_and_trigger_on_failure() {
-    init_test_config_dir();
+    common::isolate_config_dir();
     let dir = common::tempdir();
     init_git(dir.path());
     let fail_marker = dir.path().join("on_failure.log");
@@ -512,7 +488,7 @@ fn before_stage_and_before_ship_abort_on_failure_and_trigger_on_failure() {
 
 #[test]
 fn declarative_diff_policies_block_stage_fanout_apply_and_ship_and_advise_reviews() {
-    init_test_config_dir();
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let scripts = common::tempdir();
     init_git(dir.path());
@@ -692,7 +668,7 @@ handoff_path.write_text(json.dumps({
 
 #[test]
 fn when_changed_skips_unmatched_stages_in_git_and_runs_outside_git() {
-    init_test_config_dir();
+    common::isolate_config_dir();
     let dir = common::tempdir();
     init_git(dir.path());
 
@@ -742,7 +718,7 @@ fn when_changed_skips_unmatched_stages_in_git_and_runs_outside_git() {
 
 #[test]
 fn review_quorum_requires_n_distinct_passing_reviews_and_blocks_otherwise() {
-    init_test_config_dir();
+    common::isolate_config_dir();
     let dir = common::tempdir();
     init_git(dir.path());
 
@@ -806,7 +782,7 @@ fn review_quorum_requires_n_distinct_passing_reviews_and_blocks_otherwise() {
 
 #[test]
 fn live_mid_stream_budget_stops_streaming_stage_immediately_when_exceeded() {
-    init_test_config_dir();
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let streamer = dir.path().join("streamer.py");
     fs::write(
@@ -920,7 +896,7 @@ fn streaming_stage(id: &str, role: Role, harness: &str) -> Stage {
 
 #[test]
 fn a_final_stage_over_the_cap_blocks_the_run_instead_of_completing_it() {
-    init_test_config_dir();
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let settings = Settings {
         adapters: BTreeMap::from([
@@ -960,7 +936,7 @@ fn a_final_stage_over_the_cap_blocks_the_run_instead_of_completing_it() {
 
 #[test]
 fn live_run_cap_counts_parallel_stages_together() {
-    init_test_config_dir();
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let settings = Settings {
         adapters: BTreeMap::from([("slow".into(), streamer(dir.path(), 600, 30, false))]),
@@ -997,7 +973,7 @@ fn live_run_cap_counts_parallel_stages_together() {
 
 #[test]
 fn live_stage_cap_stops_fan_out_candidates() {
-    init_test_config_dir();
+    common::isolate_config_dir();
     let dir = common::tempdir();
     init_git(dir.path());
     let settings = Settings {
@@ -1037,7 +1013,7 @@ fn live_stage_cap_stops_fan_out_candidates() {
 
 #[test]
 fn fanout_candidate_diff_policy_blocks_offending_candidate() {
-    init_test_config_dir();
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let scripts = common::tempdir();
     init_git(dir.path());
@@ -1130,7 +1106,7 @@ handoff_path.write_text(json.dumps({
 
 #[test]
 fn fanout_candidate_diff_policy_reads_binary_files_and_non_ascii_paths() {
-    init_test_config_dir();
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let scripts = common::tempdir();
     init_git(dir.path());
@@ -1281,7 +1257,7 @@ fn graph_retry_workflow(r1_model: &str, r2_model: &str, base_delay_seconds: u64)
 
 #[test]
 fn graph_stage_retries_restart_cancel_during_backoff_and_yield_to_a_failed_sibling() {
-    init_test_config_dir();
+    common::isolate_config_dir();
 
     // 1. A transient failure restarts the stage after its backoff; the run
     // ends once.
@@ -1365,7 +1341,7 @@ fn graph_stage_retries_restart_cancel_during_backoff_and_yield_to_a_failed_sibli
 
 #[test]
 fn list_stage_retry_ends_the_run_once_in_metrics() {
-    init_test_config_dir();
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let mut s = stage("impl", Role::Implementation);
     s.model = "transient-once".into();
@@ -1418,7 +1394,7 @@ handoff_path.write_text(json.dumps({"schema_version": 2, "summary": "done", "ver
 
 #[test]
 fn edits_a_failed_attempt_left_before_its_automatic_retry_are_policy_checked() {
-    init_test_config_dir();
+    common::isolate_config_dir();
     for graph in [false, true] {
         let dir = common::tempdir();
         let scripts = common::tempdir();
@@ -1463,7 +1439,7 @@ fn edits_a_failed_attempt_left_before_its_automatic_retry_are_policy_checked() {
 
 #[test]
 fn after_stage_hook_edits_are_part_of_the_recorded_changes() {
-    init_test_config_dir();
+    common::isolate_config_dir();
     let dir = common::tempdir();
     init_git(dir.path());
     let mut s = stage("impl", Role::Implementation);
@@ -1530,7 +1506,7 @@ fn log_hook(log: &Path, label: &str) -> Hook {
 
 #[test]
 fn fan_out_rounds_run_stage_hooks_once_and_retry_candidates_transiently() {
-    init_test_config_dir();
+    common::isolate_config_dir();
 
     // 1. Hooks wrap the round once; a candidate's transient failure reruns
     // only that candidate.
@@ -1593,7 +1569,7 @@ fn fan_out_rounds_run_stage_hooks_once_and_retry_candidates_transiently() {
 
 #[test]
 fn fan_out_candidates_start_from_files_before_stage_hooks_prepared() {
-    init_test_config_dir();
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let scripts = common::tempdir();
     init_git(dir.path());

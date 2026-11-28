@@ -175,6 +175,21 @@ pub struct Plan {
     /// Blocking diff policies verified against the staged tree before commit.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub block_policies: Vec<DiffPolicy>,
+    /// Names of the repo-local Git config the commit or push would run or
+    /// follow, never values or subsections (see `repo_command_config`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub git_config: Vec<String>,
+    /// Salted PBKDF2 digest of every repo-local Git config entry, to tell
+    /// whether any changed after the plan (`git_config_digest`). None in
+    /// plans saved before it was recorded, which no longer apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_config_digest: Option<String>,
+    /// Salted PBKDF2 digest of the Git config of every scope
+    /// (`effective_config_digest`), to tell whether what a push reads changed
+    /// after the plan. None without a push, and in plans saved before it was
+    /// recorded, which no longer push.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_config_digest: Option<String>,
 }
 fn default_true() -> bool {
     true
@@ -271,7 +286,7 @@ impl Plan {
             Some(remote) => {
                 let _ = writeln!(
                     text,
-                    "Push: git push --set-upstream {remote} {}",
+                    "Push: the commit to {remote} as {} (no tags, no submodule commits), set as the branch's upstream",
                     self.branch
                 );
             }
@@ -290,8 +305,248 @@ impl Plan {
             }
             None => text.push_str("Draft PR: no\n"),
         }
+        if !self.git_config.is_empty() {
+            text.push_str(
+                "\nThis repository's own Git config sets commands, proxies, or URL rewrites the commit or push uses. Their values can hold credentials and are not shown or saved; read them with `git config --show-scope --list`:\n",
+            );
+            for entry in &self.git_config {
+                let _ = writeln!(text, "  {entry}");
+            }
+        }
         text
     }
+}
+
+/// What `repo_command_config` found.
+struct RepoCommandConfig {
+    /// The listed keys, in config order, once each: `section.var`, or
+    /// `section.*.var` for a key with a subsection. Never a value or a
+    /// subsection, either of which can hold a credential.
+    shown: Vec<String>,
+    /// `git_config_digest` of every repo-local entry.
+    digest: String,
+}
+
+/// A digest of repo-local Git config `entries` that is safe to save: the
+/// entries can hold a credential (a proxy or push URL, a helper command), so
+/// it is `snapshot::stretched_digest`, salted with the workspace path.
+fn git_config_digest(work: &Path, entries: &[u8]) -> String {
+    snapshot::stretched_digest(b"model-router ship git config v1", work, entries)
+}
+
+/// Whether `git push` to remote URL `url` runs a remote helper program
+/// other than Git's own: `<transport>::<address>` (such as `ext::<command>`)
+/// runs `git-remote-<transport>`, and so does `<scheme>://` for any scheme
+/// Git does not handle itself. Git compares schemes exactly, so `HTTPS://`
+/// is a helper too.
+fn runs_remote_helper(url: &str) -> bool {
+    let is_name = |name: &str| {
+        name.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    };
+    // Git takes an empty transport too and runs `git-remote-`.
+    if url
+        .split_once("::")
+        .is_some_and(|(transport, _)| is_name(transport))
+    {
+        return true;
+    }
+    url.split_once("://").is_some_and(|(scheme, _)| {
+        !scheme.is_empty()
+            && is_name(scheme)
+            && !matches!(
+                scheme,
+                "http" | "https" | "ftp" | "ftps" | "ssh" | "git" | "file" | "git+ssh" | "ssh+git"
+            )
+    })
+}
+
+/// Repo-local (`local` and `worktree` scope) Git config that makes
+/// `git commit-tree -S` or `git push` run a command, go elsewhere, or trust
+/// another server: `gpg.program`, `gpg.<format>.program`,
+/// `gpg.ssh.defaultKeyCommand`, `core.sshCommand`, `core.askPass`,
+/// `core.gitProxy`, `credential.helper`, `credential.<url>.helper`,
+/// `url.<base>.insteadOf`, `url.<base>.pushInsteadOf`,
+/// `remote.<name>.pushUrl`, `remote.<name>.proxy`,
+/// `remote.<name>.receivepack`, `remote.<name>.uploadpack`,
+/// `remote.<name>.vcs`, a `remote.<name>.url` that runs a remote helper
+/// (`runs_remote_helper`), every `http.*` and `protocol.*` key,
+/// `push.recurseSubmodules`, `push.followTags`, `push.negotiate`,
+/// `push.pushOption`, and `submodule.recurse`. Anything that can write the
+/// checkout's `.git/config` can set them, so a ship names them in its plan.
+/// The router stores no credentials, and a helper, proxy, or URL can hold
+/// one, so the plan keeps only key names. The digest covers every repo-local
+/// entry.
+fn repo_command_config(work: &Path) -> Result<RepoCommandConfig> {
+    let output = snapshot::git_command()
+        .args(["config", "--show-scope", "-z", "--list"])
+        .current_dir(work)
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        output.status.success(),
+        "git config --list (requires Git 2.26+): {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let mut shown: Vec<String> = Vec::new();
+    let mut entries: Vec<u8> = Vec::new();
+    let mut parts = output.stdout.split(|&b| b == 0);
+    while let (Some(scope), Some(raw)) = (parts.next(), parts.next()) {
+        if scope != b"local" && scope != b"worktree" {
+            continue;
+        }
+        for part in [scope, raw] {
+            entries.extend_from_slice(&(part.len() as u64).to_le_bytes());
+            entries.extend_from_slice(part);
+        }
+        let entry = String::from_utf8_lossy(raw);
+        let (key, value) = entry.split_once('\n').unwrap_or((&entry, ""));
+        let Some((section, rest)) = key.split_once('.') else {
+            continue;
+        };
+        let (subsection, var) = match rest.rsplit_once('.') {
+            Some((subsection, var)) => (Some(subsection), var.to_ascii_lowercase()),
+            None => (None, rest.to_ascii_lowercase()),
+        };
+        let nested = subsection.is_some();
+        let section = section.to_ascii_lowercase();
+        let listed = match section.as_str() {
+            "gpg" => matches!(var.as_str(), "program" | "defaultkeycommand"),
+            "core" => !nested && matches!(var.as_str(), "sshcommand" | "askpass" | "gitproxy"),
+            "credential" => var == "helper",
+            "url" => nested && matches!(var.as_str(), "insteadof" | "pushinsteadof"),
+            "remote" => {
+                nested
+                    && (matches!(
+                        var.as_str(),
+                        "pushurl" | "proxy" | "receivepack" | "uploadpack" | "vcs"
+                    ) || (var == "url" && runs_remote_helper(value)))
+            }
+            "http" | "protocol" => true,
+            "push" => {
+                !nested
+                    && matches!(
+                        var.as_str(),
+                        "recursesubmodules" | "followtags" | "negotiate" | "pushoption"
+                    )
+            }
+            "submodule" => !nested && var == "recurse",
+            _ => false,
+        };
+        if listed {
+            // `section` and `var` are config names, never a value or a
+            // subsection.
+            let name = if nested {
+                format!("{section}.*.{var}")
+            } else {
+                format!("{section}.{var}")
+            };
+            if !shown.contains(&name) {
+                shown.push(name);
+            }
+        }
+    }
+    Ok(RepoCommandConfig {
+        shown,
+        digest: git_config_digest(work, &entries),
+    })
+}
+
+/// A digest of the Git config a push reads: every entry of every scope
+/// (system, global, repository, worktree), in the order Git lists them.
+/// `git_config_digest` covers the repository's own entries only, and an
+/// `includeIf.onbranch` rule in the user's or the system's config can turn
+/// entries on once the checkout is on the ship's branch: another push URL,
+/// `push.followTags`, a proxy. Comparing this digest between the plan and
+/// the push covers any of them without a list of settings to keep up to
+/// date. Entries the caller's environment gives (`GIT_CONFIG_PARAMETERS`,
+/// `GIT_CONFIG_COUNT`) count too: the push reads them, and a `resume
+/// --advance` can run with other ones than the plan. Only the router's own
+/// overrides (`snapshot::git_command`), the same in every process, are left
+/// out. A value can hold a credential, so only `snapshot::stretched_digest`
+/// of the entries is kept.
+fn effective_config_digest(work: &Path) -> Result<String> {
+    let output = snapshot::git_command()
+        .args(["config", "--show-scope", "-z", "--list"])
+        .current_dir(work)
+        .stdin(Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        output.status.success(),
+        "git config --list (requires Git 2.26+): {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let mut entries: Vec<u8> = Vec::new();
+    let mut parts = output.stdout.split(|&b| b == 0);
+    let router_overrides: [&[u8]; 2] = [b"core.fsmonitor\nfalse", b"core.hookspath\n/dev/null"];
+    while let (Some(scope), Some(raw)) = (parts.next(), parts.next()) {
+        if scope == b"command" && router_overrides.contains(&raw) {
+            continue;
+        }
+        for part in [scope, raw] {
+            entries.extend_from_slice(&(part.len() as u64).to_le_bytes());
+            entries.extend_from_slice(part);
+        }
+    }
+    Ok(snapshot::stretched_digest(
+        b"model-router ship effective git config v1",
+        work,
+        &entries,
+    ))
+}
+
+/// What to pass as `git push --recurse-submodules`. The push sends the
+/// planned commit and nothing else, so it never pushes submodule commits on
+/// its own (`on-demand`, `only`). Where the user's config asks for any of
+/// that, or for `check`, Git still checks that the submodule commits the
+/// planned commit names are on a remote, and refuses the push if not.
+fn push_submodule_mode(work: &Path) -> &'static str {
+    let configured = git(work, &["config", "--get", "push.recurseSubmodules"])
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase());
+    let wants_submodules = match configured.as_deref() {
+        Some(value) => matches!(value, "check" | "on-demand" | "only"),
+        // Unset: `submodule.recurse` decides.
+        None => git(
+            work,
+            &["config", "--type=bool", "--get", "submodule.recurse"],
+        )
+        .is_ok_and(|value| value.trim() == "true"),
+    };
+    if wants_submodules { "check" } else { "no" }
+}
+
+/// Whether the repository's own Git config is what `plan` recorded. A plan
+/// saved without a digest never matches.
+fn git_config_is_planned(plan: &Plan, work: &Path) -> Result<bool> {
+    let current = repo_command_config(work)?;
+    Ok(plan.git_config_digest.as_deref() == Some(current.digest.as_str()))
+}
+
+/// Refuses a push remote that only a legacy `remotes/<name>` or
+/// `branches/<name>` file in the Git directory defines: `git config` does
+/// not list those, so a plan cannot tell where the push goes or whether it
+/// changed. Git ignores such a file when the config defines the remote.
+fn ensure_configured_remote(work: &Path, remote: &str) -> Result<()> {
+    if git(work, &["config", "--get", &format!("remote.{remote}.url")]).is_ok() {
+        return Ok(());
+    }
+    let common = snapshot::rev_parse_path(work, "--git-common-dir")?;
+    for legacy in ["remotes", "branches"] {
+        let file = common.join(legacy).join(remote);
+        // Only a file that is not there is safe to ignore.
+        let absent = matches!(
+            fs::symlink_metadata(&file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        );
+        ensure!(
+            absent,
+            "Remote {remote} is defined by a legacy .git/{legacy}/{remote} file; define it with `git remote add` to ship to it"
+        );
+    }
+    Ok(())
 }
 
 fn short(sha: &str) -> &str {
@@ -743,6 +998,14 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
     } else {
         None
     };
+    if let Some(remote) = &push {
+        ensure_configured_remote(dir, remote)?;
+    }
+    let git_config = repo_command_config(dir)?;
+    let push_config_digest = match &push {
+        Some(_) => Some(effective_config_digest(dir)?),
+        None => None,
+    };
     Ok(Plan {
         run: run.id.clone(),
         workspace: dir.to_path_buf(),
@@ -760,6 +1023,9 @@ pub fn plan(run: &Run, options: &Options) -> Result<Plan> {
         secret_scan: options.secret_scan,
         secret_scanner: options.secret_scanner.clone(),
         block_policies,
+        git_config: git_config.shown,
+        git_config_digest: Some(git_config.digest),
+        push_config_digest,
     })
 }
 
@@ -914,21 +1180,114 @@ impl Drop for PrivateIndex {
     }
 }
 
-/// Stages exactly `files`, as they are in the working tree now, on top of
-/// `head` in the private index at `index` (replaced if present), and returns
-/// the tree. The user's own index is not read or written.
+fn exec_sanitized_git(
+    sanitized: &snapshot::SanitizedGitDir,
+    args: &[&str],
+    dir: &Path,
+    index: &Path,
+    stdin: Option<&[u8]>,
+) -> Result<String> {
+    let mut command = sanitized.command(dir);
+    command
+        .args(args)
+        .env("GIT_INDEX_FILE", index)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().context("Start git")?;
+    let output = std::thread::scope(|scope| -> Result<std::process::Output> {
+        let writer = stdin.zip(child.stdin.take()).map(|(input, mut pipe)| {
+            scope.spawn(move || -> std::io::Result<()> {
+                match pipe.write_all(input) {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                    Err(err) => Err(err),
+                }
+            })
+        });
+        let output = child.wait_with_output()?;
+        if let Some(handle) = writer {
+            if let Ok(Err(err)) = handle.join() {
+                if output.status.success() {
+                    return Err(err.into());
+                }
+            }
+        }
+        Ok(output)
+    })?;
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    ensure!(
+        output.status.success(),
+        "git {} failed ({}): {}",
+        args.first().copied().unwrap_or_default(),
+        output
+            .status
+            .code()
+            .map_or("signal".into(), |c| format!("exit {c}")),
+        if stderr.is_empty() {
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        } else {
+            stderr
+        }
+    );
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_owned())
+}
+
+/// Refuses to stage paths whose `.gitattributes` `filter` (in the working tree
+/// or the private staging `index`) names a repo-local or worktree-local
+/// clean/process filter that `SanitizedGitDir` omits, so `ship` never commits
+/// raw unfiltered bytes (such as an uncleaned Git LFS object).
+fn refuse_suppressed_clean_filters(
+    sanitized: &snapshot::SanitizedGitDir,
+    work: &Path,
+    files: &[FileChange],
+    index: &Path,
+) -> Result<()> {
+    let drivers = sanitized.local_clean_filters();
+    if drivers.is_empty() {
+        return Ok(());
+    }
+    let mut stdin_paths = Vec::new();
+    for file in files {
+        // A deleted path restored since the run is staged as a file too.
+        if file.status != snapshot::ChangeKind::Deleted
+            || fs::symlink_metadata(work.join(&file.path)).is_ok()
+        {
+            stdin_paths.extend_from_slice(file.path.as_bytes());
+            stdin_paths.push(0);
+        }
+    }
+    if let Some((path, driver)) =
+        snapshot::find_suppressed_filter_path(sanitized, work, &stdin_paths, Some(index), drivers)?
+    {
+        anyhow::bail!(
+            "Refusing to ship {path}: repo-local Git clean filter `{driver}` is disabled for safety and shipping would commit unfiltered bytes; configure the filter globally or commit this path manually"
+        );
+    }
+    Ok(())
+}
+
 fn stage_planned(work: &Path, head: &str, files: &[FileChange], index: &Path) -> Result<String> {
     let _ = fs::remove_file(index);
-    let private = [("GIT_INDEX_FILE", index)];
-    exec("git", &["read-tree", head], work, &private)?;
-    exec_with(
-        "git",
+    let sanitized = snapshot::SanitizedGitDir::new(work)?;
+    exec_sanitized_git(&sanitized, &["read-tree", head], work, index, None)?;
+    refuse_suppressed_clean_filters(&sanitized, work, files, index)?;
+    exec_sanitized_git(
+        &sanitized,
         &["update-index", "--add", "--remove", "-z", "--stdin"],
         work,
-        &private,
+        index,
         Some(&path_list(files)),
     )?;
-    exec("git", &["write-tree"], work, &private)
+    exec_sanitized_git(&sanitized, &["write-tree"], work, index, None)
 }
 
 /// What a ship would commit: `tree` on top of `head`, staged in `index`.
@@ -991,6 +1350,12 @@ fn apply_steps(
         short(&plan.head),
         short(&head)
     );
+    // The commit and push below read the repository's own config.
+    const CONFIG_CHANGED: &str = "This repository's own Git config changed since the ship was planned; plan again and review it";
+    ensure!(git_config_is_planned(plan, work)?, "{CONFIG_CHANGED}");
+    if let Some(remote) = &plan.push {
+        ensure_configured_remote(work, remote)?;
+    }
     // Stage exactly the planned paths in a private index from HEAD. It
     // stays until the scans below have read it.
     let index = PrivateIndex(std::path::absolute(dir.join("ship.index"))?);
@@ -1014,9 +1379,10 @@ fn apply_steps(
         (" in staged changes", "refusing to commit"),
     )?;
     drop(index);
-    let list = path_list(&plan.files);
     let message = std::path::absolute(dir.join("commit-message.txt"))?;
     let message = message.to_str().context("Attempt path must be UTF-8")?;
+    // The scans above took time; signing runs what the config names now.
+    ensure!(git_config_is_planned(plan, work)?, "{CONFIG_CHANGED}");
     // `commit-tree` ignores commit.gpgSign; honor it as `git commit` would.
     let sign = git(work, &["config", "--bool", "commit.gpgsign"]).is_ok_and(|v| v == "true");
     let mut args = vec!["commit-tree", &tree, "-p", &head, "-F", message];
@@ -1025,11 +1391,17 @@ fn apply_steps(
     }
     let commit = git(work, &args)?;
     log(format!("Committed {}\n", short(&commit)));
-    // Create the branch at the commit, then point the checkout at it; the
-    // working tree is untouched, like `git switch -c` with the commit on top.
+    // Create the branch at the commit, then finish everything local before
+    // waiting on the network: update the index and point the checkout at
+    // the branch (the working tree is untouched, like `git switch -c` with
+    // the commit on top). The shipped files are then never left staged on
+    // the old branch while a push runs.
     git(work, &["branch", "--no-track", &plan.branch, &commit])?;
     outcome.commit = Some(commit.clone());
     outcome.author = git(work, &["log", "-1", "--format=%an <%ae>", &commit]).ok();
+    // The index update reads the config the plan recorded: HEAD has not
+    // moved yet, and it runs through the sanitized config in any case.
+    sync_index(work, &top, &commit, &plan.files)?;
     git(
         work,
         &[
@@ -1040,28 +1412,127 @@ fn apply_steps(
             &format!("refs/heads/{}", plan.branch),
         ],
     )?;
-    // Sync ONLY the committed paths in the real index to match `commit`'s tree,
-    // avoiding re-hashing live working tree files and leaving unrelated staged
-    // changes untouched.
-    exec_with(
-        "git",
-        &[
-            "reset",
-            "-q",
-            &commit,
-            "--pathspec-from-file=-",
-            "--pathspec-file-nul",
-        ],
-        &top,
-        &[],
-        Some(&list),
-    )?;
     log(format!("Switched to new branch {}\n", plan.branch));
+    publish(plan, dir, &commit, outcome, log)
+}
+
+/// Makes the checkout's index match `commit` for exactly the shipped
+/// `files`, leaving every other entry, staged or not, as it is. The entries
+/// are written straight from the commit's tree, so Git does not refresh the
+/// index, which `git reset <commit> -- <paths>` would. Git still compares
+/// any file whose timestamp matches the index's when it writes the index,
+/// and that runs clean filters, so the write goes through the sanitized
+/// config: no repo-local filter runs, and a required one that is left out
+/// does not stop it.
+fn sync_index(work: &Path, top: &Path, commit: &str, files: &[FileChange]) -> Result<()> {
+    let shipped: std::collections::HashSet<&[u8]> =
+        files.iter().map(|file| file.path.as_bytes()).collect();
+    // Raw bytes: a file name that is not valid UTF-8 must not be taken for
+    // a shipped path that merely decodes to the same text.
+    let tree = snapshot::git_command()
+        .args(["ls-tree", "-r", "-z", commit])
+        .current_dir(top)
+        .stdin(Stdio::null())
+        .output()
+        .context("Start git")?;
+    ensure!(
+        tree.status.success(),
+        "git ls-tree failed: {}",
+        String::from_utf8_lossy(&tree.stderr).trim()
+    );
+    let mut entries = Vec::new();
+    // Drop each path first, at every stage; a path the commit deleted stays
+    // dropped.
+    let null_id = "0".repeat(commit.len());
+    for path in &shipped {
+        entries.extend_from_slice(format!("0 {null_id}\t").as_bytes());
+        entries.extend_from_slice(path);
+        entries.push(0);
+    }
+    // `<mode> <type> <object>\t<path>`, which `--index-info` reads as is.
+    for entry in tree.stdout.split(|&b| b == 0) {
+        let path = entry
+            .iter()
+            .position(|&b| b == b'\t')
+            .map(|tab| &entry[tab + 1..]);
+        if path.is_some_and(|path| shipped.contains(path)) {
+            entries.extend_from_slice(entry);
+            entries.push(0);
+        }
+    }
+    let sanitized = snapshot::SanitizedGitDir::new(work)?;
+    sanitized.allow_missing_local_filters()?;
+    // The index this checkout's Git commands use, which is not the Git
+    // directory's when the caller set `GIT_INDEX_FILE`.
+    let real_index = snapshot::index_path(work)?;
+    exec_sanitized_git(
+        &sanitized,
+        &["update-index", "-z", "--index-info"],
+        top,
+        &real_index,
+        Some(&entries),
+    )?;
+    Ok(())
+}
+
+/// Pushes `plan`'s branch and opens its draft PR, as planned. The checkout
+/// is on the new branch by now, so config an `includeIf.onbranch` rule turns
+/// on for it is in effect: the push runs only if the repository's own config
+/// is still exactly what the plan recorded.
+fn publish(
+    plan: &Plan,
+    dir: &Path,
+    commit: &str,
+    outcome: &mut Outcome,
+    log: &mut impl FnMut(String),
+) -> Result<()> {
+    let work = plan.workspace.as_path();
     if let Some(remote) = &plan.push {
-        let refspec = format!("refs/heads/{0}:refs/heads/{0}", plan.branch);
-        git(work, &["push", "--set-upstream", remote, &refspec])?;
+        ensure!(
+            git_config_is_planned(plan, work)?,
+            "This repository's own Git config is not what the plan recorded (it changed after the commit, or an includeIf.onbranch rule applies on the new branch), so nothing was pushed. Commit {} is on branch {}; review the config and push it yourself",
+            short(commit),
+            plan.branch
+        );
+        ensure_configured_remote(work, remote)?;
+        // The same for the config of every other scope: a rule in the
+        // user's or the system's config can apply to the new branch only.
+        ensure!(
+            plan.push_config_digest.as_deref() == Some(effective_config_digest(work)?.as_str()),
+            "Git's config is not what it was when the ship was planned (a setting changed, or an includeIf.onbranch rule in your or the system's config applies to one branch and not the other), so nothing was pushed. Commit {} is on branch {}; review `git config --show-scope --list` and push it yourself",
+            short(commit),
+            plan.branch
+        );
+        // Push the commit that was scanned, by its ID: the checkout is on
+        // the branch by now, and a commit made on it since would otherwise
+        // go out unscanned. Nothing else goes with it: no tags
+        // (`push.followTags`) and no submodule commits.
+        let refspec = format!("{commit}:refs/heads/{}", plan.branch);
+        let submodules = format!("--recurse-submodules={}", push_submodule_mode(work));
+        git(
+            work,
+            &["push", "--no-follow-tags", &submodules, remote, &refspec],
+        )?;
         outcome.pushed = Some(format!("{remote}/{}", plan.branch));
         log(format!("Pushed {remote}/{}\n", plan.branch));
+        // `--set-upstream` sets nothing for a push by commit ID, so record
+        // the upstream as it would have. The branch is pushed either way.
+        let upstream = [
+            (format!("branch.{}.remote", plan.branch), remote.clone()),
+            (
+                format!("branch.{}.merge", plan.branch),
+                format!("refs/heads/{}", plan.branch),
+            ),
+        ];
+        for (key, value) in &upstream {
+            if let Err(error) = git(work, &["config", key, value]) {
+                log(format!(
+                    "Could not set {remote}/{} as the branch's upstream: {error:#}\n",
+                    plan.branch
+                ));
+                break;
+            }
+        }
     }
     if let Some(pr) = &plan.pr {
         let body = std::path::absolute(dir.join("pr-body.md"))?;
@@ -1225,6 +1696,7 @@ pub fn execute(run: &mut Run, cancel: &AtomicBool, emit: &mut impl FnMut(Event))
         tree_before: tree.clone(),
         tree_after: tree,
         checks_tree: None,
+        ignored_protected_before: None,
         usage: None,
         session: None,
         process_group: None,
@@ -1299,8 +1771,9 @@ pub fn execute(run: &mut Run, cancel: &AtomicBool, emit: &mut impl FnMut(Event))
     };
     let digest = plan.digest();
     let approved = confirmed.as_deref() == Some(approval(&digest).as_str());
-    // A run an agent or a schedule created never ships unconfirmed.
-    let confirm = options.confirm || !run.creation_source.is_user();
+    // A run an agent or a schedule created never ships unconfirmed, nor
+    // does one whose commit or push would use repo-local Git commands.
+    let confirm = options.confirm || !run.creation_source.is_user() || !plan.git_config.is_empty();
     if confirm && !approved {
         let mut text = plan.preview();
         if confirmed.is_some() {
@@ -1699,6 +2172,8 @@ mod tests {
             secret_scan: false,
             ..Options::default()
         };
+        // Repo-local config a push would run is part of the plan.
+        git(root, &["config", "core.sshCommand", "ssh -i key"]).unwrap();
         let planned = plan(&run, &opts).unwrap();
         assert_eq!(
             planned
@@ -1708,6 +2183,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["sub/added.txt", "sub/deleted.txt", "sub/tracked.txt"]
         );
+        assert_eq!(planned.git_config, ["core.sshcommand"]);
+        assert!(
+            planned.preview().contains("  core.sshcommand\n")
+                && !planned.preview().contains("ssh -i key"),
+            "{}",
+            planned.preview()
+        );
 
         // User has unrelated staged edits and an untracked file outside the run.
         fs::write(root.join("notes.txt"), "staged note\n").unwrap();
@@ -1715,6 +2197,50 @@ mod tests {
         fs::write(root.join("other.txt"), "dirty\n").unwrap();
 
         save_plan(&planned, &attempt_dir).unwrap();
+        // A signing program planted after the plan never runs.
+        let marker = root.join("signer-ran");
+        fs::write(root.join(".git/info/exclude"), "signer-ran\nsigner\n").unwrap();
+        let signer = root.join("signer");
+        fs::write(
+            &signer,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&signer, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        git(root, &["config", "gpg.program", signer.to_str().unwrap()]).unwrap();
+        git(root, &["config", "commit.gpgsign", "true"]).unwrap();
+        let outcome = apply(&planned, &attempt_dir, |_| {});
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("changed since the ship was planned")),
+            "{:?}",
+            outcome.error
+        );
+        assert!(outcome.commit.is_none() && !marker.exists());
+        git(root, &["config", "--unset", "gpg.program"]).unwrap();
+        git(root, &["config", "commit.gpgsign", "false"]).unwrap();
+        // Nor does a remote URL swapped after the plan receive a push.
+        git(
+            root,
+            &[
+                "config",
+                "remote.origin.url",
+                "https://elsewhere.invalid/x.git",
+            ],
+        )
+        .unwrap();
+        let outcome = apply(&planned, &attempt_dir, |_| {});
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("changed since the ship was planned")),
+            "{:?}",
+            outcome.error
+        );
+        git(root, &["config", "--remove-section", "remote.origin"]).unwrap();
         let outcome = apply(&planned, &attempt_dir, |_| {});
         assert_eq!(outcome.error, None);
         assert!(outcome.commit.is_some());
@@ -1727,5 +2253,366 @@ mod tests {
             git(root, &["status", "--porcelain"]).unwrap(),
             "M  notes.txt\n?? other.txt"
         );
+    }
+
+    #[test]
+    fn repo_command_config_names_push_overrides_without_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main"]).unwrap();
+        let empty = repo_command_config(root).unwrap();
+        assert!(empty.shown.is_empty());
+
+        // A plain remote and a signing choice are in the digest, not the list.
+        let url = "https://example.invalid/x.git";
+        git(root, &["config", "remote.origin.url", url]).unwrap();
+        let remote = repo_command_config(root).unwrap();
+        assert!(remote.shown.is_empty());
+        assert_ne!(remote.digest, empty.digest);
+        git(root, &["config", "commit.gpgsign", "true"]).unwrap();
+        let signing = repo_command_config(root).unwrap();
+        assert!(signing.shown.is_empty());
+        assert_ne!(signing.digest, remote.digest);
+
+        for (key, value) in [
+            ("remote.origin.pushUrl", "https://bob:s3cret@push.invalid/x"),
+            ("remote.other.pushUrl", "https://push2.invalid/x"),
+            ("http.proxy", "proxyuser:proxypass@proxy.invalid:8080"),
+            ("http.https://example.invalid/.proxy", "socks5://p.invalid"),
+            ("remote.origin.proxy", "dave:pr0xy@proxy2.invalid"),
+            ("credential.helper", "!f() { echo password=hunter2; }; f"),
+            ("credential.https://alice:tok3n@example.invalid.helper", "x"),
+            (
+                "url.https://carol:pw@mirror.invalid/.insteadOf",
+                "https://e/",
+            ),
+            ("gpg.program", "/opt/sign --token=abc123"),
+            ("http.sslVerify", "false"),
+            ("http.extraHeader", "Authorization: Bearer abc123"),
+            ("protocol.ext.allow", "always"),
+            ("remote.helper.url", "ext::sh -c 'touch x'"),
+            ("push.recurseSubmodules", "on-demand"),
+            ("push.followTags", "true"),
+            ("push.pushOption", "merge_request.create"),
+            ("submodule.recurse", "true"),
+            ("push.negotiate", "true"),
+            ("remote.origin.uploadpack", "touch x"),
+            ("remote.plain.url", "https://plain.invalid/r"),
+            ("includeIf.gitdir:/elsewhere/.path", "other.inc"),
+        ] {
+            git(root, &["config", key, value]).unwrap();
+        }
+        let found = repo_command_config(root).unwrap();
+        assert_ne!(found.digest, signing.digest);
+        // Git files a key under its section, so compare as a set.
+        let mut names = found.shown.clone();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "credential.*.helper",
+                "credential.helper",
+                "gpg.program",
+                "http.*.proxy",
+                "http.extraheader",
+                "http.proxy",
+                "http.sslverify",
+                "protocol.*.allow",
+                "push.followtags",
+                "push.negotiate",
+                "push.pushoption",
+                "push.recursesubmodules",
+                "remote.*.proxy",
+                "remote.*.pushurl",
+                "remote.*.uploadpack",
+                "remote.*.url",
+                "submodule.recurse",
+                "url.*.insteadof",
+            ]
+        );
+
+        // The digest still tells one value from another.
+        git(
+            root,
+            &[
+                "config",
+                "remote.origin.pushUrl",
+                "https://bob:other@push.invalid/x",
+            ],
+        )
+        .unwrap();
+        let changed = repo_command_config(root).unwrap();
+        assert_eq!(changed.shown, found.shown);
+        assert_ne!(changed.digest, found.digest);
+
+        for helper in [
+            "ext::sh -c x",
+            "hg::https://h/r",
+            "::addr",
+            "vendor://h/r",
+            "HTTPS://h/r",
+            "a+b://h/r",
+        ] {
+            assert!(runs_remote_helper(helper), "{helper}");
+        }
+        for plain in [
+            "https://h/r",
+            "http://[::1]/r",
+            "ssh://[::1]/r",
+            "git+ssh://h/r",
+            "file:///a/b",
+            "git@h:r.git",
+            "[::1]:r",
+            "/a/b",
+            "../r.git",
+        ] {
+            assert!(!runs_remote_helper(plain), "{plain}");
+        }
+    }
+
+    #[test]
+    fn effective_config_digest_follows_every_entry_git_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main"]).unwrap();
+        git(
+            root,
+            &[
+                "config",
+                "remote.origin.url",
+                "https://example.invalid/x.git",
+            ],
+        )
+        .unwrap();
+        let plain = effective_config_digest(root).unwrap();
+        assert_eq!(plain, effective_config_digest(root).unwrap());
+        assert!(!plain.contains("example"), "{plain}");
+
+        // Any entry counts, not a list of them.
+        git(root, &["config", "push.followTags", "true"]).unwrap();
+        let tags = effective_config_digest(root).unwrap();
+        assert_ne!(plain, tags);
+        git(root, &["config", "--unset", "push.followTags"]).unwrap();
+        assert_eq!(plain, effective_config_digest(root).unwrap());
+
+        // Config that applies only on another branch, as a rule in any
+        // scope would, changes it once HEAD is there.
+        fs::write(
+            root.join(".git/on-ship.inc"),
+            "[remote \"origin\"]\n\tpushurl = https://branch.invalid/z.git\n",
+        )
+        .unwrap();
+        git(
+            root,
+            &["config", "includeIf.onbranch:ship/**.path", "on-ship.inc"],
+        )
+        .unwrap();
+        let ruled = effective_config_digest(root).unwrap();
+        assert_ne!(plain, ruled);
+        git(root, &["symbolic-ref", "HEAD", "refs/heads/ship/x"]).unwrap();
+        assert_ne!(ruled, effective_config_digest(root).unwrap());
+    }
+
+    #[test]
+    fn push_submodule_mode_never_pushes_submodule_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main"]).unwrap();
+        // Whatever the user's own config says, the repository's wins here.
+        for (value, mode) in [
+            ("no", "no"),
+            ("check", "check"),
+            ("on-demand", "check"),
+            ("only", "check"),
+            ("On-Demand", "check"),
+        ] {
+            git(root, &["config", "push.recurseSubmodules", value]).unwrap();
+            assert_eq!(push_submodule_mode(root), mode, "{value}");
+        }
+        // `push.recurseSubmodules = no` beats `submodule.recurse`.
+        git(root, &["config", "push.recurseSubmodules", "no"]).unwrap();
+        git(root, &["config", "submodule.recurse", "true"]).unwrap();
+        assert_eq!(push_submodule_mode(root), "no");
+    }
+
+    #[test]
+    fn a_push_remote_only_a_legacy_file_defines_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main"]).unwrap();
+        ensure_configured_remote(root, "origin").unwrap();
+        fs::create_dir_all(root.join(".git/remotes")).unwrap();
+        fs::write(
+            root.join(".git/remotes/origin"),
+            "URL: https://h.invalid/r\n",
+        )
+        .unwrap();
+        let error = ensure_configured_remote(root, "origin").unwrap_err();
+        assert!(format!("{error:#}").contains("legacy"), "{error:#}");
+        // Git ignores the file once the config defines the remote.
+        git(
+            root,
+            &["config", "remote.origin.url", "https://h.invalid/r"],
+        )
+        .unwrap();
+        ensure_configured_remote(root, "origin").unwrap();
+    }
+
+    #[test]
+    fn sync_index_sets_shipped_paths_without_running_or_needing_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "-b", "main"]).unwrap();
+        for (key, value) in [
+            ("user.name", "Test"),
+            ("user.email", "test@example.com"),
+            ("commit.gpgsign", "false"),
+        ] {
+            git(root, &["config", key, value]).unwrap();
+        }
+        fs::write(root.join(".gitattributes"), "*.bin filter=mark\n").unwrap();
+        for (name, text) in [
+            ("keep.txt", "a\n"),
+            ("gone.txt", "b\n"),
+            ("other.bin", "u\n"),
+        ] {
+            fs::write(root.join(name), text).unwrap();
+        }
+        git(root, &["add", "."]).unwrap();
+        git(root, &["commit", "-qm", "init"]).unwrap();
+        let head = git(root, &["rev-parse", "HEAD"]).unwrap();
+
+        // The commit a ship would make: one file edited, one deleted, one
+        // added.
+        fs::write(root.join("keep.txt"), "a2\n").unwrap();
+        fs::remove_file(root.join("gone.txt")).unwrap();
+        fs::write(root.join("new.txt"), "n\n").unwrap();
+        let change = |path: &str, status| FileChange {
+            path: path.into(),
+            status,
+            added: None,
+            removed: None,
+        };
+        let files = vec![
+            change("keep.txt", snapshot::ChangeKind::Modified),
+            change("gone.txt", snapshot::ChangeKind::Deleted),
+            change("new.txt", snapshot::ChangeKind::Added),
+        ];
+        let index = root.join(".git/ship.index");
+        let tree = stage_planned(root, &head, &files, &index).unwrap();
+        let commit = git(root, &["commit-tree", &tree, "-p", &head, "-m", "ship"]).unwrap();
+
+        // A repo-local required filter on an unrelated file whose stat data
+        // no longer matches the index: Git reads it when the index is
+        // written.
+        let marker = root.join("filter-ran");
+        git(
+            root,
+            &[
+                "config",
+                "filter.mark.clean",
+                &format!("touch '{}'; cat", marker.display()),
+            ],
+        )
+        .unwrap();
+        git(root, &["config", "filter.mark.required", "true"]).unwrap();
+        fs::write(root.join("other.bin"), "u\n").unwrap();
+        // An unrelated staged change stays staged.
+        fs::write(root.join("staged.txt"), "s\n").unwrap();
+        git(root, &["add", "staged.txt"]).unwrap();
+        // An unrelated file whose name is not valid UTF-8, and a shipped
+        // path that is what that name decodes to. They are different files.
+        // (APFS refuses such a name, so macOS skips this part.)
+        let raw_name =
+            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"caf\xe9.txt");
+        let has_raw_name = fs::write(root.join(raw_name), "raw\n").is_ok();
+        git(root, &["add", "."]).unwrap();
+        let mut files = files;
+        if has_raw_name {
+            files.push(change("caf\u{fffd}.txt", snapshot::ChangeKind::Modified));
+        }
+        // Every entry is "racily clean" when the index is older than the
+        // files, so Git compares them all when it writes the index.
+        fs::File::options()
+            .write(true)
+            .open(root.join(".git/index"))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000))
+            .unwrap();
+        let _ = fs::remove_file(&marker);
+
+        sync_index(root, root, &commit, &files).unwrap();
+        assert!(!marker.exists(), "a repo-local clean filter ran");
+        // Only the real file is in the index: no entry was made up for the
+        // decoded name.
+        if has_raw_name {
+            let names = git(root, &["ls-files", "-z"]).unwrap();
+            assert_eq!(names.matches("caf").count(), 1, "{names:?}");
+        }
+        let entries = git(
+            root,
+            &["ls-files", "-s", "--", "keep.txt", "gone.txt", "new.txt"],
+        )
+        .unwrap();
+        let expected = git(
+            root,
+            &[
+                "ls-tree", "-r", &commit, "--", "keep.txt", "gone.txt", "new.txt",
+            ],
+        )
+        .unwrap();
+        let ids = |text: &str| -> Vec<String> {
+            text.lines()
+                .map(|line| {
+                    let (meta, path) = line.split_once('\t').unwrap();
+                    let id = meta.split(' ').find(|part| part.len() >= 40).unwrap();
+                    format!("{id} {path}")
+                })
+                .collect()
+        };
+        assert_eq!(ids(&entries), ids(&expected));
+        assert_eq!(ids(&entries).len(), 2, "{entries}");
+        assert!(
+            git(root, &["ls-files", "--", "staged.txt", "other.bin"])
+                .unwrap()
+                .contains("staged.txt")
+        );
+    }
+
+    #[test]
+    fn stage_planned_refuses_paths_with_repo_local_clean_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let run_git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.name", "Test"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        fs::write(root.join("init.txt"), "seed\n").unwrap();
+        run_git(&["add", "init.txt"]);
+        run_git(&["commit", "-q", "-m", "init"]);
+        let head = git(root, &["rev-parse", "HEAD"]).unwrap();
+
+        run_git(&["config", "--local", "filter.lfs.clean", "cat"]);
+        run_git(&["config", "--local", "filter.lfs.required", "true"]);
+        fs::write(root.join(".gitattributes"), "*.bin filter=lfs\n").unwrap();
+        fs::write(root.join("asset.bin"), "raw-binary-bytes\n").unwrap();
+
+        let files = vec![FileChange {
+            path: "asset.bin".into(),
+            status: snapshot::ChangeKind::Added,
+            added: Some(1),
+            removed: Some(0),
+        }];
+        let err = stage_planned(root, &head, &files, &root.join("private.index")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Refusing to ship asset.bin"), "{msg}");
+        assert!(msg.contains("filter `lfs`"), "{msg}");
     }
 }

@@ -135,7 +135,7 @@ pub(super) fn run_dir(run: &Run) -> std::path::PathBuf {
 
 /// The top of the repository holding `dir`, which Git paths start from.
 pub(super) fn repo_root(dir: &std::path::Path) -> std::path::PathBuf {
-    std::process::Command::new("git")
+    crate::snapshot::git_command()
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(dir)
         .stdin(std::process::Stdio::null())

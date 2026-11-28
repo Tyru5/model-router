@@ -6,15 +6,14 @@ Run: uv run --with-requirements scripts/requirements-smoke.txt python scripts/sm
 
 import json
 import os
-from pathlib import Path
 import shutil
 import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from smoke_common import ARTIFACTS, ROOT, Terminal, demo_config, records
-
 
 SLOW_SERVED = threading.Event()
 
@@ -176,7 +175,7 @@ def main():
                     paste(terminal, str(docs / file))
                     terminal.send("\r")
                     terminal.wait_for(
-                        lambda: error in terminal.text(),
+                        lambda error=error: error in terminal.text(),
                         f"{file} did not report an import error",
                     )
                     escape(terminal, 2)

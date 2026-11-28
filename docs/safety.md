@@ -125,7 +125,114 @@ each stage, and Git runs commands its config and hooks name (fsmonitor,
 filters, diff drivers). A stage refuses to start when a Git config file the
 router reads, or the target of an `include.path` or `includeIf.*.path`,
 lies in a path the stage may write. The router's own Git commands also pass
-`-c core.fsmonitor=false -c core.hooksPath=/dev/null`.
+`-c core.fsmonitor=false -c core.hooksPath=/dev/null`. Operations that inspect
+working-tree attributes, stage files, diff, apply patches, populate worktrees,
+or launch `git difftool` run against a fixed, private sanitized `GIT_DIR`
+config (requiring Git 2.26+) that excludes repo-local filters, diff/merge
+drivers, and difftools so concurrent `.git/config` changes cannot inject
+commands; it keeps repo-local Git LFS endpoint URLs and remote selection
+(`lfs.url`, `remote.*.url`, `remote.*.lfsurl`, `remote.lfsdefault`,
+`remote.lfspushdefault`, `branch.*.remote`). Router `git status` calls pass
+`--ignore-submodules=dirty`, so Git never runs inside a submodule with that
+submodule's own config; worktree mode checks each populated submodule with
+its own sanitized Git directory instead. New
+worktrees are checked for disabled smudge filters from the new worktree's own
+config, and a fan-out patch apply is refused when a patched file uses one. A
+three-way apply and its preview are refused when a patched file's `merge`
+attribute names a repo-local `merge.<name>.driver`, or the file has no `merge`
+attribute and a repo-local `merge.default` picks another driver than the
+sanitized config does; the driver never runs. A
+new worktree keeps the sparse-checkout settings and rules `git worktree add`
+copied to it (Git 2.36 or later): files outside them are not written, and
+only written files are checked for disabled smudge filters. When
+filling a new worktree fails, or a run's candidate and delegate worktrees are
+removed, the router removes those worktrees and their own records in the
+project's repository (never another repository's); it never runs
+`git worktree prune`. `model-router clean --worktrees` keeps a worktree
+if a tracked file on disk uses a disabled repo-local clean or process
+filter: Git cannot reliably tell whether that file is clean without the
+filter. Files a sparse checkout leaves out do not count. Other
+worktrees still go through an unforced `git worktree remove` with those
+filters disabled. The sanitized `GIT_DIR` lives in a `tmp` directory inside
+the router's socket directory, which stages cannot write. Partial clones
+(`extensions.partialClone` or `remote.*.promisor`) and a repository-local
+`lfs.storage` are refused; use a full clone and set `lfs.storage` globally.
+
+A ship's commit and push run with the repository's own Git config, so its
+plan names the repo-local entries that run a command, change where a push
+goes, or change which server it trusts: `gpg.program`, `gpg.<format>.program`,
+`gpg.ssh.defaultKeyCommand`, `core.sshCommand`, `core.askPass`,
+`core.gitProxy`, `credential.helper`, `credential.<url>.helper`,
+`url.<base>.insteadOf`, `url.<base>.pushInsteadOf`, `remote.<name>.pushUrl`,
+`remote.<name>.proxy`, `remote.<name>.receivepack`,
+`remote.<name>.uploadpack`, `remote.<name>.vcs`, a `remote.<name>.url` that
+runs a remote helper (`ext::...`, or a `scheme://` Git does not handle
+itself), every `http.*` and `protocol.*` key, `push.recurseSubmodules`,
+`push.followTags`, `push.negotiate`, `push.pushOption`, and
+`submodule.recurse`. A plan with
+any of them always waits for confirmation, even with `confirm = false`.
+A helper, proxy, or URL can hold a credential, so the plan and `plan.json`
+name the keys only (`credential.helper`, `remote.*.pushurl`), never a value
+or subsection. Read the values with `git config --show-scope --list`.
+`plan.json` also keeps a digest of every repo-local entry (PBKDF2-HMAC-SHA256,
+100,000 rounds, salted with the workspace path). The ship stops if that
+digest differs before staging, before the commit, or before the push, so
+any repo-local config change after the plan means planning again. After the
+commit the ship updates the checkout's index (with repo-local filters turned
+off, so a locked index stops it with nothing pushed) and moves the checkout
+to the new branch, and only then pushes. Config an `includeIf.onbranch` rule
+turns on for that branch is not what the plan recorded, so the push is
+refused and the commit stays on the branch for you to push. The plan also
+keeps a digest of the Git config of every scope, and the push is refused
+when it differs on the new branch, which covers a rule in your own or the
+system's config that applies to one branch and not the other. That digest
+includes config your environment passes Git (`GIT_CONFIG_PARAMETERS`,
+`GIT_CONFIG_COUNT`), so a `resume --advance` run with settings the plan did
+not see asks you to confirm a new plan. The push
+sends the scanned commit by its ID to the planned branch, with
+`--no-follow-tags` and without pushing submodule commits (it only checks
+them when your config asks for any submodule handling), and then records
+the branch's upstream.
+A push remote that only a legacy
+`.git/remotes/<name>` or `.git/branches/<name>` file defines is refused,
+since `git config` does not list it.
+Worktree creation and shipping fail closed when affected files rely
+on suppressed repo-local filters. A snapshot is refused if Git reports a
+new or modified file that needs a disabled clean filter, rather than recording
+unfiltered bytes. The filter comes from the working tree's `.gitattributes`
+(the index's where there is none), as `git add` reads it. Even a
+timestamp-only change can make Git reread a file.
+Workflows with `protected_paths` or blocking `policies` fail before launch
+when the pre-stage snapshot cannot be captured.
+
+Snapshots skip files Git ignores, so for an ordinary stage `protected_paths`
+also compares the ignored, untracked files that match its globs before the
+harness, after it exits, and again after configured stage checks run. It
+blocks the stage when one was added, changed, or removed, whatever made Git
+ignore it (`.gitignore`, `.git/info/exclude`, `core.excludesFile`). It
+reads each file's path, mode, and contents, a
+symbolic link's target and, when the link stays inside the work tree, the
+file it leads to, and the matching files inside an
+ignored nested repository; it skips the router's own `.model-router`. A
+glob such as `dir/**` therefore also covers ignored build output under
+`dir`. Git lists the files
+against the run's own snapshot index, so staging one in the checkout's index
+does not hide it. Each read is limited to 64 MiB per matching ignored file
+and 256 MiB in all; past that the stage stops. Keep large files out of
+`protected_paths`. Anything Git warns
+about while listing them (a directory it cannot read) also stops the stage.
+Git walks each glob's literal leading directories only, so that applies
+under those, and everywhere for a glob that starts with a wildcard.
+`run.json` keeps only a PBKDF2 digest of them. A `before_stage` hook
+runs after the first reading, so a hook that rewrites a protected ignored
+file blocks its stage, as it does for a tracked one. Not covered, as for
+tracked files: paths inside submodules, and names that differ only by case
+on a case-insensitive filesystem.
+
+Blocking `policies` govern what a run can ship or apply. Both take their
+files from the snapshot trees, so a file Git ignores, however it came to be
+ignored, is never shipped or applied, and is not scanned at the stage. `ship`
+stages only its planned paths and scans them again before the commit.
 
 A stage cannot reach a terminal host (see below), whose harness runs outside
 the sandbox, through the usual socket directories: `$XDG_RUNTIME_DIR/model-router`,
@@ -206,7 +313,9 @@ GitHub URLs go through `gh` and its login; imports read only the named file,
 issue, or PR. Other URLs are fetched without credentials. HTTPS may not
 redirect to HTTP, and neither redirects nor DNS answers may reach loopback,
 link-local (`169.254.0.0/16`, `fe80::/10`), or private (RFC 1918, `fc00::/7`)
-addresses, unless the URL you typed names such a host.
+addresses, unless the URL you typed has such an IP address or `localhost`
+(or a `*.localhost` name) as its host. A public name that resolves to a
+private address is refused.
 
 ## Process cleanup
 
@@ -297,9 +406,10 @@ calls.
   both phases. It runs with `cwd` = workspace, `{files}` and
   `MODEL_ROUTER_SHIP_FILES` = planned paths, and `GIT_INDEX_FILE` = a private
   index containing `HEAD` plus the planned files as they are now, so `--staged`
-  scanners see exactly what will be committed. Your own index is never read or
-  written; planning writes blob objects to Git's object database. Requires
-  project trust and fails closed if missing or non-zero.
+  scanners see exactly what will be committed, in its own process group with
+  `GIT_CONFIG_PARAMETERS` disabling hooks and fsmonitor. Your own index is
+  never read or written; planning writes blob objects to Git's object database.
+  Requires project trust and fails closed if missing or non-zero.
 
 ## Not enforced
 

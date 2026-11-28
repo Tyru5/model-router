@@ -175,6 +175,11 @@ pub struct Attempt {
     /// checks, outside Git, or in runs saved before receipts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checks_tree: Option<String>,
+    /// `snapshot::ignored_protected_digest` before the harness starts,
+    /// recorded when the workflow has `protected_paths`. None otherwise and
+    /// in runs saved before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_protected_before: Option<String>,
     /// Tokens and cost the harness reported; None when it reported none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<handoff::Usage>,

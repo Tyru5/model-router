@@ -603,89 +603,97 @@ fn schedule_task(
             return Ok(schedule_view(&run.project, earlier));
         }
     }
-    let schedule = schedules::update(&run.project, |store| {
-        let now = Utc::now();
-        let existing = store
-            .schedules
-            .iter_mut()
-            .find(|s| id.as_deref() == Some(s.id.as_str()));
-        let schedule = match existing {
-            Some(schedule) => {
-                if let Some(workflow) = &workflow {
-                    schedule.workflow = Some(workflow.clone());
+    let schedule = schedules::update_after(
+        &run.project,
+        |store| {
+            let now = Utc::now();
+            let existing = store
+                .schedules
+                .iter_mut()
+                .find(|s| id.as_deref() == Some(s.id.as_str()));
+            let schedule = match existing {
+                Some(schedule) => {
+                    if let Some(workflow) = &workflow {
+                        schedule.workflow = Some(workflow.clone());
+                    }
+                    if let Some(task) = text("task") {
+                        schedule.task = task.to_owned();
+                    }
+                    if let Some(trigger) = &trigger {
+                        schedule.trigger = trigger.clone();
+                    } else if let Some(tz) = text("tz") {
+                        // A tz alone re-times the stored at/cron trigger.
+                        schedule.trigger = schedule.trigger.with_tz(Some(tz))?;
+                    }
+                    if let Some(enabled) = arguments.get("enabled").and_then(Value::as_bool) {
+                        schedule.enabled = enabled;
+                    }
+                    schedule.ceiling = ceiling.clone();
+                    schedule.revision += 1;
+                    schedule.updated_at = now;
+                    schedule.approved_at = None;
+                    if let Some(key) = &key {
+                        schedule.client_request_id = key.clone();
+                        schedule.requested_by = requester.clone();
+                        schedule.request_fingerprint = fingerprint.clone();
+                    }
+                    schedule.clone()
                 }
-                if let Some(task) = text("task") {
-                    schedule.task = task.to_owned();
+                None => {
+                    if id.is_some() {
+                        anyhow::bail!("No schedule {}", id.as_deref().unwrap_or_default());
+                    }
+                    let task = text("task").context("task is required for a new schedule")?;
+                    let trigger = trigger
+                        .clone()
+                        .context("Give one of every, at, cron, or webhook")?;
+                    let number = store
+                        .schedules
+                        .iter()
+                        .filter_map(|s| s.id.strip_prefix('s')?.parse::<usize>().ok())
+                        .max()
+                        .unwrap_or(0)
+                        + 1;
+                    let schedule = Schedule {
+                        id: format!("s{number}"),
+                        workflow: workflow.clone(),
+                        task: task.to_owned(),
+                        trigger,
+                        enabled: arguments
+                            .get("enabled")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true),
+                        created_by: created_by.clone(),
+                        ceiling: ceiling.clone(),
+                        client_request_id: key.clone().unwrap_or_default(),
+                        requested_by: key.as_ref().map(|_| requester.clone()).unwrap_or_default(),
+                        request_fingerprint: key
+                            .as_ref()
+                            .map(|_| fingerprint.clone())
+                            .unwrap_or_default(),
+                        revision: 1,
+                        created_at: now,
+                        updated_at: now,
+                        approved_at: None,
+                        paused_reason: None,
+                        occurrences: vec![],
+                    };
+                    store.schedules.push(schedule.clone());
+                    schedule
                 }
-                if let Some(trigger) = &trigger {
-                    schedule.trigger = trigger.clone();
-                } else if let Some(tz) = text("tz") {
-                    // A tz alone re-times the stored at/cron trigger.
-                    schedule.trigger = schedule.trigger.with_tz(Some(tz))?;
-                }
-                if let Some(enabled) = arguments.get("enabled").and_then(Value::as_bool) {
-                    schedule.enabled = enabled;
-                }
-                schedule.ceiling = ceiling.clone();
-                schedule.revision += 1;
-                schedule.updated_at = now;
-                schedule.approved_at = None;
-                if let Some(key) = &key {
-                    schedule.client_request_id = key.clone();
-                    schedule.requested_by = requester.clone();
-                    schedule.request_fingerprint = fingerprint.clone();
-                }
-                schedule.clone()
-            }
-            None => {
-                if id.is_some() {
-                    anyhow::bail!("No schedule {}", id.as_deref().unwrap_or_default());
-                }
-                let task = text("task").context("task is required for a new schedule")?;
-                let trigger = trigger
-                    .clone()
-                    .context("Give one of every, at, cron, or webhook")?;
-                let number = store
-                    .schedules
-                    .iter()
-                    .filter_map(|s| s.id.strip_prefix('s')?.parse::<usize>().ok())
-                    .max()
-                    .unwrap_or(0)
-                    + 1;
-                let schedule = Schedule {
-                    id: format!("s{number}"),
-                    workflow: workflow.clone(),
-                    task: task.to_owned(),
-                    trigger,
-                    enabled: arguments
-                        .get("enabled")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true),
-                    created_by: created_by.clone(),
-                    ceiling: ceiling.clone(),
-                    client_request_id: key.clone().unwrap_or_default(),
-                    requested_by: key.as_ref().map(|_| requester.clone()).unwrap_or_default(),
-                    request_fingerprint: key
-                        .as_ref()
-                        .map(|_| fingerprint.clone())
-                        .unwrap_or_default(),
-                    revision: 1,
-                    created_at: now,
-                    updated_at: now,
-                    approved_at: None,
-                    paused_reason: None,
-                    occurrences: vec![],
-                };
-                store.schedules.push(schedule.clone());
-                schedule
-            }
-        };
-        schedules::check_launchable(&settings, schedule.workflow.as_deref(), &schedule.ceiling)?;
-        Ok(schedule)
-    })
+            };
+            schedules::check_launchable(
+                &settings,
+                schedule.workflow.as_deref(),
+                &schedule.ceiling,
+            )?;
+            Ok(schedule)
+        },
+        // Any edit needs approval again; revoke only after save succeeds while
+        // schedules.lock is still held.
+        |schedule| schedules::revoke(&run.project, &schedule.id),
+    )
     .map_err(|e| error("invalid_request", format!("{e:#}")))?;
-    // Any edit needs approval again.
-    schedules::revoke(&run.project, &schedule.id);
     Ok(schedule_view(&run.project, &schedule))
 }
 

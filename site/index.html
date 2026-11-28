@@ -557,7 +557,7 @@ document.querySelectorAll('[data-copy]').forEach(b=>b.addEventListener('click',(
 
 /* ---------- Shared line: one source for the diagram, patch bay, and terminal ---------- */
 const H=[
-  {id:'codex',name:'Codex',model:'gpt-6-astra',c:'#E8A82A',out:'native',status:'ready'},
+  {id:'codex',name:'Codex',model:'',c:'#E8A82A',out:'native',status:'ready'},
   {id:'claude',name:'Claude Code',model:'sonnet',c:'#1F4D3F',out:'native',status:'ready'},
   {id:'gemini',name:'Gemini',model:'',c:'#E0503A',out:'handoff file',status:'ready'},
   {id:'amp',name:'Amp',model:'high',c:'#3E9A66',out:'handoff file',status:'ready'},
@@ -565,7 +565,7 @@ const H=[
   {id:'aider',name:'Aider',model:'',c:'#9A6B3A',out:'handoff file',status:'not installed'},
 ];
 const S=[
-  {id:'research',name:'Investigate',role:'research',mode:'unattended',h:'codex',m:'gpt-6-astra',on:true,ins:'Find the root cause and propose a plan. Do not change code.'},
+  {id:'research',name:'Investigate',role:'research',mode:'unattended',h:'codex',m:'',on:true,ins:'Find the root cause and propose a plan. Do not change code.'},
   {id:'implement',name:'Implement',role:'implementation',mode:'interactive',h:'claude',m:'sonnet',on:true,ins:'Implement using the prior findings. Run checks.'},
   {id:'review',name:'Review',role:'review',mode:'unattended',h:'gemini',m:'',on:true,ins:'Return pass or needs_changes with blocking findings.'},
   {id:'summary',name:'Review summary',role:'summary',mode:'unattended',h:'codex',m:'',on:true,ins:'Write the review brief from the handoffs and the diff.'},

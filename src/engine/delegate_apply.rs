@@ -19,13 +19,14 @@ fn error(code: &'static str, message: impl Into<String>) -> ToolError {
 /// the snapshot index. None when it cannot tell (no Git 2.32 `--cached`
 /// three-way merge, or a conflict).
 fn predict(workspace: &Path, index: &Path, patch: &Path, scratch: &Path) -> Option<String> {
-    let top = snapshot::top_level(workspace).ok()?;
+    let sanitized = snapshot::SanitizedGitDir::new(workspace).ok()?;
+    let top = sanitized.top_level().to_path_buf();
     let predict = std::path::absolute(scratch.join("predict.index")).ok()?;
     fs::copy(index, &predict).ok()?;
     let run = |args: &[&str]| {
-        snapshot::git_command()
+        sanitized
+            .command(&top)
             .args(args)
-            .current_dir(&top)
             .env("GIT_INDEX_FILE", &predict)
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -160,15 +161,24 @@ pub(super) fn apply_patch(
             unknown: false,
         }),
     )?;
-    let applied = fanout::apply(
+    let applied = match fanout::apply(
         &run.workspace,
         &snapshot_index,
         &current,
         &patch.files,
         &patch.path,
         &scratch,
-    )
-    .map_err(|e| error("orchestration_error", format!("{e:#}")))?;
+    ) {
+        Ok(applied) => applied,
+        Err(e) => {
+            // A refusal wrote nothing: forget the attempt, so recovery
+            // cannot take a later change to the checkout for this apply.
+            if e.downcast_ref::<fanout::Refused>().is_some() {
+                set_journal(run, index, id, revision, None)?;
+            }
+            return Err(error("orchestration_error", format!("{e:#}")));
+        }
+    };
     match applied {
         fanout::Applied::Clean | fanout::Applied::Merged => {
             if let Some(journal) = journal_mut(run, index, id, revision) {

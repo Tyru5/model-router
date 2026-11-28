@@ -40,6 +40,7 @@ fn init_git(dir: &Path) {
 
 #[test]
 fn stall_timeout_stops_silent_stage_but_allows_active_output() {
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let script = dir.path().join("stall.py");
     fs::write(
@@ -129,6 +130,60 @@ fn protected_paths_block_stage_that_edits_matching_file() {
     assert!(err.contains(".github/workflows/ci.yml"), "{err}");
 }
 
+/// Snapshots skip files Git ignores, so a protected file the stage writes
+/// while Git ignores it is not in the tree diff. The stage still stops
+/// blocked, and an ignored protected file it leaves alone does not block it.
+#[test]
+fn protected_paths_cover_files_git_ignores() {
+    let dir = common::tempdir();
+    init_git(dir.path());
+    fs::write(dir.path().join(".gitignore"), ".env\n.model-router/\n").unwrap();
+    git(dir.path(), &["add", ".gitignore"]);
+    git(dir.path(), &["commit", "-m", "ignore .env"]);
+    fs::write(dir.path().join(".env"), "TOKEN=kept\n").unwrap();
+
+    let run_stage = |target: &str, check: Option<&str>| {
+        let mut impl_stage = stage("implement", Role::Implementation);
+        impl_stage.extra_args = vec!["--write-file".into(), target.into()];
+        if let Some(script) = check {
+            impl_stage.checks.push(model_router::config::Check {
+                command: vec!["python3".into(), "-c".into(), script.into()],
+                ..Default::default()
+            });
+        }
+        let mut wf = Workflow::new("Protected", vec![impl_stage]);
+        wf.protected_paths = vec![".env".into()];
+        let settings = common::settings(&wf);
+        let mut run = Run::create(dir.path(), &settings, &wf, "task".into(), false).unwrap();
+        let action = drive(&mut run);
+        (action, run)
+    };
+
+    let (action, run) = run_stage("notes.txt", Some("pass"));
+    assert_eq!(action, Action::Complete, "{:?}", run.error);
+
+    for (target, check) in [
+        (".env", None),
+        (
+            "notes.txt",
+            Some("from pathlib import Path; Path('.env').write_text('changed by check')"),
+        ),
+    ] {
+        fs::write(dir.path().join(".env"), "TOKEN=kept\n").unwrap();
+        let (action, run) = run_stage(target, check);
+        assert_eq!(action, Action::Stopped);
+        assert_eq!(run.status, Status::Blocked);
+        let err = run.error.as_deref().unwrap_or("");
+        assert!(err.contains("Git-ignored file matching"), "{err}");
+        if check.is_some() {
+            assert_eq!(
+                run.stages[0].attempts[0].checks[0].status,
+                model_router::handoff::TestStatus::Passed
+            );
+        }
+    }
+}
+
 /// A fan-out candidate that edits a protected path stops blocked, and its
 /// patch never reaches the workspace.
 #[test]
@@ -170,6 +225,7 @@ fn protected_paths_block_fan_out_candidates_before_they_are_applied() {
 
 #[test]
 fn handoff_repair_nudges_resumable_session_for_valid_json() {
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let script = dir.path().join("repair_mock.py");
     fs::write(
@@ -272,6 +328,7 @@ else:
 
 #[test]
 fn handoff_repair_cancellation_marks_cancelled_and_uses_attempt_schema() {
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let script = dir.path().join("cancel_repair_mock.py");
     fs::write(
@@ -351,6 +408,7 @@ else:
 /// stage output instead of stopping silently.
 #[test]
 fn handoff_repair_reports_why_it_did_not_help() {
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let script = dir.path().join("no_repair_mock.py");
     fs::write(
@@ -480,6 +538,7 @@ fn stall_timeout_is_rejected_for_harnesses_that_print_only_at_exit() {
 /// Without a stage `billing` or a router provider, the harness decides.
 #[test]
 fn billing_defaults_follow_the_harness() {
+    common::isolate_config_dir();
     let custom = BTreeMap::from([(
         "mine".to_string(),
         CustomAdapter {
@@ -578,6 +637,7 @@ fn apply_worktree_brings_changes_back_uncommitted() {
 
 #[test]
 fn ship_blocks_added_secrets_and_protected_paths() {
+    common::isolate_config_dir();
     let dir = common::tempdir();
     init_git(dir.path());
     let secret = format!("token = \"{}1234567890abcdefghij1234567890\"\n", "ghp_");
@@ -625,6 +685,7 @@ with open(sys.argv[1], "w") as f:
 
 #[test]
 fn budget_warn_continues_and_billing_splits_api_vs_subscription() {
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let script = dir.path().join("cost_mock.py");
     fs::write(
@@ -912,6 +973,7 @@ fn scripted_run(dir: &Path, body: &str) -> Run {
 
 /// `scripted_run`, in its own worktree when `worktree`.
 fn scripted_run_in(dir: &Path, body: &str, worktree: bool) -> Run {
+    common::isolate_config_dir();
     let script = dir.join(".git/scripted_stage.py");
     fs::write(
         &script,
@@ -1105,6 +1167,7 @@ sys.exit(3 if os.path.exists(sys.argv[1] + ".fail") else 0)
 /// merge with checkout edits, and changes nothing.
 #[test]
 fn apply_check_predicts_merges_and_conflicts_without_touching_the_checkout() {
+    common::isolate_config_dir();
     let dir = common::tempdir();
     init_git(dir.path());
     let lines = |edit: &[(usize, &str)]| -> String {

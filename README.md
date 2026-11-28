@@ -59,11 +59,11 @@ The first launch opens a tour that walks these steps to a completed run;
 The default workflow:
 
 ```text
-Codex / gpt-6-astra       Claude Code / sonnet      Code review          Codex
+Codex                     Claude Code / sonnet      Code review          Codex
 Investigate, unattended → Implement, interactive → disabled initially → Review summary, unattended
 ```
 
-Replace the Astra ID if your account differs. `w` adds presets such as
+Codex stages leave `model` blank to inherit your harness default. `w` adds presets such as
 **Quick task**, **Bug fix**, or **Best-of-3 implement**.
 
 ## Features

@@ -363,6 +363,25 @@ pub(crate) fn socket_dir() -> Result<PathBuf> {
 }
 
 /// A real directory, not a link, owned by this user and closed to others.
+/// A private scratch directory inside `socket_dir`, which sandboxed stages
+/// can neither write nor (under bubblewrap) see, for files the router trusts
+/// while stages run: the sanitized Git directory and the staged capture
+/// script. The default temp directory is writable by Seatbelt stages.
+pub(crate) fn private_temp_dir() -> Result<PathBuf> {
+    let dir = socket_dir()?.join("tmp");
+    match fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).with_context(|| format!("Create {}", dir.display())),
+    }
+    ensure!(
+        is_private_dir(&dir),
+        "{} must be a private directory owned by you",
+        dir.display()
+    );
+    Ok(dir)
+}
+
 pub fn is_private_dir(dir: &Path) -> bool {
     // SAFETY: getuid cannot fail.
     let uid = unsafe { libc::getuid() };

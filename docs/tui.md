@@ -327,7 +327,7 @@ the pager shows the rest.
 | `w` | Toggle wrap |
 | `o` | Coloured patch in `$PAGER` (default `less -R`) |
 | `e` / `Enter` | Open the file at the line in view in `$VISUAL`/`$EDITOR` (`+N` for vi/Vim/Neovim/nano/Emacs, `file:N` Helix, `-g file:N` VS Code) |
-| `D` | `git difftool --dir-diff` over the run's changes (needs `diff.tool`) |
+| `D` | `git difftool --dir-diff` over the run's changes (needs global `diff.tool`; refuses repo-local difftool, mergetool, and filter config) |
 | `q` / `Esc` | Close |
 
 `$PAGER` and `$EDITOR` are split like shell words and run without a shell.
@@ -414,8 +414,10 @@ existing manifest.
 
 One batch runs at a time per project; quitting or switching projects does not
 stop running tests, and their results are dropped. The footer shows `t` and
-`x` only when the project is a model-router checkout; elsewhere the keys
-explain what they need.
+`x` only when the project is a model-router checkout whose
+`scripts/capture_harness_output.py` is a regular file (not a symlink) matching
+the running binary's built-in copy byte for byte; elsewhere (including after
+switching branches to a different script) the keys explain what they need.
 
 ## Stats dialog
 

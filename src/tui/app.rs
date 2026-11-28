@@ -1267,6 +1267,12 @@ fn repository_line(app: &App, palette: Palette) -> Line<'static> {
                     Style::default().fg(palette.warn),
                 ));
             }
+            if let Some(error) = &repo.status_error {
+                spans.push(Span::styled(
+                    format!("  status unavailable: {error}"),
+                    Style::default().fg(palette.warn),
+                ));
+            }
             spans
         }
         None => vec![

@@ -212,13 +212,13 @@ pub fn run(
     {
         let (server, stop) = (server.clone(), shutdown.clone());
         std::thread::spawn(move || {
-            let mut last = std::time::Instant::now() - Duration::from_secs(60);
+            let mut last: Option<std::time::Instant> = None;
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(500));
-                if last.elapsed() < Duration::from_secs(30) {
+                if last.is_some_and(|t| t.elapsed() < Duration::from_secs(30)) {
                     continue;
                 }
-                last = std::time::Instant::now();
+                last = Some(std::time::Instant::now());
                 if let Err(error) = server.fire_schedules(None) {
                     log(format!("schedules: {error:#}"));
                 }
@@ -232,7 +232,7 @@ pub fn run(
         );
         let (token, from_env) = match std::env::var(TOKEN_ENV) {
             Ok(token) if !token.trim().is_empty() => (token.trim().to_owned(), true),
-            _ => (http::new_token(), false),
+            _ => (http::new_token()?, false),
         };
         let listener = std::net::TcpListener::bind(addr)
             .with_context(|| format!("Bind the HTTP API to {addr}"))?;

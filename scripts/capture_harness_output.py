@@ -23,13 +23,13 @@ import datetime
 import getpass
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests/fixtures/harness-output"
@@ -168,6 +168,7 @@ def version_of(program):
             capture_output=True,
             text=True,
             timeout=30,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         sys.exit(f"{program} --version failed: {error}")
@@ -295,6 +296,7 @@ def main():
             capture_output=True,
             text=True,
             timeout=args.timeout + 60,
+            check=False,
         )
         logs = sorted(
             project.glob(".model-router/runs/*/01-capture/attempt-*/stdout.log")

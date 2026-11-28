@@ -93,6 +93,45 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
     if let (Some(plan), Some(mcp)) = (sandbox.as_mut(), &mcp) {
         plan.allow_orch(&mcp.sock, &mcp.token_file, &mcp.program);
     }
+    let check_protected = !run.workflow.protected_paths.is_empty();
+    let check_policies = crate::policy::has_block_policies(&run.workflow.policies);
+    if !check_protected && !check_policies && snapshot::is_repository(&run.workspace) {
+        snapshot::ensure_supported_git(&run.workspace)?;
+    }
+    let tree_before = if check_protected || check_policies {
+        let what = match (check_protected, check_policies) {
+            (true, true) => "workflow protected_paths and policies",
+            (true, false) => "workflow protected_paths",
+            (false, true) => "workflow policies",
+            (false, false) => unreachable!(),
+        };
+        let tree = snapshot::try_tree(&run.workspace, &run.directory).with_context(|| {
+            format!(
+                "Cannot start stage: failed to capture pre-stage Git snapshot required by {what}"
+            )
+        })?;
+        ensure!(
+            tree.is_some(),
+            "Cannot start stage: {what} require a pre-stage Git snapshot, but {} is not a Git repository",
+            run.workspace.display()
+        );
+        tree
+    } else {
+        snapshot::tree(&run.workspace, &run.directory)
+    };
+    // Snapshots skip files Git ignores, so protected ones are compared apart.
+    let ignored_protected_before = if check_protected {
+        snapshot::ignored_protected_digest(
+            &run.workspace,
+            &run.directory,
+            &run.workflow.protected_paths,
+        )
+            .context(
+                "Cannot start stage: failed to read the Git-ignored files workflow protected_paths cover",
+            )?
+    } else {
+        None
+    };
     let harness_version = adapters::detected_version(&stage.harness, &invocation.program);
     storage::write_json_fast(
         &directory.join("command.json"),
@@ -110,9 +149,10 @@ pub(super) fn prepare(run: &mut Run) -> Result<Prepared> {
         handoff_file: handoff_file.clone(),
         error: None,
         checks: vec![],
-        tree_before: snapshot::tree(&run.workspace, &run.directory),
+        tree_before,
         tree_after: None,
         checks_tree: None,
+        ignored_protected_before,
         usage: None,
         session,
         process_group: None,
@@ -648,6 +688,11 @@ pub(super) fn finish(
     let mut fresh_tree: Option<String> = None;
     let check_protected = !run.workflow.protected_paths.is_empty();
     let check_policies = crate::policy::has_block_policies(&run.workflow.policies);
+    let attempts = &run.stages[index].attempts;
+    let from = prepared
+        .retry_from
+        .filter(|&first| first < attempts.len())
+        .unwrap_or(attempts.len().saturating_sub(1));
     if check_protected || check_policies {
         let workspace = run.workspace.clone();
         let what = match (check_protected, check_policies) {
@@ -656,11 +701,6 @@ pub(super) fn finish(
             (false, true) => "workflow policies",
             (false, false) => unreachable!(),
         };
-        let attempts = &run.stages[index].attempts;
-        let from = prepared
-            .retry_from
-            .filter(|&first| first < attempts.len())
-            .unwrap_or(attempts.len().saturating_sub(1));
         let Some(before) = attempts.get(from).and_then(|a| a.tree_before.clone()) else {
             run.stop(
                 Status::Blocked,
@@ -670,18 +710,24 @@ pub(super) fn finish(
             )?;
             return Ok(None);
         };
-        let Some(after) = snapshot::tree(&workspace, &run.directory) else {
-            run.stop(
-                Status::Blocked,
-                format!(
-                    "Could not snapshot workspace to verify {what}; inspect workspace and retry"
-                ),
-                Actor::Engine,
-                true,
-            )?;
-            return Ok(None);
+        let after = match snapshot::try_tree(&workspace, &run.directory)
+            .and_then(|tree| tree.context("Workspace has no Git snapshot"))
+        {
+            Ok(tree) => tree,
+            Err(error) => {
+                run.stop(
+                    Status::Blocked,
+                    format!("Could not snapshot workspace to verify {what}: {error:#}"),
+                    Actor::Engine,
+                    true,
+                )?;
+                return Ok(None);
+            }
         };
         fresh_tree = Some(after.clone());
+        if check_protected && !check_ignored_protected(run, from)? {
+            return Ok(fresh_tree);
+        }
         if after != before {
             if check_protected {
                 let changed = match snapshot::changed_paths(&workspace, &before, &after) {
@@ -712,6 +758,10 @@ pub(super) fn finish(
                     return Ok(fresh_tree);
                 }
             }
+            // Policies govern what a run can ship or apply, and both take
+            // their files from these snapshot trees. A file Git ignores is in
+            // neither tree, so it can be neither shipped nor applied, and
+            // `ship` scans what it stages again. It needs no scan here.
             if check_policies {
                 let mut scan = crate::policy::PolicyScan::new(&run.workflow.policies);
                 if let Err(error) =
@@ -737,11 +787,12 @@ pub(super) fn finish(
             }
         }
     }
-    if !blocked {
-        let existing = (!run.workflow.stages[index].checks.is_empty())
-            .then(|| fresh_tree.take())
-            .flatten();
-        if !run_checks(run, prepared, existing, cancel, emit)? {
+    if !blocked && !run.workflow.stages[index].checks.is_empty() {
+        if !run_checks(run, prepared, fresh_tree.take(), cancel, emit)? {
+            return Ok(None);
+        }
+        // Checks can write ignored files without changing the tested tree.
+        if check_protected && !check_ignored_protected(run, from)? {
             return Ok(None);
         }
     }
@@ -751,6 +802,30 @@ pub(super) fn finish(
         run.advance(Actor::Engine)?;
     }
     Ok(fresh_tree)
+}
+
+/// Checks protected files that won't appear in a Git snapshot diff.
+fn check_ignored_protected(run: &mut Run, from: usize) -> Result<bool> {
+    let before = run.stages[run.cursor]
+        .attempts
+        .get(from)
+        .and_then(|a| a.ignored_protected_before.as_deref());
+    let problem = match before {
+        None => "Could not verify workflow protected_paths: this attempt recorded no baseline of Git-ignored protected files; retry the stage".to_owned(),
+        Some(before) => match snapshot::ignored_protected_digest(
+            &run.workspace,
+            &run.directory,
+            &run.workflow.protected_paths,
+        ) {
+            Ok(after) if after.as_deref() == Some(before) => return Ok(true),
+            Ok(_) => "A Git-ignored file matching workflow protected_paths was added, changed, or removed during the stage. Revert it or update workflow protected_paths before retrying".to_owned(),
+            Err(error) => format!(
+                "Could not read the Git-ignored files workflow protected_paths cover: {error:#}"
+            ),
+        },
+    };
+    run.stop(Status::Blocked, problem, Actor::Engine, true)?;
+    Ok(false)
 }
 
 /// Runs the current stage's router checks. False when cancellation stopped the run.

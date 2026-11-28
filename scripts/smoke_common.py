@@ -15,7 +15,6 @@ import codecs
 import fcntl
 import json
 import os
-from pathlib import Path
 import pty
 import re
 import select
@@ -27,6 +26,7 @@ import sys
 import tempfile
 import termios
 import time
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS = ROOT / ".model-router/qa"
@@ -193,7 +193,8 @@ class Terminal:
                 stdin=slave,
                 stdout=slave,
                 stderr=slave,
-                preexec_fn=setup,
+                # Single-threaded smoke helper; TIOCSCTTY requires preexec_fn.
+                preexec_fn=setup,  # noqa: PLW1509
             )
         except BaseException:
             os.close(self.master)

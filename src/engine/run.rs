@@ -121,10 +121,14 @@ impl Run {
                     .map(|c| c.stage(s))
             })
             .collect();
+        let is_repo = snapshot::is_repository(project);
         ensure!(
-            candidates.is_empty() || snapshot::is_repository(project),
+            candidates.is_empty() || is_repo,
             "Fan-out stages need a Git repository: candidates run in Git worktrees"
         );
+        if is_repo {
+            snapshot::ensure_supported_git(project)?;
+        }
         for stage in workflow
             .stages
             .iter()
@@ -181,11 +185,7 @@ impl Run {
                     return;
                 }
                 if let Some(path) = &self.worktree {
-                    if let Some(s) = path.to_str() {
-                        let _ = storage::git(&self.project, &["worktree", "remove", "--force", s]);
-                    }
-                    let _ = fs::remove_dir_all(path);
-                    let _ = storage::git(&self.project, &["worktree", "prune"]);
+                    storage::discard_worktree(&self.project, path);
                     let _ = storage::git(
                         &self.project,
                         &["branch", "-D", &format!("model-router/{}", self.id)],
@@ -1311,7 +1311,8 @@ impl Run {
         if state.candidates.iter().any(|c| !c.attempts.is_empty()) {
             return Ok(());
         }
-        let base = snapshot::tree(&self.workspace, &self.directory)
+        let base = snapshot::try_tree(&self.workspace, &self.directory)
+            .context("Snapshot the workspace after before_stage hooks")?
             .context("Snapshot the workspace after before_stage hooks")?;
         if base == state.base {
             return Ok(());
@@ -1336,7 +1337,8 @@ impl Run {
             .join(format!("attempt-{number:03}"));
         fs::create_dir_all(&directory)?;
         if self.stages[index].fan_out.is_none() {
-            let base = snapshot::tree(&self.workspace, &self.directory)
+            let base = snapshot::try_tree(&self.workspace, &self.directory)
+                .context("Fan-out needs a Git snapshot of the workspace")?
                 .context("Fan-out needs a Git snapshot of the workspace")?;
             let reference = snapshot::base_ref(&self.id, &format!("{}-{number:03}", stage.id));
             let base_commit = fanout::base_commit(&self.workspace, &base, &reference)?;
@@ -1387,6 +1389,7 @@ impl Run {
             tree_before: Some(base),
             tree_after: None,
             checks_tree: None,
+            ignored_protected_before: None,
             usage: None,
             session: None,
             process_group: None,
@@ -1557,6 +1560,7 @@ impl Run {
             tree_before: Some(base),
             tree_after: None,
             checks_tree: None,
+            ignored_protected_before: None,
             usage: None,
             session,
             process_group: None,

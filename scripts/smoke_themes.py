@@ -5,11 +5,10 @@ Run: uv run --with-requirements scripts/requirements-smoke.txt python scripts/sm
 """
 
 import json
-from pathlib import Path
 import tempfile
+from pathlib import Path
 
 from smoke_common import ARTIFACTS, ROOT, Terminal, config_env, records
-
 
 THEMES = [
     ("Model Router", "model-router", "0d1421"),
@@ -102,7 +101,7 @@ def main():
                 assert "Choose theme" not in terminal.text()
                 terminal.wait_for_json(
                     prefs,
-                    lambda value: value["theme"] == theme_id,
+                    lambda value, theme_id=theme_id: value["theme"] == theme_id,
                     f"{label} was not saved",
                 )
                 assert background(terminal) == bg and "Keep my task" in terminal.text()

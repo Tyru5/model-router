@@ -4,6 +4,7 @@
 Run: uv run --with-requirements scripts/requirements-smoke.txt python scripts/smoke_startup.py
 """
 
+import itertools
 import os
 import signal
 import subprocess
@@ -12,7 +13,6 @@ import time
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
-
 from smoke_common import ARTIFACTS, BINARY, ROOT, Terminal, records
 
 BACKGROUND = (13, 20, 33)
@@ -80,7 +80,7 @@ def main():
             assert len(states) >= 6, "The animation did not visibly advance"
             assert not records(project), "Startup launched a workflow"
             durations = [
-                max(20, int((b - a) * 1000)) for a, b in zip(timings, timings[1:])
+                max(20, int((b - a) * 1000)) for a, b in itertools.pairwise(timings)
             ]
             durations.append(300)
             frames[0].save(
@@ -142,7 +142,7 @@ def main():
             terminal = first_launch(extra, env)
             try:
                 terminal.wait_for(
-                    lambda: "1 Workflow" in terminal.text(),
+                    lambda terminal=terminal: "1 Workflow" in terminal.text(),
                     "Bypass did not open the TUI",
                     timeout=1,
                 )

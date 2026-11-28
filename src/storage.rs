@@ -255,15 +255,47 @@ pub struct RepoInfo {
     pub detached: bool,
     /// Modified, staged, or untracked entries in `git status`.
     pub changes: usize,
+    /// Why `git status` could not run with the sanitized Git config (a
+    /// partial clone, for example); `changes` is then 0.
+    pub status_error: Option<String>,
 }
 
 pub fn repo_info(project: &Path) -> Option<RepoInfo> {
-    let top = git_readonly(project, &["rev-parse", "--show-toplevel"]).ok()?;
+    // Detection reads no working-tree file, so it needs no sanitized config
+    // and still names a checkout that config refuses.
+    let top = git(project, &["rev-parse", "--show-toplevel"]).ok()?;
     let name = Path::new(&top)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| top.clone());
-    let status = git_readonly(project, &["status", "--porcelain=v2", "--branch"]).ok()?;
+    let status = match git_readonly(
+        project,
+        &[
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--ignore-submodules=dirty",
+        ],
+    ) {
+        Ok(status) => status,
+        Err(err) => {
+            let (head, detached) = match git(project, &["symbolic-ref", "--short", "-q", "HEAD"]) {
+                Ok(branch) => (branch, false),
+                Err(_) => (
+                    git(project, &["rev-parse", "--short", "HEAD"])
+                        .unwrap_or_else(|_| "no commits".into()),
+                    true,
+                ),
+            };
+            return Some(RepoInfo {
+                name,
+                head,
+                detached,
+                changes: 0,
+                status_error: Some(format!("{err:#}")),
+            });
+        }
+    };
     let mut oid = None;
     let mut branch_head = None;
     let mut changes = 0usize;
@@ -291,6 +323,7 @@ pub fn repo_info(project: &Path) -> Option<RepoInfo> {
         head,
         detached,
         changes,
+        status_error: None,
     })
 }
 
@@ -379,19 +412,8 @@ pub fn open_beneath(base: &Path, relative: &Path) -> Result<File> {
 }
 
 pub fn git(project: &Path, args: &[&str]) -> Result<String> {
-    git_with(project, args, false)
-}
-
-pub fn git_readonly(project: &Path, args: &[&str]) -> Result<String> {
-    git_with(project, args, true)
-}
-
-fn git_with(project: &Path, args: &[&str], no_optional_locks: bool) -> Result<String> {
     let mut command = crate::snapshot::git_command();
     command.args(args).current_dir(project);
-    if no_optional_locks {
-        command.env("GIT_OPTIONAL_LOCKS", "0");
-    }
     let output = command.output().context("Start Git")?;
     ensure!(
         output.status.success(),
@@ -404,28 +426,225 @@ fn git_with(project: &Path, args: &[&str], no_optional_locks: bool) -> Result<St
         .to_owned())
 }
 
+pub fn git_readonly(project: &Path, args: &[&str]) -> Result<String> {
+    let sanitized = crate::snapshot::SanitizedGitDir::new(project)?;
+    let mut command = sanitized.command(project);
+    command.args(args).env("GIT_OPTIONAL_LOCKS", "0");
+    let output = command.output().context("Start Git")?;
+    ensure!(
+        output.status.success(),
+        "git {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_owned())
+}
+
+/// Git's record of linked worktree `tree` (`<common dir>/worktrees/<id>`),
+/// when `project`'s repository holds it and `tree` is the path Git
+/// registered for it: a worktree of another repository is not `project`'s
+/// to remove, and a copy of a worktree that was moved still points at the
+/// moved one's record.
+pub(crate) fn worktree_record(project: &Path, tree: &Path) -> Result<PathBuf> {
+    let record = PathBuf::from(git(tree, &["rev-parse", "--absolute-git-dir"])?);
+    ensure!(
+        record
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "worktrees"),
+        "not a linked Git worktree"
+    );
+    let common = project.join(git(project, &["rev-parse", "--git-common-dir"])?);
+    let owned = match (
+        record.parent().and_then(Path::parent).map(fs::canonicalize),
+        fs::canonicalize(&common),
+    ) {
+        (Some(Ok(owner)), Ok(common)) => owner == common,
+        _ => false,
+    };
+    ensure!(owned, "a worktree of another repository");
+    let registered =
+        fs::read_to_string(record.join("gitdir")).context("Read the worktree's Git record")?;
+    // Absolute, or relative to the record (`extensions.relativeWorktrees`).
+    let registered = record.join(registered.trim_end_matches(['\n', '\r']));
+    let same = match (
+        fs::canonicalize(&registered),
+        fs::canonicalize(tree.join(".git")),
+    ) {
+        (Ok(registered), Ok(own)) => registered == own,
+        _ => false,
+    };
+    ensure!(same, "Git registered another path for this worktree");
+    Ok(record)
+}
+
+/// Rolls back worktree `tree`, which the router just added: removes it and
+/// its own record, by force. Never `git worktree prune`, which also drops
+/// the records of other worktrees whose directories are missing for now.
+pub(crate) fn discard_worktree(project: &Path, tree: &Path) {
+    let record = worktree_record(project, tree).ok();
+    if let Some(path) = tree.to_str() {
+        let _ = git(project, &["worktree", "remove", "--force", path]);
+    }
+    let _ = fs::remove_dir_all(tree);
+    if let Some(record) = record {
+        remove_worktree_record(tree, &record);
+    }
+}
+
+/// Removes `record` (from `worktree_record`) once worktree `tree` is gone.
+pub(crate) fn remove_worktree_record(tree: &Path, record: &Path) {
+    if fs::symlink_metadata(tree).is_err() {
+        let _ = fs::remove_dir_all(record);
+    }
+}
+
 /// A worktree on a new branch from HEAD. `require_clean` refuses when the
 /// project has uncommitted changes, which the worktree would not include.
 pub fn create_worktree(project: &Path, id: &str, require_clean: bool) -> Result<PathBuf> {
-    ensure!(
-        !require_clean || git_readonly(project, &["status", "--porcelain"])?.is_empty(),
-        "Worktree mode starts from committed HEAD. Commit or stash project changes, or use the current directory instead"
-    );
+    if require_clean {
+        ensure_clean_checkout(project)?;
+    }
+    // Resolve HEAD to a fixed commit SHA once so the filter check and
+    // `worktree add` operate on the exact same commit even if HEAD moves.
+    let head = git(project, &["rev-parse", "--verify", "HEAD^{commit}"])?;
     let base = metadata_dir(project)?.join("worktrees");
     fs::create_dir_all(&base)?;
     let path = base.join(id);
+    let path_str = path.to_str().context("Worktree path must be UTF-8")?;
+    let branch = format!("model-router/{id}");
     git(
         project,
         &[
             "worktree",
             "add",
+            "--no-checkout",
             "-b",
-            &format!("model-router/{id}"),
-            path.to_str().context("Worktree path must be UTF-8")?,
-            "HEAD",
+            &branch,
+            path_str,
+            &head,
         ],
     )?;
+    if let Err(err) = crate::snapshot::populate_worktree(&path, &head) {
+        discard_worktree(project, &path);
+        let _ = git(project, &["branch", "-D", &branch]);
+        return Err(err);
+    }
     Ok(path)
+}
+
+/// Paths of the checkout's populated submodules (gitlinks whose directory
+/// has a `.git` entry, whether a file or an old-style directory).
+fn populated_submodules(sanitized: &crate::snapshot::SanitizedGitDir) -> Result<Vec<PathBuf>> {
+    use std::os::unix::ffi::OsStrExt;
+    let top = sanitized.top_level();
+    let output = sanitized
+        .command(top)
+        .args(["ls-files", "--stage", "-z"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        output.status.success(),
+        "git ls-files --stage: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let mut found = Vec::new();
+    // Entries are `<mode> <object> <stage>\t<path>`; 160000 is a gitlink.
+    for entry in output.stdout.split(|&b| b == 0) {
+        let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
+            continue;
+        };
+        if !entry.starts_with(b"160000 ") {
+            continue;
+        }
+        let path = top.join(std::ffi::OsStr::from_bytes(&entry[tab + 1..]));
+        if fs::symlink_metadata(path.join(".git")).is_ok() {
+            found.push(path);
+        }
+    }
+    Ok(found)
+}
+
+/// Whether the checkout at `dir` has a populated submodule.
+pub(crate) fn has_populated_submodules(dir: &Path) -> Result<bool> {
+    let sanitized = crate::snapshot::SanitizedGitDir::new(dir)?;
+    Ok(!populated_submodules(&sanitized)?.is_empty())
+}
+
+/// `status --ignore-submodules=dirty` skips submodule work trees, so each
+/// populated submodule is checked with its own sanitized Git directory.
+fn ensure_clean_submodules(sanitized: &crate::snapshot::SanitizedGitDir) -> Result<()> {
+    for path in populated_submodules(sanitized)? {
+        ensure_clean_checkout(&path)
+            .with_context(|| format!("Submodule {} is not clean", path.display()))?;
+    }
+    Ok(())
+}
+
+fn ensure_clean_checkout(project: &Path) -> Result<()> {
+    let sanitized = crate::snapshot::SanitizedGitDir::new(project)?;
+    let output = sanitized
+        .command(project)
+        // `dirty`: never run status inside a submodule, whose own config the
+        // shadow GIT_DIR does not cover and a stage may have written.
+        .args([
+            "status",
+            "--porcelain",
+            "-z",
+            // Whatever status.showUntrackedFiles says.
+            "--untracked-files=normal",
+            "--ignore-submodules=dirty",
+        ])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("Start Git")?;
+    ensure!(
+        output.status.success(),
+        "git status --porcelain -z: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    if output.stdout.is_empty() {
+        return ensure_clean_submodules(&sanitized);
+    }
+    // If any reported dirty path uses a suppressed repo-local clean filter,
+    // Git's sanitized comparison sees raw working-tree bytes against filtered
+    // index blobs and cannot prove whether the file actually changed.
+    let drivers = sanitized.local_clean_filters();
+    if !drivers.is_empty() {
+        let mut stdin_paths = Vec::new();
+        let mut entries = output.stdout.split(|&b| b == 0);
+        while let Some(entry) = entries.next() {
+            if entry.len() <= 3 {
+                continue;
+            }
+            let x = entry[0];
+            let y = entry[1];
+            stdin_paths.extend_from_slice(&entry[3..]);
+            stdin_paths.push(0);
+            if matches!(x, b'R' | b'C') || matches!(y, b'R' | b'C') {
+                let _ = entries.next();
+            }
+        }
+        if let Some((path, driver)) = crate::snapshot::find_suppressed_filter_path(
+            &sanitized,
+            sanitized.top_level(),
+            &stdin_paths,
+            None,
+            drivers,
+        )? {
+            anyhow::bail!(
+                "Cannot verify whether {path} is clean: repo-local Git clean filter `{driver}` is disabled for safety. Configure the filter globally or use the current directory instead"
+            );
+        }
+    }
+    anyhow::bail!(
+        "Worktree mode starts from committed HEAD. Commit or stash project changes, or use the current directory instead"
+    );
 }
 
 pub fn clean_terminal(text: &str) -> String {

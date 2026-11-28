@@ -29,7 +29,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
-/// The host's human identity; tests never invent commit authorship.
+/// The host's human identity. A machine without one gets a fixed test
+/// identity, set only in the temporary repository, so no test is skipped.
 fn identity() -> Option<(String, String)> {
     let get = |key| {
         let output = Command::new("git")
@@ -40,14 +41,12 @@ fn identity() -> Option<(String, String)> {
             .status
             .success()
             .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .filter(|value| !value.is_empty())
     };
-    match (get("user.name"), get("user.email")) {
-        (Some(name), Some(email)) => Some((name, email)),
-        _ => {
-            eprintln!("Skipping ship test: configure the human git identity first");
-            None
-        }
-    }
+    Some(match (get("user.name"), get("user.email")) {
+        (Some(name), Some(email)) => (name, email),
+        _ => ("Test User".to_owned(), "test@example.com".to_owned()),
+    })
 }
 
 struct Fixture {
@@ -81,6 +80,11 @@ impl Fixture {
         .unwrap()
     }
     fn cli(&self, args: &[&str]) -> Output {
+        self.cli_env(args, &[])
+    }
+    /// `cli` with extra environment variables, such as a Git config file
+    /// standing in for the user's own.
+    fn cli_env(&self, args: &[&str], envs: &[(&str, &Path)]) -> Output {
         let bin = self.home.path().join("bin");
         let path = std::iter::once(bin)
             .chain(std::env::split_paths(
@@ -97,6 +101,7 @@ impl Fixture {
             .env("FAKE_GH_LOG", self.gh_log())
             .env("MODEL_ROUTER_CONFIG_DIR", self.home.path().join("home"))
             .env("MODEL_ROUTER_NO_ANIMATION", "1")
+            .envs(envs.iter().copied())
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap()
@@ -158,6 +163,7 @@ fn ship_stage(options: ship::Options) -> Stage {
 /// A repository on `main` tracking a bare `origin`, with `stages` and a
 /// ship stage. `before` edits the checkout before the run starts.
 fn fixture(stages: Vec<Stage>, options: Option<ship::Options>) -> Option<Fixture> {
+    common::isolate_config_dir();
     let (name, email) = identity()?;
     let repo = tempfile::Builder::new()
         .prefix("ship test 雪 ")
@@ -492,6 +498,293 @@ fn push_failure_blocks_with_gits_stderr_and_keeps_the_commit() {
     assert_eq!(drive(&mut run), Action::Stopped);
     assert!(run.error.as_deref().unwrap().contains("already exists"));
     assert_eq!(git(dir, &["rev-parse", "HEAD"]), commit);
+}
+
+/// The checkout is on the ship's branch when the push runs, so config an
+/// `includeIf.onbranch` rule turns on there is in effect. It is not what the
+/// plan recorded, so nothing is pushed and the commit stays on the branch.
+#[test]
+fn config_that_only_applies_on_the_ship_branch_stops_the_push() {
+    let options = ship::Options {
+        push: true,
+        confirm: false,
+        ..ship::Options::default()
+    };
+    let Some(fx) = fixture(two_writers(), Some(options)) else {
+        return;
+    };
+    let dir = fx.dir();
+    let elsewhere = fx.home.path().join("elsewhere.git");
+    git(
+        fx.home.path(),
+        &["init", "-q", "--bare", elsewhere.to_str().unwrap()],
+    );
+    fs::write(
+        dir.join(".git/on-ship.inc"),
+        format!("[remote \"origin\"]\n\tpushurl = {}\n", elsewhere.display()),
+    )
+    .unwrap();
+    git(
+        dir,
+        &["config", "includeIf.onbranch:mr/**.path", "on-ship.inc"],
+    );
+    let mut run = fx.create();
+    assert_eq!(drive(&mut run), Action::Stopped);
+    assert_eq!(run.status, Status::Blocked);
+    let error = run.error.clone().unwrap();
+    assert!(error.contains("nothing was pushed"), "{error}");
+    // The commit is on the new branch, which the checkout is on.
+    let branch = git(dir, &["symbolic-ref", "--short", "HEAD"]);
+    assert!(branch.starts_with("mr/"), "{branch}");
+    let commit = git(dir, &["rev-parse", "HEAD"]);
+    assert!(error.contains(&commit[..12]), "{error}");
+    // Neither the real remote nor the one the rule names got the branch.
+    for remote in [fx.remote(), elsewhere] {
+        assert_eq!(
+            git(
+                &remote,
+                &["for-each-ref", "--format=%(refname)", "refs/heads/mr/"]
+            ),
+            ""
+        );
+    }
+}
+
+/// The same for a rule in the user's own Git config, which the digest of
+/// the repository's config does not cover: `push.followTags` turned on for
+/// the ship's branch only would send tags the plan never listed.
+#[test]
+fn a_rule_in_the_users_config_for_the_ship_branch_stops_the_push() {
+    let Some(fx) = fixture(two_writers(), None) else {
+        return;
+    };
+    let dir = fx.dir();
+    let mut run = fx.create();
+    assert_eq!(drive(&mut run), Action::Complete);
+    let global = fx.home.path().join("gitconfig");
+    let include = fx.home.path().join("on-ship.inc");
+    fs::write(&include, "[push]\n\tfollowTags = true\n").unwrap();
+    fs::write(
+        &global,
+        format!(
+            "[includeIf \"onbranch:mr/**\"]\n\tpath = {}\n",
+            include.display()
+        ),
+    )
+    .unwrap();
+    git(
+        dir,
+        &["tag", "-a", "--no-sign", "v-local", "-m", "local tag"],
+    );
+
+    let output = fx.cli_env(
+        &["ship", &run.id, "--push", "--yes"],
+        &[("GIT_CONFIG_GLOBAL", &global)],
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("nothing was pushed"), "{text}");
+    assert!(git(dir, &["symbolic-ref", "--short", "HEAD"]).starts_with("mr/"));
+    let pushed = git(
+        &fx.remote(),
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/mr/",
+            "refs/tags/",
+        ],
+    );
+    assert_eq!(pushed, "", "{text}");
+}
+
+/// Config the caller passes in the environment counts too: a `resume
+/// --advance` run with a push URL the plan never saw pushes nothing and
+/// asks to confirm the new plan.
+#[test]
+fn config_the_caller_adds_on_resume_stops_the_push() {
+    let options = ship::Options {
+        push: true,
+        ..ship::Options::default()
+    };
+    let Some(fx) = fixture(two_writers(), Some(options)) else {
+        return;
+    };
+    let output = fx.cli(&["run", "--task", "Add the new greeting file"]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(!output.status.success(), "{stdout}");
+    let id = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("Run: "))
+        .unwrap()
+        .to_owned();
+    let elsewhere = fx.home.path().join("elsewhere.git");
+    git(
+        fx.home.path(),
+        &["init", "-q", "--bare", elsewhere.to_str().unwrap()],
+    );
+
+    // Every Git the router supports reads `GIT_CONFIG_PARAMETERS`;
+    // `GIT_CONFIG_COUNT` needs 2.31. Git's quoting writes `'` as `'\''`.
+    let push_url = elsewhere.to_str().unwrap().replace('\'', "'\\''");
+    let parameters = format!("'remote.origin.pushurl={push_url}'");
+    let output = fx.cli_env(
+        &["resume", &id, "--advance"],
+        &[("GIT_CONFIG_PARAMETERS", Path::new(&parameters))],
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("The plan changed since you confirmed it"),
+        "{text}"
+    );
+    for remote in [fx.remote(), elsewhere] {
+        assert_eq!(
+            git(
+                &remote,
+                &["for-each-ref", "--format=%(refname)", "refs/heads/mr/"]
+            ),
+            "",
+            "{text}"
+        );
+    }
+}
+
+/// The push sends the planned commit and nothing else, whatever the user's
+/// config would add, and the branch tracks what was pushed.
+#[test]
+fn the_push_sends_only_the_planned_commit_and_sets_the_upstream() {
+    let Some(fx) = fixture(two_writers(), None) else {
+        return;
+    };
+    let dir = fx.dir();
+    let mut run = fx.create();
+    assert_eq!(drive(&mut run), Action::Complete);
+    // In effect on every branch, so the plan and the push agree on it.
+    let global = fx.home.path().join("gitconfig");
+    fs::write(&global, "[push]\n\tfollowTags = true\n").unwrap();
+    // An annotated tag the remote lacks, on a commit the push reaches.
+    git(
+        dir,
+        &["tag", "-a", "--no-sign", "v-local", "-m", "local tag"],
+    );
+
+    let output = fx.cli_env(
+        &["ship", &run.id, "--push", "--yes"],
+        &[("GIT_CONFIG_GLOBAL", &global)],
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{text}");
+    let branch = git(dir, &["symbolic-ref", "--short", "HEAD"]);
+    assert!(branch.starts_with("mr/"), "{branch}");
+    let commit = git(dir, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        git(
+            &fx.remote(),
+            &["rev-parse", &format!("refs/heads/{branch}")]
+        ),
+        commit
+    );
+    assert_eq!(
+        git(
+            &fx.remote(),
+            &["for-each-ref", "--format=%(refname)", "refs/tags/"]
+        ),
+        "",
+        "a tag went with the push"
+    );
+    assert_eq!(
+        git(
+            dir,
+            &[
+                "rev-parse",
+                "--abbrev-ref",
+                &format!("{branch}@{{upstream}}")
+            ]
+        ),
+        format!("origin/{branch}")
+    );
+}
+
+/// The checkout's index is updated before anything is published, so a ship
+/// that cannot write it (another Git process holds the lock) pushes nothing.
+#[test]
+fn a_locked_index_stops_the_ship_before_it_pushes() {
+    let options = ship::Options {
+        push: true,
+        confirm: false,
+        ..ship::Options::default()
+    };
+    let Some(fx) = fixture(two_writers(), Some(options)) else {
+        return;
+    };
+    let dir = fx.dir();
+    fs::write(dir.join(".git/index.lock"), "").unwrap();
+    let mut run = fx.create();
+    assert_eq!(drive(&mut run), Action::Stopped);
+    assert_eq!(run.status, Status::Blocked);
+    fs::remove_file(dir.join(".git/index.lock")).unwrap();
+    let pushed = git(
+        &fx.remote(),
+        &["for-each-ref", "--format=%(refname)", "refs/heads/mr/"],
+    );
+    assert_eq!(pushed, "", "{:?}", run.error);
+    let outcome = &report::build(&run).shipped[0];
+    assert!(outcome.pushed.is_none() && outcome.error.is_some());
+}
+
+/// The ship updates the checkout's index for the files it committed. Git
+/// refreshes the whole index as it does, so a repo-local clean filter on an
+/// unrelated file must not run then.
+#[test]
+fn the_index_update_runs_no_repo_local_filter() {
+    let options = ship::Options {
+        confirm: false,
+        ..ship::Options::default()
+    };
+    let Some(fx) = fixture(two_writers(), Some(options)) else {
+        return;
+    };
+    let dir = fx.dir();
+    let marker = fx.home.path().join("filter-ran");
+    fs::write(dir.join(".gitattributes"), "*.bin filter=mark\n").unwrap();
+    fs::write(dir.join("unrelated.bin"), "payload\n").unwrap();
+    git(dir, &["add", ".gitattributes", "unrelated.bin"]);
+    git(dir, &["commit", "-qm", "Add a filtered file"]);
+    git(
+        dir,
+        &[
+            "config",
+            "filter.mark.clean",
+            &format!("touch '{}'; cat", marker.display()),
+        ],
+    );
+    let mut run = fx.create();
+    // Same contents, new stat data: Git has to read the file to refresh it.
+    fs::write(dir.join("unrelated.bin"), "payload\n").unwrap();
+    // With the index older than the files, Git compares every entry when
+    // it next writes the index, whatever the timing of this test.
+    fs::File::options()
+        .write(true)
+        .open(dir.join(".git/index"))
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000))
+        .unwrap();
+    let _ = fs::remove_file(&marker);
+    assert_eq!(drive(&mut run), Action::Complete, "{:?}", run.error);
+    assert!(git(dir, &["symbolic-ref", "--short", "HEAD"]).starts_with("mr/"));
+    assert!(!marker.exists(), "a repo-local clean filter ran");
 }
 
 #[test]
