@@ -789,7 +789,7 @@ be a leaf task.
 | copilot | not installed where this was built; `--additional-mcp-config` unverified | — | not supported |
 | pi | needs a router-shipped `--extension` (a TypeScript bridge) | — | not supported |
 | cursor | CLI reads only `.cursor/mcp.json` | — | not supported: would edit files |
-| gemini | settings files only; `streams = false` | — | not supported |
+| antigravity | `agy mcp` edits config files; no per-launch `--mcp-config` | — | not supported |
 | goose | `--with-extension` takes a command string | — | not supported: argv invariant |
 | aider | no MCP client | — | not supported |
 

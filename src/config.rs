@@ -801,8 +801,8 @@ pub enum CustomOutput {
     Pi,
     #[serde(rename = "cursor-stream")]
     CursorStream,
-    #[serde(rename = "gemini-json")]
-    GeminiJson,
+    #[serde(rename = "antigravity-stream")]
+    AntigravityStream,
     #[serde(rename = "opencode")]
     Opencode,
     #[serde(rename = "amp-stream")]
@@ -817,7 +817,7 @@ impl CustomOutput {
             Self::ClaudeStream => OutputKind::Claude,
             Self::Pi => OutputKind::Pi,
             Self::CursorStream => OutputKind::Cursor,
-            Self::GeminiJson => OutputKind::Gemini,
+            Self::AntigravityStream => OutputKind::Antigravity,
             Self::Opencode => OutputKind::OpenCode,
             Self::AmpStream => OutputKind::Amp,
         }

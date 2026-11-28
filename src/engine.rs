@@ -554,8 +554,20 @@ mod tests {
         run.take_over().unwrap();
         assert_eq!(run.resume.as_ref().unwrap().session, "t-1");
 
+        // Antigravity reports its conversation_id in the attempt's log.
+        fs::write(
+            dir.path().join("stdout.log"),
+            "{\"event\":\"init\",\"conversation_id\":\"conv-1\"}\n",
+        )
+        .unwrap();
+        run.workflow.stages[0].harness = "antigravity".into();
         run.status = Status::Failed;
-        run.workflow.stages[0].harness = "gemini".into();
+        run.stages[0].attempts.last_mut().unwrap().session = None;
+        run.take_over().unwrap();
+        assert_eq!(run.resume.as_ref().unwrap().session, "conv-1");
+
+        run.status = Status::Failed;
+        run.workflow.stages[0].harness = "copilot".into();
         assert!(run.take_over().is_err());
     }
 

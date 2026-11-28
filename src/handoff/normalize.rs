@@ -42,20 +42,27 @@ impl From<&str> for ProtocolError {
 }
 
 /// The harness session an unattended log reports: Codex's `thread.started`
-/// thread, Pi's `session` event, OpenCode's `sessionID`, or the `session_id`
-/// on Claude Code, Cursor, and Amp stream events.
+/// thread, Pi's `session` event, OpenCode's `sessionID`, Antigravity's
+/// `conversation_id`, or the `session_id` on Claude Code, Cursor, and Amp
+/// stream events.
 pub fn session_id(raw: &str) -> Option<String> {
     raw.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
         .find_map(|event| {
-            let fields: &[&str] = match event.get("type").and_then(Value::as_str) {
-                Some("thread.started") => &["thread_id"],
-                Some("session") => &["id"],
-                _ => &["session_id", "sessionID"],
+            let pointers: &[&str] = match event.get("type").and_then(Value::as_str) {
+                Some("thread.started") => &["/thread_id"],
+                Some("session") => &["/id"],
+                _ => &[
+                    "/session_id",
+                    "/sessionID",
+                    "/conversation_id",
+                    "/init/conversation_id",
+                    "/result/conversation_id",
+                ],
             };
-            fields
+            pointers
                 .iter()
-                .find_map(|field| event.get(*field).and_then(Value::as_str))
+                .find_map(|pointer| event.pointer(pointer).and_then(Value::as_str))
                 .filter(|id| crate::adapters::is_session_id(id))
                 .map(str::to_owned)
         })
@@ -133,10 +140,9 @@ pub fn normalize(raw: &str, kind: OutputKind) -> Normalized {
     // OpenCode: the message whose text parts form the handoff.
     let mut message_id: Option<String> = None;
     let trimmed = raw.trim();
-    let whole_doc =
-        (kind == OutputKind::Gemini || trimmed.starts_with('[') || !trimmed.contains('\n'))
-            .then(|| parse_json_clean(trimmed))
-            .flatten();
+    let whole_doc = (trimmed.starts_with('[') || !trimmed.contains('\n'))
+        .then(|| parse_json_clean(trimmed))
+        .flatten();
     if let Some(value) = whole_doc {
         match value {
             Value::Array(events) => {
@@ -262,17 +268,45 @@ fn process_event(
                 }
             }
         }
-        OutputKind::Gemini => {
-            if let Some(text) = event.get("response").and_then(Value::as_str) {
-                result.text = text.into();
-                *recognized = true;
-            }
-            // JSON output carries `response`; stream-json ends with a result.
-            let succeeded = event.get("response").is_some_and(Value::is_string)
-                || (kind_name == "result"
-                    && event.get("status").and_then(Value::as_str) == Some("success"));
-            if succeeded && !failed {
-                result.error = None;
+        OutputKind::Antigravity => {
+            let event_name = event.get("event").and_then(Value::as_str).unwrap_or("");
+            if event_name == "error" {
+                result.error = Some(ProtocolError::from(
+                    truncate_json_value(event, 1500).as_str(),
+                ));
+            } else if event_name == "result"
+                || (event_name.is_empty()
+                    && (event.get("response").is_some()
+                        || event.get("structured_output").is_some()
+                        || event.get("status").is_some()))
+            {
+                let payload = event
+                    .get("result")
+                    .filter(|v| v.is_object())
+                    .unwrap_or(event);
+                let status = payload.get("status").and_then(Value::as_str).unwrap_or("");
+                let status_failed = matches!(
+                    status.to_ascii_lowercase().as_str(),
+                    "error" | "failed" | "canceled" | "cancelled"
+                );
+                let payload_failed =
+                    failed || status_failed || payload.get("error").is_some_and(is_error_value);
+                if payload_failed {
+                    result.error = Some(ProtocolError::from(
+                        truncate_json_value(event, 1500).as_str(),
+                    ));
+                } else {
+                    result.error = None;
+                    if let Some(text) = payload.get("response").and_then(Value::as_str) {
+                        result.text = text.into();
+                        *recognized = true;
+                    }
+                    if let Some(output) = payload.get("structured_output").filter(|v| v.is_object())
+                    {
+                        result.structured = Some(output.to_string());
+                        *recognized = true;
+                    }
+                }
             }
         }
         OutputKind::Codex => {

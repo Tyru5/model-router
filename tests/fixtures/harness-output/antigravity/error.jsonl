@@ -1,0 +1,2 @@
+{"event":"init","conversation_id":"00000000-0000-4000-8000-000000000063","model":"gemini-4-neon"}
+{"event":"error","error":{"type":"FatalAuthenticationError","message":"Failed to sign in. Run agy to sign in or set GEMINI_API_KEY."}}

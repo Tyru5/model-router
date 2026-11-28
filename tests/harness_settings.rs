@@ -33,11 +33,11 @@ fn native_settings_reach_both_execution_modes_and_survive_reload() {
         ),
         ("cursor", "sandbox", "enabled", "--sandbox", "enabled"),
         (
-            "gemini",
-            "approval_mode",
-            "auto_edit",
-            "--approval-mode",
-            "auto_edit",
+            "antigravity",
+            "mode",
+            "accept-edits",
+            "--mode",
+            "accept-edits",
         ),
     ];
     let paths = ContextPaths {

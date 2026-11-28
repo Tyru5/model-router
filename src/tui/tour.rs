@@ -194,7 +194,7 @@ fn text(step: &Step, page: Page) -> Vec<String> {
             "Press [3] to see which harnesses are installed.",
         ],
         Step::NoHarness if page == Page::Harnesses => &[
-            "No harness is installed. Install one (Claude Code, Codex, Gemini, OpenCode, …) and log in to it.",
+            "No harness is installed. Install one (Claude Code, Codex, Antigravity, OpenCode, …) and log in to it.",
             "Then press [r] to check again.",
         ],
         Step::NoHarness => &[

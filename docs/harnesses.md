@@ -16,7 +16,7 @@ as JSON.
 | `pi` | `pi` | Provider + model ID; optional thinking | Print-mode JSON | yes | yes |
 | `omp` | `omp` | Provider + model (`provider/model`); optional thinking | Pi's JSON format; approval mode | yes | no |
 | `cursor` | `cursor-agent` | Cursor model slug | Print-mode stream JSON | yes | no |
-| `gemini` | `gemini` | Gemini model ID | Headless JSON (at exit) | no | no |
+| `antigravity` | `agy` | Antigravity model ID; optional effort | Print-mode stream JSON | yes | yes |
 | `opencode` | `opencode` | `provider/model`; optional variant | Run-mode JSON; TUI with `--prompt` (`run --interactive` before 2.x) | yes | yes |
 | `aider` | `aider` | Native/LiteLLM model ID | Message file; auto-commits disabled | no | no |
 | `goose` | `goose` | Provider + model | `run`; interactive continuation | no | no |
@@ -26,9 +26,7 @@ as JSON.
 
 All built-ins also run interactively in their native terminal. **Follow-up** is
 the unattended session command used by `handoff_repair` (`codex` cannot follow
-up on its local providers `ollama` and `lmstudio`). `gemini` prints its JSON
-document only on exit (`streams = false`), so `stall_timeout_seconds` is
-rejected for it.
+up on its local providers `ollama` and `lmstudio`).
 
 ## Choosing a model
 
@@ -79,7 +77,7 @@ output_limit = 16384
 | Goose | `--provider openai` with `OPENAI_HOST`/`OPENAI_BASE_PATH`/`OPENAI_API_KEY`; inherited `OPENAI_*` removed. |
 | Custom | `{provider}`, `{base_url}`, `{api_key_env}` placeholders (configured entries only). |
 | Pi, omp | Own registries only. A provider only `[providers.NAME]` defines is rejected; define it in their `models.json`. |
-| Claude Code, Cursor, Gemini, Amp, Copilot | Not supported; own accounts only. |
+| Claude Code, Cursor, Antigravity, Amp, Copilot | Not supported; own accounts only. |
 
 - Only `[providers.NAME]` entries are injected. Other names, presets
   included, pass through unchanged, so the harness's own definition wins
@@ -105,7 +103,8 @@ sends no override. Values are not edits to the harness's global config.
 | Codex | `approval_policy` | `on-request`, `never` (no prompts; does not bypass the sandbox) |
 | Claude Code | `permission_mode` | `manual`, `acceptEdits`, `plan`, `dontAsk`, `auto`, `bypassPermissions` |
 | Cursor | `sandbox` | `enabled`, `disabled` |
-| Gemini | `approval_mode` | `default`, `auto_edit`, `plan`, `yolo` |
+| Antigravity | `mode` | `plan`, `accept-edits`, `auto` |
+| Antigravity | `sandbox` | `enabled` |
 | omp | `approval_mode` | `always-ask`, `write`, `yolo` |
 | Aider | `confirmations` | `yes-always` (unattended runs need it; shell commands still ask) |
 | Goose | `mode` | `approve`, `smart_approve`, `chat`, `auto` (as `GOOSE_MODE`) |
@@ -118,7 +117,7 @@ harness_settings = { sandbox = "workspace-write", approval_policy = "on-request"
 
 Settings that conflict with extra arguments are rejected before launch.
 Loosening values (`danger-full-access`, `bypassPermissions`, `yolo`, Cursor
-`disabled`, `yes-always`, Goose `auto`, `allow-all-tools`) need trust in a
+`disabled`, Antigravity `auto`, `yes-always`, Goose `auto`, `allow-all-tools`) need trust in a
 project config. The router never enables a bypass by default.
 
 Unattended stages have no input. Reported permission denials pause the run.
@@ -128,7 +127,8 @@ permissions set explicitly.
 
 ## Structured output
 
-Codex (`--output-schema`, 0.41.0+) and Claude Code (`--json-schema`, 2.1.22+)
+Codex (`--output-schema`, 0.41.0+), Claude Code (`--json-schema`, 2.1.22+),
+and Antigravity (`--json-schema`, 1.0.0+)
 receive the [handoff schema](../schema/handoff.schema.json) and return a
 validated handoff natively. Other harnesses write a handoff file or a
 `<router-handoff>` block. Order of sources:
@@ -145,12 +145,13 @@ validated handoff natively. Other harnesses write a handoff file or a
 | Pi | `--session-id` chosen by the router | `pi … --session-id ID` + model, provider, thinking |
 | omp | `session` event | `omp --resume ID` + model, thinking, approval mode |
 | Cursor | `session_id` events | `cursor-agent … --resume ID` + model, permissions |
+| Antigravity | `conversation_id` events | `agy --resume ID` + model, effort, permissions |
 | OpenCode | `sessionID` events | `opencode --session ID` |
 | Amp | `session_id` events | `amp threads continue --mode MODE ID` |
 
 Leaving the harness returns to the checkpoint; the session stays saved.
 Cancelling sends SIGTERM and waits five seconds before SIGKILL so harnesses can
-save (omp only saves on clean exit). Gemini, Copilot, Goose, Aider, and custom
+save (omp only saves on clean exit). Copilot, Goose, Aider, and custom
 adapters without `resume_args` cannot reopen after exit; use `i`. Live detached
 sessions can always be reattached, including ones left running after `mr`
 exited ([tui](tui.md#interactive-sessions)).
@@ -178,7 +179,7 @@ command = "/path/to/agent"
 args = ["--print", "{prompt}"]
 interactive_args = ["{prompt}"]
 models_args = ["models", "--plain"]       # one model ID per line
-output = "claude-stream"                  # or codex-jsonl, pi, cursor-stream, gemini-json, opencode, amp-stream, text
+output = "claude-stream"                  # or codex-jsonl, pi, cursor-stream, antigravity-stream, opencode, amp-stream, text
 session = { assign = "--session-id" }               # or { reported = true }
 resume_args = ["--resume", "{session}"]             # enables interactive takeover
 follow_up_args = ["--resume", "{session}", "--print"] # enables handoff_repair

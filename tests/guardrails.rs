@@ -483,9 +483,10 @@ print(json.dumps({"type": "result", "result": "No JSON here."}))
     );
 }
 
-/// A stall timeout cannot apply to a harness that prints only at exit.
+/// Streaming harnesses (including Antigravity and custom adapters) accept
+/// `stall_timeout_seconds`, while a zero stall timeout is rejected.
 #[test]
-fn stall_timeout_is_rejected_for_harnesses_that_print_only_at_exit() {
+fn stall_timeout_validates_for_streaming_harnesses() {
     let stalling = |harness: &str| Stage {
         id: "work".into(),
         name: "Work".into(),
@@ -497,23 +498,23 @@ fn stall_timeout_is_rejected_for_harnesses_that_print_only_at_exit() {
     let settings = |stage: Stage| Settings {
         workflows: vec![Workflow::new("Stall", vec![stage])],
         adapters: BTreeMap::from([(
-            "one-document".into(),
+            "stream-custom".into(),
             CustomAdapter {
                 command: "tool".into(),
-                output: Some(CustomOutput::GeminiJson),
+                output: Some(CustomOutput::AntigravityStream),
                 ..CustomAdapter::default()
             },
         )]),
         ..Settings::default()
     };
-    for harness in ["gemini", "one-document"] {
-        let error = settings(stalling(harness)).validate().unwrap_err();
-        let error = format!("{error:#}");
-        assert!(error.contains("stall_timeout_seconds"), "{error}");
-        assert!(error.contains("only when it exits"), "{error}");
+    for harness in ["claude", "antigravity", "stream-custom"] {
+        settings(stalling(harness)).validate().unwrap();
     }
-    settings(stalling("claude")).validate().unwrap();
-    // A fan-out stage runs its candidates' harnesses.
+    let mut zero = stalling("antigravity");
+    zero.stall_timeout_seconds = Some(0);
+    let error = format!("{:#}", settings(zero).validate().unwrap_err());
+    assert!(error.contains("stall_timeout_seconds"), "{error}");
+    // A fan-out stage validates its candidates' harnesses.
     let mut fan = stalling("claude");
     fan.fan_out = Some(FanOut {
         candidates: vec![
@@ -522,17 +523,13 @@ fn stall_timeout_is_rejected_for_harnesses_that_print_only_at_exit() {
                 ..Candidate::default()
             },
             Candidate {
-                harness: "gemini".into(),
+                harness: "antigravity".into(),
                 ..Candidate::default()
             },
         ],
         judge: "auto".into(),
     });
-    assert!(settings(fan).validate().is_err());
-    // Without a stall timeout Gemini is fine.
-    let mut plain = stalling("gemini");
-    plain.stall_timeout_seconds = None;
-    settings(plain).validate().unwrap();
+    settings(fan).validate().unwrap();
 }
 
 /// Without a stage `billing` or a router provider, the harness decides.
@@ -550,7 +547,7 @@ fn billing_defaults_follow_the_harness() {
         ("codex", Billing::Subscription),
         ("claude", Billing::Subscription),
         ("cursor", Billing::Subscription),
-        ("gemini", Billing::Subscription),
+        ("antigravity", Billing::Subscription),
         ("copilot", Billing::Subscription),
         ("pi", Billing::Api),
         ("omp", Billing::Api),
@@ -823,17 +820,17 @@ fn fan_out_candidate_spend_counts_toward_budgets_after_a_rewind() {
 #[test]
 fn apply_detected_harnesses_clears_models_and_adapts_unavailable_harnesses() {
     let mut wf = Workflow::default();
-    presets::apply_detected_harnesses(&mut wf, &["pi", "gemini"]);
+    presets::apply_detected_harnesses(&mut wf, &["pi", "antigravity"]);
     for stage in &wf.stages {
         assert!(stage.model.is_empty(), "stage {} kept model", stage.id);
         assert!(
-            matches!(stage.harness.as_str(), "pi" | "gemini"),
+            matches!(stage.harness.as_str(), "pi" | "antigravity"),
             "unexpected harness {}",
             stage.harness
         );
     }
     let review = wf.stages.iter().find(|s| s.role == Role::Review).unwrap();
-    assert_eq!(review.harness, "gemini");
+    assert_eq!(review.harness, "antigravity");
 }
 
 #[test]
@@ -861,11 +858,11 @@ fn apply_detected_harnesses_keeps_read_only_stages_read_only() {
     assert_eq!(summary.harness_settings["sandbox"], "read-only");
     assert_eq!(summary.sandbox, None);
     // The new harness has a read-only setting of its own.
-    let summary = summary_of(&["gemini"]);
-    assert_eq!(summary.harness, "gemini");
+    let summary = summary_of(&["antigravity"]);
+    assert_eq!(summary.harness, "antigravity");
     assert_eq!(
         summary.harness_settings,
-        BTreeMap::from([("approval_mode".to_owned(), "plan".to_owned())])
+        BTreeMap::from([("mode".to_owned(), "plan".to_owned())])
     );
     assert_eq!(summary.sandbox, None);
     let summary = summary_of(&["claude"]);
@@ -874,7 +871,7 @@ fn apply_detected_harnesses_keeps_read_only_stages_read_only() {
         BTreeMap::from([("permission_mode".to_owned(), "plan".to_owned())])
     );
     // It has none: the router's sandbox keeps the stage read-only.
-    let summary = summary_of(&["pi", "gemini"]);
+    let summary = summary_of(&["pi", "antigravity"]);
     assert_eq!(summary.harness, "pi");
     assert!(summary.harness_settings.is_empty());
     assert_eq!(
@@ -904,8 +901,8 @@ fn apply_detected_harnesses_reviews_with_another_harness_than_implements() {
         &["codex", "claude"][..],
         &["claude", "codex"],
         &["codex", "pi"],
-        &["claude", "gemini", "pi"],
-        &["pi", "gemini"],
+        &["claude", "antigravity", "pi"],
+        &["pi", "antigravity"],
     ] {
         let (implementation, review) = harnesses(available);
         assert!(

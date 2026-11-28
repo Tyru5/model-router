@@ -155,7 +155,7 @@ impl Handoff {
 #[serde(rename_all = "snake_case")]
 pub enum HandoffSource {
     /// The harness's schema-constrained final response (Codex
-    /// `--output-schema`, Claude Code `--json-schema`).
+    /// `--output-schema`, Claude Code / Antigravity `--json-schema`).
     Native,
     /// The file the model wrote at the handoff path.
     File,
@@ -610,14 +610,14 @@ pub struct Sources<'a> {
 }
 
 /// The schema-constrained response of a stage launched with a native output
-/// schema: Claude Code's `structured_output`, or Codex's final message.
+/// schema: Claude Code / Antigravity `structured_output`, or Codex's final message.
 pub fn native_output(
     normalized: &Normalized,
     kind: OutputKind,
     final_message: &str,
 ) -> Option<String> {
     match kind {
-        OutputKind::Claude => normalized.structured.clone(),
+        OutputKind::Claude | OutputKind::Antigravity => normalized.structured.clone(),
         OutputKind::Codex => Some(final_message.to_owned()),
         _ => None,
     }

@@ -1050,10 +1050,14 @@ fn auth_spec(harness: &str) -> Option<AuthSpec> {
             ],
             guidance: "set CURSOR_API_KEY or run `cursor-agent login`",
         },
-        "gemini" => AuthSpec {
+        "antigravity" => AuthSpec {
             env_vars: &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-            home_files: &[".gemini/oauth_creds.json", ".gemini/settings.json"],
-            guidance: "set GEMINI_API_KEY or run `gemini` to sign in",
+            home_files: &[
+                ".gemini/antigravity-cli/settings.json",
+                ".gemini/oauth_creds.json",
+                ".gemini/settings.json",
+            ],
+            guidance: "run `agy` to sign in or set GEMINI_API_KEY",
         },
         "opencode" => AuthSpec {
             env_vars: &[

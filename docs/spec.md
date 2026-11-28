@@ -212,7 +212,7 @@ to run them unattended.
 
 ## Adapters and model discovery
 
-Built-in targets: Codex, Claude Code, Pi, Cursor Agent, Gemini CLI, OpenCode,
+Built-in targets: Codex, Claude Code, Pi, Cursor Agent, Antigravity, OpenCode,
 Aider, Goose, Amp, and GitHub Copilot CLI, each one declarative spec entry
 (`src/harness/`). Custom adapters declare executable, unattended and
 interactive arguments, and optionally a model-list command, output parser,
