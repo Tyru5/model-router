@@ -7,6 +7,8 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-28
+
 ### Security
 
 - TUI `git` commands now pass `-c core.fsmonitor=false -c core.hooksPath=/dev/null`, and the diff view's `D` (`git difftool`) refuses repository-local `diff.tool`, `diff.guitool`, `diff.external`, `difftool.*`, `merge.tool`, `merge.guitool`, `mergetool.*`, and `filter.*` config entries and runs against a fixed, sanitized temporary `GIT_DIR` (requiring Git 2.26+).
@@ -568,7 +570,8 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 - CI: format, clippy, tests on Linux and macOS, MSRV check, and terminal smoke
   tests.
 
-[Unreleased]: https://github.com/Tyru5/model-router/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Tyru5/model-router/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/Tyru5/model-router/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Tyru5/model-router/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/Tyru5/model-router/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Tyru5/model-router/releases/tag/v0.2.0
