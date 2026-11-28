@@ -1132,6 +1132,7 @@ mod tests {
             timed_out: false,
             stalled: false,
             released: false,
+            finished_with_handoff: false,
         };
         finish(
             &mut run,
@@ -1532,6 +1533,7 @@ mod tests {
             timed_out: false,
             stalled: false,
             released: false,
+            finished_with_handoff: false,
         };
         finish(
             &mut run,
@@ -1892,5 +1894,175 @@ mod tests {
             "Process exited with code 1",
             "file not found"
         ));
+    }
+
+    #[test]
+    fn handoff_watcher_emits_valid_handoffs_and_updates_without_repeating() {
+        use super::exec::HandoffWatcher;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("implement-001.json");
+        let mut watcher = HandoffWatcher::new(path.clone(), Role::Implementation);
+        assert!(watcher.poll().is_none());
+
+        fs::write(&path, "").unwrap();
+        assert!(watcher.poll().is_none());
+
+        fs::write(&path, r#"{"summary":"partial"#).unwrap();
+        assert!(watcher.poll().is_none());
+
+        // Write a valid handoff (reset watcher to bypass the 1s error throttle in the unit test).
+        let mut watcher = HandoffWatcher::new(path.clone(), Role::Implementation);
+        fs::write(
+            &path,
+            r#"{"summary":"First pass done","verdict":"complete"}"#,
+        )
+        .unwrap();
+        let first = watcher.poll().expect("valid handoff should emit");
+        assert_eq!(first.summary, "First pass done");
+        // Same unchanged file does not re-emit.
+        assert!(watcher.poll().is_none());
+
+        // An updated handoff with different length re-emits.
+        fs::write(
+            &path,
+            r#"{"summary":"Updated after follow-up edits","verdict":"complete"}"#,
+        )
+        .unwrap();
+        let second = watcher.poll().expect("updated handoff should emit");
+        assert_eq!(second.summary, "Updated after follow-up edits");
+        assert!(watcher.poll().is_none());
+
+        // Review stages require a pass/needs_changes verdict.
+        let review_path = dir.path().join("review-001.json");
+        let mut review_watcher = HandoffWatcher::new(review_path.clone(), Role::Review);
+        fs::write(
+            &review_path,
+            r#"{"summary":"Wrong verdict","verdict":"complete"}"#,
+        )
+        .unwrap();
+        assert!(review_watcher.poll().is_none());
+        let mut review_watcher = HandoffWatcher::new(review_path.clone(), Role::Review);
+        fs::write(&review_path, r#"{"summary":"Looks good","verdict":"pass"}"#).unwrap();
+        let review = review_watcher
+            .poll()
+            .expect("valid review handoff should emit");
+        assert_eq!(review.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn interactive_finish_with_handoff_concludes_stage_even_when_stopped_by_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            workflows: vec![Workflow::new(
+                "Interactive",
+                vec![Stage {
+                    id: "implement".into(),
+                    name: "Implement".into(),
+                    role: Role::Implementation,
+                    harness: "mock".into(),
+                    mode: Mode::Interactive,
+                    ..Stage::default()
+                }],
+            )],
+            adapters: BTreeMap::from([(
+                "mock".into(),
+                CustomAdapter {
+                    command: "python3".into(),
+                    interactive_args: Some(vec![]),
+                    ..CustomAdapter::default()
+                },
+            )]),
+            ..Settings::default()
+        };
+        let mut run = Run::create(
+            dir.path(),
+            &settings,
+            &settings.workflows[0],
+            "Task".into(),
+            false,
+        )
+        .unwrap();
+        let prepared = prepare(&mut run).unwrap();
+        fs::write(prepared.directory.join("stdout.log"), "interactive prompt").unwrap();
+        fs::write(
+            &prepared.handoff_file,
+            r#"{"summary":"Implemented via finish key","verdict":"complete"}"#,
+        )
+        .unwrap();
+        let outcome = process::Outcome {
+            code: None,
+            cancelled: false,
+            timed_out: false,
+            stalled: false,
+            released: false,
+            finished_with_handoff: true,
+        };
+        finish(
+            &mut run,
+            &prepared,
+            Ok(outcome),
+            &AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(run.status, Status::AwaitingConfirmation);
+        assert_eq!(
+            run.stages[0].handoff.as_ref().unwrap().summary,
+            "Implemented via finish key"
+        );
+    }
+
+    #[test]
+    fn interactive_finish_with_handoff_without_file_fails_instead_of_advancing() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            workflows: vec![Workflow::new(
+                "Interactive",
+                vec![Stage {
+                    id: "implement".into(),
+                    name: "Implement".into(),
+                    role: Role::Implementation,
+                    harness: "mock".into(),
+                    mode: Mode::Interactive,
+                    ..Stage::default()
+                }],
+            )],
+            adapters: BTreeMap::from([(
+                "mock".into(),
+                CustomAdapter {
+                    command: "python3".into(),
+                    interactive_args: Some(vec![]),
+                    ..CustomAdapter::default()
+                },
+            )]),
+            ..Settings::default()
+        };
+        let mut run = Run::create(
+            dir.path(),
+            &settings,
+            &settings.workflows[0],
+            "Task".into(),
+            false,
+        )
+        .unwrap();
+        let prepared = prepare(&mut run).unwrap();
+        fs::write(prepared.directory.join("stdout.log"), "interactive prompt").unwrap();
+        let outcome = process::Outcome {
+            code: None,
+            cancelled: false,
+            timed_out: false,
+            stalled: false,
+            released: false,
+            finished_with_handoff: true,
+        };
+        finish(
+            &mut run,
+            &prepared,
+            Ok(outcome),
+            &AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(run.status, Status::Failed);
     }
 }

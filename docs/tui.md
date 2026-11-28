@@ -251,6 +251,7 @@ The saved list loads in the background and refreshes while runs are active.
 | `/` | any | [Search output](#output-search) |
 | `O` | any | Open the attempt's raw `stdout.log` in `$PAGER` |
 | `C` | running | Cancel active stage (`y` confirms) |
+| `e` | running | Finish an interactive stage using the handoff file its harness already wrote |
 | `a` | idle | Accept handoff and advance; accepts a `not_applicable` waiver; confirms a ship preview |
 | `c` | idle | Continue the run |
 | `y` | idle | Retry current stage |
@@ -341,12 +342,20 @@ Native harness terminals get keys and paste forwarded.
 | --- | --- |
 | `Ctrl+B` | Detach to the Runs page; the process keeps running and recording |
 | `t` (Runs) | Reattach, restoring screen and size |
+| `e` (Runs) | Finish the stage once its harness has written a valid handoff file (stops the harness cleanly and concludes from the handoff) |
 | `Ctrl+]` | Stop a stuck stage |
 | `/exit` or the harness's quit | Quit the harness (not detach); the router then inspects the handoff |
 
 A new interactive stage takes the screen only while its run is shown and no
 dialog is open; otherwise `t` or `i` opens it. A workflow whose first enabled
 stage is interactive opens the Runs page immediately.
+
+While detached on the Runs page, a card below the feed shows that the session is
+live (`t` attaches, `/exit` hands off). Once the harness writes a valid handoff
+file while still open, the router notifies you (even while attached), marks the
+run as needing input (`◆`, reachable with `N`), previews the handoff on the card
+(`h` opens it), and offers `e` to stop the harness cleanly and conclude the
+stage from that handoff — or `t` to attach for follow-ups or `/exit`.
 
 **Leaving a stage running.** Each interactive harness runs in its own small
 terminal host process, so it can outlive `mr`. Quitting (`q`) while one runs
@@ -435,10 +444,11 @@ switching branches to a different script) the keys explain what they need.
 - **Webhook** (off): ntfy-style POST (body = message, `Title` header) to a URL,
   or `MODEL_ROUTER_NOTIFY_URL`, which turns it on by itself.
 
-Sent when a run needs input (interactive stage, handoff review, verification
-waiver), stops blocked or failed, or completes, even while another session
-has the screen. The same event is sent at most once per three minutes. The
-dialog has a test button. CLI runs: `--notify` or `MODEL_ROUTER_NOTIFY=1`.
+Sent when a run needs input (interactive stage, interactive handoff ready,
+handoff review, verification waiver), stops blocked or failed, or completes,
+even while another session has the screen. The same event is sent at most once
+per three minutes. The dialog has a test button. CLI runs: `--notify` or
+`MODEL_ROUTER_NOTIFY=1`.
 
 ## Themes
 

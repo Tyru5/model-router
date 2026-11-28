@@ -24,6 +24,8 @@ pub(super) struct Inbox {
     state: Option<Box<Run>>,
     output: VecDeque<String>,
     skipped: usize,
+    /// Latest valid handoff written by a live interactive stage.
+    ready_handoff: Option<Box<crate::handoff::Handoff>>,
     /// The final run and result. No run means the worker panicked; the UI
     /// then reloads the saved run (see `RunSlot::crashed`).
     done: Option<(Option<Box<Run>>, Outcome)>,
@@ -50,6 +52,7 @@ impl Inbox {
                     self.output.push_back(storage::truncate(line, 1500));
                 }
             }
+            RunEvent::InteractiveHandoff(handoff) => self.ready_handoff = Some(handoff),
         }
     }
 }
@@ -120,6 +123,15 @@ impl Worker {
             notify: |_| false,
         }
     }
+    /// A worker stub attached to an interactive session, for TUI tests.
+    pub(super) fn stub_interactive(terminal: process::InteractiveSession) -> Self {
+        Self {
+            inbox: Shared::default(),
+            thread: None,
+            terminal: Some(terminal),
+            notify: |_| false,
+        }
+    }
     /// What a worker thread would report.
     pub(super) fn send(&self, event: RunEvent) {
         lock(&self.inbox).push(event);
@@ -164,6 +176,9 @@ pub(super) struct RunSlot {
     pub(super) waiver_shown: String,
     /// Reopen the stage's session interactively once its worker stops.
     pub(super) takeover: bool,
+    /// Valid structured handoff written by the currently running interactive
+    /// harness while it is still open.
+    pub(super) ready_handoff: Option<crate::handoff::Handoff>,
     /// When the worker last stopped; a key pressed just after cannot continue.
     pub(super) stopped_at: Option<Instant>,
     /// Drawing caches, so frames do not rebuild what has not changed.
@@ -200,6 +215,7 @@ impl RunSlot {
             changes_pending: None,
             waiver_shown: String::new(),
             takeover: false,
+            ready_handoff: None,
             stopped_at: None,
             cache: RefCell::default(),
         }
@@ -243,22 +259,34 @@ impl RunSlot {
         }
     }
     /// Applies what the worker reported. Returns whether anything changed,
-    /// and the driver's result once it stops.
-    pub(super) fn poll(&mut self) -> (bool, Option<std::result::Result<Action, String>>) {
+    /// whether a live interactive handoff just became ready, and the driver's
+    /// result once it stops.
+    pub(super) fn poll(&mut self) -> (bool, bool, Option<std::result::Result<Action, String>>) {
         let Some(worker) = &self.worker else {
             self.cancel.store(false, Ordering::Relaxed);
-            return (false, None);
+            return (false, false, None);
         };
-        let (state, mut output, mut skipped, done) = {
+        let (state, mut output, mut skipped, ready_handoff, done) = {
             let mut inbox = lock(&worker.inbox);
             (
                 inbox.state.take(),
                 std::mem::take(&mut inbox.output),
                 std::mem::take(&mut inbox.skipped),
+                inbox.ready_handoff.take(),
                 inbox.done.take(),
             )
         };
-        let changed = state.is_some() || !output.is_empty() || skipped > 0 || done.is_some();
+        let mut handoff_arrived = false;
+        let handoff_updated = ready_handoff.is_some();
+        if let Some(handoff) = ready_handoff {
+            handoff_arrived = self.ready_handoff.is_none();
+            self.ready_handoff = Some(*handoff);
+        }
+        let changed = state.is_some()
+            || !output.is_empty()
+            || skipped > 0
+            || handoff_updated
+            || done.is_some();
         if let Some(run) = state {
             self.run = *run;
         }
@@ -279,6 +307,8 @@ impl RunSlot {
         }
         let mut stopped = None;
         if let Some((run, result)) = done {
+            self.ready_handoff = None;
+            handoff_arrived = false;
             match run {
                 Some(run) => self.run = *run,
                 None => self.crashed(&result),
@@ -292,7 +322,7 @@ impl RunSlot {
             self.cancel.store(false, Ordering::Relaxed);
             stopped = Some(self.settle(result));
         }
-        (changed, stopped)
+        (changed, handoff_arrived, stopped)
     }
     /// Fails the run whose worker panicked, in memory only: the record on
     /// disk still says running, which the next drive recovers as interrupted.

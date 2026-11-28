@@ -16,7 +16,10 @@ use interactive::{INPUT_LIMIT, OutputDecoder, Parked, PtyChild, SessionState};
 #[cfg(test)]
 use interactive::{InputDecoder, NativeModes, OUTPUT_LIMIT, SEQUENCE_LIMIT};
 use terminal::drain_pty;
-pub use terminal::{Survivor, Terminal, interactive, reconnect, recorded_exit};
+pub use terminal::{
+    Survivor, Terminal, interactive, interactive_with_poll, reconnect, reconnect_with_poll,
+    recorded_exit,
+};
 
 use crate::{adapters::Invocation, sandbox::Plan, storage::FileLock};
 use anyhow::{Context, Result, ensure};
@@ -49,6 +52,9 @@ pub struct Outcome {
     /// An interactive harness left running in its terminal host for a
     /// later mr; it has not ended.
     pub released: bool,
+    /// An interactive harness stopped cleanly by the user once it had already
+    /// written its handoff file, so the router concludes the stage from it.
+    pub finished_with_handoff: bool,
 }
 impl Outcome {
     pub fn success(&self) -> bool {

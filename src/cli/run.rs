@@ -255,6 +255,7 @@ fn drive_printing(run: &mut Run, cancel: &AtomicBool) -> Result<Action> {
                 Line::Err(format!("[{}] {}", run.status.label(), run.current_name()))
             }
             Event::Output(text) => Line::Out(text),
+            Event::InteractiveHandoff(_) => return,
         };
         if tx.try_send(line).is_err() {
             dropped.fetch_add(1, Ordering::Relaxed);
@@ -307,7 +308,7 @@ pub fn cli_drive(run: &mut Run, cancel: &AtomicBool, notify_flag: bool) -> Resul
                         run.id
                     );
                 }
-                if cli_interactive(run, cancel)? {
+                if cli_interactive(run, cancel, notify_flag)? {
                     println!(
                         "{} keeps running in the background. Reattach with: model-router -C {} resume {}",
                         run.current_name(),
@@ -433,21 +434,26 @@ fn prompt_answer(cancel: &AtomicBool) -> Result<String> {
 }
 
 /// True when the harness was left running in the background (`d`).
-fn cli_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<bool> {
+fn cli_interactive(run: &mut Run, cancel: &AtomicBool, notify_flag: bool) -> Result<bool> {
     use process::{AttachOutcome, InteractiveSession};
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((100, 30));
     let session = InteractiveSession::new(cols, rows);
+    let handoff_event = notify::NotifyEvent::interactive_handoff(run);
     std::thread::scope(|scope| {
         let (tx, rx) = mpsc::sync_channel(128);
         let session = &session;
         let worker = scope.spawn(move || {
             engine::run_interactive(run, cancel, session, |event| {
+                if notify_flag && matches!(&event, Event::InteractiveHandoff(_)) {
+                    notify::notify(handoff_event.clone());
+                }
                 let _ = tx.try_send(event);
             })
         });
         let foreground = (|| -> Result<()> {
             let mut finished = matches!(session.attach(cancel, cancel)?, AttachOutcome::Finished);
+            let mut handoff_ready = false;
             crossterm::terminal::enable_raw_mode()?;
             struct RestoreTerminal;
             impl Drop for RestoreTerminal {
@@ -457,14 +463,11 @@ fn cli_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<bool> {
             }
             let _terminal = RestoreTerminal;
             if !finished {
-                write!(
-                    io::stdout(),
-                    "\r\nHarness still running. [t] Reattach  [d] Leave running in the background  [c] Cancel  [q] Stop\r\n"
-                )?;
-                io::stdout().flush()?;
+                cli_interactive_events(&rx, &mut handoff_ready)?;
+                write_detached_prompt(handoff_ready)?;
             }
             while !worker.is_finished() {
-                cli_interactive_events(&rx)?;
+                cli_interactive_events(&rx, &mut handoff_ready)?;
                 let mut input = libc::pollfd {
                     fd: 0,
                     events: libc::POLLIN,
@@ -511,6 +514,17 @@ fn cli_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<bool> {
                     cancel.store(true, Ordering::Relaxed);
                     write!(io::stdout(), "\r\nStopping the stage...\r\n")?;
                     io::stdout().flush()?;
+                } else if keys.contains(&b'e')
+                    && handoff_ready
+                    && !finished
+                    && !cancel.load(Ordering::Relaxed)
+                {
+                    session.finish_with_handoff();
+                    write!(
+                        io::stdout(),
+                        "\r\nFinishing stage using its handoff file...\r\n"
+                    )?;
+                    io::stdout().flush()?;
                 } else if keys.contains(&b'd') && !finished && !cancel.load(Ordering::Relaxed) {
                     session.release();
                     write!(io::stdout(), "\r\nLeaving the harness running...\r\n")?;
@@ -520,15 +534,12 @@ fn cli_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<bool> {
                     finished = matches!(session.attach(cancel, cancel)?, AttachOutcome::Finished);
                     crossterm::terminal::enable_raw_mode()?;
                     if !finished {
-                        write!(
-                            io::stdout(),
-                            "\r\nHarness still running. [t] Reattach  [d] Leave running in the background  [c] Cancel  [q] Stop\r\n"
-                        )?;
-                        io::stdout().flush()?;
+                        cli_interactive_events(&rx, &mut handoff_ready)?;
+                        write_detached_prompt(handoff_ready)?;
                     }
                 }
             }
-            cli_interactive_events(&rx)?;
+            cli_interactive_events(&rx, &mut handoff_ready)?;
             crossterm::terminal::disable_raw_mode()?;
             Ok(())
         })();
@@ -544,7 +555,24 @@ fn cli_interactive(run: &mut Run, cancel: &AtomicBool) -> Result<bool> {
     })
 }
 
-fn cli_interactive_events(events: &mpsc::Receiver<Event>) -> Result<()> {
+fn write_detached_prompt(handoff_ready: bool) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    if handoff_ready {
+        write!(
+            stdout,
+            "\r\nHandoff file written. [e] Finish stage with handoff  [t] Reattach  [d] Leave running in the background  [c] Cancel  [q] Stop\r\n"
+        )?;
+    } else {
+        write!(
+            stdout,
+            "\r\nHarness still running. [t] Reattach  [d] Leave running in the background  [c] Cancel  [q] Stop\r\n"
+        )?;
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+fn cli_interactive_events(events: &mpsc::Receiver<Event>, handoff_ready: &mut bool) -> Result<()> {
     let mut stdout = io::stdout().lock();
     for event in events.try_iter() {
         match event {
@@ -565,6 +593,16 @@ fn cli_interactive_events(events: &mpsc::Receiver<Event>) -> Result<()> {
                     } else {
                         stdout.write_all(line.as_bytes())?;
                     }
+                }
+            }
+            Event::InteractiveHandoff(_) => {
+                let first = !*handoff_ready;
+                *handoff_ready = true;
+                if first {
+                    write!(
+                        stdout,
+                        "\r\nHandoff file written. [e] Finish stage with handoff  [t] Reattach  [d] Leave running in the background  [c] Cancel  [q] Stop\r\n"
+                    )?;
                 }
             }
         }

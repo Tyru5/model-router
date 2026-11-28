@@ -238,6 +238,22 @@ impl NotifyEvent {
             key: String::new(),
         }
     }
+    /// What to tell the user when a running interactive stage writes a valid
+    /// handoff file while its harness is still open.
+    pub fn interactive_handoff(run: &Run) -> Self {
+        let workflow = &run.workflow.name;
+        let stage = run.current_name();
+        let id = &run.id;
+        let attempts = run.stages.get(run.cursor).map_or(0, |s| s.attempts.len());
+        Self {
+            kind: Kind::NeedsInput,
+            key: format!("InteractiveHandoff:{id}:{}:{attempts}", run.cursor),
+            title: format!("{workflow}: handoff ready"),
+            body: format!(
+                "{stage} wrote its handoff; exit the harness or press [e] on Runs to finish ({id})"
+            ),
+        }
+    }
 }
 
 fn first_line(text: &str) -> &str {
@@ -697,5 +713,36 @@ mod tests {
         inflight.wait_timeout(Duration::from_millis(40));
         assert!(started.elapsed() < Duration::from_millis(400));
         inflight.leave();
+    }
+
+    #[test]
+    fn interactive_handoff_notification_uses_needs_input_and_deduplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = crate::config::Settings::default();
+        settings.adapters.insert(
+            "mock".into(),
+            crate::config::CustomAdapter {
+                command: "python3".into(),
+                ..Default::default()
+            },
+        );
+        settings.workflows[0].stages.truncate(1);
+        settings.workflows[0].stages[0].harness = "mock".into();
+        let run = crate::engine::Run::create(
+            dir.path(),
+            &settings,
+            &settings.workflows[0],
+            "Task".into(),
+            false,
+        )
+        .unwrap();
+        let ev = NotifyEvent::interactive_handoff(&run);
+        assert_eq!(ev.kind, Kind::NeedsInput);
+        assert!(ev.title.contains("handoff ready"), "{}", ev.title);
+        assert!(ev.body.contains("wrote its handoff"), "{}", ev.body);
+        assert!(ev.body.contains("[e]"), "{}", ev.body);
+        let notifier = Notifier::new(Backends::default());
+        assert!(notifier.notify(&ev));
+        assert!(!notifier.notify(&ev));
     }
 }

@@ -1292,6 +1292,7 @@ mod tests {
                 dir.path(),
                 &std::sync::atomic::AtomicBool::new(false),
                 &session,
+                || {},
             )
             .unwrap();
         assert_eq!(outcome.code, Some(0));

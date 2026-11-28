@@ -310,7 +310,11 @@ pub(super) fn evaluate_outcome(
                 .into(),
         ));
     }
-    if !outcome.success() {
+    if !outcome.success()
+        && !(mode == Mode::Interactive
+            && outcome.finished_with_handoff
+            && prepared.handoff_file.is_file())
+    {
         return Ok(Exit::Stopped(
             Status::Failed,
             format_failure_detail(
@@ -1572,6 +1576,65 @@ pub(super) fn should_transient_retry(
     is_transient_error(message, &stderr_tail)
 }
 
+/// Watches an interactive stage's handoff file for a valid structured handoff
+/// while the harness is still open.
+pub(super) struct HandoffWatcher {
+    path: PathBuf,
+    role: Role,
+    seen: Option<(u64, Option<std::time::SystemTime>)>,
+    last_err: Option<std::time::Instant>,
+}
+
+impl HandoffWatcher {
+    pub(super) fn new(path: PathBuf, role: Role) -> Self {
+        Self {
+            path,
+            role,
+            seen: None,
+            last_err: None,
+        }
+    }
+
+    pub(super) fn poll(&mut self) -> Option<Handoff> {
+        let meta = fs::metadata(&self.path).ok()?;
+        if !meta.is_file() || meta.len() == 0 {
+            return None;
+        }
+        let fingerprint = (meta.len(), meta.modified().ok());
+        if self.seen == Some(fingerprint) {
+            return None;
+        }
+        if let Some(at) = self.last_err {
+            if at.elapsed() < Duration::from_secs(1) {
+                return None;
+            }
+        }
+        let text = match process::read_tail(&self.path, 1024 * 1024) {
+            Ok(text) => text,
+            Err(_) => {
+                self.last_err = Some(std::time::Instant::now());
+                return None;
+            }
+        };
+        let sources = handoff::Sources {
+            native: None,
+            file: Some(text.as_str()),
+            text: None,
+        };
+        match handoff::resolve(sources, self.role) {
+            Ok((handoff, _)) if handoff.structured => {
+                self.seen = Some(fingerprint);
+                self.last_err = None;
+                Some(handoff)
+            }
+            _ => {
+                self.last_err = Some(std::time::Instant::now());
+                None
+            }
+        }
+    }
+}
+
 /// An interactive stage gets its session and the run's held locks, which go
 /// to its terminal host if the stage is left running.
 pub(super) fn execute_stage(
@@ -1587,7 +1650,11 @@ pub(super) fn execute_stage(
         };
         let workspace = run.workspace.clone();
         let locks = lock_paths(run)?;
-        let result = process::interactive(
+        let mut watcher = HandoffWatcher::new(
+            prepared.handoff_file.clone(),
+            run.workflow.stages[index].role,
+        );
+        let result = process::interactive_with_poll(
             &prepared.invocation,
             &workspace,
             &prepared.directory,
@@ -1604,9 +1671,20 @@ pub(super) fn execute_stage(
                     let _ = SpawnJournal::new(run).add(&group);
                 }
             },
+            || {
+                if let Some(handoff) = watcher.poll() {
+                    emit(Event::InteractiveHandoff(Box::new(handoff)));
+                }
+            },
         );
         if left_running(run, &result, session, held, emit)? {
             return Ok(());
+        }
+        if matches!(&result, Ok(outcome) if outcome.finished_with_handoff) {
+            emit(Event::Output(format!(
+                "Finishing {} using its written handoff file…\n",
+                run.current_name()
+            )));
         }
         return conclude(run, &prepared, result, cancel, emit);
     }
@@ -1905,12 +1983,10 @@ pub(super) fn reattach_stage(
     emit: &mut impl FnMut(Event),
 ) -> Result<()> {
     let index = run.cursor;
-    let directory = run.stages[index]
-        .attempts
-        .last()
-        .context("No attempt")?
-        .directory
-        .clone();
+    let attempt_ref = run.stages[index].attempts.last().context("No attempt")?;
+    let directory = attempt_ref.directory.clone();
+    let handoff_file = attempt_ref.handoff_file.clone();
+    let role = run.workflow.stages[index].role;
     // Attach first: the host hands over the locks it held, so they are never
     // free. One that held none (it ended, or its mr vanished moments ago)
     // has let go of them by now.
@@ -1985,7 +2061,12 @@ pub(super) fn reattach_stage(
                 "Reattached to {} in its terminal\n",
                 run.current_name()
             )));
-            process::reconnect(terminal, &directory, cancel, session)
+            let mut watcher = HandoffWatcher::new(handoff_file, role);
+            process::reconnect_with_poll(terminal, &directory, cancel, session, || {
+                if let Some(handoff) = watcher.poll() {
+                    emit(Event::InteractiveHandoff(Box::new(handoff)));
+                }
+            })
         }
         Err(error) => {
             session.finish();
@@ -2036,6 +2117,12 @@ pub(super) fn reattach_stage(
             return Ok(());
         }
     };
+    if matches!(&result, Ok(outcome) if outcome.finished_with_handoff) {
+        emit(Event::Output(format!(
+            "Finishing {} using its written handoff file…\n",
+            run.current_name()
+        )));
+    }
     conclude(run, &prepared, result, cancel, emit)?;
     if matches!(
         run.status,

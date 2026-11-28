@@ -145,6 +145,8 @@ pub(super) enum Watch {
     Unselected,
     Running,
     Interactive,
+    /// A live interactive harness already wrote its handoff file.
+    InteractiveHandoff,
     Handoff,
     /// Its USD budget stopped it; retrying stops again.
     Budget,
@@ -250,6 +252,10 @@ fn text(step: &Step, page: Page) -> Vec<String> {
             "This stage is interactive. Work with the harness in its terminal, then exit it (/exit) to hand off to the next stage.",
             "Press [t] to open the harness's terminal.",
         ],
+        Step::Watch(Watch::InteractiveHandoff) => &[
+            "The interactive harness wrote its handoff and is still open.",
+            "Press [e] to finish the stage, or [t] to attach and /exit.",
+        ],
         Step::Watch(Watch::Handoff) => &[
             "The stage finished and wrote a handoff for the next one.",
             "[h] inspects it; [a] accepts it and moves on.",
@@ -325,7 +331,7 @@ impl App {
             .as_ref()
             .and_then(|id| self.session.runs.iter().find(|slot| &slot.run.id == id));
         if let Some(slot) = followed {
-            return self.watch(&slot.run);
+            return self.watch(slot);
         }
         let checks = &self.harnesses.checks;
         // A project switch clears the checks; until Harnesses checks again,
@@ -384,7 +390,8 @@ impl App {
     }
 
     /// The step for the followed run.
-    fn watch(&self, run: &crate::engine::Run) -> Step {
+    fn watch(&self, slot: &super::run_slot::RunSlot) -> Step {
+        let run = &slot.run;
         if run.status == Status::Complete {
             return Step::Done;
         }
@@ -393,6 +400,9 @@ impl App {
         }
         if !self.monitoring() || self.session.run().is_none_or(|shown| shown.id != run.id) {
             return Step::Watch(Watch::Unselected);
+        }
+        if slot.ready_handoff.is_some() {
+            return Step::Watch(Watch::InteractiveHandoff);
         }
         Step::Watch(match run.status {
             Status::Interactive => Watch::Interactive,
@@ -523,6 +533,7 @@ mod tests {
             Watch::Unselected,
             Watch::Running,
             Watch::Interactive,
+            Watch::InteractiveHandoff,
             Watch::Handoff,
             Watch::Budget,
             Watch::Repair,

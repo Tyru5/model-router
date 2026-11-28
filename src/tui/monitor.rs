@@ -35,6 +35,21 @@ impl App {
                     run: run.id.clone(),
                 })));
             }
+            ActionId::FinishStage => {
+                let slot = self.session.focused().context("No run selected")?;
+                let terminal = slot
+                    .terminal()
+                    .context("No live interactive stage is running")?;
+                ensure!(
+                    slot.ready_handoff.is_some(),
+                    "No valid handoff file written yet. Press [t] to attach to the harness, or [C] to cancel."
+                );
+                terminal.finish_with_handoff();
+                self.ui.message = format!(
+                    "Finishing {} using its handoff file…",
+                    slot.run.current_name()
+                );
+            }
             ActionId::TakeOver => {
                 let slot = self.session.focused().context("No run selected")?;
                 if slot.terminal().is_some() {
@@ -133,7 +148,16 @@ impl App {
             }
             ActionId::ToggleResults => self.toggle_results()?,
             ActionId::Handoff => {
-                let run = self.session.run().context("No run selected")?;
+                let slot = self.session.focused().context("No run selected")?;
+                let run = &slot.run;
+                if let Some(handoff) = &slot.ready_handoff {
+                    let stage = run.current_name().to_owned();
+                    self.ui.open(Modal::Handoff(Box::new(HandoffView::new(
+                        handoff.clone(),
+                        stage,
+                    ))));
+                    return Ok(());
+                }
                 let index = run.cursor.min(run.stages.len().saturating_sub(1));
                 let found = run
                     .stages
@@ -587,11 +611,25 @@ fn header(slot: &RunSlot, width: u16, palette: Palette) -> Line<'static> {
             muted,
         ));
     }
-    if slot.terminal().is_some() {
-        right.push(Span::styled(
-            "  ·  detached [t]",
-            Style::default().fg(palette.accent),
-        ));
+    if let Some(terminal) = slot.terminal() {
+        if terminal.finishing() {
+            right.push(Span::styled(
+                "  ·  finishing…",
+                Style::default().fg(palette.accent),
+            ));
+        } else if slot.ready_handoff.is_some() {
+            right.push(Span::styled(
+                "  ·  handoff ready [e] / [t]",
+                Style::default()
+                    .fg(palette.warn)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            right.push(Span::styled(
+                "  ·  detached [t]",
+                Style::default().fg(palette.accent),
+            ));
+        }
     }
     let right = Line::from(right);
     let width = usize::from(width);
@@ -969,8 +1007,78 @@ struct Card {
 /// Space menu.
 fn needs_card(slot: &RunSlot, width: usize, palette: Palette) -> Option<Card> {
     let run = &slot.run;
-    if slot.worker.is_some() || finished(run) {
+    if finished(run) {
         return None;
+    }
+    if slot.worker.is_some() {
+        let terminal = slot.terminal()?;
+        let stage = run.current_name().to_owned();
+        let harness = run
+            .workflow
+            .stages
+            .get(run.cursor)
+            .map_or("the harness", |s| s.harness.as_str());
+        let fg = Style::default().fg(palette.fg);
+        if let Some(handoff) = &slot.ready_handoff {
+            let mut body = vec![Line::styled(
+                if terminal.finishing() {
+                    format!("Stopping {harness} and concluding the stage from its handoff file…")
+                } else {
+                    format!(
+                        "{harness} wrote its handoff and is still open. Finish now to run checks and review, or attach to inspect or exit it (/exit)."
+                    )
+                },
+                fg,
+            )];
+            body.extend(handoff_lines(handoff, palette));
+            let keys = if terminal.finishing() {
+                vec![key_chips(
+                    palette,
+                    &[("h", "handoff"), ("C", "cancel")],
+                    width,
+                )]
+            } else {
+                vec![key_chips(
+                    palette,
+                    &[
+                        ("e", "finish stage"),
+                        ("t", "attach (/exit)"),
+                        ("h", "handoff"),
+                        ("C", "cancel"),
+                    ],
+                    width,
+                )]
+            };
+            return Some(Card {
+                title: if terminal.finishing() {
+                    format!("● Finishing {stage}…")
+                } else {
+                    format!("◆ {stage} wrote its handoff")
+                },
+                color: if terminal.finishing() {
+                    palette.accent
+                } else {
+                    palette.warn
+                },
+                body,
+                keys,
+            });
+        }
+        return Some(Card {
+            title: format!("● {stage} · live in {harness}"),
+            color: palette.accent,
+            body: vec![Line::styled(
+                format!(
+                    "This interactive session is running in {harness}'s terminal. Press [t] to attach; exit {harness} (/exit) when done to hand off."
+                ),
+                fg,
+            )],
+            keys: vec![key_chips(
+                palette,
+                &[("t", "attach"), ("C", "cancel")],
+                width,
+            )],
+        });
     }
     let stage = run.current_name().to_owned();
     let fg = Style::default().fg(palette.fg);

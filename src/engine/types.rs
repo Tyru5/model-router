@@ -539,6 +539,9 @@ pub enum Placement {
 pub enum Event {
     State(Box<Run>),
     Output(String),
+    /// A running interactive stage wrote (or updated) a valid structured
+    /// handoff file while its harness is still open.
+    InteractiveHandoff(Box<Handoff>),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {

@@ -307,15 +307,12 @@ impl Registry {
                 let handle = handle.clone();
                 move || {
                     let pricing = crate::cost::Pricing::load(&run.project);
-                    let result = engine::drive(&mut run, &cancel, |event| {
-                        handle.publish(match event {
-                            Event::State(run) => Message::State(tools::status_value_with(
-                                &run,
-                                &Info::active(),
-                                &pricing,
-                            )),
-                            Event::Output(text) => Message::Output(text),
-                        })
+                    let result = engine::drive(&mut run, &cancel, |event| match event {
+                        Event::State(run) => handle.publish(Message::State(
+                            tools::status_value_with(&run, &Info::active(), &pricing),
+                        )),
+                        Event::Output(text) => handle.publish(Message::Output(text)),
+                        Event::InteractiveHandoff(_) => {}
                     });
                     let (outcome, error) = match result {
                         Ok(action) => (
