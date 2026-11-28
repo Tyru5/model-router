@@ -78,7 +78,9 @@ https://github.com/Tyru5/model-router/releases/latest/download/model-router-inst
 ## Website
 
 `site/` is the landing page at `https://model-router.dev`: one static
-`index.html` plus its icons, no build step. `icon.svg` is a vector trace of
+`index.html` plus its icons and three painting backgrounds (`delta.jpg` behind
+the hero, `channels.jpg` behind screenshots, `estuary.jpg` behind the closing
+cards), no build step. `icon.svg` is a vector trace of
 `docs/assets/model-router-icon.png`; `favicon.ico` (16/32/48),
 `favicon-32x32.png`, and the `site.webmanifest` icons (`icon-192.png`,
 `icon-512.png`) are rendered from it. `icon.png` (180) is the Apple touch icon.
