@@ -973,6 +973,7 @@ fn scripted_run(dir: &Path, body: &str) -> Run {
 
 /// `scripted_run`, in its own worktree when `worktree`.
 fn scripted_run_in(dir: &Path, body: &str, worktree: bool) -> Run {
+    common::isolate_config_dir();
     let script = dir.join(".git/scripted_stage.py");
     fs::write(
         &script,
