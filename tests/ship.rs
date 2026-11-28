@@ -163,6 +163,7 @@ fn ship_stage(options: ship::Options) -> Stage {
 /// A repository on `main` tracking a bare `origin`, with `stages` and a
 /// ship stage. `before` edits the checkout before the run starts.
 fn fixture(stages: Vec<Stage>, options: Option<ship::Options>) -> Option<Fixture> {
+    common::isolate_config_dir();
     let (name, email) = identity()?;
     let repo = tempfile::Builder::new()
         .prefix("ship test 雪 ")

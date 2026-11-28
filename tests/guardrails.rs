@@ -40,6 +40,7 @@ fn init_git(dir: &Path) {
 
 #[test]
 fn stall_timeout_stops_silent_stage_but_allows_active_output() {
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let script = dir.path().join("stall.py");
     fs::write(
@@ -224,6 +225,7 @@ fn protected_paths_block_fan_out_candidates_before_they_are_applied() {
 
 #[test]
 fn handoff_repair_nudges_resumable_session_for_valid_json() {
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let script = dir.path().join("repair_mock.py");
     fs::write(
@@ -326,6 +328,7 @@ else:
 
 #[test]
 fn handoff_repair_cancellation_marks_cancelled_and_uses_attempt_schema() {
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let script = dir.path().join("cancel_repair_mock.py");
     fs::write(
@@ -405,6 +408,7 @@ else:
 /// stage output instead of stopping silently.
 #[test]
 fn handoff_repair_reports_why_it_did_not_help() {
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let script = dir.path().join("no_repair_mock.py");
     fs::write(
@@ -534,6 +538,7 @@ fn stall_timeout_is_rejected_for_harnesses_that_print_only_at_exit() {
 /// Without a stage `billing` or a router provider, the harness decides.
 #[test]
 fn billing_defaults_follow_the_harness() {
+    common::isolate_config_dir();
     let custom = BTreeMap::from([(
         "mine".to_string(),
         CustomAdapter {
@@ -632,6 +637,7 @@ fn apply_worktree_brings_changes_back_uncommitted() {
 
 #[test]
 fn ship_blocks_added_secrets_and_protected_paths() {
+    common::isolate_config_dir();
     let dir = common::tempdir();
     init_git(dir.path());
     let secret = format!("token = \"{}1234567890abcdefghij1234567890\"\n", "ghp_");
@@ -679,6 +685,7 @@ with open(sys.argv[1], "w") as f:
 
 #[test]
 fn budget_warn_continues_and_billing_splits_api_vs_subscription() {
+    common::isolate_config_dir();
     let dir = common::tempdir();
     let script = dir.path().join("cost_mock.py");
     fs::write(
@@ -1159,6 +1166,7 @@ sys.exit(3 if os.path.exists(sys.argv[1] + ".fail") else 0)
 /// merge with checkout edits, and changes nothing.
 #[test]
 fn apply_check_predicts_merges_and_conflicts_without_touching_the_checkout() {
+    common::isolate_config_dir();
     let dir = common::tempdir();
     init_git(dir.path());
     let lines = |edit: &[(usize, &str)]| -> String {

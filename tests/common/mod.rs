@@ -4,7 +4,44 @@ use model_router::{
     config::{CustomAdapter, Role, Settings, Stage, Workflow},
     engine::{self, Action, Run},
 };
-use std::{collections::BTreeMap, fs, path::Path, sync::atomic::AtomicBool};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::{Mutex, atomic::AtomicBool},
+};
+
+/// Points `MODEL_ROUTER_CONFIG_DIR` at a temporary directory for this test
+/// binary, so in-process runs never read or write the user's approvals or
+/// trust store. Leaves a directory the binary already set alone. Called by
+/// `settings` and `create`; call it first in a test that builds a `Run`
+/// another way.
+pub fn isolate_config_dir() -> PathBuf {
+    static DIR: Mutex<Option<tempfile::TempDir>> = Mutex::new(None);
+    extern "C" fn cleanup() {
+        if let Ok(mut guard) = DIR.lock() {
+            guard.take();
+        }
+    }
+    let mut guard = DIR.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(dir) = guard.as_ref() {
+        return dir.path().to_path_buf();
+    }
+    if let Some(dir) = std::env::var_os("MODEL_ROUTER_CONFIG_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    let temp = tempfile::tempdir().expect("test config dir");
+    // SAFETY: set once, under the mutex. Test threads read the environment
+    // through std, which serializes that with `set_var`. `cleanup` is a
+    // plain extern "C" function that never unwinds.
+    unsafe {
+        std::env::set_var("MODEL_ROUTER_CONFIG_DIR", temp.path());
+        libc::atexit(cleanup);
+    }
+    let path = temp.path().to_path_buf();
+    *guard = Some(temp);
+    path
+}
 
 pub fn fixture(stages: Vec<Stage>) -> (tempfile::TempDir, Settings, Run) {
     let dir = tempdir();
@@ -24,6 +61,7 @@ pub fn workflow(stages: Vec<Stage>) -> Workflow {
 }
 /// Settings with the offline mock adapter and `workflow` saved.
 pub fn settings(workflow: &Workflow) -> Settings {
+    isolate_config_dir();
     let adapter = CustomAdapter {
         command: "python3".into(),
         args: vec![
@@ -54,6 +92,7 @@ pub fn settings(workflow: &Workflow) -> Settings {
     }
 }
 pub fn create(dir: &Path, settings: &Settings, workflow: &Workflow) -> Run {
+    isolate_config_dir();
     Run::create(
         dir,
         settings,
