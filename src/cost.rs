@@ -683,9 +683,12 @@ pub fn stage_totals(run: &Run, pricing: &Pricing) -> Vec<CostTotal> {
         .map(|(index, state)| {
             let (provider, billing) = stage_estimate_params(run, index);
             let mut total = CostTotal::default();
-            // Every candidate's spend counts, as in `report`.
+            // Every candidate's spend counts, as in `report`. A checks-only
+            // stage's attempts ran no model and spent nothing.
             let candidates = state.candidate_attempts().map(|(_, a)| a);
-            for attempt in state.attempts.iter().chain(candidates) {
+            let checks_only = run.workflow.stages[index].checks_only();
+            let own = state.attempts.iter().filter(|_| !checks_only);
+            for attempt in own.chain(candidates) {
                 total.add(&estimate_with_billing(
                     attempt.usage.as_ref(),
                     &attempt.model,
@@ -1482,7 +1485,12 @@ impl Accumulator {
                 let candidates = state
                     .candidate_attempts()
                     .map(|(c, a)| (c.harness.as_str(), a));
-                let own = state.attempts.iter().map(|a| (stage.harness.as_str(), a));
+                // A checks-only stage's attempts used no harness.
+                let own = state
+                    .attempts
+                    .iter()
+                    .filter(|_| !stage.checks_only())
+                    .map(|a| (stage.harness.as_str(), a));
                 for (harness, attempt) in own.chain(candidates) {
                     if since.is_some_and(|since| attempt.started_at < since) {
                         continue;

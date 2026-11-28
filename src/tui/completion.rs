@@ -526,7 +526,9 @@ fn stage_lines(report: &RunReport, width: u16, palette: Palette) -> Vec<Line<'st
         .unwrap_or(0)
         .clamp(8, 24);
     let harness = |stage: &StageReport| {
-        if stage.model.is_empty() {
+        if !stage.execution.is_harness() {
+            "router checks".to_owned()
+        } else if stage.model.is_empty() {
             stage.harness.clone()
         } else {
             format!("{} {}", stage.harness, stage.model)
@@ -613,13 +615,14 @@ fn total_lines(report: &RunReport, palette: Palette) -> Vec<Line<'static>> {
 
 /// What a finished run offers next, the likeliest first. A stopped fan-out
 /// stage cannot be retried interactively, nor can a ship stage, which never
-/// runs a harness. A run its repair limit stopped leads with another repair
+/// runs a harness. Nor can a checks-only stage, which also has no model. A run its repair limit stopped leads with another repair
 /// pass; one its budget stopped offers only a raise, as a retry would stop
 /// again on the same cap.
 fn next_keys(run: &Run) -> Vec<(&'static str, &'static str)> {
     let current = run.workflow.stages.get(run.cursor);
     let fan_out = current.is_some_and(|s| s.fan_out.is_some());
     let ship = current.is_some_and(|s| s.role == crate::config::Role::Ship);
+    let checks_only = current.is_some_and(|s| s.checks_only());
     let keys: &[(&str, &str)] = if crate::cost::budget_blocked(run) {
         &[("B", "raise budget"), ("d", "diff"), ("o", "output")]
     } else if run.repair_blocked() {
@@ -650,7 +653,8 @@ fn next_keys(run: &Run) -> Vec<(&'static str, &'static str)> {
     };
     keys.iter()
         .copied()
-        .filter(|(key, _)| !((fan_out || ship) && *key == "i"))
+        .filter(|(key, _)| !((fan_out || ship || checks_only) && *key == "i"))
+        .filter(|(key, _)| !(checks_only && *key == "m"))
         .collect()
 }
 

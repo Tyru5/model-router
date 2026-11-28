@@ -169,6 +169,8 @@ pub enum HandoffSource {
     Unstructured,
     /// An interactive stage wrote none; the router's placeholder stands in.
     Placeholder,
+    /// A checks-only stage: the router wrote it from its own check results.
+    Router,
 }
 impl HandoffSource {
     pub fn label(self) -> &'static str {
@@ -180,6 +182,7 @@ impl HandoffSource {
             Self::Json => "json",
             Self::Unstructured => "unstructured",
             Self::Placeholder => "placeholder",
+            Self::Router => "router",
         }
     }
 }

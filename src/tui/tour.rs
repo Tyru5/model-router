@@ -343,12 +343,13 @@ impl App {
         if !workflow.stages.iter().any(|stage| stage.enabled) {
             return Step::NoStage;
         }
-        // The harnesses run creation requires: ship stages run in the router,
-        // and a fan-out stage runs its candidates instead of its own harness.
+        // The harnesses run creation requires: ship and checks-only stages run
+        // in the router, and a fan-out stage runs its candidates instead of
+        // its own harness.
         let missing = workflow
             .stages
             .iter()
-            .filter(|stage| stage.enabled && stage.role != config::Role::Ship)
+            .filter(|stage| stage.enabled && stage.launches_harness())
             .flat_map(|stage| {
                 let harnesses: Vec<String> = match &stage.fan_out {
                     Some(fan) => fan

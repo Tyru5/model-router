@@ -457,7 +457,7 @@ fn snapshot_items_parts(
     for workflow in workflows {
         for stage in &workflow.stages {
             items.push(format!(
-                "execution policy in {} / {}: harness {}; sandbox {}; network {}; native settings {:?}; candidate harnesses {:?}",
+                "execution policy in {} / {}: harness {}; sandbox {}; network {}; native settings {:?}; candidate harnesses {:?}{}",
                 workflow.name,
                 stage.id,
                 stage.harness,
@@ -466,6 +466,14 @@ fn snapshot_items_parts(
                 stage.harness_settings,
                 stage.fan_out.as_ref().map(|fan| fan
                     .candidates.iter().map(|candidate| &candidate.harness).collect::<Vec<_>>()),
+                // Only a checks-only stage adds to the line, so runs approved
+                // before the field existed keep their digest. A saved run
+                // edited to launch the harness instead no longer matches.
+                if stage.checks_only() {
+                    "; execution checks-only"
+                } else {
+                    ""
+                },
             ));
         }
     }
@@ -610,6 +618,14 @@ pub struct Ignored {
     delegates: BTreeMap<String, Delegate>,
     workflows: BTreeMap<String, Hooks>,
     stages: BTreeMap<(String, String), IgnoredStage>,
+}
+impl Ignored {
+    /// Whether `stage` of `workflow` had checks that are ignored this session.
+    pub fn has_checks(&self, workflow: &str, stage: &str) -> bool {
+        self.stages
+            .get(&(workflow.to_owned(), stage.to_owned()))
+            .is_some_and(|ignored| !ignored.checks.is_empty())
+    }
 }
 #[derive(Debug, Clone, Default)]
 struct IgnoredStage {
@@ -878,6 +894,32 @@ mod tests {
             },
         );
         settings
+    }
+
+    #[test]
+    fn only_a_checks_only_stage_changes_a_runs_approval_items() {
+        let mut settings = Settings::default();
+        // Runs approved before `execution` existed keep their digest.
+        assert!(
+            snapshot_items(&settings)
+                .iter()
+                .all(|item| !item.contains("execution checks-only"))
+        );
+        let before = digest(&snapshot_items(&settings));
+        let stage = &mut settings.workflows[0].stages[0];
+        stage.execution = config::Execution::ChecksOnly;
+        let at = format!(
+            "{} / {}",
+            settings.workflows[0].name, settings.workflows[0].stages[0].id
+        );
+        let items = snapshot_items(&settings);
+        assert!(
+            items
+                .iter()
+                .any(|item| item.contains(&at) && item.ends_with("; execution checks-only")),
+            "{items:?}"
+        );
+        assert_ne!(digest(&items), before);
     }
 
     #[test]

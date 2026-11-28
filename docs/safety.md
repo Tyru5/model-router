@@ -43,6 +43,11 @@ Trust is a SHA-256 digest of those sections per project in
 | `serve` | Refused for that project until `model-router -C DIR trust`. |
 | Other commands | Ignore the sections and say so. |
 
+A checks-only test stage (`execution = "checks-only"`) runs only its `checks`,
+so it needs no trust beyond theirs. With the checks ignored, creating a run
+refuses the stage (in the TUI and through `Run::create` callers too); the
+stage's harness is never launched in their place.
+
 Your global config and a `--config` file are always trusted.
 
 Saved runs are checked against the commands and permission policies they will
@@ -50,7 +55,8 @@ actually execute before retry, rerun, or interactive recovery; a harness that
 outlived its `mr` can still be reattached, stopped, or left to end, but its
 stage's checks run only while the run is approved. New runs keep
 an approval digest outside the workspace in `<config dir>/run-approvals/`,
-including runs created from global or explicit configs. Changing saved commands
+including runs created from global or explicit configs. Changing saved commands,
+a checks-only stage's `execution`,
 or effective sandbox, network, or native permission settings invalidates that
 approval, and a config cannot reapprove a run whose digest no longer matches;
 to replay such a run anyway, review its run.json, run `trust --revoke`, and

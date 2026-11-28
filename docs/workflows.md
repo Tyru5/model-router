@@ -276,6 +276,48 @@ checks = [
   run by a shell; a leading `?` marks it optional. A line whose command and
   required flag are unchanged keeps its `timeout_seconds`; new lines get 600.
 
+### Checks-only test stages
+
+`execution = "checks-only"` on a test stage runs the stage's `checks` in
+place of a harness. No prompt is built and no model request is sent:
+
+```toml
+[[workflows.stages]]
+id = "verify"
+name = "Verify"
+role = "test"
+execution = "checks-only"
+checks = [
+  { command = ["cargo", "test", "--locked"] },
+  { command = ["cargo", "clippy", "--", "-D", "warnings"], required = false },
+]
+```
+
+- Test stages only, `mode = "unattended"`, no `fan_out` or `delegation`, and
+  at least one required check.
+- The stage's harness is not looked up when the run is created and never
+  launches. `harness`, `model`, `provider`, `effort`, `instructions`,
+  `extra_args`, sandbox settings, `retry`, and `stall_timeout_seconds` are
+  unused. Each check has its own `timeout_seconds`; the stage's does not
+  apply.
+- The router writes the handoff from the results (`handoff.json`, source
+  `router`): a summary with each command's outcome, and the log directory of
+  each failure. `tests` and `findings` stay empty, since they hold what a
+  model reports. Results stay on the attempt, so the receipt's basis is
+  router checks.
+- The gate is the one above: a failed required check blocks the stage, and
+  optional failures are recorded only.
+- Its attempts add no usage or cost: `report`, budgets, and `cost` leave them
+  out instead of counting them as attempts of unknown cost.
+- `protected_paths` and block policies apply to what the checks change.
+  `before_stage`, `after_stage`, and `on_failure` hooks run.
+- In a dependency graph the stage runs alone, as any test stage does.
+- Checks need trust in a project config. In an untrusted project they are
+  ignored and a run with the stage cannot be created: the harness never
+  launches in their place.
+- `resume --retry` runs the checks again. `--interactive`, `--model`, and
+  takeover are refused, since there is no harness or session.
+
 ### Requiring router checks
 
 `require_router_checks = true` on a test stage makes model-reported passes

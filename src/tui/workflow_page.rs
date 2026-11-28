@@ -16,8 +16,8 @@ use super::{
 use crate::{
     adapters, catalog,
     config::{
-        Billing, BudgetAction, Candidate, Check, FanOut, Mode, Role, Sandbox, SandboxFallback,
-        Stage,
+        Billing, BudgetAction, Candidate, Check, Execution, FanOut, Mode, Role, Sandbox,
+        SandboxFallback, Stage,
     },
     delegation::Delegation,
     engine::{self, Run},
@@ -62,6 +62,8 @@ const FIELDS: &[&str] = &[
     "Stage instructions",
     "Ship options (TOML; ship role only)",
 ];
+/// Unattended, interactive, or checks-only (`mode` and `execution`).
+const EXECUTION: usize = 6;
 const BILLING: usize = 7;
 const TIMEOUT: usize = 8;
 const BUDGET_USD: usize = 9;
@@ -92,7 +94,7 @@ const MULTILINE: [usize; 6] = [
 const CHOICES: [usize; 9] = [
     1,
     2,
-    6,
+    EXECUTION,
     BILLING,
     BUDGET_ACTION,
     REQUIRE_CHECKS,
@@ -192,7 +194,7 @@ impl StageEditor {
             &stage.model,
             &stage.provider,
             &stage.effort,
-            stage.mode.label(),
+            execution_label(&stage),
             &billing,
             &stage.timeout_seconds.to_string(),
             &budget_usd,
@@ -273,7 +275,11 @@ impl StageEditor {
                 .collect(),
             SANDBOX_NETWORK => vec!["on".into(), "off".into()],
             SANDBOX_FALLBACK => vec!["refuse".into(), "warn".into()],
-            _ => vec!["unattended".into(), "interactive".into()],
+            _ => vec![
+                Mode::Unattended.label().into(),
+                Mode::Interactive.label().into(),
+                Execution::ChecksOnly.label().into(),
+            ],
         }
     }
     pub(super) fn finish(&self) -> Result<Stage> {
@@ -290,10 +296,17 @@ impl StageEditor {
         stage.model = content(&self.fields[3]).trim().into();
         stage.provider = content(&self.fields[4]).trim().into();
         stage.effort = content(&self.fields[5]).trim().into();
-        stage.mode = if content(&self.fields[6]) == "interactive" {
+        // One field holds both: checks-only is unattended, with no harness.
+        let execution = content(&self.fields[EXECUTION]);
+        stage.mode = if execution == Mode::Interactive.label() {
             Mode::Interactive
         } else {
             Mode::Unattended
+        };
+        stage.execution = if execution == Execution::ChecksOnly.label() {
+            Execution::ChecksOnly
+        } else {
+            Execution::Harness
         };
         stage.billing = match content(&self.fields[BILLING]).trim() {
             "api" => Some(Billing::Api),
@@ -609,6 +622,8 @@ impl StageEditor {
                 "   ·  argv per line, no shell; edit timeout_seconds in TOML"
             } else if self.selected == REQUIRE_CHECKS {
                 "   ·  test stages only: requires a passing router check instead of model-reported pass"
+            } else if self.selected == EXECUTION {
+                "   ·  checks-only (test stages): the router runs the stage's checks, no harness"
             } else if self.selected == BILLING {
                 "   ·  default infers api for routed providers, subscription for native harnesses"
             } else if self.selected == BUDGET_USD || self.selected == BUDGET_TOKENS {
@@ -641,6 +656,9 @@ impl StageEditor {
 
 fn stage_choice_help(index: usize) -> &'static str {
     match index {
+        EXECUTION => {
+            "checks-only (test stages) runs the stage's router checks in place of a harness and needs a required check. ←/→ or Space cycles."
+        }
         BILLING => {
             "default infers api for routed providers, subscription for native accounts. ←/→ or Space cycles."
         }
@@ -656,6 +674,15 @@ fn stage_choice_help(index: usize) -> &'static str {
             "refuse fails if the sandbox cannot be set up; warn runs unsandboxed with a warning (requires trust)."
         }
         _ => "←/→ or Space cycles through options.",
+    }
+}
+
+/// The editor's Execution choice for `stage`: its mode, or checks-only.
+fn execution_label(stage: &Stage) -> &'static str {
+    if stage.checks_only() {
+        Execution::ChecksOnly.label()
+    } else {
+        stage.mode.label()
     }
 }
 
@@ -863,6 +890,12 @@ impl App {
                 let stage = self.editor.stage_mut();
                 stage.enabled = !stage.enabled;
                 self.editor.dirty = true;
+            }
+            // A checks-only stage has no harness to run either way.
+            ActionId::ToggleMode if self.editor.stage().checks_only() => {
+                self.ui.message =
+                    "Checks-only stage runs no harness. Change Execution in the stage editor [e]."
+                        .into();
             }
             ActionId::ToggleMode => {
                 let stage = self.editor.stage_mut();
@@ -1261,7 +1294,12 @@ pub(super) fn draw_workflow(
         rule,
     );
     let stage = app.editor.stage();
-    let warning = app.harnesses.checks.warning(&stage.harness);
+    // A checks-only stage launches no harness to be missing flags.
+    let warning = app
+        .harnesses
+        .checks
+        .warning(&stage.harness)
+        .filter(|_| !stage.checks_only());
     let effort = app
         .catalogs
         .cached
@@ -1383,17 +1421,21 @@ fn draw_stage_detail(
             format!("fan-out · {} candidates", fan.candidates.len()),
             fg,
         ));
+    } else if stage.checks_only() {
+        summary.push(Span::styled("router checks  no harness", fg));
     } else {
         summary.push(Span::styled(format!("{}  {}", stage.harness, model.0), fg));
     }
-    summary.push(Span::styled(
-        format!("  {}", stage.mode.label()),
-        Style::default().fg(if stage.mode == Mode::Interactive {
-            palette.blue
-        } else {
-            palette.fg
-        }),
-    ));
+    if !stage.checks_only() {
+        summary.push(Span::styled(
+            format!("  {}", stage.mode.label()),
+            Style::default().fg(if stage.mode == Mode::Interactive {
+                palette.blue
+            } else {
+                palette.fg
+            }),
+        ));
+    }
     if !stage.enabled {
         summary.push(Span::styled("   ○ off", muted));
     }
@@ -1760,6 +1802,78 @@ mod tests {
         );
         editor.fields[CHECKS] = textarea(text);
         editor.finish().map(|stage| stage.checks)
+    }
+
+    #[test]
+    fn a_checks_only_stage_card_names_no_harness() {
+        let stage = Stage {
+            name: "Verify".into(),
+            role: Role::Test,
+            harness: "opencode".into(),
+            execution: Execution::ChecksOnly,
+            checks: vec![check(&["cargo", "test"], true, 600)],
+            ..Stage::default()
+        };
+        let palette = crate::tui::theme::Theme::default().palette();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                let notes = StageNotes {
+                    sandbox: Sandbox::Off,
+                    warning: None,
+                    effort_note: None,
+                    hint: None,
+                };
+                draw_stage_detail(frame, &stage, (1, 1), notes, frame.area(), palette)
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let title: String = (0..80).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(
+            title.contains("Verify   router checks  no harness"),
+            "{title}"
+        );
+        assert!(
+            !title.contains("opencode") && !title.contains("unattended"),
+            "{title}"
+        );
+    }
+
+    #[test]
+    fn execution_field_cycles_through_checks_only_and_roundtrips() {
+        let mut editor = StageEditor::new(
+            Stage {
+                role: Role::Test,
+                checks: vec![check(&["cargo", "test"], true, 600)],
+                ..Stage::default()
+            },
+            vec!["codex".into()],
+        );
+        editor.focus(EXECUTION);
+        let mut seen = vec![content(&editor.fields[EXECUTION])];
+        for _ in 0..2 {
+            editor.key(KeyEvent::new(Key::Right, Mods::NONE));
+            seen.push(content(&editor.fields[EXECUTION]));
+        }
+        assert_eq!(seen, ["unattended", "interactive", "checks-only"]);
+        let stage = editor.finish().unwrap();
+        assert_eq!(
+            (stage.mode, stage.execution),
+            (Mode::Unattended, Execution::ChecksOnly)
+        );
+        // Reopened, the one field shows checks-only and nothing has changed.
+        let mut reopened = StageEditor::new(stage, vec!["codex".into()]);
+        assert_eq!(content(&reopened.fields[EXECUTION]), "checks-only");
+        assert!(!reopened.changed());
+        // Leaving checks-only restores a harness stage.
+        reopened.focus(EXECUTION);
+        reopened.key(KeyEvent::new(Key::Right, Mods::NONE));
+        let stage = reopened.finish().unwrap();
+        assert_eq!(
+            (stage.mode, stage.execution),
+            (Mode::Unattended, Execution::Harness)
+        );
     }
 
     #[test]

@@ -124,6 +124,7 @@ comma-separated ranges (`">=0.160.0, <0.200.0"`).
 | `provider` | `""` | Harness provider or a `[providers.NAME]` key. Empty = native config. |
 | `effort` | `""` | Reasoning effort / thinking level / OpenCode variant, where supported. |
 | `mode` | `"unattended"` | `unattended` or `interactive`. |
+| `execution` | `"harness"` | `harness`, or `checks-only`: the router runs the stage's `checks` in place of a harness and sends no model request. Unattended test stages only, with at least one required check. See [checks-only test stages](workflows.md#checks-only-test-stages). |
 | `instructions` | `""` | Stage prompt. |
 | `extra_args` | `[]` | Extra harness arguments. Needs trust in a project config. |
 | `harness_settings` | `{}` | Native permission overrides; see [harnesses.md](harnesses.md#permission-settings). |

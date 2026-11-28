@@ -988,8 +988,10 @@ fn needs_card(slot: &RunSlot, width: usize, palette: Palette) -> Option<Card> {
     let mut keys = vec![];
     // Keys the engine refuses at this stage: fan-out stages have no session
     // to reopen and run unattended; a review's verdict cannot be rewritten;
-    // a ship plan has no session and its preview is not what ships.
+    // a ship plan has no session and its preview is not what ships; a
+    // checks-only stage has no harness to reopen or give another model.
     let current = run.workflow.stages.get(run.cursor);
+    let checks_only = current.is_some_and(|s| s.checks_only());
     let role = current.map(|s| s.role);
     let fan_out = current.is_some_and(|s| s.fan_out.is_some());
     let ship = role == Some(crate::config::Role::Ship);
@@ -1000,7 +1002,8 @@ fn needs_card(slot: &RunSlot, width: usize, palette: Palette) -> Option<Card> {
         pairs
             .iter()
             .copied()
-            .filter(|(key, _)| !((fan_out || ship) && matches!(*key, "t" | "i")))
+            .filter(|(key, _)| !((fan_out || ship || checks_only) && matches!(*key, "t" | "i")))
+            .filter(|(key, _)| !(checks_only && *key == "m"))
             .filter(|(key, _)| !((review || ship) && *key == "e"))
             .filter(|(key, _)| resumable || *key != "t")
             .collect()
