@@ -18,8 +18,8 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 ### Fixed
 
-- `model-router clean --worktrees` keeps worktrees whose tracked files need a disabled repo-local clean filter to verify that they are unchanged.
-- Snapshots refuse to record unfiltered contents when Git needs to reread a file with a disabled repo-local clean filter, including after a timestamp-only change.
+- `model-router clean --worktrees` keeps worktrees whose tracked files on disk need a disabled repo-local clean filter to verify that they are unchanged. Files a sparse checkout leaves out do not count.
+- Snapshots refuse to record unfiltered contents when Git needs to reread a file with a disabled repo-local clean filter, including after a timestamp-only change. The filter is read from the working tree's `.gitattributes`, as `git add` reads it, so a removed filter rule no longer blocks the snapshot.
 - Ordinary stages recheck Git-ignored `protected_paths` after configured checks finish, before advancing.
 - `serve`'s background schedule ticker no longer panics on hosts with monotonic uptime under 60 seconds.
 - `schedule_task` now revokes prior schedule approvals while holding `schedules.lock`, preventing a race with concurrent `schedules approve`.

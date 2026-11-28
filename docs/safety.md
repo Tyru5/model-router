@@ -149,8 +149,9 @@ filling a new worktree fails, or a run's candidate and delegate worktrees are
 removed, the router removes those worktrees and their own records in the
 project's repository (never another repository's); it never runs
 `git worktree prune`. `model-router clean --worktrees` keeps a worktree
-if a tracked path uses a disabled repo-local clean or process filter: Git
-cannot reliably tell whether that file is clean without the filter. Other
+if a tracked file on disk uses a disabled repo-local clean or process
+filter: Git cannot reliably tell whether that file is clean without the
+filter. Files a sparse checkout leaves out do not count. Other
 worktrees still go through an unforced `git worktree remove` with those
 filters disabled. The sanitized `GIT_DIR` lives in a `tmp` directory inside
 the router's socket directory, which stages cannot write. Partial clones
@@ -198,7 +199,9 @@ since `git config` does not list it.
 Worktree creation and shipping fail closed when affected files rely
 on suppressed repo-local filters. A snapshot is refused if Git reports a
 new or modified file that needs a disabled clean filter, rather than recording
-unfiltered bytes. Even a timestamp-only change can make Git reread a file.
+unfiltered bytes. The filter comes from the working tree's `.gitattributes`
+(the index's where there is none), as `git add` reads it. Even a
+timestamp-only change can make Git reread a file.
 Workflows with `protected_paths` or blocking `policies` fail before launch
 when the pre-stage snapshot cannot be captured.
 

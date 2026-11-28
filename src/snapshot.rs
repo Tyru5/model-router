@@ -999,7 +999,8 @@ pub(crate) fn worktree_removal_filter_overrides(dir: &Path) -> Result<Vec<String
     let drivers = sanitized.local_clean_filters();
     if !drivers.is_empty() {
         let top = sanitized.top_level();
-        let tracked = list_index_paths(&sanitized, None, &["--cached"])?;
+        // Paths a sparse checkout leaves out are not on disk to filter.
+        let tracked = regular_files(top, &list_index_paths(&sanitized, None, &["--cached"])?)?;
         if let Some((path, driver)) =
             find_suppressed_filter_path(&sanitized, top, &tracked, None, drivers)?
         {
@@ -1042,6 +1043,31 @@ fn list_index_paths(
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(output.stdout)
+}
+
+/// The NUL-delimited `paths` (relative to `top`) that are regular files on
+/// disk: Git runs no clean filter on a missing path, a symlink, or a gitlink.
+fn regular_files(top: &Path, paths: &[u8]) -> Result<Vec<u8>> {
+    let mut files = Vec::new();
+    for raw in paths.split(|&b| b == 0).filter(|path| !path.is_empty()) {
+        let path = top.join(bytes_to_os(raw)?);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => {
+                files.extend_from_slice(raw);
+                files.push(0);
+            }
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("Inspect {}", path.display()));
+            }
+        }
+    }
+    Ok(files)
 }
 
 /// Refuses to check out a worktree at `commit_or_tree` when any file in it has
@@ -1907,29 +1933,18 @@ fn capture(workspace: &Path, index: &Path) -> Result<Option<String>> {
             &["--modified", "--others", "--exclude-standard"],
         )?;
         let top = sanitized.top_level();
-        let mut reread = Vec::new();
-        for raw in paths.split(|&b| b == 0).filter(|path| !path.is_empty()) {
-            let path = top.join(bytes_to_os(raw)?);
-            match fs::symlink_metadata(&path) {
-                Ok(meta) if meta.is_file() => {
-                    reread.extend_from_slice(raw);
-                    reread.push(0);
-                }
-                // Git does not run clean filters on deletions, symlinks or gitlinks.
-                Ok(_) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                    ) => {}
-                Err(error) => {
-                    return Err(error).with_context(|| format!("Inspect {}", path.display()));
-                }
-            }
-        }
-        if let Some((path, driver)) =
-            find_suppressed_filter_path(&sanitized, top, &reread, Some(index), drivers)?
-        {
+        let reread = regular_files(top, &paths)?;
+        // Only the attributes `git add` stages with: the working tree's
+        // `.gitattributes`, falling back to the index's where there is none.
+        // The snapshot index's own copy can name a filter the user removed.
+        if let Some((path, driver)) = find_suppressed_filter_path_in(
+            &sanitized,
+            top,
+            &reread,
+            Some(index),
+            drivers,
+            &[false],
+        )? {
             anyhow::bail!(
                 "Cannot snapshot {path}: repo-local Git clean filter `{driver}` is disabled for safety; configure the filter globally instead"
             );
@@ -3135,6 +3150,50 @@ mod tests {
         assert!(
             msg.contains("repo-local Git clean filter") && msg.contains("upper"),
             "expected disabled clean filter error, got: {msg}"
+        );
+
+        // With the rule gone from the working tree's `.gitattributes`,
+        // `git add` stages the file unfiltered, so the snapshot takes it even
+        // though the snapshot index's copy still names the filter.
+        fs::write(clean_ws.join(".gitattributes"), "").unwrap();
+        fs::write(clean_ws.join("note.upper"), "edited\n").unwrap();
+        assert!(try_tree(clean_ws, &snapshots).unwrap().is_some());
+    }
+
+    #[test]
+    fn worktree_removal_skips_files_a_sparse_checkout_leaves_out() {
+        let Some(dir) = repository() else { return };
+        let ws = dir.path();
+        fs::create_dir(ws.join("hidden")).unwrap();
+        fs::write(ws.join(".gitattributes"), "*.upper filter=upper\n").unwrap();
+        fs::write(ws.join("hidden/note.upper"), "hello\n").unwrap();
+        // Committed through the filter, so the file is clean in live Git and
+        // the sparse checkout below may remove it.
+        git(
+            ws,
+            None,
+            &["config", "--local", "filter.upper.clean", "tr a-z A-Z"],
+        )
+        .unwrap();
+        git(ws, None, &["add", "."]).unwrap();
+        git(
+            ws,
+            None,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "filtered"],
+        )
+        .unwrap();
+        let err = worktree_removal_filter_overrides(ws)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("hidden/note.upper"), "{err}");
+
+        // Cone mode keeps the top-level files and drops `hidden/`.
+        git(ws, None, &["sparse-checkout", "set", "keep"]).unwrap();
+        assert!(!ws.join("hidden/note.upper").exists());
+        let overrides = worktree_removal_filter_overrides(ws).unwrap();
+        assert!(
+            overrides.iter().any(|arg| arg == "filter.upper.clean="),
+            "{overrides:?}"
         );
     }
 
