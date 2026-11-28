@@ -44,7 +44,7 @@ Each stage's billing classification is resolved in order:
 
 | Harnesses | Default billing | Basis |
 | --- | --- | --- |
-| `codex`, `claude`, `cursor`, `gemini`, `copilot` | `subscription` | Account/plan sign-in is the default login |
+| `codex`, `claude`, `cursor`, `antigravity`, `copilot` | `subscription` | Account/plan sign-in is the default login |
 | `pi`, `omp`, `opencode`, `aider`, `goose` | `api` | Typically provider API keys |
 | `amp` | `api` | Usage credits per token |
 | Custom adapters | `api` | Unknown account billing |

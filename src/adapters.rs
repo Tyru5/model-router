@@ -24,7 +24,7 @@ pub enum OutputKind {
     Claude,
     Pi,
     Cursor,
-    Gemini,
+    Antigravity,
     OpenCode,
     Amp,
 }
@@ -37,7 +37,7 @@ impl OutputKind {
             Self::Claude => "claude-stream",
             Self::Pi => "pi",
             Self::Cursor => "cursor-stream",
-            Self::Gemini => "gemini-json",
+            Self::Antigravity => "antigravity-stream",
             Self::OpenCode => "opencode",
             Self::Amp => "amp-stream",
         }
@@ -560,12 +560,11 @@ pub fn resume(
 }
 
 /// Whether the harness's unattended output arrives while it works. False
-/// when it prints one document at exit (Gemini's `--output-format json`, or
-/// a custom adapter with the `gemini-json` parser): a quiet stage then looks
+/// when a harness prints one document at exit: a quiet stage then looks
 /// the same as a stalled one, so `stall_timeout_seconds` cannot apply.
 pub fn streams(harness: &str, custom: &BTreeMap<String, CustomAdapter>) -> bool {
     match custom.get(harness) {
-        Some(adapter) => adapter.output.map(|o| o.kind()) != Some(OutputKind::Gemini),
+        Some(_) => true,
         None => harness::get(harness).is_none_or(|spec| spec.streams),
     }
 }
@@ -1601,6 +1600,10 @@ mod tests {
         );
         assert_eq!(resumed("cursor").args, ["--model", "m", "--resume", "s-1"]);
         assert_eq!(
+            resumed("antigravity").args,
+            ["--resume", "s-1", "--model", "m", "--effort", "high"]
+        );
+        assert_eq!(
             resumed("amp").args,
             ["threads", "continue", "--mode", "m", "s-1"]
         );
@@ -1617,10 +1620,10 @@ mod tests {
             .is_err()
         );
 
-        assert!(!resumable("gemini", &none));
+        assert!(!resumable("copilot", &none));
         assert!(
             resume(
-                &stage("gemini", Mode::Unattended),
+                &stage("copilot", Mode::Unattended),
                 &none,
                 &providers,
                 "x",

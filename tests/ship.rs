@@ -198,7 +198,7 @@ fn fixture(stages: Vec<Stage>, options: Option<ship::Options>) -> Option<Fixture
     for harness in [
         "codex",
         "claude",
-        "gemini",
+        "agy",
         "pi",
         "omp",
         "opencode",

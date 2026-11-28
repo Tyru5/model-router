@@ -164,8 +164,7 @@ extra arguments, and optional stall timeout for the selected stage.
 `F7` browses models and returns. `Ctrl+S` applies, `Esc` cancels. Changing the
 harness clears its settings, model, provider, and effort; extra arguments are
 kept for review. Stall timeout is rejected for harnesses that print only at
-exit (`gemini`, and custom adapters using `output = "gemini-json"` on config
-validation) and ignored while interactive. Permission values:
+exit and ignored while interactive. Permission values:
 [harnesses.md](harnesses.md#permission-settings).
 
 ### Repository browser

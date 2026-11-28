@@ -536,10 +536,10 @@ impl SchedulerState {
         ctx: &SchedulerCtx<'env>,
         emit: &mut impl FnMut(Event),
     ) {
-        let (index, kind, label) = match &worker_job {
+        let (index, harness, label) = match &worker_job {
             WorkerJob::Stage(stage) => (
                 stage.index,
-                stage.invocation.kind,
+                run.workflow.stages[stage.index].harness.as_str(),
                 run.workflow.stages[stage.index].name.clone(),
             ),
             WorkerJob::Candidate(cand) => {
@@ -555,7 +555,7 @@ impl SchedulerState {
                     if state.model.is_empty() { "" } else { " " },
                     state.model
                 )));
-                (cand.index, cand.prepared.invocation.kind, label)
+                (cand.index, state.harness.as_str(), label)
             }
         };
         self.speaking = Some(job);
@@ -576,7 +576,7 @@ impl SchedulerState {
         // As in `execute_stage`: never for output that arrives only at exit.
         let stall_timeout = run.workflow.stages[index]
             .stall_timeout_seconds
-            .filter(|_| kind != adapters::OutputKind::Gemini)
+            .filter(|_| adapters::streams(harness, &run.adapters))
             .map(Duration::from_secs);
         spawn_worker(scope, job, worker_job, timeout, stall_timeout, ctx);
         self.flight.push((job, flight_prepared));

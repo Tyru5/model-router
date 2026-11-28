@@ -3362,20 +3362,20 @@ fn toured_app(project: &std::path::Path, missing: &str) -> App {
 fn the_tour_checks_the_harnesses_a_run_needs_and_at_least_one_stage() {
     use super::tour::Step;
     let project = tempfile::tempdir().unwrap();
-    let mut app = toured_app(project.path(), "gemini");
+    let mut app = toured_app(project.path(), "antigravity");
     let stages = &mut app.editor.settings.workflows[0].stages;
     for stage in stages.iter_mut() {
         stage.harness = "claude".into();
     }
     // A ship stage runs in the router, so its harness does not matter.
     stages[0].role = Role::Ship;
-    stages[0].harness = "gemini".into();
+    stages[0].harness = "antigravity".into();
     assert_eq!(app.tour_step(), Step::Task);
     // A fan-out stage needs its candidates' harnesses.
     let stages = &mut app.editor.settings.workflows[0].stages;
     stages[1].fan_out = Some(crate::config::FanOut {
         candidates: vec![crate::config::Candidate {
-            harness: "gemini".into(),
+            harness: "antigravity".into(),
             ..Default::default()
         }],
         judge: String::new(),
@@ -3385,7 +3385,7 @@ fn the_tour_checks_the_harnesses_a_run_needs_and_at_least_one_stage() {
         app.tour_step(),
         Step::Stage {
             name,
-            harness: "gemini".into(),
+            harness: "antigravity".into(),
             candidate: true,
         }
     );
@@ -3414,7 +3414,7 @@ fn the_tour_checks_the_harnesses_a_run_needs_and_at_least_one_stage() {
 fn the_tour_names_the_followed_run_and_how_it_recovers() {
     use super::tour::{Step, Watch};
     let project = tempfile::tempdir().unwrap();
-    let mut app = toured_app(project.path(), "gemini");
+    let mut app = toured_app(project.path(), "antigravity");
     let mut run = sample_run("tour-run");
     run.status = Status::Running;
     app.tour_started(&run.id);

@@ -132,7 +132,7 @@ pub fn describe(line: &str, kind: OutputKind) -> Vec<String> {
     if trimmed.is_empty() {
         return vec![];
     }
-    if kind == OutputKind::Text || kind == OutputKind::Gemini || !trimmed.starts_with('{') {
+    if kind == OutputKind::Text || !trimmed.starts_with('{') {
         return vec![storage::clean_terminal(line)];
     }
     let Ok(event) = serde_json::from_str::<Value>(trimmed) else {
@@ -142,9 +142,10 @@ pub fn describe(line: &str, kind: OutputKind) -> Vec<String> {
         OutputKind::Codex => codex(&event),
         OutputKind::Claude | OutputKind::Amp => claude(&event),
         OutputKind::Cursor => cursor(&event),
+        OutputKind::Antigravity => antigravity(&event),
         OutputKind::Pi => pi(&event),
         OutputKind::OpenCode => opencode(&event),
-        OutputKind::Text | OutputKind::Gemini => unreachable!(),
+        OutputKind::Text => unreachable!(),
     };
     lines
         .into_iter()
@@ -533,6 +534,105 @@ fn opencode(event: &Value) -> Vec<String> {
                 .and_then(Value::as_str)
                 .map_or_else(|| event.to_string(), str::to_owned),
         ),
+        _ => vec![],
+    }
+}
+
+fn antigravity(event: &Value) -> Vec<String> {
+    match str_at(event, "/event") {
+        "init" => {
+            let payload = event.get("init").filter(|v| v.is_object()).unwrap_or(event);
+            let id = str_at(payload, "/conversation_id");
+            let id = if id.is_empty() {
+                str_at(event, "/conversation_id")
+            } else {
+                id
+            };
+            let model = str_at(payload, "/model");
+            if id.is_empty() {
+                vec![]
+            } else if model.is_empty() {
+                vec![format!("session {id}")]
+            } else {
+                vec![format!("session {id} · {model}")]
+            }
+        }
+        "step_update" => {
+            let step = event
+                .get("step_update")
+                .filter(|v| v.is_object())
+                .unwrap_or(event);
+            let Some(info) = step.get("tool_info").filter(|v| v.is_object()) else {
+                return vec![];
+            };
+            let name = ["name", "tool_name"]
+                .iter()
+                .find_map(|k| info.get(*k).and_then(Value::as_str))
+                .unwrap_or("");
+            let mut lines = vec![];
+            if !name.is_empty() {
+                let input = info
+                    .get("arguments")
+                    .or_else(|| info.get("args"))
+                    .or_else(|| info.get("input"))
+                    .unwrap_or(&Value::Null);
+                lines.push(tool(name, input));
+            }
+            if let Some(err) = info
+                .get("error")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                lines.push(result(err, true));
+            } else if let Some(out) = info.get("output").and_then(Value::as_str) {
+                lines.push(result(out, false));
+            }
+            lines
+        }
+        "result" => {
+            let payload = event
+                .get("result")
+                .filter(|v| v.is_object())
+                .unwrap_or(event);
+            let status = str_at(payload, "/status").to_ascii_lowercase();
+            let has_error = payload
+                .get("error")
+                .is_some_and(|v| !v.is_null() && v != &Value::Bool(false));
+            if matches!(
+                status.as_str(),
+                "error" | "failed" | "canceled" | "cancelled"
+            ) || has_error
+            {
+                let text = payload
+                    .pointer("/error/message")
+                    .or_else(|| payload.get("error"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Harness reported an error");
+                return error(text);
+            }
+            let mut line = "✓ finished".to_owned();
+            if let Some(secs) = payload.get("duration_seconds").and_then(Value::as_f64) {
+                line.push_str(&format!(" · {}s", secs.round() as u64));
+            }
+            line.push_str(&tokens(
+                payload
+                    .pointer("/usage/input_tokens")
+                    .and_then(Value::as_u64),
+                payload
+                    .pointer("/usage/output_tokens")
+                    .and_then(Value::as_u64),
+            ));
+            vec![line]
+        }
+        "error" => {
+            let text = event
+                .pointer("/error/message")
+                .or_else(|| event.get("error"))
+                .or_else(|| event.get("message"))
+                .and_then(Value::as_str)
+                .map_or_else(|| event.to_string(), str::to_owned);
+            error(&text)
+        }
         _ => vec![],
     }
 }
@@ -1000,6 +1100,13 @@ mod tests {
         let amp = fixture("amp/success.jsonl", OutputKind::Amp);
         assert!(amp[0].starts_with("session T-"), "{amp:?}");
         assert!(!amp.iter().any(|l| l.contains("ORIGINAL TASK")));
+        let agy = fixture("antigravity/tool-echo.jsonl", OutputKind::Antigravity);
+        assert!(agy[0].starts_with("session 00000000-"), "{agy:?}");
+        assert!(agy.iter().any(|l| l.starts_with("⚙ read_file")), "{agy:?}");
+        assert!(
+            agy.last().is_some_and(|l| l.starts_with("✓ finished")),
+            "{agy:?}"
+        );
     }
 
     #[test]

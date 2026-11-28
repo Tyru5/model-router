@@ -151,7 +151,7 @@ Per-adapter coverage, checked on 2026-11-07:
 | Pi | Both modes | 5 schema-derived, 1 captured | 1.5.0, tested, ok | Captured 2026-11-07 |
 | Oh My Pi | Both modes | 4 captured | 18.18.0, tested, ok | Captured 2026-11-07 |
 | Cursor Agent | Both modes, native settings | 5 schema-derived, 1 captured | 2026.11.05-86047df, tested, ok | Captured 2026-11-07 |
-| Gemini CLI | Both modes, native settings | 3 schema-derived (source and docs), 0 captured | Not installed | Unverified |
+| Antigravity | Both modes, native settings | 5 schema-derived (help and docs), 0 captured | 1.5.18, schema-derived, ok | Unverified |
 | OpenCode | Both modes | 4 schema-derived, 1 captured | 2.2.6, tested, ok | Captured 2026-11-07 |
 | Aider | Both modes | 1 schema-derived transcript, 0 captured | Not installed | Unverified |
 | Goose | Both modes | 1 schema-derived transcript, 0 captured | Not installed | Unverified |

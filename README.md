@@ -5,7 +5,7 @@
 </p>
 
 A native Rust TUI and CLI that runs one task through a sequence of agent
-harnesses (Codex, Claude Code, Pi, omp, Cursor, Gemini, OpenCode, Aider, Goose,
+harnesses (Codex, Claude Code, Pi, omp, Cursor, Antigravity, OpenCode, Aider, Goose,
 Amp, Copilot, or your own) with the model you pick for each stage. Each stage
 runs unattended or in the harness's own interactive terminal, hands a
 structured result to the next, and the run ends with a brief telling you what

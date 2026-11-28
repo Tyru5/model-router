@@ -19,7 +19,7 @@ fn unattended_raw_and_malformed_output_is_cleaned_but_logs_stay_raw() {
     use model_router::config::CustomOutput;
     for kind in [
         CustomOutput::Text,
-        CustomOutput::GeminiJson,
+        CustomOutput::AntigravityStream,
         CustomOutput::ClaudeStream,
         CustomOutput::CodexJsonl,
     ] {
@@ -269,8 +269,7 @@ fn manifest_is_labeled_matches_adapters_and_covers_each_scenario() {
     }
     for harness in BUILTINS {
         // Required scenarios count only in the format the adapter requests.
-        // Tool echoes may use another, explained format: Gemini's json output
-        // carries no tool output to echo.
+        // Tool echoes may use another, explained format when needed.
         let format = format_of(harness);
         let scenarios: BTreeSet<_> = manifest
             .fixture
@@ -395,6 +394,18 @@ fn doctor_reports_versions_and_flags_from_help_without_running_a_model() {
             ),
         ],
     );
+    shell_harness(
+        &bin,
+        "agy",
+        &log,
+        &[
+            ("--version", "1.5.18"),
+            (
+                "--help",
+                "Usage of agy:\n  --effort                        Reasoning effort (low|medium|high|xhigh|max)\n  --json-schema                   JSON schema\n  --mode                          Execution mode (accept-edits, auto, plan)\n  --model                         Model\n  --output-format                 Output format (text, json, stream-json)\n  --print                         Run a single prompt\n  --prompt-interactive            Run an initial prompt interactively\n  --resume                        Resume conversation\n  --sandbox                       Run in a sandbox",
+            ),
+        ],
+    );
     // No flags in help: capability support is unknown.
     shell_harness(
         &bin,
@@ -454,9 +465,12 @@ fn doctor_reports_versions_and_flags_from_help_without_running_a_model() {
     assert_eq!(report("claude")["version_tested"], true);
     assert_eq!(report("amp")["version_tested"], false);
     assert_eq!(report("amp")["summary"], "ok");
+    assert_eq!(report("antigravity")["version"], "1.5.18");
+    assert_eq!(report("antigravity")["version_tested"], true);
+    assert_eq!(report("antigravity")["summary"], "ok");
     assert_eq!(report("opencode")["summary"], "unknown: help unavailable");
-    assert_eq!(report("gemini")["path"], Value::Null);
-    assert_eq!(report("gemini")["summary"], "not checked");
+    assert_eq!(report("copilot")["path"], Value::Null);
+    assert_eq!(report("copilot")["summary"], "not checked");
     let mine = report("mine");
     assert_eq!(mine["builtin"], false);
     assert_eq!(mine["summary"], "not declared");
@@ -500,7 +514,12 @@ fn doctor_reports_versions_and_flags_from_help_without_running_a_model() {
         assert!(codex.contains(cell), "{codex}");
     }
     assert!(row("amp").contains("untested"));
-    assert!(row("gemini").contains("missing") && row("gemini").contains("not checked"));
+    assert!(
+        row("antigravity").contains("installed")
+            && row("antigravity").contains("1.5.18")
+            && row("antigravity").contains("ok")
+    );
+    assert!(row("copilot").contains("missing") && row("copilot").contains("not checked"));
     assert!(row("mine").contains("not declared"));
     assert!(table.trim_end().ends_with("Log in through each harness."));
 

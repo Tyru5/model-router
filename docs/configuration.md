@@ -30,7 +30,7 @@ checks `PATH` for installed harnesses, leaves stage models and effort blank to
 inherit each harness's default, and replaces any stage harness that is not
 installed while preserving read-only intent (mapped to the new harness's native
 read-only setting—Codex `sandbox = "read-only"`, Claude
-`permission_mode = "plan"`, Gemini `approval_mode = "plan"`—or else the
+`permission_mode = "plan"`, Antigravity `mode = "plan"`—or else the
 stage's router `sandbox = "read-only"`). When more than one harness is
 installed, review stages move to a different harness than the implementing
 stage. In the TUI, `s` saves project templates and `S` global templates.
@@ -101,7 +101,7 @@ comma-separated ranges (`">=0.160.0, <0.200.0"`).
 | `sandbox_default` | `"off"` | Router sandbox for stages without `sandbox`: `off`, `read-only`, `workspace-write`, `by-role`. |
 | `budget` | none | `{ max_usd, max_tokens, on_exceed }` for the whole run. |
 | `protected_paths` | `[]` | Repository-relative globs (`*`, `**`, `?`, up to 64). Enforced for ordinary stages, fan-out candidates (candidate stops blocked), and candidate selection; `ship` and `apply` refuse matching files. An ordinary stage is also checked for matching files Git ignores (see `docs/safety.md`). |
-| `handoff_repair` | `false` | When `true`, an unattended stage that exits 0 without a valid handoff sends one follow-up on the same session asking only for handoff JSON (an extra, possibly billed request). Supported on `codex` (not local providers `ollama`/`lmstudio`), `claude`, `pi`, `opencode`, and custom adapters with `follow_up_args`. |
+| `handoff_repair` | `false` | When `true`, an unattended stage that exits 0 without a valid handoff sends one follow-up on the same session asking only for handoff JSON (an extra, possibly billed request). Supported on `codex` (not local providers `ollama`/`lmstudio`), `claude`, `pi`, `antigravity`, `opencode`, and custom adapters with `follow_up_args`. |
 | `handoff_budget_bytes` | `14000` | Total byte budget for prior stage handoffs in downstream prompts (`1024`–`200000`). |
 | `handoff_each_bytes` | `5000` | Per-stage byte budget for each prior handoff (`1024`–`200000`, at most `handoff_budget_bytes`). |
 | `context_files` | `[]` | Repo-relative paths or globs (`*`, `**`, `?`, up to 32) whose UTF-8 contents are injected into every stage prompt (max 32 files and 32 KiB total, symlink-safe, never reading `.git` or `.model-router`). Shown in `preview` and `handoffs --prompt`. |
@@ -128,8 +128,8 @@ comma-separated ranges (`">=0.160.0, <0.200.0"`).
 | `extra_args` | `[]` | Extra harness arguments. Needs trust in a project config. |
 | `harness_settings` | `{}` | Native permission overrides; see [harnesses.md](harnesses.md#permission-settings). |
 | `timeout_seconds` | `3600` | Attempt timeout. |
-| `stall_timeout_seconds` | unset | Optional unattended inactivity limit in seconds: stops the stage if neither stdout nor stderr produces bytes for this long. Rejected for harnesses that print only at exit (`gemini` and custom adapters with `output = "gemini-json"`, including fan-out candidates); ignored for interactive stages (`preview` notes this). |
-| `billing` | unset | `"api"` or `"subscription"`. Precedence: stage `billing`, else `"api"` when routed through a router provider, else the harness default (`codex`, `claude`, `cursor`, `gemini`, `copilot` → `"subscription"`; `pi`, `omp`, `opencode`, `aider`, `goose`, `amp`, and custom adapters → `"api"`). The router does not detect a harness's login method; set `billing` explicitly when it differs from the default (for example, `billing = "subscription"` for `pi` or `omp` on a Claude or ChatGPT plan). See [cost.md](cost.md#billing). |
+| `stall_timeout_seconds` | unset | Optional unattended inactivity limit in seconds: stops the stage if neither stdout nor stderr produces bytes for this long. Rejected for harnesses that print only at exit (including fan-out candidates); ignored for interactive stages (`preview` notes this). |
+| `billing` | unset | `"api"` or `"subscription"`. Precedence: stage `billing`, else `"api"` when routed through a router provider, else the harness default (`codex`, `claude`, `cursor`, `antigravity`, `copilot` → `"subscription"`; `pi`, `omp`, `opencode`, `aider`, `goose`, `amp`, and custom adapters → `"api"`). The router does not detect a harness's login method; set `billing` explicitly when it differs from the default (for example, `billing = "subscription"` for `pi` or `omp` on a Claude or ChatGPT plan). See [cost.md](cost.md#billing). |
 | `repair_target` | `""` | Review only: implementation stage ID to repair. Empty = nearest enabled upstream. |
 | `checks` | `[]` | Router-run checks, below. Needs trust in a project config. |
 | `require_router_checks` | `false` | Test stages only: only a passing required router check (or an accepted waiver) satisfies the gate; model-reported passes do not. |
@@ -321,7 +321,7 @@ Custom harnesses. A project's adapters need trust.
 | `interactive_args` | none | Interactive arguments. Omit if the tool has no interactive mode. |
 | `models_args` | none | Arguments that print one model ID per line. |
 | `prompt_stdin` | `false` | Send the unattended prompt on stdin. |
-| `output` | `"text"` | Parser: `text`, `codex-jsonl`, `claude-stream`, `pi`, `cursor-stream`, `gemini-json`, `opencode`, `amp-stream`. |
+| `output` | `"text"` | Parser: `text`, `codex-jsonl`, `claude-stream`, `pi`, `cursor-stream`, `antigravity-stream`, `opencode`, `amp-stream`. |
 | `session` | none | `{ assign = "--session-id" }` (router picks an ID) or `{ reported = true }` (read from output events). |
 | `resume_args` | none | Interactive arguments that reopen `{session}`. Enables interactive takeover only (not `handoff_repair`); needs `session`. |
 | `follow_up_args` | none | Unattended arguments that follow up on `{session}`. Enables `handoff_repair`; accepts the same placeholders as `args` plus `{session}`, receives the prompt as an unattended launch does, needs `session` (`assign` or `reported`), and enters the project trust digest only when set. |

@@ -16,7 +16,16 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, fs, path::Path};
 
 const HARNESSES: &[&str] = &[
-    "codex", "claude", "pi", "omp", "cursor", "gemini", "opencode", "aider", "goose", "amp",
+    "codex",
+    "claude",
+    "pi",
+    "omp",
+    "cursor",
+    "antigravity",
+    "opencode",
+    "aider",
+    "goose",
+    "amp",
     "copilot",
 ];
 
@@ -41,11 +50,8 @@ const SETTINGS: &[(&str, &str, &[&str])] = &[
         ],
     ),
     ("cursor", "sandbox", &["enabled", "disabled"]),
-    (
-        "gemini",
-        "approval_mode",
-        &["default", "auto_edit", "plan", "yolo"],
-    ),
+    ("antigravity", "mode", &["plan", "accept-edits", "auto"]),
+    ("antigravity", "sandbox", &["enabled"]),
     ("omp", "approval_mode", &["always-ask", "write", "yolo"]),
     ("aider", "confirmations", &["yes-always"]),
     (
@@ -56,9 +62,9 @@ const SETTINGS: &[(&str, &str, &[&str])] = &[
     ("copilot", "tool_permissions", &["allow-all-tools"]),
 ];
 
-const CURRENT: &str =
-    "codex=codex-cli 0.160.0,claude=2.1.318 (Claude Code),opencode=opencode v2.0.22";
-const OLD: &str = "codex=codex-cli 0.40.0,claude=2.1.0 (Claude Code),opencode=1.4.3";
+const CURRENT: &str = "codex=codex-cli 0.160.0,claude=2.1.318 (Claude Code),antigravity=1.5.18,opencode=opencode v2.0.22";
+const OLD: &str =
+    "codex=codex-cli 0.40.0,claude=2.1.0 (Claude Code),antigravity=0.9.0,opencode=1.4.3";
 
 fn set_versions(value: &str) {
     // SAFETY: this test binary has a single test, so no thread reads the

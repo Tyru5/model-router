@@ -1,7 +1,7 @@
 # model-router
 
 A Rust TUI and CLI (`model-router`, alias `mr`) that runs one task through a
-sequence of agent harnesses (Codex, Claude Code, Pi, omp, Cursor, Gemini,
+sequence of agent harnesses (Codex, Claude Code, Pi, omp, Cursor, Antigravity,
 OpenCode, Aider, Goose, Amp, Copilot, custom), one model per stage, with
 structured handoffs between stages. Linux and macOS only.
 

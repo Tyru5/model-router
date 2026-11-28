@@ -9,7 +9,7 @@ Run: cargo build && python3 scripts/capture_harness_output.py claude --confirm-p
 
 It creates a temporary project and config with one unattended stage for the
 harness, with restrictive harness settings where supported (Codex read-only
-sandbox, Claude plan mode, Cursor sandbox, Gemini plan approval), and runs
+sandbox, Claude plan mode, Cursor sandbox, Antigravity plan mode), and runs
 `model-router run --task` with a tiny task asking for a fixed router-handoff
 block. The attempt's stdout.log is sanitized (prompt echoes, paths, user and
 host names, emails, IDs, keys) into
@@ -41,7 +41,7 @@ HARNESSES = {
     "pi": ("Pi", "jsonl", {}, "json"),
     "omp": ("Pi", "jsonl", {"approval_mode": "always-ask"}, "json"),
     "cursor": ("Cursor", "jsonl", {"sandbox": "enabled"}, "stream-json"),
-    "gemini": ("Gemini", "json", {"approval_mode": "plan"}, "json"),
+    "antigravity": ("Antigravity", "jsonl", {"mode": "plan"}, "stream-json"),
     "opencode": ("OpenCode", "jsonl", {}, "json"),
     "aider": ("Text", "txt", {}, "text"),
     "goose": ("Text", "txt", {}, "text"),
@@ -56,7 +56,7 @@ PREFIXED_ID = re.compile(
     r"\b(ses|msg|prt|toolu|call|req|resp|chatcmpl|item|run)_[A-Za-z0-9]{12,}\b"
 )
 ID_FIELD = re.compile(
-    r'"(session_?[iI][dD]|thread_?[iI][dD]|request_?[iI][dD]|uuid|model_call_id'
+    r'"(session_?[iI][dD]|conversation_?[iI][dD]|thread_?[iI][dD]|request_?[iI][dD]|uuid|model_call_id'
     r'|responseId|id)"(\s*:\s*)"([^"\\]{6,})"'
 )
 EMAIL = re.compile(
@@ -269,6 +269,8 @@ def main():
     program = args.harness
     if program == "cursor":
         program = "cursor-agent" if shutil.which("cursor-agent") else "agent"
+    elif program == "antigravity":
+        program = "agy"
     version = version_of(program)
     summary = f"Captured {args.harness} fixture"
     handoff = {

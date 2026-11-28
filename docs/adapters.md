@@ -11,7 +11,7 @@ model entitlement database.
 | Pi | Installed `pi --help`; [CLI source/documentation](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) | `--print --mode json`, `@prompt-file`, `--provider`, `--model`, `--thinking`. Provider catalogs include extension-defined models. A provider defined only in the router's `[providers]` is rejected before launch. Takeover and print-mode follow-up reuse the router-chosen `--session-id`. |
 | omp (oh-my-pi) | Installed `omp --help` and `omp models --json` | `--print --mode json` (Pi's event format), `@prompt-file`, `--model provider/model`, `--thinking`, `--approval-mode`. Catalog from `omp models --json`, with per-model thinking levels. Takeover: `omp --resume ID` from its `session` event. |
 | Cursor Agent | Installed `cursor-agent --help` (2026.10.22); [CLI documentation](https://cursor.com/docs/cli/overview) | Print-mode stream JSON and account model listing. Uses `cursor-agent`; `agent` only when it links into Cursor's `cursor-agent` directory or its `--help` names the Cursor Agent, since other tools use that name. Unattended uses `--output-format stream-json`, whose retries emit `{type: retry}` events; takeover `--resume ID`. |
-| Gemini CLI | [Headless reference](https://geminicli.com/docs/cli/headless/) and [CLI reference](https://geminicli.com/docs/cli/cli-reference/) | `--prompt`, single JSON `response` printed at exit (`streams = false`, so `stall_timeout_seconds` is rejected), native `--model`; interactive uses `--prompt-interactive`. |
+| Antigravity | Installed `agy --help` (1.5.18); [CLI reference](https://antigravity.google/docs/cli/reference) | `--print`, `--output-format stream-json` NDJSON events, `--json-schema` (handoff schema, 1.0.0+), native `--model`, `--effort`, `--mode`, `--sandbox`; interactive uses `--prompt-interactive`. Takeover and follow-up (`handoff_repair`) resume `conversation_id` with `--resume ID`. |
 | OpenCode | Installed `opencode run --help` and `opencode --help` (2.2.5, 2026-11-05); [CLI reference](https://opencode.ai/docs/cli/) | 2.x: `run --format json --model provider/model#variant`; interactive is the root TUI with `--prompt`, its model set through `OPENCODE_CONFIG_CONTENT` (`model`), and no variant option, so interactive effort is rejected. Before 2.x (detected `--version` major below 2): `run --interactive`, `--model`, `--variant`. `MODEL_ROUTER_HARNESS_VERSIONS=opencode=1.4.0` overrides detection. Takeover: `opencode --session ID`. Follow-up: `opencode run --session ID`. |
 | Aider | [Scripting](https://aider.chat/docs/scripting.html) and [options](https://aider.chat/docs/config/options.html) | `--message-file` unattended; interactive `--read` plus `--load` command file, written at launch (never by previews). Disable auto/dirty commits. `--yes-always` is the Confirmations setting. Aider has no flag to skip its `.env` files (home, Git root, working directory); routed providers pass `--openai-api-base` so a `.env` cannot redirect the endpoint. |
 | Goose | [CLI command reference](https://github.com/aaif-goose/goose/blob/main/documentation/docs/guides/goose-cli-commands.md) | `run --text`, `--provider`, `--model`; `--interactive` continues the conversation. Permission mode via `GOOSE_MODE` (`run` has no flag). |
@@ -26,8 +26,7 @@ Claude `--permission-mode`, and Cursor `--sandbox` were checked against installe
 CLI help on 2026-10-04; Claude's choices again on 2026-11-05 (2.1.318:
 `acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`; older
 releases called `manual` `default`). Aider `--yes-always`, Goose `GOOSE_MODE`,
-and Copilot `--allow-all-tools` follow their documentation (not installed here). Gemini's `--approval-mode` choices were checked against
-its [CLI reference](https://geminicli.com/docs/cli/cli-reference/). Extra arguments
+and Copilot `--allow-all-tools` follow their documentation (not installed here). Antigravity's `--mode` and `--sandbox` choices were checked against installed `agy --help` (1.5.18). Extra arguments
 remain available for other native settings; conflicting permission overrides
 are rejected before execution. No override is emitted for Harness default.
 Unknown effort/provider combinations are rejected rather than ignored; an
@@ -63,11 +62,11 @@ paths all read it. An entry declares:
 | `output` | The parser (`OutputKind`). |
 | `session`, `resume` | `Assign { flag, .. }`, `Reported`, or `None`; resume prepends/appends/replaces with `{session}` for interactive takeover. |
 | `follow_up` | Optional unattended session follow-up command (`FollowUp`: argument template with `{session}` and `{final_file}`, prompt delivery, and `FollowUpExtra::Same` or `ConfigOnly`), used by `workflow.handoff_repair`. |
-| `streams` | `false` when unattended output arrives as one document at exit (`gemini`), so `stall_timeout_seconds` is rejected. |
+| `streams` | `false` when unattended output arrives as one document at exit, so `stall_timeout_seconds` is rejected. |
 | `billing` | Default billing (`Billing::Api` or `Billing::Subscription`) when a stage sets no `billing` and is not routed through a router provider. |
 | `structured` | Native schema flag, first supporting version, inline or file. |
 | `settings` | Permission/sandbox settings for the stage editor. |
-| `read_only` | Optional `(setting_key, choice)` for the harness's native read-only mode (`codex`: `sandbox=read-only`, `claude`: `permission_mode=plan`, `gemini`: `approval_mode=plan`); used by `init --detect` when replacing an unavailable harness. |
+| `read_only` | Optional `(setting_key, choice)` for the harness's native read-only mode (`codex`: `sandbox=read-only`, `claude`: `permission_mode=plan`, `antigravity`: `mode=plan`); used by `init --detect` when replacing an unavailable harness. |
 | `catalog`, `version_override`, `state_dirs`, `notes` | Model listing source, older-version arguments, sandbox-writable state paths, and notes. |
 
 So adding a harness is:
@@ -106,7 +105,7 @@ never by editing user or project config (`HarnessSpec::mcp`, rendered by
 | OpenCode | `mcp.model-router` (`type = "local"`) in `OPENCODE_CONFIG_CONTENT` | `run --session` |
 | Custom | `mcp_config_args` with `{mcp_config}` (Claude format) | `follow_up_args` |
 
-Pi, omp, Cursor, Gemini, Goose, Aider, Amp, and Copilot cannot be delegating
+Pi, omp, Cursor, Antigravity, Goose, Aider, Amp, and Copilot cannot be delegating
 parents: no per-launch MCP option, or (Amp) one whose format could not be
 confirmed offline. Every harness can run tasks. `doctor` probes the
 injection flags; `tests/fixtures/adapter-golden/delegation.json` records the
@@ -150,7 +149,8 @@ The handoff's primary channel, where the harness has one; the prompt's
 | --- | --- | --- |
 | Codex | `codex exec --output-schema FILE` (since 0.41.0, [openai/codex#4079](https://github.com/openai/codex/pull/4079); checked with 0.167.0 on 2026-11-05) | Writes `handoff::strict_schema()` to `output-schema.json` in the attempt directory at launch. Codex structured output is strict: every property is required, so optional scalars are nullable and lists may be empty. The final message (`--output-last-message`) is the handoff. |
 | Claude Code | `--print --json-schema JSON` (inline JSON only; a path is rejected; print-mode fix in 2.1.22; checked with 2.1.318) | Passes the published schema without annotations. The stream's `result` event carries `structured_output`, read as the handoff; `result` holds the same JSON as text. |
-| Gemini CLI, Cursor, OpenCode, Pi, omp, Amp | None in installed help (2026-11-05) or the Gemini [headless](https://geminicli.com/docs/cli/headless/) and [CLI](https://geminicli.com/docs/cli/cli-reference/) references | Marker fallback. |
+| Antigravity | `--json-schema JSON` (inline JSON or file path; checked with `agy` 1.5.18) | Passes the published schema without annotations. The `result` event carries `result.structured_output`, read as the handoff. |
+| Cursor, OpenCode, Pi, omp, Amp | None in installed help (2026-11-05) | Marker fallback. |
 | Aider, Goose, Copilot, custom | Not documented | Marker fallback. |
 
 The flag is added only to unattended launches whose detected version
@@ -207,7 +207,7 @@ settings or an OpenAI-compatible gateway such as LiteLLM.
 HARNESS   STATUS     VERSION  TESTED          CAPABILITIES  PATH
 codex     installed  0.160.0  schema-derived  ok            ~/.local/bin/codex
 omp       installed  18.6.3   tested          ok            ~/.local/bin/omp
-gemini    missing    -        -               not checked   gemini
+antigravity installed  1.5.18   schema-derived  ok            ~/.local/bin/agy
 
 Sandbox: bwrap available at /usr/bin/bwrap (bubblewrap 0.9.0)
 Tools: git 2.43.0 at /usr/bin/git; gh missing (needed for GitHub task imports, ship --draft-pr)
@@ -280,7 +280,7 @@ output schema and must yield a handoff from it. Scenarios cover success, reporte
 retries (Codex, Pi, Claude `api_retry`, Cursor `retry`, OpenCode, and an
 assumed Amp shape), permission denials (Claude), and tool output or echoed
 prompts that contain fake handoffs. An error event followed by a successful
-final event (Claude/Cursor/Amp `result` without `is_error`, Gemini `response`,
+final event (Claude/Cursor/Amp `result` without `is_error`, Antigravity `result` with `SUCCESS`,
 OpenCode `step_finish` with reason `stop`) is a retry, not a failure. OpenCode's
 handoff is the text of its last message only, not every step.
 
@@ -294,7 +294,7 @@ cargo test --test harness_output
 
 The script runs one unattended stage in a temporary project, with restrictive
 settings where available: Codex read-only sandbox, Claude plan mode, Cursor
-sandbox, and Gemini plan approval. The task asks for a fixed handoff block. It
+sandbox, and Antigravity plan mode. The task asks for a fixed handoff block. It
 sanitizes the attempt's `stdout.log` (prompt echoes, paths, user and host
 names, emails, IDs, and keys) into `<harness>/captured-success.<ext>` and
 appends a `captured` manifest entry with the adapter's format. Review both before committing.

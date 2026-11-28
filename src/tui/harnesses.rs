@@ -1041,7 +1041,7 @@ mod tests {
         opencode
             .notes
             .push("Detected version is not a parser-tested version.".into());
-        vec![codex, opencode, report("gemini", None)]
+        vec![codex, opencode, report("antigravity", None)]
     }
 
     fn app() -> App {
@@ -1234,11 +1234,11 @@ mod tests {
             "{text}"
         );
 
-        // gemini is not installed, so it cannot be marked.
+        // antigravity is not installed, so it cannot be marked.
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Char('x'));
-        assert_eq!(app.ui.message, "gemini is not installed.");
+        assert_eq!(app.ui.message, "antigravity is not installed.");
         assert!(app.harnesses.tests.marked.is_empty());
         // [a] marks every installed harness, then clears them.
         press(&mut app, KeyCode::Char('a'));
@@ -1362,12 +1362,12 @@ mod tests {
     #[test]
     fn marks_are_revalidated_and_stale_results_dropped() {
         let (_project, mut app) = checkout();
-        // Marked before the check found gemini missing.
-        app.harnesses.tests.marked = ["codex", "gemini"].map(String::from).into();
+        // Marked before the check found antigravity missing.
+        app.harnesses.tests.marked = ["codex", "antigravity"].map(String::from).into();
         press(&mut app, KeyCode::Char('t'));
         assert_eq!(
             app.ui.message,
-            "Unmarked gemini: not installed or not built in."
+            "Unmarked antigravity: not installed or not built in."
         );
         assert!(matches!(
             app.ui.dialog(),
@@ -1401,7 +1401,7 @@ mod tests {
         app.harnesses.checks.reports = stub(&app.editor.settings, &app.project);
 
         // [a] drops marks a check found stale.
-        app.harnesses.tests.marked = ["gemini"].map(String::from).into();
+        app.harnesses.tests.marked = ["antigravity"].map(String::from).into();
         press(&mut app, KeyCode::Char('a'));
         assert_eq!(
             app.harnesses.tests.marked.iter().collect::<Vec<_>>(),

@@ -20,6 +20,7 @@ Release notes for a `vX.Y.Z` tag come from its section below.
 
 - `serve --mcp` answers a request whose worker fails unexpectedly (for example a tool that cannot put a non-UTF-8 project path in JSON) with an error instead of leaving it unanswered, and reads run records for `resources/*`, `prompts/get`, and `completion/complete` on worker threads so the stdio reader keeps reading.
 - MCP servers (`serve` and the delegation bridge) speak protocol `2025-11-25`, which current Claude Code, Gemini CLI, OpenCode, Cursor, Amp, Pi, oh-my-pi, and goose request, and echo `2025-06-18` (Codex), `2025-03-26`, or `2024-11-05` when a client asks for one. `serve` and an active bridge refuse batches at every revision, and answer a message with no `method`, `result`, or `error` with `-32600`.
+- Replaced the built-in `gemini` harness (`gemini`) with `antigravity` (`agy`), supporting `--print` / `--prompt-interactive`, `--output-format stream-json`, `--model`, `--effort`, `--json-schema` native structured output, `--mode` (`plan`, `accept-edits`, `auto`), `--sandbox`, interactive takeover (`--resume`), and unattended `handoff_repair` follow-ups. Custom adapters can select `output = "antigravity-stream"` (replacing `"gemini-json"`).
 
 ## [0.3.1] - 2026-11-28
 

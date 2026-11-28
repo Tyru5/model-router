@@ -5,7 +5,7 @@ use serde_json::Value;
 /// Tokens and cost a harness reported, never estimated: a field is None when
 /// the harness did not report it. Input excludes tokens read from cache and
 /// output includes reasoning, whatever each harness's own convention.
-/// Codex, Cursor, and Gemini report no cost.
+/// Codex, Cursor, and Antigravity report no cost.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -137,7 +137,7 @@ impl UsageTracker {
     /// Feeds the next UTF-8 stdout chunk. Returns `Some(cumulative_usage)` if
     /// one or more usage events were observed in this chunk.
     pub fn push(&mut self, chunk: &str) -> Option<Usage> {
-        if matches!(self.kind, OutputKind::Text | OutputKind::Gemini) || chunk.is_empty() {
+        if self.kind == OutputKind::Text || chunk.is_empty() {
             return None;
         }
         let mut updated = false;
@@ -253,7 +253,7 @@ fn add_usage(found: Option<Usage>, event: &Value, kind: OutputKind) -> Option<Us
     })
 }
 
-/// Largest single JSON document (Gemini's output) read whole for usage.
+/// Largest single JSON document read whole for usage.
 const DOCUMENT_LIMIT: u64 = 16 << 20;
 const MAX_LINE_BYTES: usize = 4 << 20;
 
@@ -326,7 +326,7 @@ fn line_may_have_usage(line: &[u8], kind: OutputKind) -> bool {
         OutputKind::Claude | OutputKind::Amp => {
             contains_bytes(line, b"usage") || contains_bytes(line, b"total_cost_usd")
         }
-        OutputKind::Cursor => contains_bytes(line, b"usage"),
+        OutputKind::Cursor | OutputKind::Antigravity => contains_bytes(line, b"usage"),
         OutputKind::Codex => {
             contains_bytes(line, b"turn.completed") && contains_bytes(line, b"usage")
         }
@@ -335,14 +335,13 @@ fn line_may_have_usage(line: &[u8], kind: OutputKind) -> bool {
             contains_bytes(line, b"step_finish")
                 && (contains_bytes(line, b"tokens") || contains_bytes(line, b"cost"))
         }
-        OutputKind::Gemini | OutputKind::Text => true,
+        OutputKind::Text => true,
     }
 }
 
 /// Usage from an unattended harness's stdout.log, read one line at a time
-/// so a long log is never held in memory. Gemini prints one JSON document,
-/// read whole up to `DOCUMENT_LIMIT`; a log with no JSON lines is read the
-/// same way, in case it is one pretty-printed document.
+/// so a long log is never held in memory. A log with no JSON lines is read
+/// whole up to `DOCUMENT_LIMIT`, in case it is one pretty-printed document.
 pub fn usage_file(path: &std::path::Path, kind: OutputKind) -> Option<Usage> {
     use std::io::Read;
     if kind == OutputKind::Text {
@@ -359,9 +358,6 @@ pub fn usage_file(path: &std::path::Path, kind: OutputKind) -> Option<Usage> {
             .ok()
             .and_then(|_| usage(&raw, kind))
     };
-    if kind == OutputKind::Gemini {
-        return document(path);
-    }
     let mut reader = std::io::BufReader::new(std::fs::File::open(path).ok()?);
     let mut line = Vec::new();
     let (mut found, mut any) = (None, false);
@@ -403,7 +399,12 @@ pub fn usage_file(path: &std::path::Path, kind: OutputKind) -> Option<Usage> {
 fn line_values(line: &str) -> Vec<Value> {
     let line = line.trim();
     let value = serde_json::from_str::<Value>(line).ok().or_else(|| {
-        let start = line.find('{').filter(|start| *start > 0)?;
+        // A line starting with `"` is a member of a pretty-printed JSON
+        // document (e.g. `"usage": {...}`), not a standalone event with a
+        // log prefix.
+        let start = line
+            .find('{')
+            .filter(|start| *start > 0 && !line.starts_with('"'))?;
         serde_json::from_str(&line[start..]).ok()
     });
     match value {
@@ -511,28 +512,25 @@ fn event_usage(event: &Value, kind: OutputKind) -> Option<Usage> {
             cache_write_tokens: count("/part/tokens/cache/write"),
             cost_usd: cost("/part/cost"),
         },
-        // gemini --output-format json: per-model stats; prompt includes cached,
-        // candidates exclude thoughts.
-        OutputKind::Gemini => {
-            let models = event.pointer("/stats/models")?.as_object()?;
-            let mut sum = Usage::default();
-            for model in models.values() {
-                let count = |key: &str| {
-                    model
-                        .pointer(&format!("/tokens/{key}"))
-                        .and_then(Value::as_u64)
-                };
-                let cached = count("cached");
-                sum = sum
-                    + Usage {
-                        input_tokens: count("prompt")
-                            .map(|n| n.saturating_sub(cached.unwrap_or(0))),
-                        output_tokens: plus(count("candidates"), count("thoughts")),
-                        cache_read_tokens: cached,
-                        ..Usage::default()
-                    };
+        // agy --output-format stream-json (`result` event) or `json` document:
+        // output_tokens excludes thinking_tokens; no cost reported.
+        OutputKind::Antigravity
+            if event.get("event").and_then(Value::as_str) == Some("result")
+                || (event.get("event").is_none() && event.get("usage").is_some()) =>
+        {
+            let base = if event.pointer("/result/usage").is_some() {
+                "/result/usage"
+            } else {
+                "/usage"
+            };
+            let field = |key: &str| count(&format!("{base}/{key}"));
+            Usage {
+                input_tokens: field("input_tokens"),
+                output_tokens: plus(field("output_tokens"), field("thinking_tokens")),
+                cache_read_tokens: field("cache_read_tokens"),
+                cache_write_tokens: field("cache_write_tokens"),
+                cost_usd: None,
             }
-            sum
         }
         _ => return None,
     };
@@ -997,12 +995,19 @@ mod usage_tests {
     }
 
     #[test]
-    fn gemini_sums_models_without_cost() {
-        // gemini --output-format json (docs/cli/headless.md): stats.models.*.tokens.
-        let raw = r#"{"response":"ok","stats":{"models":{"gemini-2.5-pro":{"tokens":{"prompt":1000,"candidates":50,"total":1100,"cached":600,"thoughts":50,"tool":0}},"gemini-2.5-flash":{"tokens":{"prompt":100,"candidates":10,"cached":0}}}}}"#;
+    fn antigravity_reads_stream_result_and_document_usage_without_cost() {
+        // agy --output-format stream-json: result.usage.{input_tokens, output_tokens, thinking_tokens, cache_read_tokens}.
+        let stream = r#"{"event":"init","conversation_id":"00000000-0000-4000-8000-000000000001"}
+{"event":"result","result":{"status":"SUCCESS","response":"ok","usage":{"input_tokens":1750,"output_tokens":76,"thinking_tokens":41,"cache_read_tokens":200,"total_tokens":1867}}}"#;
         assert_eq!(
-            usage(raw, OutputKind::Gemini),
-            Some(tokens(500, 110, Some(600), None))
+            usage(stream, OutputKind::Antigravity),
+            Some(tokens(1750, 117, Some(200), None))
+        );
+        // Single-document --output-format json.
+        let doc = r#"{"status":"SUCCESS","response":"ok","usage":{"input_tokens":100,"output_tokens":20,"thinking_tokens":5,"cache_read_tokens":0}}"#;
+        assert_eq!(
+            usage(doc, OutputKind::Antigravity),
+            Some(tokens(100, 25, Some(0), None))
         );
     }
 
@@ -1024,11 +1029,11 @@ mod usage_tests {
             usage_file(&path, OutputKind::Claude),
             Some(tokens(1, 2, None, None))
         );
-        // Gemini pretty-prints one document across lines.
-        let gemini = "{\n  \"stats\": {\n    \"models\": {\"m\": {\"tokens\": {\"prompt\": 7, \"candidates\": 3}}}\n  }\n}\n";
-        std::fs::write(&path, gemini).unwrap();
+        // Pretty-printed single JSON document across lines.
+        let pretty = "{\n  \"status\": \"SUCCESS\",\n  \"usage\": {\"input_tokens\": 7, \"output_tokens\": 3}\n}\n";
+        std::fs::write(&path, pretty).unwrap();
         assert_eq!(
-            usage_file(&path, OutputKind::Gemini),
+            usage_file(&path, OutputKind::Antigravity),
             Some(tokens(7, 3, None, None))
         );
         assert_eq!(
@@ -1136,7 +1141,7 @@ mod usage_tests {
         assert_eq!(
             session_usage_in(
                 &roots,
-                "gemini",
+                "antigravity",
                 None,
                 workspace,
                 at("10:00:00"),
@@ -1150,7 +1155,7 @@ mod usage_tests {
     fn text_and_unreported_output_have_no_usage() {
         assert_eq!(usage("plain text", OutputKind::Text), None);
         assert_eq!(usage("", OutputKind::Codex), None);
-        assert_eq!(usage(r#"{"response":"ok"}"#, OutputKind::Gemini), None);
+        assert_eq!(usage(r#"{"response":"ok"}"#, OutputKind::Antigravity), None);
     }
 
     #[test]

@@ -657,7 +657,7 @@ mod tests {
         );
         assert!(
             note.contains(
-                "Claude Code, Cursor, Gemini, Amp, and Copilot use only their own accounts"
+                "Claude Code, Cursor, Antigravity, Amp, and Copilot use only their own accounts"
             ),
             "{note}"
         );
