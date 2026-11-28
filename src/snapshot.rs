@@ -992,13 +992,24 @@ fn check_attr(
     Ok(output.stdout)
 }
 
-/// `-c` arguments that turn off every repo-local clean and process filter,
-/// for a Git command that has to run with the repository's own config. Fails
-/// when a filter name cannot be written as a `-c` key.
-pub(crate) fn clean_filter_overrides(dir: &Path) -> Result<Vec<String>> {
+/// Refuses removal if a disabled clean filter makes the worktree's status
+/// unreliable. Otherwise returns overrides for Git's own removal check.
+pub(crate) fn worktree_removal_filter_overrides(dir: &Path) -> Result<Vec<String>> {
     let sanitized = SanitizedGitDir::new(dir)?;
+    let drivers = sanitized.local_clean_filters();
+    if !drivers.is_empty() {
+        let top = sanitized.top_level();
+        let tracked = list_index_paths(&sanitized, None, &["--cached"])?;
+        if let Some((path, driver)) =
+            find_suppressed_filter_path(&sanitized, top, &tracked, None, drivers)?
+        {
+            anyhow::bail!(
+                "Cannot verify whether {path} is clean: repo-local Git clean filter `{driver}` is disabled for safety"
+            );
+        }
+    }
     let mut args = Vec::new();
-    for driver in sanitized.local_clean_filters() {
+    for driver in drivers {
         let name = std::str::from_utf8(driver)
             .ok()
             .filter(|name| !name.contains(['=', '\n']))
@@ -1009,6 +1020,28 @@ pub(crate) fn clean_filter_overrides(dir: &Path) -> Result<Vec<String>> {
         }
     }
     Ok(args)
+}
+
+fn list_index_paths(
+    sanitized: &SanitizedGitDir,
+    index: Option<&Path>,
+    flags: &[&str],
+) -> Result<Vec<u8>> {
+    let mut command = sanitized.command(sanitized.top_level());
+    command
+        .args(["ls-files", "-z"])
+        .args(flags)
+        .stdin(Stdio::null());
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
+    let output = command.output().context("Start Git")?;
+    ensure!(
+        output.status.success(),
+        "git ls-files: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output.stdout)
 }
 
 /// Refuses to check out a worktree at `commit_or_tree` when any file in it has
@@ -1073,59 +1106,12 @@ fn refuse_suppressed_smudge_filters_in(
         "git read-tree {commit_or_tree}: {}",
         String::from_utf8_lossy(&read_out.stderr).trim()
     );
-    // Check `--cached` against `commit_or_tree`'s index directly (ignoring
-    // unrelated working-tree `.gitattributes`).
-    let mut child = sanitized
-        .command(top)
-        .args(["check-attr", "--cached", "-z", "filter", "--stdin"])
-        .env("GIT_INDEX_FILE", &index)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Start Git")?;
-    let stdin_bytes = paths;
-    let output = std::thread::scope(|scope| -> Result<std::process::Output> {
-        let writer = child.stdin.take().map(|mut pipe| {
-            scope.spawn(move || -> std::io::Result<()> {
-                use std::io::Write;
-                match pipe.write_all(stdin_bytes) {
-                    Ok(()) => Ok(()),
-                    Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-                    Err(err) => Err(err),
-                }
-            })
-        });
-        let output = child.wait_with_output().context("Wait for Git")?;
-        if let Some(handle) = writer {
-            if let Ok(Err(err)) = handle.join() {
-                if output.status.success() {
-                    return Err(err.into());
-                }
-            }
-        }
-        Ok(output)
-    })?;
-    ensure!(
-        output.status.success(),
-        "git check-attr filter failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    let mut parts = output.stdout.split(|&b| b == 0);
-    while let (Some(path), Some(_attr), Some(value)) = (parts.next(), parts.next(), parts.next()) {
-        if value.is_empty() {
-            continue;
-        }
-        if drivers.iter().any(|d| d.as_slice() == value) {
-            anyhow::bail!(
-                "Refusing to create worktree: {} uses repo-local Git smudge filter `{}` which is disabled for safety and would leave unprocessed files in the worktree; configure the filter globally instead",
-                String::from_utf8_lossy(path),
-                String::from_utf8_lossy(value)
-            );
-        }
-        if matches!(value, b"unspecified" | b"unset" | b"set") {
-            continue;
-        }
+    if let Some((path, driver)) =
+        find_suppressed_filter_path_cached(sanitized, top, paths, &index, drivers)?
+    {
+        anyhow::bail!(
+            "Refusing to create worktree: {path} uses repo-local Git smudge filter `{driver}` which is disabled for safety and would leave unprocessed files in the worktree; configure the filter globally instead"
+        );
     }
     Ok(())
 }
@@ -1913,6 +1899,42 @@ fn capture(workspace: &Path, index: &Path) -> Result<Option<String>> {
     if !existed {
         seed(workspace, &sanitized, index)?;
     }
+    let drivers = sanitized.local_clean_filters();
+    if !drivers.is_empty() {
+        let paths = list_index_paths(
+            &sanitized,
+            Some(index),
+            &["--modified", "--others", "--exclude-standard"],
+        )?;
+        let top = sanitized.top_level();
+        let mut reread = Vec::new();
+        for raw in paths.split(|&b| b == 0).filter(|path| !path.is_empty()) {
+            let path = top.join(bytes_to_os(raw)?);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_file() => {
+                    reread.extend_from_slice(raw);
+                    reread.push(0);
+                }
+                // Git does not run clean filters on deletions, symlinks or gitlinks.
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("Inspect {}", path.display()));
+                }
+            }
+        }
+        if let Some((path, driver)) =
+            find_suppressed_filter_path(&sanitized, top, &reread, Some(index), drivers)?
+        {
+            anyhow::bail!(
+                "Cannot snapshot {path}: repo-local Git clean filter `{driver}` is disabled for safety; configure the filter globally instead"
+            );
+        }
+    }
     // Snapshots are taken under the run lock, so a leftover lock is from an
     // interrupted add and would fail every later snapshot.
     let mut lock = OsString::from(index);
@@ -2596,7 +2618,11 @@ mod tests {
         );
 
         let run_dir = run_dir(workspace);
-        assert!(tree(workspace, &run_dir).is_some());
+        let err = try_tree(workspace, &run_dir).unwrap_err().to_string();
+        assert!(
+            err.contains("filter `evil`") || err.contains("filter `a=b`"),
+            "{err}"
+        );
         assert!(
             !marker.exists(),
             "snapshot::tree executed repo-local filter command"
@@ -2652,7 +2678,14 @@ mod tests {
             fs::write(workspace.join(".gitattributes"), attrs).unwrap();
             fs::write(workspace.join("bytes.raw"), "payload\n").unwrap();
 
-            assert!(tree(workspace, &run_dir).is_some());
+            fs::remove_file(workspace.join("filtered.txt")).unwrap();
+            fs::remove_file(workspace.join("subsection.eq")).unwrap();
+            fs::remove_file(workspace.join("race.late")).unwrap();
+            let err = try_tree(workspace, &run_dir).unwrap_err().to_string();
+            assert!(
+                err.contains("bytes.raw") && err.contains("filter `bad"),
+                "{err}"
+            );
             assert!(
                 !marker.exists(),
                 "snapshot::tree executed non-UTF-8 repo-local filter"
@@ -3035,7 +3068,7 @@ mod tests {
     fn sanitized_git_preserves_numeric_required_and_reports_clean_filter_status() {
         let Some(dir) = repository() else { return };
         let workspace = dir.path();
-        let run_dir = run_dir(workspace);
+        let snapshots = run_dir(workspace);
 
         // Numeric truthy `filter.*.required = 2` must stay required in the
         // sanitized config so Git fails closed.
@@ -3054,7 +3087,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            try_tree(workspace, &run_dir).is_err(),
+            try_tree(workspace, &snapshots).is_err(),
             "filter.*.required = 2 must fail closed"
         );
 
@@ -3071,6 +3104,16 @@ mod tests {
             &["config", "--local", "filter.upper.clean", "tr a-z A-Z"],
         )
         .unwrap();
+        let note = fs::File::open(clean_ws.join("note.upper")).unwrap();
+        let restamp = |seconds| {
+            note.set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+            )
+            .unwrap();
+        };
+        // Keep the original mtime well before the index write, even on a
+        // coarse filesystem where Git would otherwise rehash a racy entry.
+        restamp(1);
         git(clean_ws, None, &["add", ".gitattributes", "note.upper"]).unwrap();
         git(
             clean_ws,
@@ -3078,15 +3121,15 @@ mod tests {
             &["-c", "commit.gpgsign=false", "commit", "-qm", "filtered"],
         )
         .unwrap();
-        // Rewrite the same working-tree bytes to invalidate index stat cache
-        // while keeping native `git status` clean.
-        fs::write(clean_ws.join("note.upper"), "hello\n").unwrap();
-        git(clean_ws, None, &["update-index", "--really-refresh"]).ok();
-        // Force a stale index entry so Git re-reads note.upper from disk.
-        let _ = Command::new("touch")
-            .args(["-t", "202001010000", "note.upper"])
-            .current_dir(clean_ws)
-            .status();
+        let snapshots = run_dir(clean_ws);
+        assert!(try_tree(clean_ws, &snapshots).unwrap().is_some());
+        // Only the timestamp changes; the router must not snapshot raw bytes.
+        restamp(2);
+        let msg = try_tree(clean_ws, &snapshots).unwrap_err().to_string();
+        assert!(
+            msg.contains("note.upper") && msg.contains("filter `upper`"),
+            "{msg}"
+        );
         let err = crate::storage::create_worktree(clean_ws, "wt-clean-filter", true).unwrap_err();
         let msg = format!("{err:#}");
         assert!(

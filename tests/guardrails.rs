@@ -141,9 +141,15 @@ fn protected_paths_cover_files_git_ignores() {
     git(dir.path(), &["commit", "-m", "ignore .env"]);
     fs::write(dir.path().join(".env"), "TOKEN=kept\n").unwrap();
 
-    let run_stage = |target: &str| {
+    let run_stage = |target: &str, check: Option<&str>| {
         let mut impl_stage = stage("implement", Role::Implementation);
         impl_stage.extra_args = vec!["--write-file".into(), target.into()];
+        if let Some(script) = check {
+            impl_stage.checks.push(model_router::config::Check {
+                command: vec!["python3".into(), "-c".into(), script.into()],
+                ..Default::default()
+            });
+        }
         let mut wf = Workflow::new("Protected", vec![impl_stage]);
         wf.protected_paths = vec![".env".into()];
         let settings = common::settings(&wf);
@@ -152,14 +158,29 @@ fn protected_paths_cover_files_git_ignores() {
         (action, run)
     };
 
-    let (action, run) = run_stage("notes.txt");
+    let (action, run) = run_stage("notes.txt", Some("pass"));
     assert_eq!(action, Action::Complete, "{:?}", run.error);
 
-    let (action, run) = run_stage(".env");
-    assert_eq!(action, Action::Stopped);
-    assert_eq!(run.status, Status::Blocked);
-    let err = run.error.as_deref().unwrap_or("");
-    assert!(err.contains("Git-ignored file matching"), "{err}");
+    for (target, check) in [
+        (".env", None),
+        (
+            "notes.txt",
+            Some("from pathlib import Path; Path('.env').write_text('changed by check')"),
+        ),
+    ] {
+        fs::write(dir.path().join(".env"), "TOKEN=kept\n").unwrap();
+        let (action, run) = run_stage(target, check);
+        assert_eq!(action, Action::Stopped);
+        assert_eq!(run.status, Status::Blocked);
+        let err = run.error.as_deref().unwrap_or("");
+        assert!(err.contains("Git-ignored file matching"), "{err}");
+        if check.is_some() {
+            assert_eq!(
+                run.stages[0].attempts[0].checks[0].status,
+                model_router::handoff::TestStatus::Passed
+            );
+        }
+    }
 }
 
 /// A fan-out candidate that edits a protected path stops blocked, and its

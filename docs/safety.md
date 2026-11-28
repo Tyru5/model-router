@@ -148,11 +148,12 @@ only written files are checked for disabled smudge filters. When
 filling a new worktree fails, or a run's candidate and delegate worktrees are
 removed, the router removes those worktrees and their own records in the
 project's repository (never another repository's); it never runs
-`git worktree prune`. `history clean --worktrees` runs
-`git worktree remove` with every repo-local clean and process filter turned
-off (`-c filter.<name>.clean= -c filter.<name>.process=`), so a file that
-needs one keeps the worktree. That `GIT_DIR` lives in a `tmp` directory inside the router's
-socket directory, which stages cannot write. Partial clones
+`git worktree prune`. `model-router clean --worktrees` keeps a worktree
+if a tracked path uses a disabled repo-local clean or process filter: Git
+cannot reliably tell whether that file is clean without the filter. Other
+worktrees still go through an unforced `git worktree remove` with those
+filters disabled. The sanitized `GIT_DIR` lives in a `tmp` directory inside
+the router's socket directory, which stages cannot write. Partial clones
 (`extensions.partialClone` or `remote.*.promisor`) and a repository-local
 `lfs.storage` are refused; use a full clone and set `lfs.storage` globally.
 
@@ -195,24 +196,27 @@ A push remote that only a legacy
 `.git/remotes/<name>` or `.git/branches/<name>` file defines is refused,
 since `git config` does not list it.
 Worktree creation and shipping fail closed when affected files rely
-on suppressed repo-local filters, and workflows with `protected_paths` or
-blocking `policies` fail before launch when the pre-stage snapshot cannot be
-captured.
+on suppressed repo-local filters. A snapshot is refused if Git reports a
+new or modified file that needs a disabled clean filter, rather than recording
+unfiltered bytes. Even a timestamp-only change can make Git reread a file.
+Workflows with `protected_paths` or blocking `policies` fail before launch
+when the pre-stage snapshot cannot be captured.
 
 Snapshots skip files Git ignores, so for an ordinary stage `protected_paths`
-also compares the ignored, untracked files that match its globs before and
-after the stage, and stops the stage blocked when one was added, changed, or
-removed, whatever made Git ignore it (`.gitignore`, `.git/info/exclude`,
-`core.excludesFile`). It reads each file's path, mode, and contents, a
+also compares the ignored, untracked files that match its globs before the
+harness, after it exits, and again after configured stage checks run. It
+blocks the stage when one was added, changed, or removed, whatever made Git
+ignore it (`.gitignore`, `.git/info/exclude`, `core.excludesFile`). It
+reads each file's path, mode, and contents, a
 symbolic link's target and, when the link stays inside the work tree, the
 file it leads to, and the matching files inside an
 ignored nested repository; it skips the router's own `.model-router`. A
 glob such as `dir/**` therefore also covers ignored build output under
 `dir`. Git lists the files
 against the run's own snapshot index, so staging one in the checkout's index
-does not hide it. The check reads every matching ignored file twice per
-stage, at most 64 MiB of one file and 256 MiB in all; past that the stage
-stops, so keep large files out of `protected_paths`. Anything Git warns
+does not hide it. Each read is limited to 64 MiB per matching ignored file
+and 256 MiB in all; past that the stage stops. Keep large files out of
+`protected_paths`. Anything Git warns
 about while listing them (a directory it cannot read) also stops the stage.
 Git walks each glob's literal leading directories only, so that applies
 under those, and everywhere for a glob that starts with a wildcard.

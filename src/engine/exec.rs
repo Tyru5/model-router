@@ -688,6 +688,11 @@ pub(super) fn finish(
     let mut fresh_tree: Option<String> = None;
     let check_protected = !run.workflow.protected_paths.is_empty();
     let check_policies = crate::policy::has_block_policies(&run.workflow.policies);
+    let attempts = &run.stages[index].attempts;
+    let from = prepared
+        .retry_from
+        .filter(|&first| first < attempts.len())
+        .unwrap_or(attempts.len().saturating_sub(1));
     if check_protected || check_policies {
         let workspace = run.workspace.clone();
         let what = match (check_protected, check_policies) {
@@ -696,11 +701,6 @@ pub(super) fn finish(
             (false, true) => "workflow policies",
             (false, false) => unreachable!(),
         };
-        let attempts = &run.stages[index].attempts;
-        let from = prepared
-            .retry_from
-            .filter(|&first| first < attempts.len())
-            .unwrap_or(attempts.len().saturating_sub(1));
         let Some(before) = attempts.get(from).and_then(|a| a.tree_before.clone()) else {
             run.stop(
                 Status::Blocked,
@@ -710,47 +710,23 @@ pub(super) fn finish(
             )?;
             return Ok(None);
         };
-        let Some(after) = snapshot::tree(&workspace, &run.directory) else {
-            run.stop(
-                Status::Blocked,
-                format!(
-                    "Could not snapshot workspace to verify {what}; inspect workspace and retry"
-                ),
-                Actor::Engine,
-                true,
-            )?;
-            return Ok(None);
+        let after = match snapshot::try_tree(&workspace, &run.directory)
+            .and_then(|tree| tree.context("Workspace has no Git snapshot"))
+        {
+            Ok(tree) => tree,
+            Err(error) => {
+                run.stop(
+                    Status::Blocked,
+                    format!("Could not snapshot workspace to verify {what}: {error:#}"),
+                    Actor::Engine,
+                    true,
+                )?;
+                return Ok(None);
+            }
         };
         fresh_tree = Some(after.clone());
-        if check_protected {
-            // Snapshots skip files Git ignores, so a protected file the
-            // stage wrote and had Git ignore is not in the diff below.
-            let ignored_before = attempts
-                .get(from)
-                .and_then(|a| a.ignored_protected_before.clone());
-            let problem = match (
-                ignored_before,
-                snapshot::ignored_protected_digest(
-                    &workspace,
-                    &run.directory,
-                    &run.workflow.protected_paths,
-                ),
-            ) {
-                (None, _) => Some(
-                    "Could not verify workflow protected_paths: this attempt recorded no baseline of Git-ignored protected files; retry the stage".to_owned(),
-                ),
-                (Some(_), Err(error)) => Some(format!(
-                    "Could not read the Git-ignored files workflow protected_paths cover: {error:#}"
-                )),
-                (Some(before), Ok(after)) if after.as_deref() != Some(before.as_str()) => Some(
-                    "A Git-ignored file matching workflow protected_paths was added, changed, or removed during the stage. Revert it or update workflow protected_paths before retrying".to_owned(),
-                ),
-                (Some(_), Ok(_)) => None,
-            };
-            if let Some(problem) = problem {
-                run.stop(Status::Blocked, problem, Actor::Engine, true)?;
-                return Ok(fresh_tree);
-            }
+        if check_protected && !check_ignored_protected(run, from)? {
+            return Ok(fresh_tree);
         }
         if after != before {
             if check_protected {
@@ -811,11 +787,12 @@ pub(super) fn finish(
             }
         }
     }
-    if !blocked {
-        let existing = (!run.workflow.stages[index].checks.is_empty())
-            .then(|| fresh_tree.take())
-            .flatten();
-        if !run_checks(run, prepared, existing, cancel, emit)? {
+    if !blocked && !run.workflow.stages[index].checks.is_empty() {
+        if !run_checks(run, prepared, fresh_tree.take(), cancel, emit)? {
+            return Ok(None);
+        }
+        // Checks can write ignored files without changing the tested tree.
+        if check_protected && !check_ignored_protected(run, from)? {
             return Ok(None);
         }
     }
@@ -825,6 +802,30 @@ pub(super) fn finish(
         run.advance(Actor::Engine)?;
     }
     Ok(fresh_tree)
+}
+
+/// Checks protected files that won't appear in a Git snapshot diff.
+fn check_ignored_protected(run: &mut Run, from: usize) -> Result<bool> {
+    let before = run.stages[run.cursor]
+        .attempts
+        .get(from)
+        .and_then(|a| a.ignored_protected_before.as_deref());
+    let problem = match before {
+        None => "Could not verify workflow protected_paths: this attempt recorded no baseline of Git-ignored protected files; retry the stage".to_owned(),
+        Some(before) => match snapshot::ignored_protected_digest(
+            &run.workspace,
+            &run.directory,
+            &run.workflow.protected_paths,
+        ) {
+            Ok(after) if after.as_deref() == Some(before) => return Ok(true),
+            Ok(_) => "A Git-ignored file matching workflow protected_paths was added, changed, or removed during the stage. Revert it or update workflow protected_paths before retrying".to_owned(),
+            Err(error) => format!(
+                "Could not read the Git-ignored files workflow protected_paths cover: {error:#}"
+            ),
+        },
+    };
+    run.stop(Status::Blocked, problem, Actor::Engine, true)?;
+    Ok(false)
 }
 
 /// Runs the current stage's router checks. False when cancellation stopped the run.
