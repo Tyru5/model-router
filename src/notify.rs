@@ -718,7 +718,16 @@ mod tests {
     #[test]
     fn interactive_handoff_notification_uses_needs_input_and_deduplicates() {
         let dir = tempfile::tempdir().unwrap();
-        let settings = crate::config::Settings::default();
+        let mut settings = crate::config::Settings::default();
+        settings.adapters.insert(
+            "mock".into(),
+            crate::config::CustomAdapter {
+                command: "python3".into(),
+                ..Default::default()
+            },
+        );
+        settings.workflows[0].stages.truncate(1);
+        settings.workflows[0].stages[0].harness = "mock".into();
         let run = crate::engine::Run::create(
             dir.path(),
             &settings,
